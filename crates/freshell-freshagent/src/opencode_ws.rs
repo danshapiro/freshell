@@ -313,11 +313,16 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
-    /// D8 (restore-open-sessions-only): the connection-scoped create's
-    /// provenance, carried in-memory to the materialization binding write (the
-    /// binding row is born at first SEND, mediations after `handle_create`
-    /// returned). `None` for conn-less sessions (attach-resume rehydrate) —
-    /// the ledger merge keeps any prior stamps.
+    /// D8 (restore-open-sessions-only): the LATEST connection-scoped provenance
+    /// this session was attached under. Parked by `handle_create` at create, by
+    /// the in-memory-hit arm AND by `resume_durable_session` at a
+    /// connection-scoped resume (focused-ep1-r3: the cold-resume reconstruction
+    /// parks it too, so the fork consumer's `session.provenance` read and the
+    /// per-send refresh write always assert the CURRENT attribution). Read by
+    /// every downstream binder: the materialization row (born at first SEND,
+    /// mediations after `handle_create` returned), the per-send refresh, and
+    /// the fork child's inheritance. `None` for conn-less sessions
+    /// (attach-resume rehydrate) — the ledger merge keeps any prior stamps.
     provenance: Option<crate::BindProvenance>,
 }
 
@@ -2411,9 +2416,10 @@ impl FreshOpencodeState {
     /// durable `ses_*` id, so the placeholder and real id are the same value.
     /// `provenance` (D8): the CURRENT connection's provenance when this resume flows
     /// from a connection-scoped create ([`Self::handle_create_resume`]; delta-r1
-    /// Finding 3) — the binding refresh below re-stamps it so a resume-into-a-new-tab
-    /// never keeps the OLD tab's attribution. `None` from conn-less lanes
-    /// (`handle_attach`): the ledger's keep-when-None merge then inherits prior stamps.
+    /// Finding 3) — parked on the reconstructed session (focused-ep1-r3) AND re-stamped
+    /// by the binding refresh below, so a resume-into-a-new-tab never keeps the OLD
+    /// tab's attribution. `None` from conn-less lanes (`handle_attach`): the session
+    /// parks nothing and the ledger's keep-when-None merge then inherits prior stamps.
     async fn resume_durable_session(
         &self,
         session_id: &str,
@@ -2549,6 +2555,16 @@ impl FreshOpencodeState {
             rec.effort.clone(),
         );
         session.real_session_id = Some(session_id.to_string());
+        // D8 (focused-ep1-r3 — the parking invariant): a session (re)attached to
+        // a client connection must hold that connection's LATEST provenance. The
+        // cold resume IS such an attach point when it flows from a
+        // connection-scoped create ([`Self::handle_create_resume`]): park BEFORE
+        // insertion so every downstream reader of `session.provenance` (the
+        // per-send refresh write, the fork consumer's child-row inheritance)
+        // asserts the CURRENT attribution. `None` stays when the resume has no
+        // connection identity (`handle_attach`) — never invented; the ledger's
+        // keep-when-None merge then continues to preserve prior stamps.
+        session.provenance = provenance.clone();
         session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
             session_id.to_string(),
@@ -3146,6 +3162,21 @@ mod tests {
                 return Box::pin(
                     async move { Ok(ServeHttpResponse::new(404, b"not found".to_vec())) },
                 );
+            }
+            // Like the real serve, `POST /session/:id/fork` mints a FRESH child
+            // `ses_N` (sharing the create counter) and remembers it, so a fork
+            // of a genuinely-known parent yields a distinct, itself-resolvable id.
+            if matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && req.url.contains("/fork")
+            {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let child = format!("ses_{n}");
+                self.created.lock().unwrap().insert(child.clone());
+                let body = serde_json::to_vec(
+                    &json!({ "id": child, "title": "forked session", "time": { "updated": 6 }, "directory": "/serve/dir" }),
+                )
+                .unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
             }
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&json!([
@@ -4734,6 +4765,146 @@ mod tests {
         assert_eq!(b.client_instance_id, None);
         assert_eq!(b.device_id, None);
         assert_eq!(b.tab_key, None);
+    }
+
+    /// Focused-ep1-r3 (the parking invariant): a COLD durable resume driven by a
+    /// connection-scoped create (`freshAgent.create{sessionRef}` with the local
+    /// map empty — the post-restart recovery-accept shape) must PARK the resume
+    /// connection's provenance on the reconstructed session before insertion.
+    /// Every downstream writer (the per-send refresh, the fork consumer's
+    /// `session.provenance` read) asserts the CURRENT attribution from the
+    /// parked value — parking nothing leaves the session permanently orphaned
+    /// from the connection that provably has it open.
+    #[tokio::test]
+    async fn cold_resume_parks_the_resume_connections_provenance_on_the_session() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+
+        let mut create = create_msg("req-cold-park");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-cold"),
+                    Some("device-cold"),
+                    Some("tab-cold"),
+                )),
+            )
+            .await;
+
+        let sessions = state.sessions.lock().await;
+        let s = sessions
+            .get(DURABLE_ID)
+            .expect("the cold resume registered the session")
+            .lock()
+            .await;
+        let p = s
+            .provenance
+            .clone()
+            .expect("the cold-resume construction parks the resume connection's provenance");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-cold"));
+        assert_eq!(p.device_id.as_deref(), Some("device-cold"));
+        assert_eq!(p.tab_key.as_deref(), Some("device-cold:tab-cold"));
+    }
+
+    /// Focused-ep1-r3, the confirmed finding's D8 consumer chain: cold-resume a
+    /// durable session over a stamped connection, then FORK it. The child
+    /// binding row must carry the RESUME connection's identity/tab (the fork
+    /// inherits the parent's parked provenance) — a `None`-stamped child row is
+    /// unattributed and `recovery_inventory`'s parent-relative keep drops the
+    /// genuinely-open fork child from the recovery offer.
+    #[tokio::test]
+    async fn cold_resume_then_fork_child_row_carries_the_resume_connections_provenance() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-cold-chain");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-chain"),
+                    Some("device-chain"),
+                    Some("tab-chain"),
+                )),
+            )
+            .await;
+
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(fork_msg(DURABLE_ID, "fork-req-cold-chain", None), sink)
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+        assert_ne!(child_id, DURABLE_ID, "the fork mints a fresh child id");
+
+        // The child SESSION parks the same stamps (a fork-of-fork stays
+        // attributed — the chain is connection > session > child rows).
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the fork child parks the parent's provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-chain"));
+            assert_eq!(p.device_id.as_deref(), Some("device-chain"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-chain:tab-chain"));
+        }
+
+        // …and the child's ledger ROW asserts the same attribution (never the
+        // unattributed row the D8 judgment drops).
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.client_instance_id.as_deref(),
+            Some("client-chain"),
+            "the child row must carry the RESUME connection's identity, not None"
+        );
+        assert_eq!(b.device_id.as_deref(), Some("device-chain"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-chain:tab-chain"));
+    }
+
+    /// The paired never-invent pin (session-level twin of
+    /// [`attach_resume_binding_keeps_none_stamps_for_ledger_inheritance`]): the
+    /// conn-less cold resume (the attach lane carries no tab identity) parks
+    /// NOTHING on the reconstructed session, so later conn-less refresh lanes
+    /// keep the ledger's prior stamps instead of asserting an invention.
+    #[tokio::test]
+    async fn attach_resume_parks_no_provenance_on_the_reconstructed_session() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let sessions = state.sessions.lock().await;
+        let s = sessions
+            .get(DURABLE_ID)
+            .expect("the attach-resume registered the session")
+            .lock()
+            .await;
+        assert_eq!(
+            s.provenance, None,
+            "a conn-less resume invents no provenance (None stays parked)"
+        );
     }
 
     // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────

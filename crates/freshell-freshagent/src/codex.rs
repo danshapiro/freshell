@@ -274,6 +274,19 @@ struct CodexSession {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
+    /// D8 (restore-open-sessions-only, focused-ep1-r3): the LATEST
+    /// connection-scoped provenance this session was attached under — parked by
+    /// [`FreshCodexState::finish_create`] from the create's threaded stamps,
+    /// CARRIED across crash-recovery rebuilds (the in-place
+    /// [`FreshCodexState::ensure_session_alive`] re-register and the mint-new
+    /// [`FreshCodexState::respawn_as_new_thread_after_crash`] re-key — the same
+    /// logical session continuing; its row-level twins are the conn-less
+    /// refresh's keep-when-None merge and the mint-new row's `supersedes`
+    /// inheritance), and inherited by [`FreshCodexState::handle_fork`]'s child
+    /// record + child ledger row. `None` on conn-less registration lanes
+    /// ([`FreshCodexState::ensure_session_resumable`]'s attach-resume) — never
+    /// invented.
+    provenance: Option<crate::BindProvenance>,
 }
 
 /// The result of [`FreshCodexState::ensure_session_alive`].
@@ -410,8 +423,9 @@ impl FreshCodexState {
         effort: Option<&str>,
         cwd: Option<&str>,
         supersedes: Option<&str>,
-        // D8 provenance stamps — `Some` from connection-scoped creates,
-        // `None` on conn-less refresh/fork lanes (the ledger merge keeps or
+        // D8 provenance stamps — `Some` from connection-scoped creates and
+        // from the fork lane (the parent's PARKED provenance, focused-ep1-r3);
+        // `None` on conn-less refresh/respawn lanes (the ledger merge keeps or
         // supersedes-inherits prior stamps).
         provenance: Option<&crate::BindProvenance>,
     ) {
@@ -1038,6 +1052,11 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                // D8 (focused-ep1-r3 — the parking invariant): park the creating
+                // connection's provenance ON the session so downstream readers
+                // (the fork child row + child record) assert the CURRENT
+                // attribution; `None` stays on conn-less lanes (never invented).
+                provenance: provenance.clone(),
             },
         );
 
@@ -2070,6 +2089,10 @@ impl FreshCodexState {
                     s.cwd.clone(),
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
+                    // D8 (focused-ep1-r3): the fork-chain inheritance source —
+                    // the parent's PARKED provenance (the child pane continues
+                    // the parent's lineage in the same client context).
+                    s.provenance.clone(),
                 )
             })
         };
@@ -2080,6 +2103,7 @@ impl FreshCodexState {
             parent_cwd,
             parent_sandbox,
             parent_permission_mode,
+            parent_provenance,
         )) = looked_up
         else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
@@ -2237,7 +2261,9 @@ impl FreshCodexState {
         // Register the child on its OWN sidecar (the shared registration tail, the
         // ensure_session_resumable shape), inheriting the parent's settings. The
         // child rollout's durable session_meta is the history-mode SoT (kata 1wxv
-        // Task 2): a paginated parent's child stays rollback-capable.
+        // Task 2): a paginated parent's child stays rollback-capable. The child
+        // record also parks the parent's provenance (D8 fork-chain inheritance,
+        // focused-ep1-r3) so a fork-of-fork stays attributed.
         self.register_live_session(
             &child_id,
             child_client,
@@ -2250,13 +2276,16 @@ impl FreshCodexState {
             parent_sandbox.clone(),
             parent_permission_mode.clone(),
             read_rollout_history_mode(&child_id),
+            parent_provenance.clone(),
         )
         .await;
 
         // P1.13: the child's binding row, AWAITED before the forked reply
         // (durable-before-answer). Fork is not a create: no create_request_id.
-        // D8: fork is conn-less here (the WS dispatch drops the connection) —
-        // provenance `None`; the row starts unattributed rather than invented.
+        // D8 (focused-ep1-r3): the child row asserts the PARENT's parked
+        // provenance (the fork pane continues the parent's lineage in the same
+        // client context). `None` only when the parent itself parks none (a
+        // conn-less attach-resumed parent) — unattributed rather than invented.
         self.record_codex_binding(
             &child_id,
             None,
@@ -2266,7 +2295,7 @@ impl FreshCodexState {
             parent_effort.as_deref(),
             eff_cwd.as_deref(),
             None,
-            None,
+            parent_provenance.as_ref(),
         )
         .await;
 
@@ -2542,7 +2571,14 @@ impl FreshCodexState {
         &self,
         session_id: &str,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (cwd, session_model, session_effort, session_sandbox, session_permission_mode) = {
+        let (
+            cwd,
+            session_model,
+            session_effort,
+            session_sandbox,
+            session_permission_mode,
+            session_provenance,
+        ) = {
             let guard = self.sessions.lock().await;
             let session = guard.get(session_id).ok_or(EnsureAliveError::NotFound)?;
             if !session.exited.load(Ordering::SeqCst) {
@@ -2554,6 +2590,12 @@ impl FreshCodexState {
                 session.effort.clone(),
                 session.sandbox.clone(),
                 session.permission_mode.clone(),
+                // D8 (focused-ep1-r3): the parked provenance rides ACROSS the
+                // recovery rebuild below (and into the mint-new fallback) — the
+                // same logical session continues; nothing new is invented (the
+                // conn-less refresh's keep-when-None merge is the row-level
+                // twin, preserving exactly these stamps).
+                session.provenance.clone(),
             )
         };
 
@@ -2684,6 +2726,7 @@ impl FreshCodexState {
                     sandbox,
                     permission_mode,
                     lease_guard,
+                    session_provenance,
                 )
                 .await;
         }
@@ -2768,6 +2811,7 @@ impl FreshCodexState {
                         sandbox,
                         permission_mode,
                         lease_guard,
+                        session_provenance,
                     )
                     .await;
             }
@@ -2859,6 +2903,11 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    // D8 (focused-ep1-r3): CARRY the crashed session's parked
+                    // provenance onto the rebuilt record (the same logical
+                    // session continues) so a post-recovery fork stays
+                    // attributed. `None` stays `None` — never invented.
+                    provenance: session_provenance.clone(),
                 },
             );
         }
@@ -2922,6 +2971,12 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // D8 (focused-ep1-r3): the crashed session's parked provenance, CARRIED
+        // onto the mint-new record below (the identity moved; the same logical
+        // session continues). The ledger row below is its row-level twin:
+        // `supersedes: Some(old)` makes the merge inherit the superseded row's
+        // stamps.
+        provenance: Option<crate::BindProvenance>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
@@ -3008,6 +3063,9 @@ impl FreshCodexState {
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
+                    // D8 (focused-ep1-r3): the parked provenance rides the
+                    // OLD→NEW re-key (carried from the crashed session).
+                    provenance,
                 },
             );
         }
@@ -3650,6 +3708,10 @@ impl FreshCodexState {
                 // Kata 1wxv Task 2 (r3): the durable rollout meta carries the
                 // mode across resume (only a missing/unparseable meta ⇒ legacy).
                 read_rollout_history_mode(thread_id),
+                // D8: the conn-less attach-resume parks NOTHING (the attach lane
+                // carries no tab identity — never invented); the ledger's
+                // keep-when-None merge preserves the row's prior stamps.
+                None,
             )
             .await;
 
@@ -3707,6 +3769,10 @@ impl FreshCodexState {
     /// snapshot. Returns the new session's `active_turn` handle. Callers own everything
     /// AROUND this insert (watcher ownership of the child, lease completion in
     /// [`Self::ensure_session_resumable`], the binding row in [`Self::handle_fork`]).
+    /// `provenance` (D8, focused-ep1-r3): the provenance to PARK on the new
+    /// session record — [`Self::handle_fork`] passes the parent's parked value
+    /// (fork-chain inheritance); the conn-less attach-resume
+    /// ([`Self::ensure_session_resumable`]) passes `None` (never invented).
     #[allow(clippy::too_many_arguments)]
     async fn register_live_session(
         &self,
@@ -3723,6 +3789,7 @@ impl FreshCodexState {
         // Kata 1wxv Task 2: the thread's durable history mode (the rollout-meta
         // parse the resume/fork callers perform post-RPC).
         history_mode: Option<HistoryMode>,
+        provenance: Option<crate::BindProvenance>,
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
@@ -3763,6 +3830,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                provenance,
             },
         );
         active_turn
@@ -3827,6 +3895,7 @@ impl FreshCodexState {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                provenance: None,
             },
         );
     }
@@ -5668,6 +5737,7 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                provenance: None,
             },
         );
         state.broadcast_tx.subscribe()
@@ -5736,6 +5806,7 @@ pub(crate) mod tests {
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
+                provenance: None,
             },
         );
         state.broadcast_tx.subscribe()
@@ -7988,6 +8059,263 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// Focused-ep1-r3 (codex sibling of the opencode parking finding — the
+    /// cross-provider audit's named gap): the freshcodex fork child row was
+    /// written with provenance `None`, so it started UNATTRIBUTED — and the D8
+    /// recovery judgment (`d8_parent_relative_keep`) drops unattributed rows
+    /// even when the forked child pane is genuinely open in a surviving client.
+    /// Fix shape mirrors opencode: the connection's provenance is PARKED on the
+    /// session at create (`finish_create`), and the fork inherits the parent's
+    /// parked value into both the child session record and the child ledger row.
+    #[tokio::test]
+    async fn fork_child_binding_carries_the_parent_connections_parked_provenance() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-parked-prov" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let parent_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-p"),
+                Some("device-p"),
+                Some("tab-p"),
+            )),
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-prov", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-parked-prov"));
+
+        // The parent parked the create's provenance at finish_create…
+        // …and the child session record parks the inherited value (a
+        // fork-of-fork stays attributed: connection > session > child rows).
+        {
+            let guard = st.sessions.lock().await;
+            let parent = guard.get(&parent_id).expect("the parent session stays");
+            let child = guard
+                .get("child-parked-prov")
+                .expect("the child session is registered");
+            for (who, s) in [("parent", parent), ("child", child)] {
+                let p = s
+                    .provenance
+                    .clone()
+                    .unwrap_or_else(|| panic!("the {who} session parks the provenance"));
+                assert_eq!(p.client_instance_id.as_deref(), Some("client-p"), "{who}");
+                assert_eq!(p.device_id.as_deref(), Some("device-p"), "{who}");
+                assert_eq!(p.tab_key.as_deref(), Some("device-p:tab-p"), "{who}");
+            }
+        }
+
+        // …and the child's ledger ROW asserts the same attribution (an
+        // unattributed row here is what the D8 judgment was dropping).
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let row = bindings
+                .iter()
+                .find(|b| b.session_id == "child-parked-prov")
+                .expect("a binding row for the child");
+            assert_eq!(
+                row.client_instance_id.as_deref(),
+                Some("client-p"),
+                "the child row inherits the parent's parked provenance, not None"
+            );
+            assert_eq!(row.device_id.as_deref(), Some("device-p"));
+            assert_eq!(row.tab_key.as_deref(), Some("device-p:tab-p"));
+        }
+    }
+
+    /// The resumed-same-thread crash-recovery door (mirror of
+    /// [`handle_fork...respawns_the_parent_sidecar_then_forks`]'s machinery):
+    /// `ensure_session_alive`'s in-place rebuild must CARRY the crashed
+    /// session's parked provenance onto the rebuilt record (the conn-less
+    /// refresh's keep-when-None ledger merge is its row-level twin — the
+    /// parked copy is the same identity, never invented), so a fork AFTER the
+    /// transparent respawn still writes an attributed child row.
+    #[tokio::test]
+    async fn fork_after_crash_recovery_keeps_the_create_provenance_chain() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let parent_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-crash"),
+                Some("device-crash"),
+                Some("tab-crash"),
+            )),
+        )
+        .await;
+        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+
+        // The respawned parent (spawn 2: resume echoes the requested id) and the
+        // child's own sidecar (spawn 3) share this config.
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-crash-prov" } } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-crash-prov", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-after-crash-prov"));
+
+        {
+            let guard = st.sessions.lock().await;
+            let parent = guard
+                .get(&parent_id)
+                .expect("the respawned parent stays registered under the SAME id");
+            let p = parent
+                .provenance
+                .clone()
+                .expect("the in-place recovery rebuild CARRIES the parked provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-crash"));
+            assert_eq!(p.device_id.as_deref(), Some("device-crash"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-crash:tab-crash"));
+
+            let child = guard
+                .get("child-after-crash-prov")
+                .expect("the fork child is registered");
+            let cp = child
+                .provenance
+                .clone()
+                .expect("the fork child parks the respawned parent's provenance");
+            assert_eq!(cp.client_instance_id.as_deref(), Some("client-crash"));
+        }
+
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-crash-prov")
+            .expect("a binding row for the post-crash fork child");
+        assert_eq!(row.client_instance_id.as_deref(), Some("client-crash"));
+        assert_eq!(row.device_id.as_deref(), Some("device-crash"));
+        assert_eq!(row.tab_key.as_deref(), Some("device-crash:tab-crash"));
+    }
+
+    /// The mint-new crash-recovery door (the `Respawned { new_session_id }`
+    /// route): `respawn_as_new_thread_after_crash` re-keys the session record
+    /// under the FRESH thread id; the parked provenance must ride across that
+    /// re-key (the mint-new row's `supersedes` inheritance is its row-level
+    /// twin), so the fork of the respawned parent is still attributed.
+    #[tokio::test]
+    async fn fork_after_a_mint_new_respawn_keeps_the_create_provenance_chain() {
+        let _guard = ENV_LOCK.lock().await;
+        // Spawn 1: the parent, crashing right after `thread/start`.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-prov",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let old_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-mint"),
+                Some("device-mint"),
+                Some("tab-mint"),
+            )),
+        )
+        .await;
+        assert_eq!(old_id, "parent-old-prov", "fixture sanity: the clicked id");
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+
+        // The durable rollout is confirmed gone — ensure-alive mints a fresh
+        // thread (spawn 2: `thread/start` -> "parent-new-prov"); the fork child's
+        // sidecar is spawn 3.
+        st.mark_thread_dead(&old_id).await;
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-prov",
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-mint-prov" } } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint-prov", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(
+            frames[0]["parentSessionId"],
+            json!("parent-new-prov"),
+            "resolved-parent keying is unchanged: {frames:?}"
+        );
+        assert_eq!(frames[0]["sessionId"], json!("child-after-mint-prov"));
+
+        {
+            let guard = st.sessions.lock().await;
+            let parent = guard
+                .get("parent-new-prov")
+                .expect("the minted parent is registered under the NEW id");
+            let p = parent
+                .provenance
+                .clone()
+                .expect("the mint-new rebuild CARRIES the parked provenance across the id move");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-mint"));
+            assert_eq!(p.device_id.as_deref(), Some("device-mint"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-mint:tab-mint"));
+
+            let child = guard
+                .get("child-after-mint-prov")
+                .expect("the fork child is registered");
+            let cp = child
+                .provenance
+                .clone()
+                .expect("the mint-new fork child parks the parent's provenance");
+            assert_eq!(cp.client_instance_id.as_deref(), Some("client-mint"));
+        }
+
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-mint-prov")
+            .expect("a binding row for the mint-new fork child");
+        assert_eq!(row.client_instance_id.as_deref(), Some("client-mint"));
+        assert_eq!(row.device_id.as_deref(), Some("device-mint"));
+        assert_eq!(row.tab_key.as_deref(), Some("device-mint:tab-mint"));
     }
 
     #[tokio::test]
@@ -11059,6 +11387,16 @@ pub(crate) mod tests {
         st: &FreshCodexState,
         rx: &mut tokio::sync::broadcast::Receiver<String>,
     ) -> String {
+        create_real_fake_session_with_provenance(st, rx, None).await
+    }
+
+    /// [`create_real_fake_session`] with the D8 connection provenance the WS
+    /// dispatch would stamp on a connection-scoped create (the parking tests).
+    async fn create_real_fake_session_with_provenance(
+        st: &FreshCodexState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        provenance: Option<crate::BindProvenance>,
+    ) -> String {
         st.handle_create(
             FreshAgentCreate {
                 request_id: "req-1".to_string(),
@@ -11076,7 +11414,7 @@ pub(crate) mod tests {
                 plugins: None,
                 tab_id: None,
             },
-            None,
+            provenance,
         )
         .await;
 
