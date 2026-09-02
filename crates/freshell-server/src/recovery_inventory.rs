@@ -345,7 +345,7 @@ pub fn build_inventory(
         dropped = d8_dropped,
         kept = ledger_only.len(),
         primary = primary_device_id.is_some(),
-        "D8 excluded stale/unattributed ledger rows");
+        "D8 offer judgment");
 
     // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3)
     substance.extend(ledger_only.iter().map(|e| {
