@@ -45,10 +45,10 @@ Two review rounds established that no aggregate recency heuristic can fix this: 
 
 `docs/plans/2026-07-26-recover-my-panes.md` D4 defined `ledgerOnly` as "all bound rows referenced by no device union and not live". D8 replaces the blanket rule with the stamped, parent-relative judgment above. Pinned tests encoding the old blanket rule are rewritten — listed by name in Task 3. Deliberate residuals stated honestly:
 
-- A row whose bind raced its own parent's next push (physically under ~one 5s cadence window within that client) keeps the benefit of the doubt even if it was closed or headless in that window; per-row open/closed provenance at sub-cadence resolution is not retained by anything, and the SIGKILL-within-5s e2e contract requires keep-side behavior there.
+- A row whose bind raced its own parent's next push (physically under ~one 5s cadence window within that client) keeps the benefit of the doubt even if it was closed or headless in that window; per-row open/closed provenance at sub-cadence resolution is not retained by anything, and the SIGKILL-within-5s e2e contract requires keep-side behavior there. Such a row stays Bound and is re-offer-eligible at future storage-loss boots (the user's decline is remembered by contentId dismissal); eliminating this corner requires a durable close-stamping contract across every close affordance — real future work, deliberately not part of this fix (the mis-classed rows were demonstrably open seconds before the loss — the polar opposite of the 30-day never-open tail this task kills).
 - A pane whose parent client left NO retained generation at all (its very first boot died before its WS-ready push reached the server, or its generations were count-cap-evicted after a reload storm) is not offered — undecidable from retained data.
-- Rows bound before this change ships (no stamped provenance) and rows from headless REST/MCP lanes are never offered via `ledgerOnly`: headless panes were never in a tab by definition, and anything pre-upgrade that WAS genuinely open is in snapshot unions anyway (referenced → restored through the layout path, not the bucket).
-- When a kept row's original tab itself vanished from all retained evidence, the row lands in the trailing tab — with exact content, replacing the junk tab the user reported.
+- Rows bound before this change ships (no stamped provenance) and rows from REST/MCP lanes (unattributable — no client connection exists at bind time) are never offered via `ledgerOnly`. Anything pre-upgrade that WAS genuinely open is in snapshot unions anyway (referenced → restored through the layout path, not the bucket). REST/MCP-orchestrated panes that DO appear in a user's browser become referenced by that browser's pushes within one cadence; the only unrecoverable case is the conjunction (REST/MCP create → server dies within ~5s before any push → AND a storage-loss boot) — documented, with the adopable-fix noted (a browser-side adopt/re-bind with connection context would stamp such rows through the replace rule).
+- When a kept row's original tab itself vanished from all retained evidence (the tab was created and lost inside the same sub-cadence window), the row lands in the trailing tab — with exact content, replacing the junk tab the user reported.
 - After this lands, a previously-dismissed offer's `contentId` changes once; a dismissed offer may re-appear at most once.
 
 ---
@@ -183,7 +183,7 @@ judgment); it is RED until the server-side filter lands."
 - Modify: `crates/freshell-ws/src/pane_ledger.rs` (`BindingRow` + `BindingWrite` gain the three optional stamp fields; BOTH upsert bodies merge keep-when-None for them), `crates/freshell-freshagent/src/*` + `crates/freshell-server/src/identity_sink.rs` (`FreshAgentBindingWrite`/`FreshAgentBindingUpsert` gain the fields; sink maps them)
 - Modify: fresh-agent creation threading — the WS `freshAgent.create` dispatch (`terminal.rs:976-1005` region) carries the connection identity down the provider `handle_create` chain so the identity-sink writes are stamped (`claude.rs`, `codex.rs`, `opencode_ws.rs` runtimes)
 - Modify: `crates/freshell-ws/src/terminal.rs` `handle_create` bind sites (:3394/:3713 — stamp from connection identity + message `tabId`), the auto-resume respawn site (:4379 — passes nothing; merge keeps it), the resolution hook (:1065 area + callers) — merge keeps prior stamps
-- Modify: `crates/freshell-freshagent/src/pane_identity_binder.rs` (REST lineage binder: stamps nothing — these rows stay unattributed by design; comment the why)
+- Modify: `crates/freshell-ws/src/pane_identity_binder.rs` (the binder helper: stamps nothing for REST lineage — these rows stay unattributed by design; comment the why) and the REST cold-start materialization call site in `crates/freshell-freshagent/src/lib.rs` (:2288-2309 region, agent-materialization binder — comment parity)
 - Test: `crates/freshell-ws/src/pane_ledger_tests.rs` (stamp/merge/compat matrix)
 
 **Interfaces:**
@@ -214,6 +214,11 @@ fn legacy_row_without_stamps_reads_back_with_none_provenance() {
 }
 ```
 
+Plus the LANE-REACH matrix (review-round-3 requirement — schema fields being optional means a lane could silently keep writing `None`, and Task 3 would then DROP that provider's genuinely-open sessions; every lane must prove its stamps arrive):
+- WS terminal.create lane: extend (or add beside) the trigger-test idiom in `crates/freshell-ws/tests/pane_ledger_triggers.rs` driving a create over a real test WS connection with stamped hello identity + `tabId`, then assert the row's `clientInstanceId`/`deviceId`/`tabKey`.
+- Fresh-agent sink lanes, one per provider family (`freshclaude`, `freshcodex`, `freshopencode`): in the freshagent crate's existing fake-sidecar test harness, drive a create and assert the sink upsert reaching `record_fresh_agent_binding` carries the stamps (follow each provider's existing identity-event test idiom).
+- Inheritance: conn-less re-bind via the shared resolution hook keeps prior stamps (already in the merge matrix above), and an adoption lane that KNOWS newer identity replaces them.
+
 Plus sink-level coverage near `crates/freshell-server/src/identity_sink.rs` tests if that file has a test module (follow its idiom): `FreshAgentBindingUpsert` carries the stamps into `record_fresh_agent_binding`.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
@@ -238,19 +243,23 @@ Check field naming against the row's existing camelCase serde convention (`clien
 
 - [ ] **Step 6: Run impacted-test verification**
 
+No fallback-chained commands here — each line must pass on its own so a failure can never be masked:
+
 ```bash
 cargo test -p freshell-ws
+cargo test -p freshell-freshagent
 cargo test -p freshell-server recovery_inventory
-npm run test:vitest -- run test/unit/server test/unit/client/store/tabRegistrySync.test.ts 2>/dev/null || npm run test:vitest -- run test/unit -t 'tabs.sync'
+npm run test:vitest -- run test/unit/client/store/tabRegistrySync.test.ts
+npm run test:vitest -- run test/unit/server
 npm run typecheck
 ```
 
-Expected: PASS (the inventory still ignores the new fields — Task 3 consumes them; typecheck covers the client wire types; the tabs.sync-focused vitest command targets the hello/sender paths — if no test file matches the `-t` filter, run `npm run test:vitest -- run test/unit/client/store test/unit/client/lib` instead and record which).
+Expected: PASS (the inventory still ignores the new fields — Task 3 consumes them; typecheck covers the client wire types; the two vitest commands cover the hello/sender and server-protocol paths — if a command matches no files, record that in the report and run the nearest broader file list instead).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add shared/ws-protocol.ts crates/freshell-protocol/src/client_messages.rs src/lib/ws-client.ts src/components/fresh-agent/FreshAgentView.tsx crates/freshell-ws/src/lib.rs crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-server/src/identity_sink.rs crates/freshell-freshagent/
+git add shared/ws-protocol.ts crates/freshell-protocol/src/client_messages.rs src/lib/ws-client.ts src/components/fresh-agent/FreshAgentView.tsx crates/freshell-ws/src/lib.rs crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/src/pane_identity_binder.rs crates/freshell-server/src/identity_sink.rs crates/freshell-freshagent/
 git commit -m "feat(ledger): stamp binding rows with client/tab provenance (D8 groundwork)
 
 BindingRow gains optional clientInstanceId/deviceId/tabKey, stamped by
@@ -429,7 +438,7 @@ Kill-window rows (SIGKILL-within-5s contract) keep unconditionally."
 - Modify: `src/lib/recovery/build-recovery-plan.ts` (per-tab plans record `sourceTabKey`; join logic at leaf-list time before `chain()`; kept `ledgerOnly` rows join their matching restored tab — geometry: rightmost leaf of the right-leaning chain, matching the plan's existing chain convention; unmatched/missing tabKey rows keep today's trailing-tab behavior)
 - Modify: `src/components/RecoveryOfferPanel.tsx` (render joined rows inside their tab's list section using the same `{tab.tabName}: {mode} — {cwd}` line format as device panes; trailing rows keep the flat `{mode} session — {cwd}` format)
 - Test: `test/unit/client/lib/recovery/build-recovery-plan.test.ts` (join matrix: matching-tab join; unmatched tabKey → trailing; missing tabKey → trailing; mixed cohort; `countRecoverablePanes` unchanged totals; the existing :85-95 trailing-tab case stays with a stamp-less fixture)
-- Test: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (extend the tail of `SIGKILL-within-5s-of-pane-creation` (:1799-1912): after the existing poll observes the OFFER path (not the auto-restore path — branch the tail on which evidence fired; when the offer is visible, accept it and assert the restored claude pane lands in the SAME restored tab as the shell pane — no trailing 'Recovered sessions' tab exists)
+- Test: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (extend the tail of `SIGKILL-within-5s-of-pane-creation` (:1799-1912) with an UNCONDITIONAL placement proof: the existing two-path poll's auto-restore branch is unreachable in this scenario — the init script clears storage before navigation, so the boot has no persisted layout to auto-restore FROM; the offer is the only reachable evidence. The tail therefore hard-expects the offer visible (`getByTestId('recovery-offer-panel')`), clicks `recovery-accept`, and asserts (a) the restored claude pane lands in the SAME restored tab as the shell pane — walk `state.panes.layouts` for the restored tab(s) and compare tab membership via the harness — and (b) NO tab titled 'Recovered sessions' exists. If the offer ever does NOT appear here, that is a regression in kill-window keep behavior — fail loud, never skip the tail)
 
 **Interfaces:**
 - Consumes: Task 3's `ledgerOnly[*].tabKey`; `RecoveryTab.tabKey` already in types (:28); `RecoveryOfferPanel.accept` loop unchanged (one dispatch per tab plan; `restoreLayout` no-ops on pre-existing layouts — the join MUST happen at plan time).
