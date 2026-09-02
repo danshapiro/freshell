@@ -31,9 +31,19 @@
  * file-local `waitForRecoverable` probe-poll guard (R2a) so WS-teardown lag
  * can never starve a later boot's required offer.
  *
+ * Scenario 5 (stale never-open ledger row pin, D8): a freshclaude pane is
+ * created, proven snapshot-open, then closed via the PLAIN pane-X — leaving
+ * its Bound ledger row unreferenced and never retired. After a server
+ * restart the recovery inventory's ledgerOnly bucket (and the offer built
+ * from it) must NOT offer that row. RED by design until the server-side
+ * parent-relative judgment lands
+ * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3).
+ *
  * Fixture shapes (fake CLI, config seeding, shell-picker choreography) are
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
- * per-spec-ownership convention.
+ * per-spec-ownership convention. The freshclaude helpers
+ * (findFreshAgentLeaf, createFreshclaudePane) are COPIED from
+ * hidden-pane-rebind-rust.spec.ts under the same convention.
  *
  * Rust-only: drives `GET /api/recovery/inventory` (no legacy equivalent) and
  * owns a RustServer directly (ephemeral loopback port — NEVER 3001/3002).
@@ -72,7 +82,13 @@ function seedConfig() {
       JSON.stringify(
         {
           version: 1,
-          settings: { codingCli: { enabledProviders: ['claude', 'codex', 'opencode'] } },
+          settings: {
+            codingCli: { enabledProviders: ['claude', 'codex', 'opencode'] },
+            // freshAgent.enabled gates the WS freshAgent.create dispatch
+            // (scenario 5's freshclaude pane). Inert for scenarios 1-4 —
+            // nothing in them issues a fresh-agent create.
+            freshAgent: { enabled: true },
+          },
         },
         null,
         2,
@@ -166,6 +182,54 @@ async function createBrowserPane(page: Page, url: string): Promise<void> {
   await urlInput.press('Enter')
   const iframe = page.locator('iframe[title="Browser content"]')
   await iframe.waitFor({ state: 'attached', timeout: 10_000 })
+}
+
+/** Donor: hidden-pane-rebind-rust.spec.ts:118 — layout tree walker. */
+function findFreshAgentLeaf(node: any): any {
+  if (!node) return null
+  if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') return node
+  if (node.type === 'split') {
+    for (const child of node.children ?? []) {
+      const found = findFreshAgentLeaf(child)
+      if (found) return found
+    }
+  }
+  return null
+}
+
+/**
+ * Donor: hidden-pane-rebind-rust.spec.ts:153 (fixture: fake-claude-sidecar.mjs
+ * via the production env seam FRESHELL_CLAUDE_SIDECAR).
+ */
+async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
+  // setAvailableClis is client-only AND gets overwritten by the app
+  // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
+  // helper only after harness.waitForConnection(), which is what makes the
+  // dispatch land AFTER those overwrites (donor ordering:
+  // freshopencode-restart-recovery.spec.ts:100-115). Keep it that way.
+  await page.evaluate(() => {
+    ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'connection/setAvailableClis',
+      payload: { claude: true, codex: false },
+    })
+  })
+  const picker = await openPanePicker(page)
+  await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
+  // /api/files/candidate-dirs returns [] on a clean isolated HOME (no $HOME
+  // fallback, crates/freshell-server/src/files.rs:15-26), so a "first
+  // option" may not exist — TYPE the cwd and press Enter instead (donor:
+  // freshopencode-restart-recovery.spec.ts:117-124).
+  const directoryInput = page.getByLabel(/^Starting directory for Freshclaude$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
+  await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
+    timeout: 15_000,
+  })
+  // NOTE: the thread-snapshot fetch can 503 on a healthy fresh pane (no
+  // claude adapter in the Rust snapshot router) and surface a history-load
+  // banner. Assert pane state via the harness (Redux), tolerate the banner —
+  // never assert error-free UI chrome for freshclaude.
 }
 
 /**
@@ -309,7 +373,15 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', 'fake-claude-cli.mjs')
     const seed = seedConfig()
     server = new RustServer({
-      env: { CLAUDE_CMD: fakeClaude, FAKE_CLAUDE_ARGV_LOG: argLog },
+      env: {
+        CLAUDE_CMD: fakeClaude,
+        FAKE_CLAUDE_ARGV_LOG: argLog,
+        // Scenario 5's freshclaude lane: the fake SDK-bridge sidecar via the
+        // production env seam (read only at freshclaude sidecar spawn — inert
+        // for scenarios 1-4). restart() re-merges this env on every boot.
+        FRESHELL_CLAUDE_SIDECAR: path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs'),
+        FAKE_CLAUDE_SIDECAR_LOG: path.join(sharedRoot, 'claude-sidecar-requests.jsonl'),
+      },
       setupHome: async (homeDir: string) => {
         capturedHome = homeDir
         await seed(homeDir)
@@ -687,5 +759,190 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await expect(panel).toHaveCount(0)
 
     await ctxPhone.close()
+  })
+
+  /**
+   * D8 contract pin: a session that was closed before its client's newest
+   * retained snapshot evidence (a stale NEVER-OPEN-at-the-evidence-horizon
+   * row) is never offered via the inventory's ledgerOnly bucket. RED by
+   * design until the server-side parent-relative judgment lands
+   * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3) — today's
+   * blanket bucket (Bound + unreferenced + not live) keeps the row and the
+   * offer would render it, to be dumped into a trailing "Recovered sessions"
+   * tab on accept.
+   *
+   * Producer recipe (validator load-bearing-validator-v1-recipe.md): a
+   * freshclaude pane split beside the boot shell pane, closed via the PLAIN
+   * pane-X, sends freshAgent.kill (never terminal.kill), and the fresh-agent
+   * identity sink has NO retire method — the row stays Bound, and the
+   * post-close push leaves it unreferenced by the newest-per-client union.
+   * MUST remain LAST in this serial describe: it wipes the generation store
+   * to re-base the evidence, which no earlier scenario may observe.
+   */
+  test('stale never-open ledger rows are never offered', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000) // 15s timing gate + <=120s generation poll + restart + two boots
+
+    // 1. Re-base the evidence base: earlier scenarios' clients hold frozen
+    //    generations whose clocks would co-survive selection with this
+    //    scenario's junk row's parent. No client is connected at this point
+    //    in the serial suite, so wiping the generation store is safe; this
+    //    scenario's own context rebuilds the evidence (and keeps the offer
+    //    recoverable via the surviving shell tab).
+    await fs.rm(path.join(capturedHome, '.freshell', 'tabs-snapshots'), { recursive: true, force: true })
+
+    // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it
+    //    (NEVER close a tab's only pane — that collapses to closeTab, whose
+    //    closed-tab record would re-reference the row forever).
+    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageA = await ctxA.newPage()
+    const harnessA = await connect(pageA, info)
+    await selectShellIfPickerShowing(pageA)
+    await expect(pageA.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    const tabAId = (await harnessA.getActiveTabId())!
+
+    // 3. The marker cwd is the offer-list discriminator (the panel renders
+    //    ledgerOnly rows as "{mode} session — {cwd}", never the sessionId):
+    //    create the freshclaude pane with a unique real marker dir as cwd.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'junk-freshclaude-'))
+    await createFreshclaudePane(pageA, harnessA, markerDir)
+
+    // 4. Acquire the DURABLE session id via the harness poll
+    //    (sessionRef.sessionId ?? resumeSessionId, canonical-UUID shape —
+    //    the argv-log idiom does not serve fresh-agent panes: the sidecar
+    //    path never spawns the CLI).
+    let junkSessionId = ''
+    await expect
+      .poll(
+        async () => {
+          const c = findFreshAgentLeaf(await harnessA.getPaneLayout(tabAId))?.content
+          junkSessionId = c?.sessionRef?.sessionId ?? c?.resumeSessionId ?? ''
+          return junkSessionId
+        },
+        { timeout: 30_000 },
+      )
+      .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+
+    // 5. Disk-wait the binding row and read bindMs (the row JSON's createdAt,
+    //    serde camelCase).
+    let bindMs = 0
+    await expect(async () => {
+      const raw = await fs
+        .readFile(
+          path.join(capturedHome, '.freshell', 'pane-ledger', 'bindings', 'claude', `${junkSessionId}.json`),
+          'utf8',
+        )
+        .catch(() => '')
+      expect(raw, 'the freshclaude binding row must land on disk').not.toBe('')
+      const row = JSON.parse(raw) as { createdAt?: unknown }
+      expect(typeof row.createdAt, 'row JSON createdAt (serde camelCase)').toBe('number')
+      bindMs = row.createdAt as number
+    }).toPass({ timeout: 15_000 })
+
+    // 6. Prove it WAS snapshot-open before it becomes the stale row (pushes
+    //    fire on ready + every 5s).
+    await waitForSnapshotContaining([junkSessionId])
+
+    // 7. Timing gate: close no earlier than bindMs + 15_000. The final
+    //    post-close push lands within one 5s tick, so the parent's newest
+    //    retained generation is server-stamped strictly after bindMs + 14_000
+    //    — well past the judgment grace, so with the D8 filter the row is
+    //    dropped; pre-fix the blanket bucket keeps it (the pinned red).
+    const gateWaitMs = bindMs + 15_000 - Date.now()
+    if (gateWaitMs > 0) await pageA.waitForTimeout(gateWaitMs)
+
+    // 8. Close via the PLAIN pane-X — NEVER shift+close and NEVER the
+    //    BackgroundSessions Stop button (terminal.kill would retire the row
+    //    and vacate the pin). The shell sibling keeps the tab alive, so
+    //    closePane (not closeTab) fires and no closed-tab record is written.
+    await pageA
+      .locator("[data-pane-id][data-context='pane']:has([data-context='fresh-agent']) button[title='Close pane']")
+      .click()
+
+    // 9. Evidence-advance: the newest generation of EVERY client must
+    //    postdate bindMs + 14_000 AND no longer contain the session id — the
+    //    post-close push's on-disk proof, and the post-fix "parent's newest"
+    //    judgment input. (After step 1's wipe only context A's client exists;
+    //    the every-client form protects the assertion if the wipe is ever
+    //    skipped.)
+    const snapshotsDir = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    await expect(async () => {
+      const newestByClient = new Map<string, { revision: number; capturedAt: number; raw: string }>()
+      const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
+      for (const device of devices) {
+        const deviceDir = path.join(snapshotsDir, device)
+        const files = (await fs.readdir(deviceDir).catch(() => [] as string[])).filter((f) => f.endsWith('.json'))
+        for (const f of files) {
+          const raw = await fs.readFile(path.join(deviceDir, f), 'utf8').catch(() => '')
+          let doc: any = null
+          try {
+            doc = JSON.parse(raw)
+          } catch {
+            continue
+          }
+          const client = doc?.clientInstanceId
+          if (typeof client !== 'string' || !client) continue
+          const revision = Number(doc?.snapshotRevision ?? 0)
+          const capturedAt = Number(doc?.capturedAt ?? 0)
+          const cur = newestByClient.get(client)
+          if (!cur || revision > cur.revision || (revision === cur.revision && capturedAt > cur.capturedAt)) {
+            newestByClient.set(client, { revision, capturedAt, raw })
+          }
+        }
+      }
+      expect(newestByClient.size, 'at least one client generation must exist after context A booted').toBeGreaterThan(0)
+      for (const [client, newest] of newestByClient) {
+        expect(
+          newest.capturedAt,
+          `client ${client}'s newest generation must postdate the close gate (bindMs + 14s)`,
+        ).toBeGreaterThan(bindMs + 14_000)
+        expect(
+          newest.raw.includes(junkSessionId),
+          `client ${client}'s newest generation must no longer contain the closed session`,
+        ).toBe(false)
+      }
+    }).toPass({ timeout: 120_000 })
+
+    // 10. Close context A, then the file's close→restart discipline parity
+    //     (recoverable guard, restart, reassign info).
+    await ctxA.close()
+    await waitForRecoverable(info)
+    info = await server.restart()
+
+    // 11. RED/GREEN inventory assertion via a STANDALONE probe BEFORE any
+    //     page is opened — never page.request (its handle dies with the
+    //     context) and never a navigated page (a booted page would register
+    //     as a tabs.sync client and could push inside the grace window).
+    //     Membership-absence, NOT emptiness: other legit rows may exist.
+    const req = await request.newContext({
+      baseURL: info.baseUrl,
+      extraHTTPHeaders: { 'x-auth-token': info.token },
+    })
+    try {
+      const res = await req.get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
+      expect(res.ok(), `inventory probe must succeed (status ${res.status()})`).toBe(true)
+      const body = (await res.json()) as { ledgerOnly?: Array<{ sessionId?: unknown }> }
+      expect(
+        (body.ledgerOnly ?? []).every((e) => e.sessionId !== junkSessionId),
+        `stale never-open ledger row ${junkSessionId} must NOT be present in the inventory's `
+          + `ledgerOnly bucket (got ${JSON.stringify(body.ledgerOnly)})`,
+      ).toBe(true)
+    } finally {
+      await req.dispose()
+    }
+
+    // 12. Offer assertion: the panel renders ledgerOnly rows as
+    //     "{mode} session — {cwd}", so the marker cwd discriminates. The
+    //     re-based union still holds the surviving shell tab, so
+    //     recoverable stays true and the offer is REQUIRED.
+    const { ctx: ctxB, page: pageB } = await openFreshContextWithOffer(browser, 'junk-exclusion')
+    const panel = pageB.getByTestId('recovery-offer-panel')
+    await expect(panel.locator('ul li', { hasText: 'junk-freshclaude-' })).toHaveCount(0)
+
+    // Do NOT click accept on the junk account alone: with the bucket empty of
+    // this row there is no junk tab to form (Task 4 separately pins that
+    // surviving rows join their original tab and that the trailing tab only
+    // appears for rows whose tab vanished).
+    await ctxB.close()
   })
 })
