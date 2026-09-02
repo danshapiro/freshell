@@ -440,3 +440,122 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
     errorSpy.mockRestore()
   })
 })
+
+describe('App ready buildId → one-shot server-build reload', () => {
+  let originalLocation: Location
+  let reloadCalls: number
+  beforeEach(() => {
+    cleanup()
+    vi.resetAllMocks()
+    stubAudio()
+    wsMocks.onReconnect.mockReturnValue(() => {})
+    wsMocks.onDisconnect.mockReturnValue(() => {})
+    wsMocks.isReady = false
+    wsMocks.serverInstanceId = undefined
+    terminalRestoreMocks.addTerminalRestoreRequestId.mockClear()
+    terminalRestoreMocks.addTerminalFreshRecoveryRequestId.mockClear()
+    messageHandler = null
+
+    wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
+      messageHandler = cb
+      return () => { messageHandler = null }
+    })
+
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    getTerminalDirectoryPage.mockReset()
+    getTerminalDirectoryPage.mockResolvedValue({ items: [], revision: 1, nextCursor: null })
+    searchTerminalView.mockReset()
+    searchTerminalView.mockResolvedValue({ matches: [] })
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      return Promise.resolve({})
+    })
+
+    sessionStorage.clear()
+    reloadCalls = 0
+    // jsdom 25's Location owns `reload` non-configurably — defineProperty on
+    // window.location itself throws. Repo precedent (import-retry.test.ts):
+    // window-level replacement with save/restore. The reload stub asserts
+    // the sentinel is armed AT CALL TIME with the attempted server build id
+    // (the ordering proof lives here too, against real jsdom sessionStorage)
+    // and counts invocations.
+    originalLocation = window.location
+    Object.defineProperty(window, 'location', {
+      value: {
+        ...window.location,
+        reload: () => {
+          expect(
+            sessionStorage.getItem('freshell.server-build-reload'),
+            'sentinel must be armed BEFORE reload fires',
+          ).toBe('b'.repeat(40))
+          reloadCalls++
+        },
+      },
+      writable: true,
+      configurable: true,
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    Object.defineProperty(window, 'location', {
+      value: originalLocation,
+      writable: true,
+      configurable: true,
+    })
+    sessionStorage.clear()
+  })
+
+  it('mismatched ready buildId triggers exactly one reload, and the sentinel (real sessionStorage, persisting across the simulated reboot) suppresses the next mismatched ready', async () => {
+    vi.stubGlobal('__FRESHELL_BUILD_ID__', 'a'.repeat(40))
+    const store = createStore()
+    await renderApp(store)
+
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
+    expect(reloadCalls).toBe(1)
+    expect(sessionStorage.getItem('freshell.server-build-reload')).toBe('b'.repeat(40))
+
+    // The reload lands: the page reboots in the SAME tab (real jsdom
+    // sessionStorage persists), the server is still stale, and the next
+    // ready must NOT reload again.
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'b'.repeat(40) })
+    expect(reloadCalls).toBe(1)
+  })
+
+  it('a matching ready clears the sentinel and re-arms the guard', async () => {
+    vi.stubGlobal('__FRESHELL_BUILD_ID__', 'a'.repeat(40))
+    // A sentinel recorded by an earlier mismatched ready (the attempted
+    // server build id), as the production code would have persisted it.
+    sessionStorage.setItem('freshell.server-build-reload', 'b'.repeat(40))
+    const store = createStore()
+    await renderApp(store)
+
+    // Server caught up to the client build (the post-reload convergence
+    // case): match → sentinel cleared, no reload.
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'a'.repeat(40) })
+    expect(reloadCalls).toBe(0)
+    expect(sessionStorage.getItem('freshell.server-build-reload')).toBeNull()
+  })
+
+  it('never reloads on missing or "unknown" buildIds', async () => {
+    vi.stubGlobal('__FRESHELL_BUILD_ID__', 'a'.repeat(40))
+    const store = createStore()
+    await renderApp(store)
+
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1' })
+    sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1', buildId: 'unknown' })
+    expect(reloadCalls).toBe(0)
+    expect(sessionStorage.getItem('freshell.server-build-reload')).toBeNull()
+  })
+})

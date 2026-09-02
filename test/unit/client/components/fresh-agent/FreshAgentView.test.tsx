@@ -1260,7 +1260,7 @@ describe('FreshAgentView', () => {
     expect(assistantSession.turns[0]).toMatchObject({
       role: 'assistant',
       model: 'codex-5',
-      summary: 'Final answer',
+      summary: '',
     })
 
     deliverThroughAppAndMountedView({

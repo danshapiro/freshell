@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 31 discriminants).
+//! Client → server messages (`ClientMessage`, 34 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -81,11 +81,17 @@ pub enum ClientMessage {
     FreshAgentFork(FreshAgentFork),
     #[serde(rename = "pane.reconcile.request")]
     PaneReconcileRequest(PaneReconcileRequest),
+    #[serde(rename = "hoststats.subscribe")]
+    HostStatsSubscribe,
+    #[serde(rename = "hoststats.unsubscribe")]
+    HostStatsUnsubscribe,
+    #[serde(rename = "hoststats.refresh")]
+    HostStatsRefresh(HostStatsRefresh),
 }
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 34] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -103,6 +109,9 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 31] = [
     "freshAgent.question.respond",
     "freshAgent.send",
     "hello",
+    "hoststats.refresh",
+    "hoststats.subscribe",
+    "hoststats.unsubscribe",
     "opencode.activity.list",
     "pane.reconcile.request",
     "ping",
@@ -681,4 +690,14 @@ pub struct FreshAgentFork {
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+// --- hoststats.* -----------------------------------------------------------
+
+/// `HostStatsRefreshSchema` (`shared/ws-protocol.ts`) — client-minted
+/// `requestId`, echoed verbatim by `hoststats.refresh.response`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostStatsRefresh {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
 }

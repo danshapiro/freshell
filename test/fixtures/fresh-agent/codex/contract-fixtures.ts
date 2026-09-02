@@ -8,6 +8,7 @@ export const codexContractTurn = {
   source: 'durable',
   role: 'assistant',
   summary: 'Codex finished a review pass',
+  summaryKind: 'echo',
   items: [
     { id: 'turn-1:item-0', kind: 'text', text: 'Codex finished a review pass.' },
     {

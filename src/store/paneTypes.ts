@@ -159,6 +159,15 @@ export type PickerPaneContent = {
   kind: 'picker'
 }
 
+/**
+ * Host stats pane content — the host pressure dashboard (CPU/memory/PSI/IO).
+ * Stateless: every value lives in the connection-level hostStats slice, so a
+ * host-stats leaf carries no fields beyond its kind.
+ */
+export type HostStatsPaneContent = {
+  kind: 'host-stats'
+}
+
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'create-failed'
 
@@ -250,7 +259,7 @@ export type ExtensionPaneContent = {
  * Union type for all pane content types.
  */
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
-  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent
+  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent | HostStatsPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -279,7 +288,7 @@ export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' 
 export type ExtensionPaneInput = ExtensionPaneContent
 
 export type LivePaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
-  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput
+  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput | HostStatsPaneContent
 
 export type LegacyPaneContentInput = Record<string, unknown>
 

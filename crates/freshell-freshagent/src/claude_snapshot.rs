@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
+use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL};
+
 /// Ordered candidate store roots. The real CLI resolves its store as
 /// `CLAUDE_CONFIG_DIR ?? $HOME/.claude` and IGNORES `CLAUDE_HOME` (verified against
 /// cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's legacy knob
@@ -493,6 +495,7 @@ fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
             turn.insert("model".into(), json!(model));
         }
         turn.insert("summary".into(), json!(summary));
+        turn.insert("summaryKind".into(), json!(SUMMARY_KIND_ECHO));
         turn.insert("items".into(), json!(items));
         turns.push(Value::Object(turn));
     }
@@ -513,11 +516,13 @@ fn tool_result_text(block: &Value) -> String {
 }
 
 /// Turn summary: first non-empty `text` item's text, falling back to the first
-/// non-empty `thinking` item's text (char-safe truncate), else a tool label --
-/// `FreshAgentTurnSchema.summary` is REQUIRED. Text is preferred over thinking
-/// so an assistant turn's summary is its visible answer, not its reasoning
-/// preamble (golden fixture turn 1: items `[thinking "pondering", text "first
-/// answer"]` must summarize to `"first answer"`).
+/// non-empty `thinking` item's text (char-safe truncate to the shared
+/// [`SUMMARY_MAX_CHARS`] policy), else a tool label -- `FreshAgentTurnSchema.summary`
+/// is REQUIRED. Text is preferred over thinking so an assistant turn's summary
+/// is its visible answer, not its reasoning preamble (golden fixture turn 1:
+/// items `[thinking "pondering", text "first answer"]` must summarize to
+/// `"first answer"`). Every claude summary is a mechanical projection of the
+/// turn's own items, so every claude turn tags `summaryKind: "echo"`.
 fn summarize(items: &[Value]) -> String {
     let first_text_of = |kind: &str| -> Option<String> {
         items.iter().find_map(|item| {
@@ -528,7 +533,7 @@ fn summarize(items: &[Value]) -> String {
             if trimmed.is_empty() {
                 None
             } else {
-                Some(trimmed.chars().take(120).collect())
+                Some(truncate_summary(trimmed))
             }
         })
     };
@@ -539,10 +544,24 @@ fn summarize(items: &[Value]) -> String {
         match item.get("kind").and_then(Value::as_str) {
             Some("tool_use") => {
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
-                    return name.to_string();
+                    // Tool names count as summaries too: the shared 140-char
+                    // policy MUST apply here (one Rust-side truncation policy
+                    // for every summary arm — fresh-eyes round 1, Finding 2).
+                    return truncate_summary(name);
                 }
             }
-            Some("tool_result") => return "[tool result]".to_string(),
+            Some("tool_result") => {
+                let is_error = item
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return if is_error {
+                    TOOL_ERROR_LABEL
+                } else {
+                    TOOL_RESULT_LABEL
+                }
+                .to_string();
+            }
             _ => {}
         }
     }
@@ -936,6 +955,64 @@ mod tests {
         let golden: serde_json::Value =
             serde_json::from_str(GOLDEN_SNAPSHOT).expect("golden parses");
         assert_eq!(built, golden);
+    }
+
+    #[test]
+    fn claude_turns_tag_every_summary_echo() {
+        let built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 0);
+        let turns = built["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 6);
+        for turn in turns {
+            assert_eq!(
+                turn["summaryKind"],
+                json!("echo"),
+                "turn {:?}",
+                turn["turnId"]
+            );
+        }
+    }
+
+    #[test]
+    fn summarize_unifies_truncation_and_tool_result_labels() {
+        let long_text = "x".repeat(200);
+        let items = vec![json!({ "kind": "text", "text": long_text })];
+        assert_eq!(summarize(&items).chars().count(), 140);
+
+        let ok = vec![json!({ "kind": "tool_result", "content": "out", "isError": false })];
+        assert_eq!(summarize(&ok), "Tool result");
+        let err = vec![json!({ "kind": "tool_result", "content": "boom", "isError": true })];
+        assert_eq!(summarize(&err), "Tool error");
+
+        // Tool names count as summaries: a >140-char tool_use name truncates
+        // through the same shared policy (fresh-eyes round 1, Finding 2 — this is
+        // the arm a `return name.to_string()` would bypass).
+        let long_name = "mcp__server__".to_string() + &"n".repeat(200);
+        let tools = vec![json!({ "kind": "tool_use", "name": long_name.clone() })];
+        let expected: String = long_name.chars().take(140).collect();
+        assert_eq!(summarize(&tools), expected);
+    }
+
+    #[test]
+    fn claude_zero_item_messages_are_dropped_before_summarizing() {
+        // Preservation pin (passes immediately — it guards an EXISTING invariant,
+        // see Step 2): `summarize`'s final fallback is the non-blank literal
+        // "[claude turn]", so the `if items.is_empty() { continue; }` guard ahead
+        // of it is the only thing keeping zero-item non-blank-summary turns
+        // unreachable (load-bearing validation LB-4). A message whose blocks are
+        // all unrecognized yields no items and must emit NO turn at all.
+        let transcript: &str = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"future_block","data":"x"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_ok","content":[{"type":"text","text":"real answer"}]}}"#,
+            "\n",
+        );
+        let built = build_claude_snapshot_json("freshclaude", "t", transcript, 0);
+        let turns = built["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["summary"], json!("real answer"));
+        assert!(turns
+            .iter()
+            .all(|turn| !turn["items"].as_array().unwrap().is_empty()));
     }
 
     /// Task 3 (presence-of-pending gate, `normalize.ts:226-232`): an EMPTY overlay must

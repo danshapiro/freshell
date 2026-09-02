@@ -1196,6 +1196,7 @@ fn every_supported_pane_kind_passes_semantic_generation_validation() {
                        "sandbox": "workspace-write", "style": "sans" } },
         { "paneId": "extension", "kind": "extension",
           "payload": { "extensionName": "demo", "props": {} } },
+        { "paneId": "hoststats", "kind": "host-stats", "payload": {} },
         { "paneId": "picker", "kind": "picker", "payload": {} }
     ]);
     put(dir.path(), "dev", "c1", 1, 1000, vec![record]);

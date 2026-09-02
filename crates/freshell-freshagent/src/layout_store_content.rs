@@ -58,6 +58,7 @@ pub fn derive_pane_title(content: &Value) -> String {
             .filter(|name| !name.is_empty())
             .unwrap_or("Extension")
             .to_string(),
+        "host-stats" => "Host Stats".to_string(),
         "terminal" => match obj.get("mode").and_then(Value::as_str) {
             Some("claude") => "Claude CLI".to_string(),
             Some("codex") => "Codex CLI".to_string(),

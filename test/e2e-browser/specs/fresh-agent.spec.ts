@@ -43,6 +43,69 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
   })
 }
 
+function toolTurn(turnId: string, calls: Array<[string, string]>) {
+  // calls: [callId, filePath] pairs; produces an assistant turn whose items are
+  // tool_use(toolUseId=callId, name:'Read', input:{file_path}) followed by its
+  // tool_result(content:'ok').
+  return {
+    id: turnId,
+    turnId,
+    role: 'assistant',
+    summary: '',
+    items: calls.flatMap(([callId, filePath]) => [
+      { id: `tool-${callId}`, kind: 'tool_use', toolUseId: callId, name: 'Read', input: { file_path: filePath } },
+      { id: `result-${callId}`, kind: 'tool_result', toolUseId: callId, content: 'ok', isError: false },
+    ]),
+  }
+}
+
+async function pointActiveFreshcodexLeafAtSession(page: any, sessionId: string) {
+  await expect.poll(async () => page.evaluate((sid) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    const state = harness?.getState()
+    const findFreshcodexLeaf = (node: any): any => {
+      if (!node) return null
+      if (
+        node.type === 'leaf'
+        && node.content?.kind === 'fresh-agent'
+        && node.content.sessionType === 'freshcodex'
+      ) {
+        return node
+      }
+      if (node.type === 'split') {
+        return findFreshcodexLeaf(node.children?.[0]) ?? findFreshcodexLeaf(node.children?.[1])
+      }
+      return null
+    }
+    let tabId: string | null = null
+    let leaf: any = null
+    for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
+      const candidateLeaf = findFreshcodexLeaf(layout)
+      if (candidateLeaf) {
+        tabId = candidateTabId
+        leaf = candidateLeaf
+      }
+    }
+    if (!tabId || !leaf) return false
+    harness?.dispatch({
+      type: 'panes/updatePaneContent',
+      payload: {
+        tabId,
+        paneId: leaf.id,
+        content: {
+          ...leaf.content,
+          sessionId: sid,
+          sessionRef: { provider: 'codex', sessionId: sid },
+          resumeSessionId: sid,
+          status: 'idle',
+          settingsDismissed: true,
+        },
+      },
+    })
+    return true
+  }, sessionId), { timeout: 10_000 }).toBe(true)
+}
+
 async function openFreshAgentSettings(page: any, sessionType: 'freshclaude' | 'freshcodex') {
   // The pane header identifies a fresh-agent pane by its agent-icon tooltip
   // ("<AgentLabel> (<sessionType> pane)", the preview's agent display name) —
@@ -1458,66 +1521,7 @@ test.describe('activity line collapse', () => {
         }),
       })
     })
-    await expect.poll(async () => page.evaluate((sid) => {
-      const harness = window.__FRESHELL_TEST_HARNESS__
-      const state = harness?.getState()
-      const findFreshcodexLeaf = (node: any): any => {
-        if (!node) return null
-        if (
-          node.type === 'leaf'
-          && node.content?.kind === 'fresh-agent'
-          && node.content.sessionType === 'freshcodex'
-        ) {
-          return node
-        }
-        if (node.type === 'split') {
-          return findFreshcodexLeaf(node.children?.[0]) ?? findFreshcodexLeaf(node.children?.[1])
-        }
-        return null
-      }
-      let tabId: string | null = null
-      let leaf: any = null
-      for (const [candidateTabId, layout] of Object.entries(state?.panes?.layouts ?? {})) {
-        const candidateLeaf = findFreshcodexLeaf(layout)
-        if (candidateLeaf) {
-          tabId = candidateTabId
-          leaf = candidateLeaf
-        }
-      }
-      if (!tabId || !leaf) return false
-      harness?.dispatch({
-        type: 'panes/updatePaneContent',
-        payload: {
-          tabId,
-          paneId: leaf.id,
-          content: {
-            ...leaf.content,
-            sessionId: sid,
-            sessionRef: { provider: 'codex', sessionId: sid },
-            resumeSessionId: sid,
-            status: 'idle',
-            settingsDismissed: true,
-          },
-        },
-      })
-      return true
-    }, sessionId), { timeout: 10_000 }).toBe(true)
-  }
-
-  function toolTurn(turnId: string, calls: Array<[string, string]>) {
-    // calls: [callId, filePath] pairs; produces an assistant turn whose items are
-    // tool_use(toolUseId=callId, name:'Read', input:{file_path}) followed by its
-    // tool_result(content:'ok').
-    return {
-      id: turnId,
-      turnId,
-      role: 'assistant',
-      summary: '',
-      items: calls.flatMap(([callId, filePath]) => [
-        { id: `tool-${callId}`, kind: 'tool_use', toolUseId: callId, name: 'Read', input: { file_path: filePath } },
-        { id: `result-${callId}`, kind: 'tool_result', toolUseId: callId, content: 'ok', isError: false },
-      ]),
-    }
+    await pointActiveFreshcodexLeafAtSession(page, sessionId)
   }
 
   test('collapses adjacent same-role tool turns into one accumulating activity line (3 + 2 = 5)', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
@@ -1557,5 +1561,141 @@ test.describe('activity line collapse', () => {
     await expect(strips).toHaveCount(2)
     await expect(strips.nth(0)).toContainText('1 tool used')
     await expect(strips.nth(1)).toContainText('1 tool used')
+  })
+})
+
+test.describe('foldable echo captions', () => {
+  async function seedFoldablePane(
+    page: Parameters<typeof openPanePicker>[0],
+    terminal: { waitForTerminal: () => Promise<void> },
+    harness: { receiveWsMessage: (message: unknown) => Promise<void> },
+    sessionId: string,
+    initialTurns: unknown[],
+  ) {
+    // Same freshcodex picker flow as 'activity line collapse' above, but the
+    // routed snapshot body is MUTABLE: pushSnapshot swaps the turn list, bumps
+    // the revision, and injects a freshAgent.session.changed frame so the pane
+    // re-fetches — the live-stream seam a real sidecar would drive.
+    let turns = initialTurns
+    let revision = 1
+    await terminal.waitForTerminal()
+    await enableClaudeAndCodex(page)
+
+    const picker = await openPanePicker(page)
+    await suppressFreshAgentNetworkForActivePane(page)
+    await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+    await page.getByRole('option').first().click()
+    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({ timeout: 10_000 })
+
+    await page.route(`**/api/fresh-agent/threads/freshcodex/codex/${sessionId}*`, async (route) => {
+      const lastTurnId = ((turns[turns.length - 1] as { id?: string } | undefined)?.id) ?? ''
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId: sessionId,
+          sessionId,
+          revision,
+          latestTurnId: lastTurnId,
+          status: 'idle',
+          summary: '',
+          capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+          settings: { model: 'gpt-5.4-flash', permissionMode: 'on-request', effort: 'high', plugins: [] },
+          tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+          pendingApprovals: [],
+          pendingQuestions: [],
+          worktrees: [],
+          diffs: [],
+          turns,
+        }),
+      })
+    })
+    await pointActiveFreshcodexLeafAtSession(page, sessionId)
+
+    return async function pushSnapshot(nextTurns: unknown[]) {
+      turns = nextTurns
+      revision += 1
+      await harness.receiveWsMessage({
+        type: 'freshAgent.event',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        event: { type: 'freshAgent.session.changed', sessionId },
+      })
+    }
+  }
+
+  test('an echo caption folds into the expanded activity line when a later turn supersedes it', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    // The one real fold path: the tail line's last member paints its gated echo
+    // caption in-stream; a LATER turn absorbs and supersedes it, so the caption
+    // leaves the stream and lives only in the line's expansion. EVERY turn is
+    // item-bearing — the zero-item/non-blank shape never occurs in Rust output
+    // (LB-4; fresh-eyes round 1, Finding 1 — do not reintroduce it here).
+    const captionTurn = {
+      id: 'turn-caption', turnId: 'turn-caption', role: 'assistant',
+      summary: 'Considering options', summaryKind: 'echo',
+      items: [{ id: 'tool-c2', kind: 'tool_use', toolUseId: 'c2', name: 'Read', input: { file_path: 'src/b.ts' } }],
+    }
+    const pushSnapshot = await seedFoldablePane(page, terminal, harness, 'fold-thread', [
+      toolTurn('turn-a', [['c1', 'src/a.ts']]),
+      captionTurn,
+    ])
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    // Painted at the tail: visible in-stream, one merged strip.
+    await expect(pane.getByTestId('fresh-agent-tail-caption')).toContainText('Considering options', { timeout: 10_000 })
+    await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(1)
+
+    await pushSnapshot([
+      toolTurn('turn-a', [['c1', 'src/a.ts']]),
+      captionTurn,
+      toolTurn('turn-c', [['c3', 'src/c.ts']]),
+    ])
+    // Superseded: the caption left the stream (blank-captioned turn-c paints
+    // nothing) and lives only in the line's expansion.
+    await expect(pane.getByText('Considering options')).toHaveCount(0, { timeout: 10_000 })
+    await expect(pane.getByTestId('fresh-agent-tail-caption')).toHaveCount(0)
+    await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(1)
+    await pane.getByRole('button', { name: 'Toggle activity details' }).click()
+    const caption = pane.getByTestId('fresh-agent-activity-caption')
+    await expect(caption).toHaveCount(1)
+    await expect(caption).toContainText('Considering options')
+    await expect(pane.getByText('src/b.ts')).toBeVisible()
+    // (Anchor order — caption row precedes the superseded turn's first item row —
+    // is pinned by the unit test's compareDocumentPosition assertion.)
+  })
+
+  test('authored prose never folds', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
+    // Real codex authored shape: a turn whose reasoning item carries a
+    // provider-written summary (`summaryKind: 'authored'`) plus a command item.
+    // The prose lives in the (showThinking-gated) reasoning row; what THIS
+    // spec pins is the fold boundary: the authored turn keeps its own line and
+    // contributes no caption — painted or stashed — anywhere.
+    const proseTurn = {
+      id: 'turn-prose', turnId: 'turn-prose', role: 'assistant',
+      summary: 'Pausing to plan the next step', summaryKind: 'authored',
+      items: [
+        { id: 'reason-p1', kind: 'reasoning', summary: ['Pausing to plan the next step'], content: ['Pausing to plan the next step'], text: 'Pausing to plan the next step' },
+        { id: 'cmd-p1', kind: 'command', command: 'ls src', status: 'completed' },
+      ],
+    }
+    const pushSnapshot = await seedFoldablePane(page, terminal, harness, 'fold-authored-thread', [
+      toolTurn('turn-a', [['c1', 'src/a.ts']]),
+      proseTurn,
+    ])
+    const pane = page.locator('[data-context="fresh-agent"]').last()
+    await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(2, { timeout: 10_000 })
+
+    await pushSnapshot([
+      toolTurn('turn-a', [['c1', 'src/a.ts']]),
+      proseTurn,
+      toolTurn('turn-b', [['c2', 'src/b.ts']]),
+    ])
+    await expect(pane.getByRole('region', { name: 'Activity strip' })).toHaveCount(2, { timeout: 10_000 })
+    await expect(pane.getByTestId('fresh-agent-tail-caption')).toHaveCount(0)
+    await pane.getByRole('button', { name: 'Toggle activity details' }).nth(0).click()
+    await pane.getByRole('button', { name: 'Toggle activity details' }).nth(1).click()
+    await expect(pane.getByTestId('fresh-agent-activity-caption')).toHaveCount(0)
   })
 })

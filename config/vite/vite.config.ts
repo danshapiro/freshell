@@ -3,11 +3,32 @@ import type { HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { execFileSync } from 'node:child_process'
 import { getNetworkHost } from '../../server/get-network-host.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
+
+/**
+ * The client's build identity: the git commit the bundle was built from,
+ * matching the server-side stamps (`crates/freshell-ws/build.rs` /
+ * `server/build-id.ts` + `scripts/bake-server-build-id.mjs`). `"unknown"`
+ * fallback — the client's compare rule ignores `"unknown"` on both sides.
+ */
+function computeClientBuildId(): string {
+  try {
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: projectRoot,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim()
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
 
 /**
  * Transport-level proxy failures that mean "the backend is down or restarting":
@@ -57,6 +78,7 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     define: {
       __PERF_LOGGING__: JSON.stringify(env.PERF_LOGGING || ''),
+      __FRESHELL_BUILD_ID__: JSON.stringify(computeClientBuildId()),
     },
     resolve: {
       alias: {

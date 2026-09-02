@@ -21,3 +21,13 @@ export function freshAgentSnapshotHasUserTurn(
 ): boolean {
   return snapshot?.turns?.some((turn) => normalizeTurnRole(turn.role) === 'user') ?? false
 }
+
+/**
+ * A turn summary is "authored" — provider-written prose that must remain a
+ * permanent transcript boundary — unless the server explicitly tagged it as an
+ * 'echo' of the turn's own items. A missing tag is conservative (authored):
+ * no absorb, no folding.
+ */
+export function turnSummaryIsAuthored(turn: Pick<FreshAgentTurn, 'summaryKind'>): boolean {
+  return turn.summaryKind !== 'echo'
+}

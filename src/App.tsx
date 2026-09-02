@@ -19,7 +19,7 @@ import {
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
-import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
+import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -33,6 +33,7 @@ import {
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
+import { checkServerBuildId } from '@/lib/server-build-check'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import { useThemeEffect } from '@/hooks/useTheme'
@@ -76,6 +77,8 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
+import { hostStatsReset, hostStatsSnapshotReceived, hostStatsSubscribedSet, resolveHostStatsRefresh, failHostStatsRefresh } from '@/store/hostStatsSlice'
+import { subscribeHostStats } from '@/lib/host-stats-ws'
 import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -160,6 +163,13 @@ const ReadyMessageSchema = z.object({
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
   bootId: z.string().min(1).optional(),
+  // The server's baked build identity (additive/optional — old servers omit
+  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
+  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
+  // there, never fail the WHOLE ready frame and silently disable restart
+  // detection. Only a non-string TYPE can fail the frame, which no real
+  // server emits (the helper additionally treats "unknown" as a no-op).
+  buildId: z.string().optional(),
   // Server capability ack (present iff our hello opted in). Deliberately a
   // loose record: an unexpected capabilities shape must never fail the WHOLE
   // ready frame and silently disable restart detection.
@@ -797,6 +807,8 @@ export default function App() {
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
         resetOpencodeActivityOverlay()
+        // The hoststats subscription died with the socket; keep last-known values.
+        dispatch(hostStatsReset())
         dispatch(setStatus('disconnected'))
       }) ?? null
 
@@ -1036,6 +1048,12 @@ export default function App() {
             if (!newBootId) {
               log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
             }
+            // Server-build mismatch detection: the server stamps the git
+            // commit it was built from (ready.buildId, additive/optional);
+            // we compare it against our own Vite-baked
+            // __FRESHELL_BUILD_ID__ and reload ONCE on a mismatch (sentinel
+            // loop-guard lives in src/lib/server-build-check.ts).
+            checkServerBuildId({ serverBuildId: ready.data.buildId })
             const bootIdRestart = !!previousBootId && previousBootId !== newBootId
             const instanceChanged = !!previousServerInstanceId
               && !!nextServerInstanceId
@@ -1114,6 +1132,15 @@ export default function App() {
           requestClaudeActivityList()
           requestAmplifierActivityList()
           requestOpencodeActivityList()
+          // hoststats: the old socket's subscription died; keep last live/manual
+          // values and resubscribe iff any Host Stats panes are mounted.
+          dispatch(hostStatsReset())
+          // `?.` mirrors the state.freshAgent?.sessions precedent: App-level
+          // folds run against deliberately partial stores in App unit tests.
+          if ((appStore.getState().hostStats?.mountedPanes ?? 0) > 0) {
+            subscribeHostStats()
+            dispatch(hostStatsSubscribedSet(true))
+          }
           lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
@@ -1446,6 +1473,31 @@ export default function App() {
         }
         if (msg.type === 'extension.server.stopped') {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
+        }
+
+        // hoststats.* frames are server-validated; the client trusts them and
+        // folds without runtime revalidation (shared/ws-protocol.ts header).
+        if (msg.type === 'hoststats.snapshot') {
+          const snapshot = msg as HostStatsSnapshotMessage
+          dispatch(hostStatsSnapshotReceived({
+            at: snapshot.at,
+            live: snapshot.live,
+            manualAt: snapshot.manualAt ?? null,
+            manual: snapshot.manual ?? null,
+          }))
+        }
+        if (msg.type === 'hoststats.refresh.response') {
+          const resp = msg as HostStatsRefreshResponseMessage
+          // Ref-map semantics keyed by requestId; unknown ids are ignored by
+          // the resolve/fail thunks without throwing.
+          const requestId = typeof resp.requestId === 'string' ? resp.requestId : ''
+          if (requestId) {
+            if (resp.ok === true && typeof resp.at === 'number' && resp.manual) {
+              dispatch(resolveHostStatsRefresh({ requestId, at: resp.at, manual: resp.manual }))
+            } else if (resp.ok === false) {
+              dispatch(failHostStatsRefresh({ requestId, error: typeof resp.error === 'string' ? resp.error : 'refresh failed' }))
+            }
+          }
         }
 
         handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)

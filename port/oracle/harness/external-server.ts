@@ -110,12 +110,72 @@ export function rustServerBinPath(root: string = PROJECT_ROOT): string {
 }
 
 /**
+ * Injectable knobs for `nodeBuildStampIsCurrent` — production passes nothing
+ * (the HEAD probe spawns git); tests pass an explicit `head` or force the
+ * git-less path so they never depend on the scratch root being a git repo.
+ */
+export interface NodeStampFreshnessOptions {
+  /** Explicit HEAD sha to compare against; skips the git probe when given. */
+  head?: string
+  /** Force the git-less environment path (legacy reuse) when false. */
+  gitAvailable?: boolean
+}
+
+/**
+ * Whether the node dist's baked build stamp (written by `build:server`'s
+ * `scripts/bake-server-build-id.mjs`) matches the CURRENT checkout HEAD.
+ *
+ * STRICT when HEAD is available: ONLY an exact match counts as current.
+ * False — rebuild — when NO bake file exists (post-feature `build:server`
+ * ALWAYS writes the bake file, so absence means a pre-feature or raw-`tsc`
+ * artifact whose ready frame may omit `buildId` entirely; delta review
+ * round 1), when the file is malformed/unreadable (defensive — the writer
+ * is atomic), when the stamp is `"unknown"` (a git-less build), or when the
+ * stamp is any real-but-different sha. The strictness keeps the oracle from
+ * ever comparing a git-less/stale node artifact against a fresh cargo-built
+ * rust binary: a dist built WITHOUT git and reused in this git-full checkout
+ * advertises `"unknown"` while the rust bake is a fresh sha, which would be
+ * a spurious oracle failure, not a divergence (delta review round 2).
+ *
+ * LENIENT only when HEAD is unavailable — the git probe fails (spawn status
+ * non-zero, e.g. a git-less environment) or `options.gitAvailable === false`:
+ * there are no stamp semantics to violate, so the legacy reuse applies.
+ */
+export function nodeBuildStampIsCurrent(
+  root: string,
+  options: NodeStampFreshnessOptions = {},
+): boolean {
+  let head: string | undefined = options.head
+  if (options.gitAvailable === false) return true
+  if (head === undefined) {
+    const probe = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' })
+    // Git-less environment: no stamp semantics to violate, keep legacy reuse.
+    if (probe.status !== 0) return true
+    head = probe.stdout.trim()
+  }
+  // Missing bake = pre-feature or raw-tsc artifact: its ready frame may omit
+  // buildId entirely — rebuild (delta review round 1).
+  const bakePath = path.join(root, 'dist', 'server', 'build-id.json')
+  if (!fs.existsSync(bakePath)) return false
+  try {
+    const baked = (JSON.parse(fs.readFileSync(bakePath, 'utf8')) as { buildId?: unknown }).buildId
+    // ONLY an exact match with the current HEAD counts as current:
+    // "unknown", malformed, and mismatched stamps all trigger a rebuild so
+    // the oracle never compares a git-less/stale node artifact against a
+    // fresh cargo-built rust binary (delta review round 2).
+    return typeof baked === 'string' && baked === head
+  } catch {
+    return false
+  }
+}
+
+/**
  * Ensure the production node server bundle exists. Builds it with `npm run
  * build:server` if missing. Safe to call repeatedly — a no-op once built.
  */
 export function ensureServerBuilt(root: string = PROJECT_ROOT): string {
   const entry = serverEntryPath(root)
-  if (fs.existsSync(entry)) return entry
+  if (fs.existsSync(entry) && nodeBuildStampIsCurrent(root)) return entry
 
   const result = spawnSync('npm', ['run', 'build:server'], {
     cwd: root,

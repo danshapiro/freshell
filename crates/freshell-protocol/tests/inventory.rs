@@ -31,12 +31,12 @@ fn client_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["clientToServer"]["count"].as_u64(),
-        Some(31),
-        "inventory declares 31 client→server types"
+        Some(34),
+        "inventory declares 34 client→server types"
     );
     let expected = json_type_set(&inv["clientToServer"]["types"]);
     let actual: BTreeSet<String> = CLIENT_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 31, "crate declares 31 client types (no dups)");
+    assert_eq!(actual.len(), 34, "crate declares 34 client types (no dups)");
     assert_eq!(
         actual, expected,
         "CLIENT_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -48,12 +48,12 @@ fn server_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(58),
-        "inventory declares 58 server→client types"
+        Some(60),
+        "inventory declares 60 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 58, "crate declares 58 server types (no dups)");
+    assert_eq!(actual.len(), 60, "crate declares 60 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_89() {
+fn combined_surface_is_94() {
     let all = all_message_types();
-    assert_eq!(all.len(), 89, "31 client + 58 server = 89 discriminants");
+    assert_eq!(all.len(), 94, "34 client + 60 server = 94 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        89,
+        94,
         "no discriminant collides across directions"
     );
 }

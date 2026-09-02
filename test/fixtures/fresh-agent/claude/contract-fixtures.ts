@@ -10,6 +10,7 @@ export const claudeContractTurn = {
   timestamp: '2026-04-18T12:00:00.000Z',
   model: 'claude-fixture',
   summary: 'Workspace is clean.',
+  summaryKind: 'echo',
   items: [
     { id: 'turn:live-1:item:0', kind: 'thinking', text: 'Inspecting workspace' },
     { id: 'turn:live-1:item:1', kind: 'tool_use', toolUseId: 'tool-1', name: 'Bash', input: { command: 'git status --short' } },

@@ -22,16 +22,22 @@ const TEST_TIMEOUT_MS = 20_000
 
 describe('getNetworkHost', () => {
   const originalHost = process.env.HOST
+  const originalBindHost = process.env.FRESHELL_BIND_HOST
 
   beforeEach(() => {
     vi.restoreAllMocks()
     vi.resetModules()
     delete process.env.HOST
+    // FRESHELL_BIND_HOST is an explicit override honored by getNetworkHost;
+    // a developer shell that exports it would otherwise leak into every case.
+    delete process.env.FRESHELL_BIND_HOST
   })
 
   afterEach(() => {
     if (originalHost !== undefined) process.env.HOST = originalHost
     else delete process.env.HOST
+    if (originalBindHost !== undefined) process.env.FRESHELL_BIND_HOST = originalBindHost
+    else delete process.env.FRESHELL_BIND_HOST
   })
 
   it('returns 127.0.0.1 when config file does not exist', async () => {

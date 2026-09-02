@@ -195,12 +195,34 @@ fn spawn_own_sleep_child() -> ChildGuard {
 }
 
 /// A record carrying the spawned child's REAL `/proc` evidence.
+///
+/// Race note: between fork() and exec(), `/proc/<pid>/cmdline` transiently
+/// holds the PARENT's argv (possibly a truncated prefix) — reading in that
+/// window captures wrong bytes and the verify re-read a millisecond later
+/// diverges (observed as a load-only `Mismatch` flake in `cargo test
+/// --workspace`). Poll until cmdline demonstrably reflects the exec'ed child.
 #[cfg(target_os = "linux")]
 fn record_for_child(pid: u32) -> CodexSidecarRecord {
+    let cmdline = {
+        let mut attempts = 0;
+        loop {
+            if let Some(args) = proc_cmdline(pid as i32) {
+                if args == ["sleep", "300"] {
+                    break args;
+                }
+            }
+            attempts += 1;
+            assert!(
+                attempts <= 1000,
+                "child cmdline never reflected exec within 1000ms"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
     CodexSidecarRecord {
         pid,
         starttime: proc_starttime(pid as i32).expect("live child has a starttime"),
-        cmdline: proc_cmdline(pid as i32).expect("live child has a cmdline"),
+        cmdline,
         ..sample_record("codex-sidecar-88888888-8888-4888-8888-888888888888")
     }
 }

@@ -5,6 +5,7 @@ import {
   freshAgentSnapshotHasUserTurn,
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
+  turnSummaryIsAuthored,
 } from '../../../shared/fresh-agent-turns.js'
 
 describe('fresh-agent display turn helpers', () => {
@@ -75,6 +76,22 @@ describe('fresh-agent display turn helpers', () => {
   it('supports legacy calls with null or undefined snapshots', () => {
     expect(freshAgentSnapshotHasUserTurn(null)).toBe(false)
     expect(freshAgentSnapshotHasUserTurn(undefined)).toBe(false)
+  })
+
+  it('accepts an optional summaryKind provenance tag on turn schema', () => {
+    const base = { id: '1', turnId: 't-1', summary: 'summary', items: [] }
+    expect(FreshAgentTurnSchema.parse({ ...base, summaryKind: 'echo' }).summaryKind).toBe('echo')
+    expect(FreshAgentTurnSchema.parse({ ...base, summaryKind: 'authored' }).summaryKind).toBe('authored')
+    // Graceful absence: a server that does not emit the field still parses.
+    expect(FreshAgentTurnSchema.parse(base).summaryKind).toBeUndefined()
+    // The enum is closed and the object stays strict.
+    expect(() => FreshAgentTurnSchema.parse({ ...base, summaryKind: 'bogus' })).toThrow()
+  })
+
+  it('treats only an explicit echo tag as non-authored (missing is conservative)', () => {
+    expect(turnSummaryIsAuthored({ summaryKind: 'echo' })).toBe(false)
+    expect(turnSummaryIsAuthored({ summaryKind: 'authored' })).toBe(true)
+    expect(turnSummaryIsAuthored({})).toBe(true)
   })
 
   it('keeps FreshAgentTurnSchema unchanged and rejects providerTurnId', () => {

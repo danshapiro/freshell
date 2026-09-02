@@ -171,6 +171,11 @@ export const FreshAgentTurnSchema = z.object({
   timestamp: z.string().optional(),
   model: z.string().optional(),
   summary: z.string(),
+  // Provenance of `summary`: 'echo' = mechanical projection of the turn's own
+  // items (foldable caption); 'authored' = provider-written prose (permanent
+  // boundary). Optional: a server that predates the field omits it and the
+  // client treats unknown provenance as authored (conservative).
+  summaryKind: z.enum(['echo', 'authored']).optional(),
   items: z.array(FreshAgentTranscriptItemSchema),
 }).strict()
 

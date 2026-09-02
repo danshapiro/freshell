@@ -57,6 +57,7 @@ fn ready_capabilities_field_is_omitted_when_none() {
         timestamp: "2026-07-22T00:00:00.000Z".to_string(),
         boot_id: Some("boot-1".to_string()),
         server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
         capabilities: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
@@ -72,6 +73,7 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
         timestamp: "2026-07-22T00:00:00.000Z".to_string(),
         boot_id: Some("boot-1".to_string()),
         server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
         capabilities: Some(ReadyCapabilities {
             pane_reconcile_v1: Some(true),
             pane_reconcile_fresh_agent_v1: None,

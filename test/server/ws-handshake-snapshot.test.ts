@@ -300,6 +300,34 @@ describe('ws handshake snapshot', () => {
     }
   })
 
+  it('includes a buildId in the ready message, stable across clients in the same process', async () => {
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await Promise.all([
+        new Promise<void>((resolve) => ws1.on('open', () => resolve())),
+        new Promise<void>((resolve) => ws2.on('open', () => resolve())),
+      ])
+
+      const [ready1, ready2] = await Promise.all([
+        waitForReady(ws1, 10_000),
+        waitForReady(ws2, 10_000),
+      ])
+
+      // Always stamped (bake or runtime probe, "unknown" fallback), stable
+      // within the process.
+      expect(typeof ready1.buildId).toBe('string')
+      expect((ready1.buildId as string).length).toBeGreaterThan(0)
+      expect(ready2.buildId).toBe(ready1.buildId)
+      // Distinct identity axis: not the boot id, not the instance id.
+      expect(ready1.buildId).not.toBe(ready1.bootId)
+    } finally {
+      await closeWs(ws1)
+      await closeWs(ws2)
+    }
+  })
+
   it('sends the same bootId to multiple clients within the same process', async () => {
     const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)

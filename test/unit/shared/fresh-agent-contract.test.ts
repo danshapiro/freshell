@@ -31,6 +31,8 @@ describe('fresh-agent shared contract schemas', () => {
     })
     expect(claudeSnapshot.extensions.claude).not.toHaveProperty('timelineSessionId')
     expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).sessionType).toBe('freshcodex')
+    expect(claudeSnapshot.turns[0].summaryKind).toBe('echo')
+    expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).turns[0].summaryKind).toBe('echo')
   })
 
   it('parses turn pages and turn bodies with the full session locator', () => {

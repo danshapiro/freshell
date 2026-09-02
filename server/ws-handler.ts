@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
+import { serverBuildId } from './build-id.js'
 import { testClockNowMs } from './test-clock.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, startPerfTimer } from './perf-logger.js'
@@ -95,6 +96,10 @@ import {
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
+  HostStatsSubscribeSchema,
+  HostStatsUnsubscribeSchema,
+  HostStatsRefreshSchema,
+  HostStatsSnapshotSchema,
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
@@ -107,6 +112,7 @@ import {
 } from '../shared/fresh-agent.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
+import { HostStatsService, type HostStatsSnapshot } from './host-stats/service.js'
 import {
   INVALID_RAW_CODEX_RESUME_MESSAGE,
   planCodexCreateRestoreDecision,
@@ -231,6 +237,7 @@ export type WsHandlerOptions = {
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
+  hostStats?: HostStatsService
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -252,6 +259,9 @@ function readWsHandlerConfig(): WsHandlerConfig {
   }
 }
 const DRAIN_POLL_INTERVAL_MS = 50
+// Per-connection floor on hoststats.refresh; the SERVICE closes the multi-socket
+// bypass with its own post-completion cooldown (REFRESH_MIN_INTERVAL_MS there).
+const HOST_STATS_REFRESH_MIN_INTERVAL_MS = 1000
 /** Sentinel value reserved in createdByRequestId while awaiting async session repair */
 const REPAIR_PENDING_SENTINEL = '__repair_pending__'
 const log = logger.child({ component: 'ws' })
@@ -487,6 +497,8 @@ type ClientState = {
   wsErrorLogs: Map<string, WsErrorLogEntry>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
+  hostStatsSubscribed: boolean
+  hostStatsLastRefreshAt?: number
   helloTimer?: NodeJS.Timeout
 }
 
@@ -571,6 +583,8 @@ export class WsHandler {
   private extensionManager?: ExtensionManager
   private agentHistorySource?: ClaudeFreshAgentHistorySource
   private freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
+  private hostStats?: HostStatsService
+  private hostStatsSubscribers = 0
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, CreatedTerminalRequestBinding>()
@@ -585,6 +599,7 @@ export class WsHandler {
 
   private readonly serverInstanceId: string
   private readonly bootId: string
+  private readonly buildId: string
   // The runtime validator is authoritative here; we keep the field typed broadly because
   // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
   // Definitely assigned via rebuildClientMessageSchema() in the constructor (and re-run on dev reload).
@@ -638,6 +653,10 @@ export class WsHandler {
     this.layoutStore = options.layoutStore
     this.extensionManager = options.extensionManager
     this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
+    this.hostStats = options.hostStats
+    // Single snapshot fan-out listener, registered at wiring time: every fast tick (and
+    // each completed refresh) reaches subscribed+authenticated sockets only.
+    this.hostStats?.onSnapshot((snapshot) => this.broadcastHostStatsSnapshot(snapshot))
     this.agentHistorySource = options.agentHistorySource ?? (this.sdkBridge
       ? createClaudeFreshAgentHistorySource({
         loadSessionHistory,
@@ -649,6 +668,7 @@ export class WsHandler {
       ? options.serverInstanceId
       : `srv-${randomUUID()}`
     this.bootId = `boot-${randomUUID()}`
+    this.buildId = serverBuildId()
     this.registry.setServerInstanceId?.(this.serverInstanceId)
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
@@ -847,6 +867,9 @@ export class WsHandler {
       FreshAgentQuestionRespondSchema,
       FreshAgentKillSchema,
       FreshAgentForkSchema,
+      HostStatsSubscribeSchema,
+      HostStatsUnsubscribeSchema,
+      HostStatsRefreshSchema,
       UiLayoutSyncSchema,
       UiScreenshotResultSchema,
     ])
@@ -881,6 +904,50 @@ export class WsHandler {
       }
       if (ws.readyState === WebSocket.OPEN) {
         this.send(ws, msg)
+      }
+    }
+  }
+
+  /**
+   * Shared hoststats subscriber bookkeeping. Subscribing 0->1 starts the service and
+   * delivers the current snapshot to THAT socket immediately; unsubscribing 1->0 stops
+   * it (zero-cost idle). Idempotent re-subscribe re-sends the snapshot to the same socket
+   * without double-counting.
+   */
+  private setHostStatsSubscribed(ws: LiveWebSocket, state: ClientState, subscribed: boolean): void {
+    const was = state.hostStatsSubscribed
+    state.hostStatsSubscribed = subscribed
+    if (subscribed === was) {
+      if (subscribed) this.sendHostStatsSnapshot(ws)
+      return
+    }
+    this.hostStatsSubscribers += subscribed ? 1 : -1
+    if (subscribed && this.hostStatsSubscribers === 1) this.hostStats?.start()
+    if (!subscribed && this.hostStatsSubscribers === 0) this.hostStats?.stop()
+    if (subscribed) this.sendHostStatsSnapshot(ws)
+  }
+
+  /** Immediate snapshot to one socket; dropped with a warn if it fails schema validation. */
+  private sendHostStatsSnapshot(ws: LiveWebSocket): void {
+    if (!this.hostStats) return
+    const parsed = HostStatsSnapshotSchema.safeParse({ type: 'hoststats.snapshot', ...this.hostStats.getSnapshot() })
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid hoststats.snapshot payload; not sending')
+      return
+    }
+    this.send(ws, parsed.data)
+  }
+
+  /** Service tick/refresh fan-out: subscribed + authenticated sockets only. */
+  private broadcastHostStatsSnapshot(snapshot: HostStatsSnapshot): void {
+    const parsed = HostStatsSnapshotSchema.safeParse({ type: 'hoststats.snapshot', ...snapshot })
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid hoststats.snapshot broadcast payload; dropping')
+      return
+    }
+    for (const [ws, state] of this.clientStates) {
+      if (state.authenticated && state.hostStatsSubscribed && ws.readyState === WebSocket.OPEN) {
+        this.safeSend(ws, parsed.data)
       }
     }
   }
@@ -1190,6 +1257,7 @@ export class WsHandler {
       wsErrorLogs: new Map(),
       interestedSessions: new Set(),
       sidebarOpenSessionKeys: new Set(),
+      hostStatsSubscribed: false,
     }
     this.clientStates.set(ws, state)
 
@@ -1228,6 +1296,9 @@ export class WsHandler {
     if (state.helloTimer) clearTimeout(state.helloTimer)
     this.connections.delete(ws)
     this.clientStates.delete(ws)
+
+    // hoststats sweep: a closing subscriber drains the count; 1->0 stops the service.
+    this.setHostStatsSubscribed(ws, state, false)
 
     // Detach from any terminals (broker-managed stream path).
     this.terminalStreamBroker.detachAllForSocket(ws)
@@ -2036,6 +2107,7 @@ export class WsHandler {
           timestamp: nowIso(),
           serverInstanceId: this.serverInstanceId,
           bootId: this.bootId,
+          buildId: this.buildId,
         })
         this.scheduleHandshakeSnapshot(ws, state)
         return
@@ -3238,6 +3310,49 @@ export class WsHandler {
         return
       }
 
+      case 'hoststats.subscribe': {
+        this.setHostStatsSubscribed(ws, state, true)
+        return
+      }
+
+      case 'hoststats.unsubscribe': {
+        this.setHostStatsSubscribed(ws, state, false)
+        return
+      }
+
+      case 'hoststats.refresh': {
+        const service = this.hostStats
+        if (!service) {
+          this.send(ws, {
+            type: 'hoststats.refresh.response',
+            requestId: m.requestId,
+            ok: false,
+            error: 'host stats unavailable',
+          })
+          return
+        }
+        // Per-connection floor: <1000ms since this connection's last refresh rejects
+        // WITHOUT invoking the service (single-flight + service cooldown are downstream).
+        const now = Date.now()
+        if (state.hostStatsLastRefreshAt !== undefined && now - state.hostStatsLastRefreshAt < HOST_STATS_REFRESH_MIN_INTERVAL_MS) {
+          this.send(ws, { type: 'hoststats.refresh.response', requestId: m.requestId, ok: false, error: 'rate_limited' })
+          return
+        }
+        state.hostStatsLastRefreshAt = now
+        try {
+          const { at, manual } = await service.refresh()
+          this.send(ws, { type: 'hoststats.refresh.response', requestId: m.requestId, ok: true, at, manual })
+        } catch (err) {
+          this.send(ws, {
+            type: 'hoststats.refresh.response',
+            requestId: m.requestId,
+            ok: false,
+            error: errorMessage(err),
+          })
+        }
+        return
+      }
+
       case 'tabs.sync.push': {
         if (!this.tabsRegistryStore) {
           this.sendError(ws, {
@@ -4094,6 +4209,10 @@ export class WsHandler {
     }
 
     this.terminalStreamBroker.close()
+
+    // Server shutdown path mirrors the onClose sweep: sampling never outlives the handler.
+    // (No counter reset here — late 'close' events keep the sweep arithmetic balanced.)
+    this.hostStats?.stop()
 
     for (const [requestId, pending] of this.screenshotRequests) {
       clearTimeout(pending.timeout)

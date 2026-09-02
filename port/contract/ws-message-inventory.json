@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 31,
+    "count": 34,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -19,6 +19,9 @@
       "freshAgent.question.respond",
       "freshAgent.send",
       "hello",
+      "hoststats.refresh",
+      "hoststats.subscribe",
+      "hoststats.unsubscribe",
       "opencode.activity.list",
       "pane.reconcile.request",
       "ping",
@@ -38,7 +41,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 58,
+    "count": 60,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -65,6 +68,8 @@
       "freshAgent.killed",
       "freshAgent.send.accepted",
       "freshAgent.session.materialized",
+      "hoststats.refresh.response",
+      "hoststats.snapshot",
       "opencode.activity.list.response",
       "opencode.activity.updated",
       "pane.reconcile.result",

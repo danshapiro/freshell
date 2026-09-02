@@ -170,6 +170,16 @@ describe('executeAction -- tab actions', () => {
     expect(result).toBeTruthy()
   })
 
+  it('new-tab passes hostStats through to /api/tabs', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', { hostStats: true })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      hostStats: true,
+    }))
+  })
+
   // Fresh-agent shorthand resume: when `mode` is absent and the pane is a
   // fresh agent (`agent` param), resume sugar previously dropped the resume
   // fields silently. Only opencode is synthesized -- it is the only provider
@@ -323,6 +333,22 @@ describe('executeAction -- pane actions', () => {
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/panes/p1/split'),
       expect.objectContaining({ direction: 'vertical' }),
+    )
+  })
+
+  it('split-pane passes hostStats through to the split route', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      return Promise.resolve({})
+    })
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    await executeAction('split-pane', { target: 'p1', hostStats: true })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1/split'),
+      expect.objectContaining({ hostStats: true }),
     )
   })
 

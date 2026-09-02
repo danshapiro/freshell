@@ -50,6 +50,7 @@ pub mod rename_persistence;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
+pub(crate) mod summary;
 pub mod target_resolver;
 pub mod terminal_tabs;
 
@@ -137,6 +138,8 @@ use freshell_protocol::{
     FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
     UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
+
+use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO};
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
 const SESSION_TYPE: &str = "freshopencode";
@@ -1392,7 +1395,7 @@ fn opencode_strip_synthetic_text_segment_suffix(id: &str) -> String {
 /// halves share the ORIGINAL part's source id and must read as one continuous excerpt, not two
 /// paragraphs separated by a blank line they never had. Falls back to the first `reasoning`
 /// item's `summary[0]` when there is no `text`-kind item at all.
-fn opencode_turn_summary(items: &[Value]) -> String {
+fn opencode_turn_summary(items: &[Value]) -> (String, &'static str) {
     let text_items: Vec<(&str, &str)> = items
         .iter()
         .filter(|item| item.get("kind").and_then(Value::as_str) == Some("text"))
@@ -1426,16 +1429,16 @@ fn opencode_turn_summary(items: &[Value]) -> String {
         if !current_text.is_empty() {
             groups.push(current_text);
         }
-        return groups.join("\n\n");
+        return (truncate_summary(&groups.join("\n\n")), SUMMARY_KIND_ECHO);
     }
-    items
+    let reasoning_excerpt = items
         .iter()
         .find(|item| item.get("kind").and_then(Value::as_str) == Some("reasoning"))
         .and_then(|item| item.get("summary").and_then(Value::as_array))
         .and_then(|arr| arr.first())
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or("");
+    (truncate_summary(reasoning_excerpt), SUMMARY_KIND_ECHO)
 }
 
 /// A `FreshAgentTurnSchema`-shaped turn from one opencode `{info, parts}` message
@@ -1488,7 +1491,9 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
     if let Some(model) = opencode_model_from_info(&info) {
         turn.insert("model".to_string(), json!(model));
     }
-    turn.insert("summary".to_string(), json!(opencode_turn_summary(&items)));
+    let (summary, summary_kind) = opencode_turn_summary(&items);
+    turn.insert("summary".to_string(), json!(summary));
+    turn.insert("summaryKind".to_string(), json!(summary_kind));
     turn.insert("items".to_string(), json!(items));
     Some(Value::Object(turn))
 }
@@ -3353,6 +3358,7 @@ mod tests {
         assert_eq!(turns[0]["items"][0]["text"], json!("hi"));
         assert_eq!(turns[1]["role"], json!("assistant"));
         assert_eq!(turns[1]["summary"], json!("hello from opencode"));
+        assert_eq!(turns[1]["summaryKind"], json!("echo"));
         assert_eq!(snapshot["latestTurnId"], turns[1]["turnId"]);
     }
 
@@ -3844,6 +3850,26 @@ mod tests {
         assert_eq!(items[1]["text"], json!("Ran the command."));
         // Summary joins the (single) text item's text.
         assert_eq!(turn["summary"], json!("Ran the command."));
+        assert_eq!(turn["summaryKind"], json!("echo"));
+    }
+
+    #[test]
+    fn opencode_turn_summary_truncates_the_text_join_and_tags_echo() {
+        let long = "y".repeat(200);
+        let items = vec![json!({ "id": "p-0", "kind": "text", "text": long })];
+        let (summary, kind) = opencode_turn_summary(&items);
+        assert_eq!(summary.chars().count(), 140);
+        assert_eq!(kind, SUMMARY_KIND_ECHO);
+
+        // The reasoning fallback is the adapter's own projection of full reasoning
+        // text — echo, NOT authored (see the plan's deviation note).
+        let reasoning_only = vec![
+            json!({ "id": "p-1", "kind": "reasoning", "summary": ["full reasoning text"], "content": [], "text": "full reasoning text" }),
+        ];
+        assert_eq!(
+            opencode_turn_summary(&reasoning_only),
+            ("full reasoning text".to_string(), SUMMARY_KIND_ECHO)
+        );
     }
 
     // ── resolve_probe_timeout_ms (Task 4 knob, pinned purely) ────────────────

@@ -22,6 +22,7 @@
       "role": "user",
       "timestamp": "2026-07-25T10:00:00.000Z",
       "summary": "first question",
+      "summaryKind": "echo",
       "items": [
         { "id": "44444444-4444-4444-8444-444444444444:0-i0", "kind": "text", "text": "first question" }
       ]
@@ -36,6 +37,7 @@
       "timestamp": "2026-07-25T10:00:01.000Z",
       "model": "claude-opus-4-6",
       "summary": "first answer",
+      "summaryKind": "echo",
       "items": [
         { "id": "44444444-4444-4444-8444-444444444444:1-i0", "kind": "thinking", "text": "pondering" },
         { "id": "44444444-4444-4444-8444-444444444444:1-i1", "kind": "text", "text": "first answer" }
@@ -49,6 +51,7 @@
       "role": "user",
       "timestamp": "2026-07-25T10:00:02.000Z",
       "summary": "plain string question",
+      "summaryKind": "echo",
       "items": [
         { "id": "44444444-4444-4444-8444-444444444444:2-i0", "kind": "text", "text": "plain string question" }
       ]
@@ -61,6 +64,7 @@
       "role": "user",
       "timestamp": "2026-07-25T10:00:02.500Z",
       "summary": "cli string content question",
+      "summaryKind": "echo",
       "items": [
         { "id": "44444444-4444-4444-8444-444444444444:3-i0", "kind": "text", "text": "cli string content question" }
       ]
@@ -73,6 +77,7 @@
       "role": "assistant",
       "timestamp": "2026-07-25T10:00:03.000Z",
       "summary": "bash",
+      "summaryKind": "echo",
       "items": [
         { "id": "44444444-4444-4444-8444-444444444444:4-i0", "kind": "tool_use", "toolUseId": "toolu_01", "name": "bash", "input": { "command": "ls" } }
       ]
@@ -84,7 +89,8 @@
       "source": "durable",
       "role": "user",
       "timestamp": "2026-07-25T10:00:04.000Z",
-      "summary": "[tool result]",
+      "summary": "Tool result",
+      "summaryKind": "echo",
       "items": [
         { "id": "44444444-4444-4444-8444-444444444444:5-i0", "kind": "tool_result", "toolUseId": "toolu_01", "content": "file-a\nfile-b", "isError": false }
       ]

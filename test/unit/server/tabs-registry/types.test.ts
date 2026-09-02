@@ -27,6 +27,31 @@ describe('TabRegistryRecordSchema (server)', () => {
     expect(parsed.status).toBe('open')
   })
 
+  it('accepts a tab record with a host-stats pane', () => {
+    const parsed = TabRegistryRecordSchema.parse({
+      tabKey: 'device-1:tab-1',
+      tabId: 'tab-1',
+      serverInstanceId: 'srv-test',
+      deviceId: 'device-1',
+      deviceLabel: 'danlaptop',
+      tabName: 'stats',
+      status: 'open',
+      revision: 1,
+      createdAt: 1739491200000,
+      updatedAt: 1739577600000,
+      paneCount: 1,
+      titleSetByUser: false,
+      panes: [
+        {
+          paneId: 'pane-1',
+          kind: 'host-stats',
+          payload: {},
+        },
+      ],
+    })
+    expect(parsed.panes[0]?.kind).toBe('host-stats')
+  })
+
   it('rejects invalid status', () => {
     const result = TabRegistryRecordSchema.safeParse({
       tabKey: 'device-1:tab-1',

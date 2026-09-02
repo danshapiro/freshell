@@ -462,7 +462,7 @@ describe('fresh-agent-ws', () => {
     expect(session.turns.at(-1)).toMatchObject({
       role: 'assistant',
       model: 'claude-sonnet-4-6',
-      summary: 'final answer',
+      summary: '',
     })
     expect(session.pendingPermissions).toEqual({})
     expect(session.pendingQuestions['question-1']).toMatchObject({

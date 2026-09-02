@@ -27,6 +27,7 @@ mod existence;
 mod existence_by_id;
 mod extensions;
 mod files;
+mod host_stats;
 mod identity_sink;
 mod instance_id;
 mod legacy_local_seed;
@@ -387,6 +388,28 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
+    // the Rust host-stats collector — freshell-platform readers over
+    // freshell-ws's trait bridge. Constructed here (not at the ~1311
+    // subagent-cadence spawn the plan cites, which sits inside the
+    // session-index block BELOW `ws_state`): the concrete instance must be
+    // Arc'd and injected INTO `WsState::host_stats` when that literal builds.
+    // NO cadence spawns here — `terminal.rs`'s `hoststats.subscribe`
+    // 0->1 edge calls the collector's `set_active(true)`, which owns
+    // spawn/abort internally (zero-cost idle). The interest registry clone
+    // shared into WsState is the SAME instance the collector's cadence
+    // delivers snapshots through (subscribed connections only — never
+    // `broadcast_tx`). `boot_anchor` backs `freshell.uptimeSec`.
+    let host_stats_interest =
+        freshell_ws::host_stats_interest::HostStatsInterestRegistry::default();
+    let host_stats_collector: std::sync::Arc<
+        dyn freshell_ws::host_stats_collector::HostStatsCollector,
+    > = std::sync::Arc::new(host_stats::HostStatsCollectorService::new(
+        host_stats::HostStatsCollectorConfig::from_env(),
+        registry.clone(),
+        host_stats_interest.clone(),
+        std::time::Instant::now(),
+    ));
     // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a79 Risk 1): the
     // Agent-API's terminal-mode `POST /api/tabs` shares THIS SAME registry --
     // never a second one -- so an Agent-API-created shell terminal is a first-class
@@ -1047,6 +1070,12 @@ async fn main() -> ExitCode {
         layout: layout_store.clone(),
         screenshots: screenshots.clone(),
         subagent_interest: subagent_interest.clone(),
+        // Task 9: the SAME interest registry the collector's cadence delivers
+        // through + the injected concrete collector.
+        host_stats: freshell_ws::host_stats_collector::WsHostStatsState {
+            interest: host_stats_interest.clone(),
+            collector: Some(host_stats_collector.clone()),
+        },
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),
@@ -2434,17 +2463,24 @@ fn kilroy_enabled_flag() -> bool {
 /// declare now that the hardened resolve response surface
 /// (degraded/providerErrors/unsearchedProviders/homeDir, warming default)
 /// landed — see `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`
-/// Tasks 2-6 (SYNC-06).
+/// Tasks 2-6 (SYNC-06). `featureFlags.hostStatsAvailable` mirrors Node's
+/// `process.platform !== 'win32'` as boot-static `cfg!(not(target_os =
+/// "windows"))`.
 fn build_platform_payload(
     available_clis: serde_json::Value,
     ai_enabled: bool,
 ) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
+    // Boot-static host-stats availability (mirrors Node's
+    // `process.platform !== 'win32'` in `detectFeatureFlags`): the collector
+    // reads /proc + /sys, so Windows reports `false`; no /proc probe at boot —
+    // readers degrade to `available: false` on failure.
+    let host_stats_available = cfg!(not(target_os = "windows"));
     serde_json::json!({
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true },
+        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true, "hostStatsAvailable": host_stats_available },
     })
 }
 
@@ -3085,6 +3121,7 @@ mod sessions_sweep_tests {
             tabs: freshell_ws::tabs::TabsRegistry::new(),
             screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -3581,12 +3618,16 @@ mod tests {
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
-        // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
-        // Rust payload. `sessionResolve` is TRUE: the hardened resolve
-        // response surface (degraded/providerErrors/unsearchedProviders/
+        // sessionResolve, hostStatsAvailable }`, camelCase, no extra fields —
+        // mirrored 1:1 in the Rust payload. `sessionResolve` is TRUE: the
+        // hardened resolve response surface
+        // (degraded/providerErrors/unsearchedProviders/
         // homeDir, warming default) landed via the hardened plan Tasks 2-6
-        // (SYNC-06), so the flag is genuinely earned. `KILROY_ENABLED` is pinned
-        // off under the shared lock so the assertion is environment-independent.
+        // (SYNC-06), so the flag is genuinely earned. `hostStatsAvailable` is
+        // boot-static on the build target (`cfg!(not(target_os = "windows"))`,
+        // mirroring Node's `process.platform !== 'win32'`). `KILROY_ENABLED` is
+        // pinned off under the shared lock so the assertion is
+        // environment-independent.
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3595,7 +3636,7 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true, "hostStatsAvailable": cfg!(not(target_os = "windows")) })
         );
     }
 
@@ -3609,7 +3650,21 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true, "hostStatsAvailable": cfg!(not(target_os = "windows")) })
+        );
+    }
+
+    #[test]
+    fn host_stats_flag_present_in_platform_payload() {
+        // Host-stats collection reads Linux `/proc` + `/sys`; both servers expose
+        // a boot-static availability flag so clients can degrade to
+        // `available: false` instead of probing — Node mirrors
+        // `process.platform !== 'win32'` (server/platform-router.ts), Rust uses
+        // the build target. Present-and-boolean regardless of host runtime.
+        let payload = build_platform_payload(serde_json::json!({}), false);
+        assert_eq!(
+            payload["featureFlags"]["hostStatsAvailable"],
+            serde_json::json!(cfg!(not(target_os = "windows")))
         );
     }
 

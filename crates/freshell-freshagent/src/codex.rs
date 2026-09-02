@@ -74,6 +74,9 @@ use freshell_protocol::{
 };
 use freshell_terminal::FrameSink;
 
+use crate::summary::{
+    truncate_summary, SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL,
+};
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
@@ -3440,11 +3443,11 @@ fn map_codex_item(item_id: &str, item: &Value, item_type: &str) -> Result<Vec<Va
 }
 
 /// `classifyCodexItemRole(item)` (`normalize.ts:475-501`): every `CodexThreadItemTypeSchema`
-/// variant maps to exactly one display role. The caller ([`build_codex_turn_json`]) only reaches
-/// this for an `item_type` that [`map_codex_item`] mapped to a NON-empty item list -- i.e. one of
-/// the known variants below -- so the catch-all arm is unreachable in practice -- it exists only
-/// so this is a total function, matching the reference's `assertNever` default case in spirit (a
-/// compile-time safety net, not a runtime path).
+/// variant maps to exactly one display role. The caller ([`build_codex_turn_json`]) classifies
+/// EVERY raw item, INCLUDING ones [`map_codex_item`] mapped to an empty item list
+/// (unrecognized types) -- the catch-all arm IS reachable there and decides whether that item
+/// pushes a zero-item display row -- so the catch-all is a runtime path, not just a
+/// compile-time safety net (it still matches the reference's `assertNever` default in spirit).
 fn classify_codex_item_role(item_type: &str) -> &'static str {
     match item_type {
         "userMessage" => "user",
@@ -3485,35 +3488,44 @@ fn read_codex_turn_error(raw_turn: &Value) -> Option<String> {
 /// `summarizeFreshAgentItems(items)` (`normalize.ts:168-207`): the turn's `summary` string is
 /// the FIRST item's kind-specific preview text (NOT a concatenation of every item) -- e.g. a
 /// turn with a `reasoning` item followed by a `command` item summarizes from the reasoning
-/// alone. `.slice(0,140)` is approximated with a 140-`char` (not UTF-16 code unit) cap, an
-/// acceptable divergence for non-BMP text.
-fn summarize_codex_items(items: &[Value]) -> String {
-    fn truncate140(text: &str) -> String {
-        text.chars().take(140).collect()
-    }
+/// alone. Truncation is the shared 140-char policy (`crate::summary`).
+///
+/// Provenance: the summary is AUTHORED only when it comes from a `reasoning`
+/// item's provider-written `summary` array (codex is the one provider that
+/// ships provider-written summary prose). Everything else — including a
+/// reasoning item reduced to its raw `content` text — is a mechanical
+/// projection and tags ECHO. The value SELECTION ORDER is the shipped one
+/// (direct `text` → provider `summary` → `content`), deliberately NOT
+/// reordered: `map_codex_item` (:3315-3322) constructs a reasoning item's
+/// `text` as the joined provider summary exactly when one exists, so authored
+/// is reachable with no visible-text change (planning decision 6).
+fn summarize_codex_items(items: &[Value]) -> (String, &'static str) {
     for item in items {
         let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
         let text = match kind {
-            "text" | "thinking" => item.get("text").and_then(Value::as_str).map(truncate140),
+            "text" | "thinking" => item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
             "reasoning" => {
+                // Shipped order: direct `text` first, then the provider
+                // `summary` array, then raw `content`.
+                let provider_summary = item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|joined| !joined.is_empty());
                 let direct = item
                     .get("text")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty());
                 let text = direct.map(str::to_string).unwrap_or_else(|| {
-                    let summary_joined = item
-                        .get("summary")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default();
-                    if !summary_joined.is_empty() {
-                        summary_joined
-                    } else {
+                    provider_summary.clone().unwrap_or_else(|| {
                         item.get("content")
                             .and_then(Value::as_array)
                             .map(|arr| {
@@ -3523,47 +3535,71 @@ fn summarize_codex_items(items: &[Value]) -> String {
                                     .join("\n")
                             })
                             .unwrap_or_default()
-                    }
+                    })
                 });
-                Some(truncate140(&text))
+                // Authored iff the RETURNED string is the provider summary
+                // join. For `map_codex_item`-built items that holds exactly
+                // when a provider summary exists; a synthetic item whose
+                // direct text diverges stays echo (the value came from text).
+                let summary_kind = match &provider_summary {
+                    Some(joined) if *joined == text => SUMMARY_KIND_AUTHORED,
+                    _ => SUMMARY_KIND_ECHO,
+                };
+                return (truncate_summary(&text), summary_kind);
             }
-            "command" => item.get("command").and_then(Value::as_str).map(truncate140),
+            "command" => item
+                .get("command")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
             "file_change" => Some("File change".to_string()),
             "mcp_tool" => {
                 let server = item.get("server").and_then(Value::as_str).unwrap_or("");
                 let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
-                Some(truncate140(&format!("{server}:{tool}")))
+                Some(truncate_summary(&format!("{server}:{tool}")))
             }
-            "dynamic_tool" | "collab_agent" => {
-                item.get("tool").and_then(Value::as_str).map(truncate140)
-            }
-            "web_search" => item.get("query").and_then(Value::as_str).map(truncate140),
-            "image_view" => item.get("path").and_then(Value::as_str).map(truncate140),
-            "image_generation" => item.get("result").and_then(Value::as_str).map(truncate140),
+            "dynamic_tool" | "collab_agent" => item
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
+            "web_search" => item
+                .get("query")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
+            "image_view" => item
+                .get("path")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
+            "image_generation" => item
+                .get("result")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
             "review_mode" => {
                 let event = item.get("event").and_then(Value::as_str).unwrap_or("");
-                Some(truncate140(&format!("{event} review mode")))
+                Some(truncate_summary(&format!("{event} review mode")))
             }
             "context_compaction" => Some("Context compacted".to_string()),
-            "tool_use" => item.get("name").and_then(Value::as_str).map(truncate140),
+            "tool_use" => item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(truncate_summary),
             "tool_result" => {
                 let is_error = item
                     .get("isError")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 Some(if is_error {
-                    "Tool error".to_string()
+                    TOOL_ERROR_LABEL.to_string()
                 } else {
-                    "Tool result".to_string()
+                    TOOL_RESULT_LABEL.to_string()
                 })
             }
             _ => None,
         };
         if let Some(text) = text {
-            return text;
+            return (text, SUMMARY_KIND_ECHO);
         }
     }
-    String::new()
+    (String::new(), SUMMARY_KIND_ECHO)
 }
 
 /// `normalizeCodexThreadSnapshot` (`normalize.ts:748-787`): map a raw `thread/read` result
@@ -3680,9 +3716,13 @@ struct CodexPendingRow {
 /// ported as [`classify_codex_item_role`]). Every raw item is mapped via [`map_codex_item`]
 /// (the full `normalizeCodexItem` switch, `normalize.ts:238-473`) before being folded into its
 /// row. DELIBERATE DEVIATION: an unrecognized item type no longer fails the turn -- per
-/// [`map_codex_item`]'s doc comment, it maps to an empty item list, and this loop skips it
-/// entirely (no role/row bookkeeping touched) so it can never manufacture a spurious empty
-/// display row. Every other item in the turn still renders normally.
+/// [`map_codex_item`]'s doc comment, it maps to an empty item list. The loop does NOT skip it:
+/// its role is still classified (the catch-all arm of [`classify_codex_item_role`] yields
+/// `assistant`) and folded into `has_assistant_output`/`has_user_output`/`all_items_are_user`,
+/// and when that role differs from the previous row's a new row is pushed whose `items` is the
+/// empty list -- a ZERO-ITEM display row with a BLANK summary (`summarize_codex_items(&[])`
+/// returns `""`). When the role matches the previous row, `row.items.extend(mapped)` extends by
+/// nothing and no empty row appears. Every other item in the turn still renders normally.
 ///
 /// A turn-level `error` (`normalize.ts:509-519,640-641`) or a completed turn whose only items
 /// are `user`-role with no `assistant` output (`normalize.ts:642-652`) each APPEND A NEW
@@ -3790,13 +3830,15 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
             } else {
                 format!("{turn_id}:row-{row_index}")
             };
+            let (summary, summary_kind) = summarize_codex_items(&row.items);
             json!({
                 "id": row_turn_id,
                 "turnId": row_turn_id,
                 "ordinal": ordinal,
                 "source": "durable",
                 "role": row.role,
-                "summary": summarize_codex_items(&row.items),
+                "summary": summary,
+                "summaryKind": summary_kind,
                 "items": row.items,
             })
         })
@@ -4195,6 +4237,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
     // ── DIAG-01 lifecycle tracing events (capturing test facility) ────────
@@ -9462,6 +9505,7 @@ pub(crate) mod tests {
         assert_eq!(turns[0]["id"], json!("turn-1"));
         assert_eq!(turns[0]["turnId"], json!("turn-1"));
         assert_eq!(turns[0]["summary"], json!("hello from codex"));
+        assert_eq!(snapshot["turns"][0]["summaryKind"], json!("echo"));
         assert_eq!(turns[0]["items"][0]["kind"], json!("text"));
         assert_eq!(turns[0]["items"][0]["text"], json!("hello from codex"));
     }
@@ -9839,7 +9883,77 @@ pub(crate) mod tests {
             json!({ "id": "a", "kind": "reasoning", "summary": ["thinking hard"], "content": [], "text": "thinking hard" }),
             json!({ "id": "b", "kind": "command", "command": "ls", "status": "completed", "output": null, "exitCode": null, "extensions": {} }),
         ];
-        assert_eq!(summarize_codex_items(&items), "thinking hard");
+        // A reasoning item carrying a provider summary array is the only authored
+        // case; `text` is CONSTRUCTED as the joined provider summary by
+        // `map_codex_item`, so the authored value is exactly today's value.
+        assert_eq!(
+            summarize_codex_items(&items),
+            ("thinking hard".to_string(), SUMMARY_KIND_AUTHORED)
+        );
+    }
+
+    #[test]
+    fn summarize_codex_items_keeps_the_shipped_reasoning_fallback_order() {
+        // Planning decision 6: the reasoning fallback order is UNCHANGED (direct
+        // `text` -> provider `summary` array -> `content`); the reorder first
+        // drafted here was reverted by load-bearing validation (LB-1 side
+        // finding). Authored iff the RETURNED STRING is the provider summary
+        // join. Construction-shaped items (`text` == the join, as `map_codex_item`
+        // builds them) tag authored with an unchanged value:
+        let construction_shaped = vec![json!({
+            "id": "a", "kind": "reasoning",
+            "summary": ["provider prose"], "content": ["raw chain"], "text": "provider prose",
+        })];
+        assert_eq!(
+            summarize_codex_items(&construction_shaped),
+            ("provider prose".to_string(), SUMMARY_KIND_AUTHORED)
+        );
+
+        // Direct text empty: the provider summary array supplies the value, so
+        // the string IS provider prose -> authored (authored stays reachable
+        // under the untouched order).
+        let no_direct_text = vec![json!({
+            "id": "b", "kind": "reasoning",
+            "summary": ["provider prose"], "content": ["raw chain"], "text": "",
+        })];
+        assert_eq!(
+            summarize_codex_items(&no_direct_text),
+            ("provider prose".to_string(), SUMMARY_KIND_AUTHORED)
+        );
+
+        // A synthetic item whose direct text diverges from the provider summary
+        // keeps today's value (the direct text) and tags echo — the value was not
+        // taken from the provider array.
+        let divergent = vec![json!({
+            "id": "c", "kind": "reasoning",
+            "summary": ["provider prose"], "content": [], "text": "direct text",
+        })];
+        assert_eq!(
+            summarize_codex_items(&divergent),
+            ("direct text".to_string(), SUMMARY_KIND_ECHO)
+        );
+    }
+
+    #[test]
+    fn summarize_codex_items_tags_reasoning_without_a_provider_summary_echo() {
+        let items = vec![
+            json!({ "id": "a", "kind": "reasoning", "summary": [], "content": ["raw chain"], "text": "raw chain" }),
+        ];
+        assert_eq!(
+            summarize_codex_items(&items),
+            ("raw chain".to_string(), SUMMARY_KIND_ECHO)
+        );
+    }
+
+    #[test]
+    fn summarize_codex_items_tags_tool_previews_echo() {
+        let items = vec![
+            json!({ "id": "c", "kind": "command", "command": "cat a.txt", "status": "completed", "output": null, "exitCode": null, "extensions": {} }),
+        ];
+        assert_eq!(
+            summarize_codex_items(&items),
+            ("cat a.txt".to_string(), SUMMARY_KIND_ECHO)
+        );
     }
 
     #[tokio::test]
@@ -9909,6 +10023,8 @@ pub(crate) mod tests {
         assert_eq!(assistant_items[0]["kind"], json!("reasoning"));
         // Turn summary is that row's own (only) item's projection.
         assert_eq!(turns[0]["summary"], json!("Checking the file"));
+        assert_eq!(turns[0]["summaryKind"], json!("authored"));
+        assert_eq!(turns[1]["summaryKind"], json!("echo"));
 
         assert_eq!(turns[1]["role"], json!("tool"));
         assert_eq!(turns[1]["ordinal"], json!(1));

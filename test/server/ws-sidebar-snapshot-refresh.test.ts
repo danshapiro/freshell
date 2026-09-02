@@ -175,7 +175,18 @@ describe('ws sidebar snapshot refresh', () => {
       await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
     } finally {
       ws.terminate()
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+      // BOUNDED close-wait: an unbounded wait here (1) could hang until the
+      // 30s test timeout, masking the test body's real failure with a
+      // useless "Test timed out", and (2) made flaky failures undiagnosable
+      // under full-suite load. Resolve on a short grace period — the
+      // original error (if any) propagates from the test body itself.
+      await new Promise<void>((resolve) => {
+        const grace = setTimeout(() => resolve(), 2_000)
+        ws.on('close', () => {
+          clearTimeout(grace)
+          resolve()
+        })
+      })
     }
   })
 
@@ -258,7 +269,18 @@ describe('ws sidebar snapshot refresh', () => {
       })
     } finally {
       ws.terminate()
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+      // BOUNDED close-wait: an unbounded wait here (1) could hang until the
+      // 30s test timeout, masking the test body's real failure with a
+      // useless "Test timed out", and (2) made flaky failures undiagnosable
+      // under full-suite load. Resolve on a short grace period — the
+      // original error (if any) propagates from the test body itself.
+      await new Promise<void>((resolve) => {
+        const grace = setTimeout(() => resolve(), 2_000)
+        ws.on('close', () => {
+          clearTimeout(grace)
+          resolve()
+        })
+      })
     }
   })
 
@@ -288,7 +310,18 @@ describe('ws sidebar snapshot refresh', () => {
       await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
     } finally {
       ws.terminate()
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+      // BOUNDED close-wait: an unbounded wait here (1) could hang until the
+      // 30s test timeout, masking the test body's real failure with a
+      // useless "Test timed out", and (2) made flaky failures undiagnosable
+      // under full-suite load. Resolve on a short grace period — the
+      // original error (if any) propagates from the test body itself.
+      await new Promise<void>((resolve) => {
+        const grace = setTimeout(() => resolve(), 2_000)
+        ws.on('close', () => {
+          clearTimeout(grace)
+          resolve()
+        })
+      })
     }
   })
 })
