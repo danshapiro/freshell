@@ -28,6 +28,10 @@ servers receive `FRESHELL_CONFIG_DIR` whose support is added to
 **Tech Stack:** Electron (main process ESM/NodeNext), React 18 + Vite (picker
 renderer), Zod, Vitest, Playwright `_electron`.
 
+## User Request
+
+> Run two electron clients on the same machine pointed at different servers: fix the blockers (single-instance lock, namespaced userData + config dir per profile) plus a profile picker at launch when more than one profile is configured in a text file. Implement with the-usual.
+
 ## Global Constraints
 
 - **Backward-compat invariant:** with no `--profile`, no `FRESHELL_PROFILE`,
