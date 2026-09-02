@@ -15,15 +15,26 @@ default) and derives per-profile paths: config dir `~/.freshell-<id>` and
 Electron userData `<appData>/<AppName>-<id>` (the default profile keeps
 today's exact paths). `entry.ts` resolves the profile at module top and calls
 `app.setPath('userData', ...)` for named profiles before `app.whenReady()` —
-which also re-keys Electron's single-instance lock per profile for free. The
-instance lock is acquired early (new `acquireInstanceLock`), before any side
-effects. A machine-global registry `~/.freshell/profiles.json` (zod-validated)
-lists named profiles; when at least one exists and no explicit profile was
-given, a new profile-picker window (built and packaged exactly like the
-launch chooser) lets the user pick the default profile (continues in-process)
+which also re-keys Electron's single-instance lock per profile for free
+(empirically verified on Electron 33.4.11: the lock is keyed to the userData
+dir; see load-bearing ledger). The instance lock is acquired **once the
+profile choice is final** — immediately after `app.whenReady()` for explicit
+flag/env launches, and after the picker resolves for flag-less launches — and
+always before provisioning or any server spawn. The picker itself runs while
+holding **no** lock, so a flag-less launch while a Default instance is
+resident still shows the picker (choosing the resident profile degrades to
+focusing the resident via `second-instance`; duplicate picker windows from
+racing launches are tolerated policy). A machine-global registry
+`~/.freshell/profiles.json` (zod-validated) lists named profiles; when at
+least one exists and no explicit profile was given, a new profile-picker
+window (built and packaged exactly like the launch chooser) lets the user
+pick the default profile (continues in-process, lock acquired at that point)
 or a named profile (relaunches with `--profile=<id>`). App-bound spawned
 servers receive `FRESHELL_CONFIG_DIR` whose support is added to
-`server/freshell-home.ts`.
+`server/freshell-home.ts`, and the server-side audit (Task 4) routes every
+profile-scoped state path through `getFreshellConfigDir` while leaving
+genuinely machine-level state (firewall/WSL port bookkeeping,
+checkout/project-scoped files) deliberately shared.
 
 **Tech Stack:** Electron (main process ESM/NodeNext), React 18 + Vite (picker
 renderer), Zod, Vitest, Playwright `_electron`.
@@ -38,6 +49,23 @@ renderer), Zod, Vitest, Playwright `_electron`.
   and no registry file, behavior is identical to today: same paths
   (`~/.freshell`, default Electron userData), same boot flow, same windows. The
   default profile never calls `app.setPath('userData', ...)` at all.
+- **Lock timing policy (load-bearing finding LB-02):** the picker phase holds
+  NO lock. The single-instance lock is acquired only after the profile choice
+  is final — explicit flag/env launches lock immediately after
+  `app.whenReady()`; picker launches lock only after the user continues as
+  Default (named choices relaunch instead). Rationale: a launcher that grabs
+  the default lock before showing the picker makes the picker unreachable in
+  the feature's steady state (tray-resident Default turns every flag-less
+  launch away before the picker branch runs). Accepted trade-offs: two
+  racing flag-less launches may each show their own picker (duplicate pickers
+  tolerated — same-user good-faith environment); a Default choice that loses a
+  meanwhile-acquired default lock quits and delivers `second-instance` to the
+  resident (which then shows its window).
+- **Resident surfacing fix:** the resident's `second-instance` handler must
+  `show()` a tray-hidden window before `focus()` (today it only restores a
+  minimized window, so a turned-away launch over a tray-hidden Default is a
+  silent no-op). This fix is required for the turned-away-launch UX and is
+  done in Task 3.
 - Profile id grammar: `^[a-z0-9][a-z0-9-]{0,31}$`; id `default` is reserved
   (means today's un-namespaced environment). The registry is machine-global
   and always lives at `~/.freshell/profiles.json` (never inside a profile dir).
@@ -806,16 +834,18 @@ git commit -m "feat(electron): add profile resolution module"
 
 ---
 
-### Task 3: Lock split, hotkey failure logging, tray tooltip, spawn env
+### Task 3: Lock split, hotkey failure logging, tray tooltip, spawn env, resident surfacing fix
 
-Four small DI-module changes that profiles depend on. Default-path behavior
-is unchanged for each. Note: `main.ts` today requests the single-instance
-lock at the very END of boot (`entry.ts:662`); Task 5 will acquire it early
-via the new `acquireInstanceLock`, fixing a pre-existing race where a second
-instance booted fully (including server spawn) before being turned away.
+Five small DI-module changes that profiles depend on. Default-path behavior
+is unchanged for each except the `second-instance` surfacing fix (a deliberate
+bug fix — see below). Note: `main.ts` today requests the single-instance
+lock at the very END of boot (`entry.ts:662`); Task 5/6 will acquire it once
+the profile choice is final via the new `acquireInstanceLock`, fixing a
+pre-existing race where a second instance booted fully (including server
+spawn) before being turned away.
 
 **Files:**
-- Modify: `electron/main.ts` (new `acquireInstanceLock`; `initMainProcess` stops requesting the lock)
+- Modify: `electron/main.ts` (new `acquireInstanceLock`; `initMainProcess` stops requesting the lock; `second-instance` handler shows tray-hidden windows)
 - Modify: `electron/tray.ts` (optional tooltip override)
 - Modify: `electron/server-spawner.ts` (exported `buildSpawnEnv`, `FRESHELL_CONFIG_DIR` in spawn env)
 - Modify: `electron/startup.ts` (warn-log on hotkey registration failure)
@@ -857,6 +887,26 @@ describe('acquireInstanceLock', () => {
   })
 })
 ```
+
+Also add a resident-surfacing regression test — the mock app is an
+`EventEmitter`, so the registered `second-instance` handler fires via `emit`:
+
+```ts
+it('shows a hidden main window before focusing it on second-instance', async () => {
+  await initMainProcess(deps)
+
+  app.emit('second-instance')
+
+  expect(mockWindow.show).toHaveBeenCalled()
+  expect(mockWindow.focus).toHaveBeenCalled()
+  expect(mockWindow.show.mock.invocationCallOrder[0])
+    .toBeLessThan(mockWindow.focus.mock.invocationCallOrder[0])
+})
+```
+
+(A tray-hidden Default window is hidden, not minimized: today the handler only
+`restore()`s minimized windows, so `focus()` on a hidden window is a silent
+no-op and a turned-away same-profile launch does nothing visible.)
 
 `test/unit/electron/tray.test.ts` — add inside the existing describe:
 
@@ -950,6 +1000,26 @@ export function acquireInstanceLock(app: ElectronApp): boolean {
 
 `initMainProcess` drops its lock block; its header comment gains: "The caller
 must hold the instance lock already (see `acquireInstanceLock`)."
+
+Also in `initMainProcess`, fix the `second-instance` handler to surface a
+hidden (tray-resident) window, not just a minimized one:
+
+```ts
+  // Second instance: surface and focus the existing window
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized?.()) {
+        mainWindow.restore?.()
+      }
+      mainWindow.show?.()
+      mainWindow.focus?.()
+    }
+  })
+```
+
+(Pre-existing bug, exposed by per-profile turn-away semantics: with
+`minimizeToTray: true` the resident window is hidden — `focus()` alone does
+nothing visible.)
 
 `electron/tray.ts`:
 
@@ -1064,13 +1134,20 @@ the profile's config dir.
 
 **Files:**
 - Modify: `server/freshell-home.ts`
-- Modify (only if the audit finds manual joiners): any `server/**` file that
-  builds `~/.freshell` paths without going through `getFreshellConfigDir()`
+- Modify: `server/logger.ts` (three `resolve*LogPath` fns re-routed, `FRESHELL_LOG_DIR` precedence kept)
+- Modify: `server/coding-cli/codex-app-server/durability-store.ts` (re-routed, override precedence kept)
+- Modify: `server/coding-cli/codex-app-server/runtime.ts` (import-time const → call-time getter, `FRESHELL_CODEX_SIDECAR_DIR` precedence kept)
+- Modify: `server/fresh-agent-extras-router.ts` (attachments + checkpoint shadow repo dirs re-routed)
+- Modify: `server/fresh-agent/recovery-store.ts` (constructor default re-routed; lazy singleton accepted as-is)
 - Test: `test/unit/server/freshell-home.test.ts` (new)
+- Test: one behavioral test per re-routed consumer (extend that consumer's existing test file; each pins profile-dir routing + override precedence)
 
 **Interfaces:**
 - Consumes: `process.env.FRESHELL_CONFIG_DIR` (absolute or relative path).
-- Produces: unchanged signatures; `getFreshellConfigDir(env?)` now honors the override.
+- Produces: `getFreshellConfigDir(env?)` honors the override; `runtime.ts`'s
+  exported `DEFAULT_CODEX_SIDECAR_METADATA_DIR` const becomes an exported
+  call-time getter (e.g. `defaultCodexSidecarMetadataDir()`) — its sole
+  consumer (`:358`) is updated. All other public signatures unchanged.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -1150,20 +1227,42 @@ export function getFreshellConfigDir(env: NodeJS.ProcessEnv = process.env): stri
 }
 ```
 
-Then AUDIT for manual joiners and route them through `getFreshellConfigDir`:
+Then route the consumer set through the helper, from the PRE-ENUMERATED table
+below (load-bearing validation LB-01 replaced ad-hoc auditing; the validators'
+file:line evidence is at `.worktrees/.the-usual-logs/electron-multi-profile/reports/load-bearing-validator-lb-01.md`).
 
-Run: `rg -n "getFreshellHomeDir\(" server/ test/ --type ts`
+**a) Re-route through `getFreshellConfigDir()` (call-time) — profile-scoped:**
+
+| Site | Change |
+|---|---|
+| `server/logger.ts:104-105,119-120,138-139` (three `resolve*LogPath` fns) | Route the default through `getFreshellConfigDir` (join `<configDir>/logs/<file>`), KEEPING each `FRESHELL_LOG_DIR` override's precedence unchanged (behavior-preserving when neither var is set). This is an ACCEPTANCE CRITERION of this task — the README's "logs per profile" promise (Task 9) is false without it. Do NOT apply the leave-deliberately hatch here. |
+| `server/coding-cli/codex-app-server/durability-store.ts:26-27` | Default `defaultCodexDurabilityStoreDir()` to `path.join(getFreshellConfigDir(), 'codex-durability')`, keeping `FRESHELL_CODEX_DURABILITY_DIR` precedence. |
+| `server/coding-cli/codex-app-server/runtime.ts:226` (consumed `:358` via `defaultMetadataDir()`) | Restructure the import-time exported const into a call-time getter (e.g. `defaultCodexSidecarMetadataDir()`), keeping `FRESHELL_CODEX_SIDECAR_DIR` precedence; update the sole consumer. |
+| `server/fresh-agent-extras-router.ts:21` (attachments) | Route through `getFreshellConfigDir()`. |
+| `server/fresh-agent-extras-router.ts:77` (checkpoint shadow repos) | Route through `getFreshellConfigDir()`. DECISION: profile-scoped (splitting is the lesser evil — the shadow repos track per-client edit sessions). |
+| `server/fresh-agent/recovery-store.ts:59` (+ lazy singleton `:152-154`) | Route the constructor default through `getFreshellConfigDir()`. Accept the lazy-singleton binding ("env honored if set before first `get()`" — true for env-at-launch, which is the only way spawn env reaches the server). |
+
+**b) Leave machine-global deliberately (note in commit message):**
+
+| Site | Why machine-global |
+|---|---|
+| `server/network-manager.ts:67-69` (Windows firewall ports file) | One machine = one firewall; two files = split-brain port bookkeeping. ALSO: this site's `FRESHELL_HOME`-direct shape (no `/.freshell` suffix) diverges from the helper — do NOT mechanically re-route it (that would change behavior for `FRESHELL_HOME`-only deployments). Leave entirely as-is. |
+| `server/wsl-port-forward.ts:60` (WSL port-forwards file) | Same one-machine rationale (one WSL VM). |
+| `server/index.ts:296` (checkout-scoped extensions dir) | Deliberately cwd/project-scoped, not home state. |
+| `server/mcp/config-writer.ts:163,167` (per-project MCP sidecar) | Deliberately project-scoped. |
+| `server/config-store.ts:236` | Hardcoded `~/.freshell` in a user-facing warning string — cosmetic drift only, not a resolution site; leave. |
+
+Already-clean call-time consumers (no changes; was the plan's old list):
+`bootstrap.ts:168`, `tabs-registry/store.ts:314`, `instance-id.ts:9`,
+`index.ts:241`, `cli/config.ts:10`, `get-network-host.ts:45`,
+`config-store.ts:80`, and `session-scanner/service.ts:56` (lazy-bound via
+`getSessionRepairService` — accepted, env-at-launch).
+
+Sanity greps after the re-route (expect zero NEW hits vs the pre-list above):
+
+Run: `rg -n "getFreshellHomeDir\(" server/ --type ts`
 Run: `rg -n -e "\.freshell" server/ --type ts`
 
-For every hit, read the surrounding code. Required outcome: every server-side
-`~/.freshell` path resolution flows through `getFreshellConfigDir(env)`
-(call-time, not import-time, so `process.env` is honored). Known consumers to
-verify: `server/bootstrap.ts` (config path), `server/logger.ts`,
-`server/tabs-registry/store.ts`, `server/instance-id.ts`,
-`server/index.ts`, `server/session-scanner/service.ts`, `server/cli/config.ts`,
-`server/get-network-host.ts`. Do not change behavior of any path that is
-deliberately not config-dir-scoped; if such a case exists, leave it and note it
-in the commit message.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -1173,7 +1272,8 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-If the audit found manual joiners, they now call `getFreshellConfigDir()`.
+The re-routed consumers now call `getFreshellConfigDir()`; the import-time
+const at `runtime.ts:226` is a call-time getter.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1181,16 +1281,45 @@ Impacted: every server unit touching home/config resolution.
 
 Run: `npm run test:vitest -- run test/unit/server test/unit/vite-config.test.ts`
 
-Expected: PASS (no behavior change when `FRESHELL_CONFIG_DIR` is unset).
+Expected: PASS (no behavior change when `FRESHELL_CONFIG_DIR` is unset — every
+re-routed site's default still lands at `~/.freshell/...`; the deliberately
+machine-global sites are untouched, including `network-manager.ts`'s divergent
+`FRESHELL_HOME`-direct shape).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add server/freshell-home.ts test/unit/server/freshell-home.test.ts \
-  $(git -C . diff --name-only -- server/ | tr '\n' ' ') \
+git add server/freshell-home.ts server/logger.ts \
+  server/coding-cli/codex-app-server/durability-store.ts \
+  server/coding-cli/codex-app-server/runtime.ts \
+  server/fresh-agent-extras-router.ts server/fresh-agent/recovery-store.ts \
+  test/unit/server/freshell-home.test.ts \
+  $(git -C . diff --name-only -- server/ test/ | tr '\n' ' ') \
   docs/plans/2026-08-26-electron-multi-profile.md
 git commit -m "feat(server): honor FRESHELL_CONFIG_DIR for config dir resolution"
 ```
+
+Commit message MUST additionally carry this rollout caveat (a near-verbatim
+version also lands in the README via Task 9):
+
+> **Daemon-unit caveat:** This change makes the Node server honor
+> `FRESHELL_CONFIG_DIR`. The shipped daemon templates
+> (`installers/systemd/freshell.service.template`, the launchd plist, and the
+> Windows task XML) have always contained an (until now inert)
+> `FRESHELL_CONFIG_DIR` line — if you previously generated a unit from them by
+> hand and substituted a non-default config directory, that value now takes
+> effect at the server's next start: config.json, tabs registry, instance id,
+> and logs will relocate to (or be created fresh in) that directory, which
+> looks like a settings reset. Either delete the `FRESHELL_CONFIG_DIR` line
+> from your unit, or move your existing `~/.freshell` contents into the
+> directory it names. Units installed with the default `~/.freshell` path are
+> unaffected, as are all Rust-server installs (`freshell-rust.service`,
+> `launch-rust.sh`), which do not read this variable.
+>
+> Machine-global by design (unchanged): Windows firewall port bookkeeping
+> (`network-manager.ts`), WSL port-forward bookkeeping (`wsl-port-forward.ts`),
+> checkout-scoped `server/index.ts` extensions dir, project-scoped MCP sidecars.
+> (`load-bearing-validator-lb-01.md`, full consumer table.)
 
 ---
 
@@ -1293,14 +1422,22 @@ import { acquireInstanceLock, initMainProcess } from './main.js'
 
 (remove the old `import { initMainProcess } from './main.js'`.)
 
-(b) In `main()`, immediately after `await app.whenReady()` (before the
-`electron_main_started` log, so a lock-loser never writes into the winner's
-per-profile log):
+(b) In `main()`, immediately after the existing `electron_main_started` log
+(before `window-all-closed` registration and before any side effects such as
+provisioning or server spawn. Task 6 will insert the profile-picker block
+immediately BEFORE this lock gate — under the LB-02 "resolve-then-lock"
+policy the lock is only ever requested once the profile choice is final,
+which for explicit flag/env launches is exactly here). Keep the comment
+accurate: a picker-launch lock-loser WILL have written its `started` line
+into the default profile's log before being turned away — harmless (same
+shared file the Default resident uses) and diagnostically useful:
 
 ```ts
-  // Per-profile single-instance lock, acquired BEFORE any side effects
-  // (provisioning, server spawn). Keyed to the userData dir, so each profile
-  // holds an independent lock and a same-profile duplicate quits here.
+  // Per-profile single-instance lock, acquired once the profile choice is
+  // final and BEFORE any side effects (provisioning, server spawn). Keyed to
+  // the userData dir, so each profile holds an independent lock and a
+  // same-profile duplicate quits here (delivering `second-instance` to the
+  // resident, which then shows its window — see Task 3's surfacing fix).
   if (!instanceLockHeld) {
     if (!acquireInstanceLock(app)) {
       return
@@ -1326,17 +1463,68 @@ createTray(Tray as any, Menu as any, iconPath, { /* existing callbacks */ },
 (d) In the `ipcMain.removeHandler(...)` block, also remove `'get-profiles'`
 and `'choose-profile'` (added in Task 6) so main() re-entry stays clean.
 
-- [ ] **Step 4: Verify compile + unit suite + dev smoke**
+- [ ] **Step 4: Verify compile + unit suite + sandboxed dev smoke**
 
 Run: `npm run build:electron && npm run test:vitest -- --config config/vitest/vitest.electron.config.ts --run`
 
 Expected: PASS both.
 
-Manual smoke (dev, then discard): `ELECTRON_DEV=0 npx electron . --profile=smoketest` from the worktree
-(after `npm run build:electron`) should fail noisily only about missing
-dist/server, and `ls ~/.freshell-smoketest/logs` should show an
-`electron-main.*.jsonl` mentioning `"profile":"smoketest"`; then
-`rm -rf ~/.freshell-smoketest ~/.config/freshell-smoketest`.
+Manual smoke (sandboxed, then discard). This host has no display (`DISPLAY`
+unset): without one, Electron dies at ozone init (`Missing X server or
+$DISPLAY`, SIGSEGV) **before** `whenReady()`, and the main-process logger only
+creates its file lazily on the first `log()` call (which fires after
+`whenReady()`), so an un-wrapped run produces no log file at all. The smoke
+MUST therefore run under `xvfb-run -a` with a fully throwaway HOME so the real
+`~/.freshell*` is never touched (procedure executed and pinned during
+load-bearing validation — `.worktrees/.the-usual-logs/electron-multi-profile/reports/load-bearing-validator-lb-03.md`).
+From the worktree:
+
+```bash
+SMOKE=/tmp/freshell-profile-smoke-$$
+mkdir -p "$SMOKE"/{home,xdg,cache,data}
+env -u DISPLAY \
+  HOME="$SMOKE/home" XDG_CONFIG_HOME="$SMOKE/xdg" \
+  XDG_CACHE_HOME="$SMOKE/cache" XDG_DATA_HOME="$SMOKE/data" \
+  ELECTRON_DEV=0 timeout 30 xvfb-run -a npx electron . --profile=smoketest \
+  > "$SMOKE/boot.log" 2>&1
+echo "exit=$?"
+```
+
+Expected observable evidence:
+
+1. `exit=124` — timeout killed a process that was still alive at 30 s. Any
+   other code (1 = ozone SIGSEGV ⇒ display wrapper missing; anything else ⇒
+   crash) fails the smoke. A trailing `FATAL:...Failed to shutdown` + SIGTRAP
+   pair at the 30 s mark is the kill artifact, not a failure.
+2. `boot.log` contains **no** `Missing X server` line and **no** mention of
+   `dist/server`. It DOES contain:
+   `electron: Failed to load URL: file://<worktree>/dist/wizard/index.html with error: ERR_FILE_NOT_FOUND`
+   — expected, and it is the proof the boot reached the setup-wizard path: a
+   fresh HOME has no `desktop.json`, so `setupCompleted:false` routes to the
+   wizard (`runStartup` returns `{ type: 'wizard' }` before any server spawn),
+   and `build:electron` does not build the wizard bundle (`build:wizard` /
+   full `build` do). Optional: run `npm run build:wizard` first to make the
+   line disappear; the smoke passes either way. GPU (`viz_main_impl`), DBus
+   (`StartServiceByName ... NoReply`), UNDICI proxy, and possibly
+   `electron-updater not available` lines are benign noise on this host.
+3. `ls "$SMOKE/home/.freshell-smoketest/logs/"` shows
+   `electron-main.<pid>.jsonl` whose first line contains
+   `"event":"electron_main_started"` and `"profile":"smoketest"`.
+   Timing caveat: this file is created lazily by the first log record, which
+   fires only after `whenReady()` — its mere existence is the proof the display
+   path worked; a no-display boot writes nothing. (The default profile would
+   log to `$SMOKE/home/.freshell/logs/` instead — Task 5's namespacing is what
+   moves it to `.freshell-smoketest`.)
+4. `ls "$SMOKE/xdg/"` shows the profile's userData dir (per Task 2's
+   `userDataDirForProfile` layout) — full userData/lock/config isolation
+   assertions remain Task 8 e2e's job; this step only checks the sandbox
+   captured them.
+5. Leak check (must pass): `ls -ld ~/.freshell-smoketest ~/.config/freshell*`
+   still says "No such file or directory", and
+   `ss -tln | grep -E ':3001 |:517[3-9] '` is unchanged from before the run
+   (the wizard path never spawns a server, so no new listener may appear).
+
+Cleanup: `rm -rf "$SMOKE"`.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -1363,11 +1551,22 @@ git commit -m "feat(electron): boot-time profile wiring (userData namespacing, e
 
 The picker window runs in the LAUNCHER process (default userData, default
 config dir) when no explicit profile was given and the registry names ≥1
-profile. Choosing **Default** continues this process's boot (no relaunch — the
-launcher ALREADY occupies the default environment; relaunching would race the
-launcher's just-released lock). Choosing a named profile relaunches with
-`--profile=<id>` and exits (the named userData lock is free, so no race).
-Closing the picker without choosing exits the app.
+profile — and it runs **holding no instance lock**: the picker block is placed
+in `main()` BEFORE Task 5's lock gate (resolve-then-lock, LB-02 Design A). A
+flag-less launch can therefore always show the picker, even while a Default
+instance is resident. Choosing **Default** continues in-process and acquires
+the default profile's lock at the gate; if a Default became resident in the
+meantime the lock fails, the process quits, and the resident surfaces its
+window via `second-instance` (Task 3's show-before-focus fix makes that
+visible when the window was tray-hidden). Choosing a named profile relaunches
+with `--profile=<id>` and exits (this process holds no lock, so the relaunch
+is race-free). Closing the picker without choosing exits the app.
+
+Accepted policy under this ordering: two racing flag-less launches may each
+show their own picker (no lock is held while picking, so `second-instance`
+cannot focus one picker into the other) — tolerated in the good-faith
+same-user environment; each picker resolves independently and a Default choice
+after a Default became resident degrades to focusing the resident.
 
 **Files:**
 - Create: `electron/profile-choice-handler.ts`
@@ -1530,6 +1729,10 @@ Add the launcher picker function (module level):
  * a named choice relaunches with --profile=<id> and this process exits, so the
  * returned promise simply never settles on that path. Closing the picker
  * without choosing exits the app.
+ *
+ * NOTE: this process holds NO instance lock while the picker is up
+ * (resolve-then-lock), so a racing flag-less launch simply shows its own
+ * picker — there is nothing to forward a `second-instance` focus to.
  */
 async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
   const pickerWin = new BrowserWindow({
@@ -1544,17 +1747,9 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
     },
   })
   const pickerWebContentsId = pickerWin.webContents.id
-  const onSecondInstance = () => {
-    if (!pickerWin.isDestroyed()) {
-      pickerWin.show()
-      pickerWin.focus()
-    }
-  }
-  app.on('second-instance', onSecondInstance)
 
   let continuing = false
   const cleanup = () => {
-    app.removeListener('second-instance', onSecondInstance)
     ipcMain.removeHandler('get-profiles')
     ipcMain.removeHandler('choose-profile')
   }
@@ -1600,8 +1795,12 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
 }
 ```
 
-And in `main()`, after the provisioning block and pendingForcedLaunch
-consumption, before `const desktopConfig = (await readDesktopConfig(configDir))`:
+And in `main()`, insert the picker block BEFORE the Task 5 (b) lock gate
+(right after the `electron_main_started` log). Under resolve-then-lock, a
+flag-less launch reaches this point holding no lock, so the picker shows even
+when a Default instance is resident; explicit-profile launches
+(`profileChoiceMade === true` from module top) skip the picker and hit the
+lock gate directly:
 
 ```ts
   // --- Profile picker -------------------------------------------------------
@@ -1620,6 +1819,14 @@ consumption, before `const desktopConfig = (await readDesktopConfig(configDir))`
     }
   }
 ```
+
+One ordering note to keep while editing `main()`: **provisioning remains AFTER
+this whole picker+lock preamble** (the current `entry.ts` order is
+whenReady → log → window-all-closed → provisioning → pendingForcedLaunch →
+readDesktopConfig — the picker+lock gate belongs between the log and
+window-all-closed). The picker's launcher process must not apply provisioning
+patches before the profile choice is final; provisioning of a named profile
+happens inside the relaunched process.
 
 - [ ] **Step 4: Run the focused test + compile**
 
@@ -2084,6 +2291,69 @@ test.describe('Profile picker', () => {
     await window.waitForLoadState('domcontentloaded')
     await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
   })
+
+  // LB-02 / resolve-then-lock: a flag-less launch must reach the picker even
+  // while a Default-profile instance is resident (the picker phase holds no
+  // lock). This is the steady state the feature exists for (minimizeToTray
+  // defaults true, so Default typically stays resident).
+  test('a flag-less launch while Default is resident still shows the picker', async () => {
+    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
+
+    // First process: pick Default, becomes the resident Default instance.
+    app = await launchApp(tmpHome)
+    const firstPicker = await app.firstWindow()
+    await firstPicker.waitForLoadState('domcontentloaded')
+    await firstPicker.getByRole('button', { name: 'Default' }).click()
+    // Resident evidence: first-run wizard (fresh home) proves Default booted.
+    await expect.poll(async () => {
+      for (const win of app!.windows()) {
+        if (await win.locator('h1:has-text("Welcome to Freshell")').count() > 0) return true
+      }
+      return false
+    }, { timeout: 30_000 }).toBe(true)
+
+    // Second flag-less launch must show ITS OWN picker (initially under test
+    // this succeeds because the picker phase holds no lock).
+    const app2 = await launchApp(tmpHome)
+    try {
+      const picker2 = await app2.firstWindow()
+      await picker2.waitForLoadState('domcontentloaded')
+      await expect(
+        picker2.getByRole('heading', { name: 'Choose a Freshell profile' }),
+      ).toBeVisible({ timeout: 30_000 })
+    } finally {
+      await app2.close().catch(() => {})
+    }
+  })
+
+  // Same-profile turn-away stays intact: an explicit duplicate of the resident
+  // profile is turned away at the lock gate, and the resident surfaces.
+  test('an explicit duplicate of a resident profile quits and surfaces the resident', async () => {
+    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
+    app = await launchApp(tmpHome, ['--profile=work'])
+    const window = await app.firstWindow()
+    await window.waitForLoadState('domcontentloaded')
+    // Named profile, fresh HOME → first-run wizard proves we are resident.
+    await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
+
+    const app2 = await electron.launch({
+      args: [PROJECT_ROOT, '--profile=work'],
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
+      },
+      cwd: PROJECT_ROOT,
+    })
+    // The turned-away process must exit on its own (lock acquisition failed
+    // → app.quit()). firstWindow() would hang forever if it stayed alive, so
+    // poll the process handle instead.
+    await expect.poll(
+      () => app2.process().exitCode,
+      { timeout: 30_000 },
+    ).not.toBeNull()
+    await app2.close().catch(() => {})
+  })
 })
 ```
 
@@ -2104,11 +2374,11 @@ until Tasks 6-7 are in; on a tree where earlier tasks already landed, the
 first spec fails at the heading assertion and the namespacing spec fails at
 the `freshell-e2ework` userData assertion).
 
-- [ ] **Step 3: Confirm all four specs pass**
+- [ ] **Step 3: Confirm all six specs pass**
 
 Run: `CI=true npx playwright test --config test/e2e-electron/playwright.electron.config.ts profile-picker` (with `xvfb-run -a` if needed)
 
-Expected: 4 passed.
+Expected: 6 passed.
 
 - [ ] **Step 4: Refactor while green**
 
@@ -2203,6 +2473,24 @@ starts with a fresh configuration.
 - Auto-update relaunches the app without `--profile`: after an update, the
   picker shows again (pick your profile back).
 - Installing/upgrading on Windows terminates all running Freshell instances.
+- Relaunching while a profile is running: on Linux/Windows, a launch without a
+  flag shows the picker again and choosing the running profile focuses its
+  window; launching with the same `--profile` as a running instance focuses
+  that window (the new process quits). On macOS, relaunching from Finder or
+  the Dock while ANY Freshell instance is running just activates the running
+  instance (the OS enforces this) and never shows the picker — use
+  `--profile=` flags or `FRESHELL_PROFILE` from a terminal, or Quit before
+  relaunching to get the picker. Two simultaneous flag-less launches can each
+  show their own picker window; that's expected, pick once in either one.
+- Daemon-service caveat for the Node server: the shipped daemon templates have
+  always contained an (until now inert) `FRESHELL_CONFIG_DIR` environment
+  line; starting with this release the Node server honors it. If you
+  hand-generated a daemon unit from those templates with a non-default config
+  directory, the value now takes effect at next start (state relocates to that
+  directory): remove the line from your unit, or move your existing
+  `~/.freshell` contents into the directory it names. Units using the default
+  `~/.freshell` path are unaffected; Rust-server installs never read this
+  variable.
 ```
 
 - [ ] **Step 2: Verify rendering**
