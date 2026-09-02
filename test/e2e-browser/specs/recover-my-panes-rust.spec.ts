@@ -922,6 +922,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       const res = await req.get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
       expect(res.ok(), `inventory probe must succeed (status ${res.status()})`).toBe(true)
       const body = (await res.json()) as { ledgerOnly?: Array<{ sessionId?: unknown }> }
+      // Anti-vacuity: prove the bucket shape before asserting absence — a probe
+      // whose response dropped `ledgerOnly` must fail, not pass vacuously.
+      expect(Array.isArray(body.ledgerOnly), 'probe response must carry a ledgerOnly array').toBe(true)
       expect(
         (body.ledgerOnly ?? []).every((e) => e.sessionId !== junkSessionId),
         `stale never-open ledger row ${junkSessionId} must NOT be present in the inventory's `
@@ -944,5 +947,6 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     // surviving rows join their original tab and that the trailing tab only
     // appears for rows whose tab vanished).
     await ctxB.close()
+    await fs.rm(markerDir, { recursive: true, force: true })
   })
 })

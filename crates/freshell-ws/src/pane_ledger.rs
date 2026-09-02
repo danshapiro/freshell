@@ -751,10 +751,14 @@ impl PaneLedger {
     /// [`Self::delete_pending`]'s atomic delete; missing file == already
     /// gone). PIN 2 (Step 4b): the ONLY caller is the spawn-failure branch
     /// of a FRESH claude preallocation — its pre-spawn row describes a pane
-    /// that never existed, and left in place it would surface as a ghost
-    /// `ledgerOnly` recovery offer for ~30 days. Never used for resume
-    /// creates: their row belongs to the prior epoch and must stay
-    /// recoverable.
+    /// that never existed. Left in place it could still surface as a ghost
+    /// `ledgerOnly` recovery offer across the row's ~30-day lifetime: the D8
+    /// parent-relative judgment narrows ghost offers to stamped rows inside
+    /// their own parent client's grace window (unattributed rows are never
+    /// offered), but this row IS connection-stamped and its bind sits inside
+    /// that window by construction — so the durable delete remains the only
+    /// guarantee it never surfaces. Never used for resume creates: their row
+    /// belongs to the prior epoch and must stay recoverable.
     pub fn delete_binding(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
         let Some(root) = &self.root else {
             return Ok(());

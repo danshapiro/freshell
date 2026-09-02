@@ -13,7 +13,37 @@ pub struct DeviceUnion {
     pub union_doc: Value,
 }
 
+/// One device dir's A15/A16 survivor selection: the retained generation ids
+/// to compose the union from, PLUS each surviving client's revision-first
+/// WINNER generation's capturedAt (the D8 parent-relative judgment input).
+pub struct ForeignSelection {
+    pub selected_ids: Vec<String>,
+    /// (client_instance_id, winner capturedAt) per surviving client, sorted
+    /// by client id for deterministic output.
+    pub winner_captured_at_by_client: Vec<(String, u64)>,
+}
+
+/// D8 parent evidence, per device: `[(client_instance_id, winner_captured_at)]`
+/// for each client that survived that device dir's A15/A16 selection.
+pub type DeviceEvidence = Vec<(String, Vec<(String, u64)>)>;
+
 const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabRegistrySync.ts:21, 475-477)
+
+/// D8 (restore-open-sessions-only): a Bound, unreferenced, not-live ledger
+/// row is offered ONLY while its own stamped parent client's evidence cannot
+/// yet have observed its absence — judged per row against that parent, never
+/// against a cohort aggregate (an aggregate MIN inherits any older surviving
+/// client's clock; a MAX drops a lost window's genuine kill-window rows
+/// whenever a second window keeps pushing). Unattributed rows (headless
+/// REST/MCP lineage, pre-upgrade rows) are never offered. The grace is one
+/// 5s diff-push cadence + 2s slack, both stamps server-clock. A kill-window
+/// row's bind postdates its parent's last retained push, so it keeps
+/// unconditionally (the SIGKILL-within-5s contract). The parent's "newest" is
+/// the capturedAt of its REVISION-FIRST winner generation — the same
+/// `generation_rank` ordering the union composition applies — so the judgment
+/// and the offered unions can never disagree about which generation is newest
+/// (a raw capturedAt-max would, after a backward server-clock step).
+const UNSNAPSHOTTED_BINDING_GRACE_MS: u64 = 7_000;
 
 /// A15 staleness + A16 concurrent-client rules (D2): drop the requester's own
 /// generations; drop clients ALL of whose retained generations postdate
@@ -22,17 +52,24 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// all predate the fresh boot, so retention depth cannot misclassify it); then
 /// drop clients whose newest generation is >15 min older than the device max
 /// over the REMAINING clients (junk must never stale-out real recovery data).
+/// Returns the surviving clients' generation ids PLUS each survivor's
+/// revision-first-winner capturedAt for the D8 parent-relative judgment.
 pub fn select_foreign_recent_generation_ids(
     generations: &[Value],
     exclude_client: &str,
     boot_cutoff_ms: u64,
-) -> Vec<String> {
+) -> ForeignSelection {
     let foreign: Vec<&Value> = generations
         .iter()
         .filter(|g| g["clientInstanceId"].as_str() != Some(exclude_client))
         .collect();
     let mut oldest_by_client: HashMap<&str, u64> = HashMap::new();
     let mut newest_by_client: HashMap<&str, u64> = HashMap::new();
+    // Revision-first winner per client — the SAME `generation_rank` ordering
+    // the union composition applies, so the D8 evidence can never disagree
+    // with the offered union about which generation is a client's newest
+    // (a raw capturedAt-max would, after a backward server-clock step).
+    let mut winner_rank_by_client: HashMap<&str, (i64, i64)> = HashMap::new();
     for g in &foreign {
         let c = g["clientInstanceId"].as_str().unwrap_or("");
         let t = g["capturedAt"].as_u64().unwrap_or(0);
@@ -44,6 +81,13 @@ pub fn select_foreign_recent_generation_ids(
         if t > *e {
             *e = t;
         }
+        let rank = freshell_ws::tabs_persist::generation_rank(g);
+        let w = winner_rank_by_client
+            .entry(c)
+            .or_insert((i64::MIN, i64::MIN));
+        if rank > *w {
+            *w = rank;
+        }
     }
     let pre_boot = |c: &str| oldest_by_client.get(c).copied().unwrap_or(u64::MAX) < boot_cutoff_ms;
     let device_max = newest_by_client
@@ -52,15 +96,24 @@ pub fn select_foreign_recent_generation_ids(
         .map(|(_, t)| *t)
         .max()
         .unwrap_or(0);
-    foreign
+    let survives = |c: &str| {
+        pre_boot(c) && newest_by_client.get(c).copied().unwrap_or(0) + STALE_CLIENT_MS >= device_max
+    };
+    let selected_ids: Vec<String> = foreign
         .iter()
-        .filter(|g| {
-            let c = g["clientInstanceId"].as_str().unwrap_or("");
-            pre_boot(c)
-                && newest_by_client.get(c).copied().unwrap_or(0) + STALE_CLIENT_MS >= device_max
-        })
+        .filter(|g| survives(g["clientInstanceId"].as_str().unwrap_or("")))
         .filter_map(|g| g["generationId"].as_str().map(String::from))
-        .collect()
+        .collect();
+    let mut winner_captured_at_by_client: Vec<(String, u64)> = winner_rank_by_client
+        .iter()
+        .filter(|(c, _)| survives(c))
+        .map(|(c, (_, captured))| (c.to_string(), (*captured).max(0) as u64))
+        .collect();
+    winner_captured_at_by_client.sort();
+    ForeignSelection {
+        selected_ids,
+        winner_captured_at_by_client,
+    }
 }
 
 fn ref_key(provider: &str, session_id: &str) -> String {
@@ -113,6 +166,7 @@ pub fn build_inventory(
     device_unions: Vec<DeviceUnion>,
     bindings: Vec<BindingRow>,
     live_session_keys: HashSet<(String, String)>,
+    evidence: &DeviceEvidence,
 ) -> Value {
     let by_key: HashMap<String, &BindingRow> = bindings
         .iter()
@@ -251,6 +305,18 @@ pub fn build_inventory(
         })
         .collect();
 
+    // D8 judgment inputs (see UNSNAPSHOTTED_BINDING_GRACE_MS): the primary
+    // device's surviving-client evidence — the only cohort whose rows can be
+    // offered at all.
+    let primary_device_id = primary_idx.map(|i| unions[i].device_id.as_str());
+    let primary_clients = primary_device_id.and_then(|id| {
+        evidence
+            .iter()
+            .find(|(device, _)| device == id)
+            .map(|(_, clients)| clients.as_slice())
+    });
+
+    let mut d8_dropped = 0usize;
     let ledger_only: Vec<Value> = bindings
         .iter()
         .filter(|r| row_is_bound(r))
@@ -258,11 +324,28 @@ pub fn build_inventory(
         .filter(|r| !referenced.contains(&ref_key(&row_provider(r), &row_session_id(r))))
         // live rows are excluded: sessions still running are never offered for resume (D7)
         .filter(|r| !is_live(&row_provider(r), &row_session_id(r)))
+        .filter(|r| {
+            let keep = d8_parent_relative_keep(r, primary_device_id, primary_clients);
+            if !keep {
+                d8_dropped += 1;
+            }
+            keep
+        })
         .map(|r| {
-            json!({"provider": row_provider(r), "sessionId": row_session_id(r),
-                   "mode": row_mode(r), "cwd": row_cwd(r)})
+            let mut entry = json!({"provider": row_provider(r), "sessionId": row_session_id(r),
+                   "mode": row_mode(r), "cwd": row_cwd(r)});
+            // D8: forward the stamped tabKey for the client-side original-tab join.
+            if let Some(tab_key) = &r.tab_key {
+                entry["tabKey"] = json!(tab_key);
+            }
+            entry
         })
         .collect();
+    tracing::debug!(target: "freshell_server::recovery_inventory",
+        dropped = d8_dropped,
+        kept = ledger_only.len(),
+        primary = primary_device_id.is_some(),
+        "D8 excluded stale/unattributed ledger rows");
 
     // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3)
     substance.extend(ledger_only.iter().map(|e| {
@@ -279,6 +362,39 @@ pub fn build_inventory(
     json!({"recoverable": recoverable, "contentId": content_id,
            "device": device.unwrap_or(Value::Null),
            "otherDevices": other_devices, "ledgerOnly": ledger_only})
+}
+
+/// D8 (restore-open-sessions-only): keep a Bound, unreferenced, not-live row
+/// iff it is ATTRIBUTED (`client_instance_id` && `device_id` present), its
+/// attributed device is the offer's primary device, its attributed client
+/// survives in that device's evidence, and the row's time is within
+/// [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's revision-first-winner
+/// capturedAt. Unattributed / non-primary-device / no-surviving-parent rows
+/// are NEVER offered.
+fn d8_parent_relative_keep(
+    r: &BindingRow,
+    primary_device_id: Option<&str>,
+    primary_clients: Option<&[(String, u64)]>,
+) -> bool {
+    let (Some(client), Some(device)) = (r.client_instance_id.as_deref(), r.device_id.as_deref())
+    else {
+        return false; // unattributed (headless REST/MCP, pre-upgrade) rows are never offered
+    };
+    let (Some(primary), Some(clients)) = (primary_device_id, primary_clients) else {
+        return false; // no primary device => no evidence at all to judge against
+    };
+    if device != primary {
+        return false;
+    }
+    let Some(parent_newest) = clients
+        .iter()
+        .find(|(c, _)| c == client)
+        .map(|(_, captured)| *captured)
+    else {
+        return false; // the row's parent client left no surviving evidence on this device
+    };
+    let row_time = r.updated_at.max(r.created_at).max(0) as u64;
+    row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) >= parent_newest
 }
 
 // Thin accessors over the real `BindingRow` fields/enums
@@ -394,8 +510,8 @@ async fn inventory_handler(
     // Missing param => 0 => boot_cutoff = now, so nothing that predates the
     // request is dropped.
     let boot_cutoff = now_ms().saturating_sub(q.boot_ago_ms.unwrap_or(0));
-    let unions = match state.snapshots_dir.clone() {
-        None => vec![],
+    let (unions, evidence) = match state.snapshots_dir.clone() {
+        None => (vec![], vec![]),
         Some(dir) => {
             let job = tokio::task::spawn_blocking(move || {
                 read_foreign_unions(&dir, &exclude, boot_cutoff)
@@ -416,7 +532,13 @@ async fn inventory_handler(
         }
     };
     let live = live_session_keys(&state.registry, &state.identity);
-    Json(build_inventory(unions, state.ledger.list_bindings(), live)).into_response()
+    Json(build_inventory(
+        unions,
+        state.ledger.list_bindings(),
+        live,
+        &evidence,
+    ))
+    .into_response()
 }
 
 /// Read-only liveness join (D7): `(provider = mode, sessionId)` for every
@@ -509,13 +631,14 @@ fn read_foreign_unions(
     dir: &std::path::Path,
     exclude_client: &str,
     boot_cutoff: u64,
-) -> std::io::Result<Vec<DeviceUnion>> {
+) -> std::io::Result<(Vec<DeviceUnion>, DeviceEvidence)> {
     use freshell_ws::tabs_persist::{
         list_snapshot_devices, read_device_overview, read_generations_union_by_ids, ComponentsUnion,
     };
     let mut out = vec![];
+    let mut evidence: DeviceEvidence = vec![];
     if !dir.is_dir() {
-        return Ok(out);
+        return Ok((out, evidence));
     }
     'devices: for device in list_snapshot_devices(dir)? {
         let mut last_missing: Vec<String> = Vec::new();
@@ -525,18 +648,22 @@ fn read_foreign_unions(
             };
             // Task 1 helper: drops the requester's own generations, concurrent
             // post-boot clients (A16), AND stale clients (A15).
-            let foreign =
+            let selection =
                 select_foreign_recent_generation_ids(&generations, exclude_client, boot_cutoff);
-            if foreign.is_empty() {
+            if selection.selected_ids.is_empty() {
                 continue 'devices;
             }
             injected_prune_between_reads(dir);
-            match read_generations_union_by_ids(dir, &device, &foreign)? {
+            match read_generations_union_by_ids(dir, &device, &selection.selected_ids)? {
                 ComponentsUnion::Found(union_doc) => {
                     out.push(DeviceUnion {
-                        device_id: device,
+                        device_id: device.clone(),
                         union_doc,
                     });
+                    // D8: the judgment's parent evidence comes from the FINAL
+                    // (successful) attempt's selection — the one whose ids
+                    // produced this union.
+                    evidence.push((device, selection.winner_captured_at_by_client));
                     continue 'devices;
                 }
                 // A component pruned between the overview scan and the union
@@ -562,7 +689,7 @@ fn read_foreign_unions(
             ),
         ));
     }
-    Ok(out)
+    Ok((out, evidence))
 }
 
 #[cfg(test)]

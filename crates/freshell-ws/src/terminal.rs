@@ -3522,8 +3522,12 @@ pub(crate) async fn handle_create(
     if let Err(err) = create_result {
         // PIN 2 (Step 4b): the spawn FAILED, so the pre-spawn claude binding
         // row (PIN2_CLAUDE_PRE_SPAWN_BINDING above) now describes a pane
-        // that never existed — left in place it would surface as a ghost
-        // `ledgerOnly` recovery offer for ~30 days. Delete it, but ONLY for
+        // that never existed — left in place it could surface as a ghost
+        // `ledgerOnly` recovery offer across the row's ~30-day lifetime.
+        // (The D8 parent-relative judgment narrows ghost offers to stamped
+        // rows inside their own parent client's grace window; this row IS
+        // connection-stamped and its bind sits inside that window, so the
+        // judgment does NOT save it.) Delete it, but ONLY for
         // a fresh preallocation (this create minted the id, so the row is
         // exclusively ours); a resume-create's row belongs to the prior
         // epoch and must stay recoverable. Same failure policy as the

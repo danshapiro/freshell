@@ -934,6 +934,38 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
   })
 
+  it('stamps freshAgent.create with the pane tab identity (D8 provenance)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-tabid',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // D8 (restore-open-sessions-only): the server composes the ledger row's
+    // tabKey as `deviceId:tabId` from the hello-stamped connection identity
+    // plus this field; the D8 judgment never offers rows whose parent
+    // evidence cannot see them, so a dropped tabId would silently orphan the
+    // pane's placement on restore.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-tabid',
+      tabId: 'tab-1',
+    }))
+  })
+
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
     const store = createStore()
     store.dispatch(initLayout({

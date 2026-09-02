@@ -126,7 +126,12 @@ fn device_dir_for(dir: &Path, device_id: &str) -> Option<PathBuf> {
 
 /// Monotonic-first generation ordering within one client. Client clocks may
 /// move backwards, but `snapshotRevision` may not.
-fn generation_rank(value: &Value) -> (i64, i64) {
+///
+/// `pub` for the recovery inventory's survivor-evidence surface (D8,
+/// restore-open-sessions-only): the offer judgment ranks each client's
+/// generations with EXACTLY this ordering, so the judged "newest" and the
+/// union-composed "newest" can never disagree.
+pub fn generation_rank(value: &Value) -> (i64, i64) {
     (
         value
             .get("snapshotRevision")

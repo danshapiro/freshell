@@ -738,8 +738,12 @@ fn delete_pending_is_a_noop_when_missing() {
 fn deleted_binding_row_is_gone_for_recovery_readers() {
     // PIN 2 (Step 4b): a pre-spawn claude binding whose spawn then FAILED is
     // deleted so it can never surface as a ghost `ledgerOnly` recovery offer.
-    // `list_bindings` is THE reader that feeds the recovery inventory
-    // (`recovery_inventory.rs` build_inventory), so "gone" is judged there.
+    // (The D8 parent-relative judgment already excludes unattributed rows and
+    // anything outside its parent's grace window; the failed-prealloc row is
+    // connection-stamped and bound inside that window, so the delete remains
+    // the only guarantee.) `list_bindings` is THE reader that feeds the
+    // recovery inventory (`recovery_inventory.rs` build_inventory), so "gone"
+    // is judged there.
     let root = temp_root("del-binding");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger

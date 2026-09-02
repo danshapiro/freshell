@@ -89,6 +89,36 @@ fn binding_row(provider: &str, session_id: &str, state_parts: StateParts) -> Bin
     binding_row_at(provider, session_id, state_parts, 1000)
 }
 
+/// D8 attribution knobs: stamp the fixture row the way the connection-scoped
+/// WS create lanes do — `tab_key` composes as `device:tab` (exactly
+/// `BindProvenance::for_create`'s rule).
+fn with_attribution(mut row: BindingRow, client: &str, device: &str, tab_id: &str) -> BindingRow {
+    row.client_instance_id = Some(client.to_string());
+    row.device_id = Some(device.to_string());
+    row.tab_key = Some(format!("{device}:{tab_id}"));
+    row
+}
+
+/// No surviving parent evidence at all (no-snapshot boot, pre-D8 inventory).
+fn no_evidence() -> DeviceEvidence {
+    Vec::new()
+}
+
+/// D8 evidence fixture: device_id -> [(client_instance_id, winner capturedAt)].
+fn evidence(maps: &[(&str, &[(&str, u64)])]) -> DeviceEvidence {
+    maps.iter()
+        .map(|(device, clients)| {
+            (
+                device.to_string(),
+                clients
+                    .iter()
+                    .map(|(client, captured)| (client.to_string(), *captured))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// WAVE-B fast-follow (B3 lane review): the inventory's D7 liveness join must
 /// match the server guard's width (terminal.rs D7 live-guard: identity-registry
 /// owner check PLUS the registry-row scan). A locator-adopted terminal holds
@@ -144,7 +174,7 @@ fn live_session_keys_ignores_retired_and_dead_identity_entries() {
 
 #[test]
 fn empty_inputs_not_recoverable() {
-    let out = build_inventory(vec![], vec![], no_live());
+    let out = build_inventory(vec![], vec![], no_live(), &no_evidence());
     assert_eq!(out["recoverable"], false);
     assert!(out["device"].is_null());
     assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
@@ -168,7 +198,7 @@ fn newest_device_wins_others_summarized() {
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell", "initialCwd": "/w"} }]),
         ),
     };
-    let out = build_inventory(vec![old, new], vec![], no_live());
+    let out = build_inventory(vec![old, new], vec![], no_live(), &no_evidence());
     assert_eq!(out["recoverable"], true);
     assert_eq!(out["device"]["deviceId"], "dev1");
     assert_eq!(out["device"]["tabs"][0]["panes"][0]["cwd"], "/w");
@@ -191,9 +221,17 @@ fn ledger_bound_row_overrides_snapshot_claim_via_superseded_chain() {
     };
     let bindings = vec![
         binding_row("claude", "S1", retired_superseded_by("claude", "S2")),
-        binding_row("claude", "S2", bound()),
+        // S2 is attributed and within grace of its parent's evidence, so ONLY
+        // the referenced rule (A4) keeps it out of ledgerOnly — the test's
+        // subject stays the deciding filter under D8.
+        with_attribution(binding_row("claude", "S2", bound()), "c1", "dev1", "t2"),
     ];
-    let out = build_inventory(vec![d], bindings, no_live());
+    let out = build_inventory(
+        vec![d],
+        bindings,
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["ledgerState"], "bound");
     assert_eq!(pane["sessionRef"]["sessionId"], "S2"); // ledger identity beat the snapshot claim
@@ -218,7 +256,9 @@ fn closed_row_strips_resume_gc_expired_keeps_snapshot_ref_unknown_passes_through
         binding_row("claude", "CLOSED", retired_closed()),
         binding_row("codex", "EXPIRED", retired_gc_expired()),
     ];
-    let out = build_inventory(vec![d], bindings, no_live());
+    // Retired rows never reach the D8 judgment (row_is_bound pre-filters
+    // them), so no evidence is needed.
+    let out = build_inventory(vec![d], bindings, no_live(), &no_evidence());
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(panes[0]["ledgerState"], "closed");
     assert!(panes[0]["sessionRef"].is_null());
@@ -229,10 +269,43 @@ fn closed_row_strips_resume_gc_expired_keeps_snapshot_ref_unknown_passes_through
 }
 
 #[test]
-fn unreferenced_bound_rows_become_ledger_only() {
-    let out = build_inventory(vec![], vec![binding_row("codex", "C9", bound())], no_live());
-    assert_eq!(out["recoverable"], true);
-    assert_eq!(out["ledgerOnly"][0]["sessionId"], "C9");
+fn unattributed_rows_are_never_offered() {
+    // D8 (restore-open-sessions-only) — THE USER'S BUG CLASS: a Bound,
+    // unreferenced, not-live row with NO provenance stamps (REST/headless
+    // lineage, and every pre-upgrade row — e.g. the 30-day tail of closed
+    // fresh-agent panes, natural CLI exits, and plain-detach closes whose
+    // rows are never retired) must NEVER be offered. Deliberate contract
+    // rewrite of the old blanket rule (`unreferenced_bound_rows_become_
+    // ledger_only`): the same fixture the old rule offered is now never
+    // surfaced, so a collapse back to the blanket bucket re-fails loudly.
+    let out = build_inventory(
+        vec![],
+        vec![binding_row("codex", "C9", bound())],
+        no_live(),
+        &no_evidence(),
+    );
+    assert_eq!(out["recoverable"], false);
+    assert!(out["device"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+
+    // Even with a primary device AND surviving parent evidence present, an
+    // unattributed row is still dropped: the attribution clause is judged
+    // before any evidence lookup, so the row can never name that parent.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            5_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![binding_row("codex", "C9", bound())],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -255,10 +328,19 @@ fn bound_row_referenced_by_non_primary_device_is_not_ledger_only() {
                      "payload": { "mode": "codex", "sessionRef": { "provider": "codex", "sessionId": "C9" } } }]),
         ),
     };
+    // C9 is attributed to the PRIMARY device with in-grace parent evidence,
+    // so the D8 judgment alone would offer it — the A4 cross-device
+    // referenced rule remains the deciding filter this test pins.
     let out = build_inventory(
         vec![newer, older],
-        vec![binding_row("codex", "C9", bound())],
+        vec![with_attribution(
+            binding_row("codex", "C9", bound()),
+            "c9",
+            "dev1",
+            "t9",
+        )],
         no_live(),
+        &evidence(&[("dev1", &[("c9", 5_000)])]),
     );
     assert_eq!(out["device"]["deviceId"], "dev1"); // dev0 is NON-primary
     assert_eq!(
@@ -284,12 +366,15 @@ fn live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only() {
     let bindings = vec![
         binding_row("claude", "S1", retired_superseded_by("claude", "S2")),
         binding_row("claude", "S2", bound()),
-        binding_row("codex", "C9", bound()),
+        // C9 is attributed with in-grace parent evidence, so the D8 judgment
+        // alone would offer it — the D7 live rule remains the deciding filter.
+        with_attribution(binding_row("codex", "C9", bound()), "c9", "dev1", "t9"),
     ];
     let out = build_inventory(
         vec![d],
         bindings,
         live(&[("claude", "S2"), ("codex", "C9")]),
+        &evidence(&[("dev1", &[("c9", 5_000)])]),
     );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["live"], true);
@@ -303,9 +388,61 @@ fn live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only() {
 
 #[test]
 fn content_id_is_stable_and_input_sensitive() {
-    let a = build_inventory(vec![], vec![binding_row("codex", "C9", bound())], no_live());
-    let b = build_inventory(vec![], vec![binding_row("codex", "C9", bound())], no_live());
-    let c = build_inventory(vec![], vec![binding_row("codex", "C8", bound())], no_live());
+    // D8 repair: the rows must actually be OFFERED (attributed + within grace
+    // of their parent's surviving evidence) — two inventories whose rows were
+    // both D8-dropped digest identically and the assert_ne below would go
+    // vacuous.
+    let union = || DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            5_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    // row_time = 1_000; 1_000 + 7_000 >= 5_000 => the row is offered.
+    let ev = || evidence(&[("dev1", &[("c1", 5_000)])]);
+    let a = build_inventory(
+        vec![union()],
+        vec![with_attribution(
+            binding_row("codex", "C9", bound()),
+            "c1",
+            "dev1",
+            "t9",
+        )],
+        no_live(),
+        &ev(),
+    );
+    let b = build_inventory(
+        vec![union()],
+        vec![with_attribution(
+            binding_row("codex", "C9", bound()),
+            "c1",
+            "dev1",
+            "t9",
+        )],
+        no_live(),
+        &ev(),
+    );
+    let c = build_inventory(
+        vec![union()],
+        vec![with_attribution(
+            binding_row("codex", "C8", bound()),
+            "c1",
+            "dev1",
+            "t8",
+        )],
+        no_live(),
+        &ev(),
+    );
+    assert!(
+        a["ledgerOnly"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["sessionId"] == "C9"),
+        "the offered row participates in the digest (anti-vacuity)"
+    );
     assert_eq!(a["contentId"], b["contentId"]);
     assert_ne!(a["contentId"], c["contentId"]);
 }
@@ -320,25 +457,276 @@ fn content_id_ignores_timestamp_churn() {
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         )
     };
+    // D8 evidence alignment: the row is attributed and within grace of its
+    // parent's evidence in BOTH builds (2_000 + 7_000 >= 5_000), so it
+    // participates in the digest — the churn-freeness pin covers the row too.
     let a = build_inventory(
         vec![DeviceUnion {
             device_id: "dev1".into(),
             union_doc: doc(1000),
         }],
-        vec![binding_row_at("codex", "C9", bound(), 1000)],
+        vec![with_attribution(
+            binding_row_at("codex", "C9", bound(), 1000),
+            "c1",
+            "dev1",
+            "t9",
+        )],
         no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
     );
     let b = build_inventory(
         vec![DeviceUnion {
             device_id: "dev1".into(),
             union_doc: doc(2000),
         }],
-        vec![binding_row_at("codex", "C9", bound(), 2000)],
+        vec![with_attribution(
+            binding_row_at("codex", "C9", bound(), 2000),
+            "c1",
+            "dev1",
+            "t9",
+        )],
         no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    assert_eq!(
+        a["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "the row must be offered (anti-vacuity)"
     );
     assert_eq!(
         a["contentId"], b["contentId"],
         "bumping only capturedAt/updatedAt must not change contentId"
+    );
+}
+
+// ── D8 (restore-open-sessions-only) parent-relative judgment matrix ──────────
+// A Bound, unreferenced, not-live row is offered ONLY while its own stamped
+// parent's evidence cannot yet have observed its absence.
+
+#[test]
+fn attributed_row_within_grace_of_its_parent_is_offered() {
+    // Parent client "c1" on primary "d1", winner capturedAt = 1_000_000; the
+    // row's updated_at sits EXACTLY at the grace boundary (inclusive):
+    // 993_000 == 1_000_000 - UNSNAPSHOTTED_BINDING_GRACE_MS.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc(
+            "d1",
+            1_000_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 993_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    let only = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(
+        only.len(),
+        1,
+        "993_000 + 7_000 >= 1_000_000: the grace boundary is inclusive"
+    );
+    assert_eq!(only[0]["sessionId"], "S1");
+    // The stamped tabKey is forwarded for the client-side original-tab join.
+    assert_eq!(only[0]["tabKey"], "d1:t1");
+    assert_eq!(out["recoverable"], true);
+}
+
+#[test]
+fn attributed_row_before_its_parents_evidence_is_dropped() {
+    // The paired boundary drop: one ms earlier falls outside the grace
+    // window (992_999 + 7_000 = 999_999 < 1_000_000).
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc(
+            "d1",
+            1_000_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let drop_row = || {
+        with_attribution(
+            binding_row_at("claude", "S1", bound(), 992_999),
+            "c1",
+            "d1",
+            "t1",
+        )
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![drop_row()],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "one ms before the grace boundary the row is dropped"
+    );
+    // recoverable false when the dropped row was the only candidate.
+    let out = build_inventory(
+        vec![],
+        vec![drop_row()],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(out["recoverable"], false);
+    assert!(out["device"].is_null());
+}
+
+#[test]
+fn row_attributed_to_a_non_primary_device_is_dropped() {
+    // D8 device clause (review-round-1 cross-device pin in parent-relative
+    // form): the row's parent client HAS surviving in-grace evidence — but
+    // only the offer's PRIMARY device can offer rows. d1's evidence map also
+    // names the row's client, so without the device-inequality clause the row
+    // would be kept: the clause itself is load-bearing here.
+    let newer = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc(
+            "d1",
+            2_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let older = DeviceUnion {
+        device_id: "d0".into(),
+        union_doc: union_doc(
+            "d0",
+            1_000,
+            json!([{ "paneId": "p0", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = with_attribution(
+        binding_row_at("codex", "C9", bound(), 5_000),
+        "c9",
+        "d0",
+        "t9",
+    );
+    let out = build_inventory(
+        vec![newer, older],
+        vec![row],
+        no_live(),
+        &evidence(&[("d0", &[("c9", 8_000)]), ("d1", &[("c9", 8_000)])]),
+    );
+    assert_eq!(out["device"]["deviceId"], "d1"); // d0 is NON-primary
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "a row attributed to a non-primary device is dropped even in grace"
+    );
+}
+
+#[test]
+fn row_whose_parent_client_left_no_surviving_evidence_is_dropped() {
+    // The stamped parent client is absent from the device's surviving set
+    // (its generations were count-cap-evicted after a reload storm, or its
+    // first boot died before its WS-ready push) — undecidable from retained
+    // data, so never offered.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc(
+            "d1",
+            1_000_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 999_000),
+        "c-gone",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "c-gone is not in the surviving set, so its rows are never offered"
+    );
+}
+
+#[test]
+fn attributed_row_with_no_primary_device_is_dropped() {
+    // No union has any records => no primary device => no evidence at all to
+    // judge against: even an attributed, in-grace row is never offered.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: json!({
+            "deviceId": "d1", "deviceLabel": "label-d1", "capturedAt": 1_000_000,
+            "records": []
+        }),
+    };
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 999_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert!(out["device"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+    assert_eq!(out["recoverable"], false);
+}
+
+#[test]
+fn backward_clock_step_cannot_drop_a_kill_window_row() {
+    // REVIEW-ROUND-2 ranking pin: parent "c1" retained rev1@capturedAt=1_000_000
+    // AND rev2@capturedAt=900_000 (the server clock stepped backward between
+    // pushes). The union's revision-first winner is rev2, so the parent's
+    // "newest" is 900_000 — a raw capturedAt-max (1_000_000) would drop a row
+    // bound right at the loss.
+    let gens = vec![
+        json!({"generationId": "g1", "clientInstanceId": "c1", "snapshotRevision": 1, "capturedAt": 1_000_000}),
+        json!({"generationId": "g2", "clientInstanceId": "c1", "snapshotRevision": 2, "capturedAt": 900_000}),
+    ];
+    let selection = select_foreign_recent_generation_ids(&gens, "me", 1_000_001);
+    assert_eq!(
+        selection.winner_captured_at_by_client,
+        vec![("c1".to_string(), 900_000u64)],
+        "the parent's newest is the revision-first WINNER's capturedAt, not the capturedAt-max"
+    );
+    // End-to-end through the judgment: row_time 900_100 + 7_000 >= 900_000 => KEPT.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc(
+            "d1",
+            900_000,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 900_100),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let evidence: DeviceEvidence = vec![(
+        "d1".to_string(),
+        selection.winner_captured_at_by_client.clone(),
+    )];
+    let out = build_inventory(vec![d], vec![row], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "a backward clock step must never drop a kill-window row"
     );
 }
 
@@ -353,7 +741,7 @@ fn stale_clients_generations_are_dropped() {
         json!({"generationId": "gD", "clientInstanceId": "me",    "capturedAt": t_max}),
     ];
     // boot cutoff AFTER every push: the A16 concurrent-client rule drops nothing here.
-    let ids = select_foreign_recent_generation_ids(&gens, "me", t_max + 1);
+    let ids = select_foreign_recent_generation_ids(&gens, "me", t_max + 1).selected_ids;
     assert!(ids.contains(&"gA".to_string()) && ids.contains(&"gB".to_string()));
     assert!(
         !ids.contains(&"gC".to_string()),
@@ -516,8 +904,74 @@ async fn route_excludes_requesting_clients_own_generations() {
 }
 
 #[tokio::test]
-async fn route_serves_ledger_only_recovery_without_snapshots() {
-    // Seed a binding file the ledger boot-scan will load (BindingRow camelCase JSON).
+async fn route_never_offers_ledger_only_rows_without_parent_evidence() {
+    // D8 route-level contract (deliberate rewrite of the old blanket-contract
+    // test `route_serves_ledger_only_recovery_without_snapshots`): with NO
+    // surviving snapshot evidence nothing unreferenced is offered, for BOTH
+    // (case 1) an unattributed Bound row (pre-upgrade / headless shape) and
+    // (case 2) an attributed row whose stamped parent left no snapshot content.
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    let seed = |session_id: &str, extra: serde_json::Value| {
+        let mut row = json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
+            "cwd": "/w", "createdAt": 1, "updatedAt": 1, "lastObservedAt": 1, "state": "bound"
+        });
+        row.as_object_mut().unwrap().extend(
+            extra
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
+        std::fs::write(
+            broot
+                .join("bindings")
+                .join("claude")
+                .join(format!("{session_id}.json")),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+    };
+    seed("S1", json!({})); // case 1: unattributed
+    seed(
+        "S2", // case 2: attributed, but its parent "c1"/"d0" has no snapshot content at all
+        json!({ "clientInstanceId": "c1", "deviceId": "d0", "tabKey": "d0:t1" }),
+    );
+    let router = router(test_state(None, Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(
+        body["recoverable"], false,
+        "no snapshot evidence => nothing unreferenced is offered (got {body})"
+    );
+    assert_eq!(body["device"], serde_json::Value::Null);
+    assert_eq!(body["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
+    // D8 route-level positive: a surviving generation for the row's OWN parent
+    // client ("c1" on "dev1") plus an attributed row in grace => offered,
+    // recoverable, and the row JSON carries the stamped tabKey.
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"k1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
     let home = tempfile::tempdir().unwrap();
     let broot = home.path().join("pane-ledger");
     std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
@@ -525,20 +979,31 @@ async fn route_serves_ledger_only_recovery_without_snapshots() {
         broot.join("bindings").join("claude").join("S1.json"),
         serde_json::to_vec(&json!({
             "ledgerVersion": 1, "provider": "claude", "sessionId": "S1", "mode": "claude",
-            "cwd": "/w", "createdAt": 1, "updatedAt": 1, "lastObservedAt": 1, "state": "bound"
+            "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
+            "state": "bound",
+            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9"
         }))
         .unwrap(),
     )
     .unwrap();
-    let router = router(test_state(None, Some(broot)));
-    let (_, body) = get(
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
         router,
         "/api/recovery/inventory?clientInstanceId=me",
         Some("tok"),
     )
     .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
     assert_eq!(body["recoverable"], true);
-    assert_eq!(body["ledgerOnly"][0]["sessionId"], "S1");
+    let only = body["ledgerOnly"].as_array().unwrap();
+    let entry = only
+        .iter()
+        .find(|e| e["sessionId"] == "S1")
+        .unwrap_or_else(|| {
+            panic!("row within grace of its parent's winner must be offered (got {body})")
+        });
+    // row_time = max(995_000, 994_000) = parent's capturedAt - 5_000: in grace.
+    assert_eq!(entry["tabKey"], "dev1:t9");
 }
 
 #[tokio::test]
@@ -809,7 +1274,7 @@ fn concurrent_fresh_windows_generations_are_dropped() {
         json!({"generationId": "gJ2", "clientInstanceId": "sibling-window", "capturedAt": boot + 300_000}),
         json!({"generationId": "gR",  "clientInstanceId": "lost",           "capturedAt": boot - 30_000}),
     ];
-    let ids = select_foreign_recent_generation_ids(&gens, "me", boot);
+    let ids = select_foreign_recent_generation_ids(&gens, "me", boot).selected_ids;
     assert!(
         ids.contains(&"gR".to_string()),
         "pre-boot client is real lost data - kept"

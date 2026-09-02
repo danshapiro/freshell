@@ -122,8 +122,10 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
     // create whose spawn fails (or loses the duplicate-live race) must NOT
     // rewrite the prior epoch's binding row — pre-spawn there is no evidence
     // the spawn will succeed, and a rewrite would point the durable ledger
-    // at a never-spawned terminal (ghost `ledgerOnly` recovery offer,
-    // defeating the `pending_for_terminal` reader rule).
+    // at a never-spawned terminal. That row's stamps would put it inside its
+    // parent client's grace window, so even the D8 parent-relative judgment
+    // could surface it as a ghost `ledgerOnly` recovery offer (and it defeats
+    // the `pending_for_terminal` reader rule).
     let dir = unique_ledger_dir("claude-resume-fail");
     // A claude spec whose binary does not exist: the PTY spawn fails with
     // NotFound BEFORE any fork (pty.rs resolve contract) — exactly the
@@ -362,8 +364,42 @@ async fn terminal_create_stamps_the_binding_row_from_the_connection_identity_and
     assert_eq!(row2.device_id.as_deref(), Some("device-stamp"));
     assert_eq!(row2.tab_key.as_deref(), Some("device-stamp:tab-stamp-2"));
 
+    // D8 fold-in (Task 2 review, Minor 2): the GATED restore arm —
+    // `create_gate::spawn_gated_restore_create` detaches the create onto a
+    // spawned task carrying the connection identity — must stamp the binding
+    // row exactly like the inline lane (a resume create exercises
+    // handle_create's shared post-spawn bind site through the gate path).
+    let session_id3 = "33333333-4444-4555-8666-777777777777";
+    let create3 = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-stamp-3",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-stamp-3",
+        "restore": true,
+        "sessionRef": { "provider": "claude", "sessionId": session_id3 },
+    });
+    ws.send(WsMessage::Text(create3.to_string())).await.unwrap();
+    let created3 = next_frame_of_type(&mut ws, "terminal.created").await;
+    assert_eq!(created3["requestId"], "req-stamp-3");
+    let terminal_id3 = created3["terminalId"].as_str().unwrap().to_string();
+    drop(ledger); // constructed before create3; its load-time index is stale
+    let ledger = PaneLedger::new(Some(dir.clone()));
+    let row3 = ledger
+        .load_binding("claude", session_id3)
+        .expect("gated restore create wrote the binding");
+    assert_eq!(
+        row3.client_instance_id.as_deref(),
+        Some("client-stamp-rotated"),
+        "the gated restore lane takes the push-refreshed connection identity"
+    );
+    assert_eq!(row3.device_id.as_deref(), Some("device-stamp"));
+    assert_eq!(row3.tab_key.as_deref(), Some("device-stamp:tab-stamp-3"));
+
     registry.kill(&terminal_id);
     registry.kill(&terminal_id2);
+    registry.kill(&terminal_id3);
     std::fs::remove_dir_all(&dir).ok();
 }
 
