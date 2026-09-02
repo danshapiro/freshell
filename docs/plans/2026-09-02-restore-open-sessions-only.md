@@ -17,11 +17,11 @@ Freshell's restore-from-server-memory path (the "Restore N panes from server mem
 ### Accepted tradeoffs and residuals
 - None stated.
 
-**Goal:** The recovery offer's ledger-derived "Recovered sessions" tab only ever contains sessions provably open when the server lost the client — the 30-day tail of Bound ledger bindings (closed fresh-agent panes, natural-exit CLI rows, headless REST/MCP lineage rows) never reaches the offer or the rebuilt layout.
+**Goal:** The recovery offer's ledger-derived "Recovered sessions" tab only ever contains sessions plausibly open when the server lost the client — the 30-day tail of Bound ledger bindings (closed fresh-agent panes, natural-exit CLI rows, headless REST/MCP lineage rows) never reaches the offer or the rebuilt layout, while the SIGKILL-near-create/resume window stays recoverable.
 
-**Architecture:** The junk enters server-side: `build_inventory` (`crates/freshell-server/src/recovery_inventory.rs:254-265`) emits as `ledgerOnly` every Bound ledger row unreferenced by any snapshot union and not live — with no recency floor. Ledger rows survive 30 days and are retired only by the WS `terminal.kill` path; fresh-agent pane closes (`freshAgent.kill`), natural CLI exits, and headless REST/MCP bindings never retire their rows, so every such session becomes a permanent offer candidate (a prior live probe measured 301 rows). The client (`build-recovery-plan.ts:62-70`) dumps that bucket into ONE trailing "Recovered sessions" tab, which also becomes the active tab. The fix keeps the bucket but grounds it in evidence: an unreferenced Bound row is offered ONLY if it was bound within one grace window (15s = 3× the client's 5s diff-push cadence) of the newest retained snapshot evidence (`capturedAt` — server-stamped at persist — over the already-selected foreign generation unions). A row older than that was provably absent from a push made *after* it bound, i.e. it was not actually open when the evidence was captured. This preserves the deliberate SIGKILL-within-5s-of-creation identity-survival contract (the row is bound seconds before the evidence froze) while permanently excluding the never-open tail. No client changes; the response shape is unchanged (`ledgerOnly` stays, now tightly scoped).
+**Architecture:** The junk enters server-side: `build_inventory` (`crates/freshell-server/src/recovery_inventory.rs:254-265`) emits as `ledgerOnly` every Bound ledger row unreferenced by the newest-per-client snapshot unions and not live — with no recency floor. Ledger rows survive 30 days and are retired only by the WS `terminal.kill` path; fresh-agent pane closes (`freshAgent.kill`), natural CLI exits, plain pane-X closes (`terminal.detach`), and headless REST/MCP bindings never retire rows, so every such session accumulates (a prior live probe measured 301 rows). The client (`build-recovery-plan.ts:62-70`) dumps that bucket into ONE trailing "Recovered sessions" tab, which also becomes the active tab. The fix keeps the bucket but grounds it in evidence (**D8**): a Bound, unreferenced, not-live row is offered only if `row_time + 15_000 >= evidence_floor` (inclusive), where `row_time` = the row's last bind/refresh (`updated_at.max(created_at)` — re-binds refresh `updated_at` while preserving `created_at`), and `evidence_floor` = the MINIMUM, across every client that survives the existing A15/A16 selection (all device dirs), of that client's newest retained generation `capturedAt` (server-stamped at persist). Semantics: a row is dropped only when EVERY still-relevant client's evidence window closed before the row was bound — otherwise it keeps the benefit of the doubt (a kill-near-create/resume row is bound seconds before the client's frozen last push, and a single plausibly-parent client is enough to keep it). A 30-day-old row predates the whole surviving cohort's pushes and dies. `None` floor (no retained generations at all) = nothing unreferenced is provably open = offer nothing. The grace 15s = 3× the client's 5s diff-push cadence. The selection layer (`select_foreign_recent_generation_ids`) surfaces survivors' newest `capturedAt` values; `read_foreign_unions` aggregates the global min; `build_inventory` receives it as a new trailing param. No client changes; response shape unchanged.
 
-**Tech Stack:** Rust workspace crates (`freshell-server` inventory builder + tests, `freshell-ws` comment truthfulness), Vitest/Playwright e2e (`test/e2e-browser/specs/recover-my-panes-rust.spec.ts`, rust-chromium project).
+**Tech Stack:** Rust workspace crates (`freshell-server` inventory builder/selection + tests, `freshell-ws` comment truthfulness), Vitest/Playwright e2e (`test/e2e-browser/specs/recover-my-panes-rust.spec.ts`, rust-chromium project).
 
 ## Global Constraints
 
@@ -35,41 +35,100 @@ Freshell's restore-from-server-memory path (the "Restore N panes from server mem
 
 ### Contract supersession note (for reviewers)
 
-`docs/plans/2026-07-26-recover-my-panes.md` D4 defined `ledgerOnly` as "all bound rows referenced by no device union and not live". This plan narrows that rule with the evidence-recency floor above (call it **D8**). Pinned tests that encode the old blanket rule are rewritten to the new contract — they are listed by name in Task 2. Deliberate residual accepted by this contract: a pane created in the final seconds of a browser's FIRST-EVER session (before its very first WS-ready push, with zero retained generations anywhere) has no snapshot evidence and is not offered; every other kill-near-create case retains recovery because pushes begin at WS-ready.
+`docs/plans/2026-07-26-recover-my-panes.md` D4 defined `ledgerOnly` as "all bound rows referenced by no device union and not live". D8 narrows that rule with the evidence-recency floor above. Pinned tests encoding the old blanket rule are rewritten to the new contract — listed by name in Task 2. Deliberate residuals accepted by D8:
+
+- A pane created in the final seconds of a browser's FIRST-EVER session (before its very first WS-ready push; zero retained generations anywhere) has no snapshot evidence and is not offered. Every other kill-near-create case retains recovery (pushes begin at WS-ready, and a post-restart WS reconnect push re-references the pane into the union anyway — such rows leave the bucket because the snapshot now contains them, which is the correct surfacing).
+- Sessions whose only snapshot evidence lives in clients already evicted by the pre-existing A15 staleness rule (newest push >15 min older than the freshest surviving client) were already absent from the offered unions; D8 aligns the ledger bucket with that same eviction.
+- Generation ranking is revision-first while the floor uses raw capturedAt-max per client (the selection layer's existing `newest_by_client`); the discrepancy needs a ≥15s backward server-clock step inside one client's retention window, biases keep-side only (never drops a genuinely-open row), and is documented rather than redesigned.
+- After this lands, a previously-dismissed offer's `contentId` changes once; a dismissed offer may re-appear at most once.
 
 ---
 
-### Task 1: E2E contract pin — never-open sessions are invisible in the inventory, the offer, and therefore the rebuilt layout
+### Task 1: E2E contract pin — a stale never-open session never reaches the inventory's ledgerOnly or the offer
 
 **Files:**
-- Modify: `test/e2e-browser/specs/recover-my-panes-rust.spec.ts` (append one scenario to the existing serial describe; follow the file's idioms exactly — `installFakeCli`, `seedConfig`, `selectShellIfPickerShowing`, `openCliPane`, `connect`, `openFreshContextWithOffer`, `waitForSnapshotContaining`, the standalone-`APIRequestContext` probe idiom of `waitForRecoverable`, `readArgvLog`/`sessionIdsOf`)
+- Modify: `test/e2e-browser/specs/recover-my-panes-rust.spec.ts` (extend the shared `beforeAll` seed/env; copy the freshclaude donor helpers per the file's per-spec-ownership convention; append ONE scenario LAST in the existing serial describe)
 
 **Interfaces:**
-- Consumes: the spec's existing helpers and shared serial-suite state (ONE owned Rust server across scenarios); `GET /api/recovery/inventory` authenticated with the `x-auth-token` header via a STANDALONE Playwright `APIRequestContext` (`request.newContext({ baseURL: info.baseUrl, extraHTTPHeaders: { 'x-auth-token': info.token } })`) — never `page.request` and never the navigated page (a booted page registers as a tabs.sync client and entangles the inventory; see the `waitForRecoverable` comment at spec :171-181).
-- Produces: a new test named so a `-g` filter selects it: `test('stale never-open ledger rows are never offered', ...)`.
+- Consumes: existing spec helpers (`installFakeCli`, `seedConfig`, `selectShellIfPickerShowing`, `connect`, `openFreshContextWithOffer`, `waitForSnapshotContaining`, `waitForRecoverable`, `readArgvLog` idioms) plus helpers copied from `test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts`: `createFreshclaudePane` (:153-182), the `findFreshAgentLeaf` walker (:118-128), and the `connection/setAvailableClis` dispatch + durable-UUID poll idioms (:159-164, :311-318).
+- Producer recipe (validator-proven; reports/load-bearing-validator-v1-recipe.md): a freshclaude pane split beside the boot shell pane, closed via the PLAIN pane-X, leaves its pane-ledger row Bound (the fresh-agent identity sink has NO retire method — `crates/freshell-freshagent/src/identity_sink.rs:46-72`; `retire_closed`'s only caller is WS `terminal.kill`, `crates/freshell-ws/src/terminal.rs:5184-5208`) and unreferenced after the client's next push. Fallback if and only if the primary is blocked (never silently substitute): recipe (b) natural-exit claude pane via SIGTERM to the argv-log pid with `FRESHELL_AUTO_RESUME_MAX_CYCLES=0` in the shared env + plain-X close (validator report lines 384-391); see the implementer brief for the full safety gates.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Append one scenario that proves the user's story end to end. The scenario needs a ledger row that is (a) BOUND, (b) UNREFERENCED by every newest-per-client retained union, and (c) bound well before the newest snapshot evidence. **Producer hazard — the pin is vacuous if the row gets retired:** closing a UI terminal pane sends the WS `terminal.kill`, which is the ONLY `retire_closed` caller (retired rows are excluded from the bucket regardless of this fix). The scenario must therefore use a producer whose row stays Bound after the pane goes away. Recipe decision rule (Stage 2 validator resolves; implement ONLY the resolved recipe):
+1. Suite `beforeAll` amendments (inert for the pre-existing scenarios — nothing in scenarios 1-4 issues a fresh-agent create, and `FRESHELL_CLAUDE_SIDECAR` is read only at freshclaude sidecar spawn, `claude.rs:2056-2066`):
+   - `seedConfig()` (:66-82): add `"freshAgent": { "enabled": true }` beside `codingCli.enabledProviders` (donor shape: hidden-pane-rebind :84-96).
+   - Env (:311-312): add `FRESHELL_CLAUDE_SIDECAR: path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')` and `FAKE_CLAUDE_SIDECAR_LOG: path.join(sharedRoot, 'claude-sidecar-requests.jsonl')`.
+   - Copy in (per-spec-ownership header convention :34-36 imports stay as-is): `createFreshclaudePane`, `findFreshAgentLeaf`, and the durable-UUID poll idiom from hidden-pane-rebind.
+2. Append the scenario LAST in the existing serial describe, with `test.setTimeout(240_000)` (scenario-1 precedent; budget: 21s grace-gate wait + ≤120s generation poll + restart + two boots):
 
-1. **Primary candidate — fresh-agent pane closed via UI:** `freshAgent.kill` never retires the ledger row (no close hook on the identity sink), so the row stays Bound; the post-close push makes it unreferenced. Use only if the validator confirms this suite can drive a fake fresh-agent pane deterministically with the existing harnesses.
-2. **Fallback — natural-exit CLI pane, then UI close:** the fake CLI exits on its own (row stays Bound — natural exit never retires), then the UI pane close. Use only if the validator confirms the kill path for an already-exited terminal does NOT retire the row (`terminal.rs` kill/retire reachability for exited terminals).
-3. **Fallback — REST/headless lineage binding:** a REST-driven agent row never enters any snapshot (unreferenced from birth) and is never retired. Use only if the validator confirms the REST path is drivable in this suite without a real provider.
-
-Whichever producer is used, the scenario's shape and assertions are producer-agnostic:
-
-1. Create the junk session in context A (already-connected or a fresh `browser.newContext(FRESH_CONTEXT_OPTIONS)` with `connect`), capture its `SESSION_ID` (argv log idiom or REST response), and wait for its ledger binding row on disk under `<home>/.freshell/pane-ledger/bindings/` capturing the row's `createdAt` as `bindMs` (scenario 1's disk-wait idiom at spec :384-390).
-2. Ensure at least one retained union REFERENCES the session's pane if it had one (snapshot-content wait idiom); for a headless producer nothing references it from birth — both classes must be handled identically by the assertions below.
-3. Remove the pane (per the resolved recipe's close/kill) and let a post-removal push land: poll the newest persisted generation under `<home>/.freshell/tabs-snapshots/` (the `waitForNewestGenerationRecordCount` ranking idiom) until its `capturedAt > bindMs + 20_000` AND its content no longer contains `SESSION_ID`. If the recipe relies on a diff push and the close happened within the grace window, first wait (bounded, documented: the 15s grace is physical wall-clock semantics) until `Date.now() >= bindMs + 16_000` before the removal, so the post-removal diff push satisfies the threshold within ~5s. Poll timeout 120s.
-4. `server.restart()` (the spec-local idiom from scenario 1), then — BEFORE opening any page — assert via the standalone API probe: the inventory's `ledgerOnly` array contains NO entry with `sessionId === SESSION_ID` (and assert the array is empty, recording in the report if shared-suite state makes a non-empty-but-excluding-SESSION_ID result necessary — do not weaken the assertion silently). RED TODAY: the row is present.
-5. Open context B with `openFreshContextWithOffer(browser, 'junk-exclusion')` (fresh context = empty storage by definition; SW already blocked; the offer is REQUIRED here because the surviving snapshot panes keep `recoverable` true) and assert the offer's rendered list never mentions `SESSION_ID`.
-6. The dump-into-last-tab mechanism itself is transitively pinned — do NOT click accept (the shared-suite primary union may carry scenario-4's 40-tab phone layout within its staleness window, making post-accept tab counts non-deterministic): the client unit pin `build-recovery-plan.test.ts:85-95` already maps every `ledgerOnly` entry to the trailing "Recovered sessions" tab, so an empty bucket provably produces no junk tab. Record this reasoning in the test comment.
+```ts
+test('stale never-open ledger rows are never offered', async ({ browser, e2eServerKind }) => {
+  expect(e2eServerKind).toBe('rust')
+  test.setTimeout(240_000)
+  // 1. Re-base the evidence base (A1/H6): earlier scenarios' clients hold frozen
+  //    generations within the A15 window whose clocks would drag the D8
+  //    per-client floor BELOW the junk bind. No client is connected at this
+  //    point in the serial suite, so wiping the generation store is safe; this
+  //    scenario's own context rebuilds the evidence (and keeps the offer
+  //    recoverable via the surviving shell tab).
+  await fs.rm(path.join(capturedHome, '.freshell', 'tabs-snapshots'), { recursive: true, force: true })
+  // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it
+  //    (H1: never close a tab's only pane — that collapses to closeTab, whose
+  //    closed-tab record would re-reference the row forever).
+  //    ctxA = browser.newContext(FRESH_CONTEXT_OPTIONS); connect(pageA, info);
+  //    selectShellIfPickerShowing(pageA); expect .xterm visible.
+  //    markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'junk-freshclaude-'))
+  //    await createFreshclaudePane(pageA, harnessA, markerDir)
+  // 3. Acquire SESSION_ID via the harness poll (sessionRef/resumeSessionId
+  //    durable-UUID regex idiom), disk-wait the binding row
+  //    <capturedHome>/.freshell/pane-ledger/bindings/claude/<SESSION_ID>.json
+  //    and read bindMs (row JSON createdAt — serde camelCase).
+  // 4. Prove it WAS snapshot-open: await waitForSnapshotContaining([SESSION_ID]).
+  // 5. H3 timing gate: bounded-wait until Date.now() >= bindMs + 21_000
+  //    (15s D8 grace + one full 5s push tick + 1s slack; the grace is physical
+  //    wall-clock — without it the post-close generation can predate
+  //    bindMs + 20s and the poll in step 7 would time out).
+  // 6. Close via the PLAIN pane-X — never shift+close, never the Stop button
+  //    (H2/H9: terminal.kill would retire the row and vacate the pin):
+  //    pageA.locator("[data-pane-id][data-context='pane']:has([data-context='fresh-agent']) button[title='Close pane']").click()
+  //    (shell sibling keeps the tab alive; closePane, not closeTab, fires).
+  // 7. Re-based evidence-advance: poll the newest generation per client under
+  //    <capturedHome>/.freshell/tabs-snapshots/ (waitForNewestGenerationRecordCount's
+  //    ranking idiom generalized to every device dir) until for EVERY client the
+  //    newest generation has capturedAt > bindMs + 20_000 AND its content does
+  //    not contain SESSION_ID (timeout 120s).
+  // 8. await ctxA.close(); await waitForRecoverable(info) (file's close→restart
+  //    discipline parity); info = await server.restart()  (reassign info).
+  // 9. RED/GREEN inventory assertion via a STANDALONE probe — never page.request,
+  //    never a navigated page (it would register as a tabs.sync client):
+  //    const req = await request.newContext({ baseURL: info.baseUrl,
+  //      extraHTTPHeaders: { 'x-auth-token': info.token } })
+  //    const body = await (await req.get(
+  //      '/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')).json()
+  //    await req.dispose()
+  //    expect(body.ledgerOnly.every((e) => e.sessionId !== SESSION_ID)).toBe(true)
+  //    (membership-absence, NOT emptiness — strategist A10: other legit rows may exist)
+  // 10. Offer assertion (H4 — the panel renders ledgerOnly rows as
+  //    "{mode} session — {cwd}", never the sessionId, so the marker cwd
+  //    discriminates): const { ctx: ctxB, page: pageB } =
+  //    await openFreshContextWithOffer(browser, 'junk-exclusion')
+  //    const panel = pageB.getByTestId('recovery-offer-panel')
+  //    await expect(panel.locator('ul li', { hasText: 'junk-freshclaude-' })).toHaveCount(0)
+  // 11. Do NOT click accept: the dump-into-last-tab mechanism is transitively
+  //    pinned — build-recovery-plan.test.ts:85-95 maps every ledgerOnly entry
+  //    to the trailing "Recovered sessions" tab
+  //    (src/lib/recovery/build-recovery-plan.ts:62-70), so an empty bucket
+  //    provably produces no junk tab; post-accept tab counts would be
+  //    non-deterministic in this shared suite. Record this in a comment.
+  // 12. await ctxB.close() (finally-style cleanup consistent with the file).
+})
+```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts -g 'stale never-open ledger rows'`
 
-Expected: FAIL because the stale row is still returned in `ledgerOnly` and rendered in the offer — assertions 4-5 trip on the current blanket bucket. A failure caused by the row having been retired (hazard above), by harness/timing mistakes, or by the offer not appearing is NOT acceptable red: iterate until it fails on the row's presence.
+Expected: FAIL — step 9's probe assertion trips because the stale row IS in `ledgerOnly` today (and step 10's list assertion would trip on the rendered `junk-freshclaude-` marker line). A failure from the row being retired (wrong close affordance), from the offer not appearing, or from timing is NOT acceptable red: iterate the recipe until the failure is exactly "stale row present".
 
 - [ ] **Step 3: Minimal production implementation**
 
@@ -81,15 +140,15 @@ Same command as Step 2. Expected: FAIL (the pinned red). Record the failure outp
 
 - [ ] **Step 5: Refactor while green**
 
-No green refactor here; ensure the scenario matches the file's conventions (helper reuse, comment style, serial-suite ordering — append LAST so shared state is never disturbed for earlier scenarios).
+No green refactor here; ensure the scenario matches the file's conventions (helper reuse, comment style, serial ordering — it MUST remain LAST in the describe so the evidence wipe cannot corrupt earlier scenarios' assertions).
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The new scenario is additive and the describe is serial; run the whole spec to prove earlier scenarios still pass with it appended:
+The scenario is additive; the beforeAll seed/env additions must be proven inert for the earlier scenarios:
 
 Run: `npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/recover-my-panes-rust.spec.ts`
 
-Expected: every pre-existing scenario PASS; ONLY the new scenario FAILS (the pinned red, recorded in the progress ledger as intentional red-until-Task-2). Any broad suite is NOT run at this stage.
+Expected: scenarios 1-4 PASS; ONLY the new scenario FAILS (the pinned red, recorded in the progress ledger as intentional red-until-Task-2). Any broad suite is NOT run at this stage.
 
 - [ ] **Step 7: Commit the task**
 
@@ -108,10 +167,10 @@ server-side filter lands."
 
 ---
 
-### Task 2: Server-side evidence-recency floor for the ledgerOnly bucket (+ comment truthfulness)
+### Task 2: Server-side D8 evidence-recency floor (+ comment truthfulness)
 
 **Files:**
-- Modify: `crates/freshell-server/src/recovery_inventory.rs` (filter, constant, union-evidence computation)
+- Modify: `crates/freshell-server/src/recovery_inventory.rs` (selection-layer floor surfacing, `read_foreign_unions` aggregation, `build_inventory` param + filter, route plumbing, D8 constant + comments, debug observability line)
 - Modify: `crates/freshell-server/src/recovery_inventory_tests.rs` (contract rewrite — listed below)
 - Modify: `crates/freshell-ws/src/pane_ledger.rs:~615-623` (`delete_binding` doc comment)
 - Modify: `crates/freshell-ws/src/terminal.rs:~3337-3346` (spawn-failure comment)
@@ -119,108 +178,111 @@ server-side filter lands."
 - Modify: `crates/freshell-ws/tests/pane_ledger_triggers.rs` (comment near `:118-126`)
 
 **Interfaces:**
-- Consumes: `BindingRow.created_at` (`crates/freshell-ws/src/pane_ledger.rs:108`) — the durable bind time; the already-plumbed `DeviceUnion.union_doc["capturedAt"]` values (max server-stamped capture of each union's selected generations, composed in `tabs_persist.rs`); existing filters (`row_is_bound`, A4 referenced-rule, D7 live-rule) in `build_inventory`.
-- Produces: no public API change — `GET /api/recovery/inventory` keeps its shape; `ledgerOnly` now contains only rows within the grace window. One new private constant documented as D8:
-  `const UNSNAPSHOTTED_BINDING_GRACE_MS: u64 = 15_000;`
+- Consumes: `BindingRow.updated_at`/`created_at` (`crates/freshell-ws/src/pane_ledger.rs:108-109`; re-bind refreshes `updated_at`, never `created_at` — validator-verified across all bind lanes); the selection layer's per-client newest times (computed at `recovery_inventory.rs:35-47` as `newest_by_client`, A15-survivor-filtered :49-61); the existing filter chain (`row_is_bound` :256, A4 referenced-rule :258, D7 live-rule :260).
+- Produces (additive; response shape unchanged):
+  - One documented private constant: `const UNSNAPSHOTTED_BINDING_GRACE_MS: u64 = 15_000;`
+  - `select_foreign_recent_generation_ids` returns the selected generation ids PLUS the selected (A15/A16-surviving) clients' newest `capturedAt` values — as a named struct per the file's existing idiom (the file already returns structs/tuples for paired results; validator V3 identified exactly two production call sites to update: `recovery_inventory.rs` `read_foreign_unions` (:520-547 region) and the selection unit tests ~:341/:351/:797/:807).
+  - `read_foreign_unions` returns `(Vec<DeviceUnion>, Option<u64>)` — unions plus the global floor = min over all device dirs' surviving clients' newest times (`None` when no surviving generation exists anywhere).
+  - `build_inventory(device_unions, bindings, live_session_keys, evidence_floor_ms: Option<u64>)`.
+  - The route handler passes the floor through (:397-420 region).
 
 - [ ] **Step 1: Write the failing behavioral tests (unit + route contract rewrite)**
 
-In `recovery_inventory_tests.rs`, rewrite the blanket-era pins to the D8 matrix. Drafts (adapt to the file's existing fixture builders; unions carry explicit `capturedAt` so the matrix is wall-clock-free):
+In `recovery_inventory_tests.rs` (fixture builders `union_doc(device, captured_at, panes)` :20-26 and `binding_row_at(provider, sid, state, updated_at)` :54-81 already exist; with the floor as a PARAM no fixture surgery is needed — drafts below adapt to real signatures):
 
 ```rust
-// REPLACES unreferenced_bound_rows_become_ledger_only (:227-232)
+// REWRITES unreferenced_bound_rows_become_ledger_only (:227-232) — blanket era
 #[test]
-fn unreferenced_row_bound_within_grace_of_latest_evidence_is_offered() {
-    // evidence capturedAt = 1_000_000; row created_at = 995_000 (5s before
-    // the evidence froze — the SIGKILL-within-5s window) => STILL offered.
-    ...
-    assert_eq!(out["ledgerOnly"][0]["sessionId"], "C9");
+fn unreferenced_row_within_grace_of_evidence_floor_is_offered() {
+    // floor F = 1_000_000; row updated_at = F - 15_000 (inclusive boundary) => offered.
+    ... assert_eq!(out["ledgerOnly"][0]["sessionId"], "C9");
 }
 
-// NEW — the user's bug
 #[test]
-fn unreferenced_row_bound_before_latest_evidence_minus_grace_is_not_offered() {
-    // evidence capturedAt = 1_000_000; row created_at = 900_000
-    // (bound 100s before the newest retained snapshot) => excluded,
-    // and when nothing else remains, not recoverable.
-    ...
-    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
-    assert_eq!(out["recoverable"], false); // when the row was the only candidate
+fn unreferenced_row_before_evidence_floor_is_not_offered() {
+    // floor F = 1_000_000; row updated_at = F - 15_001 => excluded; when no
+    // other candidate exists, recoverable flips false.
+    ... assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+       assert_eq!(out["recoverable"], false);
 }
 
-// NEW — no snapshot evidence at all means nothing unreferenced is provably open
 #[test]
 fn ledger_only_rows_without_any_snapshot_evidence_are_not_offered() {
-    // unions empty; one Bound row => ledgerOnly empty, recoverable false.
-    ...
+    // evidence_floor_ms = None; one Bound unreferenced row => empty bucket, recoverable false.
 }
 ```
 
-The `route_serves_ledger_only_recovery_without_snapshots` route test (:514-536) is rewritten in place to the new contract: bound row, no snapshot contents → 200 OK with `recoverable == false`, `device == null`, empty `ledgerOnly`.
-KEEP unchanged (must still pass as-is or with only fixture-clock alignment): `bound_row_referenced_by_non_primary_device_is_not_ledger_only` (:234), `live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only` (:267), and the two `ledgerOnly == []` asserts (:145/:195 — align fixture clocks so each fixture's evidence is within grace of its rows).
-Every rewritten test must assert behavior (row membership/absence, recoverable), never static copy — and each kept test must still exercise its original behavior, not a vacated version of it.
+Plus floor-semantics tests at the selection/aggregation layer:
+- `read_foreign_unions`-level: two device dirs with surviving clients NEWEST 900_000 and 1_000_000 ⇒ floor `Some(900_000)` (per-client min, NOT per-union max); a cohort client evicted by A15 (newest >15 min older than the device max) contributes NOTHING to the floor; no generations ⇒ `None`.
+- Selection-fn return-shape tests: update ~:341/:351/:797/:807 to the struct return (destructure only; behavioral assertions unchanged).
+
+And the contract rewrites:
+- `route_serves_ledger_only_recovery_without_snapshots` (:514-536) → rewrites in place to the new contract: one Bound row, no snapshot contents ⇒ 200 with `recoverable == false`, `device == null`, `ledgerOnly == []`.
+- NEW route-level within-grace positive (write one snapshot generation into the temp dir via the test harness's `write_snapshot` helper — generation fields: deviceId/clientInstanceId/serverInstanceId/deviceLabel/capturedAt/snapshotRevision/records with status "open" — and a ledger row with `updated_at = CAP - 5_000`) ⇒ offered and recoverable.
+- `content_id_is_stable_and_input_sensitive` (:300-306) repair: pass `Some` floors aligned so BOTH fixtures' rows stay offered (`floor ≤ row.updated_at + 15_000`); the `assert_ne` stays non-vacuous (still detects content/blind-exclusion regressions).
+- KEEP behaviorally (each must still exercise its original behavior — pass a floor value preserving it; `:308` gets a `Some` floor aligned to its fixture per validator V4): `bound_row_referenced_by_non_primary_device_is_not_ledger_only` (:234), `live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only` (:267), the empty-bucket asserts (:145, :195) — for the KEEP set floor = `None` preserves meaning (their rows are referenced/live/absent, so the D8 gate never applies).
+- All OTHER `build_inventory` test call sites (~12): pass the floor that preserves each test's behavioral meaning; record the per-site choice in the implementer report.
+
+Every rewritten test must assert behavior (membership/absence/recoverable/floor), never static copy.
 
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
 Run: `cargo test -p freshell-server recovery_inventory`
 
-Expected: FAIL — the two new exclusion tests and the rewritten route test trip on the current blanket bucket; the within-grace keep-test passes already.
+Expected: FAIL — the two new exclusion tests, the None-floor test, the route rewrite, and the floor-semantics tests trip on the current blanket bucket / pre-floor signatures; the within-grace keep-test passes already.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
 In `crates/freshell-server/src/recovery_inventory.rs`:
 
-1. Add the documented constant next to `STALE_CLIENT_MS` (:16):
+1. Documented constant next to `STALE_CLIENT_MS` (:16):
 
 ```rust
 /// D8 (restore-open-sessions-only): an unreferenced Bound row is offered only
-/// when it was bound within one grace window of the newest retained snapshot
-/// evidence (`capturedAt`, server-stamped at persist — see tabs_persist.rs).
-/// Rows older than that were provably absent from a push made AFTER they
-/// bound: they were not actually open when the evidence was captured. 15s =
-/// 3x the client's 5s diff-push cadence (tabRegistrySync), so the
-/// SIGKILL-within-5s-of-creation window stays recoverable while the 30-day
-/// Bound tail (closed fresh-agent panes, natural exits, headless REST/MCP
-/// rows) never reaches the offer.
+/// when its last bind/refresh lies within one grace window of the per-client
+/// snapshot-evidence floor (the MIN over A15/A16-surviving clients' newest
+/// retained `capturedAt`, server-stamped at persist). A row dropped by this
+/// rule was provably absent from EVERY surviving client's pushes made after
+/// it was bound — it was not actually open when the evidence was captured.
+/// 15s = 3x the client's 5s diff-push cadence (tabRegistrySync), so
+/// kill-near-create/resume rows keep recovery while the 30-day Bound tail
+/// (closed fresh-agent panes, natural exits, plain-detach closes, headless
+/// REST/MCP lineage rows) never reaches the offer. Floor vs union-max:
+/// capturedAt ranking is revision-first in unions, raw-max per client here —
+/// the discrepancy needs a >=15s backward server-clock step and biases
+/// keep-side only; documented, not redesigned.
 const UNSNAPSHOTTED_BINDING_GRACE_MS: u64 = 15_000;
 ```
 
-2. In `build_inventory`, after the `other_devices` block (:252), compute the evidence and gate `ledger_only` (:254-265):
+2. Selection layer: extend `select_foreign_recent_generation_ids` to also return the surviving clients' newest `capturedAt` values (reuse the already-computed `newest_by_client` restricted to the A15/A16 survivor predicate — one named struct per the file idiom); `read_foreign_unions` aggregates `Option<u64>` = min across all device dirs' survivors and returns it with the unions (compute the floor from the FINAL retry attempt's selection in the :522-547 region, per validator V3); handler passes it to `build_inventory`.
+3. `build_inventory` filter (the chain at :254-265 gains ONE filter):
 
 ```rust
-// D8: newest snapshot evidence across ALL selected unions (self-excluded and
-// post-boot clients already dropped by read_foreign_unions selection, so a
-// fresh requester's own pushes never count as evidence of a lost session).
-let latest_evidence_ms: Option<u64> = unions
-    .iter()
-    .filter_map(|u| u.union_doc["capturedAt"].as_u64())
-    .max();
-```
-
-…and one additional filter in the existing chain:
-
-```rust
-.filter(|r| match latest_evidence_ms {
-    Some(evidence) => (r.created_at.max(0) as u64)
-        .saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS)
-        >= evidence,
+.filter(|r| match evidence_floor_ms {
+    Some(floor) => {
+        let row_time = r.updated_at.max(r.created_at).max(0) as u64;
+        row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) >= floor
+    }
     // No snapshot evidence: nothing unreferenced is provably open (D8).
     None => false,
 })
 ```
 
-3. Observability (silent exclusion is undebuggable): after applying the filter, emit one structured debug line on the route's existing tracing target when rows WERE dropped, e.g. `tracing::debug!(target: "freshell_server::recovery_inventory", dropped, latest_evidence_ms, "D8 excluded stale unreferenced ledger rows from ledgerOnly")` — count only, no session payloads; gated on `dropped > 0`.
+4. Observability: after the filter, one structured debug line on the route's tracing target when rows were dropped (count only, no payloads, gated on `dropped > 0`):
 
-4. Re-word the four comments…
+```rust
+tracing::debug!(target: "freshell_server::recovery_inventory",
+    dropped, evidence_floor_ms, "D8 excluded stale unreferenced ledger rows from ledgerOnly");
+```
 
-3. Re-word the four comments the D8 contract makes stale, keeping them truthful about what ghost-row deletion still protects (durable-ledger truthfulness for existence/pending-reader semantics; the offer can now only surface such a row within one grace window): the four files listed above.    Delete NOTHING in those paths — the deletion machinery is untouched; comments only.
-5. Docs sweep (record findings in the implementer report): `rg -n 'ledgerOnly|recovery inventory|Recovered sessions' docs/ README.md AGENTS.md` — only edit a file if it actually documents the old blanket behavior (expected: none; historical `docs/plans/` files are never rewritten).
+5. Re-word the four comments the D8 contract makes stale, keeping them truthful about what ghost-row deletion still protects (durable-ledger truthfulness for existence/pending-reader semantics; the offer can now only surface such a row within one grace window of the evidence floor): `pane_ledger.rs` `delete_binding` doc, `terminal.rs` spawn-failure branch, `pane_ledger_tests.rs` :446-450, `pane_ledger_triggers.rs` :118-126. Delete NOTHING — comments only.
+6. Docs sweep (record findings in the implementer report): `rg -n 'ledgerOnly|recovery inventory|Recovered sessions' docs/ README.md AGENTS.md` — edit a file only if it actually documents the old blanket behavior (expected: none; historical `docs/plans/` files are never rewritten).
 
 - [ ] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-server recovery_inventory`
 
-Expected: PASS (all D8 matrix tests green).
+Expected: PASS (all D8 matrix + floor-semantics tests green).
 
 Then confirm Task 1's red pin turns green:
 
@@ -230,11 +292,9 @@ Expected: PASS.
 
 - [ ] **Step 5: Refactor while green**
 
-Check the filter reads as one coherent rule beside the existing A4/D7 filters (keep the chain style); confirm no now-dead imports/helpers (`row_mode`/`row_cwd` stay used — the bucket still emits rows). Re-run the Step 4 commands after any refactor.
+Check the filter reads as one coherent rule beside the A4/D7 filters; confirm no now-dead imports/helpers; confirm the struct name and floor threading match the file's naming. Re-run Step 4 commands after any refactor.
 
 - [ ] **Step 6: Run impacted-test verification**
-
-Impacted set: the whole `freshell-server` crate tests (inventory plumbing touches shared fixtures), the whole `freshell-ws` crate tests (comment-only edits — cheap full safety), the SIGKILL-within-5s contract pin (the behavior the grace window preserves), the whole recover-my-panes spec (the offer surface), the client recovery unit suites (client untouched — regression sanity), plus static checks:
 
 ```bash
 cargo test -p freshell-server
@@ -247,7 +307,7 @@ npm run typecheck
 npm run lint
 ```
 
-Expected: all PASS. (If the SIGKILL-5s test fails, the grace computation is wrong — fix the filter, never the pin's intent.)
+Expected: all PASS. Wall-test note (validator V4, analyzed and accepted): after a slow server reboot the OLD page's reconnect `pushNow(true)` can land before `page.goto` clears storage — that push RE-REFERENCES the just-created pane into the union, so the row leaves `ledgerOnly` because the snapshot now contains it (the correct surfacing); the test's two-path poll (auto-restored pane OR visible offer) stays green either way. A failure from the offer not appearing at all means the floor mishandled the frozen-evidence case — fix the filter, never the pin's intent.
 
 - [ ] **Step 7: Commit the task**
 
@@ -258,15 +318,18 @@ git commit -m "fix(recovery): gate ledgerOnly offers on snapshot-evidence recenc
 The recovery inventory offered every Bound ledger row referenced by no
 snapshot union and not live. With no recency floor, a user's 30-day tail
 of never-retired bindings (freshAgent.kill closes, natural exits,
-headless REST/MCP rows) was vacuumed into the offer and dumped into a
-trailing 'Recovered sessions' tab of sessions that were never open.
+plain-detach closes, headless REST/MCP rows) was vacuumed into the offer
+and dumped into a trailing 'Recovered sessions' tab of sessions that were
+never open.
 
-An unreferenced Bound row is now offered only when bound within 15s
-(3x the client's 5s diff-push cadence) of the newest retained snapshot
-evidence; rows provably absent from a push made after they bound were
-not open when the evidence was captured. The SIGKILL-within-5s
-identity-survival contract is preserved; the blanket-era pins are
-rewritten to the D8 matrix."
+An unreferenced Bound row is now offered only when its last bind/refresh
+(updated_at, creation-preserved) lies within 15s (3x the client's 5s
+diff-push cadence) of the per-client evidence floor — the MIN over
+A15/A16-surviving clients' newest retained capturedAt. A dropped row was
+provably absent from every surviving client's pushes after its bind: not
+actually open when the evidence was captured. Kill-near-create/resume
+recovery (SIGKILL-within-5s contract) is preserved; the blanket-era pins
+are rewritten to the D8 matrix."
 ```
 
 ---
