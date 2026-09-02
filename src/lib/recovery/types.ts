@@ -64,6 +64,15 @@ export interface LedgerOnlyEntry {
    * mode); absent on terminal rows.
    */
   paneKind?: string
+  /**
+   * P1.13 resume-record settings, forwarded when the ledger row carries them
+   * (focused-ep1 Finding B). Absent ⇒ the restored fresh-agent pane keeps
+   * today's defaulting, unchanged.
+   */
+  model?: string
+  effort?: string
+  sandbox?: string
+  permissionMode?: string
 }
 
 export interface RecoveryInventory {

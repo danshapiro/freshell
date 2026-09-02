@@ -184,6 +184,56 @@ describe('buildRecoveryPlan', () => {
     expect(entryContent.shell).toBeUndefined()
   })
 
+  // Focused-ep1 Finding B: a kept fresh-agent ledger row's RECORDED settings
+  // must ride the resume — the rebuilt pane carries its ORIGINAL
+  // model/effort/sandbox/permissionMode (the FreshAgentView create effect
+  // sends them with the sessionRef resume) instead of silently adopting
+  // CURRENT defaults (freshcodex would otherwise deterministically resume as
+  // gpt-5.5/max).
+  it('a ledgerOnly fresh-agent row with recorded settings restores content carrying them', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'codex', sessionId: 'thr_42', mode: 'freshcodex', cwd: '/proj', tabKey: 'k',
+        paneKind: 'fresh-agent', model: 'gpt-5.3-codex', effort: 'high',
+        sandbox: 'workspace-write', permissionMode: 'on-request' },
+    ]))
+    expect(plans).toHaveLength(1)
+    const contents = leavesOf(plans[0].layout).map((l) => l.content)
+    expect(contents).toHaveLength(2)
+    expect(contents[1]).toMatchObject({
+      kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+      model: 'gpt-5.3-codex', effort: 'high',
+      sandbox: 'workspace-write', permissionMode: 'on-request',
+      initialCwd: '/proj',
+      sessionRef: { provider: 'codex', sessionId: 'thr_42' },
+    })
+  })
+
+  it('a ledgerOnly fresh-agent row WITHOUT recorded settings behaves exactly as before', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'opencode', sessionId: 'ses_123', mode: 'freshopencode', cwd: '/proj', tabKey: 'k', paneKind: 'fresh-agent' },
+    ]))
+    const entryContent = leavesOf(plans[0].layout).map((l) => l.content)[1]
+    expect(entryContent.kind).toBe('fresh-agent')
+    // Absent settings stay absent — today's defaulting path, unchanged.
+    expect(entryContent.model).toBeUndefined()
+    expect(entryContent.effort).toBeUndefined()
+    expect(entryContent.sandbox).toBeUndefined()
+    expect(entryContent.permissionMode).toBeUndefined()
+  })
+
+  // Defense-in-depth (same regime as the sessionType fallback): an out-of-union
+  // sandbox value (corrupt/pre-schema row) must never make the restored leaf
+  // fail pane validation — drop the FIELD, never the pane.
+  it('a ledgerOnly fresh-agent row with an out-of-union sandbox drops the field, not the pane', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'codex', sessionId: 'thr_7', mode: 'freshcodex', cwd: '/x', tabKey: 'k',
+        paneKind: 'fresh-agent', model: 'm1', sandbox: 'docker' },
+    ]))
+    const entryContent = leavesOf(plans[0].layout).map((l) => l.content)[1]
+    expect(entryContent).toMatchObject({ kind: 'fresh-agent', model: 'm1' })
+    expect(entryContent.sandbox).toBeUndefined()
+  })
+
   it('a plain CLI ledgerOnly row still builds terminal content (finding-2 regime is fresh-agent-only)', () => {
     const plans = buildRecoveryPlan(inv([pane()], [
       { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' },

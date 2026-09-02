@@ -80,6 +80,18 @@ const FALLBACK_SESSION_TYPE_BY_PROVIDER: Partial<Record<string, FreshAgentSessio
   opencode: 'freshopencode',
 }
 
+// Defense-in-depth for a ledger-forwarded sandbox (focused-ep1 Finding B):
+// pane validation (paneTreeValidation's fresh-agent arm) accepts only this
+// union, so an out-of-union value (corrupt/pre-schema row) is dropped rather
+// than failing the whole restored leaf.
+function ledgerSandbox(
+  sandbox: string | undefined,
+): 'read-only' | 'workspace-write' | 'danger-full-access' | undefined {
+  return sandbox === 'read-only' || sandbox === 'workspace-write' || sandbox === 'danger-full-access'
+    ? sandbox
+    : undefined
+}
+
 /**
  * Package a kept FRESH-AGENT ledger row as a fresh-agent pane content for a
  * SESSION RESUME — the minimal equivalent of the snapshot-restore path's
@@ -92,6 +104,7 @@ const FALLBACK_SESSION_TYPE_BY_PROVIDER: Partial<Record<string, FreshAgentSessio
 function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
   const sessionType =
     normalizeFreshAgentSessionType(e.mode) ?? FALLBACK_SESSION_TYPE_BY_PROVIDER[e.provider]
+  const sandbox = ledgerSandbox(e.sandbox)
   return {
     kind: 'fresh-agent',
     sessionType,
@@ -102,6 +115,15 @@ function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
     createRequestId: nanoid(), // re-minted by restoreLayout normalization; required by the type
     status: 'creating',
     ...(e.cwd ? { initialCwd: e.cwd } : {}),
+    // Focused-ep1 Finding B: the row's recorded settings ride the resume so a
+    // restored pane keeps its ORIGINAL configuration (the create effect sends
+    // content.model/effort/sandbox/permissionMode alongside the sessionRef,
+    // and explicit create params win server-side) instead of silently adopting
+    // CURRENT defaults. Absent fields keep today's defaulting, unchanged.
+    ...(e.model ? { model: e.model } : {}),
+    ...(e.effort ? { effort: e.effort } : {}),
+    ...(sandbox ? { sandbox } : {}),
+    ...(e.permissionMode ? { permissionMode: e.permissionMode } : {}),
     sessionRef: { provider: e.provider, sessionId: e.sessionId },
   } as PaneContent
 }

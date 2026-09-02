@@ -539,6 +539,14 @@ fn attributed_row_within_grace_of_its_parent_is_offered() {
     assert_eq!(only[0]["tabKey"], "d1:t1");
     // A terminal row carries NO paneKind (the fresh-agent-only field).
     assert!(only[0].get("paneKind").is_none());
+    // No recorded settings on the fixture row ⇒ NO settings fields forwarded
+    // (absent-when-None, the same style as paneKind/tabKey).
+    for field in ["model", "effort", "sandbox", "permissionMode"] {
+        assert!(
+            only[0].get(field).is_none(),
+            "a row without recorded {field} forwards nothing"
+        );
+    }
     assert_eq!(out["recoverable"], true);
 }
 
@@ -559,6 +567,13 @@ fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
     let mut row = binding_row_at("opencode", "ses_9", bound(), 995_000);
     row.mode = "freshopencode".into();
     row.pane_kind = Some("fresh-agent".into());
+    // Focused-ep1 Finding B: the row's recorded resume settings must ride the
+    // ledgerOnly entry so the client's plan rebuilds the pane with its
+    // ORIGINAL settings instead of silently adopting CURRENT defaults.
+    row.model = Some("big-model".into());
+    row.effort = Some("high".into());
+    row.sandbox = Some("workspace-write".into());
+    row.permission_mode = Some("on-request".into());
     let row = with_attribution(row, "c1", "d1", "t9");
     let out = build_inventory(
         vec![d],
@@ -574,6 +589,10 @@ fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
         only[0]["paneKind"], "fresh-agent",
         "the row's pane_kind must reach the client as paneKind"
     );
+    assert_eq!(only[0]["model"], "big-model");
+    assert_eq!(only[0]["effort"], "high");
+    assert_eq!(only[0]["sandbox"], "workspace-write");
+    assert_eq!(only[0]["permissionMode"], "on-request");
 }
 
 #[test]

@@ -344,6 +344,22 @@ pub fn build_inventory(
             if let Some(pane_kind) = &r.pane_kind {
                 entry["paneKind"] = json!(pane_kind);
             }
+            // Focused-ep1 Finding B: forward the row's recorded resume settings
+            // (when present) so a restored fresh-agent pane keeps its ORIGINAL
+            // model/effort/sandbox/permissionMode instead of silently adopting
+            // CURRENT defaults. Absent ⇒ the client keeps today's defaulting.
+            if let Some(model) = &r.model {
+                entry["model"] = json!(model);
+            }
+            if let Some(effort) = &r.effort {
+                entry["effort"] = json!(effort);
+            }
+            if let Some(sandbox) = &r.sandbox {
+                entry["sandbox"] = json!(sandbox);
+            }
+            if let Some(permission_mode) = &r.permission_mode {
+                entry["permissionMode"] = json!(permission_mode);
+            }
             entry
         })
         .collect();

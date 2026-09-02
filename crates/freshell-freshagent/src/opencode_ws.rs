@@ -621,10 +621,11 @@ impl FreshOpencodeState {
             let guard = self.sessions.lock().await;
             guard.get(&durable_id).cloned()
         };
+        let in_memory_hit = existing.is_some();
         let session_arc = match existing {
             Some(session_arc) => session_arc,
             None => match self
-                .resume_durable_session(&durable_id, msg.cwd.as_deref(), provenance)
+                .resume_durable_session(&durable_id, msg.cwd.as_deref(), provenance.clone())
                 .await
             {
                 Ok(session_arc) => session_arc,
@@ -658,6 +659,16 @@ impl FreshOpencodeState {
         // being rewritten to the default.
         {
             let mut session = session_arc.lock().await;
+            // D8 (focused-ep1 Finding A, branch 1 — same-process in-memory
+            // hit): a resume reached through a CONNECTION-SCOPED create must
+            // re-park the CURRENT connection's provenance on the session —
+            // otherwise every later per-send refresh write keeps re-asserting
+            // the OLD tab's attribution into the ledger row (the merge's
+            // REPLACE rule). Conn-less resumes keep the parked stamps (the
+            // ledger keep-when-None merge's in-memory twin).
+            if in_memory_hit && provenance.is_some() {
+                session.provenance = provenance.clone();
+            }
             let raw_model = msg.model.clone().or_else(|| session.model.clone());
             let model = normalize_opencode_model(raw_model.as_deref());
             let raw_effort = msg.effort.clone().or_else(|| session.effort.clone());
@@ -667,6 +678,47 @@ impl FreshOpencodeState {
             if msg.cwd.is_some() {
                 session.cwd = msg.cwd.clone();
             }
+        }
+
+        // D8 (focused-ep1 Finding A, branch 1): the in-memory hit bypasses
+        // `resume_durable_session`, so it must perform that lane's SAME
+        // awaited refresh write itself (durable-before-answer) — the CURRENT
+        // connection's attribution lands on the row immediately, even if no
+        // send ever follows this resume. Conn-less resumes write nothing here
+        // (nothing new to assert; the row keeps its stamps).
+        if let Some(p) = provenance.filter(|_| in_memory_hit) {
+            let crate::BindProvenance {
+                client_instance_id,
+                device_id,
+                tab_key,
+            } = p;
+            let (model, effort, cwd) = {
+                let session = session_arc.lock().await;
+                (
+                    session.model.clone(),
+                    session.effort.clone(),
+                    session.cwd.clone(),
+                )
+            };
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                client_instance_id,
+                device_id,
+                tab_key,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model,
+                    sandbox: None,
+                    permission_mode: None,
+                    effort,
+                    cwd,
+                },
+            })
+            .await;
         }
 
         // requestId dedup cache: a duplicate create replays the DURABLE id (never a
@@ -2518,9 +2570,15 @@ impl FreshOpencodeState {
         }
 
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
-        // (durable-before-answer), and ONLY when a record was actually recovered: never
-        // launder a defaults row for a never-recorded session (V7).
-        if recovered.is_some() {
+        // (durable-before-answer). The SETTINGS payload rides only when a record was
+        // actually recovered (never launder a defaults row for a never-recorded
+        // session, V7); the D8 provenance re-stamp rides whenever the resume is
+        // connection-scoped — INCLUDING the settings-None (lineage-only row) case,
+        // which must still assert the CURRENT connection's identity/tab
+        // (focused-ep1 Finding A, branch 2). A conn-less resume of a
+        // never-recorded session still writes nothing (V7's no-laundering rule,
+        // unchanged).
+        if recovered.is_some() || provenance.is_some() {
             // D8 provenance (delta-r1 Finding 3): a connection-scoped
             // create-resume re-stamps the row with the CURRENT connection's
             // identity/tab (a resume-into-a-new-tab must not keep the OLD tab's
@@ -2532,6 +2590,21 @@ impl FreshOpencodeState {
                 device_id,
                 tab_key,
             } = provenance.unwrap_or_default();
+            // Settings merge stays as-is: recovered values when a snapshot
+            // exists; otherwise a blank payload (a replace-no-op — a
+            // lineage-only row has no settings to clobber, and a never-recorded
+            // session gains provenance WITHOUT a laundered defaults snapshot).
+            let settings = if recovered.is_some() {
+                crate::identity_sink::FreshAgentSettings {
+                    model: rec.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: rec.effort.clone(),
+                    cwd,
+                }
+            } else {
+                crate::identity_sink::FreshAgentSettings::default()
+            };
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: session_id.to_string(),
@@ -2542,13 +2615,7 @@ impl FreshOpencodeState {
                 client_instance_id,
                 device_id,
                 tab_key,
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: rec.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: rec.effort.clone(),
-                    cwd,
-                },
+                settings,
             })
             .await;
         }
@@ -4459,6 +4526,180 @@ mod tests {
         );
         assert_eq!(b.device_id.as_deref(), Some("device-new"));
         assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+    }
+
+    /// Focused-ep1 Finding A (branch 1 — same-process in-memory hit): a
+    /// connection-scoped resume-create (`freshAgent.create{sessionRef}`) for a
+    /// session ALREADY live in this process's local map must re-stamp the
+    /// CURRENT connection's identity/tab — on the parked in-memory provenance
+    /// AND on the ledger row. Otherwise every later per-send refresh write
+    /// keeps re-asserting the OLD tab's attribution (the ledger merge's
+    /// REPLACE rule then cements the stale tab into the recovery-offer
+    /// placement data).
+    #[tokio::test]
+    async fn create_resume_hitting_the_in_memory_map_restamps_the_current_connections_provenance()
+    {
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Live, materialized session parked with the OLD connection's stamps
+        // (create + first send drive the materialization binding write).
+        state
+            .handle_create(
+                create_msg("r1"),
+                Some(crate::BindProvenance::for_create(
+                    Some("client-old"),
+                    Some("device-old"),
+                    Some("tab-old"),
+                )),
+            )
+            .await;
+        state
+            .handle_send(send_msg("freshopencode-r1", "hello"))
+            .await;
+        let durable_id = "ses_1"; // FakeHttp's first POST /session mint
+        assert!(
+            state.sessions.lock().await.contains_key(durable_id),
+            "the materialized session is live in the local map"
+        );
+        let bindings_before = fake.bindings.lock().unwrap().len();
+        assert!(
+            bindings_before > 0,
+            "materialization already wrote binding rows (stamped OLD)"
+        );
+
+        // The resume-create arrives via a DIFFERENT connection (e.g. a
+        // recovery-accept into a new tab): the same-process in-memory hit arm.
+        let mut create = create_msg("req-resume-in-mem");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: durable_id.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-new"),
+                    Some("device-new"),
+                    Some("tab-new"),
+                )),
+            )
+            .await;
+
+        // The parked in-memory provenance now carries the CURRENT connection…
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get(durable_id).expect("live session").lock().await;
+            let p = s.provenance.clone().expect("parked provenance present");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-new"));
+            assert_eq!(p.device_id.as_deref(), Some("device-new"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        // …and the resume itself re-asserted the row with the CURRENT stamps
+        // (durable-before-the-created-answer; no send needed)…
+        {
+            let bindings = fake.bindings.lock().unwrap();
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == durable_id)
+                .expect("the in-memory resume's refresh write");
+            assert_eq!(
+                b.client_instance_id.as_deref(),
+                Some("client-new"),
+                "the in-memory resume must NOT keep re-asserting the OLD connection"
+            );
+            assert_eq!(b.device_id.as_deref(), Some("device-new"));
+            assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        // …and a SUBSEQUENT per-send refresh write asserts the CURRENT
+        // attribution — never the stale tab.
+        state.handle_send(send_msg(durable_id, "again")).await;
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == durable_id)
+            .expect("the post-resume send's refresh write");
+        assert_eq!(b.client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(b.device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+    }
+
+    /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
+    /// connection-scoped create-resume whose ledger row is LINEAGE-ONLY
+    /// (default settings — `load_settings` answers `None`) must STILL re-stamp
+    /// the row's provenance to the CURRENT connection: the provenance refresh,
+    /// not the settings write, is the point of the resume refresh.
+    #[tokio::test]
+    async fn create_resume_with_a_lineage_only_row_still_restamps_the_current_connections_provenance()
+    {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A lineage-only row (the "default settings" shape): binding lineage
+        // exists, but no settings snapshot is recoverable (`load_settings`
+        // answers None). Same fixture as
+        // `lineage_only_binding_does_not_arm_settings_reset_on_resume`.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-lineage".into()),
+            resolves_pending: Some("freshopencode-cr-lineage".into()),
+            supersedes: None,
+            client_instance_id: Some("client-old".into()),
+            device_id: Some("device-old".into()),
+            tab_key: Some("device-old:tab-old".into()),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage binding write ok");
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "fixture sanity: the settings-None case (lineage-only row)"
+        );
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-resume-lineage-prov");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-new"),
+                    Some("device-new"),
+                    Some("tab-new"),
+                )),
+            )
+            .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == DURABLE_ID)
+            .expect("the settings-None resume's provenance refresh write");
+        assert_eq!(
+            b.client_instance_id.as_deref(),
+            Some("client-new"),
+            "the provenance refresh must not be gated on settings presence"
+        );
+        assert_eq!(b.device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        // Settings merge stays as-is: no recoverable snapshot ⇒ the write
+        // carries a blank (replace-no-op) settings payload — never invented
+        // defaults, and the row stays lineage-only.
+        assert_eq!(
+            b.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "the settings payload is untouched by the provenance refresh"
+        );
     }
 
     /// The paired never-invert arm (delta-r1 Finding 3): a resume with NO
