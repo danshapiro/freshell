@@ -577,6 +577,12 @@ describe('readProfilesRegistry', () => {
     expect(r.profiles).toEqual([])
     expect(r.error).toContain('not valid JSON')
   })
+  it('a reader that throws (unreadable file) is reported and ignored, not fatal', () => {
+    const r = readProfilesRegistry('/x/profiles.json', () => { throw new Error('EACCES: permission denied') })
+    expect(r.profiles).toEqual([])
+    expect(r.error).toContain('could not be read')
+    expect(r.error).toContain('EACCES')
+  })
   it('schema violations are reported and ignored', () => {
     for (const bad of [
       { profiles: [{ id: 'BAD ID' }] },
@@ -769,7 +775,15 @@ export function readProfilesRegistry(
   registryPath: string,
   readFile: (p: string) => string | undefined,
 ): RegistryReadResult {
-  const content = readFile(registryPath)
+  let content: string | undefined
+  try {
+    content = readFile(registryPath)
+  } catch (err) {
+    // Exists-but-unreadable (EACCES, a directory named profiles.json, a TOCTOU
+    // race between existsSync and readFileSync in the caller's reader): warn
+    // and fall back to the default profile, exactly like an invalid registry.
+    return { profiles: [], error: `Profile registry at ${registryPath} could not be read (${err instanceof Error ? err.message : String(err)}); ignoring it.` }
+  }
   if (content === undefined) return { profiles: [] }
   let parsedJson: unknown
   try {
@@ -1393,6 +1407,11 @@ const activeProfileId = profileSelection.selection.id
 if (activeProfileId !== DEFAULT_PROFILE_ID) {
   const namespacedUserData = userDataDirForProfile(activeProfileId, app.getName(), app.getPath('appData'))
   if (namespacedUserData) {
+    // Electron's doc contract for app.setPath: the target directory must
+    // exist. Empirically 33.4.11 does NOT throw for deep nonexistent paths on
+    // Linux (load-bearing finder Appendix B.2), but create-first is the
+    // documented-correct order and is required at minimum on other platforms.
+    fs.mkdirSync(namespacedUserData, { recursive: true })
     app.setPath('userData', namespacedUserData)
   }
 }
@@ -1877,7 +1896,7 @@ surface in-file.
 - Modify: `config/electron-builder.yml` (extraResources)
 - Modify: `tsconfig.electron.json` (exclude picker tsx/html)
 - Test: `test/unit/electron/profile-picker/picker.test.tsx` (new)
-- Test: `test/unit/electron/electron-builder-config.test.ts` (add one case)
+- Packaging verification: executed `electron-builder --dir` staging smoke in Step 6 (no declarative-config test — config-text assertions do not qualify as behavioral coverage per repo policy)
 
 **Interfaces:**
 - Consumes: preload's `getProfiles` / `chooseProfile` (Task 6).
@@ -2129,24 +2148,36 @@ Expected: PASS all; `dist/profile-picker/index.html` exists.
 
 None expected.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [ ] **Step 6: Verify packaging behaviorally + run impacted tests**
 
-The electron-builder config declarative test must cover the new resource —
-add to `test/unit/electron/electron-builder-config.test.ts`:
+The house convention for config assertions (`electron-builder-config.test.ts`)
+is regex-only; repo guidance says config-text assertions do not qualify as
+behavioral verification. The real question is whether a packaged build
+contains the picker. Verify by staging an actual package layout:
 
-```ts
-  it('packages profile picker assets as extra resources', () => {
-    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
-
-    expect(config).toMatch(
-      /extraResources:\n(?:.*\n)*?  - from: dist\/profile-picker\n    to: profile-picker/,
-    )
-  })
+```bash
+npm run build && npm run build:electron && npm run build:wizard && \
+  npm run build:launch-chooser && npm run build:profile-picker && \
+  npm run prepare:bundled-node
+npx electron-builder --config config/electron-builder.yml --dir
+test -f dist/linux-unpacked/resources/profile-picker/index.html && echo "picker staged"
 ```
+
+(Adjust `linux-unpacked` for the host OS. `--dir` stages the full packaged
+layout without building an installer. If `prepare:bundled-node` is unusually
+slow, it may be skipped for THIS check only: extraResources staging does not
+depend on the bundled runtime.)
+
+Expected: the file exists (electron-builder copied `dist/profile-picker` into
+`resources/profile-picker`). If it does not, the extraResources mapping is
+wrong at the electron-builder layer — fix the yml entry, not the assertion.
+
+Then:
 
 Run: `npm run test:vitest -- --config config/vitest/vitest.electron.config.ts --run`
 
-Expected: PASS (including the new packaging assertion).
+Expected: PASS. (No new declarative-config test is added; the `--dir` smoke is
+the packaging verification.)
 
 - [ ] **Step 7: Commit the task**
 
@@ -2154,7 +2185,6 @@ Expected: PASS (including the new packaging assertion).
 git add electron/profile-picker/ config/vite/vite.profile-picker.config.ts \
   package.json config/electron-builder.yml tsconfig.electron.json \
   test/unit/electron/profile-picker/picker.test.tsx \
-  test/unit/electron/electron-builder-config.test.ts \
   docs/plans/2026-08-26-electron-multi-profile.md
 git commit -m "feat(electron): profile picker window and build packaging"
 ```
@@ -2204,11 +2234,19 @@ function createTempHomeWithRegistry(registry: unknown): string {
 }
 
 async function launchApp(tmpHome: string, extraArgs: string[] = []): Promise<ElectronApplication> {
+  // Sandbox ALL of Electron's per-user dirs, not just HOME: on Linux appData
+  // (and thus userData + the single-instance lock key) derives from
+  // XDG_CONFIG_HOME, and Chromium also writes XDG_CACHE_HOME/XDG_DATA_HOME.
+  // Without these, named profiles and locks could escape into the real home
+  // and collide with a live install (evidence: load-bearing-validator-lb-03).
   return electron.launch({
     args: [PROJECT_ROOT, ...extraArgs],
     env: {
       ...process.env,
       HOME: tmpHome,
+      XDG_CONFIG_HOME: path.join(tmpHome, '.config'),
+      XDG_CACHE_HOME: path.join(tmpHome, '.cache'),
+      XDG_DATA_HOME: path.join(tmpHome, '.local', 'share'),
       NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
     },
     cwd: PROJECT_ROOT,
@@ -2283,6 +2321,69 @@ test.describe('Profile picker', () => {
     expect(fs.existsSync(path.join(tmpHome, '.freshell', 'logs'))).toBe(false)
   })
 
+  // Two DIFFERENT named profiles must boot side by side (independent userData
+  // locks). This is the core user story; without it a per-profile lock bug
+  // could pass every other spec.
+  test('two named profiles run concurrently', async () => {
+    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'e2ework' }, { id: 'e2ehome' }] })
+    app = await launchApp(tmpHome, ['--profile=e2ework'])
+    const app2 = await launchApp(tmpHome, ['--profile=e2ehome'])
+    try {
+      const w1 = await app.firstWindow()
+      const w2 = await app2.firstWindow()
+      await expect(w1.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
+      await expect(w2.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
+
+      // Both processes are still alive (neither was turned away by the lock).
+      expect(app.process().exitCode).toBeNull()
+      expect(app2.process().exitCode).toBeNull()
+
+      const ud1 = await app.evaluate(({ app: a1 }) => a1.getPath('userData'))
+      const ud2 = await app2.evaluate(({ app: a2 }) => a2.getPath('userData'))
+      expect(path.basename(ud1).toLowerCase()).toBe('freshell-e2ework')
+      expect(path.basename(ud2).toLowerCase()).toBe('freshell-e2ehome')
+
+      // Each profile logged into its own config dir.
+      await expect.poll(() => {
+        const d = path.join(tmpHome!, '.freshell-e2ehome', 'logs')
+        return fs.existsSync(d) && fs.readdirSync(d).some((f) => /^electron-main\..*\.jsonl$/.test(f))
+      }, { timeout: 15_000 }).toBe(true)
+    } finally {
+      await app2.close().catch(() => {})
+    }
+  })
+
+  // The relaunch path itself must be proven: stub app.relaunch/app.exit in the
+  // main process before clicking, then assert the IPC choice rebuilt argv with
+  // --profile (an unstubbed relaunch would re-exec and lose the assertion).
+  test('choosing a named profile from the picker relaunches with --profile=<id>', async () => {
+    tmpHome = createTempHomeWithRegistry({ profiles: [{ id: 'work', label: 'Work' }] })
+    app = await launchApp(tmpHome)
+
+    await app.evaluate(({ app: electronApp }) => {
+      const g = globalThis as Record<string, unknown>
+      g.__relaunchCalls = []
+      ;(electronApp as unknown as Record<string, unknown>).relaunch = (opts: unknown) => {
+        ;(g.__relaunchCalls as unknown[]).push(opts)
+      }
+      ;(electronApp as unknown as Record<string, unknown>).exit = (code: number) => {
+        g.__exitCode = code
+      }
+    })
+
+    const picker = await app.firstWindow()
+    await picker.waitForLoadState('domcontentloaded')
+    await picker.getByRole('button', { name: 'Work' }).click()
+
+    await expect.poll(async () => app.evaluate(() => (globalThis as Record<string, unknown>).__exitCode ?? null),
+      { timeout: 15_000 }).toBe(0)
+    const relaunchCalls = await app.evaluate(() => (globalThis as Record<string, unknown>).__relaunchCalls)
+    expect(relaunchCalls).toHaveLength(1)
+    expect((relaunchCalls as { args: string[] }[])[0].args).toContain('--profile=work')
+    // stripProfileArgs must not double-append: exactly one --profile= entry.
+    expect((relaunchCalls as { args: string[] }[])[0].args.filter((a) => a.startsWith('--profile='))).toHaveLength(1)
+  })
+
   test('an invalid registry file is ignored and the default profile boots', async () => {
     tmpHome = createTempHomeWithRegistry('not valid json {{{')
     app = await launchApp(tmpHome)
@@ -2336,15 +2437,7 @@ test.describe('Profile picker', () => {
     // Named profile, fresh HOME → first-run wizard proves we are resident.
     await expect(window.locator('h1:has-text("Welcome to Freshell")')).toBeVisible({ timeout: 30_000 })
 
-    const app2 = await electron.launch({
-      args: [PROJECT_ROOT, '--profile=work'],
-      env: {
-        ...process.env,
-        HOME: tmpHome,
-        NODE_PATH: path.join(PROJECT_ROOT, 'node_modules'),
-      },
-      cwd: PROJECT_ROOT,
-    })
+    const app2 = await launchApp(tmpHome, ['--profile=work'])
     // The turned-away process must exit on its own (lock acquisition failed
     // → app.quit()). firstWindow() would hang forever if it stayed alive, so
     // poll the process handle instead.
@@ -2357,7 +2450,7 @@ test.describe('Profile picker', () => {
 })
 ```
 
-- [ ] **Step 2: Run the spec and verify the intended failure**
+- [ ] **Step 2: Run the spec and verify it passes against the integrated implementation**
 
 Prereqs (fresh builds the picker's prod load path needs):
 
@@ -2369,16 +2462,20 @@ Then: `CI=true npx playwright test --config test/e2e-electron/playwright.electro
 `Missing X server`/`$DISPLAY` errors, re-run as
 `CI=true xvfb-run -a npx playwright test --config test/e2e-electron/playwright.electron.config.ts profile-picker`.)
 
-Expected: FAIL because the picker never appears (no registry handling exists
-until Tasks 6-7 are in; on a tree where earlier tasks already landed, the
-first spec fails at the heading assertion and the namespacing spec fails at
-the `freshell-e2ework` userData assertion).
+NOTE on red/green honesty: this e2e suite lands LAST, after the implementation
+tasks it integrates (Tasks 5-7), so it cannot serve as the red gate for those
+tasks — its failure-first evidence lives in the unit tasks of Tasks 2-7 (each
+names its red expectation) and in the load-bearing validators' executed
+experiments (the `--profile` flag is inert at base_ref, so a checkout at
+base_ref necessarily fails the namespacing and picker specs). What Step 2/3
+protect is end-to-end integration: if any spec fails here, the wiring across
+Tasks 5-7 is wrong — fix the implementation, not the spec.
 
-- [ ] **Step 3: Confirm all six specs pass**
+- [ ] **Step 3: Confirm all eight specs pass**
 
 Run: `CI=true npx playwright test --config test/e2e-electron/playwright.electron.config.ts profile-picker` (with `xvfb-run -a` if needed)
 
-Expected: 6 passed.
+Expected: 8 passed.
 
 - [ ] **Step 4: Refactor while green**
 
@@ -2413,9 +2510,10 @@ verify by reading the file after edit).
 
 - [ ] **Step 1: Add the section**
 
-Insert a `## Desktop profiles (multiple instances)` section after the
-desktop/Electron portion of the README (place it right after the section that
-documents the desktop app install/launch flow):
+The README has no dedicated desktop/Electron install section; insert the new
+`## Desktop profiles (multiple instances)` section immediately before the
+existing `## Usage` section (the desktop app is described inside Features and
+Usage, so this placement is adjacent to where desktop usage is documented):
 
 ```markdown
 ## Desktop profiles (multiple instances)
