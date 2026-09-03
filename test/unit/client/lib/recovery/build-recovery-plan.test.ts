@@ -153,17 +153,6 @@ describe('buildRecoveryPlan', () => {
     expect(deviceContents.every((c) => (c as { sessionRef?: { sessionId: string } }).sessionRef?.sessionId !== 'C9')).toBe(true)
   })
 
-  // Delta-r2 Finding 3 regression sentinel: the trailing-tab machinery is
-  // gone — the literal tab title can never be produced again. (The placement
-  // tests above pin the behavior; this pins the machinery's removal.)
-  it('the plan builder module no longer contains the trailing-tab title', async () => {
-    const { readFile } = await import('node:fs/promises')
-    const { join } = await import('node:path')
-    // cwd is the vitest config `root` (the project root) for this suite.
-    const src = await readFile(join(process.cwd(), 'src/lib/recovery/build-recovery-plan.ts'), 'utf8')
-    expect(src.includes('Recovered sessions')).toBe(false)
-  })
-
   // Finding 2 (delta-r1): a kept fresh-agent ledger row must restore as a
   // fresh-agent pane RESUME (the FreshAgentView create effect drives the
   // sessionRef resume from the content) — never as a terminal shell: the

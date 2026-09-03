@@ -44,13 +44,15 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// and the offered unions can never disagree about which generation is newest
 /// (a raw capturedAt-max would, after a backward server-clock step).
 ///
-/// Placement clause (delta-r2 Finding 3): a kept row is offered ONLY when its
-/// stamped `tabKey` names a tab in the offer's union (the restored-tab set the
-/// client joins it into) — an unmatched/missing tabKey means the pane's whole
-/// TAB was created and lost inside the sub-cadence push window, so NO retained
-/// data knows the tab; the row is unplaceable and deliberately excluded (the
-/// pre-fix client-side trailing-tab fallback restored such rows into an
-/// unrelated tab instead).
+/// Placement clause (delta-r2 Finding 3, narrowed by focused-ep2-r1 Finding
+/// 1): a kept row is offered ONLY when its stamped `tabKey` names an OPEN,
+/// paned tab in the offer's union (the restored-tab set the client joins it
+/// into): an unmatched/missing tabKey means the pane's whole TAB was created
+/// and lost inside the sub-cadence push window, a CLOSED-but-retained record
+/// means the tab was not open in the restored evidence, and a zero-pane
+/// record has no client-side join target — in every case the row is
+/// unplaceable and deliberately excluded (the pre-fix client-side
+/// trailing-tab fallback restored such rows into an unrelated tab instead).
 const UNSNAPSHOTTED_BINDING_GRACE_MS: u64 = 7_000;
 
 /// A15 staleness + A16 concurrent-client rules (D2): drop the requester's own
@@ -315,8 +317,8 @@ pub fn build_inventory(
 
     // D8 judgment inputs (see UNSNAPSHOTTED_BINDING_GRACE_MS): the primary
     // device's surviving-client evidence — the only cohort whose rows can be
-    // offered at all — plus the primary union's tab keys, the delta-r2
-    // placement set (a kept row must rejoin a tab the offer actually
+    // offered at all — plus the primary union's placement whitelist, the
+    // delta-r2 placement set (a kept row must rejoin a tab the offer actually
     // restores; anything else is unplaceable and excluded).
     let primary_device_id = primary_idx.map(|i| unions[i].device_id.as_str());
     let primary_clients = primary_device_id.and_then(|id| {
@@ -325,10 +327,33 @@ pub fn build_inventory(
             .find(|(device, _)| device == id)
             .map(|(_, clients)| clients.as_slice())
     });
+    // Focused-ep2-r1 Finding 1 (whitelist membership): built from the primary
+    // union's RAW records — where `status` is still visible (the projection
+    // above discards it). A record joins the set ONLY when its status means
+    // OPEN (`"open"`, or absent — the record's default per
+    // server/tabs-registry/types.ts: `status` is `open|closed` with no third
+    // value, the closed-but-retained shape always stamps `"closed"`, and the
+    // persisted-generation read validation already requires `open` on real
+    // disk data, so absent-as-open cannot launder a genuine tombstone) AND
+    // its `panes` array is non-empty — the client's joinability gate
+    // (`placeLedgerEntries`, build-recovery-plan.ts: rows join only tabs with
+    // panes.length > 0) requires both, so admitting the key here would offer
+    // a row the accept path could never place (offer count > accepted plan).
     let primary_tab_keys: Option<HashSet<String>> = primary_idx.map(|i| {
-        tabs_per_union[i]
-            .iter()
-            .filter_map(|t| t["tabKey"].as_str().map(String::from))
+        unions[i]
+            .union_doc
+            .get("records")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|rec| {
+                matches!(rec.get("status").and_then(Value::as_str), None | Some("open"))
+                    && rec
+                        .get("panes")
+                        .and_then(Value::as_array)
+                        .is_some_and(|panes| !panes.is_empty())
+            })
+            .filter_map(|rec| rec.get("tabKey").and_then(Value::as_str).map(String::from))
             .collect()
     });
 
@@ -412,8 +437,9 @@ pub fn build_inventory(
 /// attributed device is the offer's primary device, its attributed client
 /// survives in that device's evidence, the row's time is within
 /// [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's revision-first-winner
-/// capturedAt, AND (delta-r2 Finding 3) its stamped `tab_key` names a tab in
-/// the primary union — the restored-tab set the client joins it into.
+/// capturedAt, AND (delta-r2 Finding 3 + focused-ep2-r1 Finding 1) its
+/// stamped `tab_key` names an OPEN, paned tab in the primary union — the
+/// restored-tab set the client joins it into.
 /// Unattributed / non-primary-device / no-surviving-parent /
 /// unplaceable-tab rows are NEVER offered.
 fn d8_parent_relative_keep(
@@ -445,11 +471,14 @@ fn d8_parent_relative_keep(
     if row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) < parent_newest {
         return false; // the parent's evidence already observed the row's absence
     }
-    // Delta-r2 Finding 3 (placement exactness): the stamped tabKey must name
-    // a tab in the offer's union. A pane whose whole TAB was created and lost
-    // inside the sub-cadence push window is unplaceable — no retained data
-    // knows the tab — so it is deliberately EXCLUDED here rather than dumped
-    // into an unrelated tab by the client's old trailing-tab fallback.
+    // Delta-r2 Finding 3 (placement exactness), narrowed by focused-ep2-r1
+    // Finding 1: the stamped tabKey must name an OPEN, paned tab in the
+    // offer's union (the whitelist above excludes closed-but-retained and
+    // zero-pane union records). A pane whose whole TAB was created and lost
+    // inside the sub-cadence push window, or whose tab is not genuinely
+    // restorable, is unplaceable — no retained open data knows the tab — so
+    // it is deliberately EXCLUDED here rather than dumped into an unrelated
+    // tab by the client's old trailing-tab fallback.
     let Some(tab_key) = r.tab_key.as_deref() else {
         return false;
     };

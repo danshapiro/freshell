@@ -785,6 +785,85 @@ fn attributed_row_whose_tab_key_matches_no_union_tab_is_dropped() {
 }
 
 #[test]
+fn attributed_row_whose_union_tab_is_a_retained_closed_record_is_dropped() {
+    // Focused-ep2-r1 Finding 1 (whitelist openness): the row is attributed,
+    // on the primary device, its parent client survives, and it is within
+    // grace — EVERY earlier D8 clause passes, and its stamped tabKey matches
+    // a union record verbatim. But that record was persisted as
+    // CLOSED-but-retained (`buildClosedTabRegistryRecord`,
+    // src/lib/tab-registry-snapshot.ts; `shouldKeepClosedTab` retention): the
+    // tab was NOT open in the restored evidence, so the row is unplaceable
+    // and deliberately EXCLUDED — the pre-fix whitelist collected tabKeys
+    // from EVERY primary-union record regardless of status.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: json!({
+            "deviceId": "d1", "deviceLabel": "label-d1", "capturedAt": 1_000_000,
+            "records": [{ "tabKey": "d1:t1", "tabId": "t1", "tabName": "work",
+                          "status": "closed", "revision": 1, "updatedAt": 1_000_000,
+                          "closedAt": 1_000_000, "paneCount": 1,
+                          "panes": [{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }] }]
+        }),
+    };
+    // 999_000 + 7_000 >= 1_000_000: within grace — the openness clause is the
+    // ONLY failing one, so this pin re-fails if the whitelist re-opens.
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 999_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "a row stamped to a closed-but-retained union tab is never offered"
+    );
+}
+
+#[test]
+fn attributed_row_whose_union_tab_has_no_panes_is_dropped() {
+    // Focused-ep2-r1 Finding 1 (whitelist paned-ness): every earlier D8
+    // clause passes and the stamped tabKey names an OPEN union record — but
+    // the record's `panes` array is EMPTY. The client's placement gate
+    // (`placeLedgerEntries`, build-recovery-plan.ts) requires panes.length > 0
+    // to join a row into a tab, so a server-side whitelist that admits the
+    // zero-pane key misaligns the offer count from the accepted plan (the row
+    // is offered, then silently unplaced). The server excludes it here.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: json!({
+            "deviceId": "d1", "deviceLabel": "label-d1", "capturedAt": 1_000_000,
+            "records": [{ "tabKey": "d1:t1", "tabId": "t1", "tabName": "work",
+                          "status": "open", "revision": 1, "updatedAt": 1_000_000,
+                          "paneCount": 0, "panes": [] }]
+        }),
+    };
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 999_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "a row stamped to a zero-pane union tab is never offered"
+    );
+}
+
+#[test]
 fn attributed_row_with_no_primary_device_is_dropped() {
     // No union has any records => no primary device => no evidence at all to
     // judge against: even an attributed, in-grace row is never offered.
