@@ -279,6 +279,16 @@ impl PaneIdentitySink for TestLedgerSink {
     fn load_settings(&self, _provider: &str, _session_id: &str) -> Option<FreshAgentSettings> {
         None
     }
+    fn load_provenance(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> Option<freshell_freshagent::BindProvenance> {
+        // Rollback-focused double (like `load_settings` above): these
+        // rollback tests never cold-attach a codex/opencode session, so the
+        // provenance read-back is out of their contract.
+        None
+    }
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
         self.ledger.load_binding(provider, session_id).is_some()
     }

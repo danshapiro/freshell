@@ -3,7 +3,8 @@
 //! injects this adapter at wiring time.
 
 use freshell_freshagent::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord, SinkWrite,
+    BindProvenance, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
+    SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -144,6 +145,26 @@ impl PaneIdentitySink for LedgerIdentitySink {
             return None;
         }
         Some(s)
+    }
+
+    fn load_provenance(&self, provider: &str, session_id: &str) -> Option<BindProvenance> {
+        // Focused-ep1-r4 Finding 2: the row's CURRENT stamps, memory-only via
+        // the same write-through read + fresh-agent gate as `load_settings`
+        // (terminal-lineage rows are not resume records). Unlike
+        // `load_settings` this is settings-INDEPENDENT — a stamped row answers
+        // even when its settings snapshot is blank (lineage-only): provenance
+        // lives on the row, not on the settings columns. An all-`None` answer
+        // is reported as absence (never `Some(default)`).
+        let row = self.ledger.load_binding(provider, session_id)?;
+        if row.pane_kind.as_deref() != Some("fresh-agent") {
+            return None;
+        }
+        let p = BindProvenance {
+            client_instance_id: row.client_instance_id,
+            device_id: row.device_id,
+            tab_key: row.tab_key,
+        };
+        (p != BindProvenance::default()).then_some(p)
     }
 
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
@@ -562,6 +583,111 @@ mod tests {
         assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
         assert_eq!(row.device_id.as_deref(), Some("device-1"));
         assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    }
+
+    /// Focused-ep1-r4 Finding 2 (the seam the cold-attach seeding reads
+    /// through): `load_provenance` over the REAL pane ledger — the row's
+    /// stamps round-trip (settings-independently: even a stamped lineage-only
+    /// row), a later conn-less (all-`None`) write keeps them via the ledger's
+    /// OWN keep-when-`None` merge (not a fake mirror), a genuinely
+    /// unattributed row answers `None`, and a terminal-pane row (no
+    /// `pane_kind`) is gated out exactly like `load_settings`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_provenance_round_trips_stamps_through_the_real_ledger_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        assert!(
+            sink.load_provenance("opencode", "nope").is_none(),
+            "no row -> None"
+        );
+
+        // A stamped LINEAGE-ONLY row (blank settings) answers its stamps.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-x".into()),
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-1".into()),
+            device_id: Some("device-1".into()),
+            tab_key: Some("device-1:tab-1".into()),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("awaited write succeeds");
+        let p = sink
+            .load_provenance("opencode", "ses_prov")
+            .expect("the stamped row answers (settings-independent)");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
+        assert_eq!(p.device_id.as_deref(), Some("device-1"));
+        assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
+
+        // A conn-less refresh (all-`None` stamps) keeps them — the REAL
+        // ledger's keep-when-`None` merge, end to end.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("awaited conn-less refresh succeeds");
+        let p = sink
+            .load_provenance("opencode", "ses_prov")
+            .expect("keep-when-None preserved the stamps");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
+
+        // A genuinely unattributed row answers None — never Some(default).
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_unstamped".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        assert_eq!(sink.load_provenance("opencode", "ses_unstamped"), None);
+
+        // A terminal-pane row (no `pane_kind`) is NOT a resume record even
+        // when stamped — the same gate `load_settings` applies.
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider: "opencode",
+                session_id: "ses_terminal",
+                mode: "shell",
+                terminal_id: "term-1",
+                cwd: Some("/w"),
+                create_request_id: None,
+                client_instance_id: Some("client-term"),
+                device_id: Some("device-term"),
+                tab_key: Some("device-term:tab-term"),
+                now_ms: 42,
+            })
+            .expect("terminal binding write ok");
+        assert_eq!(
+            sink.load_provenance("opencode", "ses_terminal"),
+            None,
+            "terminal-lineage rows are gated out (the load_settings gate's twin)"
+        );
     }
 
     /// resume path (sync, memory-only read).

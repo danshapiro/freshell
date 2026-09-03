@@ -108,6 +108,23 @@ pub trait PaneIdentitySink: Send + Sync {
     /// silently with defaults, never a false alarm. `load_settings` is
     /// unchanged — it returns None for lineage-only rows.
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool;
+    /// D8 (focused-ep1-r4 Finding 2 — cold-attach seeding from the durable
+    /// row): the binding row's provenance stamps (clientInstanceId / deviceId
+    /// / tabKey) as last asserted, keep-when-None merged. A cold CONN-LESS
+    /// (re)construction reads this to park the row's stamps on the runtime
+    /// session when no CURRENT connection supplied any — the row is the
+    /// authoritative record of "where this session last lived", and the fork
+    /// child's NEW ledger key is where a `None` park could never be rescued.
+    /// A connection-supplied provenance still wins when present (that is the
+    /// current-tab truth for a live move). Like `load_settings` this only
+    /// serves FRESH-AGENT rows (terminal-lineage rows are not resume records)
+    /// and is memory-fast + sync; unlike `load_settings` it is settings-
+    /// independent (a stamped lineage-only row still answers). `None` when no
+    /// fresh-agent row exists or the row carries NO stamps at all — an
+    /// all-`None` answer is information-free, so it is never returned as
+    /// `Some(default)` (that would fire `provenance.is_some()` gates
+    /// spuriously and park an invention).
+    fn load_provenance(&self, provider: &str, session_id: &str) -> Option<BindProvenance>;
     /// kata 1wxv decision 10's durable record: the post-op rollback record,
     /// computed from pre-mutation reads and AWAITED BEFORE the provider
     /// mutation runs (durable-BEFORE-mutation). Same awaited-write
@@ -166,6 +183,14 @@ pub(crate) struct FakeIdentitySink {
     /// bindings never enter (and a blank rewrite removes the key, matching
     /// the ledger's full-snapshot replace).
     pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// Focused-ep1-r4 Finding 2: the row's CURRENT provenance stamps, merged
+    /// per-field keep-when-`None` on every `record_binding` — the ledger
+    /// merge's (`pane_ledger.rs`) in-memory twin, backing `load_provenance`.
+    /// Same-key only (the real ledger additionally inherits from a superseded
+    /// PARENT row; no fake consumer needs that — the providers' fork-child
+    /// assertions read the child row's upsert off `bindings`, not this map).
+    pub provenance:
+        std::sync::Mutex<std::collections::HashMap<(String, String), BindProvenance>>,
     /// (provider, sessionId) -> stored rollback record (kata 1wxv).
     pub rollbacks: std::sync::Mutex<std::collections::HashMap<(String, String), RollbackRecord>>,
     /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
@@ -288,6 +313,25 @@ impl PaneIdentitySink for FakeIdentitySink {
                 self.recorded.lock().unwrap().remove(&key);
                 self.settings.lock().unwrap().remove(&key);
             }
+            // Focused-ep1-r4 Finding 2: track the row's CURRENT provenance
+            // stamps with the ledger's per-field keep-when-`None` merge (a
+            // `None` stamp keeps the prior value; a `Some` replaces).
+            {
+                let mut provenance = self.provenance.lock().unwrap();
+                // (`key` may have been moved by the settings insert above.)
+                let entry = provenance
+                    .entry((upsert.provider.clone(), upsert.session_id.clone()))
+                    .or_default();
+                if upsert.client_instance_id.is_some() {
+                    entry.client_instance_id = upsert.client_instance_id.clone();
+                }
+                if upsert.device_id.is_some() {
+                    entry.device_id = upsert.device_id.clone();
+                }
+                if upsert.tab_key.is_some() {
+                    entry.tab_key = upsert.tab_key.clone();
+                }
+            }
             // kata 1wxv Task 4 (claude rollback adoption): the rollback-row re-key
             // old→new rides the SAME awaited batch as the binding write — mirrors
             // `freshell-server`'s LedgerIdentitySink (scoped to the claude fork
@@ -324,6 +368,17 @@ impl PaneIdentitySink for FakeIdentitySink {
             .lock()
             .unwrap()
             .contains(&(provider.into(), session_id.into()))
+    }
+    fn load_provenance(&self, provider: &str, session_id: &str) -> Option<BindProvenance> {
+        let p = self
+            .provenance
+            .lock()
+            .unwrap()
+            .get(&(provider.into(), session_id.into()))
+            .cloned()?;
+        // An all-`None` answer is information-free: report absence rather
+        // than a default (never park an invention).
+        (p != BindProvenance::default()).then_some(p)
     }
     fn record_rollback(
         &self,
@@ -545,6 +600,98 @@ mod tests {
             .expect("write ok");
         assert_eq!(fake.load_rollback("opencode", "ses_1"), Some(record));
         assert!(fake.load_rollback("opencode", "nope").is_none());
+    }
+
+    /// Focused-ep1-r4 Finding 2: `load_provenance` serves the row's CURRENT
+    /// stamps with the ledger's per-field keep-when-`None` merge — a stamped
+    /// LINEAGE-ONLY row (settings blank) answers just like a settings-bearing
+    /// one (the read is settings-independent), a later all-`None` conn-less
+    /// write keeps the stamps, a genuinely unattributed row answers `None`
+    /// (never `Some(default)` — that would park an invention), and a missing
+    /// row answers `None`.
+    #[tokio::test]
+    async fn fake_sink_load_provenance_mirrors_the_keep_when_none_merge() {
+        let fake = Arc::new(FakeIdentitySink::default());
+        assert!(
+            fake.load_provenance("opencode", "ses_none").is_none(),
+            "no row -> None"
+        );
+
+        // A stamped lineage-only row (blank settings) still answers.
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-x".into()),
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-1".into()),
+            device_id: Some("device-1".into()),
+            tab_key: Some("device-1:tab-1".into()),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("binding write ok");
+        let p = fake
+            .load_provenance("opencode", "ses_prov")
+            .expect("the stamped row answers its stamps (settings-independent)");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
+        assert_eq!(p.device_id.as_deref(), Some("device-1"));
+        assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
+
+        // A later conn-less write (all-None stamps) keeps them — and a partial
+        // stamp replaces only its own field.
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("conn-less refresh ok");
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-2".into()),
+            device_id: None,
+            tab_key: None,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("partial refresh ok");
+        let p = fake
+            .load_provenance("opencode", "ses_prov")
+            .expect("keep-when-None preserved the stamps");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-2"));
+        assert_eq!(p.device_id.as_deref(), Some("device-1"));
+        assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
+
+        // A genuinely unattributed row answers None — never Some(default).
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_unstamped".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("binding write ok");
+        assert_eq!(fake.load_provenance("opencode", "ses_unstamped"), None);
     }
 
     /// A stored row whose version mismatches the schema reads as None — never

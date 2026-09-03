@@ -274,18 +274,22 @@ struct CodexSession {
     /// `ensureRuntime` lazy-restart invariant, adapter.ts:935-946). Cleared back to `false`
     /// once a respawn succeeds.
     exited: Arc<AtomicBool>,
-    /// D8 (restore-open-sessions-only, focused-ep1-r3): the LATEST
+    /// D8 (restore-open-sessions-only, focused-ep1-r3/-r4): the LATEST
     /// connection-scoped provenance this session was attached under — parked by
     /// [`FreshCodexState::finish_create`] from the create's threaded stamps,
-    /// CARRIED across crash-recovery rebuilds (the in-place
-    /// [`FreshCodexState::ensure_session_alive`] re-register and the mint-new
-    /// [`FreshCodexState::respawn_as_new_thread_after_crash`] re-key — the same
-    /// logical session continuing; its row-level twins are the conn-less
-    /// refresh's keep-when-None merge and the mint-new row's `supersedes`
-    /// inheritance), and inherited by [`FreshCodexState::handle_fork`]'s child
-    /// record + child ledger row. `None` on conn-less registration lanes
-    /// ([`FreshCodexState::ensure_session_resumable`]'s attach-resume) — never
-    /// invented.
+    /// REFRESHED by [`FreshCodexState::adopt_live_create`] when a resume-create
+    /// adopts this live session over a new connection (focused-ep1-r4 Finding
+    /// 1, re-park + ledger re-stamp), CARRIED across crash-recovery rebuilds
+    /// (the in-place [`FreshCodexState::ensure_session_alive`] re-register and
+    /// the mint-new [`FreshCodexState::respawn_as_new_thread_after_crash`]
+    /// re-key — the same logical session continuing; its row-level twins are
+    /// the conn-less refresh's keep-when-None merge and the mint-new row's
+    /// `supersedes` inheritance), and inherited by
+    /// [`FreshCodexState::handle_fork`]'s child record + child ledger row. The
+    /// conn-less attach-resume lane
+    /// ([`FreshCodexState::ensure_session_resumable`]) seeds it from the
+    /// DURABLE row's stamps (focused-ep1-r4 Finding 2); a genuinely
+    /// unattributed row leaves `None` parked — never invented.
     provenance: Option<crate::BindProvenance>,
 }
 
@@ -445,8 +449,17 @@ impl FreshCodexState {
         };
         // No-laundering guard (V7/A10): never persist an all-blank snapshot --
         // it would mask a genuine record miss forever. Real creates always carry
-        // at least cwd; a supersession write always goes through (G3 linkage).
-        if settings == crate::identity_sink::FreshAgentSettings::default() && supersedes.is_none() {
+        // at least cwd; a supersession write always goes through (G3 linkage);
+        // and a connection-scoped PROVENANCE assertion (the adopt-lane refresh,
+        // focused-ep1-r4 Finding 1) goes through even with a blank settings
+        // snapshot — the row stays lineage-only (settings keying is unchanged)
+        // while the stamps assert the CURRENT attribution (the focused-ep1
+        // branch-2 regime; a blank-snapshot row with stamps is never a
+        // laundered defaults row).
+        if settings == crate::identity_sink::FreshAgentSettings::default()
+            && supersedes.is_none()
+            && provenance.is_none()
+        {
             return;
         }
         let crate::BindProvenance {
@@ -655,7 +668,11 @@ impl FreshCodexState {
             // naming it, spawn nothing (base checked only the dead-thread negative
             // cache here, never the live sessions map).
             if self.has_live_session(&resume_session_id).await {
-                self.adopt_live_create(&request_id, &resume_session_id)
+                // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
+                // the CURRENT connection's provenance — recovery plans mint
+                // NEW tabIds, so the incumbent must not keep the old tab's
+                // attribution.
+                self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                     .await;
                 return;
             }
@@ -677,8 +694,10 @@ impl FreshCodexState {
                         break;
                     }
                     crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                        // Under-lock ADOPT (the V5 TOCTOU window).
-                        self.adopt_live_create(&request_id, &resume_session_id)
+                        // Under-lock ADOPT (the V5 TOCTOU window). D8
+                        // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
+                        // CURRENT connection's provenance on the incumbent.
+                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
                         return;
                     }
@@ -987,7 +1006,11 @@ impl FreshCodexState {
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.adopt_live_create(&request_id, &thread_id).await;
+            // D8 (focused-ep1-r4 Finding 1): the eviction-guard adopt also
+            // re-parks/re-stamps the CURRENT connection's provenance on the
+            // incumbent (this arm returns immediately, so moving `provenance`
+            // in is safe).
+            self.adopt_live_create(&request_id, &thread_id, provenance).await;
             return;
         }
 
@@ -1179,7 +1202,58 @@ impl FreshCodexState {
     /// The HAS-LIVE→ADOPT arm (Task 12, V1): answer a loser's create-with-resume with a
     /// `freshAgent.created` naming the live durable threadId under the loser's own
     /// `requestId` — no spawn, no rollout clobber.
-    async fn adopt_live_create(&self, request_id: &str, thread_id: &str) {
+    ///
+    /// D8 (focused-ep1-r4 Finding 1 — mirror of the opencode in-memory-hit
+    /// refresh, `ec435cbf3`): the adopted resume-create is STILL a
+    /// connection-scoped create — this pane IS open in that client's
+    /// (possibly NEW, recovery-minted) tab. Re-park the CURRENT connection's
+    /// provenance on the incumbent and assert it to the ledger with this
+    /// lane's awaited binding refresh (durable-before-answer, BEFORE the
+    /// created broadcast below) — otherwise the parked value and every later
+    /// refresh/fork would keep the PRE-reload connection's attribution. A
+    /// conn-less adopt (`provenance == None`) re-parks nothing (the parked
+    /// Some is never regressed to None) and writes nothing (never invented).
+    async fn adopt_live_create(
+        &self,
+        request_id: &str,
+        thread_id: &str,
+        provenance: Option<crate::BindProvenance>,
+    ) {
+        if let Some(p) = provenance {
+            // Re-park + snapshot the incumbent's settings in one lock scope
+            // (the refresh write below asserts the parked identity together
+            // with the session's current values — the same composition this
+            // lane's per-send/fork writes use). A vanished incumbent (a kill
+            // racing the has-live check) skips the write: there is nothing
+            // live to re-attribute.
+            let parked = {
+                let mut guard = self.sessions.lock().await;
+                guard.get_mut(thread_id).map(|s| {
+                    s.provenance = Some(p.clone());
+                    (
+                        s.model.clone(),
+                        s.effort.clone(),
+                        s.cwd.clone(),
+                        s.sandbox.clone(),
+                        s.permission_mode.clone(),
+                    )
+                })
+            };
+            if let Some((model, effort, cwd, sandbox, permission_mode)) = parked {
+                self.record_codex_binding(
+                    thread_id,
+                    None,
+                    &model,
+                    sandbox.as_deref(),
+                    permission_mode.as_deref(),
+                    effort.as_deref(),
+                    cwd.as_deref(),
+                    None,
+                    Some(&p),
+                )
+                .await;
+            }
+        }
         self.create_dedup
             .record_success(
                 request_id,
@@ -3626,6 +3700,19 @@ impl FreshCodexState {
         }
         let rec = recovered.clone().unwrap_or_default();
 
+        // D8 (focused-ep1-r4 Finding 2 — the parking invariant's durable
+        // half): this construction lane is CONN-LESS (attach / snapshot reads
+        // carry no tab identity), so seed the parked provenance from the
+        // DURABLE row's stamps — the authoritative record of where this
+        // session last lived (a fork parked from this session asserts them on
+        // the child row's NEW ledger key, where keep-when-None could never
+        // rescue a `None` park). A row that genuinely carries no stamps seeds
+        // nothing: `None` stays parked (never invented) and the conn-less
+        // refresh below keeps whatever the row had.
+        let row_provenance = sink
+            .as_ref()
+            .and_then(|s| s.load_provenance("codex", thread_id));
+
         let resume_result = client
             .resume_thread(
                 thread_id,
@@ -3708,10 +3795,12 @@ impl FreshCodexState {
                 // Kata 1wxv Task 2 (r3): the durable rollout meta carries the
                 // mode across resume (only a missing/unparseable meta ⇒ legacy).
                 read_rollout_history_mode(thread_id),
-                // D8: the conn-less attach-resume parks NOTHING (the attach lane
-                // carries no tab identity — never invented); the ledger's
-                // keep-when-None merge preserves the row's prior stamps.
-                None,
+                // D8 (focused-ep1-r4 Finding 2): the conn-less attach-resume
+                // parks the DURABLE row's stamps (never invented — a genuinely
+                // unattributed row seeds `None`); the conn-less refresh below
+                // writes `None` stamps so the ledger's keep-when-None merge
+                // preserves whatever the row had.
+                row_provenance,
             )
             .await;
 
@@ -3769,10 +3858,12 @@ impl FreshCodexState {
     /// snapshot. Returns the new session's `active_turn` handle. Callers own everything
     /// AROUND this insert (watcher ownership of the child, lease completion in
     /// [`Self::ensure_session_resumable`], the binding row in [`Self::handle_fork`]).
-    /// `provenance` (D8, focused-ep1-r3): the provenance to PARK on the new
-    /// session record — [`Self::handle_fork`] passes the parent's parked value
-    /// (fork-chain inheritance); the conn-less attach-resume
-    /// ([`Self::ensure_session_resumable`]) passes `None` (never invented).
+    /// `provenance` (D8, focused-ep1-r3 + focused-ep1-r4 Finding 2): the
+    /// provenance to PARK on the new session record — [`Self::handle_fork`]
+    /// passes the parent's parked value (fork-chain inheritance); the
+    /// conn-less attach-resume ([`Self::ensure_session_resumable`]) passes the
+    /// DURABLE row's stamps (a genuinely unattributed row seeds `None` —
+    /// never invented).
     #[allow(clippy::too_many_arguments)]
     async fn register_live_session(
         &self,
@@ -8316,6 +8407,510 @@ pub(crate) mod tests {
         assert_eq!(row.client_instance_id.as_deref(), Some("client-mint"));
         assert_eq!(row.device_id.as_deref(), Some("device-mint"));
         assert_eq!(row.tab_key.as_deref(), Some("device-mint:tab-mint"));
+    }
+
+    /// Focused-ep1-r4 Finding 1 (the MAIN already-live resume arm, the
+    /// `has_live_session` fast path): a connection-scoped `freshAgent.create`
+    /// carrying a `resumeSessionId` that resolves to an ALREADY-LIVE thread is
+    /// answered by ADOPTING the live session — the recovery-plan shape (plans
+    /// mint NEW tabIds), so the adopt must re-park the CURRENT connection's
+    /// provenance on the incumbent AND assert it to the ledger with this
+    /// lane's awaited binding refresh BEFORE the created reply (the mirror of
+    /// the opencode in-memory-hit refresh, ec435cbf3). Otherwise the parked
+    /// value (and every later refresh/fork) keeps the OLD tab's attribution.
+    #[tokio::test]
+    async fn adopt_live_create_restamps_the_parked_provenance_and_the_ledger_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-adopt" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // The original connection's create parks (and rows) the OLD stamps.
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+            )),
+        )
+        .await;
+
+        // A NEW connection's recovery-create resumes the ALREADY-LIVE thread:
+        // the has-live fast path adopts it (no spawn).
+        let mut resume = create_msg("req-adopt-restamp");
+        resume.resume_session_id = Some(thread_id.clone());
+        st.handle_create(
+            resume,
+            Some(crate::BindProvenance::for_create(
+                Some("client-new"),
+                Some("device-new"),
+                Some("tab-new"),
+            )),
+        )
+        .await;
+        let created = await_created(&mut rx, "req-adopt-restamp").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the adopt answers created: {created}"
+        );
+        assert_eq!(created["sessionId"], json!(thread_id));
+
+        // The incumbent re-parks the CURRENT connection's provenance…
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("the adopt RE-PARKS the current connection's provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-new"));
+            assert_eq!(p.device_id.as_deref(), Some("device-new"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        // …and asserts it to the ledger with the lane's awaited refresh write
+        // (durable-before-answer: the created frame above already resolved).
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == thread_id)
+                .expect("the adopt's refresh write");
+            assert_eq!(
+                b.client_instance_id.as_deref(),
+                Some("client-new"),
+                "the adopt refresh re-stamps the row, never keeps the old tab"
+            );
+            assert_eq!(b.device_id.as_deref(), Some("device-new"));
+            assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        // …and every later fork of the adopted session asserts the CURRENT
+        // attribution on the child row.
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&thread_id, "fork-req-adopt", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-after-adopt"));
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let child = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-adopt")
+            .expect("a binding row for the post-adopt fork child");
+        assert_eq!(child.client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(child.device_id.as_deref(), Some("device-new"));
+        assert_eq!(child.tab_key.as_deref(), Some("device-new:tab-new"));
+    }
+
+    /// Focused-ep1-r4 Finding 1 (a LISTED EARLY EXIT — `finish_create`'s
+    /// eviction guard): a resume-create that SPAWNS (has-live was false at the
+    /// guard) but finds a LIVE incumbent at registration time adopts that
+    /// incumbent — this arm must restamp exactly like the fast path.
+    #[tokio::test]
+    async fn adopt_live_create_through_the_finish_create_eviction_guard_restamps_the_current_connection()
+     {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-evict-adopt" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+            )),
+        )
+        .await;
+
+        // Drive `handle_create_resume` DIRECTLY (skipping handle_create's
+        // has-live fast path and the lease claim): the fresh sidecar resumes
+        // the thread, and finish_create's eviction guard then finds the
+        // incumbent LIVE (the TOCTOU shape: a live entry landed between the
+        // has-live check and registration) -> the :990 adopt arm.
+        st.handle_create_resume(
+            "req-evict-adopt".to_string(),
+            thread_id.clone(),
+            None,
+            "gpt-5.3-codex-spark".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(crate::BindProvenance::for_create(
+                Some("client-new"),
+                Some("device-new"),
+                Some("tab-new"),
+            )),
+        )
+        .await;
+        let created = await_created(&mut rx, "req-evict-adopt").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the eviction-guard adopt answers created: {created}"
+        );
+        assert_eq!(created["sessionId"], json!(thread_id));
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("the eviction-guard adopt RE-PARKS the current connection");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-new"));
+            assert_eq!(p.device_id.as_deref(), Some("device-new"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == thread_id)
+                .expect("the eviction-guard adopt's refresh write");
+            assert_eq!(
+                b.client_instance_id.as_deref(),
+                Some("client-new"),
+                "the eviction-guard adopt refresh re-stamps the row"
+            );
+            assert_eq!(b.device_id.as_deref(), Some("device-new"));
+            assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&thread_id, "fork-req-evict-adopt", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-after-evict-adopt"));
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let child = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-evict-adopt")
+            .expect("a binding row for the post-adopt fork child");
+        assert_eq!(child.client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(child.device_id.as_deref(), Some("device-new"));
+        assert_eq!(child.tab_key.as_deref(), Some("device-new:tab-new"));
+    }
+
+    /// The no-regression pin (the invariant's second half): an adopt answer
+    /// with NO connection identity (conn-less lane) must NOT regress the
+    /// incumbent's already-parked Some to None, and writes nothing (the
+    /// ledger's keep-when-None merge preserves the row's stamps).
+    #[tokio::test]
+    async fn adopt_live_create_with_no_connection_provenance_keeps_the_parked_stamps_and_writes_nothing()
+     {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+            )),
+        )
+        .await;
+        let rows_before = fake
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .iter()
+            .filter(|b| b.session_id == thread_id)
+            .count();
+
+        let mut resume = create_msg("req-adopt-none");
+        resume.resume_session_id = Some(thread_id.clone());
+        st.handle_create(resume, None).await;
+        let created = await_created(&mut rx, "req-adopt-none").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the conn-less adopt still answers created: {created}"
+        );
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("a conn-less adopt must NOT regress the parked Some to None");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-old"));
+            assert_eq!(p.device_id.as_deref(), Some("device-old"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-old:tab-old"));
+        }
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        assert_eq!(
+            bindings.iter().filter(|b| b.session_id == thread_id).count(),
+            rows_before,
+            "a conn-less adopt writes nothing (keep-when-None preserves the row)"
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 1, the settings-independence arm (the codex
+    /// twin of opencode's `create_resume_with_a_lineage_only_row_still_-
+    /// restamps_the_current_connections_provenance`): an adopt over an
+    /// incumbent whose reconstructed settings are ALL BLANK (a LINEAGE-ONLY
+    /// durable row — no model/cwd recoverable) must STILL assert the current
+    /// connection's provenance to the ledger: the provenance refresh, not a
+    /// settings write, is the point. The V7 no-laundering guard must not eat
+    /// it — the row stays lineage-only (settings keying untouched).
+    #[tokio::test]
+    async fn adopt_live_create_over_a_lineage_only_incumbent_still_restamps_the_provenance() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A stamped LINEAGE-ONLY row (blank settings).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "thread-lineage-adopt".into(),
+            mode: "freshcodex".into(),
+            create_request_id: Some("cr-old".into()),
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-old".into()),
+            device_id: Some("device-old".into()),
+            tab_key: Some("device-old:tab-old".into()),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("seed binding write ok");
+        st.set_identity_sink(fake.clone());
+
+        // Conn-less attach reconstructs the session (all-blank settings),
+        // seeding the OLD row's stamps (focused-ep1-r4 Finding 2).
+        st.handle_attach(attach_msg("thread-lineage-adopt")).await;
+
+        // A NEW connection's recovery-create adopts the live incumbent.
+        let mut resume = create_msg("req-adopt-lineage");
+        resume.resume_session_id = Some("thread-lineage-adopt".to_string());
+        st.handle_create(
+            resume,
+            Some(crate::BindProvenance::for_create(
+                Some("client-new"),
+                Some("device-new"),
+                Some("tab-new"),
+            )),
+        )
+        .await;
+        let created = await_created(&mut rx, "req-adopt-lineage").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the adopt answers created: {created}"
+        );
+
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == "thread-lineage-adopt")
+            .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
+        assert_eq!(
+            b.client_instance_id.as_deref(),
+            Some("client-new"),
+            "the provenance refresh must not be gated on settings presence"
+        );
+        assert_eq!(b.device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            b.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "the settings payload is untouched by the provenance refresh (stays lineage-only)"
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 2 (codex): the CONN-LESS cold attach
+    /// (`freshAgent.attach` of a thread the local map has never heard of —
+    /// the post-restart rehydrate) must seed the parked provenance from the
+    /// DURABLE row's stamps (the authoritative record of where this session
+    /// last lived): the fork child's NEW ledger key is where keep-when-None
+    /// cannot rescue a `None` park.
+    #[tokio::test]
+    async fn attach_resume_seeds_the_parked_provenance_from_the_durable_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-of-row-seeded" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The durable row from the pre-restart connection: settings + stamps.
+        // (cwd must be a REAL directory — the fork below spawns the child's
+        // sidecar with the parent's inherited cwd.)
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "thread-row-seeded".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-row".into()),
+            device_id: Some("device-row".into()),
+            tab_key: Some("device-row:tab-row".into()),
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        st.set_identity_sink(fake.clone());
+
+        st.handle_attach(attach_msg("thread-row-seeded")).await;
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard
+                .get("thread-row-seeded")
+                .expect("the attach-resume registered the session");
+            let p = s
+                .provenance
+                .clone()
+                .expect("the conn-less cold attach seeds the parked provenance from the durable row");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+
+        // The conn-less refresh (settings recovered) writes None stamps — the
+        // ledger's keep-when-None merge keeps the row's, never None over Some.
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == "thread-row-seeded")
+                .expect("the attach-resume refresh write (settings recovered)");
+            assert_eq!(b.client_instance_id, None, "conn-less refresh stamps");
+            assert_eq!(b.device_id, None);
+            assert_eq!(b.tab_key, None);
+        }
+
+        // …and a fork after the attach (before any snapshot) produces an
+        // ATTRIBUTED child row on its NEW ledger key.
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg("thread-row-seeded", "fork-req-row-seed", None),
+            sink,
+        )
+        .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-of-row-seeded"));
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let child = bindings
+            .iter()
+            .find(|b| b.session_id == "child-of-row-seeded")
+            .expect("a binding row for the post-attach fork child");
+        assert_eq!(
+            child.client_instance_id.as_deref(),
+            Some("client-row"),
+            "the fork child inherits the row-seeded provenance, not a fork-time None"
+        );
+        assert_eq!(child.device_id.as_deref(), Some("device-row"));
+        assert_eq!(child.tab_key.as_deref(), Some("device-row:tab-row"));
+    }
+
+    /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
+    /// attach of a session whose durable row is GENUINELY UNATTRIBUTED (all
+    /// stamps None) parks NOTHING — never invented — and the conn-less refresh
+    /// merge preserves exactly what the row had (nothing).
+    #[tokio::test]
+    async fn attach_resume_with_a_genuinely_unattributed_row_keeps_the_parked_none() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A settings-bearing row with NO stamps (recorded via an explicit
+        // upsert, not the seed helper, so the row unambiguously has them unset).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "thread-unattributed".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                cwd: Some("/w".into()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        st.set_identity_sink(fake.clone());
+
+        st.handle_attach(attach_msg("thread-unattributed")).await;
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard
+                .get("thread-unattributed")
+                .expect("the attach-resume registered the session");
+            assert_eq!(
+                s.provenance, None,
+                "a genuinely unattributed row seeds nothing — never invented"
+            );
+        }
+        // The conn-less refresh writes None stamps and the merge preserves the
+        // row's (empty) stamps — no attribution is ever fabricated.
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == "thread-unattributed")
+            .expect("the attach-resume refresh write (settings recovered)");
+        assert_eq!(b.client_instance_id, None);
+        assert_eq!(b.device_id, None);
+        assert_eq!(b.tab_key, None);
+        assert!(
+            b.settings.model.is_some(),
+            "the refresh still re-persists the recovered settings"
+        );
     }
 
     #[tokio::test]

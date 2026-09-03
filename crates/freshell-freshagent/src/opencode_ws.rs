@@ -321,8 +321,11 @@ struct OpencodeSession {
     /// per-send refresh write always assert the CURRENT attribution). Read by
     /// every downstream binder: the materialization row (born at first SEND,
     /// mediations after `handle_create` returned), the per-send refresh, and
-    /// the fork child's inheritance. `None` for conn-less sessions
-    /// (attach-resume rehydrate) — the ledger merge keeps any prior stamps.
+    /// the fork child's inheritance. Conn-less cold reconstruction
+    /// (attach-resume rehydrate) seeds it from the DURABLE row's stamps
+    /// (focused-ep1-r4 Finding 2); a row that genuinely has none leaves `None`
+    /// parked — never invented — and conn-less writes let the ledger merge
+    /// keep any prior stamps.
     provenance: Option<crate::BindProvenance>,
 }
 
@@ -2419,7 +2422,11 @@ impl FreshOpencodeState {
     /// Finding 3) — parked on the reconstructed session (focused-ep1-r3) AND re-stamped
     /// by the binding refresh below, so a resume-into-a-new-tab never keeps the OLD
     /// tab's attribution. `None` from conn-less lanes (`handle_attach`): the session
-    /// parks nothing and the ledger's keep-when-None merge then inherits prior stamps.
+    /// then parks the DURABLE row's stamps instead (focused-ep1-r4 Finding 2 — the
+    /// row is the authoritative record of where this session last lived; the fork
+    /// child's NEW ledger key is where a `None` park could never be rescued), and
+    /// the conn-less refresh below writes `None` stamps so the ledger's
+    /// keep-when-None merge preserves whatever the row had.
     async fn resume_durable_session(
         &self,
         session_id: &str,
@@ -2555,16 +2562,24 @@ impl FreshOpencodeState {
             rec.effort.clone(),
         );
         session.real_session_id = Some(session_id.to_string());
-        // D8 (focused-ep1-r3 — the parking invariant): a session (re)attached to
-        // a client connection must hold that connection's LATEST provenance. The
-        // cold resume IS such an attach point when it flows from a
-        // connection-scoped create ([`Self::handle_create_resume`]): park BEFORE
-        // insertion so every downstream reader of `session.provenance` (the
-        // per-send refresh write, the fork consumer's child-row inheritance)
-        // asserts the CURRENT attribution. `None` stays when the resume has no
-        // connection identity (`handle_attach`) — never invented; the ledger's
-        // keep-when-None merge then continues to preserve prior stamps.
-        session.provenance = provenance.clone();
+        // D8 (focused-ep1-r3 + focused-ep1-r4 Finding 2 — the COMPLETE parking
+        // invariant): a session (re)attached to a client connection must hold
+        // that connection's LATEST provenance; a session reconstructed by a
+        // CONN-LESS cold resume (`handle_attach` carries no tab identity)
+        // holds the DURABLE row's stamps instead — the authoritative record of
+        // where this session last lived. Park BEFORE insertion so every
+        // downstream reader of `session.provenance` (the per-send refresh
+        // write, the fork consumer's child-row inheritance — a NEW ledger key
+        // where keep-when-None could never rescue a `None` park) asserts a
+        // known attribution. The connection's provenance still wins when
+        // present (the current-tab truth for a live move). A row that
+        // genuinely carries no stamps seeds nothing: `None` stays parked —
+        // never invented — and the conn-less refresh below preserves whatever
+        // the row had.
+        session.provenance = provenance.clone().or_else(|| {
+            sink.as_ref()
+                .and_then(|s| s.load_provenance(PROVIDER, session_id))
+        });
         session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
             session_id.to_string(),
@@ -4905,6 +4920,160 @@ mod tests {
             s.provenance, None,
             "a conn-less resume invents no provenance (None stays parked)"
         );
+    }
+
+    /// Focused-ep1-r4 Finding 2 (the parking invariant's durable half): the
+    /// CONN-LESS cold attach (`freshAgent.attach` — no tab identity on the
+    /// wire) of a session the local map has never heard of must seed the
+    /// parked provenance from the DURABLE row's stamps — the authoritative
+    /// record of where this session last lived. A fork of the attached
+    /// session (before any snapshot) then produces an ATTRIBUTED child row on
+    /// its NEW ledger key, where keep-when-None cannot rescue a `None` park.
+    #[tokio::test]
+    async fn attach_resume_seeds_the_durable_rows_provenance_and_fork_inherits_it() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The durable row from the pre-restart connection: settings + stamps.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-row".into()),
+            device_id: Some("device-row".into()),
+            tab_key: Some("device-row:tab-row".into()),
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        // The reconstructed session parks the ROW's stamps…
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the attach-resume registered the session")
+                .lock()
+                .await;
+            let p = s
+                .provenance
+                .clone()
+                .expect("the conn-less cold attach seeds the parked provenance from the durable row");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+
+        // …so a fork of the attached session (the D8 consumer the finding
+        // names: the fork child has a NEW ledger key where keep-when-None
+        // cannot rescue a None park) writes an attributed child row.
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(fork_msg(DURABLE_ID, "fork-req-row-seed", None), sink)
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the fork child parks the row-seeded provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.client_instance_id.as_deref(),
+            Some("client-row"),
+            "the child row inherits the row-seeded provenance, not a fork-time None"
+        );
+        assert_eq!(b.device_id.as_deref(), Some("device-row"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-row:tab-row"));
+    }
+
+    /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
+    /// attach of a session whose durable row is GENUINELY UNATTRIBUTED (all
+    /// stamps None) parks NOTHING — never invented — and the conn-less refresh
+    /// write keeps its None stamps so the ledger merge preserves exactly what
+    /// the row had (nothing).
+    #[tokio::test]
+    async fn attach_resume_with_a_genuinely_unattributed_row_parks_none() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A settings-bearing row with NO stamps (an explicit upsert, not the
+        // seed helper, so the row unambiguously has them unset).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the attach-resume registered the session")
+                .lock()
+                .await;
+            assert_eq!(
+                s.provenance, None,
+                "a genuinely unattributed row seeds nothing — never invented"
+            );
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == DURABLE_ID)
+            .expect("the attach-resume refresh write (settings recovered)");
+        assert_eq!(b.client_instance_id, None, "never write invented stamps");
+        assert_eq!(b.device_id, None);
+        assert_eq!(b.tab_key, None);
     }
 
     // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────
