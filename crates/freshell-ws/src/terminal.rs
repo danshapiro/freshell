@@ -3833,13 +3833,32 @@ pub(crate) async fn handle_create(
         // Identity-bearing pane whose identity is still in flight (fresh
         // codex/opencode/amplifier — trigger d): a durable pending marker
         // from spawn until resolution deletes it (binding-first order).
+        // Delta-r3 Finding 2: this connection-scoped create stamps the marker
+        // with the SAME provenance the binding arm above asserts — the
+        // conn-less locator/candidate resolution (ledger_resolve_identity,
+        // `Inherit`) has no existing row to inherit FROM for a fresh CLI
+        // pane, so the marker's stamps are the ONLY attribution source that
+        // survives until the provider resolves the session id.
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let write_terminal_id = terminal_id_for_meta.clone();
         let write_mode = mode.clone();
         let write_cwd = spec.cwd.clone();
+        let write_client_instance_id = bind_provenance.client_instance_id.clone();
+        let write_device_id = bind_provenance.device_id.clone();
+        let write_tab_key = bind_provenance.tab_key.clone();
         let now = now_ms();
         let result = spawn_blocking_in_span(move || {
-            ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
+            ledger.record_pending(
+                &write_terminal_id,
+                &write_mode,
+                write_cwd.as_deref(),
+                crate::pane_ledger::ProvenanceStamps {
+                    client_instance_id: write_client_instance_id.as_deref(),
+                    device_id: write_device_id.as_deref(),
+                    tab_key: write_tab_key.as_deref(),
+                },
+                now,
+            )
         })
         .await
         .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));

@@ -401,6 +401,73 @@ async fn terminal_create_stamps_the_binding_row_from_the_connection_identity_and
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_marker_mode_pane_stamps_the_pending_marker_from_the_connection_identity_and_tab_id() {
+    // Delta-r3 Finding 2 (restore-open-sessions-only): a connection-scoped
+    // codex CLI create — the DYNAMIC-identity path (no sessionRef, no
+    // pre-spawn binding; only claude preallocates) — must stamp the
+    // spawn-time PendingMarker with the connection's hello identity + the
+    // create's `tabId`. The later locator/candidate resolution is conn-less
+    // (`ProvenancePolicy::Inherit`) with NO existing row to inherit from, so
+    // the marker's stamps are the ONLY provenance in scope for the binding
+    // row it then writes. (codex stands for all MARKER_MODES here: the
+    // marker arm is one shared post-spawn call site keyed by mode
+    // membership; unit-level coverage is mode-parameterized.)
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises
+    // the plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("marker-stamp");
+    let (url, registry, _ledger_arc) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) =
+        connect_and_capture_inventory_with_identity(&url, "device-stamp", "client-stamp").await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-marker-stamp-1",
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-marker-stamp",
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+    // Assert on the DURABLE marker document (the create handler awaits the
+    // marker write before answering, exactly like the claude binding-write
+    // sibling pins) — the raw JSON, so a missing stamp on an unfixed build
+    // fails the test behaviorally rather than being a struct-field gate.
+    let entries: Vec<_> = std::fs::read_dir(dir.join("pending"))
+        .expect("pending dir exists")
+        .collect::<Result<_, _>>()
+        .expect("list pending dir");
+    assert_eq!(entries.len(), 1, "exactly one marker written");
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entries[0].path()).expect("read marker"))
+            .expect("marker is json");
+    assert_eq!(marker["terminalId"].as_str().unwrap(), terminal_id);
+    assert_eq!(marker["mode"].as_str().unwrap(), "codex");
+    assert_eq!(
+        marker["clientInstanceId"].as_str(),
+        Some("client-stamp"),
+        "the marker carries the connection's clientInstanceId"
+    );
+    assert_eq!(
+        marker["deviceId"].as_str(),
+        Some("device-stamp"),
+        "the marker carries the connection's deviceId"
+    );
+    assert_eq!(
+        marker["tabKey"].as_str(),
+        Some("device-stamp:tab-marker-stamp"),
+        "tabKey composes as deviceId:tabId (src/lib/tab-registry-snapshot.ts)"
+    );
+
+    registry.kill(&terminal_id);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {

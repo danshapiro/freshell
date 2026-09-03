@@ -869,7 +869,13 @@ mod tests {
         // drives the module, not the WS handler).
         state
             .pane_ledger
-            .record_pending("t1", "opencode", Some("/tmp"), crate::terminal::now_ms())
+            .record_pending(
+                "t1",
+                "opencode",
+                Some("/tmp"),
+                crate::pane_ledger::ProvenanceStamps::default(),
+                crate::terminal::now_ms(),
+            )
             .unwrap();
 
         note_possible_submit(&state, "t1", "\r");

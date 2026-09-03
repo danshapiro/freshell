@@ -42,9 +42,24 @@ impl PaneIdentitySink for LedgerIdentitySink {
         );
         let now = now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.record_pending(&p, &m, c.as_deref(), now))
-                .await
-                .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
+            // Delta-r3 Finding 2: fresh-agent markers carry NO spawn-time
+            // provenance. Their identity resolves through
+            // `record_fresh_agent_binding` + `delete_pending(resolves_pending)`
+            // (the upsert's own tri-state provenance, parked from the create)
+            // — never through `resolve_pending`, whose marker-stamp sourcing
+            // exists for the terminal-lineage locator/candidate lanes. Stamps
+            // here would be dead data.
+            tokio::task::spawn_blocking(move || {
+                ledger.record_pending(
+                    &p,
+                    &m,
+                    c.as_deref(),
+                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                    now,
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
         })
     }
 

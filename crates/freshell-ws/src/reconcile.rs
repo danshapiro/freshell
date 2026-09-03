@@ -861,7 +861,13 @@ mod tests {
     fn pending_marker_yields_fresh_by_race_not_silent_fresh() {
         let f = Fixture::new();
         f.ledger
-            .record_pending("T-race", "opencode", None, 1_000)
+            .record_pending(
+                "T-race",
+                "opencode",
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("record pending");
         let mut p = pane("cr-race");
         p.mode = Some("opencode".to_string());
@@ -882,7 +888,13 @@ mod tests {
     fn marker_read_is_idempotent_across_reconciles() {
         let f = Fixture::new();
         f.ledger
-            .record_pending("T-race2", "opencode", None, 1_000)
+            .record_pending(
+                "T-race2",
+                "opencode",
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("record pending");
         let mut p = pane("cr-race2");
         p.mode = Some("opencode".to_string());
@@ -904,7 +916,13 @@ mod tests {
     fn shell_pane_ignores_pending_markers() {
         let f = Fixture::new();
         f.ledger
-            .record_pending("T-sh", "shell", None, 1_000)
+            .record_pending(
+                "T-sh",
+                "shell",
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("record pending");
         let mut p = pane("cr-sh");
         p.mode = Some("shell".to_string());

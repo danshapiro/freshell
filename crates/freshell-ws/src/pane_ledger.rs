@@ -151,6 +151,20 @@ pub struct BindingRow {
 }
 
 /// Evidence that identity establishment was in flight (G1: never a binding).
+///
+/// Markers ALSO carry spawn-time provenance (delta-r3 Finding 2): the
+/// browser client + tab that created the pane, captured at marker write
+/// because the identity they guard resolves LATER and conn-less — the
+/// locator/candidate resolution hook ([`ledger_resolve_identity`]) runs
+/// with [`ProvenancePolicy::Inherit`], and for a dynamically-identified
+/// codex/opencode/amplifier CLI pane (no pre-spawn binding; only claude
+/// preallocates) there is NO existing row to inherit from.
+/// [`PaneLedger::resolve_pending`] sources attribution by precedence: the
+/// resolve's own meaningful
+/// provenance, then THESE stamps, then inherit-from-existing-row. Serde-
+/// optional under LEDGER_VERSION 1 (the BindingRow precedent): pre-delta-r3
+/// markers — and headless REST/sink markers, intentionally never stamped —
+/// parse to all-`None` and resolution behaves exactly as it did before.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingMarker {
@@ -160,6 +174,14 @@ pub struct PendingMarker {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub spawned_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// `deviceId:tabId` — exactly `src/lib/tab-registry-snapshot.ts`'s record
+    /// composition, so the resolved row can rejoin the right restored tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_key: Option<String>,
 }
 
 /// D8 (delta-r2 Finding 2) provenance stamps carried by a
@@ -982,11 +1004,20 @@ impl PaneLedger {
     /// Durable evidence that identity establishment is in flight for this
     /// terminal (spec §4.2): written at spawn of an identity-bearing pane
     /// whose identity is not yet known. File first, then index (write-through).
+    ///
+    /// `provenance` is the write's SPAWN-TIME provenance (delta-r3 Finding 2,
+    /// see the [`PendingMarker`] doc): the connection-scoped WS create lane
+    /// passes the connection's hello identity + the create's `tabId`; the
+    /// headless REST lineage binder and the fresh-agent sink pass
+    /// [`ProvenanceStamps::default()`] (nothing to attribute — exactly their
+    /// binding-write policy). The stamps ride the marker so the conn-less
+    /// resolution can still attribute the row it writes.
     pub fn record_pending(
         &self,
         terminal_id: &str,
         mode: &str,
         cwd: Option<&str>,
+        provenance: ProvenanceStamps<'_>,
         now_ms: i64,
     ) -> std::io::Result<()> {
         let Some(root) = &self.root else {
@@ -999,6 +1030,9 @@ impl PaneLedger {
             mode: mode.to_string(),
             cwd: cwd.map(str::to_string),
             spawned_at: now_ms,
+            client_instance_id: provenance.client_instance_id.map(str::to_string),
+            device_id: provenance.device_id.map(str::to_string),
+            tab_key: provenance.tab_key.map(str::to_string),
         };
         write_row_atomic(&Self::pending_path(root, terminal_id), &marker)?;
         index.pending.insert(terminal_id.to_string(), marker);
@@ -1024,6 +1058,42 @@ impl PaneLedger {
             return Ok(());
         };
         let mut index = self.guard();
+        // Delta-r3 Finding 2 provenance precedence on the marker→binding
+        // transition: the resolve's OWN meaningful policy wins (`Replace`
+        // asserts, `Clear` erases). A conn-less `Inherit` resolve instead
+        // sources attribution from the consumed marker's spawn-time stamps:
+        // each `Some` field attributes the row, each `None` field asserts
+        // nothing, so `Replace`'s per-field keep-when-`None` yields exactly
+        // (marker stamps, else the existing row's stamps) — and an
+        // UNSTAMPED marker (headless lanes, pre-delta-r3 docs) yields
+        // `Replace(all-None)` ≡ `Inherit` in this body, i.e. a headless
+        // resolution still ends unattributed, unchanged.
+        let marker_stamps: Option<(Option<String>, Option<String>, Option<String>)> =
+            match &w.provenance {
+                ProvenancePolicy::Inherit => index.pending.get(w.terminal_id).map(|m| {
+                    (
+                        m.client_instance_id.clone(),
+                        m.device_id.clone(),
+                        m.tab_key.clone(),
+                    )
+                }),
+                _ => None,
+            };
+        let effective;
+        let w = match &marker_stamps {
+            Some((c, d, t)) => {
+                effective = BindingWrite {
+                    provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+                        client_instance_id: c.as_deref(),
+                        device_id: d.as_deref(),
+                        tab_key: t.as_deref(),
+                    }),
+                    ..*w
+                };
+                &effective
+            }
+            None => w,
+        };
         self.record_binding_locked(root, &mut index, w)?; // binding row FIRST
         if let Err(err) = Self::remove_pending(root, &mut index, w.terminal_id) {
             // THEN the marker — cleanup only. The identity IS durably
@@ -1226,7 +1296,11 @@ pub(crate) async fn ledger_resolve_identity(
             cwd: cwd_owned.as_deref(),
             create_request_id: None,
             // Conn-less lane (D8): no provenance in scope and none asserted;
-            // `Inherit` keeps any stamps the connection-scoped create wrote.
+            // `Inherit` keeps any prior row's stamps — and (delta-r3 Finding
+            // 2) `resolve_pending` additionally sources the consumed marker's
+            // spawn-time stamps, so a dynamically-identified pane whose marker
+            // the connection-scoped create stamped is STILL attributable here
+            // (no existing row would otherwise exist to inherit from).
             provenance: ProvenancePolicy::Inherit,
             now_ms: now,
         })

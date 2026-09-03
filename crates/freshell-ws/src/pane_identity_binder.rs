@@ -173,7 +173,18 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             // pane whose identity is still in flight (fresh codex/opencode/
             // amplifier -- trigger d): a durable pending marker from spawn
             // until resolution deletes it (binding-first order).
-            if let Err(err) = self.ledger.record_pending(terminal_id, mode, cwd, now_ms()) {
+            // Delta-r3 Finding 2: NO provenance stamps here — this lane is
+            // explicitly HEADLESS (no browser connection exists at create
+            // time, exactly its binding-write `Clear` policy), so a later
+            // locator/signal resolution of this marker still ends
+            // unattributed and the D8 judgment correctly never offers it.
+            if let Err(err) = self.ledger.record_pending(
+                terminal_id,
+                mode,
+                cwd,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                now_ms(),
+            ) {
                 Self::warn_write_failure(terminal_id, "spawn-time pending marker", &err);
             }
         }

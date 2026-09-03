@@ -1256,7 +1256,13 @@ mod tests {
         std::fs::create_dir_all(&ledger_root).expect("mkdir ledger root");
         let ledger = Arc::new(PaneLedger::new(Some(ledger_root)));
         ledger
-            .record_pending("t-pane1", "opencode", Some(&cwd), 1_000)
+            .record_pending(
+                "t-pane1",
+                "opencode",
+                Some(&cwd),
+                freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("pending marker");
         ledger
             .resolve_pending(&BindingWrite {

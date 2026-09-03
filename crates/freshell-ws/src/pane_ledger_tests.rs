@@ -516,7 +516,7 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
     ledger
-        .record_pending("ph", "freshclaude", None, 1)
+        .record_pending("ph", "freshclaude", None, ProvenanceStamps::default(), 1)
         .expect("pending writes keep their silent-no-op policy on a disabled ledger");
     ledger
         .delete_rollback_row("claude", "sid")
@@ -730,7 +730,7 @@ fn pending_marker_roundtrips_and_reader_rule_prefers_binding() {
     let root = temp_root("pending");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "opencode", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "opencode", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     let marker = ledger.pending_for_terminal("t1").expect("marker readable");
     assert_eq!(marker.terminal_id, "t1");
@@ -754,7 +754,7 @@ fn resolve_pending_writes_binding_first_then_deletes_marker() {
     let root = temp_root("resolve");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger
         .resolve_pending(&write("codex", "th-1", "t1", 2_000))
@@ -775,7 +775,7 @@ fn resolve_pending_marker_delete_failure_is_not_a_durability_error() {
     let root = temp_root("marker-delete-fails");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     // Make the pending dir read-only so the marker unlink fails (EACCES).
     let pending_dir = root.join("pending");
@@ -801,7 +801,7 @@ fn pending_resolution_collision_is_idempotent() {
     let root = temp_root("collision");
     let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
 
     // Sequential double-resolution.
@@ -822,7 +822,7 @@ fn pending_resolution_collision_is_idempotent() {
 
     // Concurrent resolution from two threads (the actual race shape).
     ledger
-        .record_pending("t2", "codex", Some("/tmp/p"), 3_000)
+        .record_pending("t2", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 3_000)
         .unwrap();
     let a = std::sync::Arc::clone(&ledger);
     let b = std::sync::Arc::clone(&ledger);
@@ -843,6 +843,259 @@ fn pending_resolution_collision_is_idempotent() {
 }
 
 #[test]
+fn resolve_pending_sources_provenance_from_the_consumed_marker() {
+    // Delta-r3 Finding 2 (the keep-side hole mirroring the original
+    // over-offer bug): a dynamically-identified CLI pane (codex/opencode/
+    // amplifier — no pre-spawn binding; only claude preallocates) leaves the
+    // conn-less resolution hook (`ledger_resolve_identity`, `Inherit`) with
+    // NO existing row to inherit FROM, so the spawn-time marker's stamps are
+    // the only attribution that survives until the provider resolves the
+    // session id. Resolution must write the binding row stamped FROM the
+    // consumed marker — otherwise the D8 judgment rejects the row and a
+    // genuinely-open CLI pane lost before the next snapshot is never offered.
+    let root = temp_root("resolve-marker-prov");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-1"),
+                device_id: Some("device-1"),
+                tab_key: Some("device-1:tab-1"),
+            },
+            1_000,
+        )
+        .unwrap();
+    // The conn-less lane's exact write shape (`Inherit`).
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    assert!(
+        ledger.list_pending_raw().is_empty(),
+        "the marker was consumed (binding-first order)"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolve_pending_prefers_the_resolve_calls_own_provenance_over_the_markers() {
+    // Precedence, arm 1: a resolution that KNOWS fresher provenance
+    // (`Replace`) asserts it — the consumed marker's spawn-time stamps never
+    // pin a staler attribution in place.
+    let root = temp_root("resolve-prefers-own");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-marker"),
+                device_id: Some("device-marker"),
+                tab_key: Some("device-marker:tab-marker"),
+            },
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write_provenance(
+            "codex",
+            "th-1",
+            "t1",
+            2_000,
+            Some("client-resolve"),
+            Some("device-resolve"),
+            Some("device-resolve:tab-resolve"),
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-resolve"));
+    assert_eq!(row.device_id.as_deref(), Some("device-resolve"));
+    assert_eq!(
+        row.tab_key.as_deref(),
+        Some("device-resolve:tab-resolve")
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolve_pending_merges_marker_stamps_fieldwise_over_the_existing_row() {
+    // Precedence, arm 2 (per-field): the marker is just another provenance
+    // SOURCE whose absent fields assert nothing (the `Replace`
+    // keep-when-`None` merge, delta-r2 deviation 2). A partially-stamped
+    // marker — e.g. a hello that carried `clientInstanceId` but no
+    // `deviceId`, so `tabKey` never composed — stamps only its own `Some`
+    // fields; each `None` field falls through to the EXISTING row's value
+    // (a session id previously bound from another pane can already carry
+    // stamps when a fresh pane resolves to it).
+    let root = temp_root("resolve-fieldwise");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t-prev",
+            500,
+            Some("client-old"),
+            Some("device-old"),
+            Some("device-old:tab-old"),
+        ))
+        .unwrap();
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-new"),
+                device_id: None,
+                tab_key: None,
+            },
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(
+        row.client_instance_id.as_deref(),
+        Some("client-new"),
+        "the marker's `Some` field attributes the row"
+    );
+    assert_eq!(
+        row.device_id.as_deref(),
+        Some("device-old"),
+        "a marker `None` field keeps the existing row's value"
+    );
+    assert_eq!(
+        row.tab_key.as_deref(),
+        Some("device-old:tab-old"),
+        "tab_key likewise inherited (no half-known tab identity invented)"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolve_pending_from_a_headless_origin_stays_unattributed() {
+    // Precedence, arm 3: the REST/headless lineage binder writes markers
+    // WITHOUT stamps (`ProvenanceStamps::default()`), so a resolution whose
+    // origin is headless still ends unattributed — the D8 judgment correctly
+    // never offers the row. `Replace(all-None)` ≡ `Inherit` for this body,
+    // so the behavior is exactly the pre-delta-r3 one.
+    let root = temp_root("resolve-headless");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id, None);
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolve_pending_clear_wins_over_a_stamped_marker() {
+    // The tri-state policy of the RESOLVE stays authoritative: `Clear` (the
+    // explicitly-headless re-bind arm) erases even when a stamped marker is
+    // present — the marker fallback expands only the conn-less `Inherit` arm.
+    let root = temp_root("resolve-clear-wins");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t-prev",
+            500,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-2"),
+                device_id: Some("device-2"),
+                tab_key: Some("device-2:tab-2"),
+            },
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write_with_policy(
+            "codex",
+            "th-1",
+            "t1",
+            2_000,
+            ProvenancePolicy::Clear,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id, None, "Clear erases browser stamps");
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn stamped_marker_retention_is_unchanged() {
+    // The stamps are payload, not lifetime: retention reads only
+    // `spawned_at`. A stamped marker survives a GC pass while young (stamps
+    // intact) and is swept after PENDING_MARKER_TTL_MS, exactly like an
+    // unstamped one.
+    let root = temp_root("stamped-marker-ttl");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let now = 2 * PENDING_MARKER_TTL_MS;
+    let stamps = ProvenanceStamps {
+        client_instance_id: Some("client-1"),
+        device_id: Some("device-1"),
+        tab_key: Some("device-1:tab-1"),
+    };
+    ledger
+        .record_pending("young-t", "codex", Some("/tmp/p"), stamps, now - 60_000)
+        .unwrap();
+    ledger
+        .record_pending("aged-t", "codex", Some("/tmp/p"), stamps, 1_000)
+        .unwrap();
+    let report = ledger.gc(now, &never_absent, None);
+    assert_eq!(report.stale_markers_removed, vec!["aged-t".to_string()]);
+    let young = ledger
+        .pending_for_terminal("young-t")
+        .expect("the young stamped marker is retained");
+    assert_eq!(young.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(young.device_id.as_deref(), Some("device-1"));
+    assert_eq!(young.tab_key.as_deref(), Some("device-1:tab-1"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn old_markers_without_provenance_fields_still_deserialize() {
+    // The stamps are additive under LEDGER_VERSION 1 (the BindingRow
+    // precedent, `old_terminal_rows_without_settings_fields_still_deserialize`):
+    // a pre-delta-r3 marker document has none of the new keys and parses to
+    // all-`None` — a resolution over it behaves exactly as before.
+    let json = r#"{"ledgerVersion":1,"terminalId":"t1","mode":"codex","spawnedAt":1000}"#;
+    let marker: PendingMarker = serde_json::from_str(json).expect("old marker must parse");
+    assert_eq!(marker.client_instance_id, None);
+    assert_eq!(marker.device_id, None);
+    assert_eq!(marker.tab_key, None);
+}
+
+#[test]
 fn sigkill_inside_locator_window_leaves_a_durable_marker() {
     // Red test `SIGKILL-inside-locator-window` (unit shape): a marker
     // written pre-resolution survives "process death" (a second PaneLedger
@@ -851,7 +1104,7 @@ fn sigkill_inside_locator_window_leaves_a_durable_marker() {
     let root = temp_root("sigkill-window");
     {
         let gen1 = PaneLedger::new(Some(root.clone()));
-        gen1.record_pending("t1", "opencode", Some("/tmp/p"), 1_000)
+        gen1.record_pending("t1", "opencode", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
             .unwrap();
         // gen1 "dies" here — dropped without resolving.
     }
@@ -965,7 +1218,7 @@ fn crash_between_binding_write_and_marker_delete_is_repaired_at_boot() {
     let root = temp_root("crash-window");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger
         .record_binding(&write("codex", "th-1", "t1", 2_000))
@@ -988,7 +1241,7 @@ fn boot_scan_never_sweeps_a_marker_merely_because_the_terminal_is_not_live() {
     let root = temp_root("marker-preserved");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "opencode", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "opencode", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     let report = ledger.boot_scan(2_000, &never_absent);
     assert!(report.stale_markers_removed.is_empty());
@@ -1006,7 +1259,7 @@ fn aged_out_marker_is_swept_after_its_ttl() {
     let root = temp_root("marker-ttl");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     let report = ledger.boot_scan(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent);
     assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
@@ -1023,7 +1276,7 @@ fn periodic_gc_sweeps_aged_markers_without_a_restart() {
     let root = temp_root("marker-ttl-gc");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
         .unwrap();
     // A fresh marker survives a GC pass (never swept merely for age < TTL)...
     let report = ledger.gc(2_000, &never_absent, None);
@@ -1049,13 +1302,13 @@ fn orphaned_pending_marker_is_gced_after_orphan_ttl() {
     let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
     let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
     ledger
-        .record_pending("dead-t", "codex", Some("/tmp/p"), orphan_age)
+        .record_pending("dead-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), orphan_age)
         .unwrap();
     ledger
-        .record_pending("live-t", "codex", Some("/tmp/p"), orphan_age)
+        .record_pending("live-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), orphan_age)
         .unwrap();
     ledger
-        .record_pending("young-t", "codex", Some("/tmp/p"), now - 60_000)
+        .record_pending("young-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), now - 60_000)
         .unwrap();
     let live: HashSet<String> = HashSet::from(["live-t".to_string()]);
 
@@ -1087,7 +1340,7 @@ fn boot_path_never_runs_the_orphan_rule() {
     let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
     let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
     ledger
-        .record_pending("dead-t", "codex", Some("/tmp/p"), orphan_age)
+        .record_pending("dead-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), orphan_age)
         .unwrap();
 
     let report = ledger.boot_scan(now, &never_absent);
