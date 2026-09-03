@@ -26,7 +26,7 @@ Two review rounds established that no aggregate recency heuristic can fix this: 
 
 1. **Stamp.** `BindingRow` gains optional `client_instance_id`, `device_id`, `tab_key` (additive serde-optional fields — production-proven compatible: the live store already holds 75 rows of which 72 predate the last optional field, zero quarantined). Connection-scoped lanes stamp them: the WS `hello` learns additive optional `deviceId`/`clientInstanceId` (non-strict on both server sides; no version canary trip), `terminal.create` already carries `tabId` (no wire change; tabKey composes as `deviceId:tabId` exactly like snapshot records), and `freshAgent.create` gains additive optional `tabId`. Conn-less record paths (auto-resume respawn, locator/adoption, rollback fork chains) never invent provenance: both ledger upsert bodies merge keep-when-None so re-binds preserve it. REST/headless lineage rows stay unattributed.
 2. **Judge.** `ledgerOnly` keeps a row only when ALL of: it is Bound, unreferenced, not-live; it HAS attribution; its attributed device is the offer's primary device; its attributed client survives the existing A15/A16 selection in that device dir; and `row_time + 7_000 >= newest(parent_client)`, where `row_time = updated_at.max(created_at)` and `newest(parent_client)` is the capturedAt of the parent's revision-first winner generation — the same ranking the union composition uses, so the judgment and the offered unions agree by construction. Unattributed rows and everything failing a clause are never offered (pre-upgrade 301-row tails die in place). Keep-side degenerate check: a kill-window row's bind postdates its parent's last retained push, so it satisfies the rule unconditionally.
-3. **Place.** Each kept row carries its `tab_key`; the client joins it into the restored tab whose source `tabKey` matches (the layout join happens at plan time, one dispatch), and the offer lists it under that tab's name. Rows whose tab vanished from all retained evidence (unmatched/missing tabKey) fall back to the trailing tab by design — with exact content now, not the junk tail.
+3. **Place.** Each kept row carries its `tab_key`; the client joins it into the restored tab whose source `tabKey` matches (the layout join happens at plan time, one dispatch), and the offer lists it under that tab's name. [Amended after delta review round 2:] the server offers a kept row ONLY when its stamped tabKey names an OPEN, non-empty tab in the offered unions; rows without a matching open tab are excluded outright (their original placement is unknowable from retained data), and the trailing "Recovered sessions" tab machinery is removed entirely — nothing is ever restored into a synthetic tab.
 
 **Tech Stack:** Rust workspace crates (`freshell-ws` ledger/protocol/ws dispatch, `freshell-freshagent` provider lanes, `freshell-server` inventory), TS client (protocol types, create payloads, recovery plan/panel), Vitest/Playwright e2e (`test/e2e-browser/specs/recover-my-panes-rust.spec.ts` + `restore-contract-wall-rust.spec.ts`, rust-chromium project).
 
@@ -48,7 +48,7 @@ Two review rounds established that no aggregate recency heuristic can fix this: 
 - A row whose bind raced its own parent's next push (physically under ~one 5s cadence window within that client) keeps the benefit of the doubt even if it was closed or headless in that window; per-row open/closed provenance at sub-cadence resolution is not retained by anything, and the SIGKILL-within-5s e2e contract requires keep-side behavior there. Such a row stays Bound and is re-offer-eligible at future storage-loss boots (the user's decline is remembered by contentId dismissal); eliminating this corner requires a durable close-stamping contract across every close affordance — real future work, deliberately not part of this fix (the mis-classed rows were demonstrably open seconds before the loss — the polar opposite of the 30-day never-open tail this task kills).
 - A pane whose parent client left NO retained generation at all (its very first boot died before its WS-ready push reached the server, or its generations were count-cap-evicted after a reload storm) is not offered — undecidable from retained data.
 - Rows bound before this change ships (no stamped provenance) and rows from REST/MCP lanes (unattributable — no client connection exists at bind time) are never offered via `ledgerOnly`. Anything pre-upgrade that WAS genuinely open is in snapshot unions anyway (referenced → restored through the layout path, not the bucket). REST/MCP-orchestrated panes that DO appear in a user's browser become referenced by that browser's pushes within one cadence; the only unrecoverable case is the conjunction (REST/MCP create → server dies within ~5s before any push → AND a storage-loss boot) — documented, with the adopable-fix noted (a browser-side adopt/re-bind with connection context would stamp such rows through the replace rule).
-- When a kept row's original tab itself vanished from all retained evidence (the tab was created and lost inside the same sub-cadence window), the row lands in the trailing tab — with exact content, replacing the junk tab the user reported.
+- [Amended after delta review round 2:] when a kept row's original tab vanished from all retained evidence (the whole tab was created and lost inside the sub-cadence window), the row is EXCLUDED — no retained data can name its tab, and restoring it anywhere else would recreate the dump-into-another-tab behavior the user reported. The trailing tab machinery is deleted.
 - After this lands, a previously-dismissed offer's `contentId` changes once; a dismissed offer may re-appear at most once.
 
 ---
@@ -124,9 +124,9 @@ test('stale never-open ledger rows are never offered', async ({ browser, e2eServ
   //    const panel = pageB.getByTestId('recovery-offer-panel')
   //    await expect(panel.locator('ul li', { hasText: 'junk-freshclaude-' })).toHaveCount(0)
   // 11. Do NOT click accept on the junk-account alone: with the bucket empty of
-  //    this row there is no junk tab to form (Task 4 separately pins that
-  //    surviving rows join their original tab and that the trailing tab only
-  //    appears for rows whose tab vanished).
+  //    this row there is no junk tab to form (Task 4 pins that surviving rows
+  //    join their original tab and that [as-executed] any row without a
+  //    matching open tab is excluded instead of forming a synthetic tab).
   // 12. await ctxB.close() (finally-style cleanup consistent with the file).
 })
 ```
@@ -435,9 +435,9 @@ Kill-window rows (SIGKILL-within-5s contract) keep unconditionally."
 
 **Files:**
 - Modify: `src/lib/recovery/types.ts` (`LedgerOnlyEntry` gains optional `tabKey`)
-- Modify: `src/lib/recovery/build-recovery-plan.ts` (per-tab plans record `sourceTabKey`; join logic at leaf-list time before `chain()`; kept `ledgerOnly` rows join their matching restored tab — geometry: rightmost leaf of the right-leaning chain, matching the plan's existing chain convention; unmatched/missing tabKey rows keep today's trailing-tab behavior)
-- Modify: `src/components/RecoveryOfferPanel.tsx` (render joined rows inside their tab's list section using the same `{tab.tabName}: {mode} — {cwd}` line format as device panes; trailing rows keep the flat `{mode} session — {cwd}` format)
-- Test: `test/unit/client/lib/recovery/build-recovery-plan.test.ts` (join matrix: matching-tab join; unmatched tabKey → trailing; missing tabKey → trailing; mixed cohort; `countRecoverablePanes` unchanged totals; the existing :85-95 trailing-tab case stays with a stamp-less fixture)
+- Modify: `src/lib/recovery/build-recovery-plan.ts` (per-tab plans record `sourceTabKey`; join logic at leaf-list time before `chain()`; kept `ledgerOnly` rows join their matching restored tab — geometry: rightmost leaf of the right-leaning chain, matching the plan's existing chain convention; [as-executed amendment] rows without a join target are NOT placed and no trailing tab is built — the server excludes them upstream)
+- Modify: `src/components/RecoveryOfferPanel.tsx` (render joined rows inside their tab's list section using the same `{tab.tabName}: {mode} — {cwd}` line format as device panes; [as-executed amendment] the flat trailing-row rendering was removed with the trailing tab)
+- Test: `test/unit/client/lib/recovery/build-recovery-plan.test.ts` (join matrix: matching-tab join; [as-executed amendment] unmatched/missing tabKey rows produce no junk tab; mixed cohort; `countRecoverablePanes` unchanged totals)
 - Test: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (extend the tail of `SIGKILL-within-5s-of-pane-creation` (:1799-1912) with an UNCONDITIONAL placement proof: the existing two-path poll's auto-restore branch is unreachable in this scenario — the init script clears storage before navigation, so the boot has no persisted layout to auto-restore FROM; the offer is the only reachable evidence. The tail therefore hard-expects the offer visible (`getByTestId('recovery-offer-panel')`), clicks `recovery-accept`, and asserts (a) the restored claude pane lands in the SAME restored tab as the shell pane — walk `state.panes.layouts` for the restored tab(s) and compare tab membership via the harness — and (b) NO tab titled 'Recovered sessions' exists. If the offer ever does NOT appear here, that is a regression in kill-window keep behavior — fail loud, never skip the tail)
 
 **Interfaces:**
@@ -446,15 +446,15 @@ Kill-window rows (SIGKILL-within-5s contract) keep unconditionally."
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-Extend `build-recovery-plan.test.ts`: device tab with tabKey `d1:t1` + one `ledgerOnly` row stamped `tabKey: "d1:t1"` → the restored plan for `d1:t1`'s tab contains BOTH the union panes and the joined row (assert leaf count + the joined leaf's sessionRef); row stamped `d1:tX` (absent) and a stamp-less row both land in the trailing tab; mixed cohort yields exactly one restored tab per device tab + at most one trailing tab.
+Extend `build-recovery-plan.test.ts`: device tab with tabKey `d1:t1` + one `ledgerOnly` row stamped `tabKey: "d1:t1"` → the restored plan for `d1:t1`'s tab contains BOTH the union panes and the joined row (assert leaf count + the joined leaf's sessionRef); [as-executed amendment] rows stamped to absent/unmatched tabs produce NO additional tab (no 'Recovered sessions' tab exists anywhere in the rebuilt layout — behavior-asserted, not string-matched); mixed cohort yields exactly one restored tab per device tab.
 
-Then the wall-spec tail step (write it asserting the CURRENT junk behavior is absent — it fails pre-Task-3-4 because the bucket row lands in a trailing tab with no tabKey) — details in the file list above; this tail RED here is intentional (implementation in Steps 3-4 turns it green).
+Then the wall-spec tail step (write it asserting the CURRENT junk behavior is absent — it fails pre-Task-3-4 because the bucket row lands in a synthetic placement-orphaned tab) — details in the file list above; this tail RED here is intentional (implementation in Steps 3-4 turns it green).
 
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
 Run: `npm run test:vitest -- run test/unit/client/lib/recovery/build-recovery-plan.test.ts`
 
-Expected: FAIL — the join does not exist (joined leaf missing; rows all trailing).
+Expected: FAIL — the join does not exist (joined leaf missing; ledger rows land outside any original tab).
 
 (The wall-spec tail runs at Step 4's e2e command; recording its RED once during this task's early loop is required if feasible, but its full reliable RED/GREEN pair requires Tasks 2-3 present — if run pre-Task-3 code, it fails on multi-cause junk: record exactly that as the tail's pre-fix evidence.)
 
@@ -495,7 +495,7 @@ Kept kill-window rows carry their stamped tabKey; the recovery plan joins
 each into the restored tab with the matching source tabKey (one dispatch,
 rightmost leaf of the existing chain), and the offer lists it under that
 tab's name. Rows whose tab vanished from all retained evidence fall back
-to the trailing tab — exact content only. The wall SIGKILL-5s scenario now
+any synthetic tab — unplaceable rows are excluded upstream. The wall SIGKILL-5s scenario now
 pins original-tab placement end to end."
 ```
 
