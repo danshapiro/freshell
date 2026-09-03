@@ -172,6 +172,58 @@ fn resolve(provider: &str, session_id: &str, by_key: &HashMap<String, &BindingRo
     Verdict::GcExpired
 }
 
+/// Bind-by-correlation candidate rows for a snapshot pane WITHOUT a
+/// sessionRef claim (focused-ep3): Bound rows whose advisory
+/// `create_request_id` equals the pane payload's `createRequestId` OR whose
+/// advisory `live_terminal_id` equals the payload's
+/// `liveTerminal.terminalId` (deduped by row identity — one row matching
+/// BOTH ids is still one candidate) — PLUS coherence: terminal panes only
+/// (fresh-agent panes snapshotted pre-association carry a PLACEHOLDER
+/// sessionRef, not an absent one, and never reach this arm; the kind gate is
+/// belt-and-suspenders), fresh-agent ROWS never (`pane_kind` is the row-side
+/// discriminator, `pane_ledger.rs:121`), and the row's provider must equal
+/// the pane's mode (an id correlation without provider/mode coherence is a
+/// collision, not a match). Advisory ids that are absent, wrong-typed, or
+/// empty simply name no rows.
+fn correlation_candidates<'a>(
+    pane: &Value,
+    by_create_request_id: &HashMap<&'a str, Vec<&'a BindingRow>>,
+    by_live_terminal_id: &HashMap<&'a str, Vec<&'a BindingRow>>,
+) -> Vec<&'a BindingRow> {
+    if pane["kind"].as_str() != Some("terminal") {
+        return Vec::new();
+    }
+    let payload = &pane["payload"];
+    let mode = payload.get("mode").and_then(Value::as_str).unwrap_or("");
+    let mut candidates: Vec<&BindingRow> = Vec::new();
+    for rows in [
+        payload
+            .get("createRequestId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| by_create_request_id.get(id)),
+        payload
+            .get("liveTerminal")
+            .and_then(|live| live.get("terminalId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| by_live_terminal_id.get(id)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for &row in rows {
+            if row.pane_kind.is_none()
+                && row.provider == mode
+                && !candidates.iter().any(|existing| std::ptr::eq(*existing, row))
+            {
+                candidates.push(row);
+            }
+        }
+    }
+    candidates
+}
+
 pub fn build_inventory(
     device_unions: Vec<DeviceUnion>,
     bindings: Vec<BindingRow>,
@@ -183,6 +235,35 @@ pub fn build_inventory(
         .map(|r| (ref_key(&row_provider(r), &row_session_id(r)), r))
         .collect();
     let is_live = |p: &str, s: &str| live_session_keys.contains(&(p.to_string(), s.to_string()));
+    // Bind-by-correlation advisory secondary indices (focused-ep3), Bound
+    // rows only. A codex/opencode CLI pane snapshotted INSIDE its
+    // identity-association window persists with paneId/createRequestId/
+    // liveTerminal.terminalId but NO sessionRef (the terminal payload
+    // producer, tab-registry-snapshot.ts:17-31); the attributed Bound row
+    // written at identity resolution would otherwise stay "unreferenced"
+    // and the client plan would rebuild BOTH the ref-less snapshot leaf
+    // (fresh, no resume) AND the row's resume leaf — two panes for one
+    // originally-open pane. BOTH advisory ids are indexed:
+    // `live_terminal_id` rides every terminal-row write
+    // (`record_binding_locked`), `create_request_id` only the lanes that
+    // carry it (the conn-less `ledger_resolve_identity` lane passes `None`),
+    // so neither alone covers every association window.
+    let mut by_create_request_id: HashMap<&str, Vec<&BindingRow>> = HashMap::new();
+    let mut by_live_terminal_id: HashMap<&str, Vec<&BindingRow>> = HashMap::new();
+    for row in bindings.iter().filter(|r| row_is_bound(r)) {
+        if let Some(create_request_id) = row.create_request_id.as_deref() {
+            by_create_request_id
+                .entry(create_request_id)
+                .or_default()
+                .push(row);
+        }
+        if let Some(live_terminal_id) = row.live_terminal_id.as_deref() {
+            by_live_terminal_id
+                .entry(live_terminal_id)
+                .or_default()
+                .push(row);
+        }
+    }
 
     // sort newest-first; primary device = greatest capturedAt with >=1 record
     let mut unions = device_unions;
@@ -190,7 +271,37 @@ pub fn build_inventory(
 
     // Pass 1 - resolve EVERY pane in EVERY union (not just the primary): effective refs
     // feed the cross-device ledgerOnly rule (A4) and the contentId substance (A5/A6);
-    // the primary union's tabs feed `device`.
+    // the primary union's tabs feed `device`. Ref-less panes attempt
+    // bind-by-correlation (focused-ep3) before falling back to "unknown".
+    //
+    // Correlation ambiguity census over that SAME every-union span (the rule
+    // is symmetric): a pane binds ONLY a row that is its SOLE candidate AND
+    // that NO other ref-less pane claims — any ambiguity (two rows correlate
+    // to one pane, one row claimed by two panes) leaves the pane ref-less
+    // and the row unreferenced (never guess).
+    let mut correlation_claims: HashMap<String, usize> = HashMap::new();
+    for d in &unions {
+        for rec in d.union_doc["records"].as_array().into_iter().flatten() {
+            for pane in rec["panes"].as_array().into_iter().flatten() {
+                if pane["payload"]
+                    .get("sessionRef")
+                    .filter(|v| !v.is_null())
+                    .is_some()
+                {
+                    continue; // the D4 authority chain owns panes WITH a snapshot claim
+                }
+                for row in
+                    correlation_candidates(pane, &by_create_request_id, &by_live_terminal_id)
+                {
+                    *correlation_claims
+                        .entry(ref_key(&row.provider, &row.session_id))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut correlated = 0usize;
+    let mut ambiguous = 0usize;
     let mut referenced: HashSet<String> = HashSet::new();
     let mut substance: Vec<String> = Vec::new();
     let mut tabs_per_union: Vec<Vec<Value>> = Vec::new();
@@ -212,7 +323,46 @@ pub fn build_inventory(
                         let payload = &pane["payload"];
                         let snap_ref = payload.get("sessionRef").filter(|v| !v.is_null()).cloned();
                         let (ledger_state, eff_ref) = match &snap_ref {
-                            None => ("unknown", None),
+                            None => {
+                                // Focused-ep3 bind-by-correlation: the pane was
+                                // snapshotted inside its identity-association
+                                // window. Bind ONLY the unambiguous case — the
+                                // pane's SOLE candidate row, claimed by NO other
+                                // ref-less pane; the pane then behaves exactly
+                                // as if the snapshot had claimed the row
+                                // (bound state + the row's identity + live via
+                                // the D7 join + referenced, keeping the row out
+                                // of ledgerOnly). Any ambiguity stays today's
+                                // shape (unknown/ref-less); the debug line
+                                // below reports both counters.
+                                let candidates = correlation_candidates(
+                                    pane,
+                                    &by_create_request_id,
+                                    &by_live_terminal_id,
+                                );
+                                match candidates.as_slice() {
+                                    [row]
+                                        if correlation_claims
+                                            .get(&ref_key(&row.provider, &row.session_id))
+                                            .copied()
+                                            == Some(1) =>
+                                    {
+                                        correlated += 1;
+                                        (
+                                            "bound",
+                                            Some(
+                                                json!({"provider": row_provider(row), "sessionId": row_session_id(row)}),
+                                            ),
+                                        )
+                                    }
+                                    _ => {
+                                        if !candidates.is_empty() {
+                                            ambiguous += 1;
+                                        }
+                                        ("unknown", None)
+                                    }
+                                }
+                            }
                             Some(r) => {
                                 let (p, s) = (
                                     r["provider"].as_str().unwrap_or(""),
@@ -413,6 +563,8 @@ pub fn build_inventory(
         dropped = d8_dropped,
         kept = ledger_only.len(),
         primary = primary_device_id.is_some(),
+        correlated,
+        ambiguous_correlations = ambiguous,
         "D8 offer judgment");
 
     // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3)

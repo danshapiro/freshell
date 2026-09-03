@@ -959,6 +959,358 @@ fn stale_clients_generations_are_dropped() {
     );
 }
 
+// ── Focused-ep3: bind-by-correlation (late-bound rows vs ref-less panes) ─────
+// A codex/opencode CLI pane snapshotted BEFORE its provider identity resolved
+// carries paneId/createRequestId/liveTerminal.terminalId but NO sessionRef
+// (the association window; the terminal payload producer at
+// src/lib/tab-registry-snapshot.ts:17-31 writes `sessionRef:
+// content.sessionRef`, which JSON-serialization drops while it is still
+// undefined). The attributed Bound row written at identity resolution then
+// looks "unreferenced" and the client plan rebuilds BOTH the ref-less
+// snapshot leaf (fresh, no resume) AND the row's resume leaf — two panes for
+// one originally-open pane, one of them a never-open replacement session.
+// Pass 1's bind-by-correlation rule re-attaches the row to ITS snapshot pane
+// (one pane, restored WITH resume) and NEVER guesses on ambiguity.
+
+/// Focused-ep3 fixture knob: stamp the advisory correlation ids the way the
+/// ledger's real terminal-row writes do (`record_binding_locked`,
+/// pane_ledger.rs:576-598 — `live_terminal_id` rides every terminal-row write;
+/// `create_request_id` only the lanes that carry it — the conn-less
+/// `ledger_resolve_identity` lane passes `None`, pane_ledger.rs:1297).
+fn with_correlation_ids(
+    mut row: BindingRow,
+    create_request_id: Option<&str>,
+    live_terminal_id: Option<&str>,
+) -> BindingRow {
+    row.create_request_id = create_request_id.map(str::to_string);
+    row.live_terminal_id = live_terminal_id.map(str::to_string);
+    row
+}
+
+#[test]
+fn ref_less_pane_binds_to_its_late_bound_row_by_create_request_id() {
+    // THE FINDING'S SCENARIO at the pure-builder level: the union pane was
+    // snapshotted inside the association window (sessionRef absent). The
+    // Bound row arrived after; correlation fires on the createRequestId match
+    // + provider==mode coherence, and the pane behaves EXACTLY as if the
+    // snapshot had claimed the row (ledgerState bound, sessionRef = the row's
+    // identity, live via the D7 join) — and the row is referenced, excluded
+    // from ledgerOnly.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1",
+                                  "liveTerminal": { "terminalId": "t-9", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    // Attributed, in grace (1_000 + 7_000 >= 5_000), tabKey naming the union
+    // tab: EVERY D8 clause would offer this row, so the referenced rule (fed
+    // by the correlation) is the ONLY filter keeping it out of ledgerOnly —
+    // the deciding clause under test, anti-vacuity.
+    let row = with_attribution(
+        with_correlation_ids(
+            binding_row_at("codex", "C-assoc", bound(), 1_000),
+            Some("req-1"),
+            Some("t-9"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes.len(),
+        1,
+        "one originally-open pane must restore as ONE pane, not two"
+    );
+    assert_eq!(panes[0]["ledgerState"], "bound");
+    assert_eq!(panes[0]["sessionRef"]["provider"], "codex");
+    assert_eq!(panes[0]["sessionRef"]["sessionId"], "C-assoc");
+    assert_eq!(panes[0]["live"], false);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "the correlated row is referenced — never ALSO offered as a ledgerOnly resume leaf"
+    );
+}
+
+#[test]
+fn ref_less_pane_binds_to_its_late_bound_row_by_live_terminal_id() {
+    // The conn-less resolution lane (`ledger_resolve_identity`,
+    // pane_ledger.rs:1277-1311) writes `create_request_id: None`, so for a
+    // dynamically-identified codex/opencode CLI pane the createRequestId arm
+    // can be ABSENT — the liveTerminal.terminalId arm is load-bearing for it.
+    // The pane here carries NO createRequestId at all, isolating that arm.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "opencode",
+                                  "liveTerminal": { "terminalId": "t-9", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let row = with_attribution(
+        with_correlation_ids(
+            binding_row_at("opencode", "O-assoc", bound(), 1_000),
+            None,
+            Some("t-9"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "bound");
+    assert_eq!(pane["sessionRef"]["provider"], "opencode");
+    assert_eq!(pane["sessionRef"]["sessionId"], "O-assoc");
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn correlation_requires_provider_mode_coherence() {
+    // An id correlation with NO provider/mode match is a collision, not a
+    // match: the row belongs to a different lineage and stays a ledgerOnly
+    // candidate; the pane stays ref-less (never guess).
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1" } }]),
+        ),
+    };
+    let row = with_attribution(
+        with_correlation_ids(
+            binding_row_at("claude", "S-other", bound(), 1_000),
+            Some("req-1"), // the SAME advisory id, the WRONG provider
+            None,
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "unknown", "no coherence => no correlation");
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "the mode-mismatched row stays unreferenced and is D8-offered"
+    );
+}
+
+#[test]
+fn correlation_never_binds_fresh_agent_rows_or_panes() {
+    // Both gates are load-bearing. Row side: an opencode FRESH-AGENT row's
+    // provider IS "opencode", so provider==mode coherence alone would still
+    // admit it — `pane_kind` (the row-side discriminator, pane_ledger.rs:121)
+    // must exclude it. Pane side: a fresh-agent pane never has an association
+    // window (its pre-association snapshots carry a PLACEHOLDER sessionRef,
+    // not an absent one), and the `kind` gate must exclude it even against a
+    // fabricated `mode` key (the real producer never writes `mode` on
+    // fresh-agent payloads, tab-registry-snapshot.ts:45-64).
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([
+                { "paneId": "p1", "kind": "terminal",
+                  "payload": { "mode": "opencode", "createRequestId": "req-1" } },
+                { "paneId": "p2", "kind": "fresh-agent",
+                  "payload": { "mode": "opencode", "createRequestId": "req-2" } }
+            ]),
+        ),
+    };
+    let mut fresh_row = binding_row_at("opencode", "O-fresh", bound(), 1_000);
+    fresh_row.mode = "freshopencode".into();
+    fresh_row.pane_kind = Some("fresh-agent".into());
+    let rows = vec![
+        with_attribution(
+            with_correlation_ids(fresh_row, Some("req-1"), None),
+            "c1",
+            "dev1",
+            "t1",
+        ),
+        with_attribution(
+            with_correlation_ids(
+                binding_row_at("opencode", "O-term", bound(), 1_000),
+                Some("req-2"),
+                None,
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        ),
+    ];
+    let out = build_inventory(
+        vec![d],
+        rows,
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes[0]["ledgerState"], "unknown",
+        "a fresh-agent ROW never correlates onto a terminal pane"
+    );
+    assert_eq!(
+        panes[1]["ledgerState"], "unknown",
+        "a fresh-agent PANE never correlates onto a terminal row"
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        2,
+        "both rows stay unreferenced"
+    );
+}
+
+#[test]
+fn two_bound_rows_sharing_the_panes_create_request_id_never_correlate() {
+    // Ambiguity shape 1 (never guess): TWO Bound rows carry the same advisory
+    // id as the ref-less pane. Correlating either would guess which session
+    // the pane actually ran; leave the pane ref-less and BOTH rows
+    // unreferenced instead.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1" } }]),
+        ),
+    };
+    let row = |session_id: &str| {
+        with_attribution(
+            with_correlation_ids(binding_row_at("codex", session_id, bound(), 1_000), Some("req-1"), None),
+            "c1",
+            "dev1",
+            "t1",
+        )
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![row("C-a"), row("C-b")],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "unknown");
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        2,
+        "neither ambiguous row is consumed by the pane — both remain D8-offered"
+    );
+}
+
+#[test]
+fn pane_matching_two_rows_by_both_correlation_ids_never_correlates() {
+    // Ambiguity shape 2: the pane's createRequestId arm names row A while its
+    // liveTerminal arm names row B — inconsistent advisory data; never guess.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1",
+                                  "liveTerminal": { "terminalId": "t-9", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let rows = vec![
+        with_attribution(
+            with_correlation_ids(binding_row_at("codex", "C-a", bound(), 1_000), Some("req-1"), None),
+            "c1",
+            "dev1",
+            "t1",
+        ),
+        with_attribution(
+            with_correlation_ids(binding_row_at("codex", "C-b", bound(), 1_000), None, Some("t-9")),
+            "c1",
+            "dev1",
+            "t1",
+        ),
+    ];
+    let out = build_inventory(
+        vec![d],
+        rows,
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "unknown");
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn one_row_matching_two_ref_less_panes_never_correlates_either() {
+    // Ambiguity shape 3: the SAME row is the sole candidate for TWO ref-less
+    // panes (duplicated generation components, a client-side clone — from
+    // retained data it is undecidable which pane owned the session), so NEVER
+    // guess either; a pane may bind only a row no other pane claims.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([
+                { "paneId": "p1", "kind": "terminal",
+                  "payload": { "mode": "codex", "createRequestId": "req-1" } },
+                { "paneId": "p2", "kind": "terminal",
+                  "payload": { "mode": "codex", "createRequestId": "req-1" } }
+            ]),
+        ),
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![with_attribution(
+            with_correlation_ids(binding_row_at("codex", "C-assoc", bound(), 1_000), Some("req-1"), None),
+            "c1",
+            "dev1",
+            "t1",
+        )],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(panes[0]["ledgerState"], "unknown");
+    assert_eq!(panes[1]["ledgerState"], "unknown");
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 1);
+}
+
 // ── Task 2: `GET /api/recovery/inventory` route tests ─────────────────────────
 
 use axum::body::Body;
@@ -1213,6 +1565,74 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
         });
     // row_time = max(995_000, 994_000) = parent's capturedAt - 5_000: in grace.
     assert_eq!(entry["tabKey"], "dev1:t9");
+}
+
+#[tokio::test]
+async fn route_correlates_a_late_bound_row_onto_its_ref_less_snapshot_pane() {
+    // Focused-ep3 end-to-end JSON contract — the duplicate-restore shape the
+    // client plan consumes: a codex CLI pane snapshotted INSIDE its identity
+    // association window (sessionRef absent; payload carries only
+    // createRequestId + liveTerminal.terminalId) whose attributed Bound row
+    // arrived after the snapshot. The inventory must present exactly ONE pane
+    // carrying the row's identity AND an EMPTY ledgerOnly — never the pre-fix
+    // pair (ref-less snapshot pane + the row's separate resume leaf).
+    let tmp = tempfile::tempdir().unwrap();
+    let now = now_ms_u64();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "lost",
+        now - 10_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":now - 10_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal",
+               "payload":{"mode":"codex","createRequestId":"req-1",
+                          "liveTerminal":{"terminalId":"t-9","serverInstanceId":"srv-test"}}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("codex")).unwrap();
+    // Attributed + in grace of its parent ("lost", winner capturedAt
+    // now-10_000; row_time now-10_000 + 7_000 >= now-10_000) + tabKey naming
+    // the union tab: pre-fix this row IS D8-offered, so the red failure is
+    // exactly the finding's pair (ref-less pane + ledgerOnly resume leaf).
+    std::fs::write(
+        broot.join("bindings").join("codex").join("C-assoc.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "codex", "sessionId": "C-assoc", "mode": "codex",
+            "cwd": "/w", "createdAt": now - 10_000, "updatedAt": now - 10_000,
+            "lastObservedAt": now - 10_000, "state": "bound",
+            "createRequestId": "req-1", "liveTerminalId": "t-9",
+            "clientInstanceId": "lost", "deviceId": "dev1", "tabKey": "dev1:t1"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(body["recoverable"], true);
+    let panes = body["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes.len(),
+        1,
+        "the duplicate-restore shape is gone: exactly one pane for the one originally-open pane (got {body})"
+    );
+    assert_eq!(panes[0]["ledgerState"], "bound");
+    assert_eq!(panes[0]["sessionRef"]["provider"], "codex");
+    assert_eq!(panes[0]["sessionRef"]["sessionId"], "C-assoc");
+    assert_eq!(
+        body["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "the correlated row must not ALSO surface as a ledgerOnly resume leaf (got {body})"
+    );
 }
 
 #[tokio::test]
