@@ -35,6 +35,16 @@ pub struct FreshAgentSettings {
 /// explicitly headless REST/MCP lineage lanes `Clear` (a headless re-bind
 /// erases stale browser stamps rather than keeping them under a refreshed
 /// `updated_at`).
+///
+/// Focused-ep4-r2 Findings 1+2: the value also carries its own ASSERTION
+/// TIME — `asserted_at` is captured ONCE at the WS message receipt that
+/// turned connection identity + message `tabId` into this value, and flows
+/// immutably through the whole create/respawn/fork/supersede chain (the
+/// parked-provenance clones and the fork-lane resolutions carry it
+/// unchanged). No post-spawn write, deferred SDK init, or fork completion
+/// can manufacture a later attribution time. A `default()`/hollow value
+/// carries `0` ("no assertion exists"); the ledger consumes the time only
+/// for [`Self::is_meaningful`] writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindProvenance {
     pub client_instance_id: Option<String>,
@@ -42,16 +52,21 @@ pub struct BindProvenance {
     /// `deviceId:tabId` — exactly `src/lib/tab-registry-snapshot.ts`'s record
     /// composition, so the row can rejoin the right restored tab.
     pub tab_key: Option<String>,
+    /// The browser's assertion time (ms), captured at message receipt — see
+    /// the struct doc. `0` on hollow/default values (never consumed).
+    pub asserted_at: i64,
 }
 
 impl BindProvenance {
     /// Compose the stamps for one connection-scoped create. `tab_key` exists
     /// only when BOTH halves are known — a half-known tab identity is never
-    /// invented on the wire or in the ledger.
+    /// invented on the wire or in the ledger. `asserted_at` is the message's
+    /// RECEIPT time — capture it once and pass it unchanged.
     pub fn for_create(
         client_instance_id: Option<&str>,
         device_id: Option<&str>,
         tab_id: Option<&str>,
+        asserted_at: i64,
     ) -> Self {
         Self {
             client_instance_id: client_instance_id.map(str::to_string),
@@ -60,6 +75,7 @@ impl BindProvenance {
                 (Some(d), Some(t)) => Some(format!("{d}:{t}")),
                 _ => None,
             },
+            asserted_at,
         }
     }
 
@@ -97,7 +113,10 @@ pub enum ProvenanceUpdate {
     /// Connection-supplied stamps (whole `BindProvenance` values composed
     /// from the connection's hello identity + the message's `tabId`, or
     /// resolved fork provenance): asserted onto the row — each `Some` field
-    /// replaces, a `None` field keeps the inherited value.
+    /// replaces, a `None` field keeps the inherited value. The value's
+    /// `asserted_at` is the browser's ASSERTION time (captured at message
+    /// receipt): a MEANINGFUL application stamps it as the row's attribution
+    /// time — never the (possibly much later) write's own clock.
     Replace(BindProvenance),
     /// An explicitly HEADLESS writer (the REST/MCP lineage binder,
     /// `lib.rs`'s materialization write): all stamps are CLEARED — the
@@ -401,6 +420,14 @@ impl PaneIdentitySink for FakeIdentitySink {
                     if stamps.tab_key.is_some() {
                         entry.tab_key = stamps.tab_key.clone();
                     }
+                    // Focused-ep4-r2 Findings 1+2: the assertion time rides the
+                    // value — a MEANINGFUL application advances it to the
+                    // stamps' own `asserted_at` (the ledger's
+                    // `advances_attribution` predicate, mirrored); partial/
+                    // hollow writes preserve it.
+                    if stamps.is_meaningful() {
+                        entry.asserted_at = stamps.asserted_at;
+                    }
                 }
                 ProvenanceUpdate::Clear => {
                     // An erased row answers `load_provenance` with absence
@@ -665,15 +692,37 @@ mod tests {
             client_instance_id: None,
             device_id: None,
             tab_key: Some("d:t".into()),
+            asserted_at: 0,
         }
         .is_meaningful());
         assert!(BindProvenance {
             client_instance_id: Some("c".into()),
             device_id: Some("d".into()),
             tab_key: None,
+            asserted_at: 0,
         }
         .is_meaningful());
-        assert!(BindProvenance::for_create(Some("c"), Some("d"), Some("t")).is_meaningful());
+        assert!(BindProvenance::for_create(Some("c"), Some("d"), Some("t"), 1).is_meaningful());
+    }
+
+    /// Focused-ep4-r2 Findings 1+2: the value CARRIES its assertion time —
+    /// `for_create` records the receipt time it was handed, verbatim, on the
+    /// exact stamps the D8 judgment consumes (no clock read hides inside).
+    #[test]
+    fn bind_provenance_carries_its_assertion_time() {
+        let p = BindProvenance::for_create(Some("c"), Some("d"), Some("t"), 4242);
+        assert_eq!(p.asserted_at, 4242);
+        assert_eq!(p.tab_key.as_deref(), Some("d:t"));
+        assert_eq!(
+            BindProvenance::for_create(None, None, None, 4242),
+            BindProvenance {
+                client_instance_id: None,
+                device_id: None,
+                tab_key: None,
+                asserted_at: 4242,
+            },
+            "a hollow value still carries the time (unused, but truthful)"
+        );
     }
 
     #[tokio::test]
@@ -736,6 +785,7 @@ mod tests {
                 client_instance_id: Some("client-1".into()),
                 device_id: Some("device-1".into()),
                 tab_key: Some("device-1:tab-1".into()),
+                asserted_at: 111,
             }),
             settings: FreshAgentSettings::default(),
         })
@@ -747,6 +797,10 @@ mod tests {
         assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
         assert_eq!(p.device_id.as_deref(), Some("device-1"));
         assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
+        assert_eq!(
+            p.asserted_at, 111,
+            "the assertion time rides the value through the fake merge too"
+        );
 
         // A later conn-less write (all-None stamps) keeps them — and a partial
         // stamp replaces only its own field.
@@ -783,6 +837,10 @@ mod tests {
         assert_eq!(p.client_instance_id.as_deref(), Some("client-2"));
         assert_eq!(p.device_id.as_deref(), Some("device-1"));
         assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
+        assert_eq!(
+            p.asserted_at, 111,
+            "a hollow/partial Replace preserves the assertion time (it is not an attribution)"
+        );
 
         // A genuinely unattributed row answers None — never Some(default).
         fake.record_binding(FreshAgentBindingUpsert {
@@ -819,6 +877,7 @@ mod tests {
                 client_instance_id: Some("client-1".into()),
                 device_id: Some("device-1".into()),
                 tab_key: Some("device-1:tab-1".into()),
+                asserted_at: 222,
             }),
             settings: FreshAgentSettings::default(),
         })

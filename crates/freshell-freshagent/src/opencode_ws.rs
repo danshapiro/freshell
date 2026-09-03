@@ -4232,6 +4232,7 @@ mod tests {
                     Some("client-oc"),
                     Some("device-oc"),
                     Some("tab-oc"),
+                    7_777,
                 )),
             )
             .await;
@@ -4572,6 +4573,7 @@ mod tests {
                     Some("client-new"),
                     Some("device-new"),
                     Some("tab-new"),
+                    7_777,
                 )),
             )
             .await;
@@ -4615,6 +4617,7 @@ mod tests {
                     Some("client-old"),
                     Some("device-old"),
                     Some("tab-old"),
+                    7_777,
                 )),
             )
             .await;
@@ -4646,6 +4649,7 @@ mod tests {
                     Some("client-new"),
                     Some("device-new"),
                     Some("tab-new"),
+                    7_777,
                 )),
             )
             .await;
@@ -4717,6 +4721,7 @@ mod tests {
                 client_instance_id: Some("client-old".into()),
                 device_id: Some("device-old".into()),
                 tab_key: Some("device-old:tab-old".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
@@ -4740,6 +4745,7 @@ mod tests {
                     Some("client-new"),
                     Some("device-new"),
                     Some("tab-new"),
+                    7_777,
                 )),
             )
             .await;
@@ -4825,6 +4831,7 @@ mod tests {
                     Some("client-cold"),
                     Some("device-cold"),
                     Some("tab-cold"),
+                    7_777,
                 )),
             )
             .await;
@@ -4868,6 +4875,7 @@ mod tests {
                     Some("client-chain"),
                     Some("device-chain"),
                     Some("tab-chain"),
+                    7_777,
                 )),
             )
             .await;
@@ -4964,6 +4972,7 @@ mod tests {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
                 tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
@@ -5121,6 +5130,7 @@ mod tests {
                     Some("client-a"),
                     Some("device-a"),
                     Some("tab-a"),
+                    7_777,
                 )),
             )
             .await;
@@ -5134,6 +5144,7 @@ mod tests {
                     Some("client-b"),
                     Some("device-b"),
                     Some("tab-b"),
+                    7_777,
                 )),
                 sink,
             )
@@ -5201,6 +5212,7 @@ mod tests {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
                 tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
@@ -5280,6 +5292,7 @@ mod tests {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
                 tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
@@ -5341,6 +5354,7 @@ mod tests {
                     Some("client-mem"),
                     Some("device-mem"),
                     Some("tab-mem"),
+                    7_777,
                 )),
             )
             .await;

@@ -6568,6 +6568,7 @@ rl.on('line', (line) => {
             Some("client-claude"),
             Some("device-claude"),
             Some("tab-claude"),
+            7_777,
         );
         state.handle_create(msg, Some(provenance)).await;
         await_claude_created(&mut rx, "req-binding-prov").await;

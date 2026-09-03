@@ -61,6 +61,7 @@ where
 /// per-connection cancel watch fires (send or sender drop), and every queued
 /// restore create for that connection unblocks as Cancelled WITHOUT spawning
 /// a PTY.
+#[allow(clippy::too_many_arguments)] // Same create-context plumbing as `handle_create`.
 pub(crate) fn spawn_gated_restore_create(
     create: TerminalCreate,
     state: &WsState,
@@ -71,6 +72,11 @@ pub(crate) fn spawn_gated_restore_create(
     // D8: the dispatching connection's identity, carried into the detached
     // task so the restore create's ledger rows stamp like an inline create's.
     conn_identity: crate::terminal::ConnectionIdentity,
+    // Focused-ep4-r2 Findings 1+2: the create message's RECEIPT time, captured
+    // by the dispatch arm. A restore create can park in the gate queue long
+    // after the pane's tab state moved on — its ledger provenance must still
+    // carry the browser's assertion, never this task's eventual run time.
+    asserted_at: i64,
 ) {
     let state = state.clone();
     let sink = std::sync::Arc::clone(conn_sink);
@@ -240,6 +246,7 @@ pub(crate) fn spawn_gated_restore_create(
                     pane_reconcile_v1,
                     &mut create_limiter,
                     &conn_identity,
+                    asserted_at,
                 )
                 .await;
                 // Covers create failure: no-op when handle_create settled the entry,

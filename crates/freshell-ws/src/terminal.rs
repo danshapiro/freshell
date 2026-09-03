@@ -222,12 +222,21 @@ pub struct ConnectionIdentity {
 impl ConnectionIdentity {
     /// The provenance stamps for one create off this connection — `tabKey`
     /// composes as `deviceId:tabId` (exactly `src/lib/tab-registry-snapshot.ts`'s
-    /// record composition) and only when both halves exist.
-    fn bind_provenance(&self, tab_id: Option<&str>) -> freshell_freshagent::BindProvenance {
+    /// record composition) and only when both halves exist. Focused-ep4-r2
+    /// Findings 1+2: `asserted_at` is the WS message's RECEIPT time, captured
+    /// ONCE in the dispatch arm and passed unchanged — the value carries the
+    /// browser's assertion through however long the create/spawn/fork work
+    /// takes, so no later write site needs (or may invent) a fresh clock read.
+    fn bind_provenance(
+        &self,
+        tab_id: Option<&str>,
+        asserted_at: i64,
+    ) -> freshell_freshagent::BindProvenance {
         freshell_freshagent::BindProvenance::for_create(
             self.client_instance_id.as_deref(),
             self.device_id.as_deref(),
             tab_id,
+            asserted_at,
         )
     }
 }
@@ -860,6 +869,12 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
+            // Focused-ep4-r2 Findings 1+2: the provenance's assertion time —
+            // captured ONCE here, at message receipt. The value rides the whole
+            // create chain (dedupe wait, gated-restore permit queue, spawn,
+            // post-spawn binding/pending-marker writes) unchanged, so slow
+            // work can never manufacture a later attribution.
+            let asserted_at = now_ms();
             // Server-wide requestId -> terminal dedupe (legacy `createdByRequestId`
             // parity): registered BEFORE the rate limiter and BEFORE the
             // paneReconcileV1 adopt/sessionRef-lease branches inside `handle_create`,
@@ -909,6 +924,7 @@ async fn handle_client_text(
                     conn_id,
                     pane_reconcile_v1,
                     conn_identity.clone(),
+                    asserted_at,
                 );
                 true
             } else {
@@ -923,6 +939,7 @@ async fn handle_client_text(
                     pane_reconcile_v1,
                     create_limiter,
                     conn_identity,
+                    asserted_at,
                 )
                 .await;
                 // No-op on success (the entry is Settled by `handle_create`'s
@@ -1036,7 +1053,13 @@ async fn handle_client_text(
                 // provider `handle_create` chain so the identity-sink binding
                 // write is stamped. The message alone cannot carry the device/
                 // client identity (it is per-CONNECTION, not per-pane).
-                let provenance = conn_identity.bind_provenance(create.tab_id.as_deref());
+                // Focused-ep4-r2 Findings 1+2: the assertion time is captured
+                // HERE, at message receipt — the value then rides the whole
+                // detached-task create chain (sidecar spawn, SDK init,
+                // identity write) unchanged, so a pane whose create completes
+                // after the pane closed still attributes at the browser's
+                // assertion.
+                let provenance = conn_identity.bind_provenance(create.tab_id.as_deref(), now_ms());
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
@@ -1258,7 +1281,11 @@ async fn handle_client_text(
         // fork lanes, which resolve it AHEAD of the parent's parked stamps (a
         // forceNew multi-tab fork must not inherit the other tab's attribution).
         ClientMessage::FreshAgentFork(fork) => {
-            let provenance = conn_identity.bind_provenance(fork.tab_id.as_deref());
+            // Focused-ep4-r2 Findings 1+2: assertion time captured at receipt,
+            // same as the create arm — the fork lane's provenance resolution
+            // (forking connection > parent's parked > parent's row) carries
+            // whichever value wins VERBATIM.
+            let provenance = conn_identity.bind_provenance(fork.tab_id.as_deref(), now_ms());
             if fork.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
                 let conn_sink = conn_sink.clone();
@@ -2560,7 +2587,11 @@ pub(crate) async fn prepare_launch(
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next. `conn_identity` (D8) is the creating connection's
 /// hello-stamped client identity; the ledger bind sites below stamp it onto the
-/// row (tabKey composed with the create's `tabId`).
+/// row (tabKey composed with the create's `tabId`). `asserted_at` (focused-
+/// ep4-r2 Findings 1+2) is the create message's RECEIPT time, captured once by
+/// the dispatch arm — the provenance value's assertion time — so the slowest
+/// create (gated-restore queue, cold sidecar plan, slow spawn) still attributes
+/// the browser's assertion, never this function's completion time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_create(
     create: TerminalCreate,
@@ -2571,6 +2602,7 @@ pub(crate) async fn handle_create(
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     conn_identity: &ConnectionIdentity,
+    asserted_at: i64,
 ) -> bool {
     // P1 (graceful restore/resume S1): destructure the prepared values at
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
@@ -3457,7 +3489,10 @@ pub(crate) async fn handle_create(
     // D8 (restore-open-sessions-only): the provenance this connection-scoped
     // create stamps onto its ledger rows — the connection's hello identity plus
     // the create's `tabId` (`tabKey` composes only when both halves exist).
-    let bind_provenance = conn_identity.bind_provenance(create.tab_id.as_deref());
+    // Focused-ep4-r2 Findings 1+2: the value carries its assertion time (the
+    // message's receipt, threaded in as `asserted_at`) — pre-spawn, post-spawn,
+    // and pending-marker writes below all record THAT time, never their own.
+    let bind_provenance = conn_identity.bind_provenance(create.tab_id.as_deref(), asserted_at);
 
     if claude_fresh_prealloc {
         if let Some(session_id) = resume_session_id.as_deref() {
@@ -3470,6 +3505,7 @@ pub(crate) async fn handle_create(
             let write_client_instance_id = bind_provenance.client_instance_id.clone();
             let write_device_id = bind_provenance.device_id.clone();
             let write_tab_key = bind_provenance.tab_key.clone();
+            let write_asserted_at = bind_provenance.asserted_at;
             let now = now_ms();
             let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
@@ -3484,9 +3520,9 @@ pub(crate) async fn handle_create(
                             client_instance_id: write_client_instance_id.as_deref(),
                             device_id: write_device_id.as_deref(),
                             tab_key: write_tab_key.as_deref(),
+                            asserted_at: write_asserted_at,
                         },
                     ),
-                    attributed_at: None,
                     now_ms: now,
                 })
             })
@@ -3804,6 +3840,7 @@ pub(crate) async fn handle_create(
             let write_client_instance_id = bind_provenance.client_instance_id.clone();
             let write_device_id = bind_provenance.device_id.clone();
             let write_tab_key = bind_provenance.tab_key.clone();
+            let write_asserted_at = bind_provenance.asserted_at;
             let now = now_ms();
             let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
@@ -3818,9 +3855,13 @@ pub(crate) async fn handle_create(
                             client_instance_id: write_client_instance_id.as_deref(),
                             device_id: write_device_id.as_deref(),
                             tab_key: write_tab_key.as_deref(),
+                            // Focused-ep4-r2 Findings 1+2: the POST-SPAWN write
+                            // records the receipt-captured assertion time carried
+                            // on the provenance value — never this (possibly
+                            // much later) write's own now.
+                            asserted_at: write_asserted_at,
                         },
                     ),
-                    attributed_at: None,
                     now_ms: now,
                 })
             })
@@ -3848,6 +3889,10 @@ pub(crate) async fn handle_create(
         let write_client_instance_id = bind_provenance.client_instance_id.clone();
         let write_device_id = bind_provenance.device_id.clone();
         let write_tab_key = bind_provenance.tab_key.clone();
+        // Focused-ep4-r2 Findings 1+2: the marker's `spawned_at` is the
+        // provenance's `asserted_at` by construction (`record_pending` maps
+        // it), so a gated/late marker write still carries the receipt time.
+        let write_asserted_at = bind_provenance.asserted_at;
         let now = now_ms();
         let result = spawn_blocking_in_span(move || {
             ledger.record_pending(
@@ -3858,6 +3903,7 @@ pub(crate) async fn handle_create(
                     client_instance_id: write_client_instance_id.as_deref(),
                     device_id: write_device_id.as_deref(),
                     tab_key: write_tab_key.as_deref(),
+                    asserted_at: write_asserted_at,
                 },
                 now,
             )
@@ -4508,9 +4554,10 @@ pub async fn respawn_agent_terminal(
                     create_request_id: Some(&write_request_id),
                     // Conn-less lane (D8): the auto-resume respawn has no
                     // client connection; `Inherit` preserves the create's
-                    // provenance stamps.
+                    // provenance stamps AND the assertion time the row already
+                    // carries (focused-ep4-r2 Findings 1+2: maintenance writes
+                    // touch neither).
                     provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
-                    attributed_at: None,
                     now_ms: now,
                 })
             })

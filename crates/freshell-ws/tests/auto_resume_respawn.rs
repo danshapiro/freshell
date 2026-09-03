@@ -316,7 +316,6 @@ fn seed_bound_row(ledger: &PaneLedger, provider: &str, session_id: &str) {
             cwd: None,
             create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
-            attributed_at: None,
             now_ms: now_ms(),
         })
         .expect("seed bound ledger row");

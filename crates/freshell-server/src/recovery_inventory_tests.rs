@@ -3,8 +3,8 @@
 use super::*;
 use freshell_protocol::SessionLocator;
 use freshell_ws::pane_ledger::{
-    BindingRow, BindingWrite, PaneLedger, ProvenancePolicy, ProvenanceStamps, RetiredReason,
-    RowState, LEDGER_VERSION,
+    BindingRow, BindingWrite, FreshAgentBindingWrite, PaneLedger, ProvenancePolicy,
+    ProvenanceStamps, RetiredReason, RowState, LEDGER_VERSION,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -115,10 +115,10 @@ fn binding_row(provider: &str, session_id: &str, state_parts: StateParts) -> Bin
 /// D8 attribution knobs: stamp the fixture row the way the connection-scoped
 /// WS create lanes do — `tab_key` composes as `device:tab` (exactly
 /// `BindProvenance::for_create`'s rule). Delta-r4 Finding 1: the attributed
-/// write also stamps `last_attributed_at` with the write's own `updated_at`
-/// (the production lanes set both from the same `now_ms`), so every existing
-/// boundary test below keeps asserting its INTENDED boundary against the new
-/// judgment key.
+/// write also stamps `last_attributed_at`; for the fresh direct lanes
+/// receipt ≈ write, so stamping it with the write's own `updated_at` keeps
+/// every boundary test below asserting its INTENDED boundary against the
+/// judgment key (the late-write split lives in the focused-ep4-r2 pins).
 fn with_attribution(mut row: BindingRow, client: &str, device: &str, tab_id: &str) -> BindingRow {
     row.client_instance_id = Some(client.to_string());
     row.device_id = Some(device.to_string());
@@ -1000,7 +1000,6 @@ fn ledger_row_after_writes(steps: &[(ProvenancePolicy<'static>, i64)]) -> Bindin
                 cwd: Some("/w"),
                 create_request_id: None,
                 provenance: *provenance,
-                attributed_at: None,
                 now_ms: *now_ms,
             })
             .unwrap_or_else(|e| panic!("fixture write {i} failed: {e}"));
@@ -1010,16 +1009,19 @@ fn ledger_row_after_writes(steps: &[(ProvenancePolicy<'static>, i64)]) -> Bindin
 }
 
 /// The connection-scoped create/stamp lane's exact policy shape (the WS
-/// `bind_provenance` composition): `Replace` with the full stamp triple.
+/// `bind_provenance` composition): `Replace` with the full stamp triple,
+/// asserting at the write's own time (fresh creates: receipt ≈ write).
 fn conn_scoped(
     client: &'static str,
     device: &'static str,
     tab_key: &'static str,
+    asserted_at: i64,
 ) -> ProvenancePolicy<'static> {
     ProvenancePolicy::Replace(ProvenanceStamps {
         client_instance_id: Some(client),
         device_id: Some(device),
         tab_key: Some(tab_key),
+        asserted_at,
     })
 }
 
@@ -1042,7 +1044,7 @@ fn inherit_maintenance_write_after_frozen_parent_evidence_never_revives_the_offe
         ),
     };
     let row = ledger_row_after_writes(&[
-        (conn_scoped("c1", "d1", "d1:t1"), 900_000),
+        (conn_scoped("c1", "d1", "d1:t1", 900_000), 900_000),
         (ProvenancePolicy::Inherit, 995_000),
     ]);
     assert_eq!(row.updated_at, 995_000, "the maintenance write IS fresh");
@@ -1077,8 +1079,8 @@ fn genuine_attributed_rebind_advances_the_judgment_time() {
         ),
     };
     let row = ledger_row_after_writes(&[
-        (conn_scoped("c1", "d1", "d1:t1"), 900_000),
-        (conn_scoped("c1", "d1", "d1:t1"), 995_000),
+        (conn_scoped("c1", "d1", "d1:t1", 900_000), 900_000),
+        (conn_scoped("c1", "d1", "d1:t1", 995_000), 995_000),
     ]);
     assert_eq!(
         row.last_attributed_at,
@@ -1191,6 +1193,7 @@ fn ledger_row_from_marker_resolution(
                 client_instance_id: Some("c1"),
                 device_id: Some("d1"),
                 tab_key: Some(tab_key),
+                asserted_at: spawn_ms,
             },
             spawn_ms,
         )
@@ -1204,7 +1207,6 @@ fn ledger_row_from_marker_resolution(
             cwd: Some("/w"),
             create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
-            attributed_at: None,
             now_ms: resolve_ms,
         })
         .expect("marker resolution write");
@@ -1331,6 +1333,251 @@ fn an_attributed_rows_judgment_ignores_its_creation_time() {
         0,
         "900_000 + 7_000 < 1_000_000: an over-late created_at must not \
          re-launder an attributed row into the offer"
+    );
+}
+
+// ── Focused-ep4-r2 Findings 1+2: the provenance value carries its assertion ──
+// time; slow create/spawn/fork completion must not manufacture freshness.
+
+/// Focused-ep4-r2 Pin (a): a FRESH-AGENT create whose provenance was captured
+/// at WS receipt (T = 900_000) but whose binding write lands at T+30s
+/// (930_000 — cold sidecar spawn + deferred SDK init) — the pane already
+/// closed mid-flight and the parent's evidence (frozen at 1_000_000) never
+/// observed it. The row must attribute at T (never T+30s) and the judgment
+/// must then exclude it.
+#[test]
+fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "opencode",
+            session_id: "S1",
+            mode: "freshopencode",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("d1"),
+                tab_key: Some("d1:t1"),
+                asserted_at: 900_000,
+            }),
+            now_ms: 930_000,
+        })
+        .expect("late landing binding write");
+    let row = ledger.load_binding("opencode", "S1").expect("row written");
+    assert_eq!(
+        row.last_attributed_at,
+        Some(900_000),
+        "the value's assertion time — not the 30s-late write's now"
+    );
+    assert_eq!(row.updated_at, 930_000, "the write lands late, durably");
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "900_000 + 7_000 < 1_000_000: a create completed after the pane closed \
+         judges on the receipt-time assertion — it is not offered"
+    );
+}
+
+/// Keep-side twin of Pin (a): a create whose ASSERTION sits inside the
+/// parent's kill window is still offered even though its write lands vastly
+/// later — the late write must neither drop nor launder the row.
+#[test]
+fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_late_write() {
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "opencode",
+            session_id: "S1",
+            mode: "freshopencode",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("d1"),
+                tab_key: Some("d1:t1"),
+                asserted_at: 999_000,
+            }),
+            now_ms: 1_500_000,
+        })
+        .expect("late landing binding write");
+    let row = ledger.load_binding("opencode", "S1").expect("row written");
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "999_000 + 7_000 >= 1_000_000: a genuinely kill-window assertion keeps"
+    );
+}
+
+/// Focused-ep4-r2 Pin (b): the TERMINAL post-spawn binding write
+/// (terminal.rs's `create_meta_record` arm) — provenance captured at receipt
+/// (900_000), the write landing after the spawn completes (930_000), the pane
+/// closed while the spawn was in flight. Same judgment outcome as (a).
+#[test]
+fn terminal_post_spawn_write_completed_after_the_pane_closed_is_never_offered() {
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "S1",
+            terminal_id: "t-post",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("cr-1"),
+            provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("d1"),
+                tab_key: Some("d1:t1"),
+                asserted_at: 900_000,
+            }),
+            now_ms: 930_000,
+        })
+        .expect("post-spawn binding write");
+    let row = ledger.load_binding("claude", "S1").expect("row written");
+    assert_eq!(
+        row.last_attributed_at,
+        Some(900_000),
+        "the post-spawn write attributes at receipt, not at spawn completion"
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "900_000 + 7_000 < 1_000_000: the post-spawn write cannot revive an \
+         already-closed pane into the offer"
+    );
+}
+
+/// Focused-ep4-r2 Pin (c) at inventory scale: supersession keeps the parent's
+/// assertion time through the fake's own fork write — the fork child (conn-
+/// less `Inherit`, `supersedes`) carries the stamps AND the time the parent
+/// was last asserted with, so a fork landed after the freeze does not
+/// re-enter the offer.
+#[test]
+fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "parent-id",
+            terminal_id: "t-parent",
+            mode: "codex",
+            cwd: Some("/w"),
+            create_request_id: None,
+            provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("d1"),
+                tab_key: Some("d1:t1"),
+                asserted_at: 900_000,
+            }),
+            now_ms: 900_000,
+        })
+        .expect("parent binding write");
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "codex",
+            session_id: "child-id",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: Some("parent-id"),
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 1_500_000,
+        })
+        .expect("fork child binding write");
+    let child = ledger.load_binding("codex", "child-id").expect("child row");
+    assert_eq!(
+        child.client_instance_id.as_deref(),
+        Some("c1"),
+        "stamps inherit"
+    );
+    assert_eq!(
+        child.last_attributed_at,
+        Some(900_000),
+        "the assertion time inherits: the 1_500_000 fork write asserts nothing"
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![child],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "a post-freeze supersession writes no new browser assertion, so the \
+         child judges on the parent's time — not offered"
     );
 }
 

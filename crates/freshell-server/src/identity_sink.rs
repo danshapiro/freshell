@@ -74,11 +74,16 @@ impl PaneIdentitySink for LedgerIdentitySink {
                 // the ledger itself.
                 let provenance = match &upsert.provenance {
                     freshell_freshagent::ProvenanceUpdate::Replace(stamps) => {
+                        // Focused-ep4-r2 Findings 1+2: the assertion time
+                        // rides the value across the crate boundary — the
+                        // ledger records `asserted_at` (captured at WS message
+                        // receipt), never this write's own `now_ms`.
                         freshell_ws::pane_ledger::ProvenancePolicy::Replace(
                             freshell_ws::pane_ledger::ProvenanceStamps {
                                 client_instance_id: stamps.client_instance_id.as_deref(),
                                 device_id: stamps.device_id.as_deref(),
                                 tab_key: stamps.tab_key.as_deref(),
+                                asserted_at: stamps.asserted_at,
                             },
                         )
                     }
@@ -195,8 +200,19 @@ impl PaneIdentitySink for LedgerIdentitySink {
             client_instance_id: row.client_instance_id,
             device_id: row.device_id,
             tab_key: row.tab_key,
+            // Focused-ep4-r2 Findings 1+2: the row read re-arms the value with
+            // its row-recorded assertion time so a re-parked/fork-resolved
+            // value keeps the ROW's attribution (`last_attributed_at`; the
+            // D8 fallback `created_at` for a stamped pre-delta-r4 row), never
+            // this read's wall clock.
+            asserted_at: row.last_attributed_at.unwrap_or(row.created_at),
         };
-        (p != BindProvenance::default()).then_some(p)
+        // An all-`None` STAMPS answer is information-free — never returned as
+        // `Some(..)` (the check is stamp-fields only: the asserted_at fallback
+        // above is nonzero for any real row and must not synthesize
+        // provenance out of an unstamped one).
+        (p.client_instance_id.is_some() || p.device_id.is_some() || p.tab_key.is_some())
+            .then_some(p)
     }
 
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
@@ -598,6 +614,7 @@ mod tests {
                     client_instance_id: Some("client-1".into()),
                     device_id: Some("device-1".into()),
                     tab_key: Some("device-1:tab-1".into()),
+                    asserted_at: 7_777,
                 },
             ),
             settings: FreshAgentSettings {
@@ -611,6 +628,55 @@ mod tests {
         assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
         assert_eq!(row.device_id.as_deref(), Some("device-1"));
         assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    }
+
+    /// Focused-ep4-r2 Findings 1+2 (the seam the WS fresh-agent create lanes
+    /// write through): the provenance VALUE carries its assertion time across
+    /// the crate boundary — even when the sink's write lands 30s later than
+    /// the value's capture (a fresh-agent create whose slow spawn/SDK init
+    /// completes after the pane's tab state moved on), the row attributes at
+    /// `asserted_at`, never at the write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_binding_attributes_at_the_values_assertion_time_not_the_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let asserted = now_ms() - 30_000; // "provenance captured 30s before the write"
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_late".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Replace(
+                freshell_freshagent::BindProvenance {
+                    client_instance_id: Some("client-1".into()),
+                    device_id: Some("device-1".into()),
+                    tab_key: Some("device-1:tab-1".into()),
+                    asserted_at: asserted,
+                },
+            ),
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        let row = ledger.load_binding("opencode", "ses_late").expect("row");
+        assert_eq!(
+            row.last_attributed_at,
+            Some(asserted),
+            "the value's assertion time, not the sink's write clock"
+        );
+        assert!(
+            row.updated_at > asserted,
+            "the write itself still lands at write time ({})",
+            row.updated_at
+        );
     }
 
     /// Focused-ep1-r4 Finding 2 (the seam the cold-attach seeding reads
@@ -645,6 +711,7 @@ mod tests {
                     client_instance_id: Some("client-1".into()),
                     device_id: Some("device-1".into()),
                     tab_key: Some("device-1:tab-1".into()),
+                    asserted_at: 7_777,
                 },
             ),
             settings: FreshAgentSettings::default(),
@@ -710,9 +777,9 @@ mod tests {
                         client_instance_id: Some("client-term"),
                         device_id: Some("device-term"),
                         tab_key: Some("device-term:tab-term"),
+                        asserted_at: 7_777,
                     },
                 ),
-                attributed_at: None,
                 now_ms: 42,
             })
             .expect("terminal binding write ok");
@@ -754,6 +821,7 @@ mod tests {
                 client_instance_id: Some("client-1".into()),
                 device_id: Some("device-1".into()),
                 tab_key: Some("device-1:tab-1".into()),
+                asserted_at: 7_777,
             },
         )))
         .await

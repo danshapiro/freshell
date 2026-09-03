@@ -103,7 +103,6 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             // attribution instead of inheriting it under a refreshed
             // `updated_at`.
             provenance: crate::pane_ledger::ProvenancePolicy::Clear,
-            attributed_at: None,
             now_ms: now_ms(),
         }) {
             Self::warn_write_failure(terminal_id, "pre-spawn claude binding (PIN 2)", &err);
@@ -165,7 +164,6 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 // Delta-r2 Finding 2: `Clear` makes that an ERASE of any
                 // earlier browser stamps, never an inherit-forever.
                 provenance: crate::pane_ledger::ProvenancePolicy::Clear,
-                attributed_at: None,
                 now_ms: now_ms(),
             }) {
                 Self::warn_write_failure(terminal_id, "post-spawn identity binding", &err);
@@ -430,9 +428,9 @@ mod tests {
                         client_instance_id: Some("client-1"),
                         device_id: Some("device-1"),
                         tab_key: Some("device-1:tab-1"),
+                        asserted_at: 1_000,
                     },
                 ),
-                attributed_at: None,
                 now_ms: 1_000,
             })
             .expect("seed browser-stamped row");
@@ -468,9 +466,9 @@ mod tests {
                         client_instance_id: Some("client-1"),
                         device_id: Some("device-1"),
                         tab_key: Some("device-1:tab-1"),
+                        asserted_at: 5_000,
                     },
                 ),
-                attributed_at: None,
                 now_ms: 5_000,
             })
             .expect("re-seed browser stamps");

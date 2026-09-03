@@ -47,15 +47,14 @@ fn write_with_policy(
         cwd: Some("/tmp/proj"),
         create_request_id: Some("req-1"),
         provenance,
-        attributed_at: None,
         now_ms,
     }
 }
 
 /// D8 provenance variant of [`write`]: a connection-scoped create's stamps —
 /// the WS connection's `(clientInstanceId, deviceId)` identity plus the
-/// composed `tabKey` (`deviceId:tabId`) asserted via `Replace`.
-#[allow(clippy::too_many_arguments)]
+/// composed `tabKey` (`deviceId:tabId`) asserted via `Replace`, asserted at
+/// the write's own `now_ms` (fresh creates: receipt ≈ spawn ≈ write).
 fn write_provenance(
     provider: &str,
     session_id: &str,
@@ -64,6 +63,32 @@ fn write_provenance(
     client_instance_id: Option<&str>,
     device_id: Option<&str>,
     tab_key: Option<&str>,
+) -> BindingWrite<'static> {
+    write_provenance_at(
+        provider,
+        session_id,
+        terminal_id,
+        now_ms,
+        client_instance_id,
+        device_id,
+        tab_key,
+        now_ms,
+    )
+}
+
+/// Focused-ep4-r2 Findings 1+2 twin of [`write_provenance`]: the provenance
+/// value's assertion time differs from the write's `now_ms` — a slow
+/// create/spawn/post-spawn write whose provenance was captured at receipt.
+#[allow(clippy::too_many_arguments)]
+fn write_provenance_at(
+    provider: &str,
+    session_id: &str,
+    terminal_id: &str,
+    now_ms: i64,
+    client_instance_id: Option<&str>,
+    device_id: Option<&str>,
+    tab_key: Option<&str>,
+    asserted_at: i64,
 ) -> BindingWrite<'static> {
     let leak = |s: Option<&str>| s.map(|v| &*Box::leak(v.to_string().into_boxed_str()));
     write_with_policy(
@@ -75,6 +100,7 @@ fn write_provenance(
             client_instance_id: leak(client_instance_id),
             device_id: leak(device_id),
             tab_key: leak(tab_key),
+            asserted_at,
         }),
     )
 }
@@ -96,7 +122,8 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
     }
 }
 
-/// `fa_write` variant with connection-supplied stamps asserted (`Replace`).
+/// `fa_write` variant with connection-supplied stamps asserted (`Replace`),
+/// asserted at the write's own `now_ms`.
 fn fa_write_provenance<'a>(
     provider: &'a str,
     session_id: &'a str,
@@ -105,11 +132,37 @@ fn fa_write_provenance<'a>(
     device_id: Option<&'a str>,
     tab_key: Option<&'a str>,
 ) -> FreshAgentBindingWrite<'a> {
+    fa_write_provenance_at(
+        provider,
+        session_id,
+        now_ms,
+        client_instance_id,
+        device_id,
+        tab_key,
+        now_ms,
+    )
+}
+
+/// Focused-ep4-r2 Findings 1+2 twin of [`fa_write_provenance`]: the value's
+/// assertion time differs from the write's `now_ms` — a create whose binding
+/// write lands long after the provenance was captured at message receipt
+/// (e.g. the pane already closed mid-flight).
+#[allow(clippy::too_many_arguments)]
+fn fa_write_provenance_at<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    now_ms: i64,
+    client_instance_id: Option<&'a str>,
+    device_id: Option<&'a str>,
+    tab_key: Option<&'a str>,
+    asserted_at: i64,
+) -> FreshAgentBindingWrite<'a> {
     FreshAgentBindingWrite {
         provenance: ProvenancePolicy::Replace(ProvenanceStamps {
             client_instance_id,
             device_id,
             tab_key,
+            asserted_at,
         }),
         ..fa_write(provider, session_id, now_ms)
     }
@@ -675,6 +728,7 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn()
                 client_instance_id: Some("client-1"),
                 device_id: Some("device-1"),
                 tab_key: Some("device-1:tab-1"),
+                asserted_at: 1_000,
             },
             1_000,
         )
@@ -709,6 +763,7 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn()
                 client_instance_id: Some("client-1"),
                 device_id: None,
                 tab_key: None,
+                asserted_at: 1_000,
             },
             1_000,
         )
@@ -718,6 +773,109 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn()
         .unwrap();
     let row = ledger.load_binding("codex", "th-2").expect("binding row");
     assert_eq!(row.last_attributed_at, None, "a partial marker is hollow");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn post_spawn_write_records_the_provenances_assertion_time_not_the_writes() {
+    // Focused-ep4-r2 Findings 1+2 (terminal body): the post-spawn binding
+    // write (terminal.rs's `create_meta_record` arm) used to pass
+    // `attributed_at: None` and stamp its OWN now_ms — a slow spawn or a
+    // gated-restore queue wait would manufacture freshness for a pane that
+    // already closed mid-flight. The provenance value carries the receipt
+    // time: the write at T+30s must still attribute at T.
+    let root = temp_root("attr-time-post-spawn");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t1",
+            31_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the assertion time comes from the provenance value, never the write's now"
+    );
+    assert_eq!(
+        row.updated_at, 31_000,
+        "the write itself still lands at write time (maintenance clock)"
+    );
+    assert_eq!(
+        row.created_at, 31_000,
+        "row birth is row-keeping, not attribution"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_late_binding_write_records_the_provenances_assertion_time() {
+    // Focused-ep4-r2 Findings 1+2 (fresh-agent body): the fresh-agent create
+    // lane composes its provenance at WS receipt; the binding write lands only
+    // after the sidecar spawn + SDK init — possibly long after the pane's tab
+    // state moved on. Same rule: the value's `asserted_at` decides.
+    let root = temp_root("attr-time-fa-late");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "opencode",
+            "ses_1",
+            31_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(row.last_attributed_at, Some(1_000));
+    assert_eq!(row.updated_at, 31_000);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn stamped_markers_spawn_time_is_the_provenances_assertion_time() {
+    // Focused-ep4-r2 Findings 1+2 (canonical marker flow): when a marker is
+    // created from a provenance value, its `spawned_at` IS the value's
+    // `asserted_at` — `record_pending` maps it — so the resolution-side
+    // `spawned_at` attribution (ep4-r1) is the same single flow. A headless
+    // (unstamped) marker has no assertion: `spawned_at` stays the write time.
+    let root = temp_root("marker-spawn-is-asserted");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-1"),
+                device_id: Some("device-1"),
+                tab_key: Some("device-1:tab-1"),
+                asserted_at: 900,
+            },
+            5_000,
+        )
+        .unwrap();
+    let marker = ledger.pending_for_terminal("t1").expect("stamped marker");
+    assert_eq!(
+        marker.spawned_at, 900,
+        "a provenance-created marker's spawn time is the assertion time"
+    );
+    ledger
+        .record_pending("t2", "codex", None, ProvenanceStamps::default(), 7_000)
+        .unwrap();
+    let marker = ledger.pending_for_terminal("t2").expect("headless marker");
+    assert_eq!(
+        marker.spawned_at, 7_000,
+        "an unstamped marker keeps its write-time spawn record"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -748,13 +906,17 @@ fn fresh_agent_conn_less_refresh_preserves_the_attribution_time() {
 }
 
 #[test]
-fn fresh_agent_fork_child_never_takes_the_parents_attribution_time() {
-    // Fork-chain Inherit (claude rollback adoption, codex crash-respawn): the
-    // child inherits the parent's STAMPS (it is the same pane), but it was
-    // BORN at fork time by a conn-less write — no browser asserted it, so it
-    // gets NO attribution time of his own (and the D8 judgment's created_at
-    // floor would dominate an inherited older value anyway). Only
-    // connection-scoped fork stamps (the Replace fork lanes) attribute.
+fn fresh_agent_supersession_inherits_the_parents_assertion_time() {
+    // Focused-ep4-r2 Finding 1+2 (supersession arm): the provenance VALUE
+    // carries its assertion time, and a fork-chain Inherit (claude rollback
+    // adoption, codex crash-respawn) copies the parent's stamps AND that time
+    // — the supersession chain keeps the TRUE assertion time. The judgment's
+    // `created_at` floor that once made an inherited time unusable was
+    // deleted by the ep4-r1 repair, so pane_ledger_tests.rs's old mis-pin
+    // (`None` for the child) inverts: the child's judgment key IS the
+    // parent's last browser assertion, never the child's conn-less fork
+    // write. Only a connection-scoped fork-stamp `Replace` (a browser
+    // asserting the fork) writes a FRESHER time.
     let root = temp_root("fa-attr-time-fork");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -782,12 +944,14 @@ fn fresh_agent_fork_child_never_takes_the_parents_attribution_time() {
         "stamps inherit (the fork is, by construction, the same pane)"
     );
     assert_eq!(
-        child.last_attributed_at, None,
-        "but the attribution TIME does not: the fork is conn-less maintenance"
+        child.last_attributed_at,
+        Some(1_000),
+        "the assertion time inherits too — supersession keeps the parent's \
+         true browser-asserted time, never the conn-less fork write's now"
     );
     assert_eq!(
         child.created_at, 5_000,
-        "the child judges from its own birth"
+        "the child row is still BORN at fork time (row-keeping metadata only)"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1238,6 +1402,7 @@ fn resolve_pending_sources_provenance_from_the_consumed_marker() {
                 client_instance_id: Some("client-1"),
                 device_id: Some("device-1"),
                 tab_key: Some("device-1:tab-1"),
+                asserted_at: 1_000,
             },
             1_000,
         )
@@ -1279,6 +1444,7 @@ fn resolve_pending_prefers_the_resolve_calls_own_provenance_over_the_markers() {
                 client_instance_id: Some("client-marker"),
                 device_id: Some("device-marker"),
                 tab_key: Some("device-marker:tab-marker"),
+                asserted_at: 1_000,
             },
             1_000,
         )
@@ -1343,6 +1509,7 @@ fn resolve_pending_merges_marker_stamps_fieldwise_over_the_existing_row() {
                 client_instance_id: Some("client-new"),
                 device_id: None,
                 tab_key: None,
+                asserted_at: 1_000,
             },
             1_000,
         )
@@ -1482,6 +1649,7 @@ fn resolve_pending_clear_wins_over_a_stamped_marker() {
                 client_instance_id: Some("client-2"),
                 device_id: Some("device-2"),
                 tab_key: Some("device-2:tab-2"),
+                asserted_at: 1_000,
             },
             1_000,
         )
@@ -1512,16 +1680,23 @@ fn stamped_marker_retention_is_unchanged() {
     let root = temp_root("stamped-marker-ttl");
     let ledger = PaneLedger::new(Some(root.clone()));
     let now = 2 * PENDING_MARKER_TTL_MS;
-    let stamps = ProvenanceStamps {
+    let stamps_at = |asserted_at: i64| ProvenanceStamps {
         client_instance_id: Some("client-1"),
         device_id: Some("device-1"),
         tab_key: Some("device-1:tab-1"),
+        asserted_at,
     };
     ledger
-        .record_pending("young-t", "codex", Some("/tmp/p"), stamps, now - 60_000)
+        .record_pending(
+            "young-t",
+            "codex",
+            Some("/tmp/p"),
+            stamps_at(now - 60_000),
+            now - 60_000,
+        )
         .unwrap();
     ledger
-        .record_pending("aged-t", "codex", Some("/tmp/p"), stamps, 1_000)
+        .record_pending("aged-t", "codex", Some("/tmp/p"), stamps_at(1_000), 1_000)
         .unwrap();
     let report = ledger.gc(now, &never_absent, None);
     assert_eq!(report.stale_markers_removed, vec!["aged-t".to_string()]);

@@ -8229,6 +8229,7 @@ pub(crate) mod tests {
                 Some("client-p"),
                 Some("device-p"),
                 Some("tab-p"),
+                7_777,
             )),
         )
         .await;
@@ -8306,6 +8307,7 @@ pub(crate) mod tests {
                 Some("client-crash"),
                 Some("device-crash"),
                 Some("tab-crash"),
+                7_777,
             )),
         )
         .await;
@@ -8390,6 +8392,7 @@ pub(crate) mod tests {
                 Some("client-mint"),
                 Some("device-mint"),
                 Some("tab-mint"),
+                7_777,
             )),
         )
         .await;
@@ -8488,6 +8491,7 @@ pub(crate) mod tests {
                 Some("client-old"),
                 Some("device-old"),
                 Some("tab-old"),
+                7_777,
             )),
         )
         .await;
@@ -8502,6 +8506,7 @@ pub(crate) mod tests {
                 Some("client-new"),
                 Some("device-new"),
                 Some("tab-new"),
+                7_777,
             )),
         )
         .await;
@@ -8589,6 +8594,7 @@ pub(crate) mod tests {
                 Some("client-old"),
                 Some("device-old"),
                 Some("tab-old"),
+                7_777,
             )),
         )
         .await;
@@ -8611,6 +8617,7 @@ pub(crate) mod tests {
                 Some("client-new"),
                 Some("device-new"),
                 Some("tab-new"),
+                7_777,
             )),
         )
         .await;
@@ -8685,6 +8692,7 @@ pub(crate) mod tests {
                 Some("client-old"),
                 Some("device-old"),
                 Some("tab-old"),
+                7_777,
             )),
         )
         .await;
@@ -8753,6 +8761,7 @@ pub(crate) mod tests {
                 Some("client-a"),
                 Some("device-a"),
                 Some("tab-a"),
+                7_777,
             )),
         )
         .await;
@@ -8766,6 +8775,7 @@ pub(crate) mod tests {
                 Some("client-b"),
                 Some("device-b"),
                 Some("tab-b"),
+                7_777,
             )),
             sink,
         )
@@ -8842,6 +8852,7 @@ pub(crate) mod tests {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
                 tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
@@ -8910,6 +8921,7 @@ pub(crate) mod tests {
                 Some("client-old"),
                 Some("device-old"),
                 Some("tab-old"),
+                7_777,
             )),
         )
         .await;
@@ -9016,6 +9028,7 @@ pub(crate) mod tests {
                 client_instance_id: Some("client-old".into()),
                 device_id: Some("device-old".into()),
                 tab_key: Some("device-old:tab-old".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
@@ -9036,6 +9049,7 @@ pub(crate) mod tests {
                 Some("client-new"),
                 Some("device-new"),
                 Some("tab-new"),
+                7_777,
             )),
         )
         .await;
@@ -9098,6 +9112,7 @@ pub(crate) mod tests {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
                 tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
             }),
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
@@ -12492,6 +12507,7 @@ pub(crate) mod tests {
                     Some("client-codex"),
                     Some("device-codex"),
                     Some("tab-codex"),
+                    7_777,
                 )),
             )
             .await;
