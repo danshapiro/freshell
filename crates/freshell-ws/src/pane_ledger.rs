@@ -148,6 +148,25 @@ pub struct BindingRow {
     /// composition, so the row can rejoin the right restored tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_key: Option<String>,
+    /// Delta-r4 Finding 1 (judgment time decoupled from maintenance time):
+    /// when a browser connection last ASSERTED this identity+tab. Set ONLY by
+    /// a write applying MEANINGFUL connection-scoped provenance — `Replace`
+    /// with both `client_instance_id` and `device_id` present (the hollow
+    /// guard's shape): the connection-scoped create/stamp lanes, attributed
+    /// re-binds, marker-stamped resolutions (the stamps came from a spawn-time
+    /// connection), and connection-scoped fork stamps. NEVER set by conn-less
+    /// `Inherit` maintenance writes (auto-resume respawn, locator/resolution
+    /// re-binds — they refresh `updated_at` but re-assert nothing), by
+    /// retire/state transitions, or by GC/scan maintenance; ERASED by `Clear`
+    /// (the row is then unattributed wholesale). This is what the D8 judgment
+    /// (`recovery_inventory.rs`) keys on: `updated_at` advances on EVERY
+    /// upsert including conn-less maintenance, which parked a long-closed
+    /// detached pane's row past its parent's frozen newest generation after
+    /// every restart. Serde-optional under LEDGER_VERSION 1 (the
+    /// client/device/tab field precedent): pre-delta-r4 rows parse to `None`
+    /// and keep the creation-time key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attributed_at: Option<i64>,
 }
 
 /// Evidence that identity establishment was in flight (G1: never a binding).
@@ -232,6 +251,21 @@ pub enum ProvenancePolicy<'a> {
     /// enum doc), so the rebound row becomes unattributed and the D8
     /// judgment (`recovery_inventory.rs`) correctly never offers it.
     Clear,
+}
+
+/// Delta-r4 Finding 1: whether this write's provenance is a MEANINGFUL
+/// connection-scoped application — `Replace` whose stamps carry BOTH the
+/// client and device halves (the `freshell_freshagent::BindProvenance::
+/// is_meaningful` hollow-guard shape, mirrored here because this crate cannot
+/// see that one). This is the ONE predicate deciding whether a write advances
+/// a row's `last_attributed_at`: both merge bodies consume it.
+fn advances_attribution(provenance: &ProvenancePolicy<'_>) -> bool {
+    match provenance {
+        ProvenancePolicy::Replace(stamps) => {
+            stamps.client_instance_id.is_some() && stamps.device_id.is_some()
+        }
+        _ => false,
+    }
 }
 
 /// One identity event's worth of binding-row input.
@@ -577,6 +611,22 @@ impl PaneLedger {
             ),
             ProvenancePolicy::Clear => (None, None, None),
         };
+        // Delta-r4 Finding 1: the LAST-ATTRIBUTION time rides the same
+        // tri-state (`advances_attribution` is the single predicate). A
+        // meaningful connection-scoped application SETS it to now; a conn-less
+        // `Inherit` maintenance write (respawn/locator/resolution — it
+        // refreshes `updated_at` but re-asserts nothing) and a hollow/partial
+        // `Replace` PRESERVE it; `Clear` ERASES it (unattributed wholesale),
+        // so a stale attribution time can never launder the row into the D8
+        // offer the way `updated_at` churn did.
+        let last_attributed_at = if advances_attribution(&w.provenance) {
+            Some(w.now_ms)
+        } else {
+            match w.provenance {
+                ProvenancePolicy::Clear => None,
+                _ => existing.and_then(|r| r.last_attributed_at),
+            }
+        };
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -599,6 +649,7 @@ impl PaneLedger {
             client_instance_id,
             device_id,
             tab_key,
+            last_attributed_at,
         };
         self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
 
@@ -727,6 +778,25 @@ impl PaneLedger {
             ),
             ProvenancePolicy::Clear => (None, None, None),
         };
+        // Delta-r4 Finding 1 (same predicate as the terminal body,
+        // `advances_attribution`): a meaningful connection-scoped application
+        // (the conn-scoped upsert lanes, connection-resolved fork stamps) SETS
+        // the last-attribution time; conn-less `Inherit` refreshes (settings
+        // refresh, crash-recover, attach-resume) and hollow `Replace`s
+        // PRESERVE it; `Clear` ERASES it. The preserve source is strictly the
+        // same-key existing row — a fork-chain child never takes the
+        // superseded PARENT's attribution time (only its stamps): the child
+        // was born at fork time, and the D8 judgment's defensive
+        // `created_at` floor already dominates any older inherited value, so
+        // inheriting it would record a time the judgment can never use.
+        let last_attributed_at = if advances_attribution(&w.provenance) {
+            Some(w.now_ms)
+        } else {
+            match w.provenance {
+                ProvenancePolicy::Clear => None,
+                _ => existing.and_then(|r| r.last_attributed_at),
+            }
+        };
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -749,6 +819,7 @@ impl PaneLedger {
             client_instance_id,
             device_id,
             tab_key,
+            last_attributed_at,
         };
         self.write_binding(root, &mut index, &row)?; // new bound row FIRST (pinned)
 

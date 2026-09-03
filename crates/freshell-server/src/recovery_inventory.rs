@@ -44,6 +44,15 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// and the offered unions can never disagree about which generation is newest
 /// (a raw capturedAt-max would, after a backward server-clock step).
 ///
+/// The ROW's side of the comparison is its last-attribution time, never its
+/// last write: delta-r4 Finding 1 — `updated_at` advances on EVERY upsert,
+/// including conn-less `Inherit` maintenance (the auto-resume respawn sweep,
+/// locator/resolution re-binds) that re-asserts no browser provenance, so
+/// after the parent's evidence froze such a refresh parked the row past the
+/// frozen newest generation and re-offered a long-closed detached pane
+/// forever. `last_attributed_at` advances only on a meaningful
+/// connection-scoped write (see pane_ledger.rs).
+///
 /// Placement clause (delta-r2 Finding 3, narrowed by focused-ep2-r1 Finding
 /// 1): a kept row is offered ONLY when its stamped `tabKey` names an OPEN,
 /// paned tab in the offer's union (the restored-tab set the client joins it
@@ -752,11 +761,11 @@ pub fn build_inventory(
 /// D8 (restore-open-sessions-only): keep a Bound, unreferenced, not-live row
 /// iff it is ATTRIBUTED (`client_instance_id` && `device_id` present), its
 /// attributed device is the offer's primary device, its attributed client
-/// survives in that device's evidence, the row's time is within
-/// [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's revision-first-winner
-/// capturedAt, AND (delta-r2 Finding 3 + focused-ep2-r1 Finding 1) its
-/// stamped `tab_key` names an OPEN, paned tab in the primary union — the
-/// restored-tab set the client joins it into.
+/// survives in that device's evidence, the row's LAST-ATTRIBUTION time is
+/// within [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's
+/// revision-first-winner capturedAt, AND (delta-r2 Finding 3 +
+/// focused-ep2-r1 Finding 1) its stamped `tab_key` names an OPEN, paned tab
+/// in the primary union — the restored-tab set the client joins it into.
 /// Unattributed / non-primary-device / no-surviving-parent /
 /// unplaceable-tab rows are NEVER offered.
 fn d8_parent_relative_keep(
@@ -784,7 +793,18 @@ fn d8_parent_relative_keep(
     else {
         return false; // the row's parent client left no surviving evidence on this device
     };
-    let row_time = r.updated_at.max(r.created_at).max(0) as u64;
+    // Delta-r4 Finding 1 (judgment time ≠ maintenance time): key on the row's
+    // last MEANINGFUL browser attribution (`last_attributed_at`), NEVER
+    // `updated_at` — conn-less `Inherit` upserts refresh `updated_at` without
+    // any browser re-asserting the pane, which parked long-closed detached
+    // rows past the frozen parent evidence. Legacy rows (pre-delta-r4, field
+    // absent) key on creation time; the defensive `max(created_at)` floors
+    // the judgment at the row's birth either way.
+    let row_time = r
+        .last_attributed_at
+        .unwrap_or(r.created_at)
+        .max(r.created_at)
+        .max(0) as u64;
     if row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) < parent_newest {
         return false; // the parent's evidence already observed the row's absence
     }

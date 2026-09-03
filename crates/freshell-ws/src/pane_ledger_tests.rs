@@ -147,6 +147,11 @@ fn bind_stamps_provenance_and_rebind_without_provenance_preserves_it() {
     assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
     assert_eq!(row.updated_at, 5_000, "updated_at advances on re-bind");
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "delta-r4 Finding 1: the attribution time survives the conn-less re-bind"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -183,6 +188,10 @@ fn headless_clear_rebind_erases_the_browser_stamps() {
     assert_eq!(row.client_instance_id, None, "Clear erases the clientInstanceId");
     assert_eq!(row.device_id, None, "Clear erases the deviceId");
     assert_eq!(row.tab_key, None, "Clear erases the tabKey");
+    assert_eq!(
+        row.last_attributed_at, None,
+        "Clear erases the attribution time too (unattributed wholesale)"
+    );
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
     assert_eq!(row.updated_at, 5_000, "updated_at still refreshes (rewritten, unattributed)");
     std::fs::remove_dir_all(&root).ok();
@@ -221,6 +230,11 @@ fn rebind_with_newer_provenance_replaces_it() {
     assert_eq!(row.client_instance_id.as_deref(), Some("c2"));
     assert_eq!(row.device_id.as_deref(), Some("d1"));
     assert_eq!(row.tab_key.as_deref(), Some("d1:tab-9"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "a meaningful re-bind advances the attribution time"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -251,6 +265,11 @@ fn fresh_agent_rebind_without_provenance_keeps_the_stamps() {
     assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
     assert_eq!(row.created_at, 1_000);
     assert_eq!(row.updated_at, 2_000);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "delta-r4 Finding 1: the conn-less fresh-agent refresh keeps the attribution time"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -282,6 +301,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
     assert_eq!(row.client_instance_id, None);
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at, None,
+        "Clear erases the attribution time too"
+    );
     assert_eq!(row.updated_at, 2_000, "updated_at refreshes; the stamps are gone");
 
     // Fork-chain arm: Clear + supersedes -> no parent inheritance.
@@ -348,6 +371,11 @@ fn fresh_agent_rebind_with_newer_provenance_replaces_it() {
     assert_eq!(row.client_instance_id.as_deref(), Some("c2"));
     assert_eq!(row.device_id.as_deref(), Some("d1"));
     assert_eq!(row.tab_key.as_deref(), Some("d1:tab-9"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "a meaningful fresh-agent re-bind advances the attribution time"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -414,10 +442,337 @@ fn legacy_row_without_stamps_reads_back_with_none_provenance() {
     assert_eq!(row.client_instance_id, None);
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at, None,
+        "pre-delta-r4 rows have no attribution time (creation-time key downstream)"
+    );
     let report = ledger.boot_scan(10_000, &never_absent);
     assert!(
         report.quarantined.is_empty(),
         "a legacy row is never quarantined by the D8 field addition"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ── Delta-r4 Finding 1: `last_attributed_at` writer dispositions ─────────────
+// The judgment time is attribution time, never write time: a MEANINGFUL
+// connection-scoped application (`Replace` with client+device both present)
+// sets it; conn-less `Inherit` maintenance preserves it; `Clear` erases it.
+// The merge bodies consume the ONE `advances_attribution` predicate.
+
+#[test]
+fn connection_scoped_write_stamps_the_attribution_time_durably() {
+    // The WS create lanes' exact shape (`Replace` + the full stamp triple):
+    // the row records WHEN the browser asserted this identity+tab — set from
+    // the same `now_ms` as `updated_at`, and durable across a reboot (a fresh
+    // ledger over the same root reads it back).
+    let root = temp_root("attr-time-set");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").unwrap();
+    assert_eq!(row.last_attributed_at, Some(1_000));
+    assert_eq!(row.updated_at, 1_000);
+    drop(ledger);
+    let rebooted = PaneLedger::new(Some(root.clone()));
+    let row = rebooted.load_binding("codex", "th-1").unwrap();
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the attribution time is durable (serde round-trip through disk)"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn conn_less_inherit_refresh_preserves_the_attribution_time() {
+    // THE FINDING's lane, unit shape: the auto-resume respawn's conn-less
+    // `Inherit` write refreshes `updated_at` (maintenance freshness) but must
+    // NOT advance the attribution time — no browser re-asserted the pane. It
+    // is exactly this decoupling that lets the D8 judgment ignore maintenance
+    // churn after the parent's evidence froze.
+    let root = temp_root("attr-time-keep");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write("codex", "th-1", "t2", 5_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").unwrap();
+    assert_eq!(row.updated_at, 5_000, "maintenance freshness still lands");
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the attribution time holds at the last genuine browser assertion"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn attributed_rebind_advances_the_attribution_time() {
+    // The keep-side twin: a genuine attributed re-bind (a browser connection
+    // re-asserts the identity) IS a fresh attribution and advances the key.
+    let root = temp_root("attr-time-advance");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t1",
+            1_000,
+            Some("c1"),
+            Some("d1"),
+            Some("d1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t2",
+            5_000,
+            Some("c2"),
+            Some("d1"),
+            Some("d1:tab-9"),
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").unwrap();
+    assert_eq!(row.last_attributed_at, Some(5_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn headless_clear_erases_the_attribution_time_too() {
+    // `Clear` makes the row unattributed wholesale — stamps AND their time.
+    let root = temp_root("attr-time-clear");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_with_policy(
+            "codex",
+            "th-1",
+            "t2",
+            5_000,
+            ProvenancePolicy::Clear,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").unwrap();
+    assert_eq!(row.client_instance_id, None);
+    assert_eq!(
+        row.last_attributed_at, None,
+        "an unattributed row carries no attribution time"
+    );
+    assert_eq!(row.updated_at, 5_000, "still rewritten, just unattributed");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn hollow_replace_never_advances_the_attribution_time() {
+    // The hollow guard (`is_meaningful`: client+device BOTH present — a
+    // partially-initialized hello cannot compose both). A partial `Replace`
+    // still merges its `Some` fields per keep-when-`None`, but it is NOT a
+    // browser assertion of the identity, so the time never advances.
+    let root = temp_root("attr-time-hollow");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // Arm 1: a partial Replace onto a FRESH row leaves it timeless (the row
+    // is unattributed downstream anyway — only the client field landed).
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-partial",
+            "t1",
+            1_000,
+            Some("client-1"),
+            None,
+            None,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-partial").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.last_attributed_at, None);
+    // Arm 2: a partial Replace onto an attributed row PRESERVES the time.
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-2",
+            "t2",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-2",
+            "t3",
+            5_000,
+            Some("client-rotated"),
+            None,
+            None,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-2").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-rotated"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "a hollow assertion is not an attribution"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn marker_stamped_resolution_stamps_the_attribution_time_from_the_resolve() {
+    // Delta-r3's marker provenance is spawn-time CONNECTION provenance: when
+    // the conn-less `Inherit` resolution derives `Replace(marker stamps)` from
+    // a stamped marker, that derived application is meaningful and stamps the
+    // row's attribution time at the resolve. A partially-stamped marker is
+    // hollow (never an attribution).
+    let root = temp_root("attr-time-marker");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-1"),
+                device_id: Some("device-1"),
+                tab_key: Some("device-1:tab-1"),
+            },
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "the marker-derived application re-attributes at the resolve"
+    );
+    // Partial marker → hollow derived Replace → no attribution time.
+    ledger
+        .record_pending(
+            "t2",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-1"),
+                device_id: None,
+                tab_key: None,
+            },
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-2", "t2", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-2").expect("binding row");
+    assert_eq!(row.last_attributed_at, None, "a partial marker is hollow");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_conn_less_refresh_preserves_the_attribution_time() {
+    // The fresh-agent body takes the same predicate: conn-less Inherit
+    // refresh lanes (settings refresh, crash-recover, attach-resume) refresh
+    // `updated_at` without touching the attribution time.
+    let root = temp_root("fa-attr-time-keep");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "opencode",
+            "ses_1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("opencode", "ses_1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(row.updated_at, 2_000);
+    assert_eq!(row.last_attributed_at, Some(1_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_fork_child_never_takes_the_parents_attribution_time() {
+    // Fork-chain Inherit (claude rollback adoption, codex crash-respawn): the
+    // child inherits the parent's STAMPS (it is the same pane), but it was
+    // BORN at fork time by a conn-less write — no browser asserted it, so it
+    // gets NO attribution time of his own (and the D8 judgment's created_at
+    // floor would dominate an inherited older value anyway). Only
+    // connection-scoped fork stamps (the Replace fork lanes) attribute.
+    let root = temp_root("fa-attr-time-fork");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "claude",
+            "parent-id",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            supersedes: Some("parent-id"),
+            ..fa_write("claude", "child-id", 5_000)
+        })
+        .unwrap();
+    let child = ledger
+        .load_binding("claude", "child-id")
+        .expect("child row");
+    assert_eq!(
+        child.client_instance_id.as_deref(),
+        Some("client-1"),
+        "stamps inherit (the fork is, by construction, the same pane)"
+    );
+    assert_eq!(
+        child.last_attributed_at, None,
+        "but the attribution TIME does not: the fork is conn-less maintenance"
+    );
+    assert_eq!(
+        child.created_at, 5_000,
+        "the child judges from its own birth"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -440,6 +795,10 @@ fn record_binding_roundtrips_all_fields() {
     assert_eq!(row.created_at, 1_000);
     assert_eq!(row.updated_at, 1_000);
     assert_eq!(row.last_observed_at, 1_000);
+    assert_eq!(
+        row.last_attributed_at, None,
+        "a conn-less (Inherit) write attributes nothing — no attribution time"
+    );
     assert_eq!(row.state, RowState::Bound);
     assert_eq!(row.retired_reason, None);
     assert_eq!(row.superseded_by, None);
@@ -876,6 +1235,11 @@ fn resolve_pending_sources_provenance_from_the_consumed_marker() {
     assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
     assert_eq!(row.device_id.as_deref(), Some("device-1"));
     assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "delta-r4 Finding 1: the marker-derived application re-attributes at the resolve"
+    );
     assert!(
         ledger.list_pending_raw().is_empty(),
         "the marker was consumed (binding-first order)"
@@ -1002,6 +1366,10 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     assert_eq!(row.client_instance_id, None);
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at, None,
+        "headless resolution: no stamps, no attribution time"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1051,6 +1419,10 @@ fn resolve_pending_from_a_headless_origin_clears_a_previously_stamped_row() {
     );
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at, None,
+        "the attribution time goes with the stamps (the delta-r4 key is cleared too)"
+    );
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
     assert_eq!(row.updated_at, 2_000, "updated_at still refreshes");
     assert!(
@@ -1104,6 +1476,7 @@ fn resolve_pending_clear_wins_over_a_stamped_marker() {
     assert_eq!(row.client_instance_id, None, "Clear erases browser stamps");
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
+    assert_eq!(row.last_attributed_at, None, "Clear erases the attribution time");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1447,6 +1820,7 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             client_instance_id: None,
             device_id: None,
             tab_key: None,
+            last_attributed_at: None,
         };
         write_row_atomic(
             &root

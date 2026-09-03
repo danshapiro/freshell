@@ -2,7 +2,10 @@
 
 use super::*;
 use freshell_protocol::SessionLocator;
-use freshell_ws::pane_ledger::{BindingRow, RetiredReason, RowState, LEDGER_VERSION};
+use freshell_ws::pane_ledger::{
+    BindingRow, BindingWrite, PaneLedger, ProvenancePolicy, ProvenanceStamps, RetiredReason,
+    RowState, LEDGER_VERSION,
+};
 use serde_json::json;
 use std::collections::HashSet;
 
@@ -99,6 +102,9 @@ fn binding_row_at(
         client_instance_id: None,
         device_id: None,
         tab_key: None,
+        // Delta-r4 Finding 1: unattributed fixture rows are legacy-shaped
+        // (no attribution-time key); `with_attribution` stamps one.
+        last_attributed_at: None,
     }
 }
 
@@ -108,11 +114,16 @@ fn binding_row(provider: &str, session_id: &str, state_parts: StateParts) -> Bin
 
 /// D8 attribution knobs: stamp the fixture row the way the connection-scoped
 /// WS create lanes do — `tab_key` composes as `device:tab` (exactly
-/// `BindProvenance::for_create`'s rule).
+/// `BindProvenance::for_create`'s rule). Delta-r4 Finding 1: the attributed
+/// write also stamps `last_attributed_at` with the write's own `updated_at`
+/// (the production lanes set both from the same `now_ms`), so every existing
+/// boundary test below keeps asserting its INTENDED boundary against the new
+/// judgment key.
 fn with_attribution(mut row: BindingRow, client: &str, device: &str, tab_id: &str) -> BindingRow {
     row.client_instance_id = Some(client.to_string());
     row.device_id = Some(device.to_string());
     row.tab_key = Some(format!("{device}:{tab_id}"));
+    row.last_attributed_at = Some(row.updated_at);
     row
 }
 
@@ -960,6 +971,201 @@ fn stale_clients_generations_are_dropped() {
     assert!(
         !ids.contains(&"gD".to_string()),
         "requester's own generations are excluded"
+    );
+}
+
+// ── Delta-r4 Finding 1: judgment time is attribution time, never write time ──
+// A conn-less Inherit maintenance write (the auto-resume respawn sweep,
+// terminal.rs's "Conn-less lane (D8)" arm) refreshes a row's `updated_at`
+// without any browser asserting the pane. After the parent browser's evidence
+// froze (its last retained push), such a refresh parked `row_time` past the
+// frozen newest generation, so a long-closed detached pane's row kept
+// clearing the grace lower bound and was offered again after every restart.
+
+/// Delta-r4 Finding 1 fixture lane: REAL ledger writes, exactly the two write
+/// shapes production composes — the connection-scoped create's `Replace` and
+/// the respawn's conn-less `Inherit` — so the row under judgment carries
+/// precisely the timestamps those lanes produce.
+fn ledger_row_after_writes(steps: &[(ProvenancePolicy<'static>, i64)]) -> BindingRow {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
+    let terminal = Box::leak(format!("t-steps-{}", std::process::id()).into_boxed_str());
+    for (i, (provenance, now_ms)) in steps.iter().enumerate() {
+        ledger
+            .record_binding(&BindingWrite {
+                provider: "claude",
+                session_id: "S1",
+                terminal_id: terminal,
+                mode: "claude",
+                cwd: Some("/w"),
+                create_request_id: None,
+                provenance: *provenance,
+                now_ms: *now_ms,
+            })
+            .unwrap_or_else(|e| panic!("fixture write {i} failed: {e}"));
+    }
+    // The returned row is a memory clone; the tempdir may drop with the fn.
+    ledger.load_binding("claude", "S1").expect("row written")
+}
+
+/// The connection-scoped create/stamp lane's exact policy shape (the WS
+/// `bind_provenance` composition): `Replace` with the full stamp triple.
+fn conn_scoped(
+    client: &'static str,
+    device: &'static str,
+    tab_key: &'static str,
+) -> ProvenancePolicy<'static> {
+    ProvenancePolicy::Replace(ProvenanceStamps {
+        client_instance_id: Some(client),
+        device_id: Some(device),
+        tab_key: Some(tab_key),
+    })
+}
+
+#[test]
+fn inherit_maintenance_write_after_frozen_parent_evidence_never_revives_the_offer() {
+    // THE FINDING end to end through real writes: the browser create stamps
+    // the row at T0 (its parent evidence eventually freezes at F — the
+    // browser's last retained push), then the auto-resume respawn's conn-less
+    // Inherit write at T2 (server restart AFTER the pane was long detached)
+    // refreshes `updated_at` to sit within grace of F. The judgment must
+    // STILL exclude the row: a maintenance refresh is not a browser
+    // re-assertion.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = ledger_row_after_writes(&[
+        (conn_scoped("c1", "d1", "d1:t1"), 900_000),
+        (ProvenancePolicy::Inherit, 995_000),
+    ]);
+    assert_eq!(row.updated_at, 995_000, "the maintenance write IS fresh");
+    assert_eq!(row.created_at, 900_000, "the row BIRTH is the browser's");
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "900_000 + 7_000 < 1_000_000: the parent observed the absence long ago — \
+         a conn-less maintenance refresh must not re-open the grace window"
+    );
+}
+
+#[test]
+fn genuine_attributed_rebind_advances_the_judgment_time() {
+    // The keep-side twin (same real-lane fixture): a SECOND connection-scoped
+    // write at T2 genuinely re-asserts the identity (an attributed re-bind —
+    // the browser came back and claimed the pane), so it IS fresh evidence:
+    // the same grace math that drops the Inherit-touched row keeps this one.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = ledger_row_after_writes(&[
+        (conn_scoped("c1", "d1", "d1:t1"), 900_000),
+        (conn_scoped("c1", "d1", "d1:t1"), 995_000),
+    ]);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(995_000),
+        "the re-bind advanced the attribution time"
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "995_000 + 7_000 >= 1_000_000: a genuine re-assertion keeps the kill-window semantics"
+    );
+}
+
+#[test]
+fn the_judgment_time_is_the_attribution_time_not_the_last_write() {
+    // Pure key pin (direct fixture — real writes always set updated_at ==
+    // last_attributed_at on an attributed write, so only a fixture can
+    // separate the two keys): updated_at/created_at BOTH sit far outside the
+    // grace window, the attribution time inside. Offered iff the judgment
+    // reads `last_attributed_at` and nothing else.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let mut row = with_attribution(binding_row("claude", "S1", bound()), "c1", "d1", "t1");
+    assert_eq!(
+        row.updated_at, 1_000,
+        "fixture sanity: write time far out of grace"
+    );
+    row.last_attributed_at = Some(995_000);
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "995_000 + 7_000 >= 1_000_000: the attribution time alone decides"
+    );
+}
+
+#[test]
+fn legacy_row_without_attribution_time_keys_on_creation_time() {
+    // Legacy fallback (pre-delta-r4 rows carry no `last_attributed_at` — e.g.
+    // written by a pre-upgrade binary and refreshed by its conn-less
+    // maintenance lanes): the judgment keys on CREATION time. The fixture's
+    // `updated_at` was refreshed into grace by the old server's maintenance
+    // writes — exactly the wild shape the finding names — and must NOT count.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let mut row = binding_row_at("claude", "S1", bound(), 995_000);
+    row.created_at = 900_000; // born long before the parent's evidence froze
+    let row = with_attribution(row, "c1", "d1", "t1");
+    let row = BindingRow {
+        last_attributed_at: None, // the legacy shape: no attribution-time key
+        ..row
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "900_000 + 7_000 < 1_000_000: legacy rows judge on creation time, \
+         never on a maintenance-refreshed updated_at"
     );
 }
 
@@ -1998,7 +2204,10 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
         .unwrap_or_else(|| {
             panic!("row within grace of its parent's winner must be offered (got {body})")
         });
-    // row_time = max(995_000, 994_000) = parent's capturedAt - 5_000: in grace.
+    // The seed is DELIBERATELY legacy-shaped (no `lastAttributedAt` — a
+    // pre-delta-r4 row): row_time = createdAt = 994_000, in grace
+    // (994_000 + 7_000 >= 1_000_000), pinning the legacy creation-time key
+    // end to end through the route.
     assert_eq!(entry["tabKey"], "dev1:t9");
 }
 
