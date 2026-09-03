@@ -159,12 +159,16 @@ pub struct BindingRow {
 /// with [`ProvenancePolicy::Inherit`], and for a dynamically-identified
 /// codex/opencode/amplifier CLI pane (no pre-spawn binding; only claude
 /// preallocates) there is NO existing row to inherit from.
-/// [`PaneLedger::resolve_pending`] sources attribution by precedence: the
-/// resolve's own meaningful
-/// provenance, then THESE stamps, then inherit-from-existing-row. Serde-
-/// optional under LEDGER_VERSION 1 (the BindingRow precedent): pre-delta-r3
-/// markers — and headless REST/sink markers, intentionally never stamped —
-/// parse to all-`None` and resolution behaves exactly as it did before.
+/// [`PaneLedger::resolve_pending`] derives the ORIGIN lane's policy from the
+/// consumed marker (focused-ep3-r2 Finding 2): the resolve's own meaningful
+/// provenance, then THESE stamps — and an ALL-NONE marker (headless
+/// REST/sink markers are intentionally never stamped, exactly the lane's
+/// `Clear` write policy) resolves `Clear`, erasing any prior lane's stamps
+/// so a headless lineage can never launder a stale browser attribution via
+/// the marker path. Serde-optional under LEDGER_VERSION 1 (the BindingRow
+/// precedent): pre-delta-r3 markers parse to all-`None` and take the same
+/// `Clear` derivation — conservative (unattributed ⇒ never offered), and
+/// immune by construction once the 30-day pending-marker TTL has swept them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingMarker {
@@ -1058,41 +1062,76 @@ impl PaneLedger {
             return Ok(());
         };
         let mut index = self.guard();
-        // Delta-r3 Finding 2 provenance precedence on the marker→binding
-        // transition: the resolve's OWN meaningful policy wins (`Replace`
-        // asserts, `Clear` erases). A conn-less `Inherit` resolve instead
-        // sources attribution from the consumed marker's spawn-time stamps:
-        // each `Some` field attributes the row, each `None` field asserts
-        // nothing, so `Replace`'s per-field keep-when-`None` yields exactly
-        // (marker stamps, else the existing row's stamps) — and an
-        // UNSTAMPED marker (headless lanes, pre-delta-r3 docs) yields
-        // `Replace(all-None)` ≡ `Inherit` in this body, i.e. a headless
-        // resolution still ends unattributed, unchanged.
-        let marker_stamps: Option<(Option<String>, Option<String>, Option<String>)> =
-            match &w.provenance {
-                ProvenancePolicy::Inherit => index.pending.get(w.terminal_id).map(|m| {
-                    (
-                        m.client_instance_id.clone(),
-                        m.device_id.clone(),
-                        m.tab_key.clone(),
-                    )
-                }),
-                _ => None,
-            };
+        // Delta-r3 Finding 2 + focused-ep3-r2 Finding 2 provenance precedence
+        // on the marker→binding transition: the resolve's OWN meaningful
+        // policy wins (`Replace` asserts, `Clear` erases). A conn-less
+        // `Inherit` resolve instead derives the ORIGIN lane's policy from the
+        // consumed marker, exactly the way the origin's direct writes express
+        // it:
+        //   * a marker carrying ANY spawn-time stamp → `Replace(stamps)` —
+        //     the conn-less SESSION-AFFILIATED source rule: each `Some`
+        //     field attributes the row, each `None` field asserts nothing,
+        //     so `Replace`'s per-field keep-when-`None` yields exactly
+        //     (marker stamps, else the existing row's stamps);
+        //   * an ALL-NONE marker → `Clear` — the HEADLESS origin record:
+        //     the explicitly-headless REST/headless lineage binder stamps
+        //     nothing by design (`pane_identity_binder.rs`, whose direct
+        //     writes are `Clear`), so resolution must AGREE with that lane —
+        //     stamps → `None` regardless of the marker and the existing row.
+        //     Keeping them (`Replace(all-None)` ≡ `Inherit`) laundered a
+        //     previously browser-stamped row under a refreshed `updated_at`
+        //     when a dynamically-identified headless terminal resolved onto
+        //     it: the delta-r2 laundering class via the marker path.
+        //   * NO marker at all → plain `Inherit` — the mid-session rebind
+        //     shape carries no origin record; the write asserts nothing.
+        enum Derived {
+            Keep,
+            Stamps,
+            Clear,
+        }
+        // Owned stamp clones are hoisted to the function scope so `effective`
+        // can borrow them past the `index.pending` lookup's lifetime.
+        let mut stamp_client: Option<String> = None;
+        let mut stamp_device: Option<String> = None;
+        let mut stamp_tab: Option<String> = None;
+        let derived = match &w.provenance {
+            ProvenancePolicy::Inherit => match index.pending.get(w.terminal_id) {
+                Some(marker)
+                    if marker.client_instance_id.is_some()
+                        || marker.device_id.is_some()
+                        || marker.tab_key.is_some() =>
+                {
+                    stamp_client.clone_from(&marker.client_instance_id);
+                    stamp_device.clone_from(&marker.device_id);
+                    stamp_tab.clone_from(&marker.tab_key);
+                    Derived::Stamps
+                }
+                Some(_headless_origin) => Derived::Clear,
+                None => Derived::Keep,
+            },
+            _ => Derived::Keep,
+        };
         let effective;
-        let w = match &marker_stamps {
-            Some((c, d, t)) => {
+        let w = match derived {
+            Derived::Stamps => {
                 effective = BindingWrite {
                     provenance: ProvenancePolicy::Replace(ProvenanceStamps {
-                        client_instance_id: c.as_deref(),
-                        device_id: d.as_deref(),
-                        tab_key: t.as_deref(),
+                        client_instance_id: stamp_client.as_deref(),
+                        device_id: stamp_device.as_deref(),
+                        tab_key: stamp_tab.as_deref(),
                     }),
                     ..*w
                 };
                 &effective
             }
-            None => w,
+            Derived::Clear => {
+                effective = BindingWrite {
+                    provenance: ProvenancePolicy::Clear,
+                    ..*w
+                };
+                &effective
+            }
+            Derived::Keep => w,
         };
         self.record_binding_locked(root, &mut index, w)?; // binding row FIRST
         if let Err(err) = Self::remove_pending(root, &mut index, w.terminal_id) {
@@ -1300,7 +1339,10 @@ pub(crate) async fn ledger_resolve_identity(
             // 2) `resolve_pending` additionally sources the consumed marker's
             // spawn-time stamps, so a dynamically-identified pane whose marker
             // the connection-scoped create stamped is STILL attributable here
-            // (no existing row would otherwise exist to inherit from).
+            // (no existing row would otherwise exist to inherit from), while
+            // (focused-ep3-r2 Finding 2) an unstamped — headless — marker
+            // derives `Clear`, so the same resolution can never launder a
+            // stale browser attribution.
             provenance: ProvenancePolicy::Inherit,
             now_ms: now,
         })

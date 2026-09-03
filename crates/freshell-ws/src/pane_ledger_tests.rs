@@ -987,8 +987,9 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     // Precedence, arm 3: the REST/headless lineage binder writes markers
     // WITHOUT stamps (`ProvenanceStamps::default()`), so a resolution whose
     // origin is headless still ends unattributed — the D8 judgment correctly
-    // never offers the row. `Replace(all-None)` ≡ `Inherit` for this body,
-    // so the behavior is exactly the pre-delta-r3 one.
+    // never offers the row. Focused-ep3-r2 Finding 2: an unstamped marker
+    // derives `Clear`; with NO existing row there is nothing to erase, so the
+    // outcome is the same all-`None` it always was.
     let root = temp_root("resolve-headless");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -1001,6 +1002,61 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     assert_eq!(row.client_instance_id, None);
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolve_pending_from_a_headless_origin_clears_a_previously_stamped_row() {
+    // Focused-ep3-r2 Finding 2 — the delta-r2 laundering class THROUGH the
+    // marker transition: a Bound row stamped by a browser create, later
+    // resolved onto by a dynamically-identified HEADLESS (REST/headless
+    // lineage) terminal. The origin lane's pending marker is UNSTAMPED by
+    // design (`pane_identity_binder.rs` passes `ProvenanceStamps::default()`
+    // — its policy is `Clear`, exactly its binding-write policy), and the
+    // resolution must honor that: stamps → `None` regardless of the marker
+    // and regardless of the EXISTING row. Keeping them would attribute the
+    // refreshed row to a stale browser parent, so the D8 grace judgment
+    // would offer a session that was not open. Routed exactly the way
+    // production reaches it: the conn-less `ledger_resolve_identity` hook's
+    // write shape (`Inherit` + a create-time marker).
+    let root = temp_root("resolve-headless-clears");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t-browser",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .expect("seed the browser-stamped row");
+    ledger
+        .record_pending(
+            "t-rest",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps::default(), // the headless binder's exact marker shape
+            1_500,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t-rest", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(
+        row.client_instance_id, None,
+        "a headless-origin resolution CLEARS the stale browser clientInstanceId"
+    );
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
+    assert_eq!(row.updated_at, 2_000, "updated_at still refreshes");
+    assert!(
+        ledger.list_pending_raw().is_empty(),
+        "the consumed marker is gone (binding-first order)"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

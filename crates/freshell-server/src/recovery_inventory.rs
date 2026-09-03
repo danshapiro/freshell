@@ -279,7 +279,18 @@ pub fn build_inventory(
     // that NO other ref-less pane claims — any ambiguity (two rows correlate
     // to one pane, one row claimed by two panes) leaves the pane ref-less
     // and the row unreferenced (never guess).
+    //
+    // Focused-ep3-r2 Finding 1: ambiguity TAINTS the rows too, not just the
+    // pane bind. Every row that PARTICIPATES in an ambiguous correlation —
+    // any row in a multi-candidate pane's set (pane-side), or a row claimed
+    // by two-or-more ref-less panes (row-side) — is excluded from
+    // `ledgerOnly` for this inventory build (never correlated, NEVER
+    // OFFERED: offering the candidates replays the finding's three-panes-
+    // for-one-open shape). This is an offer-eligibility decision only: the
+    // rows stay in the ledger (no retirement, no delete) and are counted
+    // separately in the D8 judgment debug line (`ambiguous_suppressed`).
     let mut correlation_claims: HashMap<String, usize> = HashMap::new();
+    let mut ambiguous_rows: HashSet<String> = HashSet::new();
     for d in &unions {
         for rec in d.union_doc["records"].as_array().into_iter().flatten() {
             for pane in rec["panes"].as_array().into_iter().flatten() {
@@ -290,14 +301,27 @@ pub fn build_inventory(
                 {
                     continue; // the D4 authority chain owns panes WITH a snapshot claim
                 }
-                for row in
-                    correlation_candidates(pane, &by_create_request_id, &by_live_terminal_id)
-                {
+                let candidates =
+                    correlation_candidates(pane, &by_create_request_id, &by_live_terminal_id);
+                if candidates.len() > 1 {
+                    // Pane-side ambiguity: EVERY candidate participates.
+                    for row in &candidates {
+                        ambiguous_rows.insert(ref_key(&row.provider, &row.session_id));
+                    }
+                }
+                for row in candidates {
                     *correlation_claims
                         .entry(ref_key(&row.provider, &row.session_id))
                         .or_default() += 1;
                 }
             }
+        }
+    }
+    // Row-side ambiguity: a row claimed by two-or-more ref-less panes
+    // participates in ambiguity no matter how each claimant's own set looks.
+    for (key, claims) in &correlation_claims {
+        if *claims > 1 {
+            ambiguous_rows.insert(key.clone());
         }
     }
     let mut correlated = 0usize;
@@ -333,8 +357,10 @@ pub fn build_inventory(
                                 // (bound state + the row's identity + live via
                                 // the D7 join + referenced, keeping the row out
                                 // of ledgerOnly). Any ambiguity stays today's
-                                // shape (unknown/ref-less); the debug line
-                                // below reports both counters.
+                                // shape (unknown/ref-less), and the TAINTED
+                                // rows are suppressed from the offer below
+                                // (focused-ep3-r2 Finding 1); the debug line
+                                // below reports all three counters.
                                 let candidates = correlation_candidates(
                                     pane,
                                     &by_create_request_id,
@@ -508,6 +534,7 @@ pub fn build_inventory(
     });
 
     let mut d8_dropped = 0usize;
+    let mut ambiguous_suppressed = 0usize;
     let ledger_only: Vec<Value> = bindings
         .iter()
         .filter(|r| row_is_bound(r))
@@ -515,6 +542,18 @@ pub fn build_inventory(
         .filter(|r| !referenced.contains(&ref_key(&row_provider(r), &row_session_id(r))))
         // live rows are excluded: sessions still running are never offered for resume (D7)
         .filter(|r| !is_live(&row_provider(r), &row_session_id(r)))
+        // Focused-ep3-r2 Finding 1 (offer-eligibility only): rows tainted by
+        // an ambiguous correlation are never offered. Rows that do not
+        // correlate at all are untouched — they fall through to the normal
+        // D8 judgment below.
+        .filter(|r| {
+            let suppressed =
+                ambiguous_rows.contains(&ref_key(&row_provider(r), &row_session_id(r)));
+            if suppressed {
+                ambiguous_suppressed += 1;
+            }
+            !suppressed
+        })
         .filter(|r| {
             let keep = d8_parent_relative_keep(
                 r,
@@ -565,6 +604,7 @@ pub fn build_inventory(
         primary = primary_device_id.is_some(),
         correlated,
         ambiguous_correlations = ambiguous,
+        ambiguous_suppressed,
         "D8 offer judgment");
 
     // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3)

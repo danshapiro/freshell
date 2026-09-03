@@ -1198,7 +1198,10 @@ fn two_bound_rows_sharing_the_panes_create_request_id_never_correlate() {
     // Ambiguity shape 1 (never guess): TWO Bound rows carry the same advisory
     // id as the ref-less pane. Correlating either would guess which session
     // the pane actually ran; leave the pane ref-less and BOTH rows
-    // unreferenced instead.
+    // unreferenced instead. Focused-ep3-r2 Finding 1: ambiguity-TAINTED rows
+    // are also EXCLUDED from the offer itself (never correlated, never
+    // offered) — offering them replays the finding's exact three-panes-for-
+    // one-open shape (ref-less snapshot leaf + one resume leaf per candidate).
     let d = DeviceUnion {
         device_id: "dev1".into(),
         union_doc: union_doc_with_tab_key(
@@ -1223,13 +1226,19 @@ fn two_bound_rows_sharing_the_panes_create_request_id_never_correlate() {
         no_live(),
         &evidence(&[("dev1", &[("c1", 5_000)])]),
     );
-    let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["ledgerState"], "unknown");
-    assert!(pane["sessionRef"].is_null());
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes.len(),
+        1,
+        "the one originally-open pane restores as exactly ONE ref-less pane"
+    );
+    assert_eq!(panes[0]["ledgerState"], "unknown");
+    assert!(panes[0]["sessionRef"].is_null());
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
-        2,
-        "neither ambiguous row is consumed by the pane — both remain D8-offered"
+        0,
+        "neither ambiguous row is consumed by the pane AND neither is offered \
+         (ambiguity-tainted rows are suppressed — never correlated, never offered)"
     );
 }
 
@@ -1237,6 +1246,8 @@ fn two_bound_rows_sharing_the_panes_create_request_id_never_correlate() {
 fn pane_matching_two_rows_by_both_correlation_ids_never_correlates() {
     // Ambiguity shape 2: the pane's createRequestId arm names row A while its
     // liveTerminal arm names row B — inconsistent advisory data; never guess.
+    // Focused-ep3-r2 Finding 1: both tainted rows are suppressed from the
+    // offer too.
     let d = DeviceUnion {
         device_id: "dev1".into(),
         union_doc: union_doc_with_tab_key(
@@ -1271,7 +1282,11 @@ fn pane_matching_two_rows_by_both_correlation_ids_never_correlates() {
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["ledgerState"], "unknown");
     assert!(pane["sessionRef"].is_null());
-    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "both id-arm candidates are ambiguity-tainted — suppressed, never offered"
+    );
 }
 
 #[test]
@@ -1308,7 +1323,62 @@ fn one_row_matching_two_ref_less_panes_never_correlates_either() {
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(panes[0]["ledgerState"], "unknown");
     assert_eq!(panes[1]["ledgerState"], "unknown");
-    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "the contested row is ambiguity-tainted — suppressed, never offered \
+         (focused-ep3-r2 Finding 1, row-side ambiguity direction)"
+    );
+}
+
+#[test]
+fn ambiguity_suppression_never_touches_rows_that_do_not_correlate() {
+    // Focused-ep3-r2 Finding 1, the boundary pin: suppression reaches ONLY
+    // rows that participate in an ambiguous correlation. A row NO ref-less
+    // pane names is not tainted — it follows the normal D8 judgment end to
+    // end (attributed + in grace + whitelisted tabKey => offered), so a
+    // suppression comparator bug (e.g. a key-shape mismatch that suppresses
+    // every row) re-fails this test.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1" } }]),
+        ),
+    };
+    let contested = |session_id: &str| {
+        with_attribution(
+            with_correlation_ids(binding_row_at("codex", session_id, bound(), 1_000), Some("req-1"), None),
+            "c1",
+            "dev1",
+            "t1",
+        )
+    };
+    let untouched = with_attribution(
+        with_correlation_ids(binding_row_at("codex", "C-z", bound(), 1_000), Some("req-z"), None),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![contested("C-a"), contested("C-b"), untouched],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let only = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(
+        only.len(),
+        1,
+        "only the NON-correlating row survives: the ambiguous pair is suppressed (got {only:?})"
+    );
+    assert_eq!(
+        only[0]["sessionId"], "C-z",
+        "the surviving entry is the unrelated row, under the normal D8 judgment"
+    );
 }
 
 // ── Task 2: `GET /api/recovery/inventory` route tests ─────────────────────────
