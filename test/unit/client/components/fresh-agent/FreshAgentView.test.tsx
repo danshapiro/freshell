@@ -3890,6 +3890,7 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_fork_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      tabId: 'tab-1',
       cwd: '/repo/route-aware',
       input: { atTurnId: 'turn-route-fork' },
     })
