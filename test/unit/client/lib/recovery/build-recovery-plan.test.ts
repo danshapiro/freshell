@@ -85,14 +85,18 @@ describe('buildRecoveryPlan', () => {
     expect(root.children[1].content).toMatchObject({ kind: 'picker' })
   })
 
-  // Missing-tabKey pin (D8): a stamp-less row (pre-upgrade or headless
-  // REST/MCP lineage) can never be placed, so it keeps the trailing tab.
-  it('ledgerOnly entries without a stamped tabKey get a trailing Recovered sessions tab', () => {
+  // Missing-tabKey pin (D8, delta-r2 Finding 3): a stamp-less row (pre-upgrade
+  // or a straggler the server's placement clause should have excluded) has no
+  // join target, so it is NOT placed anywhere — the client must not resurrect
+  // the trailing-tab pattern for stamp-less/mismatched leftovers.
+  it('ledgerOnly entries without a stamped tabKey are NOT placed (no trailing tab)', () => {
     const plans = buildRecoveryPlan(inv([pane()], [{ provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x' }]))
-    expect(plans).toHaveLength(2)
-    expect(plans[1].title).toBe('Recovered sessions')
-    const content = (plans[1].layout as { content: Record<string, unknown> }).content
-    expect(content).toMatchObject({ kind: 'terminal', mode: 'codex', initialCwd: '/x', sessionRef: { provider: 'codex', sessionId: 'C9' } })
+    expect(plans).toHaveLength(1)
+    expect(plans[0].title).toBe('work')
+    expect(leavesOf(plans[0].layout)).toHaveLength(1)
+    // The unplaced row restores nowhere — closest thing to it is absent.
+    const allLeafContents = plans.flatMap((p) => leavesOf(p.layout).map((l) => l.content))
+    expect(allLeafContents.every((c) => (c as { sessionRef?: { sessionId: string } }).sessionRef?.sessionId !== 'C9')).toBe(true)
   })
 
   it('a ledgerOnly row whose tabKey matches a restored tab joins that tab (rightmost leaf), no trailing tab', () => {
@@ -112,48 +116,52 @@ describe('buildRecoveryPlan', () => {
     })
   })
 
-  it('a ledgerOnly row whose tabKey matches no restored tab keeps the trailing tab', () => {
+  it('a ledgerOnly row whose tabKey matches no restored tab is NOT placed (no trailing tab)', () => {
     const plans = buildRecoveryPlan(inv([pane()], [
       { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' },
     ]))
-    expect(plans).toHaveLength(2)
-    expect(plans[1].title).toBe('Recovered sessions')
-    const trailContents = leavesOf(plans[1].layout).map((l) => l.content)
-    expect(trailContents).toHaveLength(1)
-    expect(trailContents[0]).toMatchObject({
-      kind: 'terminal', mode: 'codex', initialCwd: '/x',
-      sessionRef: { provider: 'codex', sessionId: 'C9' },
-    })
-    // The device tab's plan is untouched by the unmatched row.
-    expect(leavesOf(plans[0].layout)).toHaveLength(1)
+    expect(plans).toHaveLength(1)
+    const leaves = leavesOf(plans[0].layout)
+    expect(leaves).toHaveLength(1)
+    // The unmatched row joins nothing and produces no extra tab.
+    const allLeafContents = plans.flatMap((p) => leavesOf(p.layout).map((l) => l.content))
+    expect(allLeafContents.every((c) => (c as { sessionRef?: { sessionId: string } }).sessionRef?.sessionId !== 'C9')).toBe(true)
   })
 
-  it('a tabKey naming a tab with no snapshot panes falls back to the trailing tab (no plan exists for it)', () => {
+  it('a tabKey naming a tab with no snapshot panes is NOT placed (no plan exists for it)', () => {
     const inventory = inv([pane()], [
       { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k-empty' },
     ])
     inventory.device!.tabs.push({ tabKey: 'k-empty', tabName: 'empty', panes: [] })
     const plans = buildRecoveryPlan(inventory)
-    expect(plans).toHaveLength(2)
-    expect(plans.map((p) => p.title)).toEqual(['work', 'Recovered sessions'])
-    const trailContents = leavesOf(plans[1].layout).map((l) => l.content)
-    expect(trailContents).toHaveLength(1)
-    expect(trailContents[0]).toMatchObject({ sessionRef: { provider: 'codex', sessionId: 'C9' } })
+    expect(plans).toHaveLength(1)
+    expect(plans[0].title).toBe('work')
+    expect(leavesOf(plans[0].layout)).toHaveLength(1)
   })
 
-  it('a mixed cohort joins the matched row and trails the unmatched one in a single trailing tab', () => {
+  it('a mixed cohort joins the matched row and leaves the unmatched one unplaced (single device plan, no trailing tab)', () => {
     const plans = buildRecoveryPlan(inv([pane(), pane({ paneId: 'p2' })], [
       { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' },
       { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' },
     ]))
-    expect(plans).toHaveLength(2)
+    expect(plans).toHaveLength(1)
+    expect(plans[0].title).toBe('work')
     const deviceContents = leavesOf(plans[0].layout).map((l) => l.content)
     expect(deviceContents).toHaveLength(3)
     expect(deviceContents[2]).toMatchObject({ sessionRef: { provider: 'claude', sessionId: 'S9' } })
-    expect(plans[1].title).toBe('Recovered sessions')
-    const trailContents = leavesOf(plans[1].layout).map((l) => l.content)
-    expect(trailContents).toHaveLength(1)
-    expect(trailContents[0]).toMatchObject({ sessionRef: { provider: 'codex', sessionId: 'C9' } })
+    // The unmatched codex row restores nowhere.
+    expect(deviceContents.every((c) => (c as { sessionRef?: { sessionId: string } }).sessionRef?.sessionId !== 'C9')).toBe(true)
+  })
+
+  // Delta-r2 Finding 3 regression sentinel: the trailing-tab machinery is
+  // gone — the literal tab title can never be produced again. (The placement
+  // tests above pin the behavior; this pins the machinery's removal.)
+  it('the plan builder module no longer contains the trailing-tab title', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const { join } = await import('node:path')
+    // cwd is the vitest config `root` (the project root) for this suite.
+    const src = await readFile(join(process.cwd(), 'src/lib/recovery/build-recovery-plan.ts'), 'utf8')
+    expect(src.includes('Recovered sessions')).toBe(false)
   })
 
   // Finding 2 (delta-r1): a kept fresh-agent ledger row must restore as a

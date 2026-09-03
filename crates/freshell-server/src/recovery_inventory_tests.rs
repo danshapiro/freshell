@@ -18,9 +18,22 @@ fn live(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
 }
 
 fn union_doc(device: &str, captured_at: u64, panes: serde_json::Value) -> serde_json::Value {
+    union_doc_with_tab_key(device, captured_at, "k1", panes)
+}
+
+/// Union fixture whose single record carries an explicit `tabKey` — the D8
+/// placement clause (delta-r2 Finding 3) offers a kept row only when its
+/// stamped tabKey names a tab in the offer's union, so kept-row fixtures and
+/// the clause-isolating drop fixtures carry the row's key here.
+fn union_doc_with_tab_key(
+    device: &str,
+    captured_at: u64,
+    tab_key: &str,
+    panes: serde_json::Value,
+) -> serde_json::Value {
     json!({
         "deviceId": device, "deviceLabel": format!("label-{device}"), "capturedAt": captured_at,
-        "records": [{ "tabKey": "k1", "tabId": "t1", "tabName": "work", "revision": 1,
+        "records": [{ "tabKey": tab_key, "tabId": "t1", "tabName": "work", "revision": 1,
                       "updatedAt": captured_at, "paneCount": 1, "panes": panes }]
     })
 }
@@ -392,18 +405,19 @@ fn content_id_is_stable_and_input_sensitive() {
     // of their parent's surviving evidence) — two inventories whose rows were
     // both D8-dropped digest identically and the assert_ne below would go
     // vacuous.
-    let union = || DeviceUnion {
+    let union = |tab_key: &str| DeviceUnion {
         device_id: "dev1".into(),
-        union_doc: union_doc(
+        union_doc: union_doc_with_tab_key(
             "dev1",
             5_000,
+            tab_key,
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         ),
     };
     // row_time = 1_000; 1_000 + 7_000 >= 5_000 => the row is offered.
     let ev = || evidence(&[("dev1", &[("c1", 5_000)])]);
     let a = build_inventory(
-        vec![union()],
+        vec![union("dev1:t9")],
         vec![with_attribution(
             binding_row("codex", "C9", bound()),
             "c1",
@@ -414,7 +428,7 @@ fn content_id_is_stable_and_input_sensitive() {
         &ev(),
     );
     let b = build_inventory(
-        vec![union()],
+        vec![union("dev1:t9")],
         vec![with_attribution(
             binding_row("codex", "C9", bound()),
             "c1",
@@ -425,7 +439,7 @@ fn content_id_is_stable_and_input_sensitive() {
         &ev(),
     );
     let c = build_inventory(
-        vec![union()],
+        vec![union("dev1:t8")],
         vec![with_attribution(
             binding_row("codex", "C8", bound()),
             "c1",
@@ -451,9 +465,10 @@ fn content_id_is_stable_and_input_sensitive() {
 fn content_id_ignores_timestamp_churn() {
     // A5/A6: heartbeat re-pushes bump capturedAt/updatedAt every <=5 min - dismissal must survive.
     let doc = |captured_at| {
-        union_doc(
+        union_doc_with_tab_key(
             "dev1",
             captured_at,
+            "dev1:t9",
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         )
     };
@@ -507,12 +522,14 @@ fn content_id_ignores_timestamp_churn() {
 fn attributed_row_within_grace_of_its_parent_is_offered() {
     // Parent client "c1" on primary "d1", winner capturedAt = 1_000_000; the
     // row's updated_at sits EXACTLY at the grace boundary (inclusive):
-    // 993_000 == 1_000_000 - UNSNAPSHOTTED_BINDING_GRACE_MS.
+    // 993_000 == 1_000_000 - UNSNAPSHOTTED_BINDING_GRACE_MS. The union's
+    // record carries the row's stamped tabKey (the placement clause's match).
     let d = DeviceUnion {
         device_id: "d1".into(),
-        union_doc: union_doc(
+        union_doc: union_doc_with_tab_key(
             "d1",
             1_000_000,
+            "d1:t1",
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         ),
     };
@@ -556,14 +573,6 @@ fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
     // `pane_kind` as `paneKind` in the ledgerOnly JSON so the client's plan
     // builder packages it as a fresh-agent resume — never a terminal shell
     // (the row's mode is a fresh-agent session type, not a terminal CLI mode).
-    let d = DeviceUnion {
-        device_id: "d1".into(),
-        union_doc: union_doc(
-            "d1",
-            1_000_000,
-            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
-        ),
-    };
     let mut row = binding_row_at("opencode", "ses_9", bound(), 995_000);
     row.mode = "freshopencode".into();
     row.pane_kind = Some("fresh-agent".into());
@@ -575,8 +584,17 @@ fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
     row.sandbox = Some("workspace-write".into());
     row.permission_mode = Some("on-request".into());
     let row = with_attribution(row, "c1", "d1", "t9");
+    let d2 = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t9",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
     let out = build_inventory(
-        vec![d],
+        vec![d2],
         vec![row],
         no_live(),
         &evidence(&[("d1", &[("c1", 1_000_000)])]),
@@ -598,12 +616,14 @@ fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
 #[test]
 fn attributed_row_before_its_parents_evidence_is_dropped() {
     // The paired boundary drop: one ms earlier falls outside the grace
-    // window (992_999 + 7_000 = 999_999 < 1_000_000).
+    // window (992_999 + 7_000 = 999_999 < 1_000_000). The union carries the
+    // row's stamped tabKey, so ONLY the grace clause decides this pin.
     let d = DeviceUnion {
         device_id: "d1".into(),
-        union_doc: union_doc(
+        union_doc: union_doc_with_tab_key(
             "d1",
             1_000_000,
+            "d1:t1",
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         ),
     };
@@ -660,12 +680,18 @@ fn row_attributed_to_a_non_primary_device_is_dropped() {
             json!([{ "paneId": "p0", "kind": "terminal", "payload": {"mode": "shell"} }]),
         ),
     };
-    let row = with_attribution(
+    let mut row = with_attribution(
         binding_row_at("codex", "C9", bound(), 5_000),
         "c9",
         "d0",
         "t9",
     );
+    // The delta-r2 placement clause (tabKey must name a primary-union tab)
+    // SUBSUMES realistically-stamped non-primary rows (their device-composed
+    // tabKey can never name a d1 tab). To keep THIS pin discriminating on the
+    // device clause itself, the fixture carries a tabKey the primary union
+    // HAS — a deliberately inconsistent (device d0 / tabKey k1) stamp.
+    row.tab_key = Some("k1".to_string());
     let out = build_inventory(
         vec![newer, older],
         vec![row],
@@ -685,12 +711,14 @@ fn row_whose_parent_client_left_no_surviving_evidence_is_dropped() {
     // The stamped parent client is absent from the device's surviving set
     // (its generations were count-cap-evicted after a reload storm, or its
     // first boot died before its WS-ready push) — undecidable from retained
-    // data, so never offered.
+    // data, so never offered. The union carries the row's stamped tabKey, so
+    // ONLY the parent-survivor clause decides this pin.
     let d = DeviceUnion {
         device_id: "d1".into(),
-        union_doc: union_doc(
+        union_doc: union_doc_with_tab_key(
             "d1",
             1_000_000,
+            "d1:t1",
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         ),
     };
@@ -710,6 +738,49 @@ fn row_whose_parent_client_left_no_surviving_evidence_is_dropped() {
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
         "c-gone is not in the surviving set, so its rows are never offered"
+    );
+}
+
+#[test]
+fn attributed_row_whose_tab_key_matches_no_union_tab_is_dropped() {
+    // Delta-r2 Finding 3 (placement exactness): the row is attributed, on the
+    // primary device, its parent client survives selection, and it is within
+    // grace — EVERY earlier D8 clause passes — but its stamped tabKey names a
+    // tab that vanished from all retained evidence. Such a row is
+    // deliberately EXCLUDED: the pre-fix trailing-tab fallback restored it
+    // into an unrelated tab, and a pane whose whole TAB was created and lost
+    // inside the sub-cadence push window is unplaceable from retained data.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    // 999_000 + 7_000 >= 1_000_000: within grace — the placement clause is
+    // the ONLY failing one, so this pin re-fails if it is removed.
+    let row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 999_000),
+        "c1",
+        "d1",
+        "t-gone",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "a row whose stamped tabKey matches no union tab is never offered"
+    );
+    assert_eq!(
+        out["recoverable"], true,
+        "the union's own tab is still offered (only the unplaceable row drops)"
     );
 }
 
@@ -761,9 +832,10 @@ fn backward_clock_step_cannot_drop_a_kill_window_row() {
     // End-to-end through the judgment: row_time 900_100 + 7_000 >= 900_000 => KEPT.
     let d = DeviceUnion {
         device_id: "d1".into(),
-        union_doc: union_doc(
+        union_doc: union_doc_with_tab_key(
             "d1",
             900_000,
+            "d1:t1",
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
         ),
     };
@@ -1014,7 +1086,10 @@ async fn route_never_offers_ledger_only_rows_without_parent_evidence() {
 async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
     // D8 route-level positive: a surviving generation for the row's OWN parent
     // client ("c1" on "dev1") plus an attributed row in grace => offered,
-    // recoverable, and the row JSON carries the stamped tabKey.
+    // recoverable, and the row JSON carries the stamped tabKey. The generation's
+    // record carries the row's stamped tabKey ("dev1:t9") — the delta-r2
+    // placement clause requires the stamped key to name a tab in the offer's
+    // union.
     let tmp = tempfile::tempdir().unwrap();
     write_snapshot(
         tmp.path(),
@@ -1023,7 +1098,7 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
         1_000_000,
         1,
         json!([
-            {"tabKey":"k1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
              "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
         ]),
     );

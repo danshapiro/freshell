@@ -43,6 +43,14 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// `generation_rank` ordering the union composition applies — so the judgment
 /// and the offered unions can never disagree about which generation is newest
 /// (a raw capturedAt-max would, after a backward server-clock step).
+///
+/// Placement clause (delta-r2 Finding 3): a kept row is offered ONLY when its
+/// stamped `tabKey` names a tab in the offer's union (the restored-tab set the
+/// client joins it into) — an unmatched/missing tabKey means the pane's whole
+/// TAB was created and lost inside the sub-cadence push window, so NO retained
+/// data knows the tab; the row is unplaceable and deliberately excluded (the
+/// pre-fix client-side trailing-tab fallback restored such rows into an
+/// unrelated tab instead).
 const UNSNAPSHOTTED_BINDING_GRACE_MS: u64 = 7_000;
 
 /// A15 staleness + A16 concurrent-client rules (D2): drop the requester's own
@@ -307,13 +315,21 @@ pub fn build_inventory(
 
     // D8 judgment inputs (see UNSNAPSHOTTED_BINDING_GRACE_MS): the primary
     // device's surviving-client evidence — the only cohort whose rows can be
-    // offered at all.
+    // offered at all — plus the primary union's tab keys, the delta-r2
+    // placement set (a kept row must rejoin a tab the offer actually
+    // restores; anything else is unplaceable and excluded).
     let primary_device_id = primary_idx.map(|i| unions[i].device_id.as_str());
     let primary_clients = primary_device_id.and_then(|id| {
         evidence
             .iter()
             .find(|(device, _)| device == id)
             .map(|(_, clients)| clients.as_slice())
+    });
+    let primary_tab_keys: Option<HashSet<String>> = primary_idx.map(|i| {
+        tabs_per_union[i]
+            .iter()
+            .filter_map(|t| t["tabKey"].as_str().map(String::from))
+            .collect()
     });
 
     let mut d8_dropped = 0usize;
@@ -325,7 +341,12 @@ pub fn build_inventory(
         // live rows are excluded: sessions still running are never offered for resume (D7)
         .filter(|r| !is_live(&row_provider(r), &row_session_id(r)))
         .filter(|r| {
-            let keep = d8_parent_relative_keep(r, primary_device_id, primary_clients);
+            let keep = d8_parent_relative_keep(
+                r,
+                primary_device_id,
+                primary_clients,
+                primary_tab_keys.as_ref(),
+            );
             if !keep {
                 d8_dropped += 1;
             }
@@ -389,20 +410,25 @@ pub fn build_inventory(
 /// D8 (restore-open-sessions-only): keep a Bound, unreferenced, not-live row
 /// iff it is ATTRIBUTED (`client_instance_id` && `device_id` present), its
 /// attributed device is the offer's primary device, its attributed client
-/// survives in that device's evidence, and the row's time is within
+/// survives in that device's evidence, the row's time is within
 /// [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's revision-first-winner
-/// capturedAt. Unattributed / non-primary-device / no-surviving-parent rows
-/// are NEVER offered.
+/// capturedAt, AND (delta-r2 Finding 3) its stamped `tab_key` names a tab in
+/// the primary union — the restored-tab set the client joins it into.
+/// Unattributed / non-primary-device / no-surviving-parent /
+/// unplaceable-tab rows are NEVER offered.
 fn d8_parent_relative_keep(
     r: &BindingRow,
     primary_device_id: Option<&str>,
     primary_clients: Option<&[(String, u64)]>,
+    primary_tab_keys: Option<&HashSet<String>>,
 ) -> bool {
     let (Some(client), Some(device)) = (r.client_instance_id.as_deref(), r.device_id.as_deref())
     else {
         return false; // unattributed (headless REST/MCP, pre-upgrade) rows are never offered
     };
-    let (Some(primary), Some(clients)) = (primary_device_id, primary_clients) else {
+    let (Some(primary), Some(clients), Some(tab_keys)) =
+        (primary_device_id, primary_clients, primary_tab_keys)
+    else {
         return false; // no primary device => no evidence at all to judge against
     };
     if device != primary {
@@ -416,7 +442,18 @@ fn d8_parent_relative_keep(
         return false; // the row's parent client left no surviving evidence on this device
     };
     let row_time = r.updated_at.max(r.created_at).max(0) as u64;
-    row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) >= parent_newest
+    if row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) < parent_newest {
+        return false; // the parent's evidence already observed the row's absence
+    }
+    // Delta-r2 Finding 3 (placement exactness): the stamped tabKey must name
+    // a tab in the offer's union. A pane whose whole TAB was created and lost
+    // inside the sub-cadence push window is unplaceable — no retained data
+    // knows the tab — so it is deliberately EXCLUDED here rather than dumped
+    // into an unrelated tab by the client's old trailing-tab fallback.
+    let Some(tab_key) = r.tab_key.as_deref() else {
+        return false;
+    };
+    tab_keys.contains(tab_key)
 }
 
 // Thin accessors over the real `BindingRow` fields/enums

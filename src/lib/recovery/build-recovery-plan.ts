@@ -149,8 +149,14 @@ function ledgerEntryContent(e: LedgerOnlyEntry): PaneContent {
 export interface LedgerPlacement {
   /** Rows joining a restored tab, keyed by the inventory tab's tabKey. */
   joinedByTabKey: Map<string, LedgerOnlyEntry[]>
-  /** Rows falling back to the trailing tab (unmatched or missing tabKey). */
-  trailing: LedgerOnlyEntry[]
+  /**
+   * Rows with no join target (unmatched or missing tabKey) — NOT placed
+   * anywhere. The server's placement clause (delta-r2 Finding 3) excludes
+   * such rows from the offer, so this bucket is defense-in-depth only: the
+   * client must not resurrect a trailing recovered-sessions tab for
+   * stragglers (that restored them into an unrelated tab).
+   */
+  unplaced: LedgerOnlyEntry[]
 }
 
 /**
@@ -158,27 +164,28 @@ export interface LedgerPlacement {
  * the listing always matches the physical destination: a kept ledger row
  * whose stamped tabKey names a tab that yields a plan joins that tab; every
  * other row (unmatched tabKey — the tab vanished from the retained evidence;
- * missing tabKey — pre-upgrade or headless lineage) falls back to the
- * trailing tab. Joinability is computed from the tabs that PRODUCE plans
- * (panes.length > 0), not raw inventory tabs: an empty-pane tab gets no plan,
- * so rows stamped for it must fall through.
+ * missing tabKey — pre-upgrade/headless lineage or a straggler the server's
+ * placement clause would have excluded) is NOT placed (delta-r2 Finding 3).
+ * Joinability is computed from the tabs that PRODUCE plans (panes.length > 0),
+ * not raw inventory tabs: an empty-pane tab gets no plan, so rows stamped for
+ * it have no join target.
  */
 export function placeLedgerEntries(inv: RecoveryInventory): LedgerPlacement {
   const joinableTabKeys = new Set(
     (inv.device?.tabs ?? []).filter((t) => t.panes.length > 0).map((t) => t.tabKey),
   )
   const joinedByTabKey = new Map<string, LedgerOnlyEntry[]>()
-  const trailing: LedgerOnlyEntry[] = []
+  const unplaced: LedgerOnlyEntry[] = []
   for (const entry of inv.ledgerOnly) {
     if (entry.tabKey !== undefined && joinableTabKeys.has(entry.tabKey)) {
       const list = joinedByTabKey.get(entry.tabKey) ?? []
       if (list.length === 0) joinedByTabKey.set(entry.tabKey, list)
       list.push(entry)
     } else {
-      trailing.push(entry)
+      unplaced.push(entry)
     }
   }
-  return { joinedByTabKey, trailing }
+  return { joinedByTabKey, unplaced }
 }
 
 export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
@@ -187,7 +194,10 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
   // loop (one dispatch per plan) can never graft a row on afterwards. Joined
   // rows extend the existing chain as the rightmost leaf (D6 geometry).
   const placement = placeLedgerEntries(inv)
-  const plans: RecoveryTabPlan[] = (inv.device?.tabs ?? [])
+  // Every offered row now joins a restored tab — the server excludes
+  // unplaceable rows (delta-r2 Finding 3), and `placement.unplaced` drops any
+  // straggler rather than reviving the trailing-tab fallback.
+  return (inv.device?.tabs ?? [])
     .filter((t) => t.panes.length > 0)
     .map((t) => ({
       tabId: nanoid(),
@@ -199,13 +209,4 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
       ]),
       paneTitles: {},
     }))
-  if (placement.trailing.length > 0) {
-    plans.push({
-      tabId: nanoid(),
-      title: 'Recovered sessions',
-      layout: chain(placement.trailing.map((e) => leaf(ledgerEntryContent(e)))),
-      paneTitles: {},
-    })
-  }
-  return plans
 }

@@ -54,8 +54,10 @@ export interface LedgerOnlyEntry {
    * D8 provenance stamp: `<deviceId>:<tabId>` of the tab the pane was open in
    * (present only for rows bound by a connection-scoped lane). The recovery
    * plan joins the row into the restored tab with this key when one exists;
-   * rows without it (or whose tab left no retained evidence) fall back to the
-   * trailing tab.
+   * rows without a join target (missing key, or the tab left no retained
+   * evidence) are NOT placed — the server excludes them from the offer
+   * (delta-r2 Finding 3), and the client drops any straggler rather than
+   * reviving the trailing-tab fallback.
    */
   tabKey?: string
   /**

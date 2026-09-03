@@ -170,8 +170,8 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   // D8 placement: the listing must match the plan's physical destination, so
   // both consume the same partition — a kept ledger row whose stamped tabKey
   // names a restorable tab renders under THAT tab in the same line format as
-  // its snapshot panes; rows without a restorable tab match keep the flat
-  // "session" line of the trailing tab they land in.
+  // its snapshot panes. Rows without a restorable tab match are not restored
+  // (delta-r2 Finding 3) and are not listed.
   const restorableTabs = (device?.tabs ?? []).filter((tab) => tab.panes.length > 0)
   const placement = placeLedgerEntries(inventory)
 
@@ -240,11 +240,6 @@ export function RecoveryOfferPanel(): JSX.Element | null {
               </li>
             )),
           ])}
-          {placement.trailing.map((entry) => (
-            <li key={`${entry.provider}:${entry.sessionId}`}>
-              {entry.mode} session — {entry.cwd ?? 'unknown directory'}
-            </li>
-          ))}
         </ul>
         {anyLive && (
           <p data-testid="recovery-live-note" className="mt-3 text-xs text-muted-foreground">

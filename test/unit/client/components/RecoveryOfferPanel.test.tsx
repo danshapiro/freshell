@@ -293,8 +293,8 @@ describe('RecoveryOfferPanel', () => {
     render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
     // The heading counts the joined row exactly once
     expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
-    // Listed under its tab in the same format as device panes, never the flat
-    // "session" line reserved for trailing rows
+    // Listed under its tab in the same format as device panes, never a flat
+    // "{mode} session" line (that rendering died with the trailing tab)
     expect(screen.getByText('work: codex — /x')).toBeInTheDocument()
     expect(screen.queryByText(/codex session — \/x/)).not.toBeInTheDocument()
 

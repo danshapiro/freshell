@@ -764,12 +764,12 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   /**
    * D8 contract pin: a session that was closed before its client's newest
    * retained snapshot evidence (a stale NEVER-OPEN-at-the-evidence-horizon
-   * row) is never offered via the inventory's ledgerOnly bucket. RED by
-   * design until the server-side parent-relative judgment lands
-   * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3) — today's
-   * blanket bucket (Bound + unreferenced + not live) keeps the row and the
-   * offer would render it, to be dumped into a trailing "Recovered sessions"
-   * tab on accept.
+   * row) is never offered via the inventory's ledgerOnly bucket. Pinned RED
+   * against the pre-D8 blanket bucket (Bound + unreferenced + not live),
+   * which kept the row and offered it; the server-side parent-relative
+   * judgment
+   * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3) turned it
+   * GREEN.
    *
    * Producer recipe (validator load-bearing-validator-v1-recipe.md): a
    * freshclaude pane split beside the boot shell pane, closed via the PLAIN
@@ -802,8 +802,9 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     const tabAId = (await harnessA.getActiveTabId())!
 
     // 3. The marker cwd is the offer-list discriminator (the panel renders
-    //    ledgerOnly rows as "{mode} session — {cwd}", never the sessionId):
-    //    create the freshclaude pane with a unique real marker dir as cwd.
+    //    ledgerOnly rows under their tab as "{tabName}: {mode} — {cwd}",
+    //    never the sessionId): create the freshclaude pane with a unique
+    //    real marker dir as cwd.
     const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'junk-freshclaude-'))
     await createFreshclaudePane(pageA, harnessA, markerDir)
 
@@ -934,8 +935,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
       await req.dispose()
     }
 
-    // 12. Offer assertion: the panel renders ledgerOnly rows as
-    //     "{mode} session — {cwd}", so the marker cwd discriminates. The
+    // 12. Offer assertion: the panel's ledgerOnly lines carry the row's cwd
+    //     ("{tabName}: {mode} — {cwd}"), so the marker cwd discriminates. The
     //     re-based union still holds the surviving shell tab, so
     //     recoverable stays true and the offer is REQUIRED.
     const { ctx: ctxB, page: pageB } = await openFreshContextWithOffer(browser, 'junk-exclusion')
@@ -944,8 +945,8 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
 
     // Do NOT click accept on the junk account alone: with the bucket empty of
     // this row there is no junk tab to form (Task 4 separately pins that
-    // surviving rows join their original tab and that the trailing tab only
-    // appears for rows whose tab vanished).
+    // surviving rows join their original tab; rows whose tab vanished are
+    // excluded server-side, so the trailing tab never forms at all).
     await ctxB.close()
     await fs.rm(markerDir, { recursive: true, force: true })
   })
