@@ -51,16 +51,19 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// that re-asserts no browser provenance, so after the parent's evidence
 /// froze such a refresh parked the row past the frozen newest generation and
 /// re-offered a long-closed detached pane forever. `last_attributed_at`
-/// advances only on a meaningful connection-scoped write, at the ASSERTION's
-/// time — carried on the provenance value itself (focused-ep4-r2 Findings
-/// 1+2: captured ONCE at WS message receipt, so slow create/spawn/fork work
-/// can never manufacture a later attribution; a fork-chain `Inherit` child
-/// inherits the parent's time), and, for a marker-stamped resolution, the
-/// consumed marker's `spawned_at` (focused-ep4 — which IS the provenance's
-/// `asserted_at` by construction when the marker came from a provenance
-/// value). A marker-derived row's `created_at` IS the resolution time and a
-/// fork child's is the fork time, so a `created_at` floor would re-launder
-/// either — see pane_ledger.rs.
+/// advances only on a full-triple connection-scoped write, at the
+/// ASSERTION's time — carried on the provenance value itself (focused-ep4-r2
+/// Findings 1+2: captured ONCE at WS message receipt, so slow
+/// create/spawn/fork work can never manufacture a later attribution;
+/// focused-ep4-r3 Findings 1+2: application is also MONOTONE in that time —
+/// an older delayed write never drags it back, and a tab-less re-assert
+/// never refreshes it; a fork-chain `Inherit` child inherits the parent's
+/// time), and, for a marker-stamped resolution, the consumed marker's
+/// `asserted_at` field (focused-ep4; since the focused-ep4-r3 Finding 3
+/// split the field is dedicated — the `spawned_at` fallback covers
+/// intermediate-build markers). A marker-derived row's `created_at` IS the
+/// resolution time and a fork child's is the fork time, so a `created_at`
+/// floor would re-launder either — see pane_ledger.rs.
 ///
 /// Placement clause (delta-r2 Finding 3, narrowed by focused-ep2-r1 Finding
 /// 1): a kept row is offered ONLY when its stamped `tabKey` names an OPEN,

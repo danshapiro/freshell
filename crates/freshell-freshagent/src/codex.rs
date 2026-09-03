@@ -283,7 +283,7 @@ struct CodexSession {
     /// (the in-place [`FreshCodexState::ensure_session_alive`] re-register and
     /// the mint-new [`FreshCodexState::respawn_as_new_thread_after_crash`]
     /// re-key — the same logical session continuing; its row-level twins are
-    /// the conn-less refresh's keep-when-None merge and the mint-new row's
+    /// the conn-less refresh's `Inherit` preserve and the mint-new row's
     //    / `supersedes` inheritance), and read by
     /// [`FreshCodexState::handle_fork`] as precedence source (2) for the child
     /// record + child ledger row (the FORKING connection's stamps win,

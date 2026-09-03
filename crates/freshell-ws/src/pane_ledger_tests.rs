@@ -649,15 +649,20 @@ fn headless_clear_erases_the_attribution_time_too() {
 }
 
 #[test]
-fn hollow_replace_never_advances_the_attribution_time() {
-    // The hollow guard (`is_meaningful`: client+device BOTH present — a
-    // partially-initialized hello cannot compose both). A partial `Replace`
-    // still merges its `Some` fields per keep-when-`None`, but it is NOT a
-    // browser assertion of the identity, so the time never advances.
+fn weak_replace_leaves_the_attribution_fact_untouched() {
+    // Focused-ep4-r3 Finding 2 (renamed from
+    // `hollow_replace_never_advances_the_attribution_time` — the flip the
+    // finding mandates): the attribution fact (stamps+time) is ATOMIC and
+    // moves only on a FULL client+device+tab triple. A partial `Replace` —
+    // a half-initialized hello, a legacy client that cannot compose tabId —
+    // no longer merges its `Some` fields piecemeal: that produced
+    // client/device/tab combinations NO single browser assertion ever made,
+    // and (under the pre-fix predicate) refreshed the attribution time
+    // against the row's kept, stale tab.
     let root = temp_root("attr-time-hollow");
     let ledger = PaneLedger::new(Some(root.clone()));
-    // Arm 1: a partial Replace onto a FRESH row leaves it timeless (the row
-    // is unattributed downstream anyway — only the client field landed).
+    // Arm 1: a partial Replace onto a FRESH row leaves it FULLY unattributed
+    // (stamps+time untouched — there is no attribution to advance).
     ledger
         .record_binding(&write_provenance(
             "codex",
@@ -670,10 +675,12 @@ fn hollow_replace_never_advances_the_attribution_time() {
         ))
         .unwrap();
     let row = ledger.load_binding("codex", "th-partial").unwrap();
-    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(row.client_instance_id, None);
     assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
     assert_eq!(row.last_attributed_at, None);
-    // Arm 2: a partial Replace onto an attributed row PRESERVES the time.
+    // Arm 2: a partial Replace onto an attributed row PRESERVES the whole
+    // attribution — stamps AND time.
     ledger
         .record_binding(&write_provenance(
             "codex",
@@ -697,7 +704,13 @@ fn hollow_replace_never_advances_the_attribution_time() {
         ))
         .unwrap();
     let row = ledger.load_binding("codex", "th-2").unwrap();
-    assert_eq!(row.client_instance_id.as_deref(), Some("client-rotated"));
+    assert_eq!(
+        row.client_instance_id.as_deref(),
+        Some("client-1"),
+        "the weaker write's client field does NOT piecemeal-merge"
+    );
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
     assert_eq!(
         row.last_attributed_at,
         Some(1_000),
@@ -707,18 +720,23 @@ fn hollow_replace_never_advances_the_attribution_time() {
 }
 
 #[test]
-fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn() {
+fn marker_stamped_resolution_stamps_the_attribution_time_from_the_markers_assertion() {
     // Delta-r3's marker provenance is spawn-time CONNECTION provenance, and
     // focused-ep4 Finding: the attribution TIME must be the marker's
-    // `spawned_at`, NOT the resolve write's `now` — the browser asserted the
-    // pane when it SPAWNED it; the conn-less identity resolution merely lands
-    // the marker's stamps later (arbitrarily later for a codex/opencode
+    // ASSERTION time — carried on the marker's OWN `asserted_at` field since
+    // the focused-ep4-r3 Finding 3 split — NOT the resolve write's `now` and
+    // not the marker's write-time `spawned_at`: the browser asserted the pane
+    // when it SPAWNED it, the marker may be written long after (a delayed
+    // gated create), and the conn-less identity resolution merely lands the
+    // marker's stamps later still (arbitrarily later for a codex/opencode
     // locator resolution — possibly after the pane already closed and the
     // parent's evidence froze, where resolve-time attribution would re-launder
     // the row into the D8 offer). A partially-stamped marker is hollow (never
     // an attribution).
     let root = temp_root("attr-time-marker");
     let ledger = PaneLedger::new(Some(root.clone()));
+    // Distinct creation/assertion times (the Finding 3 split): asserted at
+    // 1_000, the marker itself written at 1_500 (a delayed gated create).
     ledger
         .record_pending(
             "t1",
@@ -730,9 +748,18 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn()
                 tab_key: Some("device-1:tab-1"),
                 asserted_at: 1_000,
             },
-            1_000,
+            1_500,
         )
         .unwrap();
+    let marker = ledger.pending_for_terminal("t1").expect("stamped marker");
+    assert_eq!(
+        marker.spawned_at, 1_500,
+        "the marker's creation time is its own clock (retention)"
+    );
+    assert_eq!(
+        marker.asserted_at, 1_000,
+        "the assertion rides its own field"
+    );
     ledger
         .resolve_pending(&write("codex", "th-1", "t1", 2_000))
         .unwrap();
@@ -741,8 +768,8 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn()
     assert_eq!(
         row.last_attributed_at,
         Some(1_000),
-        "the marker-derived application attributes at the marker's spawn, \
-         not the resolve"
+        "the marker-derived application attributes at the marker's ASSERTION, \
+         neither the marker's write nor the resolve"
     );
     assert_eq!(
         row.updated_at, 2_000,
@@ -773,6 +800,50 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn()
         .unwrap();
     let row = ledger.load_binding("codex", "th-2").expect("binding row");
     assert_eq!(row.last_attributed_at, None, "a partial marker is hollow");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolution_of_a_legacy_marker_falls_back_to_spawned_at() {
+    // Focused-ep4-r3 Finding 3 (legacy fallback): a marker persisted by an
+    // INTERMEDIATE build (ep4-r2: for a STAMPED marker `spawned_at` WAS the
+    // provenance's `asserted_at` — the split did not exist yet, so no
+    // `assertedAt` field) deserializes with `asserted_at == 0`, and the
+    // resolution sources the attribution time from `spawned_at` — exactly the
+    // intermediate build's semantics, so its evidence survives the upgrade.
+    let root = temp_root("marker-legacy-fallback");
+    // Hand-craft the intermediate-build marker JSON ON DISK (the current code
+    // would now also emit an `assertedAt` field), then construct the ledger
+    // over it — the post-upgrade boot shape.
+    let pending_dir = root.join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+    std::fs::write(
+        pending_dir.join("t-legacy.json"),
+        r#"{"ledgerVersion":1,"terminalId":"t-legacy","mode":"codex","cwd":"/tmp/p","spawnedAt":1000,"clientInstanceId":"client-1","deviceId":"device-1","tabKey":"device-1:tab-1"}"#,
+    )
+    .unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let marker = ledger
+        .pending_for_terminal("t-legacy")
+        .expect("the legacy marker parses");
+    assert_eq!(marker.spawned_at, 1_000);
+    assert_eq!(
+        marker.asserted_at, 0,
+        "no field on disk ⇒ the 0 sentinel ⇒ the fallback is armed"
+    );
+    ledger
+        .resolve_pending(&write("codex", "th-legacy", "t-legacy", 2_000))
+        .unwrap();
+    let row = ledger
+        .load_binding("codex", "th-legacy")
+        .expect("binding row");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the fallback is `spawned_at` — which the intermediate build set to \
+         the assertion time, so its evidence resolves unchanged"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -841,12 +912,14 @@ fn fresh_agent_late_binding_write_records_the_provenances_assertion_time() {
 }
 
 #[test]
-fn stamped_markers_spawn_time_is_the_provenances_assertion_time() {
-    // Focused-ep4-r2 Findings 1+2 (canonical marker flow): when a marker is
-    // created from a provenance value, its `spawned_at` IS the value's
-    // `asserted_at` — `record_pending` maps it — so the resolution-side
-    // `spawned_at` attribution (ep4-r1) is the same single flow. A headless
-    // (unstamped) marker has no assertion: `spawned_at` stays the write time.
+fn marker_spawn_time_is_the_write_time_and_assertion_rides_its_own_field() {
+    // Focused-ep4-r3 Finding 3 (renamed from
+    // `stamped_markers_spawn_time_is_the_provenances_assertion_time` — the
+    // split the finding mandates): `spawned_at` is the marker's ACTUAL
+    // write/creation time — retention (the 30-day TTL, the 7-day orphan rule)
+    // keys on it, so a delayed gated create can never arrive pre-aged; the
+    // provenance value's assertion time rides the marker's OWN `asserted_at`
+    // field, which a later resolution (not the GC) consumes.
     let root = temp_root("marker-spawn-is-asserted");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -865,8 +938,12 @@ fn stamped_markers_spawn_time_is_the_provenances_assertion_time() {
         .unwrap();
     let marker = ledger.pending_for_terminal("t1").expect("stamped marker");
     assert_eq!(
-        marker.spawned_at, 900,
-        "a provenance-created marker's spawn time is the assertion time"
+        marker.spawned_at, 5_000,
+        "spawned_at is the marker's write/creation time (the retention clock)"
+    );
+    assert_eq!(
+        marker.asserted_at, 900,
+        "the provenance's assertion time rides its OWN field"
     );
     ledger
         .record_pending("t2", "codex", None, ProvenanceStamps::default(), 7_000)
@@ -875,6 +952,10 @@ fn stamped_markers_spawn_time_is_the_provenances_assertion_time() {
     assert_eq!(
         marker.spawned_at, 7_000,
         "an unstamped marker keeps its write-time spawn record"
+    );
+    assert_eq!(
+        marker.asserted_at, 0,
+        "a headless marker carries no assertion (the `0` sentinel)"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -952,6 +1033,413 @@ fn fresh_agent_supersession_inherits_the_parents_assertion_time() {
     assert_eq!(
         child.created_at, 5_000,
         "the child row is still BORN at fork time (row-keeping metadata only)"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ── Focused-ep4-r3 Findings 1+2: attribution is ONE atomic, MONOTONE fact ────
+// The stamps+time move TOGETHER, and only from a FULL client+device+tab
+// triple whose assertion time is >= the row's current attribution time. An
+// older delayed write (assertion captured at message receipt, landing after
+// gated/async create work) must never drag the attribution back — and a
+// weaker assertion (any stamp half missing — e.g. a legacy client that
+// cannot compose tabId) must never touch it at all.
+
+#[test]
+fn out_of_order_meaningful_replace_keeps_the_newer_attribution() {
+    // Focused-ep4-r3 Finding 1 (terminal body): the row was attributed at T2
+    // by the newer create (tab-9), then the T1<T2 delayed write lands at
+    // 6_000 — the assertion was captured at ITS message receipt, before the
+    // gated/async create work, so it is simply OLDER. The stamps+time stay at
+    // T2; the write's OTHER fields still land (it is a real write — the pane
+    // moved terminals, the row freshened).
+    let root = temp_root("attr-mono-out-of-order");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t1",
+            5_000,
+            Some("client-2"),
+            Some("device-1"),
+            Some("device-1:tab-9"),
+            5_000,
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t2",
+            6_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(
+        row.client_instance_id.as_deref(),
+        Some("client-2"),
+        "an older delayed assertion never re-stamps the client"
+    );
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(
+        row.tab_key.as_deref(),
+        Some("device-1:tab-9"),
+        "an older delayed assertion never re-places the pane into its own tab"
+    );
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "the attribution time is monotonic in asserted_at — never dragged back"
+    );
+    assert_eq!(
+        row.live_terminal_id.as_deref(),
+        Some("t2"),
+        "the write's other fields still land (row-keeping is not attribution)"
+    );
+    assert_eq!(row.updated_at, 6_000, "maintenance freshness still lands");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn equal_time_meaningful_replace_replaces_in_arrival_order() {
+    // The exact-tie rule (`>=`): an arriving full-triple assertion AT the
+    // row's current time still replaces — deterministic, and the only rule a
+    // same-instant re-assertion (re-attach at the receipt moment the row
+    // already carries) can satisfy without a tiebreak lottery.
+    let root = temp_root("attr-mono-tie");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t1",
+            5_000,
+            Some("client-2"),
+            Some("device-1"),
+            Some("device-1:tab-9"),
+            5_000,
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t2",
+            6_000,
+            Some("client-3"),
+            Some("device-1"),
+            Some("device-1:tab-3"),
+            5_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-3"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-3"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "exact tie: the arriving assertion wins, the time holds"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn later_meaningful_replace_advances_normally() {
+    // The keep-side twin: a genuinely NEWER full-triple assertion advances
+    // the attribution exactly as before (T3 > T2).
+    let root = temp_root("attr-mono-later");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t1",
+            5_000,
+            Some("client-2"),
+            Some("device-1"),
+            Some("device-1:tab-9"),
+            5_000,
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t2",
+            8_000,
+            Some("client-3"),
+            Some("device-1"),
+            Some("device-1:tab-3"),
+            7_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-3"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-3"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(7_000),
+        "a newer assertion advances"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_out_of_order_replace_keeps_the_newer_attribution() {
+    // Focused-ep4-r3 Finding 1, fresh-agent mirror (`:837`): the fresh-agent
+    // body's meaningful Replace obeys the same monotonic application — the
+    // whole attribution fact (stamps+time) stays at the newer assertion while
+    // the write's settings/row-keeping fields still land.
+    let root = temp_root("fa-attr-mono-out-of-order");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "opencode",
+            "ses_1",
+            5_000,
+            Some("client-2"),
+            Some("device-1"),
+            Some("device-1:tab-9"),
+            5_000,
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            model: Some("m-late"),
+            ..fa_write_provenance_at(
+                "opencode",
+                "ses_1",
+                6_000,
+                Some("client-1"),
+                Some("device-1"),
+                Some("device-1:tab-1"),
+                1_000,
+            )
+        })
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-2"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-9"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "the fresh-agent body's attribution is monotonic in asserted_at too"
+    );
+    assert_eq!(
+        row.model.as_deref(),
+        Some("m-late"),
+        "the settings snapshot still lands — only the attribution is gated"
+    );
+    assert_eq!(row.updated_at, 6_000);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn legacy_reassert_missing_tab_never_touches_the_attribution() {
+    // Focused-ep4-r3 Finding 2 (terminal body): a LEGACY client that cannot
+    // compose a tabId re-asserts client+device ONLY — under the pre-fix
+    // predicate (client+device sufficed) that REFRESHED the attribution time
+    // while the per-field replace kept the row's old tabKey, laundering
+    // freshness onto a stale tab. Attribution advance now requires the FULL
+    // triple: the weaker re-assertion updates the row's other fields but
+    // leaves stamps+time untouched.
+    let root = temp_root("attr-triple-legacy");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    // The legacy re-assert: no tabId on the wire (tab_key None), newer write.
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t2",
+            5_000,
+            Some("client-legacy"),
+            Some("device-1"),
+            None,
+            5_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(
+        row.client_instance_id.as_deref(),
+        Some("client-1"),
+        "a weaker re-assertion does not re-stamp ANY field — the attribution \
+         fact is atomic"
+    );
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the attribution time is NOT refreshed by a tab-less legacy re-assert"
+    );
+    assert_eq!(
+        row.live_terminal_id.as_deref(),
+        Some("t2"),
+        "the row's other fields still update"
+    );
+    assert_eq!(row.updated_at, 5_000);
+    // The "full triple ⇒ advances" half: a modern re-assertion (tab present)
+    // IS a real attribution.
+    ledger
+        .record_binding(&write_provenance_at(
+            "claude",
+            "sess-1",
+            "t3",
+            6_000,
+            Some("client-modern"),
+            Some("device-1"),
+            Some("device-1:tab-5"),
+            6_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-modern"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-5"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(6_000),
+        "a full-triple re-assert advances the attribution"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_legacy_reassert_missing_tab_never_touches_the_attribution() {
+    // Focused-ep4-r3 Finding 2, fresh-agent mirror: same triple rule in the
+    // fresh-agent body — a tab-less re-assert updates the settings and the
+    // row-keeping clocks but leaves stamps+time untouched.
+    let root = temp_root("fa-attr-triple-legacy");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "codex",
+            "ses_1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            model: Some("m-legacy"),
+            ..fa_write_provenance_at(
+                "codex",
+                "ses_1",
+                5_000,
+                Some("client-legacy"),
+                Some("device-1"),
+                None,
+                5_000,
+            )
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "ses_1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the fresh-agent body's time is untouched by a tab-less re-assert"
+    );
+    assert_eq!(
+        row.model.as_deref(),
+        Some("m-legacy"),
+        "settings still land"
+    );
+    assert_eq!(row.updated_at, 5_000);
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "codex",
+            "ses_1",
+            6_000,
+            Some("client-modern"),
+            Some("device-1"),
+            Some("device-1:tab-5"),
+            6_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "ses_1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-modern"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(6_000),
+        "full triple ⇒ advances"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn marker_sourced_resolution_never_drags_a_newer_attribution_back() {
+    // Focused-ep4-r3 Finding 1, marker arm — CLOSES the ep4-r2 documented
+    // residual ("a marker-sourced SET still overwrites a later genuine
+    // attribution"): an existing row attributed at 5_000 (a live connection's
+    // newer re-assert) is resolved onto by a stamped marker whose pane was
+    // asserted at 1_000. The resolution's derived stamps are the OLDER
+    // assertion, so the row keeps its 5_000 attribution.
+    let root = temp_root("attr-mono-marker");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "codex",
+            "th-1",
+            "t-live",
+            5_000,
+            Some("client-2"),
+            Some("device-1"),
+            Some("device-1:tab-9"),
+            5_000,
+        ))
+        .unwrap();
+    ledger
+        .record_pending(
+            "t-marker",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-1"),
+                device_id: Some("device-1"),
+                tab_key: Some("device-1:tab-1"),
+                asserted_at: 1_000,
+            },
+            1_000,
+        )
+        .unwrap();
+    // The conn-less resolution lane's exact write shape (`Inherit`).
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t-marker", 6_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-2"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-9"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "the marker carries the OLDER assertion — the row's newer attribution \
+         survives the resolution"
+    );
+    assert!(
+        ledger.list_pending_raw().is_empty(),
+        "the marker is still consumed (resolution itself is unchanged)"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1478,15 +1966,16 @@ fn resolve_pending_prefers_the_resolve_calls_own_provenance_over_the_markers() {
 }
 
 #[test]
-fn resolve_pending_merges_marker_stamps_fieldwise_over_the_existing_row() {
-    // Precedence, arm 2 (per-field): the marker is just another provenance
-    // SOURCE whose absent fields assert nothing (the `Replace`
-    // keep-when-`None` merge, delta-r2 deviation 2). A partially-stamped
-    // marker — e.g. a hello that carried `clientInstanceId` but no
-    // `deviceId`, so `tabKey` never composed — stamps only its own `Some`
-    // fields; each `None` field falls through to the EXISTING row's value
-    // (a session id previously bound from another pane can already carry
-    // stamps when a fresh pane resolves to it).
+fn resolve_pending_from_a_partial_marker_leaves_the_attribution_untouched() {
+    // Precedence, arm 2 (focused-ep4-r3 Finding 2 flip, renamed from
+    // `resolve_pending_merges_marker_stamps_fieldwise_over_the_existing_row`):
+    // a partially-stamped marker — e.g. a hello that carried
+    // `clientInstanceId` but no `deviceId`, so `tabKey` never composed —
+    // derives an INCOMPLETE triple, and the attribution fact is atomic: the
+    // resolution leaves the EXISTING row's stamps+time untouched instead of
+    // mixing marker and row stamps into a combination no single browser
+    // assertion ever made (a session id previously bound from another pane
+    // can already carry stamps when a fresh pane resolves to it).
     let root = temp_root("resolve-fieldwise");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -1520,18 +2009,15 @@ fn resolve_pending_merges_marker_stamps_fieldwise_over_the_existing_row() {
     let row = ledger.load_binding("codex", "th-1").expect("binding row");
     assert_eq!(
         row.client_instance_id.as_deref(),
-        Some("client-new"),
-        "the marker's `Some` field attributes the row"
+        Some("client-old"),
+        "a partial marker does not piecemeal-stamp the row"
     );
+    assert_eq!(row.device_id.as_deref(), Some("device-old"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-old:tab-old"));
     assert_eq!(
-        row.device_id.as_deref(),
-        Some("device-old"),
-        "a marker `None` field keeps the existing row's value"
-    );
-    assert_eq!(
-        row.tab_key.as_deref(),
-        Some("device-old:tab-old"),
-        "tab_key likewise inherited (no half-known tab identity invented)"
+        row.last_attributed_at,
+        Some(500),
+        "the attribution time is untouched too"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1672,11 +2158,17 @@ fn resolve_pending_clear_wins_over_a_stamped_marker() {
 }
 
 #[test]
-fn stamped_marker_retention_is_unchanged() {
+fn stamped_marker_retention_keys_on_creation_time_never_assertion_time() {
     // The stamps are payload, not lifetime: retention reads only
-    // `spawned_at`. A stamped marker survives a GC pass while young (stamps
-    // intact) and is swept after PENDING_MARKER_TTL_MS, exactly like an
-    // unstamped one.
+    // `spawned_at` — the marker's ACTUAL creation time (focused-ep4-r3
+    // Finding 3 renamed this test from `stamped_marker_retention_is_
+    // unchanged`; the flip is that `spawned_at` no longer carries the
+    // assertion). The creation/assertion times are DELIBERATELY far apart so
+    // the two roles cannot be conflated: a marker born NOW whose browser
+    // assertion is 30+ days stale (a long-gated create's parked provenance,
+    // finally spawned) is RETAINED (creation is young — it did not arrive
+    // pre-aged), while a marker CREATED past the TTL is swept whatever its
+    // assertion says.
     let root = temp_root("stamped-marker-ttl");
     let ledger = PaneLedger::new(Some(root.clone()));
     let now = 2 * PENDING_MARKER_TTL_MS;
@@ -1691,15 +2183,20 @@ fn stamped_marker_retention_is_unchanged() {
             "young-t",
             "codex",
             Some("/tmp/p"),
-            stamps_at(now - 60_000),
-            now - 60_000,
+            stamps_at(1_000), // a 30+ days stale ASSERTION…
+            now - 60_000,     // …but the marker itself was CREATED a minute ago
         )
         .unwrap();
     ledger
         .record_pending("aged-t", "codex", Some("/tmp/p"), stamps_at(1_000), 1_000)
         .unwrap();
     let report = ledger.gc(now, &never_absent, None);
-    assert_eq!(report.stale_markers_removed, vec!["aged-t".to_string()]);
+    assert_eq!(
+        report.stale_markers_removed,
+        vec!["aged-t".to_string()],
+        "only the marker whose CREATION is past the TTL is swept — the stale \
+         assertion on a just-created marker must not pre-age it"
+    );
     let young = ledger
         .pending_for_terminal("young-t")
         .expect("the young stamped marker is retained");
@@ -1720,6 +2217,21 @@ fn old_markers_without_provenance_fields_still_deserialize() {
     assert_eq!(marker.client_instance_id, None);
     assert_eq!(marker.device_id, None);
     assert_eq!(marker.tab_key, None);
+    assert_eq!(
+        marker.asserted_at, 0,
+        "focused-ep4-r3 Finding 3: the split field is likewise additive — no \
+         assertion recorded"
+    );
+    // The INTERMEDIATE (ep4-r2) shape: stamps present, `spawned_at` carrying
+    // the assertion time, and no `assertedAt` — the split did not exist yet.
+    // It parses with `asserted_at == 0`, which arms the resolution's
+    // `spawned_at` fallback (`resolution_of_a_legacy_marker_falls_back_to_
+    // spawned_at` pins the resolution side, end to end).
+    let json = r#"{"ledgerVersion":1,"terminalId":"t2","mode":"codex","spawnedAt":1000,"clientInstanceId":"c","deviceId":"d","tabKey":"d:t"}"#;
+    let marker: PendingMarker = serde_json::from_str(json).expect("intermediate marker must parse");
+    assert_eq!(marker.spawned_at, 1_000);
+    assert_eq!(marker.asserted_at, 0);
+    assert_eq!(marker.tab_key.as_deref(), Some("d:t"));
 }
 
 #[test]

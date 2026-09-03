@@ -1581,6 +1581,98 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
     );
 }
 
+// ── Focused-ep4-r3 Finding 1: out-of-order assertion never drags attribution ──
+// Assertion time is captured at MESSAGE RECEIPT, before gated/async
+// create/fork work — an older delayed write can land AFTER a newer assertion
+// for the same session. The ledger applies provenance monotonically in
+// `asserted_at`, so the row keeps the NEWER stamps+time and the pane is
+// neither omitted (dragged out of its grace window) nor misplaced (dragged
+// into the older assertion's tab).
+
+#[test]
+fn out_of_order_delayed_create_keeps_the_newer_tab_and_time() {
+    // Real-write fixture (both writes are the WS connection-scoped lane's
+    // exact shape): the row is attributed at 999_000 to tab t2 by the newer
+    // create; a DELAYED write asserted 900_000 (tab t1 — its provenance was
+    // captured at its own earlier receipt, then sat in the gated-restore
+    // queue) lands at 995_000.
+    let row = ledger_row_after_writes(&[
+        (conn_scoped("c1", "d1", "d1:t2", 999_000), 999_000),
+        (conn_scoped("c1", "d1", "d1:t1", 900_000), 995_000),
+    ]);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(999_000),
+        "the older delayed assertion never drags the attribution back"
+    );
+    assert_eq!(row.tab_key.as_deref(), Some("d1:t2"));
+    assert_eq!(row.updated_at, 995_000, "the write itself still landed");
+
+    // OMISSION arm: only t2 survives in the restored union — the pane is
+    // offered into t2 (pre-fix: attribution dragged to (t1, 900_000) ⇒ out of
+    // grace AND off-tab ⇒ the pane vanished from the offer).
+    let d_only_t2 = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t2",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let out = build_inventory(
+        vec![d_only_t2],
+        vec![row.clone()],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    let offered = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(
+        offered.len(),
+        1,
+        "999_000 + 7_000 >= 1_000_000: the pane stays offered under its \
+         NEWER attribution — the out-of-order write cannot drag it out of \
+         the grace window"
+    );
+    assert_eq!(offered[0]["tabKey"], "d1:t2");
+
+    // MISPLACEMENT arm: BOTH tabs survive in the union, and the delayed
+    // assertion sits inside grace — the offered row still names t2, never
+    // dragged back into the older assertion's tab t1 (pre-fix: tabKey t1).
+    let row_in_grace = ledger_row_after_writes(&[
+        (conn_scoped("c1", "d1", "d1:t2", 999_000), 999_000),
+        (conn_scoped("c1", "d1", "d1:t1", 998_500), 999_500),
+    ]);
+    assert_eq!(row_in_grace.tab_key.as_deref(), Some("d1:t2"));
+    let d_both = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: json!({
+            "deviceId": "d1", "deviceLabel": "label-d1", "capturedAt": 1_000_000,
+            "records": [
+                { "tabKey": "d1:t1", "tabId": "t1", "tabName": "old", "revision": 1,
+                  "updatedAt": 1_000_000, "paneCount": 1,
+                  "panes": [{ "paneId": "px", "kind": "terminal", "payload": {"mode": "shell"} }] },
+                { "tabKey": "d1:t2", "tabId": "t2", "tabName": "work", "revision": 1,
+                  "updatedAt": 1_000_000, "paneCount": 1,
+                  "panes": [{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }] },
+            ]
+        }),
+    };
+    let out = build_inventory(
+        vec![d_both],
+        vec![row_in_grace],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    let offered = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(
+        offered[0]["tabKey"], "d1:t2",
+        "the pane joins the tab its NEWER assertion named — never dragged \
+         back into the older assertion's tab"
+    );
+}
+
 // ── Focused-ep3: bind-by-correlation (late-bound rows vs ref-less panes) ─────
 // A codex/opencode CLI pane snapshotted BEFORE its provider identity resolved
 // carries paneId/createRequestId/liveTerminal.terminalId but NO sessionRef

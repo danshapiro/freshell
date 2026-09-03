@@ -44,7 +44,10 @@ pub struct FreshAgentSettings {
 /// unchanged). No post-spawn write, deferred SDK init, or fork completion
 /// can manufacture a later attribution time. A `default()`/hollow value
 /// carries `0` ("no assertion exists"); the ledger consumes the time only
-/// for [`Self::is_meaningful`] writes.
+/// when applying a new attribution — since focused-ep4-r3 Findings 1+2 that
+/// means a FULL-triple `Replace` whose `asserted_at` is >= the row's, which
+/// [`Self::is_meaningful`] alone does not decide (it is the parking-level
+/// hollow guard, not the attribution-advance predicate — see its doc).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindProvenance {
     pub client_instance_id: Option<String>,
@@ -88,8 +91,11 @@ impl BindProvenance {
     /// behave like `None` on EVERY override/refresh decision (re-park,
     /// refresh-write gate, fork precedence). It is never a usable
     /// attribution, and letting it override would replace parked/row truth
-    /// with nothing. `tab_key` is deliberately not required — the judgment
-    /// uses it for placement only, never for the offer keep.
+    /// with nothing. `tab_key` is deliberately not required HERE — this is
+    /// the parking-level hollow guard, not the ledger's attribution-advance
+    /// predicate (since focused-ep4-r3 Finding 2 that one requires the FULL
+    /// triple — client+device+tab — plus a monotonicity guard; see
+    /// `freshell_ws::pane_ledger::advances_attribution`).
     pub fn is_meaningful(&self) -> bool {
         self.client_instance_id.is_some() && self.device_id.is_some()
     }
@@ -112,11 +118,13 @@ pub enum ProvenanceUpdate {
     Inherit,
     /// Connection-supplied stamps (whole `BindProvenance` values composed
     /// from the connection's hello identity + the message's `tabId`, or
-    /// resolved fork provenance): asserted onto the row — each `Some` field
-    /// replaces, a `None` field keeps the inherited value. The value's
-    /// `asserted_at` is the browser's ASSERTION time (captured at message
-    /// receipt): a MEANINGFUL application stamps it as the row's attribution
-    /// time — never the (possibly much later) write's own clock.
+    /// resolved fork provenance): asserted onto the row ATOMICALLY — since
+    /// focused-ep4-r3 Findings 1+2 the ledger applies stamps AND the
+    /// attribution time as ONE fact, and only from a full
+    /// client+device+tab triple whose `asserted_at` is >= the row's current
+    /// attribution time (the browser's ASSERTION time, captured at message
+    /// receipt — never the possibly much later write's own clock); a weaker
+    /// or older `Replace` leaves the row's attribution untouched.
     Replace(BindProvenance),
     /// An explicitly HEADLESS writer (the REST/MCP lineage binder,
     /// `lib.rs`'s materialization write): all stamps are CLEARED — the
@@ -151,7 +159,8 @@ pub struct FreshAgentBindingUpsert {
     /// (codex crash-respawn passes the old thread id; everyone else None).
     pub supersedes: Option<String>,
     /// D8 provenance write policy (see [`ProvenanceUpdate`]; the ledger's
-    /// keep-when-`None`/clear merge lives in `freshell-ws`'s pane ledger).
+    /// atomic apply/preserve/clear merge lives in `freshell-ws`'s pane
+    /// ledger).
     pub provenance: ProvenanceUpdate,
     pub settings: FreshAgentSettings,
 }
@@ -197,7 +206,7 @@ pub trait PaneIdentitySink: Send + Sync {
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool;
     /// D8 (focused-ep1-r4 Finding 2 — cold-attach seeding from the durable
     /// row): the binding row's provenance stamps (clientInstanceId / deviceId
-    /// / tabKey) as last asserted, keep-when-None merged. A cold CONN-LESS
+    /// / tabKey) as last asserted. A cold CONN-LESS
     /// (re)construction reads this to park the row's stamps on the runtime
     /// session when no CURRENT connection supplied any — the row is the
     /// authoritative record of "where this session last lived", and the fork
@@ -270,8 +279,8 @@ pub(crate) struct FakeIdentitySink {
     /// bindings never enter (and a blank rewrite removes the key, matching
     /// the ledger's full-snapshot replace).
     pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
-    /// Focused-ep1-r4 Finding 2: the row's CURRENT provenance stamps, merged
-    /// per-field keep-when-`None` on every `record_binding` — the ledger
+    /// Focused-ep1-r4 Finding 2: the row's CURRENT provenance stamps,
+    /// atomically applied/preserved on every `record_binding` — the ledger
     /// merge's (`pane_ledger.rs`) in-memory twin, backing `load_provenance`.
     /// Same-key only (the real ledger additionally inherits from a superseded
     /// PARENT row; no fake consumer needs that — the providers' fork-child
@@ -398,11 +407,14 @@ impl PaneIdentitySink for FakeIdentitySink {
                 self.recorded.lock().unwrap().remove(&key);
                 self.settings.lock().unwrap().remove(&key);
             }
-            // Focused-ep1-r4 Finding 2 + delta-r2 Finding 2: track the row's
-            // CURRENT provenance stamps with the ledger's merge policy —
-            // `Replace` fields replace independently (a `None` field keeps
-            // the prior value), `Inherit` asserts nothing (every stamp
-            // survives), `Clear` (explicitly headless lineage) erases them.
+            // Focused-ep1-r4 Finding 2 + delta-r2 Finding 2 + focused-ep4-r3
+            // Findings 1+2: track the row's CURRENT provenance stamps with the
+            // ledger's merge policy — the attribution fact moves ATOMICALLY:
+            // `Replace` applies stamps AND time together, and only from a
+            // FULL client+device+tab triple whose assertion time is >= the
+            // tracked one (the ledger's `advances_attribution` + monotonicity
+            // guard, mirrored); `Inherit` asserts nothing (every stamp
+            // survives); `Clear` (explicitly headless lineage) erases them.
             match &upsert.provenance {
                 ProvenanceUpdate::Inherit => {}
                 ProvenanceUpdate::Replace(stamps) => {
@@ -411,21 +423,20 @@ impl PaneIdentitySink for FakeIdentitySink {
                     let entry = provenance
                         .entry((upsert.provider.clone(), upsert.session_id.clone()))
                         .or_default();
-                    if stamps.client_instance_id.is_some() {
+                    // The ledger's rule (focused-ep4-r3): a weaker (partial/
+                    // hollow) `Replace` touches NOTHING — no piecemeal field
+                    // merge — and an OLDER full-triple assertion never drags
+                    // the stamps+time back. A fresh entry (`0`) is always
+                    // superseded, matching the ledger's absent-prior-time
+                    // arm; the focused-ep4-r2 rule (the assertion time rides
+                    // the value, never a write's own clock) is unchanged.
+                    let complete = stamps.client_instance_id.is_some()
+                        && stamps.device_id.is_some()
+                        && stamps.tab_key.is_some();
+                    if complete && stamps.asserted_at >= entry.asserted_at {
                         entry.client_instance_id = stamps.client_instance_id.clone();
-                    }
-                    if stamps.device_id.is_some() {
                         entry.device_id = stamps.device_id.clone();
-                    }
-                    if stamps.tab_key.is_some() {
                         entry.tab_key = stamps.tab_key.clone();
-                    }
-                    // Focused-ep4-r2 Findings 1+2: the assertion time rides the
-                    // value — a MEANINGFUL application advances it to the
-                    // stamps' own `asserted_at` (the ledger's
-                    // `advances_attribution` predicate, mirrored); partial/
-                    // hollow writes preserve it.
-                    if stamps.is_meaningful() {
                         entry.asserted_at = stamps.asserted_at;
                     }
                 }
@@ -758,15 +769,19 @@ mod tests {
         assert!(fake.load_rollback("opencode", "nope").is_none());
     }
 
-    /// Focused-ep1-r4 Finding 2: `load_provenance` serves the row's CURRENT
-    /// stamps with the ledger's per-field keep-when-`None` merge — a stamped
-    /// LINEAGE-ONLY row (settings blank) answers just like a settings-bearing
-    /// one (the read is settings-independent), a later all-`None` conn-less
-    /// write keeps the stamps, a genuinely unattributed row answers `None`
-    /// (never `Some(default)` — that would park an invention), and a missing
-    /// row answers `None`.
+    /// Focused-ep1-r4 Finding 2 + focused-ep4-r3 Findings 1+2:
+    /// `load_provenance` serves the row's CURRENT stamps with the ledger's
+    /// merge rule — a stamped LINEAGE-ONLY row (settings blank) answers just
+    /// like a settings-bearing one (the read is settings-independent), a
+    /// later conn-less write keeps the stamps, a genuinely unattributed row
+    /// answers `None` (never `Some(default)` — that would park an invention),
+    /// and a missing row answers `None`. The focused-ep4-r3 flip: the
+    /// attribution fact moves ATOMICALLY and monotonically — a partial
+    /// `Replace` no longer merges its `Some` fields piecemeal (the ledger's
+    /// rule, mirrored), and an OLDER full-triple assertion never drags the
+    /// stamps+time back.
     #[tokio::test]
-    async fn fake_sink_load_provenance_mirrors_the_keep_when_none_merge() {
+    async fn fake_sink_load_provenance_mirrors_the_atomic_monotone_attribution_rule() {
         let fake = Arc::new(FakeIdentitySink::default());
         assert!(
             fake.load_provenance("opencode", "ses_none").is_none(),
@@ -803,7 +818,7 @@ mod tests {
         );
 
         // A later conn-less write (all-None stamps) keeps them — and a partial
-        // stamp replaces only its own field.
+        // stamp touches NOTHING (the attribution fact is atomic).
         fake.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -833,14 +848,62 @@ mod tests {
         .expect("partial refresh ok");
         let p = fake
             .load_provenance("opencode", "ses_prov")
-            .expect("keep-when-None preserved the stamps");
-        assert_eq!(p.client_instance_id.as_deref(), Some("client-2"));
+            .expect("the atomic rule preserved the stamps");
+        assert_eq!(
+            p.client_instance_id.as_deref(),
+            Some("client-1"),
+            "a weaker (partial) Replace no longer piecemeal-merges its field"
+        );
         assert_eq!(p.device_id.as_deref(), Some("device-1"));
         assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
         assert_eq!(
             p.asserted_at, 111,
             "a hollow/partial Replace preserves the assertion time (it is not an attribution)"
         );
+
+        // The monotonic rule (the ledger's `asserted_at >= existing` gate,
+        // mirrored): an OLDER full-triple assertion never drags the
+        // attribution back; an equal-or-newer one replaces it.
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Replace(BindProvenance {
+                client_instance_id: Some("client-3".into()),
+                device_id: Some("device-3".into()),
+                tab_key: Some("device-3:tab-3".into()),
+                asserted_at: 50,
+            }),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("out-of-order write ok");
+        let p = fake.load_provenance("opencode", "ses_prov").expect("row");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
+        assert_eq!(p.asserted_at, 111, "the older assertion never applies");
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Replace(BindProvenance {
+                client_instance_id: Some("client-4".into()),
+                device_id: Some("device-4".into()),
+                tab_key: Some("device-4:tab-4".into()),
+                asserted_at: 222,
+            }),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("newer write ok");
+        let p = fake.load_provenance("opencode", "ses_prov").expect("row");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-4"));
+        assert_eq!(p.asserted_at, 222, "the newer assertion advances");
 
         // A genuinely unattributed row answers None — never Some(default).
         fake.record_binding(FreshAgentBindingUpsert {

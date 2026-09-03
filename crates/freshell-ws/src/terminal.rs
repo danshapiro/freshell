@@ -3889,9 +3889,10 @@ pub(crate) async fn handle_create(
         let write_client_instance_id = bind_provenance.client_instance_id.clone();
         let write_device_id = bind_provenance.device_id.clone();
         let write_tab_key = bind_provenance.tab_key.clone();
-        // Focused-ep4-r2 Findings 1+2: the marker's `spawned_at` is the
-        // provenance's `asserted_at` by construction (`record_pending` maps
-        // it), so a gated/late marker write still carries the receipt time.
+        // Focused-ep4-r2 Findings 1+2, as split by focused-ep4-r3 Finding 3:
+        // the provenance's `asserted_at` rides the marker's dedicated field,
+        // so a gated/late marker write still carries the receipt time (its
+        // `spawned_at` stays the write time — the retention clock).
         let write_asserted_at = bind_provenance.asserted_at;
         let now = now_ms();
         let result = spawn_blocking_in_span(move || {

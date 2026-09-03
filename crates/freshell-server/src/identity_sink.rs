@@ -682,8 +682,8 @@ mod tests {
     /// Focused-ep1-r4 Finding 2 (the seam the cold-attach seeding reads
     /// through): `load_provenance` over the REAL pane ledger — the row's
     /// stamps round-trip (settings-independently: even a stamped lineage-only
-    /// row), a later conn-less (all-`None`) write keeps them via the ledger's
-    /// OWN keep-when-`None` merge (not a fake mirror), a genuinely
+    /// row), a later conn-less (all-`None`/`Inherit`) write keeps them via
+    /// the ledger's OWN preserve rule (not a fake mirror), a genuinely
     /// unattributed row answers `None`, and a terminal-pane row (no
     /// `pane_kind`) is gated out exactly like `load_settings`.
     #[tokio::test(flavor = "multi_thread")]
@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
 
         // A conn-less refresh (all-`None` stamps) keeps them — the REAL
-        // ledger's keep-when-`None` merge, end to end.
+        // ledger's `Inherit` preserve, end to end.
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -741,7 +741,7 @@ mod tests {
         .expect("awaited conn-less refresh succeeds");
         let p = sink
             .load_provenance("opencode", "ses_prov")
-            .expect("keep-when-None preserved the stamps");
+            .expect("the conn-less preserve kept the stamps");
         assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
 
         // A genuinely unattributed row answers None — never Some(default).
