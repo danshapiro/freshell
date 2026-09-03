@@ -277,13 +277,36 @@ describe('buildRecoveryPlan', () => {
     })
   })
 
-  it('countRecoverablePanes sums device panes and ledgerOnly', () => {
-    expect(countRecoverablePanes(inv([pane(), pane({ paneId: 'p2' })], [{ provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: null }]))).toBe(3)
-  })
-
   it('countRecoverablePanes counts a joined row identically (placement changes the total by nothing)', () => {
     expect(countRecoverablePanes(inv([pane()], [
       { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' },
     ]))).toBe(2)
+  })
+
+  // Delta-r4 Finding 2 (offer count/plan consistency): the prompt's count must
+  // equal what the accept path can actually place. Against an OLDER server
+  // (a supported client-only deploy — additive protocol, rows without tabKey)
+  // the offer can still carry unplaceable rows; counting them advertises N
+  // while the plan restores fewer. The count consumes the SAME placement
+  // predicate as the listing and the plan.
+  it('countRecoverablePanes counts only PLACEABLE ledgerOnly rows (mixed cohort)', () => {
+    const inventory = inv([pane(), pane({ paneId: 'p2' })], [
+      { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' }, // joins
+      { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' }, // no join target
+      { provider: 'opencode', sessionId: 'O1', mode: 'opencode', cwd: '/y' }, // no tabKey at all
+    ])
+    // 2 snapshot panes + the 1 placeable row; the 2 unplaceable rows count for nothing.
+    expect(countRecoverablePanes(inventory)).toBe(3)
+  })
+
+  it('the advertised count equals exactly the panes the accept path produces', () => {
+    const inventory = inv([pane(), pane({ paneId: 'p2' })], [
+      { provider: 'claude', sessionId: 'S9', mode: 'claude', cwd: '/j', tabKey: 'k' }, // joins
+      { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' }, // unplaceable
+    ])
+    const plans = buildRecoveryPlan(inventory)
+    const produced = plans.flatMap((p) => leavesOf(p.layout)).length
+    expect(produced).toBe(3)
+    expect(countRecoverablePanes(inventory)).toBe(produced)
   })
 })

@@ -63,10 +63,8 @@ export interface RecoveryTabPlan {
   paneTitles: Record<string, string>
 }
 
-export function countRecoverablePanes(inv: RecoveryInventory): number {
-  const device = inv.device?.tabs.reduce((n, t) => n + t.panes.length, 0) ?? 0
-  return device + inv.ledgerOnly.length
-}
+// Delta-r4 Finding 2: the advertised count lives below `placeLedgerEntries`
+// and consumes it — see its body's comment.
 
 // Defense-in-depth for a fresh-agent row whose mode is not a valid session
 // type (corrupt/pre-schema data): the provider's default flavor. Real rows
@@ -160,15 +158,19 @@ export interface LedgerPlacement {
 }
 
 /**
- * D8 placement partition, shared by the plan builder and the offer panel so
- * the listing always matches the physical destination: a kept ledger row
- * whose stamped tabKey names a tab that yields a plan joins that tab; every
- * other row (unmatched tabKey — the tab vanished from the retained evidence;
- * missing tabKey — pre-upgrade/headless lineage or a straggler the server's
- * placement clause would have excluded) is NOT placed (delta-r2 Finding 3).
- * Joinability is computed from the tabs that PRODUCE plans (panes.length > 0),
- * not raw inventory tabs: an empty-pane tab gets no plan, so rows stamped for
- * it have no join target.
+ * D8 placement partition — THE placement predicate, shared by the offer
+ * panel's listing, the plan builder, AND the prompt's advertised count
+ * (`countRecoverablePanes` below) so count, list, and plans always agree
+ * (delta-r4 Finding 2): a kept ledger row whose stamped tabKey names a tab
+ * that yields a plan joins that tab; every other row (unmatched tabKey — the
+ * tab vanished from the retained evidence; missing tabKey — pre-upgrade/
+ * headless lineage or a straggler the server's placement clause would have
+ * excluded) is NOT placed (delta-r2 Finding 3) and counts for NOTHING — an
+ * older server (a supported client-only deploy, additive protocol) may still
+ * offer such rows, and counting them would advertise N panes while the accept
+ * path restores fewer. Joinability is computed from the tabs that PRODUCE
+ * plans (panes.length > 0), not raw inventory tabs: an empty-pane tab gets no
+ * plan, so rows stamped for it have no join target.
  */
 export function placeLedgerEntries(inv: RecoveryInventory): LedgerPlacement {
   const joinableTabKeys = new Set(
@@ -186,6 +188,20 @@ export function placeLedgerEntries(inv: RecoveryInventory): LedgerPlacement {
     }
   }
   return { joinedByTabKey, unplaced }
+}
+
+/**
+ * The panel heading's advertised pane count: snapshot panes plus the
+ * PLACEABLE ledger rows only — computed through the same `placeLedgerEntries`
+ * partition the listing and the plan consume (delta-r4 Finding 2), so an
+ * unplaceable row (no join target) can never make the prompt advertise more
+ * than the accept path restores.
+ */
+export function countRecoverablePanes(inv: RecoveryInventory): number {
+  const device = inv.device?.tabs.reduce((n, t) => n + t.panes.length, 0) ?? 0
+  let joined = 0
+  for (const entries of placeLedgerEntries(inv).joinedByTabKey.values()) joined += entries.length
+  return device + joined
 }
 
 export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {

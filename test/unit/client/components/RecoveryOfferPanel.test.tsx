@@ -317,4 +317,40 @@ describe('RecoveryOfferPanel', () => {
       expect(consumeTerminalRestoreRequestId(content!.createRequestId)).toBe(true)
     }
   })
+
+  // Delta-r4 Finding 2 (offer count/plan consistency): against an OLDER server
+  // (a supported client-only deploy — its placement clause may be absent, so
+  // unplaceable rows can ride the offer), the heading's count must match the
+  // listing AND the accepted plan exactly — never advertise N while restoring
+  // fewer. Count, list, and plan all consume the same placement predicate.
+  it('an unplaceable ledgerOnly row is excluded from the count, the list, and the accepted plan alike', async () => {
+    const mixedInventory: RecoveryInventory = {
+      ...INVENTORY,
+      ledgerOnly: [
+        { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' }, // joins
+        { provider: 'opencode', sessionId: 'O1', mode: 'opencode', cwd: '/y', tabKey: 'd:t-gone' }, // no join target
+      ],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(mixedInventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    // 1 snapshot pane + 1 placeable row; the unplaceable row counts for nothing.
+    expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
+    // The listing shows the joined row under its tab and NOTHING for the unplaceable one.
+    expect(screen.getByText('work: codex — /x')).toBeInTheDocument()
+    expect(screen.queryByText(/opencode/)).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    // The accepted plan produced exactly the advertised 2 panes in the one tab.
+    const leaves = findRecoveredTerminalLeaves(store, 'work')
+    expect(leaves).toHaveLength(2)
+    const sessionIds = leaves.map((l) => {
+      if (l.content.kind !== 'terminal') throw new Error('unreachable')
+      return l.content.sessionRef?.sessionId
+    })
+    expect(sessionIds).toContain('C9')
+    expect(sessionIds).not.toContain('O1')
+  })
 })

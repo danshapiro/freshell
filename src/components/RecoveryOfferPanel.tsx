@@ -171,7 +171,9 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   // both consume the same partition — a kept ledger row whose stamped tabKey
   // names a restorable tab renders under THAT tab in the same line format as
   // its snapshot panes. Rows without a restorable tab match are not restored
-  // (delta-r2 Finding 3) and are not listed.
+  // (delta-r2 Finding 3) and are not listed. The heading's count flows through
+  // `countRecoverablePanes`, which consumes the SAME partition (delta-r4
+  // Finding 2) — count, list, and plan can never disagree.
   const restorableTabs = (device?.tabs ?? []).filter((tab) => tab.panes.length > 0)
   const placement = placeLedgerEntries(inventory)
 
