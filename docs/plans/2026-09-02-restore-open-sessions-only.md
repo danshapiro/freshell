@@ -494,9 +494,9 @@ git commit -m "feat(recovery): restored ledger rows rejoin their original tab (D
 Kept kill-window rows carry their stamped tabKey; the recovery plan joins
 each into the restored tab with the matching source tabKey (one dispatch,
 rightmost leaf of the existing chain), and the offer lists it under that
-tab's name. Rows whose tab vanished from all retained evidence fall back
-any synthetic tab — unplaceable rows are excluded upstream. The wall SIGKILL-5s scenario now
-pins original-tab placement end to end."
+tab's name. Rows whose tab vanished from all retained evidence do not fall
+back to any synthetic tab — unplaceable rows are excluded upstream. The
+wall SIGKILL-5s scenario now pins original-tab placement end to end."
 ```
 
 ---
