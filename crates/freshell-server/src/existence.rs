@@ -657,6 +657,7 @@ mod tests {
                 cwd: None,
                 create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -705,6 +706,7 @@ mod tests {
                 cwd: None,
                 create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -1273,6 +1275,7 @@ mod tests {
                 cwd: Some(&cwd),
                 create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 2_000,
             })
             .expect("first bind: root");
@@ -1285,6 +1288,7 @@ mod tests {
                 cwd: Some(&cwd),
                 create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 3_000,
             })
             .expect("signal rebind: child");
@@ -1298,6 +1302,7 @@ mod tests {
                 cwd: Some(&cwd),
                 create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 2_500,
             })
             .expect("control bind: root2");

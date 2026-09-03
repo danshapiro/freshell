@@ -45,13 +45,18 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// (a raw capturedAt-max would, after a backward server-clock step).
 ///
 /// The ROW's side of the comparison is its last-attribution time, never its
-/// last write: delta-r4 Finding 1 — `updated_at` advances on EVERY upsert,
-/// including conn-less `Inherit` maintenance (the auto-resume respawn sweep,
-/// locator/resolution re-binds) that re-asserts no browser provenance, so
-/// after the parent's evidence froze such a refresh parked the row past the
-/// frozen newest generation and re-offered a long-closed detached pane
-/// forever. `last_attributed_at` advances only on a meaningful
-/// connection-scoped write (see pane_ledger.rs).
+/// last write and never its row-creation metadata: delta-r4 Finding 1 —
+/// `updated_at` advances on EVERY upsert, including conn-less `Inherit`
+/// maintenance (the auto-resume respawn sweep, locator/resolution re-binds)
+/// that re-asserts no browser provenance, so after the parent's evidence
+/// froze such a refresh parked the row past the frozen newest generation and
+/// re-offered a long-closed detached pane forever. `last_attributed_at`
+/// advances only on a meaningful connection-scoped write, at the ASSERTION's
+/// time (the write's own now — or, for a marker-stamped resolution, the
+/// consumed marker's `spawned_at`: focused-ep4 — the browser asserted the
+/// pane at spawn, the conn-less resolution merely lands that assertion
+/// later; a marker-derived row's `created_at` IS the resolution time, so a
+/// `created_at` floor would re-launder it — see pane_ledger.rs).
 ///
 /// Placement clause (delta-r2 Finding 3, narrowed by focused-ep2-r1 Finding
 /// 1): a kept row is offered ONLY when its stamped `tabKey` names an OPEN,
@@ -793,18 +798,22 @@ fn d8_parent_relative_keep(
     else {
         return false; // the row's parent client left no surviving evidence on this device
     };
-    // Delta-r4 Finding 1 (judgment time ≠ maintenance time): key on the row's
-    // last MEANINGFUL browser attribution (`last_attributed_at`), NEVER
-    // `updated_at` — conn-less `Inherit` upserts refresh `updated_at` without
-    // any browser re-asserting the pane, which parked long-closed detached
-    // rows past the frozen parent evidence. Legacy rows (pre-delta-r4, field
-    // absent) key on creation time; the defensive `max(created_at)` floors
-    // the judgment at the row's birth either way.
-    let row_time = r
-        .last_attributed_at
-        .unwrap_or(r.created_at)
-        .max(r.created_at)
-        .max(0) as u64;
+    // Delta-r4 Finding 1 + focused-ep4 Finding (judgment-time composition):
+    // key on the row's last MEANINGFUL browser attribution
+    // (`last_attributed_at`), NEVER `updated_at` — conn-less `Inherit`
+    // upserts refresh `updated_at` without any browser re-asserting the pane,
+    // which parked long-closed detached rows past the frozen parent evidence.
+    // And never `created_at` either: the attribution time is
+    // browser-ASSERTED and authoritative, while `created_at` is row-keeping
+    // metadata — for marker-derived rows it IS the conn-less resolution time
+    // (potentially long after the pane closed and the evidence froze), so a
+    // `max(created_at)` floor would re-launder a resolved-after-close pane
+    // into the offer. (For every non-marker production write
+    // `last_attributed_at >= created_at` holds anyway — the row is born on
+    // its first meaningful stamp and only advances — so trusting the
+    // attribution time alone changes nothing outside the marker lane.)
+    // Legacy rows (pre-delta-r4, field absent) keep the creation-time key.
+    let row_time = r.last_attributed_at.unwrap_or(r.created_at).max(0) as u64;
     if row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) < parent_newest {
         return false; // the parent's evidence already observed the row's absence
     }

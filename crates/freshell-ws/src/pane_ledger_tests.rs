@@ -47,6 +47,7 @@ fn write_with_policy(
         cwd: Some("/tmp/proj"),
         create_request_id: Some("req-1"),
         provenance,
+        attributed_at: None,
         now_ms,
     }
 }
@@ -653,12 +654,16 @@ fn hollow_replace_never_advances_the_attribution_time() {
 }
 
 #[test]
-fn marker_stamped_resolution_stamps_the_attribution_time_from_the_resolve() {
-    // Delta-r3's marker provenance is spawn-time CONNECTION provenance: when
-    // the conn-less `Inherit` resolution derives `Replace(marker stamps)` from
-    // a stamped marker, that derived application is meaningful and stamps the
-    // row's attribution time at the resolve. A partially-stamped marker is
-    // hollow (never an attribution).
+fn marker_stamped_resolution_stamps_the_attribution_time_from_the_marker_spawn() {
+    // Delta-r3's marker provenance is spawn-time CONNECTION provenance, and
+    // focused-ep4 Finding: the attribution TIME must be the marker's
+    // `spawned_at`, NOT the resolve write's `now` — the browser asserted the
+    // pane when it SPAWNED it; the conn-less identity resolution merely lands
+    // the marker's stamps later (arbitrarily later for a codex/opencode
+    // locator resolution — possibly after the pane already closed and the
+    // parent's evidence froze, where resolve-time attribution would re-launder
+    // the row into the D8 offer). A partially-stamped marker is hollow (never
+    // an attribution).
     let root = temp_root("attr-time-marker");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -681,8 +686,18 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_resolve() {
     assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
     assert_eq!(
         row.last_attributed_at,
-        Some(2_000),
-        "the marker-derived application re-attributes at the resolve"
+        Some(1_000),
+        "the marker-derived application attributes at the marker's spawn, \
+         not the resolve"
+    );
+    assert_eq!(
+        row.updated_at, 2_000,
+        "the resolve write itself still lands at resolve time \
+         (maintenance freshness is a separate clock)"
+    );
+    assert_eq!(
+        row.created_at, 2_000,
+        "the row is born at resolution — the judgment must not floor on it"
     );
     // Partial marker → hollow derived Replace → no attribution time.
     ledger
@@ -1237,8 +1252,9 @@ fn resolve_pending_sources_provenance_from_the_consumed_marker() {
     assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
     assert_eq!(
         row.last_attributed_at,
-        Some(2_000),
-        "delta-r4 Finding 1: the marker-derived application re-attributes at the resolve"
+        Some(1_000),
+        "delta-r4 Finding 1 + focused-ep4 Finding: the marker-derived \
+         application attributes at the marker's spawn, not the resolve"
     );
     assert!(
         ledger.list_pending_raw().is_empty(),
@@ -1284,6 +1300,13 @@ fn resolve_pending_prefers_the_resolve_calls_own_provenance_over_the_markers() {
     assert_eq!(
         row.tab_key.as_deref(),
         Some("device-resolve:tab-resolve")
+    );
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "focused-ep4 Finding, keep side: a resolution asserting FRESH \
+         connection provenance attributes at the resolve's own time — the \
+         marker-time rule applies only when the stamps COME from the marker"
     );
     std::fs::remove_dir_all(&root).ok();
 }

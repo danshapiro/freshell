@@ -148,6 +148,7 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
             cwd: Some("/prior/cwd"),
             create_request_id: Some("req-prior-epoch"),
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            attributed_at: None,
             now_ms: seeded_at,
         })
         .expect("seed prior-epoch binding row");

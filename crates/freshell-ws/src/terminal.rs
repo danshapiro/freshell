@@ -3486,6 +3486,7 @@ pub(crate) async fn handle_create(
                             tab_key: write_tab_key.as_deref(),
                         },
                     ),
+                    attributed_at: None,
                     now_ms: now,
                 })
             })
@@ -3819,6 +3820,7 @@ pub(crate) async fn handle_create(
                             tab_key: write_tab_key.as_deref(),
                         },
                     ),
+                    attributed_at: None,
                     now_ms: now,
                 })
             })
@@ -4508,6 +4510,7 @@ pub async fn respawn_agent_terminal(
                     // client connection; `Inherit` preserves the create's
                     // provenance stamps.
                     provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                    attributed_at: None,
                     now_ms: now,
                 })
             })

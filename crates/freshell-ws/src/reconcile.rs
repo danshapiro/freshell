@@ -558,6 +558,7 @@ mod tests {
                     cwd: None,
                     create_request_id: None,
                     provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                    attributed_at: None,
                     now_ms,
                 })
                 .expect("ledger bind");
@@ -749,6 +750,7 @@ mod tests {
                 cwd: None,
                 create_request_id: Some("cr-never"),
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 1_000,
             })
             .expect("record binding");
@@ -775,6 +777,7 @@ mod tests {
                 cwd: None,
                 create_request_id: Some("cr-gone2"),
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                attributed_at: None,
                 now_ms: 1_000,
             })
             .expect("record binding");

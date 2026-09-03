@@ -1000,6 +1000,7 @@ fn ledger_row_after_writes(steps: &[(ProvenancePolicy<'static>, i64)]) -> Bindin
                 cwd: Some("/w"),
                 create_request_id: None,
                 provenance: *provenance,
+                attributed_at: None,
                 now_ms: *now_ms,
             })
             .unwrap_or_else(|e| panic!("fixture write {i} failed: {e}"));
@@ -1166,6 +1167,170 @@ fn legacy_row_without_attribution_time_keys_on_creation_time() {
         0,
         "900_000 + 7_000 < 1_000_000: legacy rows judge on creation time, \
          never on a maintenance-refreshed updated_at"
+    );
+}
+
+/// Focused-ep4 Finding fixture lane: REAL marker + resolution writes, exactly
+/// the two write shapes production composes for a dynamically-identified CLI
+/// pane — the connection-scoped spawn's stamped `record_pending` and the
+/// conn-less locator resolution's `resolve_pending(.., Inherit, ..)` — so the
+/// row under judgment carries precisely the timestamps those lanes produce.
+fn ledger_row_from_marker_resolution(
+    spawn_ms: i64,
+    resolve_ms: i64,
+    tab_key: &'static str,
+) -> BindingRow {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = PaneLedger::new(Some(tmp.path().to_path_buf()));
+    ledger
+        .record_pending(
+            "t-marker",
+            "codex",
+            Some("/w"),
+            ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("d1"),
+                tab_key: Some(tab_key),
+            },
+            spawn_ms,
+        )
+        .expect("pending marker write");
+    ledger
+        .resolve_pending(&BindingWrite {
+            provider: "codex",
+            session_id: "S1",
+            terminal_id: "t-marker",
+            mode: "codex",
+            cwd: Some("/w"),
+            create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            attributed_at: None,
+            now_ms: resolve_ms,
+        })
+        .expect("marker resolution write");
+    // The returned row is a memory clone; the tempdir may drop with the fn.
+    ledger.load_binding("codex", "S1").expect("row written")
+}
+
+#[test]
+fn marker_derived_resolution_after_the_pane_closed_never_re_offers_it() {
+    // THE FINDING end to end through real writes: the browser spawns a codex
+    // CLI pane at 900_000 (the marker carries the spawn-time stamps), the pane
+    // is closed and omitted by the parent's pushes, the parent's evidence
+    // freezes at 1_000_000, and only THEN (1_100_000) does the conn-less
+    // locator resolve the session id. The binding row is BORN at resolution
+    // (`created_at`/`updated_at` = 1_100_000) but no browser asserted the pane
+    // at that moment — the assertion is the marker's spawn. Neither the
+    // resolution time nor the row's creation metadata may re-open the grace
+    // window. (Scale note: the brief's schematic 1_000/1_500/2_000 collapses
+    // into one 7s grace window — a pane born and closed entirely inside a
+    // window is genuinely indistinguishable from one alive at freeze, so the
+    // discriminating assertion needs a frozen newest more than one grace past
+    // the spawn; the ordering marker-spawn < frozen < resolution is intact.)
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = ledger_row_from_marker_resolution(900_000, 1_100_000, "d1:t1");
+    assert_eq!(
+        row.last_attributed_at,
+        Some(900_000),
+        "attribution is the marker's spawn time, not the resolve"
+    );
+    assert_eq!(
+        row.created_at, 1_100_000,
+        "the row is born at resolution — later than the frozen evidence"
+    );
+    assert_eq!(row.updated_at, 1_100_000, "the resolve write lands fresh");
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "900_000 + 7_000 < 1_000_000: an identity resolving after the pane \
+         closed must not be offered — judgment time is the browser-asserted \
+         attribution, never the row's resolution-time creation metadata"
+    );
+}
+
+#[test]
+fn marker_derived_resolution_within_grace_of_the_frozen_parent_is_offered() {
+    // Keep-side twin (kill-window parity): a pane spawned 1s before the
+    // parent's last push whose conn-less resolution lands AFTER the freeze
+    // (server restarted before the locator ran) IS still offered — the
+    // marker-time rule re-dates the attribution to the spawn but must not
+    // over-tighten the sub-cadence window the grace exists for.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = ledger_row_from_marker_resolution(999_000, 1_100_000, "d1:t1");
+    assert_eq!(row.last_attributed_at, Some(999_000));
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "999_000 + 7_000 >= 1_000_000: a genuinely kill-window pane keeps, \
+         resolution-time row birth notwithstanding"
+    );
+}
+
+#[test]
+fn an_attributed_rows_judgment_ignores_its_creation_time() {
+    // Pure composition pin (the mirror of
+    // `the_judgment_time_is_the_attribution_time_not_the_last_write`): an
+    // attributed row whose CREATION metadata postdates the frozen evidence
+    // must still judge on its attribution time alone. `last_attributed_at` is
+    // browser-asserted and authoritative; `created_at` is row-keeping
+    // metadata (resolution-time birth for marker-derived rows) and must never
+    // floor the judgment back into the offer.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let mut row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 1_100_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    row.created_at = 1_100_000; // resolution-time birth, past the frozen newest
+    row.last_attributed_at = Some(900_000); // the browser's assertion, out of grace
+    let out = build_inventory(
+        vec![d],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "900_000 + 7_000 < 1_000_000: an over-late created_at must not \
+         re-launder an attributed row into the offer"
     );
 }
 

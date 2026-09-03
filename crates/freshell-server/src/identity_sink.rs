@@ -712,6 +712,7 @@ mod tests {
                         tab_key: Some("device-term:tab-term"),
                     },
                 ),
+                attributed_at: None,
                 now_ms: 42,
             })
             .expect("terminal binding write ok");
