@@ -16,9 +16,11 @@ pub struct DeviceUnion {
 /// One device dir's A15/A16 survivor selection: the retained generation ids
 /// to compose the union from, PLUS each surviving client's revision-first
 /// WINNER generation's capturedAt (the D8 parent-relative judgment input) —
-/// within the winner's final revision, the capturedAt of the LAST matching
-/// entry in push order (the freshest assertion), never a capturedAt-max
-/// (focused-ep4-r4 Finding 2).
+/// within the winner's final revision, the capturedAt of the FIRST matching
+/// entry on the route's (revision, capturedAt)-descending feed: that
+/// revision's freshest stamp, identical to the union composition's
+/// `newest_per_client` winner key there (focused-ep4-r5 Finding 3), so
+/// judgment and offered union can never disagree about the parent's clock.
 pub struct ForeignSelection {
     pub selected_ids: Vec<String>,
     /// (client_instance_id, winner capturedAt) per surviving client, sorted
@@ -46,17 +48,27 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// `generation_rank` ordering the union composition applies — so the judgment
 /// and the offered unions can never disagree about which generation is newest
 /// (a raw capturedAt-max across revisions would, after a backward
-/// server-clock step). Focused-ep4-r4 Finding 2 (skew-safe evidence clock):
-/// WITHIN the final revision the key is the capturedAt of the LAST matching
-/// entry in push order — the freshest assertion — never a capturedAt-MAX
-/// over the retained entries at that revision; a retained pre-step entry at
-/// the same final revision would otherwise pin the clock HIGH until
-/// retention rotated it out. Residual (a reduction, not perfection): during
-/// a backward wall-clock jump the keep window may extend by up to the skew
-/// magnitude — a pre-step attribution compares as within grace until the
-/// parent's post-step pushes outrun row_time + grace — while the fix bounds
-/// a false judgment to the skew instead of letting it ride on a pinned
-/// retained entry.
+/// server-clock step). Focused-ep4-r5 Finding 3 (equal-revision ties honor
+/// the route's ordering contract): WITHIN the final revision the key is the
+/// capturedAt of the FIRST matching entry on the route's (revision,
+/// capturedAt)-descending feed — that revision's capturedAt-max, identical
+/// to the union's `newest_per_client` winner key there, so judgment and
+/// offered union cannot disagree; the superseded r4 rule kept the LAST entry
+/// (the run's lowest stamp on that feed). A greater revision still wins
+/// outright, so across a backward wall-clock step the client's first REAL
+/// post-step push (revision-bumping) re-keys the clock immediately.
+/// Residual (a reduction, not perfection): during such a jump a retained
+/// PRE-step entry at the SAME final revision holds the key HIGH (union-
+/// consistently) until that first real post-step push lands — a row judged
+/// in the window can be dropped up to the skew magnitude EARLIER than the
+/// client's true freshest assertion would allow. The r4 keep-side extension
+/// is unchanged where it still lives: once the post-step revision lands, a
+/// row within grace of the post-step stamp keeps until post-step pushes
+/// outrun row_time + grace. And the ROW-side monotonic compare has the same
+/// bounded wall-clock residual (focused-ep4-r5 Finding 2a, documented in
+/// `pane_ledger.rs`): after a backward step a genuinely-later browser
+/// assertion can compare as older and be rejected for up to the skew
+/// magnitude — no sequence counter is built for either side.
 ///
 /// The ROW's side of the comparison is its last-attribution time, never its
 /// last write and never its row-creation metadata: delta-r4 Finding 1 —
@@ -120,21 +132,23 @@ pub fn select_foreign_recent_generation_ids(
     // the union composition applies, so the D8 evidence can never disagree
     // with the offered union about which generation is a client's newest (a
     // raw capturedAt-max across REVISIONS would, after a backward
-    // server-clock step). Focused-ep4-r4 Finding 2 (skew-safe evidence
-    // clock): WITHIN the final revision, the key is the capturedAt of the
-    // LAST matching entry in push order — the freshest assertion — never a
-    // capturedAt-MAX over the retained entries at that revision. A
-    // pre-clock-step entry retained at the same final revision would
-    // otherwise pin the max HIGH (judging rows against a stale pre-step
-    // assertion) until retention rotated it out. Monotone clocks collapse
-    // last == max so judgments are unchanged outside a backward-step window;
-    // the bounded extension a skewed-low key buys is recorded on the
-    // [`UNSNAPSHOTTED_BINDING_GRACE_MS`] block. Feed-order
-    // note: `read_device_overview`'s meta array orders each client's entries
-    // (revision, capturedAt)-descending, so a final-revision run that MIXES
-    // pre- and post-step entries ends in the LOWEST-stamped (post-step) one;
-    // the run's pre-step entries never win the key, which is exactly the
-    // skew-safety this rule exists for.
+    // server-clock step). Focused-ep4-r5 Finding 3 (equal-revision selection
+    // honors the route's ordering contract): the production feed —
+    // `read_device_overview`'s meta — supplies each client's generations
+    // (revision, capturedAt)-DESCENDING (its `all_generations_parsed`
+    // per-client queue sorts `generation_rank` descending), so the FIRST
+    // matching entry of the final revision IS that revision's freshest
+    // stamp: its capturedAt-max — identical to the union composition's
+    // `newest_per_client` winner key ((revision, capturedAt)-max per client).
+    // The superseded r4 rule (replace on equal revision, keeping the LAST
+    // array entry) read the run's LOWEST stamp off the descending feed, so
+    // the judgment and the offered union could disagree by construction
+    // whenever a re-delivered push left two entries at one revision. Greater
+    // revision still replaces outright, so the first REAL post-clock-step
+    // push (every real push bumps `snapshotRevision`) re-keys the clock
+    // immediately; array order only ever matters inside one revision. The
+    // skew-window residual this leaves is recorded on the
+    // [`UNSNAPSHOTTED_BINDING_GRACE_MS`] block.
     let mut winner_rank_by_client: HashMap<&str, (i64, i64)> = HashMap::new();
     for g in &foreign {
         let c = g["clientInstanceId"].as_str().unwrap_or("");
@@ -150,10 +164,10 @@ pub fn select_foreign_recent_generation_ids(
         let rank = freshell_ws::tabs_persist::generation_rank(g);
         let w = winner_rank_by_client.entry(c).or_insert(rank);
         // Greater revision replaces the winner outright; the SAME revision
-        // replaces it with the LATER array entry (push order — the fresher
-        // assertion). The tuple's capturedAt component then answers the last
-        // entry's stamp, never the run's max.
-        if rank.0 >= w.0 {
+        // never overwrites — the FIRST matching entry wins the tie, which on
+        // the route's (revision, capturedAt)-descending feed is the run's
+        // freshest stamp (== the union's winner key).
+        if rank.0 > w.0 {
             *w = rank;
         }
     }
@@ -816,9 +830,10 @@ pub fn build_inventory(
 /// row is an intermediate-build artifact with no clock key and is excluded
 /// exactly like an unattributed one) AND that LAST-ATTRIBUTION time is
 /// within [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's
-/// revision-first-winner capturedAt (the freshest assertion of the parent's
-/// final revision — the LAST matching entry in push order, never a
-/// capturedAt-max; focused-ep4-r4 Finding 2), AND (delta-r2 Finding 3 +
+/// revision-first-winner capturedAt (the freshest stamp of the parent's
+/// final revision — the FIRST matching entry on the route's (revision,
+/// capturedAt)-descending feed, identical to the union's winner key;
+/// focused-ep4-r5 Finding 3), AND (delta-r2 Finding 3 +
 /// focused-ep2-r1 Finding 1) its stamped `tab_key` names an OPEN, paned tab
 /// in the primary union — the restored-tab set the client joins it into.
 /// Unattributed / fieldless / non-primary-device / no-surviving-parent /

@@ -149,16 +149,21 @@ pub struct BindingRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_key: Option<String>,
     /// Delta-r4 Finding 1 (judgment time decoupled from maintenance time):
-    /// when a browser connection last ASSERTED this identity+tab. Focused-
+    /// when a browser connection last ASSERTED this identity (see the
+    /// floor note below for the one non-assertion shape). Focused-
     /// ep4-r2 Findings 1+2 (assertion time is VALUE-carried, never
     /// write-time): the stamped time is the ASSERTION's time, carried on the
     /// provenance value itself — captured ONCE at message receipt on the
     /// connection-scoped lanes, so slow create/spawn/fork work (or fork-chain
     /// supersession) can never manufacture a later attribution. The writer
-    /// rules (one shared predicate, `advances_attribution`, plus the
-    /// monotonicity guard — focused-ep4-r3 Findings 1+2): a `Replace` with
-    /// the FULL client+device+tab triple whose `asserted_at` is >= the
-    /// row's current value SETS stamps+time together (an older delayed
+    /// rules (the focused-ep4-r5 Finding 1 attach/advance split plus the
+    /// monotonicity guard — focused-ep4-r3 Findings 1+2): a `Replace`
+    /// ATTACHES whatever MEANINGFUL provenance exists (client+device, plus
+    /// tab and the assertion time when present — no triple requirement —
+    /// so a legacy client's create/fork leaves an attribution) when the row
+    /// has NO prior attribution; a `Replace` ADVANCES an existing one only
+    /// with the FULL client+device+tab triple whose `asserted_at` is >= the
+    /// row's current value, SETTING stamps+time together (an older delayed
     /// write never drags them back; a tab-less legacy re-assert never
     /// refreshes them against the kept tab); a conn-less `Inherit`
     /// PRESERVES the value (same-key row, or the superseded parent's on a
@@ -167,8 +172,13 @@ pub struct BindingRow {
     /// marker-stamped `resolve_pending` attributes at the consumed marker's
     /// `asserted_at` field (the focused-ep4-r3 Finding 3 split; the
     /// `spawned_at` fallback covers intermediate-build markers, where that
-    /// field carried the assertion time); `Clear` ERASES it (the row is
-    /// then unattributed wholesale); retire/state transitions and GC/scan
+    /// field carried the assertion time); `Clear` erases the identity
+    /// STAMPS but RAISES this clock (focused-ep4-r5 Finding 2):
+    /// `max(existing, clear_now)` — the floor rejects a delayed pre-Clear
+    /// assertion that could otherwise resurrect the cleared stamps, and the
+    /// row stays unofferable while its stamps are `None` (the judgment
+    /// gates on the stamps first).
+    /// Retire/state transitions and GC/scan
     /// maintenance NEVER touch it. This is what the D8 judgment
     /// (`recovery_inventory.rs`) keys on — and it keys on NOTHING ELSE:
     /// `updated_at` advances on EVERY upsert including conn-less
@@ -201,7 +211,9 @@ pub struct BindingRow {
 /// REST/sink markers are intentionally never stamped, exactly the lane's
 /// `Clear` write policy) resolves `Clear`, erasing any prior lane's stamps
 /// so a headless lineage can never launder a stale browser attribution via
-/// the marker path. Serde-optional under LEDGER_VERSION 1 (the BindingRow
+/// the marker path (and flooring the erased row's attribution clock at
+/// `max(existing, resolve_now)`, focused-ep4-r5 Finding 2). Serde-optional
+/// under LEDGER_VERSION 1 (the BindingRow
 /// precedent): pre-delta-r3 markers parse to all-`None` and take the same
 /// `Clear` derivation — conservative (unattributed ⇒ never offered), and
 /// immune by construction once the 30-day pending-marker TTL has swept them.
@@ -254,13 +266,16 @@ pub struct PendingMarker {
 /// immutably through the create/respawn/fork/supersede chain; an applying
 /// `Replace` records it verbatim as the row's `last_attributed_at` (never
 /// the write's own `now_ms` — a post-spawn or resolution-time write must
-/// not manufacture freshness). Focused-ep4-r3 Findings 1+2: a `Replace`
-/// APPLIES only when the full client+device+tab triple is present AND
-/// `asserted_at` is >= the row's current attribution time (an older delayed
-/// write never drags the attribution back). `0` = "no assertion exists"
-/// (the headless `default()`; a weaker value's time is never consumed — a
-/// full-triple stamp with `0` would attribute the epoch and fail CLOSED,
-/// never offered).
+/// not manufacture freshness). The application gates (focused-ep4-r5
+/// Finding 1): with NO prior attribution on the row the value ATTACHES when
+/// it is MEANINGFUL (client+device — the tab rides along only when the
+/// wire carried one: legacy clients omit it); with an EXISTING attribution
+/// it ADVANCES only on the full client+device+tab triple whose
+/// `asserted_at` is >= the row's current attribution time (focused-ep4-r3
+/// Findings 1+2 — an older delayed write never drags the attribution back).
+/// `0` = "no assertion exists" (the headless `default()`; a `0`-timed
+/// attach records NO time at all — see [`applied_attribution_time`] — and
+/// the row fails CLOSED, never offered).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProvenanceStamps<'a> {
     pub client_instance_id: Option<&'a str>,
@@ -292,40 +307,70 @@ pub enum ProvenancePolicy<'a> {
     /// them from the connection's hello identity + the message's `tabId`):
     /// an adoption lane that KNOWS newer identity replaces it here. The
     /// attribution is ONE atomic fact (focused-ep4-r3 Findings 1+2): the
-    /// stamps AND the row's `last_attributed_at` are replaced TOGETHER, and
-    /// only when the full client+device+tab triple is present AND the
-    /// stamps' `asserted_at` is >= the row's current attribution time (the
-    /// browser's assertion, captured at message receipt — the write's own
-    /// `now_ms` never enters the attribution clock, focused-ep4-r2 Findings
-    /// 1+2). A weaker `Replace` (any stamp half missing — e.g. a legacy
-    /// client that cannot compose a `tabKey`) or an OLDER assertion leaves
-    /// stamps+time untouched while the write's other fields still land; the
-    /// pre-finding-2 per-field keep-when-`None` merge is gone (it mixed
-    /// stamps from different assertions and refreshed the time against the
-    /// row's kept, stale tab).
+    /// stamps AND the row's `last_attributed_at` move TOGETHER. Since
+    /// focused-ep4-r5 Finding 1 there are two application gates: with NO
+    /// prior attribution on the row the value ATTACHES when it is meaningful
+    /// (client+device — a legacy client that cannot compose a `tabKey` still
+    /// attaches, tab `None`); with an EXISTING attribution it ADVANCES only
+    /// when the full client+device+tab triple is present AND the stamps'
+    /// `asserted_at` is >= the row's current attribution time (the browser's
+    /// assertion, captured at message receipt — the write's own `now_ms`
+    /// never enters the attribution clock, focused-ep4-r2 Findings 1+2). A
+    /// `Replace` that fails its gate leaves stamps+time untouched while the
+    /// write's other fields still land; the pre-finding-2 per-field
+    /// keep-when-`None` merge is gone (it mixed stamps from different
+    /// assertions and refreshed the time against the row's kept, stale tab).
     Replace(ProvenanceStamps<'a>),
     /// An explicitly HEADLESS writer (the REST/MCP lineage binder — no
-    /// browser connection exists at bind time): all stamps are CLEARED.
-    /// A headless re-bind must never keep an earlier browser stamp (see the
-    /// enum doc), so the rebound row becomes unattributed and the D8
-    /// judgment (`recovery_inventory.rs`) correctly never offers it.
+    /// browser connection exists at bind time): all identity stamps are
+    /// CLEARED. A headless re-bind must never keep an earlier browser stamp
+    /// (see the enum doc), so the rebound row becomes unattributed and the
+    /// D8 judgment (`recovery_inventory.rs`) correctly never offers it. The
+    /// attribution CLOCK is never erased (focused-ep4-r5 Finding 2):
+    /// `last_attributed_at` floors at `max(existing, clear_now)`, so a
+    /// delayed pre-`Clear` assertion can never sneak through a
+    /// no-prior-attribution arm and resurrect the cleared stamps.
     Clear,
 }
 
-/// Whether this write's provenance may APPLY a new attribution (stamps+time
-/// as one fact): a `Replace` whose stamps carry the FULL
-/// client+device+tab triple. Originally (delta-r4 Finding 1) the client and
-/// device halves sufficed (the `freshell_freshagent::BindProvenance::
-/// is_meaningful` hollow-guard shape, mirrored here because this crate cannot
-/// see that one); focused-ep4-r3 Finding 2 tightened the gate to the full
-/// triple: a legacy client that cannot compose a `tabKey` would otherwise
-/// REFRESH the attribution time while the merge kept the row's old tab —
-/// laundering freshness onto a stale tab. Both merge bodies consume this
-/// ONE predicate (together with the monotonicity guard — see the bodies):
-/// the advancing time is the stamps' own `asserted_at` (the provenance
-/// value's assertion time, focused-ep4-r2 Findings 1+2), never the write's
-/// `now_ms`. A weaker re-assertion updates the row's other fields but
-/// leaves stamps+time untouched.
+/// Whether this write's provenance may ATTACH an attribution to a row that
+/// has NONE YET (focused-ep4-r5 Finding 1): a `Replace` whose stamps carry
+/// the MEANINGFUL halves — client+device (the
+/// `freshell_freshagent::BindProvenance::is_meaningful` hollow-guard shape,
+/// mirrored here because this crate cannot see that one). No tab
+/// requirement: `freshAgent.create`/`freshAgent.fork.tabId` are
+/// additive/optional, so a legacy client still composes
+/// client+device+`asserted_at` from its hello identity and the message
+/// receipt — if the full triple gated here too, a genuinely-open legacy
+/// create/fork would be born with no attribution at all: unrecoverable
+/// wholesale. (A tab-less attach stays unofferable regardless — the D8
+/// placement clause still requires the stamped tabKey to name an open tab;
+/// this is the documented ceiling for legacy clients.) The triple
+/// requirement below gates only ADVANCING an attribution the row ALREADY
+/// has.
+fn attaches_attribution(provenance: &ProvenancePolicy<'_>) -> bool {
+    match provenance {
+        ProvenancePolicy::Replace(stamps) => {
+            stamps.client_instance_id.is_some() && stamps.device_id.is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Whether this write's provenance may ADVANCE an attribution the row
+/// ALREADY has (stamps+time moving as one fact): a `Replace` whose stamps
+/// carry the FULL client+device+tab triple. Originally (delta-r4 Finding 1)
+/// the client and device halves sufficed; focused-ep4-r3 Finding 2 tightened
+/// the gate to the full triple: a legacy client that cannot compose a
+/// `tabKey` would otherwise REFRESH the attribution time while the merge
+/// kept the row's old tab — laundering freshness onto a stale tab. Both
+/// merge bodies consume this ONE predicate only when a prior attribution
+/// exists (focused-ep4-r5 Finding 1 split the never-attributed case out to
+/// [`attaches_attribution`]), together with the monotonicity guard (see the
+/// bodies): the advancing time is the stamps' own `asserted_at` (the
+/// provenance value's assertion time, focused-ep4-r2 Findings 1+2), never
+/// the write's `now_ms`. A weaker re-assertion over an attributed row
+/// updates the row's other fields but leaves stamps+time untouched.
 fn advances_attribution(provenance: &ProvenancePolicy<'_>) -> bool {
     match provenance {
         ProvenancePolicy::Replace(stamps) => {
@@ -335,6 +380,16 @@ fn advances_attribution(provenance: &ProvenancePolicy<'_>) -> bool {
         }
         _ => false,
     }
+}
+
+/// The time an applying `Replace` stamps onto the row: the provenance
+/// value's own assertion time. The `0` sentinel ("no assertion exists" — the
+/// headless `default()` shape) never lands on a row: a 0-timed attach
+/// records NO time, leaving the row time-less (and re-attachable — a later
+/// real assertion can still land), failing CLOSED at the D8 judgment exactly
+/// like a fieldless stamped row (focused-ep4-r4 Finding 1).
+fn applied_attribution_time(asserted_at: i64) -> Option<i64> {
+    (asserted_at > 0).then_some(asserted_at)
 }
 
 /// One identity event's worth of binding-row input.
@@ -656,26 +711,39 @@ impl PaneLedger {
         //
         // * `Inherit` (conn-less session-affiliated lane): the write asserts
         //   nothing — the row keeps every stamp AND the attribution time.
-        // * `Replace` APPLIES its whole provenance — stamps AND time — only
-        //   when it is a COMPLETE, NOT-STALE attribution: the full
-        //   client+device+tab triple is present (`advances_attribution`,
-        //   finding 2) AND the stamps' `asserted_at` is >= the row's current
-        //   `last_attributed_at` (finding 1; the exact tie replaces, keeping
-        //   semantics deterministic; an absent prior time never blocks). The
-        //   assertion time is captured at message RECEIPT — before
-        //   gated/async create/fork work — so an older delayed write can
-        //   land AFTER a newer assertion for the same session; without the
-        //   guard it would drag stamps+time back to the older tab/moment.
-        // * A `Replace` that fails either gate (partial/hollow stamps — a
-        //   legacy client that cannot compose a tabId — or an older
-        //   assertion) leaves stamps+time UNTOUCHED while the write's other
-        //   fields still land. The pre-finding-2 per-field keep-when-`None`
-        //   merge is gone: it mixed marker/write and row stamps into
-        //   combinations no single browser assertion ever made.
-        // * `Clear` (explicitly-headless lineage lane): the row's stamps AND
-        //   time are erased, so a stale browser attribution can never
-        //   launder the row into the D8 offer under a refreshed
-        //   `updated_at`.
+        // * `Replace` splits on whether the row HAS a prior attribution
+        //   (focused-ep4-r5 Finding 1):
+        //   - ATTACH (no prior `last_attributed_at`): applies whatever
+        //     MEANINGFUL provenance exists — the client+device halves, plus
+        //     the tab and the assertion time when present
+        //     (`attaches_attribution`; no triple requirement — a legacy
+        //     client whose wire message omits `tabId` still attaches).
+        //   - ADVANCE (a prior `last_attributed_at` exists): applies stamps
+        //     AND time only when it is a COMPLETE, NOT-STALE attribution:
+        //     the full client+device+tab triple is present
+        //     (`advances_attribution`, focused-ep4-r3 finding 2) AND the
+        //     stamps' `asserted_at` is >= the row's current
+        //     `last_attributed_at` (finding 1; the exact tie replaces,
+        //     keeping semantics deterministic). The assertion time is
+        //     captured at message RECEIPT — before gated/async create/fork
+        //     work — so an older delayed write can land AFTER a newer
+        //     assertion for the same session; without the guard it would
+        //     drag stamps+time back to the older tab/moment.
+        // * A `Replace` that fails its gate (hollow stamps on a
+        //   never-attributed row, or a partial/older assertion over an
+        //   attributed one) leaves stamps+time UNTOUCHED while the write's
+        //   other fields still land. The pre-finding-2 per-field
+        //   keep-when-`None` merge is gone: it mixed marker/write and row
+        //   stamps into combinations no single browser assertion ever made.
+        // * `Clear` (explicitly-headless lineage lane): the row's IDENTITY
+        //   stamps are erased, so a stale browser attribution can never
+        //   launder the row into the D8 offer under a refreshed `updated_at`
+        //   — but the attribution CLOCK is FLOORED, never erased
+        //   (focused-ep4-r5 Finding 2): `last_attributed_at` becomes
+        //   `max(existing, clear_now)`, so a delayed pre-Clear assertion can
+        //   never pass a no-prior-attribution arm and resurrect the cleared
+        //   stamps. The row stays unofferable while the stamps are `None`
+        //   (the judgment gates on the stamps first).
         //
         // The advancing TIME is the stamps' own `asserted_at` — the
         // provenance value's assertion time since message receipt
@@ -689,13 +757,20 @@ impl PaneLedger {
         // `updated_at` churn did. DELIBERATELY unlike this body's other
         // advisory fields (`create_request_id`), which are
         // wholesale-replaced.
-        let advance = match w.provenance {
-            ProvenancePolicy::Replace(stamps) => {
-                advances_attribution(&w.provenance)
-                    && existing
-                        .and_then(|r| r.last_attributed_at)
-                        .is_none_or(|t| stamps.asserted_at >= t)
-            }
+        //
+        // The monotonic compare is WALL-CLOCK: after a backward server-clock
+        // step a genuinely-later assertion compares as older and is rejected
+        // for up to the skew magnitude (until real time outruns the stored
+        // value) — the same bounded-skew class as the evidence-clock
+        // residual (`UNSNAPSHOTTED_BINDING_GRACE_MS` in
+        // `recovery_inventory.rs`), and a sequence counter is deliberately
+        // NOT built for it (focused-ep4-r5 Finding 2a).
+        let prior_attribution = existing.and_then(|r| r.last_attributed_at);
+        let apply = match w.provenance {
+            ProvenancePolicy::Replace(stamps) => match prior_attribution {
+                None => attaches_attribution(&w.provenance),
+                Some(t) => advances_attribution(&w.provenance) && stamps.asserted_at >= t,
+            },
             _ => false,
         };
         let (client_instance_id, device_id, tab_key, last_attributed_at) = match w.provenance {
@@ -706,12 +781,12 @@ impl PaneLedger {
                 existing.and_then(|r| r.last_attributed_at),
             ),
             ProvenancePolicy::Replace(stamps) => {
-                if advance {
+                if apply {
                     (
                         stamps.client_instance_id.map(str::to_string),
                         stamps.device_id.map(str::to_string),
                         stamps.tab_key.map(str::to_string),
-                        Some(stamps.asserted_at),
+                        applied_attribution_time(stamps.asserted_at),
                     )
                 } else {
                     (
@@ -722,7 +797,12 @@ impl PaneLedger {
                     )
                 }
             }
-            ProvenancePolicy::Clear => (None, None, None, None),
+            ProvenancePolicy::Clear => (
+                None,
+                None,
+                None,
+                Some(prior_attribution.map_or(w.now_ms, |t| t.max(w.now_ms))),
+            ),
         };
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
@@ -833,7 +913,8 @@ impl PaneLedger {
             .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
         // Provenance writer rules (the SAME atomic, MONOTONE attribution fact
         // as the terminal body — focused-ep4-r3 Findings 1+2, one shared
-        // `advances_attribution`; the tri-state is delta-r2 Finding 2):
+        // `attaches_attribution`/`advances_attribution` pair; the tri-state
+        // is delta-r2 Finding 2):
         //
         // * `Inherit` asserts nothing — conn-less refresh lanes keep the
         //   create's stamps AND time; a fork-chain first write
@@ -843,23 +924,39 @@ impl PaneLedger {
         //   construction, the same pane; the ep4-r1 repair deleted the
         //   judgment's `created_at` floor that once made an inherited older
         //   value unusable).
-        // * `Replace` APPLIES its whole provenance — stamps AND time — only
-        //   on a COMPLETE (full triple, finding 2), NOT-STALE
+        // * `Replace` splits on whether the preserve source HAS a prior
+        //   attribution (focused-ep4-r5 Finding 1): ATTACH (none) applies
+        //   whatever MEANINGFUL provenance exists — client+device, plus the
+        //   tab and the assertion time when present (no triple requirement,
+        //   so a legacy client's create/fork — `FreshAgentFork.tab_id` is
+        //   additive/optional — no longer leaves the child attribution-less);
+        //   ADVANCE (a prior time exists) applies stamps AND time only on a
+        //   COMPLETE (full triple, finding 2), NOT-STALE
         //   (`asserted_at >= the preserved attribution time`, exact tie
         //   replaces — finding 1) attribution; otherwise stamps+time stay
         //   with the preserve source while the write's settings/row-keeping
         //   fields still land.
-        // * `Clear` (explicitly-headless lineage) erases all stamps AND the
-        //   time and NEVER inherits — a headless re-bind must not keep a
-        //   browser's attribution under a refreshed `updated_at`, or the D8
-        //   judgment would offer a session that was not open.
+        // * `Clear` (explicitly-headless lineage) erases all stamps and
+        //   NEVER inherits the parent's stamps — a headless re-bind must not
+        //   keep a browser's attribution under a refreshed `updated_at`, or
+        //   the D8 judgment would offer a session that was not open. The
+        //   attribution CLOCK is FLOORED, not erased (focused-ep4-r5 Finding
+        //   2): `last_attributed_at` becomes `max(preserved, clear_now)`, so
+        //   a delayed pre-Clear assertion can never resurrect the cleared
+        //   stamps; the row stays unofferable while they are `None`.
         //
         // The preserve/monotonicity source is the merge's `inherit` — the
         // same-key existing row, else the superseded PARENT on a fork-chain
         // first write — so a supersession chain's true assertion time also
         // bounds any later-arriving older write. The advancing time is the
         // stamps' own `asserted_at` (focused-ep4-r2 Findings 1+2), never this
-        // conn-less-or-late write's `now_ms`. The retire/link below is
+        // conn-less-or-late write's `now_ms`; the `Clear` floor IS this
+        // write's `now` (a clear asserts nothing about the browser — its own
+        // time is the floor). The monotonic compare is WALL-CLOCK: after a
+        // backward server-clock step a genuinely-later assertion can be
+        // rejected for up to the skew magnitude — the bounded-skew residual
+        // documented in the terminal body (focused-ep4-r5 Finding 2a); no
+        // sequence counter is built for it. The retire/link below is
         // unchanged by the policy; this block is stamps+time only.
         let superseded_parent = w
             .supersedes
@@ -871,13 +968,12 @@ impl PaneLedger {
                     .cloned()
             });
         let inherit = existing.or(superseded_parent.as_ref());
-        let advance = match w.provenance {
-            ProvenancePolicy::Replace(stamps) => {
-                advances_attribution(&w.provenance)
-                    && inherit
-                        .and_then(|r| r.last_attributed_at)
-                        .is_none_or(|t| stamps.asserted_at >= t)
-            }
+        let prior_attribution = inherit.and_then(|r| r.last_attributed_at);
+        let apply = match w.provenance {
+            ProvenancePolicy::Replace(stamps) => match prior_attribution {
+                None => attaches_attribution(&w.provenance),
+                Some(t) => advances_attribution(&w.provenance) && stamps.asserted_at >= t,
+            },
             _ => false,
         };
         let (client_instance_id, device_id, tab_key, last_attributed_at) = match w.provenance {
@@ -888,12 +984,12 @@ impl PaneLedger {
                 inherit.and_then(|r| r.last_attributed_at),
             ),
             ProvenancePolicy::Replace(stamps) => {
-                if advance {
+                if apply {
                     (
                         stamps.client_instance_id.map(str::to_string),
                         stamps.device_id.map(str::to_string),
                         stamps.tab_key.map(str::to_string),
-                        Some(stamps.asserted_at),
+                        applied_attribution_time(stamps.asserted_at),
                     )
                 } else {
                     (
@@ -904,7 +1000,12 @@ impl PaneLedger {
                     )
                 }
             }
-            ProvenancePolicy::Clear => (None, None, None, None),
+            ProvenancePolicy::Clear => (
+                None,
+                None,
+                None,
+                Some(prior_attribution.map_or(w.now_ms, |t| t.max(w.now_ms))),
+            ),
         };
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
@@ -1257,21 +1358,27 @@ impl PaneLedger {
         let mut index = self.guard();
         // Delta-r3 Finding 2 + focused-ep3-r2 Finding 2 provenance precedence
         // on the marker→binding transition: the resolve's OWN meaningful
-        // policy wins (`Replace` asserts, `Clear` erases). A conn-less
+        // policy wins (`Replace` asserts, `Clear` erases the stamps and
+        // floors the clock). A conn-less
         // `Inherit` resolve instead derives the ORIGIN lane's policy from the
         // consumed marker, exactly the way the origin's direct writes express
         // it:
         //   * a marker carrying ANY spawn-time stamp → `Replace(stamps)` —
         //     the conn-less SESSION-AFFILIATED source rule: the derived
-        //     stamps ride the same atomic attribution rule as any other
-        //     `Replace` — a FULL marker triple applies wholesale (subject to
-        //     the focused-ep4-r3 Finding 1 monotonicity guard), a partial one
-        //     leaves the row's existing attribution untouched;
+        //     stamps ride the same two-tier attribution rule as any other
+        //     `Replace` — with NO prior attribution a MEANINGFUL
+        //     (client+device) marker ATTACHES (a legacy client creates such
+        //     tab-less markers; focused-ep4-r5 Finding 1); over an existing
+        //     attribution a FULL marker triple advances (subject to the
+        //     focused-ep4-r3 Finding 1 monotonicity guard) and a weaker one
+        //     leaves the row's attribution untouched;
         //   * an ALL-NONE marker → `Clear` — the HEADLESS origin record:
         //     the explicitly-headless REST/headless lineage binder stamps
         //     nothing by design (`pane_identity_binder.rs`, whose direct
         //     writes are `Clear`), so resolution must AGREE with that lane —
-        //     stamps → `None` regardless of the marker and the existing row.
+        //     stamps → `None` regardless of the marker and the existing row,
+        //     and the attribution clock floors at `max(existing, resolve_now)`
+        //     (focused-ep4-r5 Finding 2).
         //     Keeping them (`Replace(all-None)` ≡ `Inherit`) laundered a
         //     previously browser-stamped row under a refreshed `updated_at`
         //     when a dynamically-identified headless terminal resolved onto
@@ -1563,7 +1670,9 @@ pub(crate) async fn ledger_resolve_identity(
             // 2) `resolve_pending` additionally sources the consumed marker's
             // spawn-time stamps, so a dynamically-identified pane whose marker
             // the connection-scoped create stamped is STILL attributable here
-            // (no existing row would otherwise exist to inherit from), while
+            // (no existing row would otherwise exist to inherit from — a
+            // tab-less legacy marker now ATTACHES its client+device under the
+            // focused-ep4-r5 Finding 1 rule), while
             // (focused-ep3-r2 Finding 2) an unstamped — headless — marker
             // derives `Clear`, so the same resolution can never launder a
             //     stale browser attribution. Focused-ep4-r2 Findings 1+2 (as

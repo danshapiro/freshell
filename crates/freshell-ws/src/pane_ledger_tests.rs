@@ -243,8 +243,10 @@ fn headless_clear_rebind_erases_the_browser_stamps() {
     assert_eq!(row.device_id, None, "Clear erases the deviceId");
     assert_eq!(row.tab_key, None, "Clear erases the tabKey");
     assert_eq!(
-        row.last_attributed_at, None,
-        "Clear erases the attribution time too (unattributed wholesale)"
+        row.last_attributed_at,
+        Some(5_000),
+        "focused-ep4-r5 Finding 2: Clear RAISES the attribution floor \
+         (max(1_000, clear_now = 5_000)) — it never erases the clock"
     );
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
     assert_eq!(row.updated_at, 5_000, "updated_at still refreshes (rewritten, unattributed)");
@@ -332,7 +334,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
     // Delta-r2 Finding 2, fresh-agent body: `Clear` erases the row's stamps
     // wholesale, and a Clear fork-chain write (`supersedes: Some(parent)`)
     // must NOT inherit the superseded parent's stamps either — inheritance is
-    // a conn-less-session-affiliated-lane behavior only.
+    // a conn-less-session-affiliated-lane behavior only. (Focused-ep4-r5
+    // Finding 2: erasing the stamps no longer erases the attribution CLOCK —
+    // `Clear` raises `last_attributed_at` to `max(prior, clear_now)`, carried
+    // through the fork chain's `inherit` source like every other preserve.)
     let root = temp_root("fa-prov-clear");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -356,12 +361,15 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
     assert_eq!(
-        row.last_attributed_at, None,
-        "Clear erases the attribution time too"
+        row.last_attributed_at,
+        Some(2_000),
+        "focused-ep4-r5 Finding 2: Clear raises the attribution floor \
+         (max(1_000, clear_now = 2_000)) — the clock is floored, not erased"
     );
     assert_eq!(row.updated_at, 2_000, "updated_at refreshes; the stamps are gone");
 
-    // Fork-chain arm: Clear + supersedes -> no parent inheritance.
+    // Fork-chain arm: Clear + supersedes -> no parent STAMP inheritance (the
+    // attribution FLOOR carries through the chain: max(parent_floor, now)).
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("sess-1"),
@@ -369,6 +377,18 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
             ..fa_write("claude", "sess-2", 3_000)
         })
         .unwrap();
+    let sess2 = ledger
+        .load_binding("claude", "sess-2")
+        .expect("cleared child");
+    assert_eq!(
+        sess2.client_instance_id, None,
+        "Clear never inherits a parent stamp"
+    );
+    assert_eq!(
+        sess2.last_attributed_at,
+        Some(3_000),
+        "the floor rises to the child's own clear, bounded below by the parent's floor"
+    );
     // Re-stamp the parent AFTER its retirement shape does not matter: seed a
     // fresh stamped parent and a Clear child instead, to pin inheritance-off.
     ledger
@@ -392,6 +412,11 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
     assert_eq!(child.client_instance_id, None, "Clear never inherits the superseded parent");
     assert_eq!(child.device_id, None);
     assert_eq!(child.tab_key, None);
+    assert_eq!(
+        child.last_attributed_at,
+        Some(5_000),
+        "the child floor is max(parent attribution 4_000, clear_now 5_000)"
+    );
     let parent = ledger.load_binding("claude", "sess-3").expect("parent row");
     assert_eq!(parent.state, RowState::Retired, "supersession mechanics unchanged");
     std::fs::remove_dir_all(&root).ok();
@@ -614,12 +639,19 @@ fn attributed_rebind_advances_the_attribution_time() {
 }
 
 #[test]
-fn headless_clear_erases_the_attribution_time_too() {
-    // `Clear` makes the row unattributed wholesale — stamps AND their time.
+fn headless_clear_erases_the_stamps_and_raises_the_attribution_floor() {
+    // Focused-ep4-r5 Finding 2 (renamed from
+    // `headless_clear_erases_the_attribution_time_too` — the flip the finding
+    // mandates): `Clear` erases the IDENTITY stamps — the row is then
+    // unattributed wholesale and unofferable while they are `None` — but it
+    // RAISES the attribution-clock floor to `max(existing, clear_now)`, so a
+    // delayed pre-Clear assertion can never pass an absent-time arm and
+    // resurrect the cleared stamps.
     let root = temp_root("attr-time-clear");
     let ledger = PaneLedger::new(Some(root.clone()));
+    // Arm 1: the ordinary ordering — the clear postdates the attribution.
     ledger
-        .record_binding(&write_provenance(
+        .record_binding(&write_provenance_at(
             "codex",
             "th-1",
             "t1",
@@ -627,6 +659,7 @@ fn headless_clear_erases_the_attribution_time_too() {
             Some("client-1"),
             Some("device-1"),
             Some("device-1:tab-1"),
+            1_000,
         ))
         .unwrap();
     ledger
@@ -640,11 +673,44 @@ fn headless_clear_erases_the_attribution_time_too() {
         .unwrap();
     let row = ledger.load_binding("codex", "th-1").unwrap();
     assert_eq!(row.client_instance_id, None);
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
     assert_eq!(
-        row.last_attributed_at, None,
-        "an unattributed row carries no attribution time"
+        row.last_attributed_at,
+        Some(5_000),
+        "the floor rises to the clear's time: max(1_000, clear_now = 5_000)"
     );
     assert_eq!(row.updated_at, 5_000, "still rewritten, just unattributed");
+    // Arm 2: a clear whose WRITE lands late (clear_now < the row's recorded
+    // attribution) — the floor is the MAX, never dragged down.
+    ledger
+        .record_binding(&write_provenance_at(
+            "codex",
+            "th-2",
+            "t1",
+            5_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            5_000,
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_with_policy(
+            "codex",
+            "th-2",
+            "t2",
+            2_000,
+            ProvenancePolicy::Clear,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-2").unwrap();
+    assert_eq!(row.client_instance_id, None);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "a late-landing clear never drags the floor down"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -652,17 +718,23 @@ fn headless_clear_erases_the_attribution_time_too() {
 fn weak_replace_leaves_the_attribution_fact_untouched() {
     // Focused-ep4-r3 Finding 2 (renamed from
     // `hollow_replace_never_advances_the_attribution_time` — the flip the
-    // finding mandates): the attribution fact (stamps+time) is ATOMIC and
-    // moves only on a FULL client+device+tab triple. A partial `Replace` —
-    // a half-initialized hello, a legacy client that cannot compose tabId —
-    // no longer merges its `Some` fields piecemeal: that produced
-    // client/device/tab combinations NO single browser assertion ever made,
-    // and (under the pre-fix predicate) refreshed the attribution time
-    // against the row's kept, stale tab.
+    // finding mandates): the attribution fact (stamps+time) is ATOMIC. A
+    // partial `Replace` no longer merges its `Some` fields piecemeal: that
+    // produced client/device/tab combinations NO single browser assertion
+    // ever made, and (under the pre-fix predicate) refreshed the attribution
+    // time against the row's kept, stale tab. Since focused-ep4-r5 Finding 1
+    // the two gates are ATTACH (no prior attribution — needs exactly the
+    // meaningful client+device halves; a legacy tab-less create/fork uses
+    // this lane) and ADVANCE (a prior attribution exists — the full
+    // client+device+tab triple with a not-older assertion, the finding-2
+    // rule). The arms below fail BOTH (arm 1: half-initialized hello misses
+    // device — nothing to attach; arm 2: a hollow re-assert over an
+    // attributed row — nothing to advance into).
     let root = temp_root("attr-time-hollow");
     let ledger = PaneLedger::new(Some(root.clone()));
     // Arm 1: a partial Replace onto a FRESH row leaves it FULLY unattributed
-    // (stamps+time untouched — there is no attribution to advance).
+    // (client without device is not MEANINGFUL — there is no attribution to
+    // advance and nothing complete enough to attach).
     ledger
         .record_binding(&write_provenance(
             "codex",
@@ -1388,6 +1460,345 @@ fn fresh_agent_legacy_reassert_missing_tab_never_touches_the_attribution() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// ── Focused-ep4-r5 Finding 1: provenance ATTACH needs no tab — the full ────
+// triple gates only ADVANCE. A legacy client (`freshAgent.create`/
+// `freshAgent.fork.tabId` are additive/optional, so older clients omit the
+// tab) still composes client+device+assertion-time from its hello identity
+// and the message receipt; when NO prior attribution exists (a fresh row, or
+// a row whose lanes never stamped one — e.g. a conn-less-spawned fork parent)
+// that provenance ATTACHES as-is, tab `None` and all. Without the attach half
+// a genuinely-open legacy pane was born with no attribution at all and so was
+// unrecoverable wholesale. The atomic+monotone full-triple regime (focused-
+// ep4-r3 Findings 1+2) gates only ADVANCING an existing attribution — the
+// legacy re-assert pins above stay exactly as they are and stay green.
+
+#[test]
+fn legacy_create_attaches_client_device_and_the_assertion_time_without_a_tab() {
+    // Terminal body: a legacy client's create carries client+device (its
+    // hello identity) and a receipt-time assertion, but no tabKey — the wire
+    // field is additive/optional. On a FRESH row that weaker value ATTACHES
+    // (there is no prior attribution to preserve or advance): the row records
+    // exactly what the provenance asserts — client+device+the assertion time,
+    // tab None.
+    let root = temp_root("attr-attach-legacy-create");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "codex",
+            "sess-1",
+            "t1",
+            1_000,
+            Some("client-legacy"),
+            Some("device-1"),
+            None,
+            1_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "sess-1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-legacy"));
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(
+        row.tab_key, None,
+        "the legacy client never composed a tab: attach records what exists, nothing more"
+    );
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the assertion time attaches with the stamps"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_legacy_create_and_fork_attach_their_provenance_without_a_tab() {
+    // The finding's exact lane (fresh-agent body): `FreshAgentFork.tab_id` is
+    // additive/optional, so a legacy client create/fork composes
+    // client+device+the receipt-time assertion and NO tab.
+    //  * create arm — a fresh row attaches the weaker value;
+    //  * fork arm — the fork-chain first write (no same-key row) attaches the
+    //    child even though an `inherit` source exists: the conn-less-spawned
+    //    parent was never attributed (its `Inherit` write asserted nothing),
+    //    so there is NO prior attribution to preserve or advance.
+    let root = temp_root("attr-attach-fa-legacy");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "opencode",
+            "ses_1",
+            1_000,
+            Some("client-legacy"),
+            Some("device-1"),
+            None,
+            1_000,
+        ))
+        .unwrap();
+    let created = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(created.client_instance_id.as_deref(), Some("client-legacy"));
+    assert_eq!(created.device_id.as_deref(), Some("device-1"));
+    assert_eq!(created.tab_key, None);
+    assert_eq!(created.last_attributed_at, Some(1_000));
+    // Fork arm: the never-attributed parent (a conn-less `Inherit` write on a
+    // fresh row asserts nothing), then the legacy fork binding the child.
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "ses_parent", 500))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            supersedes: Some("ses_parent"),
+            ..fa_write_provenance_at(
+                "claude",
+                "ses_child",
+                2_000,
+                Some("client-legacy"),
+                Some("device-1"),
+                None,
+                2_000,
+            )
+        })
+        .unwrap();
+    let child = ledger.load_binding("claude", "ses_child").unwrap();
+    assert_eq!(child.client_instance_id.as_deref(), Some("client-legacy"));
+    assert_eq!(child.device_id.as_deref(), Some("device-1"));
+    assert_eq!(child.tab_key, None);
+    assert_eq!(
+        child.last_attributed_at,
+        Some(2_000),
+        "the fork child's row attaches the legacy provenance (the parent had none to preserve)"
+    );
+    assert_eq!(
+        ledger
+            .load_binding("claude", "ses_parent")
+            .unwrap()
+            .last_attributed_at,
+        None,
+        "the conn-less-spawned (never-stamped) parent stays attribution-less"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn legacy_marker_resolution_attaches_client_device_when_no_prior_attribution_exists() {
+    // The marker lane rides the SAME attach rule: a legacy client's
+    // connection-scoped create records client+device (+the assertion) on the
+    // pending marker (no tabKey composed), and the conn-less identity
+    // resolution derives the origin lane's `Replace` from it. With no prior
+    // attribution that derived (weaker) provenance ATTACHES — the row is no
+    // longer born attribution-less.
+    let root = temp_root("attr-attach-marker-legacy");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            ProvenanceStamps {
+                client_instance_id: Some("client-legacy"),
+                device_id: Some("device-1"),
+                tab_key: None,
+                asserted_at: 1_000,
+            },
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-legacy"));
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(1_000),
+        "the marker-derived attach attributes at the marker's assertion, not the resolve"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ── Focused-ep4-r5 Finding 2: `Clear` RAISES the attribution floor — it ────
+// never erases it. Erasing the time let a DELAYED pre-`Clear` assertion pass
+// the absent-prior-time arm and resurrect the cleared stamps wholesale. The
+// row's `last_attributed_at` after a `Clear` is `max(existing, clear_now)`;
+// the identity stamps still clear, and the row stays unofferable while they
+// are `None` (the D8 judgment gates on the stamps first). The monotonic
+// compare then rejects the delayed assertion exactly like any other older
+// one.
+
+#[test]
+fn clear_raises_the_attribution_floor_so_a_delayed_pre_clear_assertion_never_resurrects_the_stamps()
+{
+    // Terminal body: browser-stamped row, a headless Clear, then the delayed
+    // gated create whose provenance was captured BEFORE the Clear landing
+    // after it.
+    let root = temp_root("attr-clear-floor");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance_at(
+            "codex",
+            "sess-1",
+            "t1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_with_policy(
+            "codex",
+            "sess-1",
+            "t2",
+            5_000,
+            ProvenancePolicy::Clear,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "sess-1").unwrap();
+    assert_eq!(
+        row.client_instance_id, None,
+        "Clear still erases the identity stamps"
+    );
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "Clear RAISES the attribution floor (max(existing, clear_now)), never erases it"
+    );
+    // The assertion captured at 4_000 — BEFORE the Clear — lands at 6_000:
+    // the floor rejects it exactly like any older assertion.
+    ledger
+        .record_binding(&write_provenance_at(
+            "codex",
+            "sess-1",
+            "t3",
+            6_000,
+            Some("client-stale"),
+            Some("device-1"),
+            Some("device-1:tab-9"),
+            4_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "sess-1").unwrap();
+    assert_eq!(
+        row.client_instance_id, None,
+        "a delayed pre-Clear assertion never resurrects the cleared stamps"
+    );
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    assert_eq!(row.last_attributed_at, Some(5_000), "the floor holds");
+    assert_eq!(
+        row.live_terminal_id.as_deref(),
+        Some("t3"),
+        "the write's other fields still land (row-keeping is not attribution)"
+    );
+    assert_eq!(row.updated_at, 6_000);
+    // A genuinely POST-clear assertion is simply newer: it advances normally.
+    ledger
+        .record_binding(&write_provenance_at(
+            "codex",
+            "sess-1",
+            "t4",
+            7_000,
+            Some("client-live"),
+            Some("device-1"),
+            Some("device-1:tab-7"),
+            6_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "sess-1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-live"));
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-7"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(6_000),
+        "a post-clear assertion attaches/advances normally"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_assertions() {
+    // Fresh-agent mirror (the body's Clear arm + the inherit-sourced floor):
+    // same floor-raise, same delayed-assertion rejection, with the settings
+    // snapshot still landing on every write.
+    let root = temp_root("fa-attr-clear-floor");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "opencode",
+            "ses_1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            1_000,
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provenance: ProvenancePolicy::Clear,
+            ..fa_write("opencode", "ses_1", 5_000)
+        })
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(row.client_instance_id, None);
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(5_000),
+        "the floor rises to the clear"
+    );
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            model: Some("m-stale"),
+            ..fa_write_provenance_at(
+                "opencode",
+                "ses_1",
+                6_000,
+                Some("client-stale"),
+                Some("device-1"),
+                Some("device-1:tab-9"),
+                4_000,
+            )
+        })
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(
+        row.client_instance_id, None,
+        "a delayed pre-Clear assertion never resurrects the cleared stamps"
+    );
+    assert_eq!(row.last_attributed_at, Some(5_000), "the floor holds");
+    assert_eq!(
+        row.model.as_deref(),
+        Some("m-stale"),
+        "the settings snapshot still lands — only the attribution is gated"
+    );
+    assert_eq!(row.updated_at, 6_000);
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance_at(
+            "opencode",
+            "ses_1",
+            7_000,
+            Some("client-live"),
+            Some("device-1"),
+            Some("device-1:tab-7"),
+            6_000,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_1").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-live"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-7"));
+    assert_eq!(
+        row.last_attributed_at,
+        Some(6_000),
+        "a post-clear assertion advances"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn marker_sourced_resolution_never_drags_a_newer_attribution_back() {
     // Focused-ep4-r3 Finding 1, marker arm — CLOSES the ep4-r2 documented
@@ -2028,8 +2439,11 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     // WITHOUT stamps (`ProvenanceStamps::default()`), so a resolution whose
     // origin is headless still ends unattributed — the D8 judgment correctly
     // never offers the row. Focused-ep3-r2 Finding 2: an unstamped marker
-    // derives `Clear`; with NO existing row there is nothing to erase, so the
-    // outcome is the same all-`None` it always was.
+    // derives `Clear`; with NO existing row there are no stamps to erase —
+    // and (focused-ep4-r5 Finding 2) the derived `Clear` still raises the
+    // attribution FLOOR to its own time, which never makes the row offerable
+    // (the judgment gates on the stamps first) but does reject any delayed
+    // pre-Clear assertion arriving later.
     let root = temp_root("resolve-headless");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -2043,8 +2457,11 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
     assert_eq!(
-        row.last_attributed_at, None,
-        "headless resolution: no stamps, no attribution time"
+        row.last_attributed_at,
+        Some(2_000),
+        "focused-ep4-r5 Finding 2: the headless resolution floors the attribution \
+         clock at its own time even with no prior attribution — the stamps stay \
+         None, so the row is never offered"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -2096,8 +2513,12 @@ fn resolve_pending_from_a_headless_origin_clears_a_previously_stamped_row() {
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
     assert_eq!(
-        row.last_attributed_at, None,
-        "the attribution time goes with the stamps (the delta-r4 key is cleared too)"
+        row.last_attributed_at,
+        Some(2_000),
+        "focused-ep4-r5 Finding 2: the derived Clear raises the attribution \
+         floor to its own time (max(1_000, 2_000)) — the clock is floored, \
+         not erased, so a delayed pre-Clear assertion can never resurrect \
+         the cleared stamps"
     );
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
     assert_eq!(row.updated_at, 2_000, "updated_at still refreshes");
@@ -2153,7 +2574,12 @@ fn resolve_pending_clear_wins_over_a_stamped_marker() {
     assert_eq!(row.client_instance_id, None, "Clear erases browser stamps");
     assert_eq!(row.device_id, None);
     assert_eq!(row.tab_key, None);
-    assert_eq!(row.last_attributed_at, None, "Clear erases the attribution time");
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "focused-ep4-r5 Finding 2: Clear raises the attribution floor \
+         (max(500, clear_now = 2_000)) — never erases the clock"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
