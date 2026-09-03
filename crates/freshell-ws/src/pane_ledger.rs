@@ -176,7 +176,12 @@ pub struct BindingRow {
     /// resolution-time birth for marker-derived rows, fork-time birth for
     /// fork children — so neither may floor the judgment. Serde-optional
     /// under LEDGER_VERSION 1 (the client/device/tab field precedent):
-    /// pre-delta-r4 rows parse to `None` and keep the creation-time key.
+    /// pre-delta-r4 rows parse to `None` — and `None` is fatal to the offer
+    /// (focused-ep4-r4 Finding 1): stamps and this field were introduced
+    /// together in the branch, so a stamped-but-fieldless row can only be an
+    /// intermediate-branch-build artifact (whose `created_at` can be
+    /// invented late); the judgment has NO creation-time fallback and
+    /// excludes such rows exactly like unattributed ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attributed_at: Option<i64>,
 }

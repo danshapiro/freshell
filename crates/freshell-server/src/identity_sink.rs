@@ -202,9 +202,11 @@ impl PaneIdentitySink for LedgerIdentitySink {
             tab_key: row.tab_key,
             // Focused-ep4-r2 Findings 1+2: the row read re-arms the value with
             // its row-recorded assertion time so a re-parked/fork-resolved
-            // value keeps the ROW's attribution (`last_attributed_at`; the
-            // D8 fallback `created_at` for a stamped pre-delta-r4 row), never
-            // this read's wall clock.
+            // value keeps the ROW's attribution (`last_attributed_at`;
+            // `created_at` only when the field is absent — defensive coverage
+            // for intermediate-branch-build rows, since the D8 judgment
+            // (focused-ep4-r4 Finding 1) has no `created_at` fallback and
+            // never offers such a row as-is), never this read's wall clock.
             asserted_at: row.last_attributed_at.unwrap_or(row.created_at),
         };
         // An all-`None` STAMPS answer is information-free — never returned as

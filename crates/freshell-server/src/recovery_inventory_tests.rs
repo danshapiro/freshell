@@ -951,6 +951,259 @@ fn backward_clock_step_cannot_drop_a_kill_window_row() {
     );
 }
 
+// ── Focused-ep4-r4 Finding 2: the per-parent evidence clock is the FRESHEST ──
+// assertion of the final revision (the LAST matching entry in push order),
+// never a capturedAt-max over the retained entries at that revision. A
+// retained pre-clock-step entry at the SAME final revision pins a
+// capturedAt-max HIGH until retention rotates it out, false-dropping
+// kill-window rows in the interim.
+
+/// Generations fixture for the skew scenario: one client, push order.
+fn skew_gen(id: &str, client: &str, revision: i64, captured_at: u64) -> serde_json::Value {
+    json!({"generationId": id, "clientInstanceId": client,
+           "snapshotRevision": revision, "capturedAt": captured_at})
+}
+
+#[test]
+fn pinned_high_pre_step_entry_at_the_final_revision_boundedly_extends_the_keep_window() {
+    // THE FINDING (skew, discriminating): the parent's FINAL revision has a
+    // retained PRE-clock-step entry (capturedAt 1_000_000) AND post-step
+    // pushes (950_000, then the freshest 960_000). The freshest assertion of
+    // the final revision (the LAST matching entry in push order) is
+    // 960_000 — a capturedAt-max would instead answer the pinned 1_000_000
+    // until retention rotates it out.
+    //
+    // The row was attributed at 990_000 (grace horizon 997_000): the freshest
+    // post-step assertion (960_000) cannot yet prove its absence — across the
+    // skew the comparison extends the keep window by up to the skew magnitude
+    // (the documented residual). The max-keyed clock instead answers the
+    // pinned 1_000_000 and DROPS the row immediately (997_000 < 1_000_000) —
+    // the interim KEPT judgment below is the discriminating arm.
+    //
+    // Closure: once a post-step push lands past the grace horizon
+    // (998_000 > 997_000 — an older push, pre-step, can never outrun it), the
+    // row is DROPPED — the extension is bounded by the skew, nothing else.
+    //
+    // Frozen mirror: WITHOUT the fresh pushes (evidence frozen at the
+    // pre-step push alone, 1_000_000), a row within grace of it (attributed
+    // at 994_000) can never be dropped — 1_001_000 >= 1_000_000 — the
+    // frozen-evidence keep-side semantics are unchanged (last == max on the
+    // singleton set).
+    let gens = vec![
+        skew_gen("g1", "c1", 2, 1_000_000), // pre-step push, final revision 2
+        skew_gen("g2", "c1", 2, 950_000),   // post-step pushes of revision 2…
+        skew_gen("g3", "c1", 2, 960_000),   // …the freshest assertion, LAST in push order
+    ];
+    let union = || DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let row = || {
+        with_attribution(binding_row_at("claude", "S1", bound(), 990_000), "c1", "d1", "t1")
+    };
+    // boot cutoff above every push: the A16 concurrent-client rule drops nothing.
+    let selection = select_foreign_recent_generation_ids(&gens, "me", 2_000_000);
+    assert_eq!(
+        selection.winner_captured_at_by_client,
+        vec![("c1".to_string(), 960_000u64)],
+        "the evidence clock is the LAST matching entry in push order (the freshest \
+         assertion), never a capturedAt-max pinned high by the pre-step entry"
+    );
+    // Interim: KEPT (dropped by the pre-fix capturedAt-max).
+    let evidence: DeviceEvidence = vec![(
+        "d1".to_string(),
+        selection.winner_captured_at_by_client.clone(),
+    )];
+    let out = build_inventory(vec![union()], vec![row()], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "990_000 + 7_000 >= 960_000: the freshest post-step assertion cannot yet \
+         prove the absence — the keep window extends by up to the skew magnitude"
+    );
+    // Closure: a post-step push past the grace horizon drops the row.
+    let mut gens_closed = gens.clone();
+    gens_closed.push(skew_gen("g4", "c1", 2, 998_000));
+    let selection = select_foreign_recent_generation_ids(&gens_closed, "me", 2_000_000);
+    assert_eq!(
+        selection.winner_captured_at_by_client,
+        vec![("c1".to_string(), 998_000u64)]
+    );
+    let evidence: DeviceEvidence = vec![(
+        "d1".to_string(),
+        selection.winner_captured_at_by_client.clone(),
+    )];
+    let out = build_inventory(vec![union()], vec![row()], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "998_000 > 990_000 + 7_000: once a post-step push outruns the grace \
+         horizon the row is dropped — the extension is bounded"
+    );
+    // Frozen mirror: without the fresh pushes, a within-grace row can never
+    // be dropped (its own row, attributed at 994_000: 1_001_000 >= 1_000_000).
+    let frozen = vec![skew_gen("g1", "c1", 2, 1_000_000)];
+    let selection = select_foreign_recent_generation_ids(&frozen, "me", 2_000_000);
+    assert_eq!(
+        selection.winner_captured_at_by_client,
+        vec![("c1".to_string(), 1_000_000u64)]
+    );
+    let frozen_row = with_attribution(
+        binding_row_at("claude", "S1", bound(), 994_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let evidence: DeviceEvidence = vec![(
+        "d1".to_string(),
+        selection.winner_captured_at_by_client.clone(),
+    )];
+    let out = build_inventory(vec![union()], vec![frozen_row], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "frozen evidence at 1_000_000 keeps a within-grace row unconditionally — \
+         unchanged frozen-evidence semantics"
+    );
+}
+
+#[test]
+fn without_clock_skew_the_last_assertion_equals_the_captured_max() {
+    // No-skew equality pin: clocks monotone => the LAST entry of the final
+    // revision in push order IS its capturedAt-max, so the judgment is
+    // byte-identical to the pre-fix keep/drop matrix. Same-revision entries
+    // in monotone push order (re-delivered pushes re-stamped ascending) plus
+    // an older, filtered-out revision: winner = 1_000_000, and the 993_000 /
+    // 992_999 grace boundary judges exactly as the existing boundary pair.
+    let gens = vec![
+        skew_gen("g0", "c1", 1, 980_000), // older revision: invisible to the winner
+        skew_gen("g1", "c1", 2, 990_000),
+        skew_gen("g2", "c1", 2, 995_000),
+        skew_gen("g3", "c1", 2, 1_000_000), // LAST in push order == capturedAt-max
+    ];
+    let selection = select_foreign_recent_generation_ids(&gens, "me", 2_000_000);
+    assert_eq!(
+        selection.winner_captured_at_by_client,
+        vec![("c1".to_string(), 1_000_000u64)],
+        "monotone clocks: last == max — no-skew judgments are unchanged"
+    );
+    let union = || DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let evidence: DeviceEvidence = vec![(
+        "d1".to_string(),
+        selection.winner_captured_at_by_client.clone(),
+    )];
+    // 993_000 + 7_000 == 1_000_000: the boundary itself is KEPT (existing matrix).
+    let kept = with_attribution(binding_row_at("claude", "S1", bound(), 993_000), "c1", "d1", "t1");
+    let out = build_inventory(vec![union()], vec![kept], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        1,
+        "the in-grace boundary judges exactly as before"
+    );
+    // 992_999 + 7_000 == 999_999 < 1_000_000: one ms outside is dropped.
+    let dropped =
+        with_attribution(binding_row_at("claude", "S2", bound(), 992_999), "c1", "d1", "t1");
+    let out = build_inventory(vec![union()], vec![dropped], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "the out-of-grace boundary judges exactly as before"
+    );
+}
+
+#[test]
+fn skew_correction_is_per_parent_and_the_cross_parent_staleness_max_is_unchanged() {
+    // Two-parent pin (cross-parent max still applied where it exists today):
+    // c1 carries the skew shape (a pinned pre-step entry at its final
+    // revision; freshest post-step assertion 99_960_000) and c2 is
+    // no-skew (99_980_000 — one parent's freshest post-step capture exceeds
+    // the other's). The correction is PER PARENT: c1's evidence key is its
+    // own freshest assertion, c2's is its own — and the A15 staleness rule's
+    // cross-parent device max is computed EXACTLY as today (the raw
+    // capturedAt-max per client): c3, 16 minutes behind the device max, is
+    // staled out of the selection wholesale.
+    let t_high: u64 = 100_000_000;
+    let gens = vec![
+        // c1: pinned pre-step entry at the final revision, then post-step pushes.
+        skew_gen("c1a", "c1", 2, t_high),                    // pre-step (pinned HIGH)
+        skew_gen("c1b", "c1", 2, t_high - 50_000),           // post-step…
+        skew_gen("c1c", "c1", 2, t_high - 40_000),           // …freshest (LAST in push order)
+        // c2: no skew; its freshest (99_980_000) exceeds c1's (99_960_000).
+        skew_gen("c2a", "c2", 3, t_high - 20_000),
+        // c3: 16 min behind the cross-parent max — staled out by A15 (the rule
+        // still reads the raw capturedAt-max, NOT the skew-corrected winner).
+        skew_gen("c3a", "c3", 1, t_high - 16 * 60 * 1000),
+    ];
+    let selection = select_foreign_recent_generation_ids(&gens, "me", t_high + 1);
+    let ids = &selection.selected_ids;
+    assert!(ids.contains(&"c1a".to_string()) && ids.contains(&"c1c".to_string()));
+    assert!(ids.contains(&"c2a".to_string()));
+    assert!(
+        !ids.contains(&"c3a".to_string()),
+        "the A15 staleness rule still applies its cross-parent capturedAt-max: c3 \
+         is staled against c1's raw newest ({t_high}), skew correction notwithstanding"
+    );
+    assert_eq!(
+        selection.winner_captured_at_by_client,
+        vec![
+            ("c1".to_string(), t_high - 40_000),
+            ("c2".to_string(), t_high - 20_000)
+        ],
+        "each parent's evidence clock is corrected independently (last matching \
+         entry in push order); a cross-parent max is never applied to the keys"
+    );
+    // The judgment stays PARENT-RELATIVE: c1's row at t_high-34_000 (grace
+    // horizon t_high-27_000) is kept against c1's own 99_960_000 even though
+    // c2's 99_980_000 EXCEEDS that horizon — a cross-parent max over the
+    // winner keys would drop it.
+    let union = || DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            t_high,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let evidence: DeviceEvidence = vec![(
+        "d1".to_string(),
+        selection.winner_captured_at_by_client.clone(),
+    )];
+    let r1 = with_attribution(
+        binding_row_at("claude", "S1", bound(), (t_high - 34_000) as i64),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let r2 = with_attribution(
+        binding_row_at("claude", "S2", bound(), (t_high - 25_000) as i64),
+        "c2",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(vec![union()], vec![r1, r2], no_live(), &evidence);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        2,
+        "c1's row keeps against c1's own freshest assertion (t_high-34_000 + 7_000 \
+         >= t_high-40_000) — never against c2's higher key — and c2's row keeps \
+         against its own (t_high-25_000 + 7_000 >= t_high-20_000)"
+    );
+}
+
 #[test]
 fn stale_clients_generations_are_dropped() {
     // A15: any client silent >15 min (heartbeat is 5 min) is closed or rotated - drop it.
@@ -1136,13 +1389,22 @@ fn the_judgment_time_is_the_attribution_time_not_the_last_write() {
 }
 
 #[test]
-fn legacy_row_without_attribution_time_keys_on_creation_time() {
-    // Legacy fallback (pre-delta-r4 rows carry no `last_attributed_at` — e.g.
-    // written by a pre-upgrade binary and refreshed by its conn-less
-    // maintenance lanes): the judgment keys on CREATION time. The fixture's
-    // `updated_at` was refreshed into grace by the old server's maintenance
-    // writes — exactly the wild shape the finding names — and must NOT count.
-    let d = DeviceUnion {
+fn stamped_row_without_the_attribution_time_field_is_never_offered() {
+    // Focused-ep4-r4 Finding 1 (the created_at fallback is DELETED): stamps
+    // and `last_attributed_at` were introduced TOGETHER in this branch, so
+    // the only stamped-but-fieldless rows are intermediate-branch-build dev
+    // rows — and those can carry an invented-LATE `created_at` (a
+    // marker-derived row's birth is its conn-less resolution time, long
+    // after the pane closed). Falling back to `created_at` laundered exactly
+    // those rows back into the offer. The attribution-based keep now
+    // requires a PRESENT `last_attributed_at`: a fieldless stamped row is
+    // excluded exactly like an unattributed one — no clock key, no offer, at
+    // ANY `created_at` value.
+    //
+    // Arm 1 — late invented creation (within grace of the frozen evidence
+    // 1_000_000): NOT offered. Pre-fix this arm WAS offered (the fallback
+    // key 995_000 + 7_000 >= 1_000_000) — the finding's exact laundry.
+    let d = || DeviceUnion {
         device_id: "d1".into(),
         union_doc: union_doc_with_tab_key(
             "d1",
@@ -1152,14 +1414,14 @@ fn legacy_row_without_attribution_time_keys_on_creation_time() {
         ),
     };
     let mut row = binding_row_at("claude", "S1", bound(), 995_000);
-    row.created_at = 900_000; // born long before the parent's evidence froze
+    row.created_at = 995_000; // invented at the conn-less resolution, not a birth
     let row = with_attribution(row, "c1", "d1", "t1");
     let row = BindingRow {
-        last_attributed_at: None, // the legacy shape: no attribution-time key
+        last_attributed_at: None, // the intermediate-build shape: stamps, no field
         ..row
     };
     let out = build_inventory(
-        vec![d],
+        vec![d()],
         vec![row],
         no_live(),
         &evidence(&[("d1", &[("c1", 1_000_000)])]),
@@ -1167,8 +1429,46 @@ fn legacy_row_without_attribution_time_keys_on_creation_time() {
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
-        "900_000 + 7_000 < 1_000_000: legacy rows judge on creation time, \
-         never on a maintenance-refreshed updated_at"
+        "a stamped row without `last_attributed_at` is never offered — the \
+         created_at fallback must not launder an invented-late birth"
+    );
+
+    // Arm 2 — very old creation (long out of grace): NOT offered either
+    // (green under both regimes; anchors that arm 1's exclusion — not the
+    // time math — is what does the work).
+    let mut row = binding_row_at("claude", "S2", bound(), 995_000);
+    row.created_at = 900_000;
+    let row = with_attribution(row, "c1", "d1", "t1");
+    let row = BindingRow {
+        last_attributed_at: None,
+        ..row
+    };
+    let out = build_inventory(
+        vec![d()],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "a fieldless stamped row with an old created_at is likewise never offered"
+    );
+
+    // Arm 3 — the OTHER legacy shape: an unattributed row from old servers
+    // (no stamps at all) is NOT offered (`unattributed_rows_are_never_offered`
+    // carries the primary pin; this arm keeps the conjunction in one place:
+    // NEITHER legacy shape is ever offered).
+    let out = build_inventory(
+        vec![d()],
+        vec![binding_row_at("claude", "S3", bound(), 995_000)],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "an unattributed legacy row from old servers is never offered"
     );
 }
 
@@ -2687,7 +2987,8 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
             "ledgerVersion": 1, "provider": "claude", "sessionId": "S1", "mode": "claude",
             "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
             "state": "bound",
-            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9"
+            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+            "lastAttributedAt": 995_000
         }))
         .unwrap(),
     )
@@ -2708,10 +3009,11 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
         .unwrap_or_else(|| {
             panic!("row within grace of its parent's winner must be offered (got {body})")
         });
-    // The seed is DELIBERATELY legacy-shaped (no `lastAttributedAt` — a
-    // pre-delta-r4 row): row_time = createdAt = 994_000, in grace
-    // (994_000 + 7_000 >= 1_000_000), pinning the legacy creation-time key
-    // end to end through the route.
+    // The seed is the CURRENT-writer shape: stamps + `lastAttributedAt`
+    // (stamped rows always carry the field — focused-ep4-r4 Finding 1 deleted
+    // the `created_at` fallback, so the judgment key is 995_000, in grace:
+    // 995_000 + 7_000 >= 1_000_000). The fieldless exclusion is unit-covered
+    // by `stamped_row_without_the_attribution_time_field_is_never_offered`.
     assert_eq!(entry["tabKey"], "dev1:t9");
 }
 

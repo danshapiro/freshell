@@ -15,7 +15,10 @@ pub struct DeviceUnion {
 
 /// One device dir's A15/A16 survivor selection: the retained generation ids
 /// to compose the union from, PLUS each surviving client's revision-first
-/// WINNER generation's capturedAt (the D8 parent-relative judgment input).
+/// WINNER generation's capturedAt (the D8 parent-relative judgment input) —
+/// within the winner's final revision, the capturedAt of the LAST matching
+/// entry in push order (the freshest assertion), never a capturedAt-max
+/// (focused-ep4-r4 Finding 2).
 pub struct ForeignSelection {
     pub selected_ids: Vec<String>,
     /// (client_instance_id, winner capturedAt) per surviving client, sorted
@@ -42,7 +45,18 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// the capturedAt of its REVISION-FIRST winner generation — the same
 /// `generation_rank` ordering the union composition applies — so the judgment
 /// and the offered unions can never disagree about which generation is newest
-/// (a raw capturedAt-max would, after a backward server-clock step).
+/// (a raw capturedAt-max across revisions would, after a backward
+/// server-clock step). Focused-ep4-r4 Finding 2 (skew-safe evidence clock):
+/// WITHIN the final revision the key is the capturedAt of the LAST matching
+/// entry in push order — the freshest assertion — never a capturedAt-MAX
+/// over the retained entries at that revision; a retained pre-step entry at
+/// the same final revision would otherwise pin the clock HIGH until
+/// retention rotated it out. Residual (a reduction, not perfection): during
+/// a backward wall-clock jump the keep window may extend by up to the skew
+/// magnitude — a pre-step attribution compares as within grace until the
+/// parent's post-step pushes outrun row_time + grace — while the fix bounds
+/// a false judgment to the skew instead of letting it ride on a pinned
+/// retained entry.
 ///
 /// The ROW's side of the comparison is its last-attribution time, never its
 /// last write and never its row-creation metadata: delta-r4 Finding 1 —
@@ -63,7 +77,13 @@ const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabR
 /// split the field is dedicated — the `spawned_at` fallback covers
 /// intermediate-build markers). A marker-derived row's `created_at` IS the
 /// resolution time and a fork child's is the fork time, so a `created_at`
-/// floor would re-launder either — see pane_ledger.rs.
+/// floor would re-launder either — see pane_ledger.rs. Focused-ep4-r4
+/// Finding 1 removes the last remnant of that floor: stamps and the field
+/// were introduced TOGETHER in this branch, so a stamped-but-fieldless row
+/// can only be an intermediate-branch-build dev artifact (with a possibly
+/// invented-late `created_at`) — the judgment requires a PRESENT
+/// `last_attributed_at` and excludes such rows exactly like unattributed
+/// ones.
 ///
 /// Placement clause (delta-r2 Finding 3, narrowed by focused-ep2-r1 Finding
 /// 1): a kept row is offered ONLY when its stamped `tabKey` names an OPEN,
@@ -98,8 +118,23 @@ pub fn select_foreign_recent_generation_ids(
     let mut newest_by_client: HashMap<&str, u64> = HashMap::new();
     // Revision-first winner per client — the SAME `generation_rank` ordering
     // the union composition applies, so the D8 evidence can never disagree
-    // with the offered union about which generation is a client's newest
-    // (a raw capturedAt-max would, after a backward server-clock step).
+    // with the offered union about which generation is a client's newest (a
+    // raw capturedAt-max across REVISIONS would, after a backward
+    // server-clock step). Focused-ep4-r4 Finding 2 (skew-safe evidence
+    // clock): WITHIN the final revision, the key is the capturedAt of the
+    // LAST matching entry in push order — the freshest assertion — never a
+    // capturedAt-MAX over the retained entries at that revision. A
+    // pre-clock-step entry retained at the same final revision would
+    // otherwise pin the max HIGH (judging rows against a stale pre-step
+    // assertion) until retention rotated it out. Monotone clocks collapse
+    // last == max so judgments are unchanged outside a backward-step window;
+    // the bounded extension a skewed-low key buys is recorded on the
+    // [`UNSNAPSHOTTED_BINDING_GRACE_MS`] block. Feed-order
+    // note: `read_device_overview`'s meta array orders each client's entries
+    // (revision, capturedAt)-descending, so a final-revision run that MIXES
+    // pre- and post-step entries ends in the LOWEST-stamped (post-step) one;
+    // the run's pre-step entries never win the key, which is exactly the
+    // skew-safety this rule exists for.
     let mut winner_rank_by_client: HashMap<&str, (i64, i64)> = HashMap::new();
     for g in &foreign {
         let c = g["clientInstanceId"].as_str().unwrap_or("");
@@ -113,10 +148,12 @@ pub fn select_foreign_recent_generation_ids(
             *e = t;
         }
         let rank = freshell_ws::tabs_persist::generation_rank(g);
-        let w = winner_rank_by_client
-            .entry(c)
-            .or_insert((i64::MIN, i64::MIN));
-        if rank > *w {
+        let w = winner_rank_by_client.entry(c).or_insert(rank);
+        // Greater revision replaces the winner outright; the SAME revision
+        // replaces it with the LATER array entry (push order — the fresher
+        // assertion). The tuple's capturedAt component then answers the last
+        // entry's stamp, never the run's max.
+        if rank.0 >= w.0 {
             *w = rank;
         }
     }
@@ -773,12 +810,18 @@ pub fn build_inventory(
 /// D8 (restore-open-sessions-only): keep a Bound, unreferenced, not-live row
 /// iff it is ATTRIBUTED (`client_instance_id` && `device_id` present), its
 /// attributed device is the offer's primary device, its attributed client
-/// survives in that device's evidence, the row's LAST-ATTRIBUTION time is
+/// survives in that device's evidence, the row carries a PRESENT
+/// `last_attributed_at` (focused-ep4-r4 Finding 1: no `created_at` fallback
+/// — stamps and the field were introduced together, so a fieldless stamped
+/// row is an intermediate-build artifact with no clock key and is excluded
+/// exactly like an unattributed one) AND that LAST-ATTRIBUTION time is
 /// within [`UNSNAPSHOTTED_BINDING_GRACE_MS`] of that parent's
-/// revision-first-winner capturedAt, AND (delta-r2 Finding 3 +
+/// revision-first-winner capturedAt (the freshest assertion of the parent's
+/// final revision — the LAST matching entry in push order, never a
+/// capturedAt-max; focused-ep4-r4 Finding 2), AND (delta-r2 Finding 3 +
 /// focused-ep2-r1 Finding 1) its stamped `tab_key` names an OPEN, paned tab
 /// in the primary union — the restored-tab set the client joins it into.
-/// Unattributed / non-primary-device / no-surviving-parent /
+/// Unattributed / fieldless / non-primary-device / no-surviving-parent /
 /// unplaceable-tab rows are NEVER offered.
 fn d8_parent_relative_keep(
     r: &BindingRow,
@@ -805,20 +848,28 @@ fn d8_parent_relative_keep(
     else {
         return false; // the row's parent client left no surviving evidence on this device
     };
-    // Delta-r4 Finding 1 + focused-ep4/ep4-r2 findings (judgment-time
+    // Delta-r4 Finding 1 + focused-ep4/ep4-r2/ep4-r4 findings (judgment-time
     // composition): key on the row's last MEANINGFUL browser attribution
-    // (`last_attributed_at`), NEVER `updated_at` — conn-less `Inherit`
-    // upserts refresh `updated_at` without any browser re-asserting the pane,
-    // which parked long-closed detached rows past the frozen parent evidence.
-    // And never `created_at` either: the attribution time is
+    // (`last_attributed_at`) and NOTHING else — NEVER `updated_at`: conn-less
+    // `Inherit` upserts refresh `updated_at` without any browser re-asserting
+    // the pane, which parked long-closed detached rows past the frozen parent
+    // evidence. And never `created_at` either: the attribution time is
     // browser-ASSERTED (carried on the provenance value — a late-landing
     // write records the receipt time, not its own) and authoritative, while
     // `created_at` is row-keeping metadata — for marker-derived rows it IS
     // the conn-less resolution time (potentially long after the pane closed
-    // and the evidence froze), so a `max(created_at)` floor would re-launder
-    // a resolved-after-close pane into the offer.
-    // Legacy rows (pre-delta-r4, field absent) keep the creation-time key.
-    let row_time = r.last_attributed_at.unwrap_or(r.created_at).max(0) as u64;
+    // and the evidence froze), so a `created_at` fallback would re-launder a
+    // resolved-after-close pane into the offer.
+    // Focused-ep4-r4 Finding 1 (no legacy fallback): stamps and the field
+    // were introduced TOGETHER in this branch — a current-writer stamped row
+    // ALWAYS carries it, so the only stamped-but-fieldless rows are
+    // intermediate-branch-build dev rows (whose `created_at` can be invented
+    // late). Such a row has no attribution clock key and is excluded exactly
+    // like an unattributed one.
+    let Some(attributed_at) = r.last_attributed_at else {
+        return false;
+    };
+    let row_time = attributed_at.max(0) as u64;
     if row_time.saturating_add(UNSNAPSHOTTED_BINDING_GRACE_MS) < parent_newest {
         return false; // the parent's evidence already observed the row's absence
     }
