@@ -242,6 +242,34 @@ impl PaneIdentitySink for LedgerIdentitySink {
             .map(|row| row.session_id)
     }
 
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): the
+    /// kill handlers' awaited retire batch — the same awaited-spawn_blocking
+    /// discipline as `record_binding`. Best-effort like every non-rollback
+    /// lane: the caller warn-logs `Err`, never block the kill.
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.retire_closed(&p, &s, now))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    /// The PENDING companion of [`Self::retire_closed`]: delete the pending
+    /// marker. Same awaited-write discipline; a missing marker is `Ok` (the
+    /// ledger's own idempotence).
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = placeholder_id.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
     /// kata 1wxv: await the rollback-record row write BEFORE the provider
     /// mutation runs (durable-BEFORE-mutation; a pre-write failure refuses
     /// the rollback with `LEDGER_WRITE_REFUSAL_COPY`).
@@ -884,6 +912,89 @@ mod tests {
             None
         );
         assert_eq!(sink.lookup_by_create_request_id("codex", "cr-1"), None);
+    }
+
+    /// Retire-on-kill (delta-review round 5): the WS `freshAgent.kill`
+    /// handler body calls `sink.retire_closed` for every durable id the kill
+    /// covers; the sink must reach the REAL pane ledger — a Bound row ends
+    /// Retired with reason `closed` (durable on disk), an unknown or
+    /// already-retired row is an idempotent no-op, and `delete_pending`
+    /// removes a live marker (a kill observed before identity resolution must
+    /// not leave marker-driven evidence behind).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_closed_retires_the_row_and_delete_pending_clears_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "ses-to-kill".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        sink.record_pending("freshopencode-cr-kill", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
+        assert!(
+            ledger
+                .pending_for_terminal("freshopencode-cr-kill")
+                .is_some(),
+            "marker present before the kill"
+        );
+
+        sink.retire_closed("claude", "ses-to-kill")
+            .await
+            .expect("awaited retire succeeds");
+        let row = ledger.load_binding("claude", "ses-to-kill").expect("row");
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Retired);
+        assert_eq!(
+            row.retired_reason,
+            Some(freshell_ws::pane_ledger::RetiredReason::Closed)
+        );
+        // A fresh ledger over the same root sees the retirement (durable, not
+        // just memory) — the recovery inventory reads files at boot.
+        let ledger2 = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            ledger2
+                .load_binding("claude", "ses-to-kill")
+                .expect("row")
+                .state,
+            freshell_ws::pane_ledger::RowState::Retired,
+            "the retirement is durable on disk"
+        );
+
+        // Idempotent: an already-retired row re-retires to Ok, and an unknown
+        // row retires to Ok (a kill for an evicted session still lands).
+        sink.retire_closed("claude", "ses-to-kill")
+            .await
+            .expect("re-retire is an idempotent no-op");
+        sink.retire_closed("claude", "never-existed")
+            .await
+            .expect("unknown id retires to Ok");
+
+        sink.delete_pending("freshopencode-cr-kill")
+            .await
+            .expect("awaited marker delete succeeds");
+        assert!(
+            ledger
+                .pending_for_terminal("freshopencode-cr-kill")
+                .is_none(),
+            "the kill cleared the pending marker"
+        );
+        sink.delete_pending("never-recorded")
+            .await
+            .expect("missing marker deletes to Ok");
     }
 
     /// Task 3 semantics change (`was_recorded` rekeying): a lineage-only

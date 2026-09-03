@@ -32,12 +32,24 @@
  * can never starve a later boot's required offer.
  *
  * Scenario 5 (stale never-open ledger row pin, D8): a freshclaude pane is
- * created, proven snapshot-open, then closed via the PLAIN pane-X — leaving
- * its Bound ledger row unreferenced and never retired. After a server
- * restart the recovery inventory's ledgerOnly bucket (and the offer built
- * from it) must NOT offer that row. RED by design until the server-side
- * parent-relative judgment lands
- * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3).
+ * created, proven snapshot-open, then closed OUTSIDE the judgment's grace
+ * window (a 15s gate) via the PLAIN pane-X — the pane row is left
+ * unreferenced by the newest-per-client union (and, since the retire-on-kill
+ * repair, additionally retired Closed at the kill). After a server restart
+ * the recovery inventory's ledgerOnly bucket (and the offer built from it)
+ * must NOT offer that row. First pinned RED against the pre-judgment blanket
+ * bucket; the parent-relative judgment
+ * (docs/plans/2026-09-02-restore-open-sessions-only.md, Task 3) turned it
+ * GREEN.
+ *
+ * Kill-window pin (delta-review round 5, "retire-on-kill"): a freshclaude
+ * pane is created and closed PROMPTLY (inside the 7s creation-race grace
+ * window — the immediate post-close evidence cannot distinguish "never
+ * snapshotted" from "just closed"), the browser is lost and the server is
+ * SIGKILLed. The explicit freshAgent.kill retires the pane's ledger row
+ * Closed, so the inventory never offers it and accepting the offer never
+ * recreates it. Pinned RED pre-repair: the kill left the row Bound, and
+ * inside the grace window the parent-relative judgment kept it.
  *
  * Fixture shapes (fake CLI, config seeding, shell-picker choreography) are
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
@@ -762,6 +774,226 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   })
 
   /**
+   * Retire-on-kill contract pin (delta-review round 5): a fresh-agent pane
+   * closed INSIDE the 7-second creation-race grace window must never be
+   * offered after a browser loss + server SIGKILL. The window cannot tell
+   * "created, not yet snapshotted" (keep, per the SIGKILL-within-5s
+   * contract) from "created and just closed" — the boundary is exactly the
+   * explicit freshAgent.kill, which now retires the row Closed (the
+   * inventory's ledgerOnly pipeline pre-filters to Bound rows). Pre-repair
+   * the kill left the row Bound with an in-window `lastAttributedAt`, so the
+   * judgment kept it and the accept path rebuilt a pane the user had just
+   * closed — the finding's verbatim failure shape.
+   *
+   * Producer: freshclaude pane split beside the boot shell pane (same donor
+   * shape as the stale-row scenario), closed via the PLAIN pane-X as soon as
+   * its binding row is on disk (well inside the window), then the COMPOUND
+   * loss: browser to about:blank, server SIGKILL+revive. Post-kill evidence
+   * shaping (donor: restore-contract-wall-rust.spec.ts's SIGKILL-within-5s
+   * leg) deletes every retained generation referencing the session — the
+   * within-cadence loss shape, made deterministic — so the row is
+   * unreferenced by construction and reaches the offer pipeline only through
+   * ledgerOnly. Assertions: the row's file records Retired/Closed (soft
+   * precondition — pre-repair this times out and the later offer-side
+   * assertions carry the RED), the probe inventory's ledgerOnly lacks the
+   * session, the offer panel lists no line for its marker cwd, and accepting
+   * restores the surviving shell while NEVER recreating the killed pane.
+   * Placement: second-to-last — the LAST test wipes the evidence base, and
+   * this scenario's own wipe depends on no later state.
+   */
+  test('kill inside the grace window: a just-closed fresh-agent pane is never offered or restored', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000) // create + push poll + abrupt restart + two boots
+
+    // 1. Re-base the evidence base (same justification as the stale-row
+    //    scenario: no client is connected at this serial boundary, so wiping
+    //    the generation store is safe; this scenario's own context rebuilds
+    //    the evidence and keeps the offer recoverable via the surviving
+    //    shell tab).
+    await fs.rm(path.join(capturedHome, '.freshell', 'tabs-snapshots'), { recursive: true, force: true })
+
+    // 2. Context A: boot shell pane, then SPLIT a freshclaude pane beside it.
+    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageA = await ctxA.newPage()
+    const harnessA = await connect(pageA, info)
+    await selectShellIfPickerShowing(pageA)
+    await expect(pageA.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    const tabAId = (await harnessA.getActiveTabId())!
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kill-window-freshclaude-'))
+    await createFreshclaudePane(pageA, harnessA, markerDir)
+
+    // 3. Durable id + binding row on disk (same idioms as the stale-row
+    //    scenario); `attributedAt` is the row's browser-asserted attribution
+    //    time — the judgment's row_time — for the in-window premise read
+    //    below.
+    let killedSessionId = ''
+    await expect
+      .poll(
+        async () => {
+          const c = findFreshAgentLeaf(await harnessA.getPaneLayout(tabAId))?.content
+          killedSessionId = c?.sessionRef?.sessionId ?? c?.resumeSessionId ?? ''
+          return killedSessionId
+        },
+        { timeout: 30_000 },
+      )
+      .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    const rowPath = path.join(
+      capturedHome,
+      '.freshell',
+      'pane-ledger',
+      'bindings',
+      'claude',
+      `${killedSessionId}.json`,
+    )
+    let attributedAt = 0
+    await expect(async () => {
+      const raw = await fs.readFile(rowPath, 'utf8').catch(() => '')
+      expect(raw, 'the freshclaude binding row must land on disk').not.toBe('')
+      const row = JSON.parse(raw) as { lastAttributedAt?: unknown }
+      expect(typeof row.lastAttributedAt, 'row JSON lastAttributedAt (the judgment row_time)').toBe('number')
+      attributedAt = row.lastAttributedAt as number
+    }).toPass({ timeout: 15_000 })
+
+    // 4. Close VIA THE PLAIN pane-X immediately — inside the grace window —
+    //    never shift+close, never the BackgroundSessions Stop button (the
+    //    terminal.kill shape is the other provider family). The shell sibling
+    //    keeps the tab alive, so closePane (not closeTab) fires.
+    await pageA
+      .locator("[data-pane-id][data-context='pane']:has([data-context='fresh-agent']) button[title='Close pane']")
+      .click()
+
+    // 5. SOFT retire-on-kill precondition: the row's file records
+    //    Retired/Closed once the kill is processed. Short-budgeted and
+    //    tolerated on timeout so a pre-repair run still proceeds to the
+    //    offer-side assertions (THE red of the finding); on the repaired
+    //    build this polls true in well under a second.
+    const readRowState = async () => {
+      const raw = await fs.readFile(rowPath, 'utf8').catch(() => '')
+      if (!raw) return ''
+      const row = JSON.parse(raw) as { state?: unknown; retiredReason?: unknown }
+      return row.state === 'retired' && row.retiredReason === 'closed' ? 'closed' : String(row.state ?? '')
+    }
+    await expect(async () => {
+      expect(await readRowState()).toBe('closed')
+    })
+      .toPass({ timeout: 5_000, intervals: [150, 250, 500] })
+      .catch(() => {})
+
+    // 6. The COMPOUND loss: the browser dies FIRST (about:blank — the wall
+    //    spec's determinism note: a surviving page would reconnect and
+    //    force-push its registry after the shaping below), then SIGKILL.
+    await pageA.goto('about:blank')
+    info = await server.restartAbrupt()
+
+    // 7. Post-kill evidence shaping + the IN-WINDOW premise read, in one
+    //    pass (donor: restore-contract-wall-rust.spec.ts SIGKILL-within-5s):
+    //    delete every retained generation referencing the closed session (a
+    //    within-cadence loss; retention prunes them the same way in
+    //    production), require a session-free newest generation per surviving
+    //    client, and require its capturedAt to sit INSIDE the grace window of
+    //    the row's attribution time — otherwise the time-drop clause alone
+    //    would answer the exclusion and every assertion below is vacuous.
+    const snapshotsRoot = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    const newestByClient = new Map<string, { revision: number; capturedAt: number }>()
+    let keptSessionFreeGeneration = false
+    for (const deviceDirName of await fs.readdir(snapshotsRoot).catch(() => [] as string[])) {
+      const deviceDir = path.join(snapshotsRoot, deviceDirName)
+      for (const name of (await fs.readdir(deviceDir)).filter((n) => n.endsWith('.json'))) {
+        const filePath = path.join(deviceDir, name)
+        const raw = await fs.readFile(filePath, 'utf8')
+        if (raw.includes(killedSessionId)) {
+          await fs.rm(filePath)
+          continue
+        }
+        keptSessionFreeGeneration = true
+        let doc: any = null
+        try {
+          doc = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        const client = doc?.clientInstanceId
+        if (typeof client !== 'string' || !client) continue
+        const revision = Number(doc?.snapshotRevision ?? 0)
+        const capturedAt = Number(doc?.capturedAt ?? 0)
+        const cur = newestByClient.get(client)
+        if (!cur || revision > cur.revision || (revision === cur.revision && capturedAt > cur.capturedAt)) {
+          newestByClient.set(client, { revision, capturedAt })
+        }
+      }
+    }
+    expect(
+      keptSessionFreeGeneration,
+      'evidence shaping must leave a session-free generation behind (the shell-pane push)',
+    ).toBe(true)
+    expect(newestByClient.size, 'context A pushed at least one retained generation').toBeGreaterThan(0)
+    for (const [client, newest] of newestByClient) {
+      expect(
+        newest.capturedAt,
+        `client ${client}'s newest retained generation must sit INSIDE the grace window ` +
+          `of the row's attribution (capturedAt=${newest.capturedAt}, lastAttributedAt=${attributedAt}, ` +
+          'grace=7000ms) — otherwise the time-drop clause alone answers the exclusion ' +
+          'and this scenario is vacuous',
+      ).toBeLessThanOrEqual(attributedAt + 7_000)
+    }
+
+    // 8. Inventory assertion via a STANDALONE probe BEFORE any page is opened
+    //    (scenario-5 idiom): membership-absence in ledgerOnly, with the
+    //    bucket-shape anti-vacuity check.
+    const req = await request.newContext({
+      baseURL: info.baseUrl,
+      extraHTTPHeaders: { 'x-auth-token': info.token },
+    })
+    try {
+      const res = await req.get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
+      expect(res.ok(), `inventory probe must succeed (status ${res.status()})`).toBe(true)
+      const body = (await res.json()) as { ledgerOnly?: Array<{ sessionId?: unknown }> }
+      expect(Array.isArray(body.ledgerOnly), 'probe response must carry a ledgerOnly array').toBe(true)
+      expect(
+        (body.ledgerOnly ?? []).every((e) => e.sessionId !== killedSessionId),
+        `killed-in-window ledger row ${killedSessionId} must NOT be present in the inventory's ` +
+          `ledgerOnly bucket (got ${JSON.stringify(body.ledgerOnly)})`,
+      ).toBe(true)
+    } finally {
+      await req.dispose()
+    }
+
+    // 9. Offer assertion: the shell tab survived in the evidence, so the
+    //    offer is REQUIRED; the panel's ledgerOnly lines render
+    //    "{tabName}: {mode} — {cwd}", and the marker cwd must appear on NO
+    //    line.
+    const { ctx: ctxB, page: pageB, harness: harnessB } = await openFreshContextWithOffer(browser, 'kill-window-exclusion')
+    const panel = pageB.getByTestId('recovery-offer-panel')
+    await expect(panel.locator('ul li', { hasText: 'kill-window-freshclaude-' })).toHaveCount(0)
+
+    // 10. Accept: the surviving shell restores (anti-vacuity), and NO leaf
+    //     anywhere carries the killed session — the pane the user closed
+    //     stays closed. (Layout scan has a soft budget: the restore runs
+    //     through the plan rebuild, not instantly.)
+    await pageB.getByTestId('recovery-accept').click()
+    await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    await expect(async () => {
+      const layout = await harnessB.getPaneLayout(await harnessB.getActiveTabId())
+      const walk = (node: any): any[] =>
+        !node ? [] : node.type === 'leaf' ? [node] : (node.children ?? []).flatMap(walk)
+      const hit = walk(layout).some(
+        (leaf) =>
+          leaf?.content?.sessionRef?.sessionId === killedSessionId
+          || leaf?.content?.resumeSessionId === killedSessionId
+          || leaf?.content?.sessionId === killedSessionId,
+      )
+      expect(hit, `no restored pane may carry the killed session ${killedSessionId}`).toBe(false)
+      const shellCount = walk(layout).filter(
+        (leaf) => leaf?.content?.kind === 'terminal' && (leaf?.content?.mode ?? 'shell') === 'shell',
+      ).length
+      expect(shellCount, 'accept must restore the surviving shell (anti-vacuity)').toBeGreaterThan(0)
+    }).toPass({ timeout: 30_000 })
+
+    await ctxB.close()
+    await fs.rm(markerDir, { recursive: true, force: true })
+  })
+
+  /**
    * D8 contract pin: a session that was closed before its client's newest
    * retained snapshot evidence (a stale NEVER-OPEN-at-the-evidence-horizon
    * row) is never offered via the inventory's ledgerOnly bucket. Pinned RED
@@ -773,11 +1005,13 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
    *
    * Producer recipe (validator load-bearing-validator-v1-recipe.md): a
    * freshclaude pane split beside the boot shell pane, closed via the PLAIN
-   * pane-X, sends freshAgent.kill (never terminal.kill), and the fresh-agent
-   * identity sink has NO retire method — the row stays Bound, and the
-   * post-close push leaves it unreferenced by the newest-per-client union.
-   * MUST remain LAST in this serial describe: it wipes the generation store
-   * to re-base the evidence, which no earlier scenario may observe.
+   * pane-X, sends freshAgent.kill (never terminal.kill). The 15s timing gate
+   * below holds the close OUTSIDE the judgment's grace window, so the row is
+   * excluded no matter how the close is recorded; since the retire-on-kill
+   * repair (the prior scenario's subject) the close additionally retires the
+   * row Closed. MUST remain LAST in this serial describe: it wipes the
+   * generation store to re-base the evidence, which no earlier scenario may
+   * observe.
    */
   test('stale never-open ledger rows are never offered', async ({ browser, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')

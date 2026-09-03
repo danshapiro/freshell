@@ -535,6 +535,14 @@ fn content_id_ignores_timestamp_churn() {
 
 #[test]
 fn attributed_row_within_grace_of_its_parent_is_offered() {
+    // The PURE creation crash-race pin (the SIGKILL-within-5s e2e contract's
+    // unit twin): the row below is still BOUND — no explicit close ever
+    // happened, so nothing retired it — and inside the grace window the
+    // judgment keeps it. The paired kill-window pin
+    // (`retired_closed_row_inside_the_grace_window_is_never_offered`, the
+    // retire-on-kill/delta-round-5 repair arm's retarget of this boundary)
+    // exercises the same window with the row retired Closed: excluded.
+    //
     // Parent client "c1" on primary "d1", winner capturedAt = 1_000_000; the
     // row's updated_at sits EXACTLY at the grace boundary (inclusive):
     // 993_000 == 1_000_000 - UNSNAPSHOTTED_BINDING_GRACE_MS. The union's
@@ -580,6 +588,62 @@ fn attributed_row_within_grace_of_its_parent_is_offered() {
         );
     }
     assert_eq!(out["recoverable"], true);
+}
+
+/// Delta-round-5 retire-on-kill: an EXPLICIT `freshAgent.kill` retires the
+/// pane's ledger row Closed at kill time, so the created-then-quickly-closed
+/// shape this boundary used to admit lands Retired(Closed) — and retired rows
+/// are excluded from ledgerOnly by the `row_is_bound` pre-filter REGARDLESS of
+/// the grace clause. This is the exclusion pin for the kill-in-window class
+/// (the finding preserved from delta review round 5); its Bound twin
+/// (`attributed_row_within_grace_of_its_parent_is_offered`) keeps the pure
+/// creation crash-race keep-side semantics.
+#[test]
+fn retired_closed_row_inside_the_grace_window_is_never_offered() {
+    // Same boundary geometry as the Bound twin: the row's last_attributed_at
+    // (its still-stamped attribution) sits EXACTLY at the inclusive grace
+    // boundary of its parent's newest evidence, and the union's record
+    // carries the row's stamped tabKey — every D8 fact that made the Bound
+    // row offerable is held; ONLY the state differs.
+    let d = DeviceUnion {
+        device_id: "d1".into(),
+        union_doc: union_doc_with_tab_key(
+            "d1",
+            1_000_000,
+            "d1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let mut row = with_attribution(
+        binding_row_at("claude", "S1", retired_closed(), 993_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    // A fresh-agent row (the finding class), attribution fully stamped.
+    row.mode = "freshclaude".into();
+    row.pane_kind = Some("fresh-agent".into());
+    let out = build_inventory(
+        vec![d],
+        vec![row.clone()],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "an explicitly-killed (Retired/Closed) row is never offered, even inside the grace window: {}",
+        serde_json::to_string_pretty(&out["ledgerOnly"]).unwrap()
+    );
+    // recoverable requires the device union here, so isolate the row instead:
+    // with no unions at all the row alone must not recover.
+    let out = build_inventory(
+        vec![],
+        vec![row],
+        no_live(),
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+    );
+    assert_eq!(out["recoverable"], false);
+    assert!(out["device"].is_null());
 }
 
 #[test]

@@ -720,8 +720,10 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
     /// EXIT hook (terminal.rs:1334-1342) EXACTLY — retire the identity row
     /// (in-memory flag flip) and delete any pending marker. Deliberately
     /// does NOT touch the ledger binding: `retire_closed` is the
-    /// explicit-user-close trigger only ("P1.8 trigger (e)", the WS kill
-    /// command path, terminal.rs:3849-3868), never the natural-exit path,
+    /// explicit-user-close trigger only ("P1.8 trigger (e)", the WS
+    /// `terminal.kill` command path, terminal.rs:3849-3868, and the
+    /// freshAgent providers' `handle_kill` since the delta-round-5
+    /// retire-on-kill repair), never the natural-exit path,
     /// and the Bound-after-natural-exit ledger row is load-bearing —
     /// `auto_resume::pre_respawn_guard` reads a still-Bound row as "pane
     /// still wants this session" (auto_resume.rs:445-450) and the recovery

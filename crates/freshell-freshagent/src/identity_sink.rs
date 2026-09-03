@@ -261,6 +261,26 @@ pub trait PaneIdentitySink: Send + Sync {
         provider: &str,
         create_request_id: &str,
     ) -> Option<String>;
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit `freshAgent.kill` is an INTENTIONAL session end — the pane's
+    /// binding row retires `Closed` on every kill entry point, so the
+    /// recovery inventory's `ledgerOnly` pipeline (Bound-only at its
+    /// `row_is_bound` pre-filter) can never offer a session the user had just
+    /// closed. Without this the kill left a Bound row behind, and a browser
+    /// loss inside the 7-second creation-race grace window
+    /// (`UNSNAPSHOTTED_BINDING_GRACE_MS`) reproduced exactly the
+    /// never-actually-open restore the task exists to kill. Idempotent (an
+    /// unknown or already-retired row is a no-op), awaited like every
+    /// non-rollback lane (failures surface as `Err` for the caller to
+    /// warn-log, never a kill blocker). Same discipline as the WS
+    /// `terminal.kill` path's `retire_closed` ("P1.8 trigger (e)").
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite;
+    /// The PENDING companion of [`Self::retire_closed`]: a kill observed
+    /// before identity resolution also deletes the pending marker, so a
+    /// marker-driven resolution that lands later can never carry evidence
+    /// for a pane that provably no longer exists. Idempotent (a missing
+    /// marker == `Ok`).
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -289,6 +309,10 @@ pub(crate) struct FakeIdentitySink {
         std::sync::Mutex<std::collections::HashMap<(String, String), BindProvenance>>,
     /// (provider, sessionId) -> stored rollback record (kata 1wxv).
     pub rollbacks: std::sync::Mutex<std::collections::HashMap<(String, String), RollbackRecord>>,
+    /// Retire-on-kill record (delta-review round 5): every `retire_closed`
+    /// call, in order — kill-handler tests assert the (provider, sessionId)
+    /// batch a kill retires.
+    pub retires: std::sync::Mutex<Vec<(String, String)>>,
     /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
     /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
     /// through [`RollbackRecord::from_stored_payload`] exactly like the real
@@ -542,6 +566,24 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .lock()
                 .unwrap()
                 .remove(&(provider.into(), session_id.into()));
+        }
+        self.write_result()
+    }
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.retires
+                .lock()
+                .unwrap()
+                .push((provider.into(), session_id.into()));
+        }
+        self.write_result()
+    }
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.pendings
+                .lock()
+                .unwrap()
+                .retain(|(p, _, _)| p.as_str() != placeholder_id);
         }
         self.write_result()
     }

@@ -193,8 +193,10 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
     fn retire_pane_identity(&self, terminal_id: &str) {
         // The WS pane EXIT hook ONLY (terminal.rs:1334-1342) -- identity
         // retire + pending-marker delete, both called directly (sync). Do
-        // NOT port `retire_closed` from the kill path (handle_kill): that is
-        // the explicit-user-close trigger (P1.8 trigger (e)); a natural exit
+        // NOT port `retire_closed` from the kill paths (terminal.rs's
+        // `handle_kill`; the freshAgent providers' `handle_kill` since the
+        // delta-round-5 retire-on-kill repair): that is the
+        // explicit-user-close trigger (P1.8 trigger (e)); a natural exit
         // or crash must leave the ledger binding Bound, exactly like a WS
         // pane, so auto_resume::pre_respawn_guard (auto_resume.rs:445-450)
         // and the recovery inventory (RetiredReason::Closed keying,
@@ -501,7 +503,9 @@ mod tests {
         assert!(row.retired, "exit hook flips the retired flag");
         // NATURAL-EXIT contract pin: the durable ledger binding must STAY
         // Bound — retire_closed is the explicit-kill trigger
-        // (terminal.rs handle_kill), never the exit hook's. A still-Bound row
+        // (terminal.rs handle_kill, and the freshAgent providers' own
+        // handle_kill since the delta-round-5 retire-on-kill repair), never
+        // the exit hook's. A still-Bound row
         // after natural exit is load-bearing for
         // auto_resume::pre_respawn_guard and the recovery inventory's
         // RetiredReason::Closed keying.

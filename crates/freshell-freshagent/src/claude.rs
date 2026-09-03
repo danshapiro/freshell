@@ -822,8 +822,45 @@ impl FreshClaudeState {
             .await
             .unwrap_or_else(|| session_id.clone());
         let removed = self.sessions.lock().await.remove(&map_key);
+
+        // Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+        // explicit kill is an intentional session END — every durable id this
+        // kill covers retires its pane-ledger row `Closed`, so the recovery
+        // inventory (Bound-only at its `row_is_bound` pre-filter) can never
+        // re-offer a pane the user just closed inside the 7s creation-race
+        // grace window. The row is keyed on the DURABLE claude UUID while the
+        // wire kill may name the placeholder OR the durable alias, so the
+        // retire set is { the wire id } ∪ { the removed session's
+        // cli_session_id } ∪ { every cli_index alias of the map key }. An
+        // UNKNOWN/evicted id is still retired by name: the session map is
+        // process memory while the row is durable.
+        let mut retire_ids = vec![session_id.clone()];
         if let Some(session) = removed {
+            // Abort AND JOIN the consumer before collecting the kill's durable
+            // ids: after the join, no consumer arm (the sdk.session.init
+            // adoption) can mint a NEW alias this kill must still retire. A
+            // consumer mid-adopt at the abort point may have orphaned an
+            // already-started ledger write (spawn_blocking is not abortable);
+            // the SECOND retire pass after teardown sweeps exactly that
+            // remnant.
             session.consumer.abort();
+            let _ = session.consumer.await;
+            if let Some(cli_id) = session.cli_session_id.as_deref() {
+                if cli_id != map_key && !retire_ids.iter().any(|id| id == cli_id) {
+                    retire_ids.push(cli_id.to_string());
+                }
+            }
+            {
+                let index = self.cli_index.lock().await;
+                for (durable, mapped) in index.iter() {
+                    if mapped == &map_key && !retire_ids.iter().any(|id| id == durable) {
+                        retire_ids.push(durable.clone());
+                    }
+                }
+            }
+            // First retire pass BEFORE the heavy teardown: the fast ledger
+            // write lands even if a server crash interrupts the process kill.
+            self.retire_closed_rows(&retire_ids).await;
             let mut stdin = session.stdin;
             let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n").await;
             let _ = stdin.flush().await;
@@ -833,6 +870,12 @@ impl FreshClaudeState {
             let mut child = session.child;
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&session.ownership_id);
+            // Second pass (the sweep): anything the aborted consumer's doomed
+            // in-flight ledger write managed to land during teardown retires
+            // here. Idempotent no-op when pass one already covered every id.
+            self.retire_closed_rows(&retire_ids).await;
+        } else {
+            self.retire_closed_rows(&retire_ids).await;
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -856,6 +899,24 @@ impl FreshClaudeState {
             session_type: session_type.to_string(),
             success: true,
         }));
+    }
+
+    /// The kill-side lane of `retire_closed` (delta-review round 5): retire
+    /// every id in `ids` through the identity sink, AWAITED before the
+    /// `freshAgent.killed` broadcast (durable-before-answer, like the
+    /// create-path binding write), warn-logged per id on failure, never a
+    /// kill blocker. `retire_closed` is idempotent itself, so the two
+    /// pre/post-teardown passes `handle_kill` runs stay cheap no-ops when the
+    /// row was already covered.
+    async fn retire_closed_rows(&self, ids: &[String]) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        for id in ids {
+            if let Err(e) = sink.retire_closed(PROVIDER, id).await {
+                tracing::warn!(error = %e, session = %id, "freshagent.claude.retire_on_kill_failed");
+            }
+        }
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
@@ -5695,6 +5756,114 @@ rl.on('line', (line) => {
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
         assert_eq!(frame["sessionId"], "unknown-session");
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END — the pane-ledger row retires
+    /// `Closed` through the identity sink, so the recovery inventory (Bound-only
+    /// at its pre-filter) can never re-offer a pane the user just closed inside
+    /// the 7s creation-race grace window. The ledger row is keyed on the DURABLE
+    /// claude UUID while the wire kill may name the placeholder (the created
+    /// frame's sessionId) or the durable alias — BOTH must retire the
+    /// durable-keyed row.
+    #[tokio::test]
+    async fn handle_kill_retires_the_durable_row_whichever_id_addresses_it() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-retire-claude"), None).await;
+        let created = await_claude_created(&mut rx, "req-retire-claude").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let durable = "3d3d3d3d-3d3d-4d3d-8d3d-3d3d3d3d3d3d";
+        // Alias the durable id at it (live: the consumer's sdk.session.init fold
+        // writes this mapping; here the test writes it directly, same trick as
+        // attach_rebind_ack_stamps_the_tracked_live_status_not_hardcoded_idle).
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), placeholder.clone());
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&placeholder)
+            .expect("session tracked under the placeholder")
+            .cli_session_id = Some(durable.to_string());
+
+        // Kill addressed by the DURABLE id must retire the durable-keyed row
+        // (resolve_session_key walks cli_index to the live map key).
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: durable.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("claude".to_string(), durable.to_string())),
+            "a durable-addressed kill must retire (claude, {durable}): {retires:?}"
+        );
+
+        // Re-create + re-alias (the kill removed both), then kill addressed by
+        // the PLACEHOLDER — the same durable row must retire.
+        st.handle_create(dedup_create_msg("req-retire-claude-2"), None).await;
+        let created2 = await_claude_created(&mut rx, "req-retire-claude-2").await;
+        let placeholder2 = created2["sessionId"].as_str().unwrap().to_string();
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), placeholder2.clone());
+        st.sessions
+            .lock()
+            .await
+            .get_mut(&placeholder2)
+            .expect("session tracked under the placeholder")
+            .cli_session_id = Some(durable.to_string());
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder2.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires
+                .iter()
+                .filter(|(p, s)| p == "claude" && s == durable)
+                .count()
+                >= 2,
+            "a placeholder-addressed kill must retire the same durable row: {retires:?}"
+        );
+        drop(env);
+    }
+
+    /// The unknown-id arm of the same contract: a kill for a session this
+    /// process already evicted (the map is process memory; the durable row
+    /// outlives it) still retires the row the id names — idempotently when no
+    /// row exists.
+    #[tokio::test]
+    async fn handle_kill_of_an_evicted_session_still_retires_the_row_it_names() {
+        let (st, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: "evicted-durable".to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("claude".to_string(), "evicted-durable".to_string())),
+            "the kill must retire (claude, evicted-durable): {retires:?}"
+        );
     }
 
     // ── freshAgent.approval.respond / question.respond / compact (Task 2) ─────────

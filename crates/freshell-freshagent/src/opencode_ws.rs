@@ -313,6 +313,13 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+    /// Retire-on-kill (delta-review round 5): set by `handle_kill` inside its
+    /// session-lock phase. A send that took this session's Arc just before the
+    /// kill's map removal is Parking on this lock and would otherwise
+    /// materialize + re-bind a ledger row for the pane that is going away;
+    /// `handle_send` consults the flag BEFORE any side effect and refuses
+    /// (SESSION_NOT_FOUND — the same answer the map-removed arm gives).
+    killed: Arc<AtomicBool>,
     /// D8 (restore-open-sessions-only): the LATEST connection-scoped provenance
     /// this session was attached under. Parked by `handle_create` at create, by
     /// the in-memory-hit arm AND by `resume_durable_session` at a
@@ -365,6 +372,7 @@ impl OpencodeSession {
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
+            killed: Arc::new(AtomicBool::new(false)),
             provenance: None,
         }
     }
@@ -791,6 +799,24 @@ impl FreshOpencodeState {
 
         let mut session = session_arc.lock().await;
 
+        // Retire-on-kill (delta-review round 5, the resolution arm): a send that
+        // took this session's Arc just before `handle_kill`'s map removal parks
+        // on this very lock — see the killed flag the kill set inside its own
+        // session-lock phase and refuse with the SAME SESSION_NOT_FOUND the
+        // map-removed arm gives, BEFORE any side effect. Without this gate the
+        // send would materialize + re-bind a ledger row for the pane that just
+        // closed (the finding class: a created-then-closed row re-offered in
+        // the creation-race grace window).
+        if session.killed.load(Ordering::SeqCst) {
+            drop(session);
+            self.send_error(
+                &request_id,
+                "SESSION_NOT_FOUND",
+                "opencode session not found",
+            );
+            return;
+        }
+
         // D2-F1 (delta-review round 2): a send arriving while a COMPACT is in flight
         // is REFUSED — the nested `freshAgent.error{INTERNAL_ERROR}` — BEFORE any side
         // effect (flag reset, busy snapshot, materialization, prompt POST). Registering
@@ -1057,6 +1083,13 @@ impl FreshOpencodeState {
             if let Some(session_arc) = &found {
                 let (placeholder, real) = {
                     let s = session_arc.lock().await;
+                    // Retire-on-kill (delta-review round 5): mark the session
+                    // killed INSIDE this session-lock phase, BEFORE removing the
+                    // map keys — a send that took this Arc just before the
+                    // removal parks on this very lock and must observe the flag
+                    // (never materialize + re-bind a row for the pane that is
+                    // going away).
+                    s.killed.store(true, Ordering::SeqCst);
                     (s.placeholder_id.clone(), s.real_session_id.clone())
                 };
                 guard.remove(&placeholder);
@@ -1067,8 +1100,12 @@ impl FreshOpencodeState {
             found
         };
 
+        let mut real_session_id = None;
+        let mut placeholder_id = None;
         if let Some(session_arc) = session_arc {
             let mut s = session_arc.lock().await;
+            real_session_id = s.real_session_id.clone();
+            placeholder_id = Some(s.placeholder_id.clone());
             if let Some(task) = s.turn_task.take() {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
                 // before the kill answers — the compensation must have landed.
@@ -1082,6 +1119,45 @@ impl FreshOpencodeState {
             // Task 13: a killed session must reopen its durable id's lease binding.
             if let Some(real) = s.real_session_id.as_deref() {
                 self.leases.clear_binding(PROVIDER, real);
+            }
+        }
+
+        // Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+        // explicit kill is an intentional session END — retire the session's
+        // DURABLE row `Closed` (the ledger row is keyed on the materialized
+        // `ses_*` id) so the recovery inventory (Bound-only pre-filter) can
+        // never re-offer a pane the user just closed inside the 7s
+        // creation-race grace window; and delete the pending marker so a late
+        // materialization resolution can never carry evidence for a pane that
+        // provably no longer exists. A kill naming an id the map never held
+        // still retires that DURABLE id by name (an evicted session's row is
+        // durable) and still clears a marker under that placeholder name.
+        if let Some(sink) = self.identity_sink() {
+            let mut retire_ids: Vec<&str> = Vec::new();
+            if let Some(real) = real_session_id.as_deref() {
+                retire_ids.push(real);
+            }
+            if !msg.session_id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                && Some(msg.session_id.as_str()) != real_session_id.as_deref()
+            {
+                retire_ids.push(&msg.session_id);
+            }
+            for id in retire_ids {
+                if let Err(e) = sink.retire_closed(PROVIDER, id).await {
+                    tracing::warn!(error = %e, session = %id, "freshagent.opencode.retire_on_kill_failed");
+                }
+            }
+            if let Some(placeholder) = placeholder_id.as_deref() {
+                if let Err(e) = sink.delete_pending(placeholder).await {
+                    tracing::warn!(error = %e, placeholder = %placeholder, "freshagent.opencode.pending_delete_failed_on_kill");
+                }
+            }
+            if msg.session_id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                && Some(msg.session_id.as_str()) != placeholder_id.as_deref()
+            {
+                if let Err(e) = sink.delete_pending(&msg.session_id).await {
+                    tracing::warn!(error = %e, placeholder = %msg.session_id, "freshagent.opencode.pending_delete_failed_on_kill");
+                }
             }
         }
 
@@ -3540,6 +3616,173 @@ mod tests {
             None,
             "the dedup cache must have been evicted by the kill, so this create is a \
              genuinely fresh (unmaterialized) session, not a replay of the killed one"
+        );
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END. Killing a MATERIALIZED
+    /// session must (a) retire its durable row `Closed` through the identity
+    /// sink — so the recovery inventory (Bound-only pre-filter) can never
+    /// re-offer a pane the user just closed inside the 7s creation-race grace
+    /// window — and (b) clear the pending marker, so a late resolution can
+    /// never carry evidence for a pane that provably no longer exists.
+    #[tokio::test]
+    async fn handle_kill_retires_the_materialized_row_and_clears_the_pending_marker() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-retire"), None).await;
+        let placeholder = "freshopencode-req-kill-retire";
+        assert!(
+            fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
+            "precondition: create recorded the pending marker"
+        );
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("sanity: the session materialized before the kill")
+        };
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("opencode".to_string(), real_id.clone())),
+            "the kill must retire (opencode, {real_id}) — the durable-keyed row: {retires:?}"
+        );
+        assert!(
+            !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "the kill must delete the pending marker for {placeholder}"
+        );
+    }
+
+    /// The PENDING arm of the same contract: a kill arriving before the first
+    /// send materialized the session deletes the pending marker (so the marker
+    /// can never resolve into a Bound row after the pane is gone), and a kill
+    /// naming an id the session map never held — a durable id whose sidecar
+    /// was already evicted — still retires the row that id names.
+    #[tokio::test]
+    async fn handle_kill_before_materialization_clears_the_marker_and_evicted_ids_still_retire() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-pending"), None).await;
+        let placeholder = "freshopencode-req-kill-pending";
+        assert!(
+            fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
+            "precondition: create recorded the pending marker"
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            !fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
+            "the pre-materialization kill must delete the pending marker"
+        );
+
+        // The evicted-session arm: a durable id no longer in the session map
+        // still retires the row it names (idempotent when no row exists).
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_evicted".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("opencode".to_string(), "ses_evicted".to_string())),
+            "the kill must retire (opencode, ses_evicted): {retires:?}"
+        );
+    }
+
+    /// The resurrection gate (the same repair's resolution arm): a send that
+    /// holds the session's Arc across the kill — the real client sequence is
+    /// "send in flight, pane closed" — must NOT materialize + re-bind a row for
+    /// the pane that is going away. The kill marks the session killed inside
+    /// its session-lock phase; the send's own critical section sees the flag and
+    /// is refused (SESSION_NOT_FOUND, the same answer the map-removed arm gives)
+    /// BEFORE any side effect.
+    #[tokio::test]
+    async fn a_send_against_a_killed_session_is_refused_and_writes_no_binding_row() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-killed-gate"), None).await;
+        let placeholder = "freshopencode-req-killed-gate";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        // Drive the kill's state reach directly (same-crate white-box seam):
+        // what the send must obey is the killed flag the kill sets inside its
+        // session-lock phase.
+        session_arc.lock().await.killed.store(true, Ordering::SeqCst);
+
+        st.handle_send(send_msg(placeholder, "hi")).await;
+
+        // SESSION_NOT_FOUND through the error channel…
+        let frame: serde_json::Value = loop {
+            let frame: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.expect("a frame")).unwrap();
+            if frame["type"] == "error" || frame["type"] == "freshAgent.send.accepted" {
+                break frame;
+            }
+        };
+        assert_eq!(
+            frame["type"], "error",
+            "a send against a killed session is refused, never accepted: {frame}"
+        );
+        // `send_error` maps to ErrorCode::InternalError with the textual code in
+        // the message (the opencode slice's refusal convention, same as the
+        // map-removed arm).
+        assert_eq!(frame["code"], "INTERNAL_ERROR");
+        assert!(
+            frame["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND")),
+            "the refusal answers SESSION_NOT_FOUND: {frame}"
+        );
+        // …and the identity is never re-bound: no materialization, no row.
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "the refused send must not materialize the killed session"
+        );
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "the refused send must not record a binding row: {:?}",
+            fake.bindings.lock().unwrap()
         );
     }
 

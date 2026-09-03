@@ -341,6 +341,29 @@ impl PaneIdentitySink for TestLedgerSink {
             .lookup_by_create_request_id(provider, create_request_id)
             .map(|row| row.session_id)
     }
+
+    // Retire-on-kill (delta-review round 5): the same real-ledger pass-through
+    // the LedgerIdentitySink this double mirrors now implements.
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = placeholder_id.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
 }
 
 fn test_settings_value() -> Value {

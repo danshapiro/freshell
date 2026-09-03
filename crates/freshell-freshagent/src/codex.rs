@@ -2489,6 +2489,16 @@ impl FreshCodexState {
         // also clears it; idempotent -- this covers watcher-less test sessions too).
         self.leases.clear_binding(PROVIDER, &session_id);
 
+        // Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+        // explicit kill is an intentional session END — retire the thread's
+        // pane-ledger row `Closed`, so the recovery inventory (Bound-only at
+        // its `row_is_bound` pre-filter) can never re-offer a session the user
+        // just closed inside the 7s creation-race grace window. Runs for an
+        // UNKNOWN/Evicted id too: the session map is process memory while the
+        // row is durable, so a (consumer-exit-evicted) session the map no
+        // longer knows still has its row retired here.
+        self.retire_closed_row(&session_id).await;
+
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
         // `ws-handler.ts:3673`) -- an EXPLICIT kill means a later duplicate `create` for
@@ -2505,6 +2515,21 @@ impl FreshCodexState {
             session_type: SESSION_TYPE.to_string(),
             success: true,
         }));
+    }
+
+    /// The kill-side lane of `retire_closed` (delta-review round 5):
+    /// best-effort AWAITED retire of this provider's ledger row — awaited
+    /// before the `freshAgent.killed` broadcast (durable-before-answer, like
+    /// the create-path binding write), warn-logged on failure, never a kill
+    /// blocker (the kill is a liveness operation; the ledger write is cheap
+    /// and the caller is already going away).
+    async fn retire_closed_row(&self, session_id: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        if let Err(e) = sink.retire_closed(PROVIDER, session_id).await {
+            tracing::warn!(error = %e, session = %session_id, "freshagent.codex.retire_on_kill_failed");
+        }
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -6203,6 +6228,67 @@ pub(crate) mod tests {
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END — it must retire the
+    /// thread's pane-ledger row `Closed` through the identity sink, so the
+    /// recovery inventory (Bound-only at its `row_is_bound` pre-filter) can
+    /// never re-offer a session the user had just closed inside the 7s
+    /// creation-race grace window.
+    #[tokio::test]
+    async fn handle_kill_retires_the_ledger_row_for_the_killed_thread() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx, fake) = state_with_sink();
+        let child = spawn_sleeper();
+        insert_fake_session(
+            &st,
+            "thread-kill",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill-retire",
+        )
+        .await;
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-kill".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("codex".to_string(), "thread-kill".to_string())),
+            "the kill must retire (codex, thread-kill): {retires:?}"
+        );
+    }
+
+    /// The unknown-id arm of the same contract: a kill for an already-evicted
+    /// session (the session map is process memory; the durable row outlives it)
+    /// still retires the row the id names — idempotently when no row exists.
+    #[tokio::test]
+    async fn handle_kill_of_an_evicted_session_still_retires_the_row_it_names() {
+        let (st, _rx, fake) = state_with_sink();
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "evicted-thread".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("codex".to_string(), "evicted-thread".to_string())),
+            "the kill must retire (codex, evicted-thread): {retires:?}"
+        );
     }
 
     // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────
