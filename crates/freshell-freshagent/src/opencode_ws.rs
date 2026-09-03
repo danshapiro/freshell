@@ -321,11 +321,14 @@ struct OpencodeSession {
     /// per-send refresh write always assert the CURRENT attribution). Read by
     /// every downstream binder: the materialization row (born at first SEND,
     /// mediations after `handle_create` returned), the per-send refresh, and
-    /// the fork child's inheritance. Conn-less cold reconstruction
+    /// the fork child's precedence source (2) (the FORKING connection's
+    /// stamps win, focused-ep1-r5 Finding 1). Conn-less cold reconstruction
     /// (attach-resume rehydrate) seeds it from the DURABLE row's stamps
     /// (focused-ep1-r4 Finding 2); a row that genuinely has none leaves `None`
     /// parked — never invented — and conn-less writes let the ledger merge
-    /// keep any prior stamps.
+    /// keep any prior stamps. Every park/refresh gate filters hollow `Some`s
+    /// away (focused-ep1-r5 Finding 2): a partially initialized client's
+    /// hello never lands or overrides here.
     provenance: Option<crate::BindProvenance>,
 }
 
@@ -552,8 +555,10 @@ impl FreshOpencodeState {
         let mut session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
         // D8: park the connection provenance ON the session — the binding row
         // is written at materialization (first send), well after this create
-        // returns.
-        session.provenance = provenance;
+        // returns. A HOLLOW `Some` (a partially initialized client's hello,
+        // focused-ep1-r5 Finding 2) parks `None` instead — never a hollow
+        // value downstream readers would treat as truth.
+        session.provenance = provenance.filter(|p| p.is_meaningful());
         self.sessions
             .lock()
             .await
@@ -623,6 +628,14 @@ impl FreshOpencodeState {
         msg: &FreshAgentCreate,
         provenance: Option<crate::BindProvenance>,
     ) {
+        // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
+        // HOLLOW `Some` (a partially initialized client's hello without
+        // device/client fields) behaves like `None` on every gate below: the
+        // in-memory re-park and the refresh write never let a hollow value
+        // override parked/row truth, and the cold path falls through to the
+        // durable row's seed.
+        let provenance = provenance.filter(|p| p.is_meaningful());
+
         // Already tracked locally (a live pane, or an earlier attach/create already
         // rebound it)? Reuse it -- mirrors handle_attach's local-map-first lookup.
         let existing = {
@@ -1514,7 +1527,23 @@ impl FreshOpencodeState {
     /// | placeholder never materialized | nested `freshAgent.error{INVALID_SESSION_ID}` with the legacy parity text (adapter.ts:403) |
     /// | a fork for this parent is already in flight (duplicate click, D2-F2) | nested `freshAgent.error{INTERNAL_ERROR}`, NO other action — no second fork POST, no child minted (a second child could never correlate after the first fork re-keys the pane) |
     /// | serve failure (400/500/…) | nested `freshAgent.error{INTERNAL_ERROR}` carrying the serve error text, BEFORE any state change |
-    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+    /// `provenance` (D8, focused-ep1-r5 Finding 1) is the FORKING connection's
+    /// stamped identity (the WS dispatch composes it from the hello identity
+    /// + the fork's `tabId`, exactly like the create lanes).
+    ///
+    /// Fork is always connection-initiated (a user clicks Fork in a specific
+    /// browser tab), so the child row's attribution resolves by precedence:
+    /// first the forking connection's provenance — a HOLLOW `Some` (a
+    /// partially initialized client's hello, Finding 2) behaves like `None`
+    /// and never overrides real stamps — then the parent's PARKED provenance,
+    /// then the parent's DURABLE ROW stamps via
+    /// [`crate::identity_sink::PaneIdentitySink::load_provenance`].
+    pub async fn handle_fork(
+        &self,
+        msg: FreshAgentFork,
+        provenance: Option<crate::BindProvenance>,
+        reply_sink: FrameSink,
+    ) {
         // D2-F2 single-flight: acquire BEFORE any lookup/POST; the RAII guard
         // releases on every terminal leg (success AND every failure), so a refreshed
         // Fork click once this op settles is never stranded.
@@ -1576,13 +1605,30 @@ impl FreshOpencodeState {
                 session.cwd.clone(),
                 session.model.clone(),
                 session.effort.clone(),
-                // D8 fork-chain inheritance: the child pane is the parent's
-                // lineage in the same client context — carry the parent's
-                // parked provenance (None when the parent itself is conn-less,
-                // e.g. resumed after a restart).
+                // Fork precedence source (2) (focused-ep1-r3/r5): the
+                // parent's PARKED provenance.
                 session.provenance.clone(),
             )
         };
+
+        // D8 (focused-ep1-r5 Findings 1+2): fork provenance by precedence —
+        // (1) the FORKING connection's provenance (fork is always
+        // connection-initiated; parked provenance is SHARED across the
+        // globally-shared session, so a fork from tab B must not stamp the
+        // child with tab A's most-recent park). A HOLLOW connection `Some`
+        // (a partially initialized client's hello) behaves like `None` —
+        // it never overrides real stamps. (2) the parent's parked value.
+        // (3) the parent's DURABLE row stamps — the last source that can
+        // know, and the child's NEW ledger key is where a `None` resolution
+        // (merged keep-when-None against an empty row) could never be
+        // rescued.
+        let fork_provenance = provenance
+            .filter(|p| p.is_meaningful())
+            .or(parent_provenance)
+            .or_else(|| {
+                self.identity_sink()
+                    .and_then(|s| s.load_provenance(PROVIDER, &real_id))
+            });
 
         // The selected-turn knob (REVIEWED, fresh-eyes F4/F5): the probed opencode
         // 1.18.18 `POST /session/:id/fork` body schema is `{messageID?: ^msg…}` with
@@ -1648,7 +1694,7 @@ impl FreshOpencodeState {
             model.clone(),
             effort.clone(),
         );
-        child_session.provenance = parent_provenance.clone();
+        child_session.provenance = fork_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
         child_session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
@@ -1668,7 +1714,7 @@ impl FreshOpencodeState {
             client_instance_id,
             device_id,
             tab_key,
-        } = parent_provenance.unwrap_or_default();
+        } = fork_provenance.unwrap_or_default();
         self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
             provider: PROVIDER.into(),
             session_id: child.id.clone(),
@@ -1676,8 +1722,9 @@ impl FreshOpencodeState {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            // D8: inherit the parent's parked provenance (fork chain = the
-            // same client context); `None` when the parent has none.
+            // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
+            // connection > parent's parked > parent's row); `None` only when
+            // no source knows the attribution — never invented.
             client_instance_id,
             device_id,
             tab_key,
@@ -2433,6 +2480,12 @@ impl FreshOpencodeState {
         cwd: Option<&str>,
         provenance: Option<crate::BindProvenance>,
     ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
+        // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
+        // HOLLOW `Some` (a partially initialized client's hello) behaves like
+        // `None` on every decision below: the park falls through to the
+        // durable row's stamp seed, and the refresh gate never fires on
+        // hollow alone.
+        let provenance = provenance.filter(|p| p.is_meaningful());
         let manager = self.fresh_agent.ensure_manager().await;
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
@@ -4855,7 +4908,7 @@ mod tests {
 
         let (sink, captured) = capturing_sink();
         state
-            .handle_fork(fork_msg(DURABLE_ID, "fork-req-cold-chain", None), sink)
+            .handle_fork(fork_msg(DURABLE_ID, "fork-req-cold-chain", None), None, sink)
             .await;
         let frames = captured.lock().expect("captured mutex").clone();
         let child_id = match frames.as_slice() {
@@ -4980,7 +5033,7 @@ mod tests {
         // cannot rescue a None park) writes an attributed child row.
         let (sink, captured) = capturing_sink();
         state
-            .handle_fork(fork_msg(DURABLE_ID, "fork-req-row-seed", None), sink)
+            .handle_fork(fork_msg(DURABLE_ID, "fork-req-row-seed", None), None, sink)
             .await;
         let frames = captured.lock().expect("captured mutex").clone();
         let child_id = match frames.as_slice() {
@@ -5074,6 +5127,318 @@ mod tests {
         assert_eq!(b.client_instance_id, None, "never write invented stamps");
         assert_eq!(b.device_id, None);
         assert_eq!(b.tab_key, None);
+    }
+
+    /// Focused-ep1-r5 Finding 1 (Major — fork stamps from the FORKING
+    /// connection): parked provenance is shared across the globally-shared
+    /// session, so under forceNew multi-tab a fork from tab B must stamp the
+    /// child with TAB B's identity — never the parent's parked (tab A's
+    /// most-recent) attribution. A fork is always connection-initiated, so
+    /// the forking connection's provenance wins over the parked value and
+    /// the durable row alike.
+    #[tokio::test]
+    async fn fork_stamps_the_child_from_the_forking_connection_over_the_stale_park() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Tab A's connection cold-resumes the session (parks + rows A).
+        let mut create = create_msg("req-stale-park-a");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-a"),
+                    Some("device-a"),
+                    Some("tab-a"),
+                )),
+            )
+            .await;
+
+        // The fork is issued over TAB B's connection.
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(
+                fork_msg(DURABLE_ID, "fork-req-b", None),
+                Some(crate::BindProvenance::for_create(
+                    Some("client-b"),
+                    Some("device-b"),
+                    Some("tab-b"),
+                )),
+                sink,
+            )
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+
+        // The child SESSION parks the forking connection's stamps…
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the child parks the FORKING connection's provenance, not the stale park");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-b"));
+            assert_eq!(p.device_id.as_deref(), Some("device-b"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-b:tab-b"));
+        }
+
+        // …and the child ROW asserts the same.
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.client_instance_id.as_deref(),
+            Some("client-b"),
+            "the fork child row stamps the FORKING connection, not the parent's stale park"
+        );
+        assert_eq!(b.device_id.as_deref(), Some("device-b"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-b:tab-b"));
+    }
+
+    /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
+    /// one: a fork whose connection provenance is HOLLOW (a partially
+    /// initialized client's hello — all fields absent) behaves like None, and
+    /// with a parent that parks nothing the child stamps fall back to the
+    /// parent's DURABLE ROW (the last source that knows the attribution).
+    #[tokio::test]
+    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty()
+     {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The parent's durable row knows the attribution (lineage-only
+        // payload: no settings ride the seed).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-row".into()),
+            device_id: Some("device-row".into()),
+            tab_key: Some("device-row:tab-row".into()),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("row stamp write ok");
+        state.set_identity_sink(fake.clone());
+        // …but the local session parks NOTHING (a conn-less construction the
+        // row seeding never reached).
+        insert_fork_parent(&state, DURABLE_ID, Some("/serve/dir"), None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(
+                fork_msg(DURABLE_ID, "fork-req-hollow", None),
+                // HOLLOW: the forking connection's hello carried no
+                // device/client fields — must NOT blank out the row's stamps.
+                Some(crate::BindProvenance::default()),
+                sink,
+            )
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the child parks the durable row's stamps (hollow connection, empty park)");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.client_instance_id.as_deref(),
+            Some("client-row"),
+            "the child row falls back to the parent's durable row stamps, not a hollow None"
+        );
+        assert_eq!(b.device_id.as_deref(), Some("device-row"));
+        assert_eq!(b.tab_key.as_deref(), Some("device-row:tab-row"));
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the cold-resume park, `resume_durable_session`):
+    /// a connection-scoped resume-create carrying a HOLLOW provenance behaves
+    /// like None — the row seed (not the hollow value) is what gets parked,
+    /// and the refresh gate does not fire on hollow alone (parked/row truth
+    /// is never replaced with nothing).
+    #[tokio::test]
+    async fn hollow_cold_resume_falls_back_to_the_row_seed_and_writes_nothing() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A stamped LINEAGE-ONLY row (blank settings): the only gate driver
+        // here would be the provenance — exactly Finding 2's shape.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-row".into()),
+            resolves_pending: None,
+            supersedes: None,
+            client_instance_id: Some("client-row".into()),
+            device_id: Some("device-row".into()),
+            tab_key: Some("device-row:tab-row".into()),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("seed binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-hollow-cold");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(create, Some(crate::BindProvenance::default()))
+            .await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the cold resume registered the session")
+                .lock()
+                .await;
+            let p = s
+                .provenance
+                .clone()
+                .expect("a hollow resume parks the ROW seed, not the hollow value");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        assert_eq!(
+            bindings.iter().filter(|b| b.session_id == DURABLE_ID).count(),
+            1,
+            "a hollow provenance does not fire the refresh gate (only the seed row exists)"
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the named `opencode_ws.rs:677` gate): an
+    /// in-memory resume-create hit carrying a HOLLOW provenance keeps the
+    /// parked Some EXACTLY and writes nothing — hollow behaves like None.
+    #[tokio::test]
+    async fn hollow_in_memory_resume_keeps_the_parked_stamps_and_writes_nothing() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // First create: tab A's connection cold-resumes (parks + rows A).
+        let mut first = create_msg("req-mem-a");
+        first.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                first,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-mem"),
+                    Some("device-mem"),
+                    Some("tab-mem"),
+                )),
+            )
+            .await;
+        let rows_before = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.session_id == DURABLE_ID)
+            .count();
+
+        // The partially-initialized client's resume hits the in-memory map:
+        // hollow Some.
+        let mut second = create_msg("req-mem-hollow");
+        second.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(second, Some(crate::BindProvenance::default()))
+            .await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the session stays")
+                .lock()
+                .await;
+            let p = s
+                .provenance
+                .clone()
+                .expect("a hollow in-memory resume must NOT regress the parked Some");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-mem"));
+            assert_eq!(p.device_id.as_deref(), Some("device-mem"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-mem:tab-mem"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        assert_eq!(
+            bindings.iter().filter(|b| b.session_id == DURABLE_ID).count(),
+            rows_before,
+            "a hollow in-memory resume writes nothing (like the conn-less resume)"
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the create-lane park): a create carrying a
+    /// HOLLOW connection provenance parks NOTHING on the placeholder — never
+    /// a hollow Some that downstream readers would treat as truth.
+    #[tokio::test]
+    async fn hollow_create_provenance_parks_nothing() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http).await;
+        st.handle_create(
+            create_msg("req-hollow-park"),
+            Some(crate::BindProvenance::default()),
+        )
+        .await;
+
+        let sessions = st.sessions.lock().await;
+        let s = sessions
+            .get("freshopencode-req-hollow-park")
+            .expect("the placeholder session")
+            .lock()
+            .await;
+        assert_eq!(
+            s.provenance, None,
+            "a hollow hello parks None — never a hollow Some"
+        );
     }
 
     // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────
@@ -7021,6 +7386,7 @@ mod tests {
             input: at_turn_id.map(|id| json!({ "atTurnId": id })),
             request_id: Some(request_id.to_string()),
             cwd: None,
+            tab_id: None,
         }
     }
 
@@ -7170,7 +7536,7 @@ mod tests {
         .await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), None, sink)
             .await;
 
         // The exact `freshAgent.forked` reply — every field, request_id echoed
@@ -7250,7 +7616,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-2", None), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-2", None), None, sink)
             .await;
 
         assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
@@ -7271,7 +7637,7 @@ mod tests {
         let placeholder = "freshopencode-req-fork";
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(placeholder, "fork-req-3", None), sink)
+        st.handle_fork(fork_msg(placeholder, "fork-req-3", None), None, sink)
             .await;
 
         let frames = captured.lock().expect("captured mutex").clone();
@@ -7300,7 +7666,7 @@ mod tests {
         let st = fork_state(http.clone()).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_ghost", "fork-req-4", None), sink)
+        st.handle_fork(fork_msg("ses_ghost", "fork-req-4", None), None, sink)
             .await;
 
         let frames = captured.lock().expect("captured mutex").clone();
@@ -7324,7 +7690,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-5", None), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-5", None), None, sink)
             .await;
 
         let frames = captured.lock().expect("captured mutex").clone();
@@ -7373,7 +7739,7 @@ mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("ses_parent", "fork-req-dup-1", None), sink1)
+                st.handle_fork(fork_msg("ses_parent", "fork-req-dup-1", None), None, sink1)
                     .await;
             })
         };
@@ -7392,7 +7758,7 @@ mod tests {
         let (sink2, captured2) = capturing_sink();
         tokio::time::timeout(
             Duration::from_secs(2),
-            st.handle_fork(fork_msg("ses_parent", "fork-req-dup-2", None), sink2),
+            st.handle_fork(fork_msg("ses_parent", "fork-req-dup-2", None), None, sink2),
         )
         .await
         .expect("the duplicate fork is refused inline, never upstream-blocking");
@@ -7432,7 +7798,7 @@ mod tests {
         );
 
         let (sink3, captured3) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-dup-3", None), sink3)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-dup-3", None), None, sink3)
             .await;
         let frames3 = captured3.lock().expect("captured mutex").clone();
         assert!(
@@ -7459,7 +7825,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink1, captured1) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-f1", None), sink1)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f1", None), None, sink1)
             .await;
         let frames1 = captured1.lock().expect("captured mutex").clone();
         let v1 = serde_json::to_value(&frames1[0]).unwrap();
@@ -7473,7 +7839,7 @@ mod tests {
 
         // The retry reaches the wire — the failure path released the guard.
         let (sink2, captured2) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-f2", None), sink2)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f2", None), None, sink2)
             .await;
         let frames2 = captured2.lock().expect("captured mutex").clone();
         let v2 = serde_json::to_value(&frames2[0]).unwrap();
@@ -7508,7 +7874,7 @@ mod tests {
             insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
 
             let (sink, captured) = capturing_sink();
-            st.handle_fork(fork_msg("ses_parent", "fork-req-8", None), sink)
+            st.handle_fork(fork_msg("ses_parent", "fork-req-8", None), None, sink)
                 .await;
 
             let frames = captured.lock().expect("captured mutex").clone();
@@ -7547,7 +7913,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-6", Some("msg_abc")), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-6", Some("msg_abc")), None, sink)
             .await;
 
         assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
@@ -7572,6 +7938,7 @@ mod tests {
         let (sink, captured) = capturing_sink();
         st.handle_fork(
             fork_msg("ses_parent", "fork-req-7", Some("not-a-msg")),
+            None,
             sink,
         )
         .await;

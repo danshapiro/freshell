@@ -1270,17 +1270,20 @@ export function FreshAgentView({
     // The freshAgent.forked broadcast is matched on createRequestId +
     // parentSessionId by the listener below, which repoints this pane at
     // the forked session. atTurnId is best-effort: providers that can't
-    // fork mid-thread fork from the tip.
+    // fork mid-thread fork from the tip. D8 (focused-ep1-r5): `tabId` lets
+    // the fork child row stamp this forking tab's identity — a forceNew
+    // multi-tab fork must not inherit the OTHER tab's parked attribution.
     sendFreshAgentMessage({
       type: 'freshAgent.fork',
       requestId: current.createRequestId,
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      tabId,
       ...(cwd ? { cwd } : {}),
       ...(atTurnId ? { input: { atTurnId } } : {}),
     })
-  }, [sendFreshAgentMessage])
+  }, [sendFreshAgentMessage, tabId])
 
   // kata 1wxv: rollback requests mint a requestId so the requesting-sink ack
   // (composer refill) and any rollback-flagged refusal route back to THIS pane;

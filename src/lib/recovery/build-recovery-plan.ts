@@ -102,8 +102,21 @@ function ledgerSandbox(
  * matching the snapshot path.
  */
 function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
-  const sessionType =
-    normalizeFreshAgentSessionType(e.mode) ?? FALLBACK_SESSION_TYPE_BY_PROVIDER[e.provider]
+  const modeSessionType = normalizeFreshAgentSessionType(e.mode)
+  // Focused-ep1-r5 Finding 3 (provider consistency): the row's `provider` is
+  // authoritative for the RESUME identity, and the built content must stay
+  // consistent with the fresh-agent mode mapping (pane validation's
+  // invariant: provider === resolveFreshAgentRuntimeProvider(sessionType)).
+  // A row whose stamped mode maps to a DIFFERENT provider lane (malformed/
+  // pre-schema data) is NOT reconstructed as a resumable pane — with the
+  // mismatch kept, the create effect would dispatch the sessionRef to the
+  // wrong provider, which filters it and silently mints a fresh, non-resume
+  // session. Like a closed/live row, the pane rebuilds carrying the row's
+  // recorded flavor + settings WITHOUT the resume ref (the plan builder's
+  // existing convention for unresumable content — no new error surface).
+  const modeProvider = modeSessionType ? resolveFreshAgentRuntimeProvider(modeSessionType) : undefined
+  const providerReconciles = modeProvider === undefined || modeProvider === e.provider
+  const sessionType = modeSessionType ?? FALLBACK_SESSION_TYPE_BY_PROVIDER[e.provider]
   const sandbox = ledgerSandbox(e.sandbox)
   return {
     kind: 'fresh-agent',
@@ -124,7 +137,7 @@ function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
     ...(e.effort ? { effort: e.effort } : {}),
     ...(sandbox ? { sandbox } : {}),
     ...(e.permissionMode ? { permissionMode: e.permissionMode } : {}),
-    sessionRef: { provider: e.provider, sessionId: e.sessionId },
+    ...(providerReconciles ? { sessionRef: { provider: e.provider, sessionId: e.sessionId } } : {}),
   } as PaneContent
 }
 

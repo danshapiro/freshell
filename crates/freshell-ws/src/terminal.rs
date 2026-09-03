@@ -1251,19 +1251,26 @@ async fn handle_client_text(
         // remaining unsupported cells (claude permanently, amplifier unconditionally).
         // Detached task, same shape as the FreshAgentCompact arm (the fork RPC chain
         // never blocks the select loop).
+        //
+        // D8 (focused-ep1-r5 Finding 1): fork stamps from the FORKING connection —
+        // thread this connection's provenance (hello identity + the fork's `tabId`,
+        // the same composition the create arm above uses) into both providers'
+        // fork lanes, which resolve it AHEAD of the parent's parked stamps (a
+        // forceNew multi-tab fork must not inherit the other tab's attribution).
         ClientMessage::FreshAgentFork(fork) => {
+            let provenance = conn_identity.bind_provenance(fork.tab_id.as_deref());
             if fork.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
-                    async move { fresh_opencode.handle_fork(fork, conn_sink).await }
+                    async move { fresh_opencode.handle_fork(fork, Some(provenance), conn_sink).await }
                         .instrument(tracing::Span::current()),
                 );
             } else if is_codex_provider(fork.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
-                    async move { fresh_codex.handle_fork(fork, conn_sink).await }
+                    async move { fresh_codex.handle_fork(fork, Some(provenance), conn_sink).await }
                         .instrument(tracing::Span::current()),
                 );
             }

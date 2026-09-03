@@ -234,6 +234,35 @@ describe('buildRecoveryPlan', () => {
     expect(entryContent.sandbox).toBeUndefined()
   })
 
+  // Focused-ep1-r5 Finding 3 (provider consistency): a row whose `mode`
+  // stamps a fresh-agent session type from a DIFFERENT provider lane than
+  // the row's `provider` (malformed/pre-schema data) must NOT rebuild as a
+  // resumable pane — the built content would dispatch the sessionRef to the
+  // wrong provider, which filters the mismatched ref and silently mints a
+  // fresh, non-resume session. Like a closed/live row, the pane rebuilds
+  // carrying the row's recorded flavor + settings WITHOUT the resume ref
+  // (the plan builder's existing convention for unresumable content — no
+  // new error surface).
+  it('a ledgerOnly fresh-agent row whose mode names a different provider lane is NOT rebuilt as a resumable pane', () => {
+    const plans = buildRecoveryPlan(inv([pane()], [
+      { provider: 'opencode', sessionId: 'ses_mm', mode: 'freshcodex', cwd: '/proj', tabKey: 'k',
+        paneKind: 'fresh-agent', model: 'm1', effort: 'high' },
+    ]))
+    expect(plans).toHaveLength(1)
+    const entryContent = leavesOf(plans[0].layout).map((l) => l.content)[1]
+    expect(entryContent.kind).toBe('fresh-agent')
+    expect(entryContent.sessionRef).toBeUndefined()
+    // The pane keeps the row's recorded flavor + settings — a fresh pane of
+    // the stamped flavor, never a wrong-provider resume dispatch.
+    expect(entryContent).toMatchObject({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      model: 'm1',
+      effort: 'high',
+      initialCwd: '/proj',
+    })
+  })
+
   it('a plain CLI ledgerOnly row still builds terminal content (finding-2 regime is fresh-agent-only)', () => {
     const plans = buildRecoveryPlan(inv([pane()], [
       { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' },

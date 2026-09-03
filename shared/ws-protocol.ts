@@ -747,6 +747,10 @@ export const FreshAgentForkSchema = z.object({
   provider: z.enum(['claude', 'codex', 'opencode']),
   cwd: z.string().optional(),
   input: z.record(z.string(), z.unknown()).optional(),
+  /** D8 (focused-ep1-r5): the forking tab's client-side id — the fork child
+   * row's provenance stamps from the forking connection, `deviceId:tabId`.
+   * Non-strict schema — tolerated by older servers. */
+  tabId: z.string().min(1).optional(),
 })
 
 const freshAgentRollbackShape = {

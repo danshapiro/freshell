@@ -712,6 +712,14 @@ pub struct FreshAgentFork {
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// D8 (restore-open-sessions-only, focused-ep1-r5 Finding 1): the forking
+    /// tab's client-side id. Fork is always connection-initiated, so the
+    /// child row's provenance resolves from the FORKING connection (hello
+    /// identity + this tab id, `deviceId:tabId`) ahead of the parent's parked
+    /// stamps. Additive optional; older clients omit it (the child row then
+    /// stamps the connection's identity without a tabKey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

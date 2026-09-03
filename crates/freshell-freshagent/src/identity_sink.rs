@@ -60,6 +60,21 @@ impl BindProvenance {
             },
         }
     }
+
+    /// Focused-ep1-r5 Finding 2 — "meaningful" provenance: exactly the fields
+    /// the D8 recovery judgment gates on (`d8_parent_relative_keep`,
+    /// `crates/freshell-server/src/recovery_inventory.rs`) —
+    /// `client_instance_id` AND `device_id`. A partially-initialized client
+    /// can send `hello` without device/client fields, producing a HOLLOW
+    /// `Some(BindProvenance)` whose fields are all absent; such a value must
+    /// behave like `None` on EVERY override/refresh decision (re-park,
+    /// refresh-write gate, fork precedence). It is never a usable
+    /// attribution, and letting it override would replace parked/row truth
+    /// with nothing. `tab_key` is deliberately not required — the judgment
+    /// uses it for placement only, never for the offer keep.
+    pub fn is_meaningful(&self) -> bool {
+        self.client_instance_id.is_some() && self.device_id.is_some()
+    }
 }
 
 /// One fresh-agent identity event. Settings are a FULL snapshot (replace,
@@ -567,6 +582,40 @@ mod tests {
             None
         );
         assert_eq!(fake.lookup_by_create_request_id("codex", "cr-1"), None);
+    }
+
+    /// Focused-ep1-r5 Finding 2: the "meaningful provenance" definition —
+    /// exactly the fields the D8 recovery judgment requires
+    /// (`client_instance_id` + `device_id`); `tab_key` is placement-only and
+    /// never required. Hollow (all-absent) and half-stamped values are not
+    /// meaningful: they must behave like `None` on override/refresh
+    /// decisions instead of replacing parked/row truth with nothing.
+    #[test]
+    fn bind_provenance_meaningfulness_tracks_the_d8_judgment_requirements() {
+        assert!(!BindProvenance::default().is_meaningful());
+        assert!(!BindProvenance {
+            client_instance_id: Some("c".into()),
+            ..Default::default()
+        }
+        .is_meaningful());
+        assert!(!BindProvenance {
+            device_id: Some("d".into()),
+            ..Default::default()
+        }
+        .is_meaningful());
+        assert!(!BindProvenance {
+            client_instance_id: None,
+            device_id: None,
+            tab_key: Some("d:t".into()),
+        }
+        .is_meaningful());
+        assert!(BindProvenance {
+            client_instance_id: Some("c".into()),
+            device_id: Some("d".into()),
+            tab_key: None,
+        }
+        .is_meaningful());
+        assert!(BindProvenance::for_create(Some("c"), Some("d"), Some("t")).is_meaningful());
     }
 
     #[tokio::test]
