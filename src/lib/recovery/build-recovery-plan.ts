@@ -195,7 +195,10 @@ export function placeLedgerEntries(inv: RecoveryInventory): LedgerPlacement {
  * PLACEABLE ledger rows only — computed through the same `placeLedgerEntries`
  * partition the listing and the plan consume (delta-r4 Finding 2), so an
  * unplaceable row (no join target) can never make the prompt advertise more
- * than the accept path restores.
+ * than the accept path restores. Focused-ep4-r2 Finding 4: the panel's
+ * OFFERABILITY gate also consumes this — `0` means no device tab pane and no
+ * placeable ledger row exist, i.e. not recoverable (no render, pending flag
+ * cleared), so a vacuous "Restore 0 panes" prompt can never appear.
  */
 export function countRecoverablePanes(inv: RecoveryInventory): number {
   const device = inv.device?.tabs.reduce((n, t) => n + t.panes.length, 0) ?? 0

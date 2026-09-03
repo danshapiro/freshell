@@ -318,6 +318,46 @@ describe('RecoveryOfferPanel', () => {
     }
   })
 
+  // Focused-ep4-r2 Finding 4 (vacuous offer suppression): against an older
+  // server (or any inventory whose every ledger row is unplaceable with no
+  // device tabs), the offer used to render "Restore 0 panes from server
+  // memory?", RECORD the pending offer, and accept vacuously. The
+  // offerability check now consumes the SAME placeable-row predicate as the
+  // plan (`countRecoverablePanes`, which reads `placeLedgerEntries`): zero
+  // device panes AND zero placeable rows == not recoverable — no render, and
+  // the stale pending record is cleared.
+  it('an all-unplaceable inventory renders no offer and clears the pending flag', async () => {
+    setPendingOffer('cid-1', 0)
+    vi.mocked(getRecoveryInventory).mockResolvedValue({
+      ...INVENTORY,
+      device: null, // no device tabs at all
+      ledgerOnly: [
+        { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'd:t-gone' },
+        { provider: 'opencode', sessionId: 'O1', mode: 'opencode', cwd: '/y' }, // no tabKey at all
+      ],
+    })
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(getPendingOffer()).toBeNull())
+  })
+
+  // Focused-ep4-r2 Finding 4, mixed arm (the delta-r4 count-consistency pin
+  // stays green): a cohort with even ONE placeable pane offers exactly
+  // placeable + device panes.
+  it('a mixed cohort offers exactly placeable-plus-device panes', async () => {
+    const mixedInventory: RecoveryInventory = {
+      ...INVENTORY,
+      ledgerOnly: [
+        { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' }, // joins
+        { provider: 'opencode', sessionId: 'O1', mode: 'opencode', cwd: '/y', tabKey: 'd:t-gone' }, // no join target
+      ],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(mixedInventory)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
+  })
+
   // Delta-r4 Finding 2 (offer count/plan consistency): against an OLDER server
   // (a supported client-only deploy — its placement clause may be absent, so
   // unplaceable rows can ride the offer), the heading's count must match the

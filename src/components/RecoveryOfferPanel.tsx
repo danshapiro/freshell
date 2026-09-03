@@ -88,7 +88,16 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     getRecoveryInventory(getCurrentTabRegistryClientInstanceId(), Date.now() - bootAt)
       .then((inv) => {
         if (cancelled) return
-        if (!inv.recoverable || isDismissed(inv.contentId)) {
+        // Focused-ep4-r2 Finding 4 (vacuous-offer suppression): the
+        // offerability check consumes the SAME placeable-row predicate as the
+        // plan — countRecoverablePanes sums device-tab panes plus
+        // `placeLedgerEntries`'s joined rows. Against an older server (or any
+        // inventory whose ledger rows are all unplaceable with no device
+        // tabs) that count is 0, and the panel used to render "Restore 0
+        // panes", record the pending offer, and accept vacuously. Zero
+        // placeable panes is not recoverable: do not render, and clear the
+        // pending record like any other dead offer.
+        if (!inv.recoverable || isDismissed(inv.contentId) || countRecoverablePanes(inv) === 0) {
           // A dead offer (nothing recoverable / already dismissed) must not
           // leave a stale pending record causing pointless fetches every boot.
           // Fetch ERRORS deliberately keep the flag set (retry next boot).
