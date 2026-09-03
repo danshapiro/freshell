@@ -53,6 +53,10 @@ fn retired_gc_expired() -> StateParts {
     (RowState::Retired, Some(RetiredReason::GcExpired), None)
 }
 
+fn retired_session_missing() -> StateParts {
+    (RowState::Retired, Some(RetiredReason::SessionMissing), None)
+}
+
 fn retired_superseded_by(provider: &str, session_id: &str) -> StateParts {
     (
         RowState::Retired,
@@ -1379,6 +1383,367 @@ fn ambiguity_suppression_never_touches_rows_that_do_not_correlate() {
         only[0]["sessionId"], "C-z",
         "the surviving entry is the unrelated row, under the normal D8 judgment"
     );
+}
+
+// ── Focused-ep3-r3: retired rows participate in correlation (closed-arm parity) ──
+// The focused-ep3 correlation indices hold only Bound rows, but retirement
+// (retire_closed / retire_missing / supersession) KEEPS the row's advisory
+// create_request_id/live_terminal_id. A ref-less pane (snapshotted inside its
+// identity-association window) whose identity was retired before the next
+// snapshot correlated to NOTHING and reported ledgerState "unknown", even
+// though the ledger authoritatively records where that identity ENDED. The
+// retired tier closes the parity gap: an unambiguous retired correlation
+// emits the SAME verdict shape the snapshot-claim arm's D4 chain (resolve())
+// produces for that row's identity, with the row's identity standing in for
+// the absent claim — Closed => ("closed", no ref); successor-less
+// SessionMissing/GcExpired => ("gc_expired", row identity — the claim arm's
+// keep-the-claim shape); Superseded => the chain's own verdict. Retired rows
+// never reach ledgerOnly (the row_is_bound pre-filter, unchanged) and keep
+// the bound tier's never-guess discipline (sole candidate AND sole claimant,
+// counted only among panes with NO bound candidates).
+
+#[test]
+fn ref_less_pane_correlated_to_a_retired_closed_row_reports_closed() {
+    // THE FINDING: the union pane was snapshotted inside its association
+    // window; the identity then bound AND was explicitly killed
+    // (terminal.kill -> retire_closed) before the next snapshot. The pane
+    // must report the claim arm's closed-verdict shape (ledgerState "closed",
+    // NO effective ref — the client rebuilds it fresh, exactly like the
+    // established closed-with-ref arm) instead of "unknown". The retired row
+    // stays out of ledgerOnly either way (the row_is_bound pre-filter is the
+    // deciding filter for every retired row — attribution cannot change it),
+    // and no second pane is planned (exactly one pane in, one pane out).
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1",
+                                  "liveTerminal": { "terminalId": "t-9", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let row = with_correlation_ids(
+        binding_row_at("codex", "C-killed", retired_closed(), 1_000),
+        Some("req-1"),
+        Some("t-9"),
+    );
+    let out = build_inventory(vec![d], vec![row], no_live(), &no_evidence());
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes.len(),
+        1,
+        "one originally-open pane must restore as ONE pane, not two"
+    );
+    assert_eq!(panes[0]["ledgerState"], "closed");
+    assert!(
+        panes[0]["sessionRef"].is_null(),
+        "closed verdict carries NO effective ref — the claim arm's Closed shape"
+    );
+    assert_eq!(panes[0]["live"], false);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "the closed row is NOT in ledgerOnly (retired rows are already excluded — it stays so)"
+    );
+}
+
+#[test]
+fn ref_less_pane_correlated_to_a_session_missing_row_reports_gc_expired() {
+    // Per-reason disposition — SessionMissing: the identity is over (the
+    // session file vanished provider-side) but NOT by an observed user close.
+    // resolve()'s established verdict for a successor-less non-closed
+    // terminus is GcExpired, so the correlated pane reports exactly the claim
+    // arm's GcExpired shape: ledgerState "gc_expired" with the effective ref
+    // KEPT — the correlated row's identity stands in for the absent claim,
+    // exactly as the claim arm keeps the original snapshot claim. Isolated to
+    // the liveTerminal arm (the conn-less lane writes create_request_id: None).
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "opencode",
+                                  "liveTerminal": { "terminalId": "t-7", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let row = with_correlation_ids(
+        binding_row_at("opencode", "O-gone", retired_session_missing(), 1_000),
+        None,
+        Some("t-7"),
+    );
+    let out = build_inventory(vec![d], vec![row], no_live(), &no_evidence());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "gc_expired");
+    assert_eq!(pane["sessionRef"]["provider"], "opencode");
+    assert_eq!(
+        pane["sessionRef"]["sessionId"], "O-gone",
+        "the claim arm keeps the original claim for gc_expired — the correlated row's identity is that claim"
+    );
+    assert_eq!(pane["live"], false);
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn ref_less_pane_correlated_to_a_gc_expired_row_reports_gc_expired() {
+    // Per-reason disposition — GcExpired: "gc_expired rows are the old dates"
+    // (a Bound row unobserved for the 30-day sweep TTL, tombstoned by the GC).
+    // The correlation still reports the ledger's authoritative terminus
+    // verdict for the pane's identity — GcExpired, the SAME verdict a stale
+    // snapshot CLAIM would resolve to through this row (resolve() does not
+    // distinguish how the row came to the pane's attention).
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-old" } }]),
+        ),
+    };
+    let row = with_correlation_ids(
+        binding_row_at("codex", "C-old", retired_gc_expired(), 1_000),
+        Some("req-old"),
+        None,
+    );
+    let out = build_inventory(vec![d], vec![row], no_live(), &no_evidence());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "gc_expired");
+    assert_eq!(pane["sessionRef"]["provider"], "codex");
+    assert_eq!(pane["sessionRef"]["sessionId"], "C-old");
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn ref_less_pane_correlated_to_a_superseded_row_forwards_to_the_successor_verdict() {
+    // Per-reason disposition — Superseded: "superseded rows forward through
+    // resolve()". The pane's identity did not END, it MOVED (session switch
+    // on a new terminal): S1 retired-superseded keeps the OLD terminal's
+    // advisory ids; the Bound successor S2 was bound on a NEW terminal (its
+    // advisory ids do NOT match the pane), so the retired arm is the ONLY
+    // correlation. resolve(S1) walks to S2 and answers the chain's own
+    // verdict — Bound(S2): the pane behaves exactly as if the snapshot had
+    // claimed S1 (the claim arm's D4 chain shape). S2 is attributed + in
+    // grace + tabKey-matched, so ONLY the referenced rule (fed by the
+    // forwarded bind) keeps it out of ledgerOnly — anti-vacuity.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "claude", "createRequestId": "req-1",
+                                  "liveTerminal": { "terminalId": "t-1", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let rows = vec![
+        with_correlation_ids(
+            binding_row_at("claude", "S1", retired_superseded_by("claude", "S2"), 1_000),
+            Some("req-1"),
+            Some("t-1"),
+        ),
+        with_attribution(
+            with_correlation_ids(
+                binding_row_at("claude", "S2", bound(), 1_000),
+                None,
+                Some("t-2"), // the NEW terminal — the pane's ids never reach S2 directly
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        ),
+    ];
+    let out = build_inventory(
+        vec![d],
+        rows,
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+    );
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0]["ledgerState"], "bound");
+    assert_eq!(panes[0]["sessionRef"]["provider"], "claude");
+    assert_eq!(
+        panes[0]["sessionRef"]["sessionId"], "S2",
+        "the superseded correlation forwards to the chain's Bound verdict, successor identity"
+    );
+    assert_eq!(panes[0]["live"], false);
+    assert_eq!(
+        out["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "S1 is retired (never offered); S2 is referenced via the forwarded bind, not ledger-only"
+    );
+}
+
+#[test]
+fn ref_less_pane_correlated_to_a_superseded_row_with_a_closed_terminus_reports_closed() {
+    // The forwarding walk ends wherever the CHAIN ends: S1 superseded -> S2,
+    // and S2 itself retired-closed. resolve()'s verdict for the pane's
+    // identity is therefore Closed — the same ("closed", no effective ref)
+    // shape as the finding's direct closed-row correlation.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "claude", "createRequestId": "req-1",
+                                  "liveTerminal": { "terminalId": "t-1", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let rows = vec![
+        with_correlation_ids(
+            binding_row_at("claude", "S1", retired_superseded_by("claude", "S2"), 1_000),
+            Some("req-1"),
+            Some("t-1"),
+        ),
+        with_correlation_ids(
+            binding_row_at("claude", "S2", retired_closed(), 1_000),
+            None,
+            Some("t-2"),
+        ),
+    ];
+    let out = build_inventory(vec![d], rows, no_live(), &no_evidence());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "closed");
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn retired_row_correlation_requires_provider_mode_coherence() {
+    // The retired tier keeps the coherence gates verbatim (the SAME
+    // correlation_candidates): an id match with the WRONG provider/mode is a
+    // collision, not a match — NO correlation at all; the pane falls to the
+    // unknown arm. (The retired row is never offered either way — retired
+    // rows never reach the offer pipeline.)
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1" } }]),
+        ),
+    };
+    let row = with_correlation_ids(
+        binding_row_at("claude", "S-killed", retired_closed(), 1_000),
+        Some("req-1"), // the SAME advisory id, the WRONG provider
+        None,
+    );
+    let out = build_inventory(vec![d], vec![row], no_live(), &no_evidence());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "unknown", "no coherence => no correlation");
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn retired_fresh_agent_rows_never_correlate() {
+    // The row-side `pane_kind` gate applies to the retired tier too: a retired
+    // FRESH-AGENT row is never a verdict source for a terminal pane. The
+    // fixture mirrors the bound tier's guard — the row's provider DOES equal
+    // the pane's mode, so `pane_kind.is_none()` is the ONLY gate excluding it.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "opencode", "createRequestId": "req-1" } }]),
+        ),
+    };
+    let mut fresh_row = binding_row_at("opencode", "O-fresh", retired_closed(), 1_000);
+    fresh_row.mode = "freshopencode".into();
+    fresh_row.pane_kind = Some("fresh-agent".into());
+    let row = with_correlation_ids(fresh_row, Some("req-1"), None);
+    let out = build_inventory(vec![d], vec![row], no_live(), &no_evidence());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["ledgerState"], "unknown",
+        "a retired fresh-agent ROW never correlates onto a terminal pane"
+    );
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn two_retired_rows_sharing_the_panes_create_request_id_never_correlate() {
+    // The retired tier keeps the campaign's never-guess discipline, pane-side:
+    // TWO retired rows named by the one ref-less pane => NO verdict at all
+    // (the unknown arm) — never a coin flip between two ended identities.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "codex", "createRequestId": "req-1" } }]),
+        ),
+    };
+    let row = |session_id: &str| {
+        with_correlation_ids(
+            binding_row_at("codex", session_id, retired_closed(), 1_000),
+            Some("req-1"),
+            None,
+        )
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![row("C-a"), row("C-b")],
+        no_live(),
+        &no_evidence(),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "unknown");
+    assert!(pane["sessionRef"].is_null());
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn one_retired_row_matching_two_ref_less_panes_never_correlates_either() {
+    // Row-side symmetry with the bound tier's claim census: a retired row
+    // claimed by TWO ref-less panes (duplicated generation components — from
+    // retained data it is undecidable which pane owned the identity) binds
+    // NEITHER. The census counts claims only among panes with NO bound
+    // candidates — the ones that will actually take the retired arm.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            5_000,
+            "dev1:t1",
+            json!([
+                { "paneId": "p1", "kind": "terminal",
+                  "payload": { "mode": "codex", "createRequestId": "req-1" } },
+                { "paneId": "p2", "kind": "terminal",
+                  "payload": { "mode": "codex", "createRequestId": "req-1" } }
+            ]),
+        ),
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![with_correlation_ids(
+            binding_row_at("codex", "C-killed", retired_closed(), 1_000),
+            Some("req-1"),
+            None,
+        )],
+        no_live(),
+        &no_evidence(),
+    );
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(panes[0]["ledgerState"], "unknown");
+    assert_eq!(panes[1]["ledgerState"], "unknown");
+    assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
 }
 
 // ── Task 2: `GET /api/recovery/inventory` route tests ─────────────────────────

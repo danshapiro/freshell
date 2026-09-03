@@ -173,7 +173,9 @@ fn resolve(provider: &str, session_id: &str, by_key: &HashMap<String, &BindingRo
 }
 
 /// Bind-by-correlation candidate rows for a snapshot pane WITHOUT a
-/// sessionRef claim (focused-ep3): Bound rows whose advisory
+/// sessionRef claim (focused-ep3): rows from whichever advisory index set the
+/// caller passes (Bound rows for the restore-with-resume bind; RETIRED rows
+/// for the focused-ep3-r3 ended-identity verdict) whose advisory
 /// `create_request_id` equals the pane payload's `createRequestId` OR whose
 /// advisory `live_terminal_id` equals the payload's
 /// `liveTerminal.terminalId` (deduped by row identity — one row matching
@@ -264,6 +266,35 @@ pub fn build_inventory(
                 .push(row);
         }
     }
+    // Focused-ep3-r3: RETIRED rows keep their advisory ids at retirement
+    // (`retire_closed`/`retire_missing`/supersession touch only state,
+    // retired_reason, updated_at, superseded_by). A ref-less pane whose
+    // identity was retired BETWEEN the snapshot and the server death would
+    // otherwise correlate to nothing and report ledgerState "unknown" even
+    // though the ledger authoritatively records that the identity ENDED (the
+    // finding: an explicit terminal.kill -> Retired(Closed)). The retired
+    // indices feed ONLY the ended-identity verdict arm below (closed-arm
+    // parity with resolve()); retired rows never reach the ledgerOnly
+    // pipeline (the row_is_bound pre-filter, unchanged) — the verdict can
+    // never become an offer. All four retired reasons are indexed; the
+    // per-reason disposition is resolve()'s own terminus semantics, applied
+    // at verdict time (see the ref-less arm's retired branch).
+    let mut retired_by_create_request_id: HashMap<&str, Vec<&BindingRow>> = HashMap::new();
+    let mut retired_by_live_terminal_id: HashMap<&str, Vec<&BindingRow>> = HashMap::new();
+    for row in bindings.iter().filter(|r| row_is_retired(r)) {
+        if let Some(create_request_id) = row.create_request_id.as_deref() {
+            retired_by_create_request_id
+                .entry(create_request_id)
+                .or_default()
+                .push(row);
+        }
+        if let Some(live_terminal_id) = row.live_terminal_id.as_deref() {
+            retired_by_live_terminal_id
+                .entry(live_terminal_id)
+                .or_default()
+                .push(row);
+        }
+    }
 
     // sort newest-first; primary device = greatest capturedAt with >=1 record
     let mut unions = device_unions;
@@ -272,7 +303,8 @@ pub fn build_inventory(
     // Pass 1 - resolve EVERY pane in EVERY union (not just the primary): effective refs
     // feed the cross-device ledgerOnly rule (A4) and the contentId substance (A5/A6);
     // the primary union's tabs feed `device`. Ref-less panes attempt
-    // bind-by-correlation (focused-ep3) before falling back to "unknown".
+    // bind-by-correlation (focused-ep3), then the retired-tier ended-identity
+    // verdict (focused-ep3-r3), before falling back to "unknown".
     //
     // Correlation ambiguity census over that SAME every-union span (the rule
     // is symmetric): a pane binds ONLY a row that is its SOLE candidate AND
@@ -291,6 +323,17 @@ pub fn build_inventory(
     // separately in the D8 judgment debug line (`ambiguous_suppressed`).
     let mut correlation_claims: HashMap<String, usize> = HashMap::new();
     let mut ambiguous_rows: HashSet<String> = HashSet::new();
+    // Focused-ep3-r3: the retired tier keeps the bound tier's never-guess
+    // discipline (sole candidate AND sole claimant), but its claim census
+    // counts ONLY panes with NO bound candidates — a pane taking the bound
+    // path never effectively claims a retired row, so its retired candidates
+    // must not taint a sibling pane's verdict. Retired rows join NEITHER
+    // `ambiguous_rows` nor the suppression filter: they never reach the
+    // ledgerOnly pipeline at all (the row_is_bound pre-filter), so there is
+    // no offer to suppress them from. An ambiguous retired correlation simply
+    // leaves the pane at today's ("unknown", None) shape — never a coin flip
+    // between two ended identities.
+    let mut retired_claims: HashMap<String, usize> = HashMap::new();
     for d in &unions {
         for rec in d.union_doc["records"].as_array().into_iter().flatten() {
             for pane in rec["panes"].as_array().into_iter().flatten() {
@@ -309,10 +352,22 @@ pub fn build_inventory(
                         ambiguous_rows.insert(ref_key(&row.provider, &row.session_id));
                     }
                 }
+                let no_bound_candidates = candidates.is_empty();
                 for row in candidates {
                     *correlation_claims
                         .entry(ref_key(&row.provider, &row.session_id))
                         .or_default() += 1;
+                }
+                if no_bound_candidates {
+                    for row in correlation_candidates(
+                        pane,
+                        &retired_by_create_request_id,
+                        &retired_by_live_terminal_id,
+                    ) {
+                        *retired_claims
+                            .entry(ref_key(&row.provider, &row.session_id))
+                            .or_default() += 1;
+                    }
                 }
             }
         }
@@ -326,6 +381,7 @@ pub fn build_inventory(
     }
     let mut correlated = 0usize;
     let mut ambiguous = 0usize;
+    let mut retired_correlated = 0usize;
     let mut referenced: HashSet<String> = HashSet::new();
     let mut substance: Vec<String> = Vec::new();
     let mut tabs_per_union: Vec<Vec<Value>> = Vec::new();
@@ -381,10 +437,78 @@ pub fn build_inventory(
                                             ),
                                         )
                                     }
-                                    _ => {
-                                        if !candidates.is_empty() {
-                                            ambiguous += 1;
+                                    [] => {
+                                        // Focused-ep3-r3 (closed-arm parity):
+                                        // NO Bound row correlates, but a
+                                        // RETIRED row keeping the pane's
+                                        // advisory ids is the ledger's
+                                        // authoritative record of where this
+                                        // pane's identity ENDED. For the
+                                        // unambiguous retired correlation
+                                        // (sole candidate AND sole claimant),
+                                        // emit the SAME verdict shape the
+                                        // snapshot-claim arm's D4 chain
+                                        // produces for this row's identity —
+                                        // resolve() decides it, with the
+                                        // row's identity standing in for the
+                                        // absent claim:
+                                        //   Closed terminus              => ("closed", None) — THE FINDING
+                                        //   SessionMissing/GcExpired     => ("gc_expired", row
+                                        //     identity) — the claim arm's
+                                        //     keep-the-original-claim shape
+                                        //   Superseded                   => the chain's own
+                                        //     verdict (a Bound successor binds;
+                                        //     a closed terminus => ("closed", None))
+                                        // Any ambiguity stays today's
+                                        // ("unknown", None) — never guess.
+                                        let retired = correlation_candidates(
+                                            pane,
+                                            &retired_by_create_request_id,
+                                            &retired_by_live_terminal_id,
+                                        );
+                                        match retired.as_slice() {
+                                            [row]
+                                                if retired_claims
+                                                    .get(&ref_key(&row.provider, &row.session_id))
+                                                    .copied()
+                                                    == Some(1) =>
+                                            {
+                                                retired_correlated += 1;
+                                                let identity = json!({"provider": row_provider(row), "sessionId": row_session_id(row)});
+                                                match resolve(
+                                                    &row.provider,
+                                                    &row.session_id,
+                                                    &by_key,
+                                                ) {
+                                                    Verdict::Bound(bp, bs) => (
+                                                        "bound",
+                                                        Some(
+                                                            json!({"provider": bp, "sessionId": bs}),
+                                                        ),
+                                                    ),
+                                                    Verdict::Closed => ("closed", None),
+                                                    Verdict::GcExpired => {
+                                                        ("gc_expired", Some(identity))
+                                                    }
+                                                    // Unreachable: the row
+                                                    // comes from `bindings`,
+                                                    // which `by_key` covers —
+                                                    // resolve() can never miss
+                                                    // the first hop. Claim-arm
+                                                    // parity shape regardless.
+                                                    Verdict::Unknown => ("unknown", Some(identity)),
+                                                }
+                                            }
+                                            _ => {
+                                                if !retired.is_empty() {
+                                                    ambiguous += 1;
+                                                }
+                                                ("unknown", None)
+                                            }
                                         }
+                                    }
+                                    _ => {
+                                        ambiguous += 1;
                                         ("unknown", None)
                                     }
                                 }
@@ -604,6 +728,7 @@ pub fn build_inventory(
         primary = primary_device_id.is_some(),
         correlated,
         ambiguous_correlations = ambiguous,
+        retired_correlated,
         ambiguous_suppressed,
         "D8 offer judgment");
 
@@ -690,6 +815,10 @@ fn row_session_id(r: &BindingRow) -> String {
 
 fn row_is_bound(r: &BindingRow) -> bool {
     r.state == RowState::Bound
+}
+
+fn row_is_retired(r: &BindingRow) -> bool {
+    r.state == RowState::Retired
 }
 
 fn row_reason_is_closed(r: &BindingRow) -> bool {
