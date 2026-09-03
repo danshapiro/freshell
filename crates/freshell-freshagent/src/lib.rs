@@ -68,7 +68,7 @@ pub use claude_snapshot::{
 pub use codex::FreshCodexState;
 pub use identity_sink::{
     BindProvenance, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    SharedPaneIdentitySink, SinkWrite,
+    ProvenanceUpdate, SharedPaneIdentitySink, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
@@ -2392,11 +2392,13 @@ async fn send_keys(
                     // D8 (restore-open-sessions-only): REST/MCP lineage rows
                     // intentionally stamp NO provenance — no browser client
                     // connection exists at bind time, so there is nothing true
-                    // to attribute. Rows without attribution are never offered
-                    // by the recovery judgment (`recovery_inventory.rs`).
-                    client_instance_id: None,
-                    device_id: None,
-                    tab_key: None,
+                    // to attribute. Delta-r2 Finding 2: `Clear` (not merely
+                    // no-stamps) — a headless re-bind of a browser-stamped row
+                    // must ERASE the stale browser attribution instead of
+                    // inheriting it under a refreshed `updated_at`; rows
+                    // without attribution are never offered by the recovery
+                    // judgment (`recovery_inventory.rs`).
+                    provenance: identity_sink::ProvenanceUpdate::Clear,
                     settings: identity_sink::FreshAgentSettings {
                         model: pane.model.clone(),
                         sandbox: None,
@@ -3643,6 +3645,15 @@ mod tests {
         // SEND's requestId and the REST path stamped `None`; the placeholder
         // is the lineage source of truth on both paths now.
         assert_eq!(b.create_request_id.as_deref(), Some("r1"));
+        // Delta-r2 Finding 2 pin: the REST/MCP materialization lane is
+        // EXPLICITLY headless — its write must CLEAR any prior browser stamps
+        // on the row, never inherit them (a kept stamp under the refreshed
+        // `updated_at` would launder the row into the D8 recovery offer).
+        assert_eq!(
+            b.provenance,
+            identity_sink::ProvenanceUpdate::Clear,
+            "the REST lineage write is a provenance Clear"
+        );
         // A settings-bearing row keeps "recorded" status under the new keying.
         drop(bindings);
         assert!(fake.was_recorded("opencode", "ses_1"));

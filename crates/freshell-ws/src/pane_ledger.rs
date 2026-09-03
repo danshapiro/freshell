@@ -133,12 +133,13 @@ pub struct BindingRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// D8 (restore-open-sessions-only) provenance: the browser client + tab
-    /// this binding was created from. Written by connection-scoped lanes only;
-    /// conn-less re-bind lanes (respawn, locator/adoption resolution, fork
-    /// chains) write `None` and the upsert bodies merge keep-when-`None` so
-    /// re-binds preserve the stamps. Serde-optional under LEDGER_VERSION 1:
-    /// pre-D8 rows (and REST/headless rows — intentionally never stamped,
-    /// `pane_identity_binder.rs`) parse to all-`None`.
+    /// this binding was created from. What a write DOES with them is the
+    /// tri-state [`ProvenancePolicy`] on the write structs (delta-r2 Finding
+    /// 2): connection-scoped lanes `Replace`, conn-less re-bind lanes
+    /// (respawn, locator/adoption resolution, fork chains) `Inherit`, and the
+    /// explicitly-headless REST/MCP lineage lanes (`pane_identity_binder.rs`)
+    /// `Clear`. Serde-optional under LEDGER_VERSION 1: pre-D8 rows (and
+    /// headless rows — intentionally never stamped) parse to all-`None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,6 +162,52 @@ pub struct PendingMarker {
     pub spawned_at: i64,
 }
 
+/// D8 (delta-r2 Finding 2) provenance stamps carried by a
+/// [`ProvenancePolicy::Replace`] write: the browser client + tab the binding
+/// event was caused by. `tab_key` composes as `deviceId:tabId` (exactly
+/// `src/lib/tab-registry-snapshot.ts`'s record composition), so the row can
+/// rejoin the right restored tab.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvenanceStamps<'a> {
+    pub client_instance_id: Option<&'a str>,
+    pub device_id: Option<&'a str>,
+    pub tab_key: Option<&'a str>,
+}
+
+/// D8 (delta-r2 Finding 2) provenance write policy: every binding write
+/// declares what it ASSERTS about attribution. The bare `Option` fields this
+/// replaces made `None` ambiguous between "I assert nothing — keep the
+/// stamps" (conn-less session-affiliated refresh lanes) and "this lane is
+/// HEADLESS and the row is unattributable from it" (REST/MCP lineage) — and
+/// the ambiguity laundered: a headless re-bind of a browser-stamped row kept
+/// the stamps while refreshing `updated_at`, so after the parent browser's
+/// evidence froze the row kept clearing the D8 grace lower bound forever and
+/// the not-open session was offered with stale attribution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProvenancePolicy<'a> {
+    /// Conn-less SESSION-AFFILIATED lanes (auto-resume respawn,
+    /// locator/adoption resolution): the write asserts nothing about
+    /// attribution, so every existing stamp survives; the fresh-agent body
+    /// additionally inherits a superseded PARENT's stamps on a fork-chain
+    /// first write (the fork is, by construction, the same pane).
+    #[default]
+    Inherit,
+    /// Connection-supplied stamps (the WS create/fresh-agent lanes compose
+    /// them from the connection's hello identity + the message's `tabId`):
+    /// an adoption lane that KNOWS newer identity replaces it here. Each
+    /// `Some` field replaces the row's value; a `None` field asserts nothing
+    /// about ITSELF and keeps the row's value (a connection that cannot
+    /// compose one stamp — e.g. `tabKey` without a `tabId` on the wire —
+    /// must not erase the row's existing one).
+    Replace(ProvenanceStamps<'a>),
+    /// An explicitly HEADLESS writer (the REST/MCP lineage binder — no
+    /// browser connection exists at bind time): all stamps are CLEARED.
+    /// A headless re-bind must never keep an earlier browser stamp (see the
+    /// enum doc), so the rebound row becomes unattributed and the D8
+    /// judgment (`recovery_inventory.rs`) correctly never offers it.
+    Clear,
+}
+
 /// One identity event's worth of binding-row input.
 pub struct BindingWrite<'a> {
     pub provider: &'a str,
@@ -169,13 +216,9 @@ pub struct BindingWrite<'a> {
     pub mode: &'a str,
     pub cwd: Option<&'a str>,
     pub create_request_id: Option<&'a str>,
-    /// D8 provenance stamps — `Some` from connection-scoped create lanes
-    /// (`terminal.rs` compose from the stored hello identity + the create's
-    /// `tabId`), `None` from conn-less lanes (the upsert merges keep-when-None;
-    /// see `record_binding_locked`).
-    pub client_instance_id: Option<&'a str>,
-    pub device_id: Option<&'a str>,
-    pub tab_key: Option<&'a str>,
+    /// D8 provenance write policy — see [`ProvenancePolicy`] for the
+    /// per-lane contract (Replace / Inherit / Clear).
+    pub provenance: ProvenancePolicy<'a>,
     pub now_ms: i64,
 }
 
@@ -197,13 +240,10 @@ pub struct FreshAgentBindingWrite<'a> {
     /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
     /// row is retired and linked AFTER the new row persists.
     pub supersedes: Option<&'a str>,
-    /// D8 provenance stamps — `Some` from connection-scoped create lanes,
-    /// `None` from conn-less lanes (keep-when-None merge, falling back to the
-    /// superseded parent's stamps on a fork-chain write; see
-    /// `record_fresh_agent_binding`).
-    pub client_instance_id: Option<&'a str>,
-    pub device_id: Option<&'a str>,
-    pub tab_key: Option<&'a str>,
+    /// D8 provenance write policy — see [`ProvenancePolicy`] for the
+    /// per-lane contract (Replace / Inherit / Clear; the Inherit merge falls
+    /// back to the superseded parent's stamps on a fork-chain write).
+    pub provenance: ProvenancePolicy<'a>,
     pub now_ms: i64,
 }
 
@@ -478,25 +518,39 @@ impl PaneLedger {
                 "pane_ledger_revived: gc_expired tombstone re-bound by a live identity event"
             );
         }
-        // D8 provenance merge (keep-when-None): conn-less re-bind lanes
-        // (auto-resume respawn, locator/adoption resolution) write `None` here
-        // and must NOT erase the stamps the connection-scoped create wrote.
-        // DELIBERATELY unlike this body's other advisory fields
-        // (`create_request_id` is wholesale-replaced): a stamped-lane write
-        // carries `Some` and still replaces (adoption lanes that KNOW newer
-        // identity), so only the `None` case inherits.
-        let client_instance_id = w
-            .client_instance_id
-            .map(str::to_string)
-            .or_else(|| existing.and_then(|r| r.client_instance_id.clone()));
-        let device_id = w
-            .device_id
-            .map(str::to_string)
-            .or_else(|| existing.and_then(|r| r.device_id.clone()));
-        let tab_key = w
-            .tab_key
-            .map(str::to_string)
-            .or_else(|| existing.and_then(|r| r.tab_key.clone()));
+        // D8 provenance merge (delta-r2 Finding 2 tri-state,
+        // [`ProvenancePolicy`]): `Inherit` is the conn-less session-affiliated
+        // lane — the write asserts nothing, so the row keeps every stamp.
+        // `Replace` is the connection-supplied lane — each `Some` field
+        // replaces, a `None` field asserts nothing about itself and is kept
+        // (a connection that cannot compose that stamp must not erase the
+        // row's value; DELIBERATELY unlike this body's other advisory fields
+        // such as `create_request_id`, which are wholesale-replaced).
+        // `Clear` is the explicitly-headless lineage lane — the row's stamps
+        // are erased so a stale browser attribution can never launder the row
+        // into the D8 offer under a refreshed `updated_at`.
+        let (client_instance_id, device_id, tab_key) = match w.provenance {
+            ProvenancePolicy::Inherit => (
+                existing.and_then(|r| r.client_instance_id.clone()),
+                existing.and_then(|r| r.device_id.clone()),
+                existing.and_then(|r| r.tab_key.clone()),
+            ),
+            ProvenancePolicy::Replace(stamps) => (
+                stamps
+                    .client_instance_id
+                    .map(str::to_string)
+                    .or_else(|| existing.and_then(|r| r.client_instance_id.clone())),
+                stamps
+                    .device_id
+                    .map(str::to_string)
+                    .or_else(|| existing.and_then(|r| r.device_id.clone())),
+                stamps
+                    .tab_key
+                    .map(str::to_string)
+                    .or_else(|| existing.and_then(|r| r.tab_key.clone())),
+            ),
+            ProvenancePolicy::Clear => (None, None, None),
+        };
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -603,12 +657,18 @@ impl PaneLedger {
             .create_request_id
             .map(str::to_string)
             .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
-        // D8 provenance merge (keep-when-None): conn-less refresh lanes carry
-        // `None` and keep the create's stamps. A fork-chain first write
+        // D8 provenance merge (delta-r2 Finding 2 tri-state,
+        // [`ProvenancePolicy`]): `Inherit` asserts nothing — conn-less
+        // refresh lanes keep the create's stamps; a fork-chain first write
         // (`supersedes: Some(parent)`, no same-key row — the claude rollback
         // adoption and codex crash-respawn lanes) inherits the superseded
-        // PARENT's stamps: the fork is, by construction, the same pane. The
-        // retire/link below is unchanged; this read is inheritance-only.
+        // PARENT's stamps (the fork is, by construction, the same pane).
+        // `Replace` fields replace independently (a `None` field keeps the
+        // inherited value). `Clear` (explicitly-headless lineage) erases all
+        // stamps and NEVER inherits — a headless re-bind must not keep a
+        // browser's attribution under a refreshed `updated_at`, or the D8
+        // judgment would offer a session that was not open. The retire/link
+        // below is unchanged by the policy; this block is stamps-only.
         let superseded_parent = w
             .supersedes
             .filter(|old| *old != w.session_id)
@@ -619,18 +679,28 @@ impl PaneLedger {
                     .cloned()
             });
         let inherit = existing.or(superseded_parent.as_ref());
-        let client_instance_id = w
-            .client_instance_id
-            .map(str::to_string)
-            .or_else(|| inherit.and_then(|r| r.client_instance_id.clone()));
-        let device_id = w
-            .device_id
-            .map(str::to_string)
-            .or_else(|| inherit.and_then(|r| r.device_id.clone()));
-        let tab_key = w
-            .tab_key
-            .map(str::to_string)
-            .or_else(|| inherit.and_then(|r| r.tab_key.clone()));
+        let (client_instance_id, device_id, tab_key) = match w.provenance {
+            ProvenancePolicy::Inherit => (
+                inherit.and_then(|r| r.client_instance_id.clone()),
+                inherit.and_then(|r| r.device_id.clone()),
+                inherit.and_then(|r| r.tab_key.clone()),
+            ),
+            ProvenancePolicy::Replace(stamps) => (
+                stamps
+                    .client_instance_id
+                    .map(str::to_string)
+                    .or_else(|| inherit.and_then(|r| r.client_instance_id.clone())),
+                stamps
+                    .device_id
+                    .map(str::to_string)
+                    .or_else(|| inherit.and_then(|r| r.device_id.clone())),
+                stamps
+                    .tab_key
+                    .map(str::to_string)
+                    .or_else(|| inherit.and_then(|r| r.tab_key.clone())),
+            ),
+            ProvenancePolicy::Clear => (None, None, None),
+        };
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -1155,12 +1225,9 @@ pub(crate) async fn ledger_resolve_identity(
             mode: &provider_owned,
             cwd: cwd_owned.as_deref(),
             create_request_id: None,
-            // Conn-less lane (D8): no provenance in scope; the upsert's
-            // keep-when-None merge preserves any stamps the connection-scoped
-            // create wrote.
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            // Conn-less lane (D8): no provenance in scope and none asserted;
+            // `Inherit` keeps any stamps the connection-scoped create wrote.
+            provenance: ProvenancePolicy::Inherit,
             now_ms: now,
         })
     })

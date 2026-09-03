@@ -1087,9 +1087,7 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
         create_request_id: Some("cr-abc123".into()),
         resolves_pending: Some("freshopencode-cr-abc123".into()),
         supersedes: None,
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
         settings: FreshAgentSettings::default(),
     })
     .await

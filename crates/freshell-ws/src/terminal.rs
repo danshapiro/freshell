@@ -3479,9 +3479,13 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
-                    client_instance_id: write_client_instance_id.as_deref(),
-                    device_id: write_device_id.as_deref(),
-                    tab_key: write_tab_key.as_deref(),
+                    provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                        crate::pane_ledger::ProvenanceStamps {
+                            client_instance_id: write_client_instance_id.as_deref(),
+                            device_id: write_device_id.as_deref(),
+                            tab_key: write_tab_key.as_deref(),
+                        },
+                    ),
                     now_ms: now,
                 })
             })
@@ -3808,9 +3812,13 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
-                    client_instance_id: write_client_instance_id.as_deref(),
-                    device_id: write_device_id.as_deref(),
-                    tab_key: write_tab_key.as_deref(),
+                    provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                        crate::pane_ledger::ProvenanceStamps {
+                            client_instance_id: write_client_instance_id.as_deref(),
+                            device_id: write_device_id.as_deref(),
+                            tab_key: write_tab_key.as_deref(),
+                        },
+                    ),
                     now_ms: now,
                 })
             })
@@ -4478,11 +4486,9 @@ pub async fn respawn_agent_terminal(
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
                     // Conn-less lane (D8): the auto-resume respawn has no
-                    // client connection; the upsert's keep-when-None merge
-                    // preserves the create's provenance stamps.
-                    client_instance_id: None,
-                    device_id: None,
-                    tab_key: None,
+                    // client connection; `Inherit` preserves the create's
+                    // provenance stamps.
+                    provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                     now_ms: now,
                 })
             })

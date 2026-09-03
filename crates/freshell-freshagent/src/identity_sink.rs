@@ -28,11 +28,13 @@ pub struct FreshAgentSettings {
 /// D8 (restore-open-sessions-only) bind-lane provenance: WHICH browser client
 /// and tab caused a ledger binding write. Connection-scoped lanes stamp it
 /// from the WS connection's hello identity (`deviceId`/`clientInstanceId`)
-/// plus the create message's `tabId`; conn-less lanes (respawn, locator/
-/// adoption resolution, fork chains, REST/headless) carry `None`s and the
-/// ledger upsert bodies merge keep-when-`None` so re-binds preserve prior
-/// stamps (adoption lanes that DO know newer identity pass `Some` and
-/// replace).
+/// plus the create message's `tabId`. What a write DOES with it is the
+/// tri-state [`ProvenanceUpdate`] policy (delta-r2 Finding 2): conn-less
+/// lanes `Inherit` (re-binds preserve prior stamps, fork chains inherit the
+/// superseded parent's), connection-supplied lanes `Replace`, and the
+/// explicitly headless REST/MCP lineage lanes `Clear` (a headless re-bind
+/// erases stale browser stamps rather than keeping them under a refreshed
+/// `updated_at`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindProvenance {
     pub client_instance_id: Option<String>,
@@ -77,6 +79,45 @@ impl BindProvenance {
     }
 }
 
+/// Delta-r2 Finding 2 — the write's provenance POLICY (tri-state), the
+/// freshagent-crate mirror of `freshell_ws::pane_ledger::ProvenancePolicy`
+/// (this crate cannot see the ledger; the server-side sink maps between
+/// them). The bare `Option`-per-field upsert shape it replaces made `None`
+/// ambiguous between "assert nothing, keep the stamps" and "headless lane —
+/// clear them": a headless REST/MCP lineage re-bind of a browser-stamped row
+/// kept the browser's stamps under a refreshed `updated_at`, laundering the
+/// row into the D8 recovery offer with a stale parent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ProvenanceUpdate {
+    /// Conn-less SESSION-AFFILIATED lanes (respawn, refresh, attach-resume,
+    /// fork chains with no connection-supplied stamps to assert): the ledger
+    /// merge keeps every existing stamp.
+    #[default]
+    Inherit,
+    /// Connection-supplied stamps (whole `BindProvenance` values composed
+    /// from the connection's hello identity + the message's `tabId`, or
+    /// resolved fork provenance): asserted onto the row — each `Some` field
+    /// replaces, a `None` field keeps the inherited value.
+    Replace(BindProvenance),
+    /// An explicitly HEADLESS writer (the REST/MCP lineage binder,
+    /// `lib.rs`'s materialization write): all stamps are CLEARED — the
+    /// rebound row becomes unattributed, so the D8 judgment never offers it.
+    Clear,
+}
+
+impl From<Option<BindProvenance>> for ProvenanceUpdate {
+    /// The provider-lane idiom: lanes holding an `Option<BindProvenance>`
+    /// assert it (`Replace`) when Some and assert nothing (`Inherit`) when
+    /// None. `Clear` is never produced here — it is spelled out explicitly
+    /// at the headless lineage call sites.
+    fn from(p: Option<BindProvenance>) -> Self {
+        match p {
+            Some(p) => Self::Replace(p),
+            None => Self::Inherit,
+        }
+    }
+}
+
 /// One fresh-agent identity event. Settings are a FULL snapshot (replace,
 /// not merge). `resolves_pending` names a pending marker (placeholder id)
 /// this binding supersedes.
@@ -90,12 +131,24 @@ pub struct FreshAgentBindingUpsert {
     /// G3 supersession (V8/A14): OLD session id this binding replaces
     /// (codex crash-respawn passes the old thread id; everyone else None).
     pub supersedes: Option<String>,
-    /// D8 provenance stamps (see [`BindProvenance`]); `None` fields merge
-    /// keep-when-None against the existing (or superseded-parent) row.
-    pub client_instance_id: Option<String>,
-    pub device_id: Option<String>,
-    pub tab_key: Option<String>,
+    /// D8 provenance write policy (see [`ProvenanceUpdate`]; the ledger's
+    /// keep-when-`None`/clear merge lives in `freshell-ws`'s pane ledger).
+    pub provenance: ProvenanceUpdate,
     pub settings: FreshAgentSettings,
+}
+
+impl FreshAgentBindingUpsert {
+    /// The D8 stamps this write ASSERTS: the `Replace` payload for a
+    /// connection-supplied lane, all-`None` for `Inherit` (asserts nothing —
+    /// the ledger keeps prior stamps) and `Clear` (asserts erasure; the
+    /// all-`None` answer is read alongside `provenance` in the Clear pins).
+    #[cfg(test)]
+    pub(crate) fn asserted_stamps(&self) -> BindProvenance {
+        match &self.provenance {
+            ProvenanceUpdate::Replace(stamps) => stamps.clone(),
+            ProvenanceUpdate::Inherit | ProvenanceUpdate::Clear => BindProvenance::default(),
+        }
+    }
 }
 
 /// Write-completion future (see Interfaces block for the style citation:
@@ -244,9 +297,7 @@ impl FakeIdentitySink {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Inherit,
             settings: s,
         });
     }
@@ -328,23 +379,36 @@ impl PaneIdentitySink for FakeIdentitySink {
                 self.recorded.lock().unwrap().remove(&key);
                 self.settings.lock().unwrap().remove(&key);
             }
-            // Focused-ep1-r4 Finding 2: track the row's CURRENT provenance
-            // stamps with the ledger's per-field keep-when-`None` merge (a
-            // `None` stamp keeps the prior value; a `Some` replaces).
-            {
-                let mut provenance = self.provenance.lock().unwrap();
-                // (`key` may have been moved by the settings insert above.)
-                let entry = provenance
-                    .entry((upsert.provider.clone(), upsert.session_id.clone()))
-                    .or_default();
-                if upsert.client_instance_id.is_some() {
-                    entry.client_instance_id = upsert.client_instance_id.clone();
+            // Focused-ep1-r4 Finding 2 + delta-r2 Finding 2: track the row's
+            // CURRENT provenance stamps with the ledger's merge policy —
+            // `Replace` fields replace independently (a `None` field keeps
+            // the prior value), `Inherit` asserts nothing (every stamp
+            // survives), `Clear` (explicitly headless lineage) erases them.
+            match &upsert.provenance {
+                ProvenanceUpdate::Inherit => {}
+                ProvenanceUpdate::Replace(stamps) => {
+                    let mut provenance = self.provenance.lock().unwrap();
+                    // (`key` may have been moved by the settings insert above.)
+                    let entry = provenance
+                        .entry((upsert.provider.clone(), upsert.session_id.clone()))
+                        .or_default();
+                    if stamps.client_instance_id.is_some() {
+                        entry.client_instance_id = stamps.client_instance_id.clone();
+                    }
+                    if stamps.device_id.is_some() {
+                        entry.device_id = stamps.device_id.clone();
+                    }
+                    if stamps.tab_key.is_some() {
+                        entry.tab_key = stamps.tab_key.clone();
+                    }
                 }
-                if upsert.device_id.is_some() {
-                    entry.device_id = upsert.device_id.clone();
-                }
-                if upsert.tab_key.is_some() {
-                    entry.tab_key = upsert.tab_key.clone();
+                ProvenanceUpdate::Clear => {
+                    // An erased row answers `load_provenance` with absence
+                    // (the default-map entry is never a meaningful answer).
+                    self.provenance
+                        .lock()
+                        .unwrap()
+                        .remove(&(upsert.provider.clone(), upsert.session_id.clone()));
                 }
             }
             // kata 1wxv Task 4 (claude rollback adoption): the rollback-row re-key
@@ -480,9 +544,7 @@ mod tests {
             create_request_id: Some("r1".into()),
             resolves_pending: Some("freshopencode-r1".into()),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings {
                 model: Some("m".into()),
                 sandbox: None,
@@ -520,9 +582,7 @@ mod tests {
             create_request_id: Some("cr-blank".into()),
             resolves_pending: Some("freshopencode-cr-blank".into()),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -564,9 +624,7 @@ mod tests {
             create_request_id: Some("cr-1".into()),
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -674,9 +732,11 @@ mod tests {
             create_request_id: Some("cr-x".into()),
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-1".into()),
-            device_id: Some("device-1".into()),
-            tab_key: Some("device-1:tab-1".into()),
+            provenance: ProvenanceUpdate::Replace(BindProvenance {
+                client_instance_id: Some("client-1".into()),
+                device_id: Some("device-1".into()),
+                tab_key: Some("device-1:tab-1".into()),
+            }),
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -697,9 +757,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -711,9 +769,10 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-2".into()),
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Replace(BindProvenance {
+                client_instance_id: Some("client-2".into()),
+                ..Default::default()
+            }),
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -733,14 +792,71 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
         .expect("binding write ok");
         assert_eq!(fake.load_provenance("opencode", "ses_unstamped"), None);
+    }
+
+    /// Delta-r2 Finding 2: a `Clear` upsert (the explicitly-headless REST/MCP
+    /// lineage lanes) ERASES the tracked stamps — the ledger's real merge does
+    /// the same, so `load_provenance` answers absence afterwards. Without this,
+    /// a headless re-bind of a browser-stamped row would keep the stamps under
+    /// a refreshed `updated_at` and launder the row into the D8 offer.
+    #[tokio::test]
+    async fn fake_sink_clear_provenance_erases_the_tracked_stamps() {
+        let fake = Arc::new(FakeIdentitySink::default());
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_clr".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-b".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Replace(BindProvenance {
+                client_instance_id: Some("client-1".into()),
+                device_id: Some("device-1".into()),
+                tab_key: Some("device-1:tab-1".into()),
+            }),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("browser-stamped create write ok");
+        assert!(fake.load_provenance("opencode", "ses_clr").is_some());
+
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_clr".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-b".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Clear,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("headless rebind write ok");
+        assert_eq!(
+            fake.load_provenance("opencode", "ses_clr"),
+            None,
+            "a Clear rebind erases the browser's stamps (load_provenance answers absence)"
+        );
+        // Inherit afterwards has nothing to keep: the stamps stay gone.
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_clr".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("conn-less refresh ok");
+        assert_eq!(fake.load_provenance("opencode", "ses_clr"), None);
     }
 
     /// A stored row whose version mismatches the schema reads as None — never

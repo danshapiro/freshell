@@ -26,6 +26,18 @@ fn write(
     terminal_id: &str,
     now_ms: i64,
 ) -> BindingWrite<'static> {
+    write_with_policy(provider, session_id, terminal_id, now_ms, ProvenancePolicy::Inherit)
+}
+
+/// The conn-less lane ([`write`]'s default made explicit) and the
+/// explicitly-headless lane share a constructor: only the policy differs.
+fn write_with_policy(
+    provider: &str,
+    session_id: &str,
+    terminal_id: &str,
+    now_ms: i64,
+    provenance: ProvenancePolicy<'static>,
+) -> BindingWrite<'static> {
     // Leak the strings for test brevity — tests are short-lived.
     BindingWrite {
         provider: Box::leak(provider.to_string().into_boxed_str()),
@@ -34,16 +46,14 @@ fn write(
         mode: Box::leak(provider.to_string().into_boxed_str()),
         cwd: Some("/tmp/proj"),
         create_request_id: Some("req-1"),
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance,
         now_ms,
     }
 }
 
 /// D8 provenance variant of [`write`]: a connection-scoped create's stamps —
 /// the WS connection's `(clientInstanceId, deviceId)` identity plus the
-/// composed `tabKey` (`deviceId:tabId`).
+/// composed `tabKey` (`deviceId:tabId`) asserted via `Replace`.
 #[allow(clippy::too_many_arguments)]
 fn write_provenance(
     provider: &str,
@@ -55,18 +65,17 @@ fn write_provenance(
     tab_key: Option<&str>,
 ) -> BindingWrite<'static> {
     let leak = |s: Option<&str>| s.map(|v| &*Box::leak(v.to_string().into_boxed_str()));
-    BindingWrite {
-        provider: Box::leak(provider.to_string().into_boxed_str()),
-        session_id: Box::leak(session_id.to_string().into_boxed_str()),
-        terminal_id: Box::leak(terminal_id.to_string().into_boxed_str()),
-        mode: Box::leak(provider.to_string().into_boxed_str()),
-        cwd: Some("/tmp/proj"),
-        create_request_id: Some("req-1"),
-        client_instance_id: leak(client_instance_id),
-        device_id: leak(device_id),
-        tab_key: leak(tab_key),
+    write_with_policy(
+        provider,
+        session_id,
+        terminal_id,
         now_ms,
-    }
+        ProvenancePolicy::Replace(ProvenanceStamps {
+            client_instance_id: leak(client_instance_id),
+            device_id: leak(device_id),
+            tab_key: leak(tab_key),
+        }),
+    )
 }
 
 fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAgentBindingWrite<'a> {
@@ -81,21 +90,39 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
         permission_mode: None,
         effort: None,
         supersedes: None,
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance: ProvenancePolicy::Inherit,
         now_ms,
+    }
+}
+
+/// `fa_write` variant with connection-supplied stamps asserted (`Replace`).
+fn fa_write_provenance<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    now_ms: i64,
+    client_instance_id: Option<&'a str>,
+    device_id: Option<&'a str>,
+    tab_key: Option<&'a str>,
+) -> FreshAgentBindingWrite<'a> {
+    FreshAgentBindingWrite {
+        provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+            client_instance_id,
+            device_id,
+            tab_key,
+        }),
+        ..fa_write(provider, session_id, now_ms)
     }
 }
 
 #[test]
 fn bind_stamps_provenance_and_rebind_without_provenance_preserves_it() {
     // D8 (restore-open-sessions-only) merge rule: a connection-scoped create
-    // stamps the row; a CONN-LESS re-bind of the same identity (the shared
-    // resolution hook's `resolve_pending` shape: no stamps on the write) must
-    // KEEP every stamp — never erase them. This is the one hazard the
-    // terminal upsert's historical REPLACE-semantics for advisory fields
+    // stamps the row (Replace); a CONN-LESS re-bind of the same identity (the
+    // shared resolution hook's `resolve_pending` shape, `Inherit`) must KEEP
+    // every stamp — never erase them. This is the one hazard the terminal
+    // upsert's historical REPLACE-semantics for advisory fields
     // (`create_request_id`) would otherwise inflict on the stamp fields.
+    // (Delta-r2 Finding 2 test (b): the respawn/locator-style lane.)
     let root = temp_root("prov-keep");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -109,7 +136,8 @@ fn bind_stamps_provenance_and_rebind_without_provenance_preserves_it() {
             Some("device-1:tab-1"),
         ))
         .unwrap();
-    // Conn-less re-bind (respawn / locator/adoption resolution): no stamps.
+    // Conn-less re-bind (respawn / locator/adoption resolution): asserts
+    // nothing — `Inherit`.
     ledger
         .resolve_pending(&write("codex", "th-1", "t2", 5_000))
         .unwrap();
@@ -119,6 +147,44 @@ fn bind_stamps_provenance_and_rebind_without_provenance_preserves_it() {
     assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
     assert_eq!(row.updated_at, 5_000, "updated_at advances on re-bind");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn headless_clear_rebind_erases_the_browser_stamps() {
+    // Delta-r2 Finding 2, ledger arm of test (a): an explicitly-HEADLESS
+    // re-bind (the REST/MCP lineage binder's policy) must ERASE the row's
+    // browser stamps — never inherit them — so the rebound row becomes
+    // unattributed and the D8 judgment correctly never offers it (the
+    // refreshed `updated_at` can no longer launder a stale parent).
+    let root = temp_root("prov-clear");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "codex",
+            "th-1",
+            "t1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_binding(&write_with_policy(
+            "codex",
+            "th-1",
+            "t2",
+            5_000,
+            ProvenancePolicy::Clear,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").unwrap();
+    assert_eq!(row.client_instance_id, None, "Clear erases the clientInstanceId");
+    assert_eq!(row.device_id, None, "Clear erases the deviceId");
+    assert_eq!(row.tab_key, None, "Clear erases the tabKey");
+    assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
+    assert_eq!(row.updated_at, 5_000, "updated_at still refreshes (rewritten, unattributed)");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -162,17 +228,19 @@ fn rebind_with_newer_provenance_replaces_it() {
 fn fresh_agent_rebind_without_provenance_keeps_the_stamps() {
     // Same merge rule on the fresh-agent upsert body (where advisory
     // `create_request_id` already merges latest-observed): refresh lanes
-    // (settings refresh, crash-recover, attach-resume) carry no provenance
-    // and must never erase the create's stamps.
+    // (settings refresh, crash-recover, attach-resume) assert no provenance
+    // (`Inherit`) and must never erase the create's stamps.
     let root = temp_root("fa-prov-keep");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_fresh_agent_binding(&FreshAgentBindingWrite {
-            client_instance_id: Some("client-1"),
-            device_id: Some("device-1"),
-            tab_key: Some("device-1:tab-1"),
-            ..fa_write("opencode", "ses_1", 1_000)
-        })
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "opencode",
+            "ses_1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
         .unwrap();
     ledger
         .record_fresh_agent_binding(&fa_write("opencode", "ses_1", 2_000))
@@ -187,24 +255,94 @@ fn fresh_agent_rebind_without_provenance_keeps_the_stamps() {
 }
 
 #[test]
+fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
+    // Delta-r2 Finding 2, fresh-agent body: `Clear` erases the row's stamps
+    // wholesale, and a Clear fork-chain write (`supersedes: Some(parent)`)
+    // must NOT inherit the superseded parent's stamps either — inheritance is
+    // a conn-less-session-affiliated-lane behavior only.
+    let root = temp_root("fa-prov-clear");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "claude",
+            "sess-1",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provenance: ProvenancePolicy::Clear,
+            ..fa_write("claude", "sess-1", 2_000)
+        })
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").unwrap();
+    assert_eq!(row.client_instance_id, None);
+    assert_eq!(row.device_id, None);
+    assert_eq!(row.tab_key, None);
+    assert_eq!(row.updated_at, 2_000, "updated_at refreshes; the stamps are gone");
+
+    // Fork-chain arm: Clear + supersedes -> no parent inheritance.
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            supersedes: Some("sess-1"),
+            provenance: ProvenancePolicy::Clear,
+            ..fa_write("claude", "sess-2", 3_000)
+        })
+        .unwrap();
+    // Re-stamp the parent AFTER its retirement shape does not matter: seed a
+    // fresh stamped parent and a Clear child instead, to pin inheritance-off.
+    ledger
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "claude",
+            "sess-3",
+            4_000,
+            Some("client-9"),
+            Some("device-9"),
+            Some("device-9:tab-9"),
+        ))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            supersedes: Some("sess-3"),
+            provenance: ProvenancePolicy::Clear,
+            ..fa_write("claude", "sess-4", 5_000)
+        })
+        .unwrap();
+    let child = ledger.load_binding("claude", "sess-4").expect("child row");
+    assert_eq!(child.client_instance_id, None, "Clear never inherits the superseded parent");
+    assert_eq!(child.device_id, None);
+    assert_eq!(child.tab_key, None);
+    let parent = ledger.load_binding("claude", "sess-3").expect("parent row");
+    assert_eq!(parent.state, RowState::Retired, "supersession mechanics unchanged");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn fresh_agent_rebind_with_newer_provenance_replaces_it() {
     let root = temp_root("fa-prov-replace");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_fresh_agent_binding(&FreshAgentBindingWrite {
-            client_instance_id: Some("c1"),
-            device_id: Some("d1"),
-            tab_key: Some("d1:tab-1"),
-            ..fa_write("claude", "sess-1", 1_000)
-        })
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "claude",
+            "sess-1",
+            1_000,
+            Some("c1"),
+            Some("d1"),
+            Some("d1:tab-1"),
+        ))
         .unwrap();
     ledger
-        .record_fresh_agent_binding(&FreshAgentBindingWrite {
-            client_instance_id: Some("c2"),
-            device_id: Some("d1"),
-            tab_key: Some("d1:tab-9"),
-            ..fa_write("claude", "sess-1", 2_000)
-        })
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "claude",
+            "sess-1",
+            2_000,
+            Some("c2"),
+            Some("d1"),
+            Some("d1:tab-9"),
+        ))
         .unwrap();
     let row = ledger.load_binding("claude", "sess-1").unwrap();
     assert_eq!(row.client_instance_id.as_deref(), Some("c2"));
@@ -216,19 +354,22 @@ fn fresh_agent_rebind_with_newer_provenance_replaces_it() {
 #[test]
 fn fresh_agent_supersession_inherits_provenance_from_the_retired_parent() {
     // Fork-chain inheritance (claude rollback adoption, codex crash-respawn
-    // re-mint): the child row is written with `supersedes: Some(parent)` and NO
-    // stamps (conn-less lanes never invent provenance) under a BRAND-NEW key —
-    // there is no same-key row to merge from, so the stamps must come from the
-    // superseded parent row (the fork is, by construction, the same pane).
+    // re-mint): the child row is written with `supersedes: Some(parent)` and
+    // `Inherit` provenance (conn-less lanes never invent provenance) under a
+    // BRAND-NEW key — there is no same-key row to merge from, so the stamps
+    // must come from the superseded parent row (the fork is, by construction,
+    // the same pane).
     let root = temp_root("fa-prov-fork-inherit");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_fresh_agent_binding(&FreshAgentBindingWrite {
-            client_instance_id: Some("client-1"),
-            device_id: Some("device-1"),
-            tab_key: Some("device-1:tab-1"),
-            ..fa_write("claude", "parent-id", 1_000)
-        })
+        .record_fresh_agent_binding(&fa_write_provenance(
+            "claude",
+            "parent-id",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+        ))
         .unwrap();
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
@@ -370,9 +511,7 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
             permission_mode: None,
             effort: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenancePolicy::Inherit,
             now_ms: 1,
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
@@ -1107,9 +1246,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
             permission_mode: Some("on-request"),
             effort: Some("high"),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenancePolicy::Inherit,
             now_ms: 1_000,
         })
         .unwrap();
@@ -1139,9 +1276,7 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
         permission_mode: None,
         effort: Some("low"),
         supersedes: None,
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance: ProvenancePolicy::Inherit,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -1149,9 +1284,7 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m2"),
             effort: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenancePolicy::Inherit,
             now_ms: 2_000,
             ..base
         })
@@ -1184,9 +1317,7 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
         permission_mode: None,
         effort: None,
         supersedes: None,
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance: ProvenancePolicy::Inherit,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -1194,9 +1325,7 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             session_id: "new-thread",
             supersedes: Some("old-thread"),
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenancePolicy::Inherit,
             now_ms: 2_000,
             ..base
         })
@@ -1245,18 +1374,14 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
         permission_mode: None,
         effort: None,
         supersedes: None,
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance: ProvenancePolicy::Inherit,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             create_request_id: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenancePolicy::Inherit,
             now_ms: 2_000,
             ..base
         })
@@ -1289,9 +1414,7 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
         permission_mode: None,
         effort: None,
         supersedes: None,
-        client_instance_id: None,
-        device_id: None,
-        tab_key: None,
+        provenance: ProvenancePolicy::Inherit,
         now_ms: 1_000,
     };
     // A cwd-only snapshot counts as settings-bearing (real creates always
@@ -1333,9 +1456,7 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
             permission_mode: None,
             effort: None,
             supersedes: Some("never-existed"),
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: ProvenancePolicy::Inherit,
             now_ms: 1_000,
         })
         .expect("missing old row is a silent no-op, not an error");

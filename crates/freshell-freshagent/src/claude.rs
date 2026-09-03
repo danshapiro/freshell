@@ -2878,11 +2878,6 @@ impl FreshClaudeState {
             return;
         }
         let Some(sink) = identity_sink else { return };
-        let crate::BindProvenance {
-            client_instance_id,
-            device_id,
-            tab_key,
-        } = provenance.cloned().unwrap_or_default();
         if let Err(e) = sink
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
@@ -2891,9 +2886,7 @@ impl FreshClaudeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: supersedes.map(str::to_string),
-                client_instance_id,
-                device_id,
-                tab_key,
+                provenance: provenance.cloned().into(),
                 settings: settings.cloned().unwrap_or_default(),
             })
             .await
@@ -6594,9 +6587,9 @@ rl.on('line', (line) => {
 
         let bindings = fake.bindings.lock().unwrap();
         let b = bindings.last().expect("binding at sdk.session.init");
-        assert_eq!(b.client_instance_id.as_deref(), Some("client-claude"));
-        assert_eq!(b.device_id.as_deref(), Some("device-claude"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-claude:tab-claude"));
+        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-claude"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-claude"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-claude:tab-claude"));
         drop(env);
     }
 

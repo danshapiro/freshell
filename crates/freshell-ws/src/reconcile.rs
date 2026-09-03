@@ -557,9 +557,7 @@ mod tests {
                     mode: provider,
                     cwd: None,
                     create_request_id: None,
-                    client_instance_id: None,
-                    device_id: None,
-                    tab_key: None,
+                    provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                     now_ms,
                 })
                 .expect("ledger bind");
@@ -750,9 +748,7 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: Some("cr-never"),
-                client_instance_id: None,
-                device_id: None,
-                tab_key: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
             .expect("record binding");
@@ -778,9 +774,7 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: Some("cr-gone2"),
-                client_instance_id: None,
-                device_id: None,
-                tab_key: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
             .expect("record binding");

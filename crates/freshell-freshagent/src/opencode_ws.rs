@@ -708,11 +708,6 @@ impl FreshOpencodeState {
         // send ever follows this resume. Conn-less resumes write nothing here
         // (nothing new to assert; the row keeps its stamps).
         if let Some(p) = provenance.filter(|_| in_memory_hit) {
-            let crate::BindProvenance {
-                client_instance_id,
-                device_id,
-                tab_key,
-            } = p;
             let (model, effort, cwd) = {
                 let session = session_arc.lock().await;
                 (
@@ -728,9 +723,7 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
-                client_instance_id,
-                device_id,
-                tab_key,
+                provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
                 settings: crate::identity_sink::FreshAgentSettings {
                     model,
                     sandbox: None,
@@ -916,12 +909,7 @@ impl FreshOpencodeState {
                 .insert(durable_id.clone(), session_arc.clone());
 
             // D8: stamps parked on the session at create reach the
-            // materialization row here.
-            let crate::BindProvenance {
-                client_instance_id,
-                device_id,
-                tab_key,
-            } = session.provenance.clone().unwrap_or_default();
+            // materialization row here (Some asserts, None inherits).
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
@@ -938,9 +926,7 @@ impl FreshOpencodeState {
                     .map(str::to_string),
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
-                client_instance_id,
-                device_id,
-                tab_key,
+                provenance: session.provenance.clone().into(),
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -974,13 +960,8 @@ impl FreshOpencodeState {
         // durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
             // D8: same session-carried stamps (a per-send refresh re-asserts
-            // them; a conn-less refresh lane would carry `None` and the
-            // ledger's keep-when-None merge would preserve them).
-            let crate::BindProvenance {
-                client_instance_id,
-                device_id,
-                tab_key,
-            } = session.provenance.clone().unwrap_or_default();
+            // them via `Replace`; a conn-less refresh lane carries `None` →
+            // `Inherit` and the ledger merge preserves them).
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: acked_session_id.clone(),
@@ -988,9 +969,7 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
-                client_instance_id,
-                device_id,
-                tab_key,
+                provenance: session.provenance.clone().into(),
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -1710,11 +1689,6 @@ impl FreshOpencodeState {
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
         // (durable-before-answer). Opencode has no sandbox/permission concepts —
         // always `None`.
-        let crate::BindProvenance {
-            client_instance_id,
-            device_id,
-            tab_key,
-        } = fork_provenance.unwrap_or_default();
         self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
             provider: PROVIDER.into(),
             session_id: child.id.clone(),
@@ -1723,11 +1697,9 @@ impl FreshOpencodeState {
             resolves_pending: None,
             supersedes: None,
             // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
-            // connection > parent's parked > parent's row); `None` only when
-            // no source knows the attribution — never invented.
-            client_instance_id,
-            device_id,
-            tab_key,
+            // connection > parent's parked > parent's row); `Inherit` only
+            // when no source knows the attribution — never invented.
+            provenance: fork_provenance.into(),
             settings: crate::identity_sink::FreshAgentSettings {
                 model,
                 sandbox: None,
@@ -2666,14 +2638,10 @@ impl FreshOpencodeState {
             // D8 provenance (delta-r1 Finding 3): a connection-scoped
             // create-resume re-stamps the row with the CURRENT connection's
             // identity/tab (a resume-into-a-new-tab must not keep the OLD tab's
-            // attribution). When no connection identity is available the stamps
-            // stay `None` (never invent) and the ledger's keep-when-None merge
-            // preserves the create's stamps.
-            let crate::BindProvenance {
-                client_instance_id,
-                device_id,
-                tab_key,
-            } = provenance.unwrap_or_default();
+            // attribution). When no connection identity is available the write
+            // is `Inherit` (never invent) and the ledger merge preserves the
+            // create's stamps.
+            let provenance: crate::identity_sink::ProvenanceUpdate = provenance.into();
             // Settings merge stays as-is: recovered values when a snapshot
             // exists; otherwise a blank payload (a replace-no-op — a
             // lineage-only row has no settings to clobber, and a never-recorded
@@ -2696,9 +2664,7 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
-                client_instance_id,
-                device_id,
-                tab_key,
+                provenance,
                 settings,
             })
             .await;
@@ -4278,9 +4244,9 @@ mod tests {
             .iter()
             .find(|b| b.session_id.starts_with("ses_"))
             .expect("binding at materialization");
-        assert_eq!(b.client_instance_id.as_deref(), Some("client-oc"));
-        assert_eq!(b.device_id.as_deref(), Some("device-oc"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-oc:tab-oc"));
+        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-oc"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-oc"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-oc:tab-oc"));
     }
 
     // ── P1.13 Task 8: settings-from-ledger resume (attach + create-with-resume) ──
@@ -4383,9 +4349,7 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -4619,12 +4583,12 @@ mod tests {
             .find(|b| b.session_id == DURABLE_ID)
             .expect("the resume refresh binding write (the seed's stamps are all None)");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-new"),
             "stale/None: the resume must stamp the CURRENT connection"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
     }
 
     /// Focused-ep1 Finding A (branch 1 — same-process in-memory hit): a
@@ -4706,12 +4670,12 @@ mod tests {
                 .find(|b| b.session_id == durable_id)
                 .expect("the in-memory resume's refresh write");
             assert_eq!(
-                b.client_instance_id.as_deref(),
+                b.asserted_stamps().client_instance_id.as_deref(),
                 Some("client-new"),
                 "the in-memory resume must NOT keep re-asserting the OLD connection"
             );
-            assert_eq!(b.device_id.as_deref(), Some("device-new"));
-            assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
         }
 
         // …and a SUBSEQUENT per-send refresh write asserts the CURRENT
@@ -4723,9 +4687,9 @@ mod tests {
             .rev()
             .find(|b| b.session_id == durable_id)
             .expect("the post-resume send's refresh write");
-        assert_eq!(b.client_instance_id.as_deref(), Some("client-new"));
-        assert_eq!(b.device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
     }
 
     /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
@@ -4749,9 +4713,11 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
-            client_instance_id: Some("client-old".into()),
-            device_id: Some("device-old".into()),
-            tab_key: Some("device-old:tab-old".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-old".into()),
+                device_id: Some("device-old".into()),
+                tab_key: Some("device-old:tab-old".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -4785,12 +4751,12 @@ mod tests {
             .find(|b| b.session_id == DURABLE_ID)
             .expect("the settings-None resume's provenance refresh write");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-new"),
             "the provenance refresh must not be gated on settings presence"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
         // Settings merge stays as-is: no recoverable snapshot ⇒ the write
         // carries a blank (replace-no-op) settings payload — never invented
         // defaults, and the row stays lineage-only.
@@ -4830,9 +4796,9 @@ mod tests {
             .rev()
             .find(|b| b.session_id == DURABLE_ID)
             .expect("the attach-resume refresh binding write");
-        assert_eq!(b.client_instance_id, None);
-        assert_eq!(b.device_id, None);
-        assert_eq!(b.tab_key, None);
+        assert_eq!(b.asserted_stamps().client_instance_id, None);
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
     }
 
     /// Focused-ep1-r3 (the parking invariant): a COLD durable resume driven by a
@@ -4945,12 +4911,12 @@ mod tests {
             .find(|b| b.session_id == child_id)
             .expect("a binding row for the forked child");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-chain"),
             "the child row must carry the RESUME connection's identity, not None"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-chain"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-chain:tab-chain"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-chain"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-chain:tab-chain"));
     }
 
     /// The paired never-invent pin (session-level twin of
@@ -4994,9 +4960,11 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-row".into()),
-            device_id: Some("device-row".into()),
-            tab_key: Some("device-row:tab-row".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -5063,12 +5031,12 @@ mod tests {
             .find(|b| b.session_id == child_id)
             .expect("a binding row for the forked child");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-row"),
             "the child row inherits the row-seeded provenance, not a fork-time None"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-row"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-row"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
     }
 
     /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
@@ -5089,9 +5057,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -5124,9 +5090,9 @@ mod tests {
             .rev()
             .find(|b| b.session_id == DURABLE_ID)
             .expect("the attach-resume refresh write (settings recovered)");
-        assert_eq!(b.client_instance_id, None, "never write invented stamps");
-        assert_eq!(b.device_id, None);
-        assert_eq!(b.tab_key, None);
+        assert_eq!(b.asserted_stamps().client_instance_id, None, "never write invented stamps");
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
     }
 
     /// Focused-ep1-r5 Finding 1 (Major — fork stamps from the FORKING
@@ -5204,12 +5170,12 @@ mod tests {
             .find(|b| b.session_id == child_id)
             .expect("a binding row for the forked child");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-b"),
             "the fork child row stamps the FORKING connection, not the parent's stale park"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-b"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-b:tab-b"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-b"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-b:tab-b"));
     }
 
     /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
@@ -5231,9 +5197,11 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-row".into()),
-            device_id: Some("device-row".into()),
-            tab_key: Some("device-row:tab-row".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -5282,12 +5250,12 @@ mod tests {
             .find(|b| b.session_id == child_id)
             .expect("a binding row for the forked child");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-row"),
             "the child row falls back to the parent's durable row stamps, not a hollow None"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-row"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-row"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
     }
 
     /// Focused-ep1-r5 Finding 2 (the cold-resume park, `resume_durable_session`):
@@ -5308,9 +5276,11 @@ mod tests {
             create_request_id: Some("cr-row".into()),
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-row".into()),
-            device_id: Some("device-row".into()),
-            tab_key: Some("device-row:tab-row".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

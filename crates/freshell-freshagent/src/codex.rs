@@ -466,11 +466,6 @@ impl FreshCodexState {
         {
             return;
         }
-        let crate::BindProvenance {
-            client_instance_id,
-            device_id,
-            tab_key,
-        } = provenance.cloned().unwrap_or_default();
         if let Err(e) = sink
             .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: "codex".into(),
@@ -479,9 +474,11 @@ impl FreshCodexState {
                 create_request_id: create_request_id.map(Into::into),
                 resolves_pending: None,
                 supersedes: supersedes.map(Into::into),
-                client_instance_id,
-                device_id,
-                tab_key,
+                // Delta-r2 Finding 2 tri-state: a connection-supplied value
+                // asserts (`Replace`); a conn-less refresh/respawn lane
+                // asserts nothing (`Inherit` — the ledger merge keeps prior
+                // stamps).
+                provenance: provenance.cloned().into(),
                 settings,
             })
             .await
@@ -8273,12 +8270,12 @@ pub(crate) mod tests {
                 .find(|b| b.session_id == "child-parked-prov")
                 .expect("a binding row for the child");
             assert_eq!(
-                row.client_instance_id.as_deref(),
+                row.asserted_stamps().client_instance_id.as_deref(),
                 Some("client-p"),
                 "the child row inherits the parent's parked provenance, not None"
             );
-            assert_eq!(row.device_id.as_deref(), Some("device-p"));
-            assert_eq!(row.tab_key.as_deref(), Some("device-p:tab-p"));
+            assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-p"));
+            assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-p:tab-p"));
         }
     }
 
@@ -8361,9 +8358,9 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-crash-prov")
             .expect("a binding row for the post-crash fork child");
-        assert_eq!(row.client_instance_id.as_deref(), Some("client-crash"));
-        assert_eq!(row.device_id.as_deref(), Some("device-crash"));
-        assert_eq!(row.tab_key.as_deref(), Some("device-crash:tab-crash"));
+        assert_eq!(row.asserted_stamps().client_instance_id.as_deref(), Some("client-crash"));
+        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-crash"));
+        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-crash:tab-crash"));
     }
 
     /// The mint-new crash-recovery door (the `Respawned { new_session_id }`
@@ -8454,9 +8451,9 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-mint-prov")
             .expect("a binding row for the mint-new fork child");
-        assert_eq!(row.client_instance_id.as_deref(), Some("client-mint"));
-        assert_eq!(row.device_id.as_deref(), Some("device-mint"));
-        assert_eq!(row.tab_key.as_deref(), Some("device-mint:tab-mint"));
+        assert_eq!(row.asserted_stamps().client_instance_id.as_deref(), Some("client-mint"));
+        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-mint"));
+        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-mint:tab-mint"));
     }
 
     /// Focused-ep1-r4 Finding 1 (the MAIN already-live resume arm, the
@@ -8538,12 +8535,12 @@ pub(crate) mod tests {
                 .find(|b| b.session_id == thread_id)
                 .expect("the adopt's refresh write");
             assert_eq!(
-                b.client_instance_id.as_deref(),
+                b.asserted_stamps().client_instance_id.as_deref(),
                 Some("client-new"),
                 "the adopt refresh re-stamps the row, never keeps the old tab"
             );
-            assert_eq!(b.device_id.as_deref(), Some("device-new"));
-            assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
         }
 
         // …and every later fork of the adopted session asserts the CURRENT
@@ -8560,9 +8557,9 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-adopt")
             .expect("a binding row for the post-adopt fork child");
-        assert_eq!(child.client_instance_id.as_deref(), Some("client-new"));
-        assert_eq!(child.device_id.as_deref(), Some("device-new"));
-        assert_eq!(child.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(child.asserted_stamps().client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(child.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(child.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
     }
 
     /// Focused-ep1-r4 Finding 1 (a LISTED EARLY EXIT — `finish_create`'s
@@ -8643,12 +8640,12 @@ pub(crate) mod tests {
                 .find(|b| b.session_id == thread_id)
                 .expect("the eviction-guard adopt's refresh write");
             assert_eq!(
-                b.client_instance_id.as_deref(),
+                b.asserted_stamps().client_instance_id.as_deref(),
                 Some("client-new"),
                 "the eviction-guard adopt refresh re-stamps the row"
             );
-            assert_eq!(b.device_id.as_deref(), Some("device-new"));
-            assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
         }
 
         let (sink, captured) = capturing_sink();
@@ -8663,9 +8660,9 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-evict-adopt")
             .expect("a binding row for the post-adopt fork child");
-        assert_eq!(child.client_instance_id.as_deref(), Some("client-new"));
-        assert_eq!(child.device_id.as_deref(), Some("device-new"));
-        assert_eq!(child.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(child.asserted_stamps().client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(child.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(child.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
     }
 
     /// The no-regression pin (the invariant's second half): an adopt answer
@@ -8801,12 +8798,12 @@ pub(crate) mod tests {
             .find(|b| b.session_id == "child-from-tab-b")
             .expect("a binding row for the child");
         assert_eq!(
-            row.client_instance_id.as_deref(),
+            row.asserted_stamps().client_instance_id.as_deref(),
             Some("client-b"),
             "the fork child row stamps the FORKING connection, not the parent's stale park"
         );
-        assert_eq!(row.device_id.as_deref(), Some("device-b"));
-        assert_eq!(row.tab_key.as_deref(), Some("device-b:tab-b"));
+        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-b"));
+        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-b:tab-b"));
     }
 
     /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
@@ -8841,9 +8838,11 @@ pub(crate) mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-row".into()),
-            device_id: Some("device-row".into()),
-            tab_key: Some("device-row:tab-row".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -8882,12 +8881,12 @@ pub(crate) mod tests {
             .find(|b| b.session_id == "child-of-row-fallback")
             .expect("a binding row for the child");
         assert_eq!(
-            row.client_instance_id.as_deref(),
+            row.asserted_stamps().client_instance_id.as_deref(),
             Some("client-row"),
             "the child row falls back to the parent's durable row stamps, not a hollow None"
         );
-        assert_eq!(row.device_id.as_deref(), Some("device-row"));
-        assert_eq!(row.tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-row"));
+        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
     }
 
     /// Focused-ep1-r5 Finding 2 (the codex adopt gate, the :1222 named
@@ -8986,9 +8985,9 @@ pub(crate) mod tests {
             .rev()
             .find(|b| b.session_id == thread_id)
             .expect("the create's binding write");
-        assert_eq!(b.client_instance_id, None, "hollow stamps nothing");
-        assert_eq!(b.device_id, None);
-        assert_eq!(b.tab_key, None);
+        assert_eq!(b.asserted_stamps().client_instance_id, None, "hollow stamps nothing");
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
     }
 
     /// Focused-ep1-r4 Finding 1, the settings-independence arm (the codex
@@ -9013,9 +9012,11 @@ pub(crate) mod tests {
             create_request_id: Some("cr-old".into()),
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-old".into()),
-            device_id: Some("device-old".into()),
-            tab_key: Some("device-old:tab-old".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-old".into()),
+                device_id: Some("device-old".into()),
+                tab_key: Some("device-old:tab-old".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -9051,12 +9052,12 @@ pub(crate) mod tests {
             .find(|b| b.session_id == "thread-lineage-adopt")
             .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
         assert_eq!(
-            b.client_instance_id.as_deref(),
+            b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-new"),
             "the provenance refresh must not be gated on settings presence"
         );
-        assert_eq!(b.device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
         assert_eq!(
             b.settings,
             crate::identity_sink::FreshAgentSettings::default(),
@@ -9093,9 +9094,11 @@ pub(crate) mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-row".into()),
-            device_id: Some("device-row".into()),
-            tab_key: Some("device-row:tab-row".into()),
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+            }),
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
@@ -9133,9 +9136,9 @@ pub(crate) mod tests {
                 .rev()
                 .find(|b| b.session_id == "thread-row-seeded")
                 .expect("the attach-resume refresh write (settings recovered)");
-            assert_eq!(b.client_instance_id, None, "conn-less refresh stamps");
-            assert_eq!(b.device_id, None);
-            assert_eq!(b.tab_key, None);
+            assert_eq!(b.asserted_stamps().client_instance_id, None, "conn-less refresh stamps");
+            assert_eq!(b.asserted_stamps().device_id, None);
+            assert_eq!(b.asserted_stamps().tab_key, None);
         }
 
         // …and a fork after the attach (before any snapshot) produces an
@@ -9157,12 +9160,12 @@ pub(crate) mod tests {
             .find(|b| b.session_id == "child-of-row-seeded")
             .expect("a binding row for the post-attach fork child");
         assert_eq!(
-            child.client_instance_id.as_deref(),
+            child.asserted_stamps().client_instance_id.as_deref(),
             Some("client-row"),
             "the fork child inherits the row-seeded provenance, not a fork-time None"
         );
-        assert_eq!(child.device_id.as_deref(), Some("device-row"));
-        assert_eq!(child.tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(child.asserted_stamps().device_id.as_deref(), Some("device-row"));
+        assert_eq!(child.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
     }
 
     /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
@@ -9184,9 +9187,7 @@ pub(crate) mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
@@ -9219,9 +9220,9 @@ pub(crate) mod tests {
             .rev()
             .find(|b| b.session_id == "thread-unattributed")
             .expect("the attach-resume refresh write (settings recovered)");
-        assert_eq!(b.client_instance_id, None);
-        assert_eq!(b.device_id, None);
-        assert_eq!(b.tab_key, None);
+        assert_eq!(b.asserted_stamps().client_instance_id, None);
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
         assert!(
             b.settings.model.is_some(),
             "the refresh still re-persists the recovered settings"
@@ -12517,9 +12518,9 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == thread_id)
             .expect("binding row written at thread/start");
-        assert_eq!(b.client_instance_id.as_deref(), Some("client-codex"));
-        assert_eq!(b.device_id.as_deref(), Some("device-codex"));
-        assert_eq!(b.tab_key.as_deref(), Some("device-codex:tab-codex"));
+        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-codex"));
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-codex"));
+        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-codex:tab-codex"));
     }
 
     /// Task 4 (P1.13, awaited-writes policy): a failed ledger write is surfaced as a

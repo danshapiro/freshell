@@ -53,6 +53,27 @@ impl PaneIdentitySink for LedgerIdentitySink {
         let now = now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                // Delta-r2 Finding 2: the upsert's tri-state provenance policy
+                // maps verbatim onto the ledger's own tri-state; the merge
+                // (Replace per-field / Inherit keep / Clear erase) lives in
+                // the ledger itself.
+                let provenance = match &upsert.provenance {
+                    freshell_freshagent::ProvenanceUpdate::Replace(stamps) => {
+                        freshell_ws::pane_ledger::ProvenancePolicy::Replace(
+                            freshell_ws::pane_ledger::ProvenanceStamps {
+                                client_instance_id: stamps.client_instance_id.as_deref(),
+                                device_id: stamps.device_id.as_deref(),
+                                tab_key: stamps.tab_key.as_deref(),
+                            },
+                        )
+                    }
+                    freshell_freshagent::ProvenanceUpdate::Inherit => {
+                        freshell_ws::pane_ledger::ProvenancePolicy::Inherit
+                    }
+                    freshell_freshagent::ProvenanceUpdate::Clear => {
+                        freshell_ws::pane_ledger::ProvenancePolicy::Clear
+                    }
+                };
                 let w = FreshAgentBindingWrite {
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
@@ -64,11 +85,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     permission_mode: upsert.settings.permission_mode.as_deref(),
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
-                    // D8: the upsert's provenance stamps ride through verbatim;
-                    // the keep-when-None merge lives in the ledger itself.
-                    client_instance_id: upsert.client_instance_id.as_deref(),
-                    device_id: upsert.device_id.as_deref(),
-                    tab_key: upsert.tab_key.as_deref(),
+                    provenance,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
@@ -260,9 +277,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -357,9 +372,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -403,9 +416,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: Some("old-uuid".into()),
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: settings.clone(),
         })
         .await
@@ -427,9 +438,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: Some("old-thread".into()),
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings,
         })
         .await
@@ -569,9 +578,13 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-1".into()),
-            device_id: Some("device-1".into()),
-            tab_key: Some("device-1:tab-1".into()),
+            provenance: freshell_freshagent::ProvenanceUpdate::Replace(
+                freshell_freshagent::BindProvenance {
+                    client_instance_id: Some("client-1".into()),
+                    device_id: Some("device-1".into()),
+                    tab_key: Some("device-1:tab-1".into()),
+                },
+            ),
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -612,9 +625,13 @@ mod tests {
             create_request_id: Some("cr-x".into()),
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: Some("client-1".into()),
-            device_id: Some("device-1".into()),
-            tab_key: Some("device-1:tab-1".into()),
+            provenance: freshell_freshagent::ProvenanceUpdate::Replace(
+                freshell_freshagent::BindProvenance {
+                    client_instance_id: Some("client-1".into()),
+                    device_id: Some("device-1".into()),
+                    tab_key: Some("device-1:tab-1".into()),
+                },
+            ),
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -635,9 +652,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -655,9 +670,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -677,9 +690,13 @@ mod tests {
                 terminal_id: "term-1",
                 cwd: Some("/w"),
                 create_request_id: None,
-                client_instance_id: Some("client-term"),
-                device_id: Some("device-term"),
-                tab_key: Some("device-term:tab-term"),
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Replace(
+                    freshell_ws::pane_ledger::ProvenanceStamps {
+                        client_instance_id: Some("client-term"),
+                        device_id: Some("device-term"),
+                        tab_key: Some("device-term:tab-term"),
+                    },
+                ),
                 now_ms: 42,
             })
             .expect("terminal binding write ok");
@@ -687,6 +704,64 @@ mod tests {
             sink.load_provenance("opencode", "ses_terminal"),
             None,
             "terminal-lineage rows are gated out (the load_settings gate's twin)"
+        );
+    }
+
+    /// Delta-r2 Finding 2 (seam test): a freshagent-side `Clear` upsert (the
+    /// explicitly-headless REST/MCP lineage lanes) must reach the REAL ledger
+    /// as an ERASE — the browser stamps on the row are wiped, `updated_at`
+    /// still refreshes, and `created_at` is preserved. Without the mapping a
+    /// headless re-bind would keep the browser's attribution under a
+    /// refreshed timestamp and launder the row into the D8 offer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provenance_clear_reaches_the_ledger_and_erases_the_stamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let upsert = |provenance: freshell_freshagent::ProvenanceUpdate| FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_clr".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-b".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+        sink.record_binding(upsert(freshell_freshagent::ProvenanceUpdate::Replace(
+            freshell_freshagent::BindProvenance {
+                client_instance_id: Some("client-1".into()),
+                device_id: Some("device-1".into()),
+                tab_key: Some("device-1:tab-1".into()),
+            },
+        )))
+        .await
+        .expect("browser-stamped write succeeds");
+        let stamped = ledger.load_binding("opencode", "ses_clr").expect("row");
+        assert_eq!(stamped.client_instance_id.as_deref(), Some("client-1"));
+
+        std::thread::sleep(std::time::Duration::from_millis(2)); // distinct updated_at
+        sink.record_binding(upsert(freshell_freshagent::ProvenanceUpdate::Clear))
+            .await
+            .expect("headless Clear rebind succeeds");
+        let cleared = ledger.load_binding("opencode", "ses_clr").expect("row");
+        assert_eq!(cleared.client_instance_id, None);
+        assert_eq!(cleared.device_id, None);
+        assert_eq!(cleared.tab_key, None);
+        assert_eq!(cleared.created_at, stamped.created_at);
+        assert!(
+            cleared.updated_at > stamped.updated_at,
+            "the row IS rewritten (updated_at refreshes), just unattributed"
+        );
+        assert_eq!(
+            sink.load_provenance("opencode", "ses_clr"),
+            None,
+            "the cleared row answers no provenance"
         );
     }
 
@@ -705,9 +780,7 @@ mod tests {
             create_request_id: Some("cr-1".into()),
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             // Blank settings on purpose: lineage must resolve even for
             // lineage-only rows (settings-bearing-ness is unrelated).
             settings: FreshAgentSettings::default(),
@@ -748,9 +821,7 @@ mod tests {
             create_request_id: Some("cr-9".into()),
             resolves_pending: Some("freshopencode-cr-9".into()),
             supersedes: None,
-            client_instance_id: None,
-            device_id: None,
-            tab_key: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
