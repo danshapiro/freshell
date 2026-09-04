@@ -873,6 +873,7 @@ mod tests {
                 "t1",
                 "opencode",
                 Some("/tmp"),
+                None,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 crate::terminal::now_ms(),
             )

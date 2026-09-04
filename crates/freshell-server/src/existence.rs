@@ -656,6 +656,7 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
@@ -704,6 +705,7 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
@@ -1260,6 +1262,7 @@ mod tests {
                 "t-pane1",
                 "opencode",
                 Some(&cwd),
+                None,
                 freshell_ws::pane_ledger::ProvenanceStamps::default(),
                 1_000,
             )
@@ -1272,6 +1275,7 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 2_000,
             })
@@ -1284,6 +1288,7 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 3_000,
             })
@@ -1297,6 +1302,7 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 2_500,
             })

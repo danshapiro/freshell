@@ -828,10 +828,14 @@ describe('WebSocket edge cases', () => {
   describe('Rust-only message acceptance', () => {
     // Delta-r7-r2 (Findings F1+F2): `pane.closed` is the dedicated durable
     // pane-close evidence channel; only the Rust server journals it (the Node
-    // server has no recovery ledger). A valid pane.closed must be accepted
-    // and ignored — never answered with INVALID_MESSAGE/UNKNOWN_MESSAGE — so
-    // a mixed client never draws an error per close on the legacy server.
-    it('accepts and ignores pane.closed (no error frame, connection stays open)', async () => {
+    // server has no recovery ledger). Delta-r7-r3 (focused-episode-7 round 2,
+    // Finding F2): the close is ACKNOWLEDGED on every floor — the client
+    // gates pane removal on the correlated `pane.closed.result`, so the Node
+    // server accepts AND answers success (its close-durability model records
+    // nothing: no ledger, no recovery pipeline, nothing to fail) — never an
+    // INVALID_MESSAGE/UNKNOWN_MESSAGE error and never silence (a v9 client
+    // against silence would refuse every terminal close for 5s).
+    it('accepts pane.closed and answers a correlated success result (no error frame, connection stays open)', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
       ws.send(JSON.stringify({
@@ -848,6 +852,20 @@ describe('WebSocket edge cases', () => {
       ws.send(JSON.stringify({ type: 'ping' }))
       const messages = await collectMessages(ws, 400)
       expect(messages.some((m) => m.type === 'pong')).toBe(true)
+      const results = messages.filter((m) => m.type === 'pane.closed.result')
+      expect(results).toEqual([
+        {
+          type: 'pane.closed.result',
+          createRequestId: 'req-node-accept',
+          terminalId: 'term-node-accept',
+          success: true,
+        },
+        {
+          type: 'pane.closed.result',
+          createRequestId: 'req-node-accept-2',
+          success: true,
+        },
+      ])
       expect(
         messages.filter((m) => m.type === 'error'),
         `pane.closed must never draw an error frame: ${JSON.stringify(messages)}`,

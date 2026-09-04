@@ -315,6 +315,7 @@ fn seed_bound_row(ledger: &PaneLedger, provider: &str, session_id: &str) {
             mode: provider,
             cwd: None,
             create_request_id: None,
+            origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: now_ms(),
         })

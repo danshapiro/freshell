@@ -8,6 +8,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 /**
  * TERM-15 + TERM-16 (Rust) — terminal-mode CLI activity, server-authoritative
@@ -72,7 +73,7 @@ class WsCapture {
     this.ws = new WebSocket(wsUrl)
     this.opened = new Promise((resolve, reject) => {
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: WS_PROTOCOL_VERSION, token }))
         resolve()
       })
       this.ws.on('error', reject)

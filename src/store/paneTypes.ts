@@ -110,6 +110,13 @@ export type TerminalPaneContent = {
   initialCwd?: string
   /** One-shot user-visible reconcile notice (corrected identity, fresh-by-reason, duplicate ignored). Rendered then cleared by TerminalView. */
   reconcileNotice?: string
+  /** The pane-close failure surface (delta-r7-r3 / focused-episode-7 round 2
+   * Finding F2): set by the close gate when the server does NOT confirm the
+   * durable pane-close journal (success:false or the bounded wait timed out)
+   * — the pane stays open and TerminalView renders this as the xterm "[Close
+   * failed]" notice, then clears it. VOLATILE: never persisted (stripped in
+   * persistMiddleware beside reconcileNotice). */
+  closeError?: string
   /** Set by verdict folding; consumed by TerminalView when it sends terminal.create. 'respawn' = create-with-resume from sessionRef; 'fresh' = clean create. */
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter. Incremented by applyReconcileAttach / resetPaneForReconcileCreate so a fold on an already-mounted pane (same createRequestId — never re-minted) re-fires TerminalView's create-or-attach effect (Task 12 adds it to the dep array). Stripped from persistence (Task 8). */

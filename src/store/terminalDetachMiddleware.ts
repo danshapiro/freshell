@@ -2,6 +2,7 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
 import { collectAllTerminalIds, collectPaneEntries } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
+import { consumePaneCloseEvidenceMark } from '@/lib/pane-close-evidence-marks'
 import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles, closePane, removeLayout, replacePane } from './panesSlice'
 import type { PaneNode } from './paneTypes'
 
@@ -135,8 +136,18 @@ export const terminalDetachMiddleware: Middleware = (store) => (next) => (action
   // Evidence first (the kill lane's durable-close-before-teardown order):
   // one `pane.closed` per REMOVED pane identity — including terminalId-less
   // in-flight creates and panes whose terminal retains other references.
+  // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): this send is the
+  // BELT — the gated close thunks (closePaneWithCleanup / closeTab /
+  // replacePaneWithCleanup) already sent+awaited the acknowledged evidence
+  // before letting the reducer run, so their identities carry a one-shot
+  // confirmation mark and are skipped here. The belt remains the evidence
+  // floor for any DIRECT dispatch that bypasses the gates (the close-set
+  // action list is maintained by hand — see the warning above): a bypassing
+  // removal still journals, just without the gate's abort-on-failure
+  // behavior.
   if (isPaneClose) {
     for (const removed of collectRemovedPaneIdentities(beforeLayouts, afterLayouts)) {
+      if (consumePaneCloseEvidenceMark(removed.createRequestId)) continue
       getWsClient().send({
         type: 'pane.closed',
         createRequestId: removed.createRequestId,

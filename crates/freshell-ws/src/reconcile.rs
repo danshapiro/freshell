@@ -557,6 +557,7 @@ mod tests {
                     mode: provider,
                     cwd: None,
                     create_request_id: None,
+                    origin_create_request_id: None,
                     provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                     now_ms,
                 })
@@ -748,6 +749,7 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: Some("cr-never"),
+                origin_create_request_id: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
@@ -774,6 +776,7 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: Some("cr-gone2"),
+                origin_create_request_id: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
@@ -865,6 +868,7 @@ mod tests {
                 "T-race",
                 "opencode",
                 None,
+                None,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 1_000,
             )
@@ -891,6 +895,7 @@ mod tests {
             .record_pending(
                 "T-race2",
                 "opencode",
+                None,
                 None,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 1_000,
@@ -919,6 +924,7 @@ mod tests {
             .record_pending(
                 "T-sh",
                 "shell",
+                None,
                 None,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 1_000,

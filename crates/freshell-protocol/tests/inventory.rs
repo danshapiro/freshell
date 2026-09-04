@@ -31,12 +31,12 @@ fn client_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["clientToServer"]["count"].as_u64(),
-        Some(36),
-        "inventory declares 36 client→server types"
+        Some(37),
+        "inventory declares 37 client→server types"
     );
     let expected = json_type_set(&inv["clientToServer"]["types"]);
     let actual: BTreeSet<String> = CLIENT_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 36, "crate declares 36 client types (no dups)");
+    assert_eq!(actual.len(), 37, "crate declares 37 client types (no dups)");
     assert_eq!(
         actual, expected,
         "CLIENT_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -48,12 +48,12 @@ fn server_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(61),
-        "inventory declares 61 server→client types"
+        Some(62),
+        "inventory declares 62 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 61, "crate declares 61 server types (no dups)");
+    assert_eq!(actual.len(), 62, "crate declares 62 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_97() {
+fn combined_surface_is_99() {
     let all = all_message_types();
-    assert_eq!(all.len(), 97, "36 client + 61 server = 97 discriminants");
+    assert_eq!(all.len(), 99, "37 client + 62 server = 99 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        97,
+        99,
         "no discriminant collides across directions"
     );
 }
@@ -108,6 +108,37 @@ fn terminal_killed_roundtrips_camel_case() {
     let v: serde_json::Value = serde_json::to_value(&fail).unwrap();
     assert_eq!(v["success"], false);
     assert_eq!(v["error"], "the close could not be recorded");
+}
+
+/// Delta-r7-round-3 (focused-episode-7 round 2, Finding F2/F4): the
+/// correlated `pane.closed` answer roundtrips camelCase, elides the absent
+/// terminalId/error, and parses the failure shape.
+#[test]
+fn pane_closed_result_roundtrips_camel_case() {
+    let json = r#"{"type":"pane.closed.result","createRequestId":"req-1","terminalId":"t-1","success":true}"#;
+    let msg: freshell_protocol::ServerMessage = serde_json::from_str(json).expect("parse");
+    let back = serde_json::to_string(&msg).expect("serialize");
+    let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+    assert_eq!(v["type"], "pane.closed.result");
+    assert_eq!(v["createRequestId"], "req-1");
+    assert_eq!(v["terminalId"], "t-1");
+    assert_eq!(v["success"], true);
+    assert!(v.get("error").is_none(), "no error key without a failure");
+    // The terminalId-less (in-flight-create close) shape elides the key.
+    let no_tid: freshell_protocol::ServerMessage = serde_json::from_str(
+        r#"{"type":"pane.closed.result","createRequestId":"req-2","success":true}"#,
+    )
+    .expect("parse terminalId-less shape");
+    let v: serde_json::Value = serde_json::to_value(&no_tid).unwrap();
+    assert!(v.get("terminalId").is_none(), "{v}");
+    // The failure shape carries the reason.
+    let fail: freshell_protocol::ServerMessage = serde_json::from_str(
+        r#"{"type":"pane.closed.result","createRequestId":"req-3","success":false,"error":"the record could not be written durably"}"#,
+    )
+    .expect("parse failure shape");
+    let v: serde_json::Value = serde_json::to_value(&fail).unwrap();
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "the record could not be written durably");
 }
 
 #[test]

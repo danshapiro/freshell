@@ -61,7 +61,7 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    PaneClosed, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
+    PaneClosed, PaneClosedResult, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
     TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly,
     TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
     LEGACY_RESUME_IDENTITY_REFUSAL,
@@ -983,10 +983,7 @@ async fn handle_client_text(
                 send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
             }
         }
-        ClientMessage::PaneClosed(closed) => {
-            handle_pane_closed(&closed, state).await;
-            true
-        }
+        ClientMessage::PaneClosed(closed) => handle_pane_closed(&closed, state, ws_tx).await,
         ClientMessage::TerminalInput(input) => {
             // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
             // the opencode lane (see input_session_identity_ok): a
@@ -3530,6 +3527,9 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Lineage (F1): the origin falls back to this write's own
+                    // createRequestId — the conn-scoped lane's create IS the origin.
+                    origin_create_request_id: None,
                     provenance: crate::pane_ledger::ProvenancePolicy::Replace(
                         crate::pane_ledger::ProvenanceStamps {
                             client_instance_id: write_client_instance_id.as_deref(),
@@ -3865,6 +3865,9 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Lineage (F1): the origin falls back to this write's own
+                    // createRequestId — the conn-scoped lane's create IS the origin.
+                    origin_create_request_id: None,
                     provenance: crate::pane_ledger::ProvenancePolicy::Replace(
                         crate::pane_ledger::ProvenanceStamps {
                             client_instance_id: write_client_instance_id.as_deref(),
@@ -3901,6 +3904,13 @@ pub(crate) async fn handle_create(
         let write_terminal_id = terminal_id_for_meta.clone();
         let write_mode = mode.clone();
         let write_cwd = spec.cwd.clone();
+        // Delta-r7-round-3 (focused-episode-7 round-2 Finding F1): the
+        // marker ALSO carries the ORIGIN pane's createRequestId, so the row
+        // this marker resolves into records the pane lineage even on the
+        // conn-less resolution lane (whose binding write is deliberately
+        // create_request_id-less) — the join key a CRID-only pane.closed
+        // record (an in-flight-create close) can still cover.
+        let write_request_id = create.request_id.clone();
         let write_client_instance_id = bind_provenance.client_instance_id.clone();
         let write_device_id = bind_provenance.device_id.clone();
         let write_tab_key = bind_provenance.tab_key.clone();
@@ -3915,6 +3925,7 @@ pub(crate) async fn handle_create(
                 &write_terminal_id,
                 &write_mode,
                 write_cwd.as_deref(),
+                Some(&write_request_id),
                 crate::pane_ledger::ProvenanceStamps {
                     client_instance_id: write_client_instance_id.as_deref(),
                     device_id: write_device_id.as_deref(),
@@ -4568,6 +4579,9 @@ pub async fn respawn_agent_terminal(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Lineage (F1): the origin falls back to this write's own
+                    // createRequestId — the conn-scoped lane's create IS the origin.
+                    origin_create_request_id: None,
                     // Conn-less lane (D8): the auto-resume respawn has no
                     // client connection; `Inherit` preserves the create's
                     // provenance stamps AND the assertion time the row already
@@ -5533,11 +5547,32 @@ async fn handle_detach(
 /// on the blocking pool (the kill lane's fsync idiom); a write failure never
 /// fails anything client-visible (no live state changes — the record is the
 /// whole act), so it surfaces through the ledger's standard loud degradation
-/// seam (structured ERROR + invariant counter + the live broadcast). `Ok(())`
-/// always at the wire: there is no reply.
-async fn handle_pane_closed(closed: &PaneClosed, state: &WsState) {
+/// seam (structured ERROR + invariant counter + the live broadcast).
+///
+/// Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the close is
+/// now ACKNOWLEDGED: `pane.closed.result{createRequestId, terminalId?,
+/// success, error?}` answers EVERY well-formed `pane.closed` once the
+/// journal write resolved one way or the other (`success:false` means
+/// NOTHING is durable; a persisted-despite-reported-error record answers
+/// `success:true` — the evidence stands). The closing client awaits this
+/// answer before dropping the pane, exactly the kill lane's correlated
+/// `terminal.killed` discipline — an unacknowledged close (disconnect,
+/// half-open socket) can no longer be dropped silently by the client after
+/// the user acted.
+async fn handle_pane_closed(closed: &PaneClosed, state: &WsState, ws_tx: &mut WsSink) -> bool {
     if closed.create_request_id.is_empty() {
-        return; // never a malformed record key
+        // Never a malformed record key — but still ANSWER (loudly): leaving
+        // this close unacknowledged would wedge the client's bounded wait.
+        return send(
+            ws_tx,
+            &ServerMessage::PaneClosedResult(PaneClosedResult {
+                create_request_id: closed.create_request_id.clone(),
+                terminal_id: closed.terminal_id.clone(),
+                success: false,
+                error: Some("createRequestId must not be empty".to_string()),
+            }),
+        )
+        .await;
     }
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let crid = closed.create_request_id.clone();
@@ -5552,11 +5587,19 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState) {
             std::io::Error::other(format!("pane.closed record task join failed: {join_err}")),
         ))
     });
+    let answer = |success: bool, error: Option<String>| {
+        ServerMessage::PaneClosedResult(PaneClosedResult {
+            create_request_id: closed.create_request_id.clone(),
+            terminal_id: closed.terminal_id.clone(),
+            success,
+            error,
+        })
+    };
     match result {
-        Ok(()) => {}
+        Ok(()) => send(ws_tx, &answer(true, None)).await,
         Err(err) if err.is_persisted() => {
             // The record IS durable despite the reported error — the close
-            // evidence stands, so nothing is degraded; loud, structured,
+            // evidence stands, so the answer is success; loud, structured,
             // never silent.
             tracing::error!(
                 target: "freshell_ws::terminal",
@@ -5565,11 +5608,13 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState) {
                 "pane_close_persisted_despite_error: the non-retiring pane-close \
                  record is durable; the write layer reported an error"
             );
+            send(ws_tx, &answer(true, None)).await
         }
         Err(err) => {
             // Clean: NOTHING is durable — genuine durability degradation.
             // Surface through the ledger's standard loud seam (structured
-            // ERROR + invariant counter + the live broadcast).
+            // ERROR + invariant counter + the live broadcast) AND answer the
+            // close as failed — the client keeps the pane on success:false.
             crate::pane_ledger::surface_write_failure(
                 state,
                 closed.terminal_id.as_deref().unwrap_or(&closed.create_request_id),
@@ -5577,6 +5622,14 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState) {
                     "pane-close record write failed: {err}"
                 ))),
             );
+            send(
+                ws_tx,
+                &answer(
+                    false,
+                    Some("the pane-close record could not be written durably".to_string()),
+                ),
+            )
+            .await
         }
     }
 }

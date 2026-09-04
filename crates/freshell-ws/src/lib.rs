@@ -4,7 +4,7 @@
 //! A faithful port of the **handshake path** of `server/ws-handler.ts`:
 //!
 //! * mount `/ws` (an axum WebSocket upgrade — tokio-tungstenite-backed);
-//! * read the first `hello`, validate `protocolVersion == 8` **first**, then the
+//! * read the first `hello`, validate `protocolVersion == 9` **first**, then the
 //!   token with a **constant-time** compare (mirrors `auth.ts#timingSafeCompare`
 //!   and the `ws-handler.ts` ordering: version check precedes auth);
 //! * on success emit, IN ORDER, exactly what the original sends on a clean
@@ -627,7 +627,7 @@ pub enum HelloOutcome {
     Accept,
     /// Not a `hello` frame, or unparseable — the original closes NOT_AUTHENTICATED.
     NotHello,
-    /// `protocolVersion != 8` — checked BEFORE the token (matches ws-handler.ts).
+    /// `protocolVersion != 9` — checked BEFORE the token (matches ws-handler.ts).
     ProtocolMismatch,
     /// Bad/missing token (constant-time compared).
     BadToken,
@@ -992,14 +992,14 @@ mod tests {
         );
 
         // Right version, wrong token.
-        let v = json!({ "type": "hello", "protocolVersion": 8, "token": "nope" });
+        let v = json!({ "type": "hello", "protocolVersion": WS_PROTOCOL_VERSION, "token": "nope" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::BadToken
         );
 
         // Right version, right token.
-        let v = json!({ "type": "hello", "protocolVersion": 8, "token": "s3cr3t-token-abcdef" });
+        let v = json!({ "type": "hello", "protocolVersion": WS_PROTOCOL_VERSION, "token": "s3cr3t-token-abcdef" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::Accept

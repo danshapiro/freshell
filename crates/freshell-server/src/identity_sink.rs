@@ -65,6 +65,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     &p,
                     &m,
                     c.as_deref(),
+                    None,
                     freshell_ws::pane_ledger::ProvenanceStamps::default(),
                     now,
                 )
@@ -975,6 +976,7 @@ mod tests {
                 terminal_id: "term-1",
                 cwd: Some("/w"),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Replace(
                     freshell_ws::pane_ledger::ProvenanceStamps {
                         client_instance_id: Some("client-term"),

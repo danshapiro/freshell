@@ -94,6 +94,12 @@ function normalizePaneContent(
       ...(restoreError ? { restoreError } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
       reconcileNotice: typeof input.reconcileNotice === 'string' ? input.reconcileNotice : undefined,
+      // The close-gate failure surface (delta-r7-r3, F2): rides the
+      // whitelist like reconcileNotice — a later content merge must not
+      // silently drop the unconfirmed-close reason.
+      closeError: typeof (input as { closeError?: unknown }).closeError === 'string'
+        ? (input as { closeError?: string }).closeError
+        : undefined,
       pendingReconcile: input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
         ? input.pendingReconcile
         : undefined,
@@ -2274,6 +2280,29 @@ export const panesSlice = createSlice({
       content.reconcileNotice = action.payload.notice
     },
 
+    // Delta-r7-r3 (focused-episode-7 round 2 Finding F2): the close gate's
+    // failure surface — the unconfirmed-close reason carried on the pane
+    // itself (TerminalView renders it as the xterm "[Close failed]" notice
+    // and clears it). Terminal panes only: the fresh-agent lane has its own
+    // session-error banner.
+    setPaneCloseError: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; error: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.closeError = action.payload.error
+    },
+
+    clearPaneCloseError: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.closeError = undefined
+    },
+
     clearPaneReconcileNotice: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
@@ -2442,6 +2471,8 @@ export const {
   resetFreshAgentPaneForReconcileCreate,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
+  setPaneCloseError,
+  clearPaneCloseError,
   setPaneCrashTrace,
   clearPaneCrashTrace,
   setDeadSessionAdjudication,

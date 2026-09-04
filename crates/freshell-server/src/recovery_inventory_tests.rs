@@ -110,6 +110,9 @@ fn binding_row_at(
         cwd: Some("/x".to_string()),
         live_terminal_id: None,
         create_request_id: None,
+        // Delta-r7-r3 (focused-ep7-r2 F1): fixtures default to the legacy
+        // (lineage-less) shape; F1's pins set the origin key explicitly.
+        origin_create_request_id: None,
         created_at: 1000,
         updated_at,
         last_observed_at: updated_at,
@@ -948,7 +951,7 @@ fn a_reattached_row_is_offered_despite_the_old_panes_detach_close() {
         // pane was never closed), the SAME terminal the old pane's close
         // record names, attribution ADVANCED to the reattach's assertion time
         // (996_000 — inside grace of the parent's 1_000_000).
-        let restamped = with_attribution(
+        let mut restamped = with_attribution(
             with_correlation_ids(
                 binding_row_at("claude", "S-reopened", bound(), 996_000),
                 Some("req-reopened"),
@@ -958,6 +961,9 @@ fn a_reattached_row_is_offered_despite_the_old_panes_detach_close() {
             "dev1",
             "t1",
         );
+        // The production restamp re-keys the lineage wholesale (delta-r7-r3,
+        // F1 `note_pane_reattach`): origin == the new pane's CRID too.
+        restamped.origin_create_request_id = Some("req-reopened".to_string());
         build_inventory(
             vec![d],
             vec![restamped],
@@ -1022,6 +1028,236 @@ fn a_reattached_row_is_offered_despite_the_old_panes_detach_close() {
     assert!(
         out["ledgerOnly"].as_array().unwrap().is_empty(),
         "a row still keyed by the closed pane's CRID stays covered (never a lapse): {out}"
+    );
+}
+
+/// Delta-r7-round-3 (focused-episode-7 round 2, Finding F1) — the pinned
+/// record/row/inventory combination from the finding: a pane closed BEFORE
+/// `terminal.created` journals a CRID-only non-retiring close record
+/// (`createRequestId` present, NO `terminalId` — the client never learned
+/// it); the conn-less resolution lane then writes the Bound row with
+/// `create_request_id: None` (the deliberate dynamic-identity rule). Neither
+/// pre-existing arm joins record→row: the record has only the CRID, the row
+/// only the terminal id. The row durable-records its ORIGIN lineage key
+/// (from the consumed pending marker), and close coverage consults the
+/// lineage — record CRID == row origin CRID covers the row, LIVE or DEAD.
+#[test]
+fn a_detach_close_covers_a_crid_less_row_by_its_origin_lineage() {
+    let make = |live_keys: &[(&str, &str)]| {
+        let d = DeviceUnion {
+            device_id: "dev1".into(),
+            union_doc: union_doc_with_tab_key(
+                "dev1",
+                1_000_000,
+                "dev1:t1",
+                json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+            ),
+        };
+        // THE FINDING'S ROW: crid None (the conn-less resolution lane), the
+        // ORIGIN pane's lineage key recorded, live terminal the spawn's.
+        let mut covered = with_attribution(
+            with_correlation_ids(
+                binding_row_at("codex", "S-closed-inflight", bound(), 995_000),
+                None,
+                Some("term-inflight"),
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        );
+        covered.origin_create_request_id = Some("req-closed-inflight".to_string());
+        let sibling = with_attribution(
+            with_correlation_ids(
+                binding_row_at("codex", "S-open", bound(), 995_000),
+                Some("req-open"),
+                Some("term-open"),
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        );
+        build_inventory(
+            vec![d],
+            vec![covered, sibling],
+            live(live_keys),
+            &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+            // THE FINDING'S RECORD: the in-flight close — CRID only, NO
+            // terminal id (the pane closed before terminal.created).
+            &closes_with_detach(&[("req-closed-inflight", None)]),
+        )
+    };
+    for (label, keys) in [
+        ("DEAD (post-restart)", &[][..]),
+        (
+            "LIVE (still Running — association landed inside the attribution window)",
+            &[("codex", "S-closed-inflight"), ("codex", "S-open")][..],
+        ),
+    ] {
+        let out = make(keys);
+        let only = out["ledgerOnly"].as_array().unwrap();
+        assert!(
+            only.iter().all(|e| e["sessionId"] != "S-closed-inflight"),
+            "the origin-lineage-covered row is never offered ({label}): {out}"
+        );
+        assert!(
+            only.iter().any(|e| e["sessionId"] == "S-open"),
+            "the uncovered sibling stays offered ({label} anti-vacuity): {out}"
+        );
+    }
+
+    // The ORIGIN arm keys the lineage alone: a row whose origin key does NOT
+    // match the record is not covered by it — even when the record's
+    // terminal id names the row's live terminal. Scenario: two panes shared
+    // one terminal; ONLY the sibling pane was closed. This pane's row
+    // (origin-lineage the surviving pane) must stay offerable — the
+    // terminal-id fallback arm serves ONLY fully lineage-less legacy rows.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1_000_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let mut survivors_row = with_attribution(
+        with_correlation_ids(
+            binding_row_at("codex", "S-survivor", bound(), 995_000),
+            None,
+            Some("term-shared"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    survivors_row.origin_create_request_id = Some("req-surviving-pane".to_string());
+    let out = build_inventory(
+        vec![d],
+        vec![survivors_row],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+        // The CLOSED SIBLING pane's record carries the shared terminal id.
+        &closes_with_detach(&[("req-closed-sibling", Some("term-shared"))]),
+    );
+    assert!(
+        out["ledgerOnly"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["sessionId"] == "S-survivor"),
+        "an origin-keyed row answers its lineage alone — the sibling pane's \
+         terminal-keyed close record must NOT reach across: {out}"
+    );
+
+    // CONTROL (the pre-existing terminal arm is unchanged for genuinely
+    // lineage-less rows): the same shape with NO origin key stays covered —
+    // the conn-less legacy row on the closed pane's terminal.
+    let crid_less = with_attribution(
+        with_correlation_ids(
+            binding_row_at("codex", "S-legacy-cridless", bound(), 995_000),
+            None,
+            Some("term-shared"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![DeviceUnion {
+            device_id: "dev1".into(),
+            union_doc: union_doc_with_tab_key(
+                "dev1",
+                1_000_000,
+                "dev1:t1",
+                json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+            ),
+        }],
+        vec![crid_less],
+        no_live(),
+        &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+        &closes_with_detach(&[("req-closed-sibling", Some("term-shared"))]),
+    );
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "a fully lineage-less row on the closed pane's terminal stays covered \
+         via the terminal arm (the legacy residual is untouched): {out}"
+    );
+}
+
+/// Delta-r7-round-3 (focused-episode-7 round 2, Finding F3) — the dismissal
+/// `contentId` folds the ledger-only row's pane identity substance
+/// (createRequestId + tabKey + liveTerminalId), mirroring the snapshot side's
+/// placement keys (deviceId + tabKey + paneId ...). A genuine close/reopen
+/// after an early loss reattaches the same still-running session under a NEW
+/// pane identity — the digest must RE-KEY, or a dismissal of the earlier
+/// offer would suppress the materially different offer (different pane,
+/// potentially different destination tab and terminal handle).
+#[test]
+fn content_id_rekeys_on_ledger_row_pane_identity_churn() {
+    let build = |crid: Option<&str>, tid: Option<&str>, tab: &str| {
+        let mut row = with_attribution(
+            with_correlation_ids(
+                binding_row_at("codex", "S-reattached", bound(), 995_000),
+                crid,
+                tid,
+            ),
+            "c1",
+            "dev1",
+            tab,
+        );
+        row.origin_create_request_id = crid.map(str::to_string);
+        build_inventory(
+            vec![DeviceUnion {
+                device_id: "dev1".into(),
+                union_doc: union_doc_with_tab_key(
+                    "dev1",
+                    1_000_000,
+                    &format!("dev1:{tab}"),
+                    json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+                ),
+            }],
+            vec![row],
+            no_live(),
+            &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+            &no_closes(),
+        )
+    };
+    let baseline = build(Some("req-1"), Some("term-1"), "t9");
+    let same = build(Some("req-1"), Some("term-1"), "t9");
+    let new_crid = build(Some("req-2"), Some("term-1"), "t9");
+    let new_terminal = build(Some("req-1"), Some("term-2"), "t9");
+    let new_tab = build(Some("req-1"), Some("term-1"), "t8");
+    for (label, out) in [
+        ("baseline", &baseline),
+        ("same", &same),
+        ("new_crid", &new_crid),
+        ("new_terminal", &new_terminal),
+        ("new_tab", &new_tab),
+    ] {
+        assert!(
+            out["ledgerOnly"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["sessionId"] == "S-reattached"),
+            "the row must be offered in every build ({label} anti-vacuity): {out}"
+        );
+    }
+    assert_eq!(
+        baseline["contentId"], same["contentId"],
+        "identical offers keep the dismissal identity"
+    );
+    assert_ne!(
+        baseline["contentId"], new_crid["contentId"],
+        "a reattach's new createRequestId re-keys the dismissal (F3)"
+    );
+    assert_ne!(
+        baseline["contentId"], new_terminal["contentId"],
+        "a new terminal handle re-keys the dismissal (F3)"
+    );
+    assert_ne!(
+        baseline["contentId"], new_tab["contentId"],
+        "a new destination tab re-keys the dismissal (F3)"
     );
 }
 
@@ -2116,6 +2352,7 @@ fn ledger_row_after_writes(steps: &[(ProvenancePolicy<'static>, i64)]) -> Bindin
                 mode: "claude",
                 cwd: Some("/w"),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: *provenance,
                 now_ms: *now_ms,
             })
@@ -2446,6 +2683,7 @@ fn ledger_row_from_marker_resolution(
             "t-marker",
             "codex",
             Some("/w"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("c1"),
                 device_id: Some("d1"),
@@ -2463,6 +2701,7 @@ fn ledger_row_from_marker_resolution(
             mode: "codex",
             cwd: Some("/w"),
             create_request_id: None,
+            origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
             now_ms: resolve_ms,
         })
@@ -2728,6 +2967,7 @@ fn terminal_post_spawn_write_completed_after_the_pane_closed_is_never_offered() 
             mode: "claude",
             cwd: Some("/w"),
             create_request_id: Some("cr-1"),
+            origin_create_request_id: None,
             provenance: ProvenancePolicy::Replace(ProvenanceStamps {
                 client_instance_id: Some("c1"),
                 device_id: Some("d1"),
@@ -2782,6 +3022,7 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
             mode: "codex",
             cwd: Some("/w"),
             create_request_id: None,
+            origin_create_request_id: None,
             provenance: ProvenancePolicy::Replace(ProvenanceStamps {
                 client_instance_id: Some("c1"),
                 device_id: Some("d1"),

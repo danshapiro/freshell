@@ -59,6 +59,18 @@ const wsMocks = vi.hoisted(() => {
   }
 })
 
+/** Answer every in-flight pane.closed with a success result (delta-r7-r3, F2: the healthy-server close acknowledgment). */
+function ackPendingPaneCloses() {
+  for (const [msg] of wsMocks.send.mock.calls) {
+    const m = msg as { type?: string; createRequestId?: string }
+    if (m?.type === 'pane.closed' && m.createRequestId) {
+      for (const handler of [...wsMocks.handlers]) {
+        handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+      }
+    }
+  }
+}
+
 /** Answer every in-flight kill the provider sent with a successful durable close. */
 function ackPendingKills() {
   for (const [msg] of wsMocks.send.mock.calls) {
@@ -2537,17 +2549,22 @@ describe('ContextMenuProvider', () => {
 
       await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
 
-      // Verify the plain identity-driven terminal.detach was sent (F1: the
-      // close evidence now rides its own pane.closed message, below)
-      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
-      // F1 (delta-r7-r2): 'Replace pane' is a user-visible pane REMOVAL — it
-      // journals the durable pane-close evidence keyed by the replaced pane's
-      // createRequestId, exactly like the pane-X.
+      // F2 (delta-r7-r3): the gate sends the close evidence and AWAITS the
+      // correlated server answer BEFORE the pane becomes a picker.
       expect(wsMocks.send).toHaveBeenCalledWith({
         type: 'pane.closed',
         createRequestId: 'req-replace-1',
         terminalId: 'term-1',
       })
+      ackPendingPaneCloses()
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts['tab-1']
+        expect(layout.type === 'leaf' && layout.content.kind === 'picker').toBe(true)
+      })
+
+      // Verify the plain identity-driven terminal.detach was sent (F1: the
+      // close evidence now rides its own pane.closed message, above)
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
 
       // Verify pane content is now picker
       const layout = store.getState().panes.layouts['tab-1']
@@ -2586,11 +2603,19 @@ describe('ContextMenuProvider', () => {
 
       await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
 
+      ackPendingPaneCloses()
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts['tab-1']
+        expect(layout.type === 'leaf' && layout.content.kind === 'picker').toBe(true)
+      })
+
       const detachMessages = wsMocks.send.mock.calls
         .map(([msg]) => msg as { type?: string; terminalId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
       expect(detachMessages).toHaveLength(1)
-      // Exactly one pane-close evidence message keyed by the replaced pane (F1).
+      // Exactly ONE pane-close evidence message keyed by the replaced pane:
+      // the gate's acknowledged send is THE send (the middleware belt skips
+      // it via the one-shot confirmation mark — delta-r7-r3, F2).
       const paneClosedMessages = wsMocks.send.mock.calls
         .map(([msg]) => msg as { type?: string; createRequestId?: string })
         .filter((msg) => msg?.type === 'pane.closed')

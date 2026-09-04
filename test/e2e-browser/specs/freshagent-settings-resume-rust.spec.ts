@@ -40,6 +40,7 @@ import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -69,7 +70,7 @@ class WsCapture {
     this.ws = new WebSocket(wsUrl)
     this.opened = new Promise((resolve, reject) => {
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: WS_PROTOCOL_VERSION, token }))
         resolve()
       })
       this.ws.on('error', reject)

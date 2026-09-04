@@ -540,7 +540,17 @@ export const TerminalDetachSchema = z.object({
  * exists. The server journals a durable NON-retiring pane-close record (the
  * session survives — nothing is fenced or retired). The detach channel
  * itself stays identity-driven: detach is about the terminal, never the
- * pane. */
+ * pane.
+ *
+ * Delta-r7-r3 (focused-episode-7 round 2, Findings F2+F4): the close is
+ * ACKNOWLEDGED — the server answers one `pane.closed.result` per message
+ * once the journal write resolves, and the client's close gate awaits it
+ * (never an unconfirmed drop). Because a pre-result server silently DROPS
+ * unknown typed messages at its deserialization boundary, this shape ships
+ * WITH the protocol version bump 8 → 9: the strict hello handshake rejects
+ * a mixed-version pair with PROTOCOL_MISMATCH, so a client that gates on
+ * the answer can only ever connect to a server that speaks it (see
+ * `shared/ws-version.ts` for the full mixed-version note). */
 export const PaneClosedSchema = z.object({
   type: z.literal('pane.closed'),
   createRequestId: z.string().min(1),
@@ -1069,6 +1079,33 @@ export type TerminalKilledMessage = {
   error?: string
 }
 
+/**
+ * The correlated `pane.closed` answer (delta-r7-round-3 / focused-episode-7
+ * round 2, Finding F2): sent once per `pane.closed`, AFTER the durable
+ * pane-close journal write resolved one way or the other, so the closing
+ * client can await the evidence's durability before dropping the pane (the
+ * kill lane's close-ack rule). Correlated by the pane identity — the close
+ * is keyed by `createRequestId` end to end, no separate request id.
+ * `terminalId` echoes the message's when present (absent on the
+ * in-flight-create close shape). `success: false` (with `error`) means the
+ * durable record could NOT be written — the client keeps the pane and shows
+ * the failure on it; a persisted-despite-reported-error record answers
+ * `success: true` (the evidence IS durable).
+ *
+ * server→client only. Introduced WITH the protocol version bump 8 → 9
+ * (Finding F4): a server that predates this frame's schema drops unknown
+ * typed messages silently, so the client awaits the answer ONLY from a
+ * server the strict hello already proved speaks v9 — see
+ * `shared/ws-version.ts` for the full mixed-version note.
+ */
+export type PaneClosedResultMessage = {
+  type: 'pane.closed.result'
+  createRequestId: string
+  terminalId?: string
+  success: boolean
+  error?: string
+}
+
 export type TerminalExitMessage = {
   type: 'terminal.exit'
   terminalId: string
@@ -1438,6 +1475,7 @@ export type ServerMessage =
   | TerminalStreamChangedMessage
   | TerminalDetachedMessage
   | TerminalKilledMessage
+  | PaneClosedResultMessage
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalReplacedMessage

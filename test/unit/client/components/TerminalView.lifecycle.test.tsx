@@ -3,7 +3,7 @@ import { act, render, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
-import panesReducer, { removeLayout, requestPaneRefresh } from '@/store/panesSlice'
+import panesReducer, { removeLayout, requestPaneRefresh, setPaneCloseError } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
@@ -3658,6 +3658,43 @@ describe('TerminalView lifecycle updates', () => {
 
     const term = terminalInstances[0]
     expectTerminalWriteContaining(term, '[Close failed] the terminal close could not be recorded durably')
+  })
+
+  it('renders a close-gate failure (closeError) as the in-pane [Close failed] notice and clears it (delta-r7-r3, F2)', async () => {
+    // Focused-episode-7 round 2 (Finding F2): when the close gate leaves the
+    // pane standing (unacknowledged/failed durable close), the pane's own
+    // error chrome — the xterm notice, the input.blocked convention —
+    // explains why the close did not happen.
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-close-gate',
+      status: 'running',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      store.dispatch(setPaneCloseError({
+        tabId,
+        paneId,
+        error: 'the pane close could not be recorded durably; the pane was left open',
+      }))
+    })
+
+    const term = terminalInstances[0]
+    await waitFor(() => {
+      expectTerminalWriteContaining(term, '[Close failed] the pane close could not be recorded durably')
+    })
+    expect(getLeafTerminalContent(store, tabId).closeError).toBeUndefined()
   })
 
   it('shows feedback when Codex input is blocked by the restore identity gate', async () => {

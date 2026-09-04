@@ -1,7 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const sendMock = vi.fn()
-vi.mock('@/lib/ws-client', () => ({ getWsClient: () => ({ send: sendMock }) }))
+// Delta-r7-r3 (focused-episode-7 round 2, Finding F2): tabs closed mid-press
+// route through the close gate, which awaits the correlated
+// `pane.closed.result` — this mock answers every pane.closed with success
+// (the healthy-server shape) so mid-press closes complete.
+const closeAckHandlers = new Set<(msg: unknown) => void>()
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: (msg: unknown) => {
+      sendMock(msg)
+      const m = msg as { type?: string; createRequestId?: string }
+      if (m?.type === 'pane.closed' && m.createRequestId) {
+        for (const handler of [...closeAckHandlers]) {
+          handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+        }
+      }
+    },
+    onMessage: (handler: (msg: unknown) => void) => {
+      closeAckHandlers.add(handler)
+      return () => {
+        closeAckHandlers.delete(handler)
+      }
+    },
+  }),
+}))
 
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, closeTab } from '@/store/tabsSlice'
@@ -237,10 +260,13 @@ describe('DeckController', () => {
     expect(store.getState().tabs.activeTabId).toBe('t2')
   })
 
-  it('press on a tab that was closed mid-press is a no-op', () => {
+  it('press on a tab that was closed mid-press is a no-op', async () => {
     const { store, device } = setup({ tabCount: 2 })
     device.emit({ type: 'keyDown', keyIndex: 1 })
-    store.dispatch(closeTab('t2'))
+    // The close gate (delta-r7-r3, F2) acknowledges pane closes before the
+    // layout loses them — the dispatch promise resolves once the
+    // acknowledged close completes (the mock answers inline).
+    await store.dispatch(closeTab('t2'))
     expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1']) // t2 really gone mid-press
     vi.advanceTimersByTime(100)
     device.emit({ type: 'keyUp', keyIndex: 1 })

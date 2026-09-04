@@ -94,6 +94,7 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             mode,
             cwd,
             create_request_id,
+            origin_create_request_id: None, // the fallback keeps the write's own crid
             // D8 (restore-open-sessions-only): REST/headless rows stamp NO
             // provenance — there is no browser connection to attribute at bind
             // time, and rows without attribution are never offered by the
@@ -158,6 +159,7 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 mode,
                 cwd,
                 create_request_id,
+                origin_create_request_id: None, // the fallback keeps the write's own crid
                 // D8: REST/headless lineage rows stay UNATTRIBUTED by design
                 // (no browser connection exists here) — unlike the WS create
                 // lane, which stamps from the connection identity + `tabId`.
@@ -182,6 +184,12 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 terminal_id,
                 mode,
                 cwd,
+                // Lineage (delta-r7-round-3, Finding F1): the REST/headless
+                // lane stamps its own request id exactly like the WS lane —
+                // uniform marker shape; a REST-minted pane never carries a
+                // browser pane.closed (it is unattributed by design), so the
+                // key is inert there but never absent when the lane knows it.
+                create_request_id,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 now_ms(),
             ) {
@@ -425,6 +433,7 @@ mod tests {
                 mode: "claude",
                 cwd: Some("/w"),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Replace(
                     crate::pane_ledger::ProvenanceStamps {
                         client_instance_id: Some("client-1"),
@@ -463,6 +472,7 @@ mod tests {
                 mode: "claude",
                 cwd: Some("/w"),
                 create_request_id: None,
+                origin_create_request_id: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Replace(
                     crate::pane_ledger::ProvenanceStamps {
                         client_instance_id: Some("client-1"),

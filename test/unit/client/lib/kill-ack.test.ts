@@ -22,6 +22,7 @@ import {
   EXIT_FALLBACK_GRACE_MS,
   KILL_ACK_TIMEOUT_MS,
   sendFreshAgentKillAndAwait,
+  sendPaneClosedAndAwait,
   sendTerminalKillAndAwait,
 } from '@/lib/kill-ack'
 
@@ -223,6 +224,82 @@ describe('kill-ack', () => {
         provider: 'claude',
       })
       await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+    })
+  })
+
+  describe('sendPaneClosedAndAwait (delta-r7-r3 / focused-episode-7 round 2 Finding F2)', () => {
+    it('sends pane.closed and resolves ok on the matching correlated pane.closed.result', async () => {
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-1', terminalId: 'term-1' })
+      expect(mockSend).toHaveBeenCalledTimes(1)
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'pane.closed',
+        createRequestId: 'cr-1',
+        terminalId: 'term-1',
+      })
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-1', terminalId: 'term-1', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
+    it('omits the terminalId key for the in-flight-create close shape', async () => {
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-flight' })
+      const sent = mockSend.mock.calls[0][0]
+      expect(sent).toEqual({ type: 'pane.closed', createRequestId: 'cr-flight' })
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-flight', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
+    it('an answer delivered INSIDE the send call resolves — the wait subscribes BEFORE the send (the auto-answer/test-double order is load-bearing)', async () => {
+      const send = vi.fn((msg: unknown) => {
+        const m = msg as { createRequestId?: string }
+        emit({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+      })
+      await expect(sendPaneClosedAndAwait({ createRequestId: 'cr-sync' }, { send })).resolves.toEqual({ ok: true })
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(mockSend).not.toHaveBeenCalled()
+    })
+
+    it('success:false resolves as a failure carrying the server error', async () => {
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-fail' })
+      emit({
+        type: 'pane.closed.result',
+        createRequestId: 'cr-fail',
+        success: false,
+        error: 'the pane-close record could not be written durably',
+      })
+      await expect(pending).resolves.toEqual({
+        ok: false,
+        error: 'the pane-close record could not be written durably',
+      })
+    })
+
+    it('never resolves on answers for OTHER panes (the createRequestId correlation is exact)', async () => {
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-mine' })
+      const probe = vi.fn()
+      void pending.then(probe)
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-other', success: true })
+      emit({ type: 'terminal.killed', requestId: 'x', terminalId: 'term-1', success: true })
+      await Promise.resolve()
+      expect(probe).not.toHaveBeenCalled()
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-mine', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
+    it('times out as a UI failure (unconfirmed close — the pane stays)', async () => {
+      vi.useFakeTimers()
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-timeout' })
+      await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+    })
+
+    it('a late answer after the timeout can never resurrect the settled wait', async () => {
+      vi.useFakeTimers()
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-late' })
+      await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-late', success: true })
+      await Promise.resolve()
+      // still settled as the timeout — a second resolution would be a bug
       await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
     })
   })

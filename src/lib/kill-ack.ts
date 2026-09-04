@@ -156,6 +156,67 @@ export function sendTerminalKillAndAwait(
   })
 }
 
+/**
+ * The pane-close failure banner copy (delta-r7-round-3, focused-episode-7
+ * round 2 Finding F2): written onto the pane whose close the server did not
+ * confirm durable (the xterm notice — the terminal pane's ordinary error
+ * chrome, mirrored on `writeLocalXtermNotice`'s "[Close failed]"
+ * convention). Stays truthful for the NON-retiring pane.close family: the
+ * session is EXPECTED to survive; the failure is that the close EVIDENCE is
+ * unrecorded, so the pane stays and a later restore-from-server-memory pass
+ * may offer it again until the close is confirmed once.
+ */
+export const PANE_CLOSE_FAILED_MESSAGE =
+  'the pane close could not be recorded durably; the pane was left open'
+export const PANE_CLOSE_ACK_TIMEOUT_MESSAGE =
+  'the server did not acknowledge the pane close in time; the pane was left open'
+
+/**
+ * The correlated durable-pane-close (delta-r7-round-3, focused-episode-7
+ * round 2 Finding F2): send `pane.closed` and resolve on the ONE
+ * `pane.closed.result{createRequestId, success, error?}` the server answers
+ * once the journal write resolved. Correlation is the pane's own
+ * createRequestId (the close is keyed by it end to end — no separate
+ * request id). The wait SUBSCRIBES BEFORE THE SEND, so a test double or a
+ * server answering inline during `send()` still lands.
+ *
+ * No legacy fallbacks BY DESIGN (Finding F4 / WS_PROTOCOL_VERSION 9): a
+ * server that never learned this frame silently drops unknown typed
+ * messages, and the strict hello handshake makes that server unreachable
+ * for this client — an unanswered wait is always a REAL unconfirmed close
+ * (disconnect, half-open socket), settling as `timedOut` at the bounded
+ * KILL_ACK_TIMEOUT_MS with the pane kept. `markTerminalReleased` is NOT
+ * involved (the pane-close journal is non-retiring; the detach loop owns
+ * the subscription release).
+ */
+export function sendPaneClosedAndAwait(
+  identity: { createRequestId: string; terminalId?: string },
+  opts?: { timeoutMs?: number; send?: (msg: unknown) => void },
+): Promise<KillAck> {
+  const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
+  const wait = awaitCloseFrame((msg) => {
+    const m = msg as Record<string, unknown>
+    if (m.type === 'pane.closed.result' && m.createRequestId === identity.createRequestId) {
+      return { ok: m.success !== false, error: typeof m.error === 'string' ? m.error : undefined }
+    }
+    return null
+  }, opts?.timeoutMs ?? KILL_ACK_TIMEOUT_MS)
+  send({
+    type: 'pane.closed',
+    createRequestId: identity.createRequestId,
+    ...(identity.terminalId ? { terminalId: identity.terminalId } : {}),
+  })
+  return wait.then((ack) => {
+    if (!ack.ok) {
+      log.warn('pane close was not acknowledged as durably recorded — the pane stays', {
+        createRequestId: identity.createRequestId,
+        ...ack,
+      })
+    }
+    return ack
+  })
+}
+
 /** The fresh-agent close request (the `freshAgent.kill` payload minus its type). */
 export interface FreshAgentKillRequest {
   sessionId: string

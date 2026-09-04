@@ -225,6 +225,7 @@ impl PaneIdentitySink for TestLedgerSink {
                     &p,
                     &m,
                     c.as_deref(),
+                    None,
                     freshell_ws::pane_ledger::ProvenanceStamps::default(),
                     now,
                 )

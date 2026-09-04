@@ -3985,10 +3985,21 @@ export class WsHandler {
         return
 
       case 'pane.closed':
-        // Rust-only feature: durable pane-close evidence is journaled by the
-        // freshell-ws pane ledger (the Node server has no recovery ledger) —
-        // accept and ignore so a valid client message never triggers
-        // UNKNOWN_MESSAGE.
+        // The durable pane-close evidence is journaled only by the Rust
+        // freshell-ws pane ledger (this server has no recovery ledger).
+        // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close is
+        // ACKNOWLEDGED on every floor — the client's close gate awaits one
+        // correlated `pane.closed.result` per pane.closed, so answer success
+        // (this server's close-durability model records exactly nothing:
+        // there is no ledger read path to protect, hence nothing that can
+        // fail). Answer, never ignore: a v9 client treats silence as an
+        // unconfirmed close.
+        this.send(ws, {
+          type: 'pane.closed.result',
+          createRequestId: m.createRequestId,
+          ...(typeof m.terminalId === 'string' && m.terminalId ? { terminalId: m.terminalId } : {}),
+          success: true,
+        })
         return
 
       default:

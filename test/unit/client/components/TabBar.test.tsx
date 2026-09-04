@@ -57,6 +57,21 @@ function ackAllTerminalKills() {
   }
 }
 
+/** Answer every in-flight pane.closed with success (delta-r7-r3, F2: the
+ * healthy-server close acknowledgment the close gate awaits). */
+function ackAllPaneCloses() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; createRequestId?: string }
+    if (m?.type === 'pane.closed' && m.createRequestId) {
+      emitWsMessage({
+        type: 'pane.closed.result',
+        createRequestId: m.createRequestId,
+        success: true,
+      })
+    }
+  }
+}
+
 // Mock the api module so the repo-icon meta probe thunk never hits the network
 vi.mock('@/lib/api', () => ({
   api: {
@@ -648,7 +663,7 @@ describe('TabBar', () => {
       expect(state.tabs[0].id).toBe('tab-2')
     })
 
-    it('close button sends detach message when pane has terminalId', () => {
+    it('close button sends detach message when pane has terminalId', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -681,18 +696,21 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      // Delta-r7-r2 (Finding F2): the plain tab close is a pane close, so its
-      // durable NON-retiring pane-close evidence rides the dedicated
-      // pane.closed message keyed by the closing pane's createRequestId, while
-      // the detach stays identity-driven (about the terminal, never the pane).
+      // Delta-r7-r3 (Finding F2): the close gate sends the durable pane-close
+      // evidence FIRST and awaits the server's answer before the layout loses
+      // the pane; on ack the identity-driven detach follows (about the
+      // terminal, never the pane).
       expect(mockSend).toHaveBeenCalledWith({
         type: 'pane.closed',
         createRequestId: 'req-pane-1',
         terminalId: 'term-123',
       })
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'terminal.detach',
-        terminalId: 'term-123',
+      ackAllPaneCloses()
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith({
+          type: 'terminal.detach',
+          terminalId: 'term-123',
+        })
       })
     })
 
@@ -740,12 +758,21 @@ describe('TabBar', () => {
       // The tab survives until the correlated durable close lands.
       expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
       ackAllTerminalKills()
+      // The kill-succeeded closeTab then runs the pane-close evidence gate
+      // (delta-r7-r3, F2): the tab still stands until pane.closed is acked.
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'pane.closed', createRequestId: 'req-pane-1' }),
+        )
+      })
+      expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
+      ackAllPaneCloses()
       await waitFor(() => {
         expect(store.getState().tabs.tabs).toEqual([])
       })
     })
 
-    it('plain close sends exactly one terminal.detach per terminal', () => {
+    it('plain close sends exactly one terminal.detach per terminal', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -778,20 +805,27 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      const detachMessages = mockSend.mock.calls
-        .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
-        .filter((msg) => msg?.type === 'terminal.detach')
-      // Exactly ONE identity-driven detach (never a CRID rider — delta-r7-r2
-      // F2); the pane-close evidence is the separate pane.closed message.
-      expect(detachMessages).toEqual([
-        { type: 'terminal.detach', terminalId: 'term-123' },
-      ])
+      // Exactly ONE pane-close evidence message — the gate's acknowledged
+      // send (the middleware belt skips it via the one-shot confirmation
+      // mark, delta-r7-r3 F2).
       const paneClosed = mockSend.mock.calls
         .map(([msg]) => msg as { type?: string; createRequestId?: string; terminalId?: string })
         .filter((msg) => msg?.type === 'pane.closed')
       expect(paneClosed).toEqual([
         { type: 'pane.closed', createRequestId: 'req-pane-1', terminalId: 'term-123' },
       ])
+      ackAllPaneCloses()
+      await waitFor(() => {
+        const detachMessages = mockSend.mock.calls
+          .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
+          .filter((msg) => msg?.type === 'terminal.detach')
+        // Exactly ONE identity-driven detach (never a CRID rider —
+        // delta-r7-r2 F2); the pane-close evidence is the separate
+        // pane.closed message above.
+        expect(detachMessages).toEqual([
+          { type: 'terminal.detach', terminalId: 'term-123' },
+        ])
+      })
     })
 
     it('shift close leaves the tab standing when the terminal close is not durably acknowledged', async () => {
@@ -886,7 +920,7 @@ describe('TabBar', () => {
       )
     })
 
-    it('close button detaches every terminal in split pane layout', () => {
+    it('close button detaches every terminal in split pane layout', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -914,9 +948,9 @@ describe('TabBar', () => {
       fireEvent.click(closeButton)
 
       // Delta-r7-r2 (Finding F2): EVERY removed pane's close evidence lands
-      // FIRST (one pane.closed per removed pane identity), then the
-      // identity-driven detaches (one per vanished terminal).
-      expect(mockSend).toHaveBeenCalledTimes(4)
+      // FIRST (one pane.closed per removed pane identity); delta-r7-r3 (F2)
+      // then gates — the identity-driven detaches fire only once the close
+      // evidence is acknowledged.
       expect(mockSend).toHaveBeenNthCalledWith(1, {
         type: 'pane.closed',
         createRequestId: 'req-pane-1',
@@ -927,13 +961,17 @@ describe('TabBar', () => {
         createRequestId: 'req-pane-2',
         terminalId: 'term-b',
       })
-      expect(mockSend).toHaveBeenNthCalledWith(3, {
-        type: 'terminal.detach',
-        terminalId: 'term-a',
-      })
-      expect(mockSend).toHaveBeenNthCalledWith(4, {
-        type: 'terminal.detach',
-        terminalId: 'term-b',
+      ackAllPaneCloses()
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledTimes(4)
+        expect(mockSend).toHaveBeenNthCalledWith(3, {
+          type: 'terminal.detach',
+          terminalId: 'term-a',
+        })
+        expect(mockSend).toHaveBeenNthCalledWith(4, {
+          type: 'terminal.detach',
+          terminalId: 'term-b',
+        })
       })
     })
 

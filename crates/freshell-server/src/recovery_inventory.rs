@@ -506,17 +506,44 @@ pub fn build_inventory(
     // the OLD pane alone, and the terminal arm must never reach across to
     // the re-opened one (terminals are never re-minted, but they ARE
     // re-attached).
+    // Delta-r7-round-3 (focused-episode-7 round-2, Finding F1): the close
+    // coverage ALSO consults the row's ORIGIN lineage key. A pane closed
+    // before `terminal.created` journals a CRID-only pane.closed record (the
+    // client never learned the terminal id); the conn-less resolution lane
+    // later writes the row with `create_request_id: None` — without the
+    // origin consult neither arm matched and the deliberately closed session
+    // was offered (record CRID == row CRID == row ORIGIN CRID: any equals).
+    // The terminal-id fallback arm is now gated on the row being FULLY
+    // lineage-less: a row carrying either pane key answers its keys alone —
+    // that arm exists for the legacy residual (conn-less rows written by
+    // builds that never stamped lineage), and an origin-keyed row must never
+    // be covered by ANOTHER pane's terminal-keyed close record (two panes
+    // sharing one terminal: closing only the sibling must not suppress this
+    // pane's row).
     let row_close_covered = |r: &BindingRow| -> bool {
         let crid_hit = r
             .create_request_id
             .as_deref()
             .filter(|id| !id.is_empty())
-            .is_some_and(|id| covered_crids.contains(id));
+            .is_some_and(|id| covered_crids.contains(id))
+            || r
+                .origin_create_request_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .is_some_and(|id| covered_crids.contains(id));
         if crid_hit {
             return true;
         }
-        if r.create_request_id.as_deref().is_some_and(|id| !id.is_empty()) {
-            return false; // a keyed row answers its key alone (the reattach lapse)
+        let lineage_keyed = r
+            .create_request_id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty())
+            || r
+                .origin_create_request_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty());
+        if lineage_keyed {
+            return false; // a lineage-keyed row answers its keys alone (the reattach lapse)
         }
         r.live_terminal_id
             .as_deref()
@@ -1091,6 +1118,10 @@ pub fn build_inventory(
     let mut d8_dropped = 0usize;
     let mut ambiguous_suppressed = 0usize;
     let mut close_covered = 0usize;
+    // Row-side dismissal substance, pushed by the entry map below (F3 — see
+    // the push site). TIMESTAMP-FREE by construction (the line names only
+    // stable identity/placement handles).
+    let mut ledger_row_substance: Vec<String> = Vec::new();
     let ledger_only: Vec<Value> = bindings
         .iter()
         .filter(|r| row_is_bound(r))
@@ -1146,6 +1177,26 @@ pub fn build_inventory(
         })
         .map(|r| {
             let row_live = is_live(&row_provider(r), &row_session_id(r));
+            // Delta-r7-round-3 (focused-episode-7 round-2, Finding F3) — the
+            // dismissal contentId folds the row's PANE IDENTITY substance
+            // (createRequestId + tabKey + liveTerminalId), the ledger-side
+            // parity of the snapshot rows' placement keys (deviceId +
+            // tabKey + paneId, line ~987): reattaching the same still-running
+            // session changes its pane identity (and potentially its
+            // destination tab and terminal handle), and a dismissal recorded
+            // against the earlier offer must never suppress the materially
+            // different one. Read from the ROW (not the entry) so the digest
+            // never depends on the wire's live-only forwarding of the
+            // terminal handle: identity churn re-keys even for dead rows.
+            ledger_row_substance.push(format!(
+                "{}:{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                row_provider(r),
+                row_session_id(r),
+                row_live,
+                r.create_request_id.as_deref().unwrap_or(""),
+                r.tab_key.as_deref().unwrap_or(""),
+                r.live_terminal_id.as_deref().unwrap_or("")
+            ));
             let mut entry = json!({"provider": row_provider(r), "sessionId": row_session_id(r),
                    "mode": row_mode(r), "cwd": row_cwd(r), "live": row_live});
             // The REATTACH arm (F1): a LIVE row forwards its still-running
@@ -1203,14 +1254,11 @@ pub fn build_inventory(
     // round 5, Finding F3) — a live→dead transition is a materially different
     // offer (reattach vs resume), so the dismissal identity must RE-KEY on it
     // rather than suppress the now-dead row under the live offer's id.
-    substance.extend(ledger_only.iter().map(|e| {
-        format!(
-            "{}:{}\u{1}{}",
-            e["provider"].as_str().unwrap_or(""),
-            e["sessionId"].as_str().unwrap_or(""),
-            e["live"].as_bool().unwrap_or(false)
-        )
-    }));
+    // Delta-r7-round-3 (Finding F3): the row substance lines (pushed by the
+    // entry map at construction) additionally fold the row's pane identity —
+    // createRequestId + tabKey + liveTerminalId — so a reattach/replacement
+    // RE-KEYS the dismissal identity.
+    substance.extend(ledger_row_substance);
     substance.sort();
     let content_id = digest16(&substance);
 

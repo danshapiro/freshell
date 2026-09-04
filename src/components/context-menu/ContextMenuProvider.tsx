@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { addTab, closeTab, reopenClosedTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
+import { addTab, closeTab, reopenClosedTab, closePaneWithCleanup, replacePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
   addPane,
   initLayout,
-  replacePane,
   requestPaneRefresh,
   requestPaneRename,
   requestTabRefresh,
@@ -328,7 +327,12 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const replacePaneAction = useCallback((tabId: string, paneId: string) => {
-    dispatch(replacePane({ tabId, paneId }))
+    // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): replace discards
+    // the pane's identity — a pane CLOSE in every respect that matters to
+    // the recovery ledger — so it routes through the acknowledged close gate
+    // (the pane becomes a picker only once the durable close evidence is
+    // confirmed; on failure the content stays and wears the error).
+    dispatch(replacePaneWithCleanup({ tabId, paneId }))
   }, [dispatch])
 
   const closeTabById = useCallback((tabId: string) => {

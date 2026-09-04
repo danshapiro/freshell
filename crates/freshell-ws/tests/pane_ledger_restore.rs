@@ -75,6 +75,7 @@ async fn inventory_stamping_falls_back_to_ledger_bound_rows() {
             mode: "codex",
             cwd: None,
             create_request_id: Some("req-stamp-1"),
+            origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: 1_000,
         })
@@ -290,6 +291,7 @@ async fn claude_restore_is_refused_while_a_rest_shaped_live_claude_owns_the_sess
             mode: "claude",
             cwd: None,
             create_request_id: Some("req-rest-live-1"),
+            origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: 1_000,
         })

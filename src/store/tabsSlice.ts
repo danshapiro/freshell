@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -18,6 +18,9 @@ import {
   shouldKeepClosedTab,
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
+import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, sendPaneClosedAndAwait } from '@/lib/kill-ack'
+import { collectPaneEntries } from '@/lib/pane-utils'
+import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout, markTabsLoadRecovery } from './persistMiddleware'
@@ -455,6 +458,87 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
 }
 
 /**
+ * Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the acknowledged
+ * close gate. EVERY user- or system-initiated pane removal routes through one
+ * of the three gated thunks below (`closePaneWithCleanup`, `closeTab`,
+ * `replacePaneWithCleanup`), and each terminal-pane identity's durable close
+ * evidence must be CONFIRMED before the layout loses the pane — the kill
+ * lane's close-ack rule applied to the non-retiring pane-close family. An
+ * unacknowledged send after `next(action)` (the r7-r2 shape) could be lost by
+ * a disconnect/half-open socket/page termination AFTER the user acted, and
+ * the recovery offer would later recreate a pane the user explicitly removed.
+ *
+ * The gate: one `pane.closed` per removed terminal-pane identity (shared
+ * `sendPaneClosedAndAwait`, bounded wait), awaited BEFORE any reducer runs —
+ * all-or-nothing for a multi-pane close (a partial removal would strand the
+ * tab mid-close). On success the reducers run exactly as before (the
+ * detach middleware's belt re-sends idempotently). On failure/timeout the
+ * pane STAYS (server's authority: the close either recorded or it didn't)
+ * and every failed pane's own error surface (`closeError`, the xterm
+ * "[Close failed]" notice) carries why.
+ */
+type PaneCloseIdentity = { paneId: string; createRequestId: string; terminalId?: string }
+
+/** Terminal-pane identities (crid-bearing) in a layout subtree — the gate's unit. */
+function collectPaneCloseIdentities(layout: PaneNode | undefined): PaneCloseIdentity[] {
+  if (!layout) return []
+  const identities: PaneCloseIdentity[] = []
+  for (const { paneId, content } of collectPaneEntries(layout)) {
+    if (content.kind !== 'terminal') continue
+    if (!content.createRequestId) continue // the pathological legacy shape sends nothing
+    identities.push({
+      paneId,
+      createRequestId: content.createRequestId,
+      ...(content.terminalId ? { terminalId: content.terminalId } : {}),
+    })
+  }
+  return identities
+}
+
+/**
+ * Send + await the close evidence for every identity. Returns the FAILED
+ * verdicts (empty = every close confirmed durable). One shared bounded wait
+ * per identity, all in flight concurrently.
+ */
+async function awaitPaneCloseEvidence(
+  identities: PaneCloseIdentity[],
+): Promise<Array<{ identity: PaneCloseIdentity; timedOut: boolean }>> {
+  const verdicts = await Promise.all(
+    identities.map(async (identity) => ({
+      identity,
+      ack: await sendPaneClosedAndAwait({
+        createRequestId: identity.createRequestId,
+        ...(identity.terminalId ? { terminalId: identity.terminalId } : {}),
+      }, { timeoutMs: KILL_ACK_TIMEOUT_MS }),
+    })),
+  )
+  // A confirmed close marks its identity so the detach middleware's belt
+  // skips the redundant duplicate send (the one-shot mark/consume pattern —
+  // `terminal-release-marks`).
+  for (const v of verdicts) {
+    if (v.ack.ok) markPaneCloseEvidenceConfirmed(v.identity.createRequestId)
+  }
+  return verdicts
+    .filter((v) => !v.ack.ok)
+    .map((v) => ({ identity: v.identity, timedOut: v.ack.ok === false && v.ack.timedOut === true }))
+}
+
+/** Surface the failure on every pane whose close evidence was not confirmed. */
+function surfacePaneCloseFailures(
+  dispatch: (action: unknown) => void,
+  tabId: string,
+  failed: Array<{ identity: PaneCloseIdentity; timedOut: boolean }>,
+) {
+  for (const { identity, timedOut } of failed) {
+    dispatch(setPaneCloseError({
+      tabId,
+      paneId: identity.paneId,
+      error: timedOut ? PANE_CLOSE_ACK_TIMEOUT_MESSAGE : PANE_CLOSE_FAILED_MESSAGE,
+    }))
+  }
+}
+
+/**
  * Close a pane and clean up its attention state.
  * If the target pane is the tab's only pane, closes the tab instead.
  * Otherwise only clears attention if closePane actually removed the pane (i.e. layout changed).
@@ -466,6 +550,16 @@ export const closePaneWithCleanup = createAsyncThunk(
     if (before?.type === 'leaf' && before.id === paneId) {
       await dispatch(closeTab(tabId))
       return
+    }
+    // F2: confirm the durable close evidence BEFORE the layout loses the pane.
+    const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
+    if (identity.length > 0) {
+      const failed = await awaitPaneCloseEvidence(identity)
+      if (failed.length > 0) {
+        log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
+        surfacePaneCloseFailures(dispatch, tabId, failed)
+        return
+      }
     }
     dispatch(closePane({ tabId, paneId }))
     const after = (getState() as RootState).panes.layouts[tabId]
@@ -480,6 +574,24 @@ export const closePaneWithCleanup = createAsyncThunk(
 export const closeTab = createAsyncThunk(
   'tabs/closeTab',
   async (tabId: string, { dispatch, getState }) => {
+    // F2: the whole-tab close is all-or-nothing — EVERY terminal-pane
+    // identity's close evidence must confirm before ANY state moves (the
+    // closed-tab snapshot, the reopen stack, the tab list, the layout). One
+    // failed close keeps the whole tab standing, exactly the TabBar
+    // shift-close kill lane's rule ("a kill whose close envelope failed
+    // leaves BOTH the terminal running AND the tab standing").
+    const identities = collectPaneCloseIdentities((getState() as RootState).panes.layouts[tabId])
+    if (identities.length > 0) {
+      const failed = await awaitPaneCloseEvidence(identities)
+      if (failed.length > 0) {
+        log.warn('tab close evidence was not fully confirmed; the tab stays', {
+          tabId,
+          failedPanes: failed.map((f) => f.identity.paneId),
+        })
+        surfacePaneCloseFailures(dispatch, tabId, failed)
+        return
+      }
+    }
     const stateBeforeClose = getState() as RootState
     const tab = stateBeforeClose.tabs.tabs.find((item) => item.id === tabId)
     const layout = stateBeforeClose.panes.layouts[tabId]
@@ -532,6 +644,33 @@ export const closeTab = createAsyncThunk(
       dispatch(clearPaneAttention({ paneId }))
       clearDraft(paneId)
     }
+  }
+)
+
+/**
+ * The context-menu "Replace pane" close gate (delta-r7-round-3, F2): the
+ * discarded pane's identity removal needs its confirmed close evidence
+ * exactly like a plain X-close — the pane becomes a picker only once the
+ * journal acked. On failure the original content stays and wears the error.
+ */
+export const replacePaneWithCleanup = createAsyncThunk(
+  'tabs/replacePaneWithCleanup',
+  async ({ tabId, paneId }: { tabId: string; paneId: string }, { dispatch, getState }) => {
+    const identity = collectPaneCloseIdentities(
+      (getState() as RootState).panes.layouts[tabId],
+    ).filter((i) => i.paneId === paneId)
+    if (identity.length > 0) {
+      const failed = await awaitPaneCloseEvidence(identity)
+      if (failed.length > 0) {
+        log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
+          tabId,
+          paneId,
+        })
+        surfacePaneCloseFailures(dispatch, tabId, failed)
+        return
+      }
+    }
+    dispatch(replacePane({ tabId, paneId }))
   }
 )
 

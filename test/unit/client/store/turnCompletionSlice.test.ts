@@ -1,4 +1,34 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+
+const { paneCloseAckHandlers } = vi.hoisted(() => ({
+  paneCloseAckHandlers: new Set<(msg: unknown) => void>(),
+}))
+
+// Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close gate awaits
+// the correlated `pane.closed.result` before the layout loses a pane — this
+// mock answers EVERY pane.closed with success (the healthy-server shape), so
+// these tests exercise the acknowledged-close path end to end.
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: (msg: unknown) => {
+      const m = msg as { type?: string; createRequestId?: string }
+      if (m?.type === 'pane.closed' && m.createRequestId) {
+        for (const handler of [...paneCloseAckHandlers]) {
+          handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+        }
+      }
+    },
+    onMessage: (handler: (msg: unknown) => void) => {
+      paneCloseAckHandlers.add(handler)
+      return () => {
+        paneCloseAckHandlers.delete(handler)
+      }
+    },
+  }),
+  resetWsClientForTests: vi.fn(),
+}))
+
+
 import { configureStore } from '@reduxjs/toolkit'
 import reducer, {
   clearTabAttention,

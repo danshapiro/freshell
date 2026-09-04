@@ -555,7 +555,7 @@
               "type": "string"
             },
             "protocolVersion": {
-              "const": 8,
+              "const": 9,
               "type": "number"
             },
             "sessions": {
@@ -4203,7 +4203,7 @@
           "type": "string"
         },
         "protocolVersion": {
-          "const": 8,
+          "const": 9,
           "type": "number"
         },
         "sessions": {
@@ -8395,5 +8395,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket wire protocol — frozen contract",
-  "wsProtocolVersion": 8
+  "wsProtocolVersion": 9
 }

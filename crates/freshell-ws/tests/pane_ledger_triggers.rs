@@ -147,6 +147,7 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
             mode: "claude",
             cwd: Some("/prior/cwd"),
             create_request_id: Some("req-prior-epoch"),
+            origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: seeded_at,
         })
@@ -220,6 +221,15 @@ async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
         .pending_for_terminal(&terminal_id)
         .expect("pending marker written at spawn");
     assert_eq!(marker.mode, "codex");
+    // Delta-r7-round-3 (focused-episode-7 round 2, Finding F1): the marker
+    // ALSO durable-records the ORIGIN pane's createRequestId — the lineage
+    // key the resolved row inherits so a CRID-only `pane.closed` record (a
+    // close before terminal.created) can still cover that row.
+    assert_eq!(
+        marker.create_request_id.as_deref(),
+        Some("req-codex-1"),
+        "the spawn-time marker carries the origin pane's createRequestId"
+    );
 
     // Observed exit IN THIS EPOCH ends the identity-in-flight window: the
     // kill path must delete the marker (spec §4.2 marker GC rule). Poll the
@@ -725,6 +735,7 @@ async fn a_kill_before_identity_resolution_records_a_pane_close_the_late_resolut
             mode: "codex",
             cwd: Some("/tmp"),
             create_request_id: None,
+            origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: 9_000,
         })
@@ -959,6 +970,76 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
         2,
         "the detach lane carries no pane identity (F2: evidence and detach are decoupled)"
     );
+
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the pane-close
+/// evidence message is ACKNOWLEDGED, kill-lack rule style: the server answers
+/// ONE `pane.closed.result{createRequestId, terminalId?, success}` per
+/// `pane.closed`, AFTER the durable journal write resolved (the close-ack
+/// discipline the kill lane's `terminal.killed` established). The answer is
+/// correlated by the message's own pane identity (no separate request id:
+/// the close is keyed by createRequestId end to end). Success covers the
+/// terminalId-less in-flight-create shape as well as the terminalId-bearing
+/// one — and the answer lands before any later message's answer (wire order
+/// = durability order), so the client can genuinely await before dropping
+/// the pane.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pane_closed_is_answered_by_a_correlated_result_after_the_journal() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("pane-closed-ack");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // The terminalId-bearing shape: the answer echoes BOTH identity keys and
+    // the record is already durable when the answer arrives.
+    ws.send(
+        WsMessage::Text(
+            serde_json::json!({
+                "type": "pane.closed",
+                "createRequestId": "req-ack-1",
+                "terminalId": "term-no-such-terminal", // never registered: the record keys the pane, not the registry
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    let ack = next_frame_of_type(&mut ws, "pane.closed.result").await;
+    assert_eq!(ack["createRequestId"], "req-ack-1");
+    assert_eq!(ack["terminalId"], "term-no-such-terminal");
+    assert_eq!(
+        ack["success"], true,
+        "a journaled close acknowledges success: {ack}"
+    );
+    let closes = server_ledger.list_pane_detach_closes();
+    assert_eq!(closes.len(), 1, "the answer follows the durable write: {closes:?}");
+    assert_eq!(closes[0].create_request_id, "req-ack-1");
+
+    // The in-flight-create shape (NO terminalId) answers the same way, the
+    // terminalId key absent from the wire.
+    ws.send(
+        WsMessage::Text(
+            serde_json::json!({
+                "type": "pane.closed",
+                "createRequestId": "req-ack-2",
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    let ack2 = next_frame_of_type(&mut ws, "pane.closed.result").await;
+    assert_eq!(ack2["createRequestId"], "req-ack-2");
+    assert_eq!(ack2["success"], true, "{ack2}");
+    assert!(
+        ack2.get("terminalId").is_none(),
+        "a terminalId-less close is answered without the key: {ack2}"
+    );
+    assert_eq!(server_ledger.list_pane_detach_closes().len(), 2);
 
     let _ = registry;
     std::fs::remove_dir_all(&dir).ok();

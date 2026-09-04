@@ -78,6 +78,21 @@ function emitWsMessage(msg: unknown) {
   for (const handler of [...wsMessageHandlers]) handler(msg)
 }
 
+/** Answer every in-flight pane.closed with success (delta-r7-r3, F2: the
+ * healthy-server close acknowledgment the close gate awaits). */
+function ackPaneClosesMocked() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; createRequestId?: string }
+    if (m?.type === 'pane.closed' && m.createRequestId) {
+      emitWsMessage({
+        type: 'pane.closed.result',
+        createRequestId: m.createRequestId,
+        success: true,
+      })
+    }
+  }
+}
+
 /** Answer the in-flight fresh-agent kills with success. */
 function ackFreshAgentKillsMocked() {
   for (const [msg] of mockSend.mock.calls) {
@@ -450,7 +465,7 @@ describe('PaneContainer', () => {
   })
 
   describe('terminal cleanup on pane close', () => {
-    it('closing a pane sends the plain identity-driven detach AND the pane-close evidence keyed by the pane\'s createRequestId (delta-round-7 F2 / delta-r7-r2 F2)', () => {
+    it('closing a pane sends the plain identity-driven detach AND the pane-close evidence keyed by the pane\'s createRequestId (delta-round-7 F2 / delta-r7-r2 F2)', async () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
       const terminalId = 'term-123'
@@ -488,22 +503,26 @@ describe('PaneContainer', () => {
       const closeButtons = screen.getAllByTitle('Close pane')
       fireEvent.click(closeButtons[0])
 
-      // The detach stays identity-driven (about the TERMINAL, never the pane).
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'terminal.detach',
-        terminalId: terminalId,
-      })
       // The durable, NON-retiring pane-close record rides its own message,
-      // keyed by the closing pane's createRequestId (the session survives the
-      // detach by design).
+      // keyed by the closing pane's createRequestId — sent FIRST, and the
+      // gate (delta-r7-r3 F2) awaits the server's answer before the layout
+      // loses the pane (the detach follows after the ack).
       expect(mockSend).toHaveBeenCalledWith({
         type: 'pane.closed',
         createRequestId: 'req-pane-1',
         terminalId,
       })
+      ackPaneClosesMocked()
+      // The detach stays identity-driven (about the TERMINAL, never the pane).
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith({
+          type: 'terminal.detach',
+          terminalId: terminalId,
+        })
+      })
     })
 
-    it('sends exactly one terminal.detach when closing a pane with terminalId', () => {
+    it('sends exactly one terminal.detach when closing a pane with terminalId', async () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
       const terminalId = 'term-123'
@@ -541,10 +560,13 @@ describe('PaneContainer', () => {
       const closeButtons = screen.getAllByTitle('Close pane')
       fireEvent.click(closeButtons[0])
 
-      const detachMessages = mockSend.mock.calls
-        .map(([msg]) => msg as { type?: string; terminalId?: string })
-        .filter((msg) => msg?.type === 'terminal.detach')
-      expect(detachMessages).toHaveLength(1)
+      ackPaneClosesMocked()
+      await waitFor(() => {
+        const detachMessages = mockSend.mock.calls
+          .map(([msg]) => msg as { type?: string; terminalId?: string })
+          .filter((msg) => msg?.type === 'terminal.detach')
+        expect(detachMessages).toHaveLength(1)
+      })
     })
 
     // Delta-round-7 (Finding F2) — the strongest false-positive guard: a

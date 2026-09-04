@@ -610,6 +610,26 @@ pub struct BindingRow {
     /// is never an identity join key).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create_request_id: Option<String>,
+    /// The ORIGIN pane lineage key (delta-r7-round-3, focused-episode-7
+    /// round-2 Finding F1): the createRequestId of the pane whose create led
+    /// to this row, recorded REGARDLESS of the dynamic-identity CRID rule.
+    /// The conn-less resolution lane (`ledger_resolve_identity`) deliberately
+    /// writes `create_request_id: None`; without the lineage key, a pane
+    /// closed BEFORE `terminal.created` (whose `pane.closed` journal record
+    /// is CRID-only — the client never learned the terminal id) could never
+    /// cover the row resolution later writes, and the deliberately closed
+    /// session re-entered the recovery offer. Write rules: a row resolving
+    /// from a pending marker records the MARKER's createRequestId (stamped
+    /// at spawn by the connection-scoped create); every other write falls
+    /// back to its own `create_request_id`, then to the row's prior origin
+    /// (a pane-identity-less rebind never ERASES lineage); the attach
+    /// restamp re-keys it wholesale to the attaching pane (the delta-r7-r2
+    /// reattach lapse — the old pane's close record must never reach the
+    /// re-opened session). Serde-optional under LEDGER_VERSION 1 (the
+    /// provenance-fields precedent): pre-delta-r7-r3 rows parse to `None`
+    /// and fall back to the pre-existing coverage arms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_create_request_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_observed_at: i64,
@@ -754,6 +774,18 @@ pub struct PendingMarker {
     /// composition, so the resolved row can rejoin the right restored tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_key: Option<String>,
+    /// The ORIGIN pane's createRequestId (delta-r7-round-3, focused-episode-7
+    /// round-2 Finding F1): stamped by the connection-scoped create beside
+    /// the provenance stamps, so the row this marker later resolves into can
+    /// durable-record the pane lineage EVEN ON the conn-less resolution lane
+    /// (whose binding write deliberately carries `create_request_id: None`).
+    /// A pane closed while its create was in flight journals a CRID-only
+    /// `pane.closed` record; this is the join key that lets the close
+    /// coverage reach that row. Serde-optional under LEDGER_VERSION 1 (the
+    /// stamps precedent): pre-delta-r7-r3 markers parse to `None` and the
+    /// resolve falls back to the pre-existing coverage arms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
 }
 
 /// D8 (delta-r2 Finding 2) provenance stamps carried by a
@@ -984,6 +1016,13 @@ pub struct BindingWrite<'a> {
     pub mode: &'a str,
     pub cwd: Option<&'a str>,
     pub create_request_id: Option<&'a str>,
+    /// The ORIGIN pane lineage key (delta-r7-round-3, focused-episode-7
+    /// round-2 Finding F1) — see [`BindingRow::origin_create_request_id`].
+    /// Only `resolve_pending` sets it (from the consumed pending marker);
+    /// every other lane leaves it `None` and the row's origin falls back to
+    /// this write's own `create_request_id`, then to the row's prior origin
+    /// (a pane-identity-less rebind never ERASES recorded lineage).
+    pub origin_create_request_id: Option<&'a str>,
     /// D8 provenance write policy — see [`ProvenancePolicy`] for the
     /// per-lane contract (Replace / Inherit / Clear). A meaningful `Replace`
     /// carries its OWN assertion time on the stamps' `asserted_at` (focused-
@@ -1611,6 +1650,22 @@ impl PaneLedger {
         // NOT built for it (focused-ep4-r5 Finding 2a).
         let (client_instance_id, device_id, tab_key, last_attributed_at) =
             resolve_provenance_merge(existing, &w.provenance, w.now_ms);
+        // Delta-r7-round-3 (focused-episode-7 round-2 Finding F1) — the
+        // lineage key, in precedence order: an explicit origin (the marker
+        // arm of `resolve_pending`) wins; otherwise this write's OWN pane
+        // key IS the origin (a conn-scoped create/re-bind knows the pane it
+        // serves); otherwise the row's PRIOR origin stands — a
+        // pane-identity-less write (the conn-less rebind shape) never
+        // ERASES recorded lineage. DELIBERATELY unlike the advisory
+        // `create_request_id` above, which is wholesale-replaced: lineage is
+        // a fact about the identity's pane ancestry and only ever MOVES
+        // when a write knows a new pane owns the row (the restamp re-keys
+        // it explicitly — `note_pane_reattach`).
+        let origin_create_request_id = w
+            .origin_create_request_id
+            .or(w.create_request_id)
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|r| r.origin_create_request_id.clone()));
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -1619,6 +1674,7 @@ impl PaneLedger {
             cwd: w.cwd.map(str::to_string),
             live_terminal_id: Some(w.terminal_id.to_string()),
             create_request_id: w.create_request_id.map(str::to_string),
+            origin_create_request_id,
             created_at,
             updated_at: w.now_ms,
             last_observed_at: w.now_ms,
@@ -1700,6 +1756,11 @@ impl PaneLedger {
         let row = BindingRow {
             live_terminal_id: Some(w.terminal_id.to_string()),
             create_request_id: Some(w.create_request_id.to_string()),
+            // The row's pane keys move WHOLESALE onto the attaching pane —
+            // lineage included (delta-r7-round-3, F1): the old pane's close
+            // record must keep covering only the old pane, never the
+            // genuinely re-opened session (the reattach lapse).
+            origin_create_request_id: Some(w.create_request_id.to_string()),
             updated_at: w.now_ms,
             last_observed_at: w.now_ms,
             client_instance_id,
@@ -1866,6 +1927,12 @@ impl PaneLedger {
             .create_request_id
             .map(str::to_string)
             .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
+        // Lineage (delta-r7-round-3, F1): the fresh-agent row's origin
+        // mirrors its pane key — the same computed value — so the coverage
+        // join against either key is identical to the pre-F1 crid arm on
+        // this lane (fresh-agent closes own the KILL lanes; `pane.closed`
+        // never keys them).
+        let origin_create_request_id = create_request_id.clone();
         // Provenance writer rules (the SAME atomic, MONOTONE attribution fact
         // as the terminal body — focused-ep4-r3 Findings 1+2, one shared
         // `attaches_attribution`/`advances_attribution` pair; the tri-state
@@ -1970,6 +2037,7 @@ impl PaneLedger {
             cwd: w.cwd.map(str::to_string),
             live_terminal_id: None, // fresh-agent panes have no terminal
             create_request_id,
+            origin_create_request_id,
             created_at,
             updated_at: w.now_ms,
             last_observed_at: w.now_ms,
@@ -3459,11 +3527,19 @@ impl PaneLedger {
     /// intermediate build persisted before the field existed). An unstamped
     /// (headless) marker records `asserted_at: 0`; its resolution derives
     /// `Clear` and never consumes a time.
+    ///
+    /// `create_request_id` (delta-r7-round-3, focused-episode-7 round-2
+    /// Finding F1): the ORIGIN pane's lineage key, stamped by the lanes that
+    /// know it (the connection-scoped WS create; the REST lineage binder's
+    /// own request id) so the row this marker later resolves into records
+    /// the pane lineage regardless of the conn-less lane's deliberate
+    /// `create_request_id: None` — see [`BindingRow::origin_create_request_id`].
     pub fn record_pending(
         &self,
         terminal_id: &str,
         mode: &str,
         cwd: Option<&str>,
+        create_request_id: Option<&str>,
         provenance: ProvenanceStamps<'_>,
         now_ms: i64,
     ) -> std::io::Result<()> {
@@ -3481,6 +3557,7 @@ impl PaneLedger {
             client_instance_id: provenance.client_instance_id.map(str::to_string),
             device_id: provenance.device_id.map(str::to_string),
             tab_key: provenance.tab_key.map(str::to_string),
+            create_request_id: create_request_id.map(str::to_string),
         };
         write_row_atomic(&Self::pending_path(root, terminal_id), &marker)?;
         index.pending.insert(terminal_id.to_string(), marker);
@@ -3565,6 +3642,21 @@ impl PaneLedger {
         let mut stamp_device: Option<String> = None;
         let mut stamp_tab: Option<String> = None;
         let mut stamp_asserted_at: i64 = 0;
+        // Delta-r7-round-3 (focused-episode-7 round-2 Finding F1) — the
+        // LINEAGE key: when this resolve consumes a pending marker, the row
+        // durable-records the marker's ORIGIN createRequestId
+        // (`origin_create_request_id`) regardless of the conn-less lane's
+        // deliberate `create_request_id: None`. A pane closed while its
+        // create was in flight journals a CRID-only `pane.closed` record;
+        // without this line no coverage arm can join that record to the row
+        // resolution writes, and the deliberately closed session re-entered
+        // the recovery offer. Consumed-marker origin wins over the write's
+        // own (there is none on the conn-less lane); the marker LESS shape
+        // (a mid-session rebind) leaves the write's own value untouched.
+        let marker_origin_crid: Option<String> = index
+            .pending
+            .get(w.terminal_id)
+            .and_then(|marker| marker.create_request_id.clone());
         let derived = match &w.provenance {
             ProvenancePolicy::Inherit => match index.pending.get(w.terminal_id) {
                 Some(marker)
@@ -3620,6 +3712,9 @@ impl PaneLedger {
                         tab_key: stamp_tab.as_deref(),
                         asserted_at: stamp_asserted_at,
                     }),
+                    origin_create_request_id: marker_origin_crid
+                        .as_deref()
+                        .or(w.origin_create_request_id),
                     ..*w
                 };
                 &effective
@@ -3627,11 +3722,28 @@ impl PaneLedger {
             Derived::Clear => {
                 effective = BindingWrite {
                     provenance: ProvenancePolicy::Clear,
+                    origin_create_request_id: marker_origin_crid
+                        .as_deref()
+                        .or(w.origin_create_request_id),
                     ..*w
                 };
                 &effective
             }
-            Derived::Keep => w,
+            Derived::Keep => {
+                if marker_origin_crid.is_some() && w.origin_create_request_id.is_none() {
+                    // A consumed marker's lineage stamps even on arms that
+                    // keep the write's own provenance policy as-is (the row
+                    // must never shed the close-coverage join key merely
+                    // because the resolve had its own policy).
+                    effective = BindingWrite {
+                        origin_create_request_id: marker_origin_crid.as_deref(),
+                        ..*w
+                    };
+                    &effective
+                } else {
+                    w
+                }
+            }
         };
         // Delta-r6-r2 (focused-episode-6 round 1, F1+F2) — the close-record
         // CONSULT: a resolution landing for a pane whose close already
@@ -3900,6 +4012,10 @@ pub(crate) async fn ledger_resolve_identity(
             mode: &provider_owned,
             cwd: cwd_owned.as_deref(),
             create_request_id: None,
+            // The lineage key arrives via the consumed marker inside
+            // `resolve_pending` (delta-r7-round-3, Finding F1) — this
+            // conn-less lane itself knows no pane identity.
+            origin_create_request_id: None,
             // Conn-less lane (D8): no provenance in scope and none asserted;
             // `Inherit` keeps any prior row's stamps — and (delta-r3 Finding
             // 2) `resolve_pending` additionally sources the consumed marker's

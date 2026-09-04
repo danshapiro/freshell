@@ -46,6 +46,7 @@ fn write_with_policy(
         mode: Box::leak(provider.to_string().into_boxed_str()),
         cwd: Some("/tmp/proj"),
         create_request_id: Some("req-1"),
+        origin_create_request_id: None,
         provenance,
         now_ms,
     }
@@ -814,6 +815,7 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_markers_assert
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-1"),
                 device_id: Some("device-1"),
@@ -858,6 +860,7 @@ fn marker_stamped_resolution_stamps_the_attribution_time_from_the_markers_assert
             "t2",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-1"),
                 device_id: None,
@@ -999,6 +1002,7 @@ fn marker_spawn_time_is_the_write_time_and_assertion_rides_its_own_field() {
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-1"),
                 device_id: Some("device-1"),
@@ -1018,7 +1022,8 @@ fn marker_spawn_time_is_the_write_time_and_assertion_rides_its_own_field() {
         "the provenance's assertion time rides its OWN field"
     );
     ledger
-        .record_pending("t2", "codex", None, ProvenanceStamps::default(), 7_000)
+        .record_pending("t2", "codex", None,
+        None, ProvenanceStamps::default(), 7_000)
         .unwrap();
     let marker = ledger.pending_for_terminal("t2").expect("headless marker");
     assert_eq!(
@@ -1591,6 +1596,7 @@ fn legacy_marker_resolution_attaches_client_device_when_no_prior_attribution_exi
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-legacy"),
                 device_id: Some("device-1"),
@@ -1826,6 +1832,7 @@ fn marker_sourced_resolution_never_drags_a_newer_attribution_back() {
             "t-marker",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-1"),
                 device_id: Some("device-1"),
@@ -1953,7 +1960,8 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
     ledger
-        .record_pending("ph", "freshclaude", None, ProvenanceStamps::default(), 1)
+        .record_pending("ph", "freshclaude", None,
+        None, ProvenanceStamps::default(), 1)
         .expect("pending writes keep their silent-no-op policy on a disabled ledger");
     ledger
         .delete_rollback_row("claude", "sid")
@@ -2167,7 +2175,8 @@ fn pending_marker_roundtrips_and_reader_rule_prefers_binding() {
     let root = temp_root("pending");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "opencode", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "opencode", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     let marker = ledger.pending_for_terminal("t1").expect("marker readable");
     assert_eq!(marker.terminal_id, "t1");
@@ -2191,7 +2200,8 @@ fn resolve_pending_writes_binding_first_then_deletes_marker() {
     let root = temp_root("resolve");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger
         .resolve_pending(&write("codex", "th-1", "t1", 2_000))
@@ -2212,7 +2222,8 @@ fn resolve_pending_marker_delete_failure_is_not_a_durability_error() {
     let root = temp_root("marker-delete-fails");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     // Make the pending dir read-only so the marker unlink fails (EACCES).
     let pending_dir = root.join("pending");
@@ -2238,7 +2249,8 @@ fn pending_resolution_collision_is_idempotent() {
     let root = temp_root("collision");
     let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
 
     // Sequential double-resolution.
@@ -2259,7 +2271,8 @@ fn pending_resolution_collision_is_idempotent() {
 
     // Concurrent resolution from two threads (the actual race shape).
     ledger
-        .record_pending("t2", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 3_000)
+        .record_pending("t2", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 3_000)
         .unwrap();
     let a = std::sync::Arc::clone(&ledger);
     let b = std::sync::Arc::clone(&ledger);
@@ -2297,6 +2310,7 @@ fn resolve_pending_sources_provenance_from_the_consumed_marker() {
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-1"),
                 device_id: Some("device-1"),
@@ -2339,6 +2353,7 @@ fn resolve_pending_prefers_the_resolve_calls_own_provenance_over_the_markers() {
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-marker"),
                 device_id: Some("device-marker"),
@@ -2405,6 +2420,7 @@ fn resolve_pending_from_a_partial_marker_leaves_the_attribution_untouched() {
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-new"),
                 device_id: None,
@@ -2447,7 +2463,8 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     let root = temp_root("resolve-headless");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger
         .resolve_pending(&write("codex", "th-1", "t1", 2_000))
@@ -2498,6 +2515,7 @@ fn resolve_pending_from_a_headless_origin_clears_a_previously_stamped_row() {
             "t-rest",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps::default(), // the headless binder's exact marker shape
             1_500,
         )
@@ -2552,6 +2570,7 @@ fn resolve_pending_clear_wins_over_a_stamped_marker() {
             "t1",
             "codex",
             Some("/tmp/p"),
+            None,
             ProvenanceStamps {
                 client_instance_id: Some("client-2"),
                 device_id: Some("device-2"),
@@ -2583,6 +2602,228 @@ fn resolve_pending_clear_wins_over_a_stamped_marker() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// ── Delta-r7-round-3 (focused-episode-7 round 2, Finding F1) — pane LINEAGE
+// durable on the row: a row resolving from a pending marker records the
+// marker's ORIGIN createRequestId, so a pane closed BEFORE its identity ever
+// resolved (the CRID-only `pane.closed` journal shape) still covers the row
+// the conn-less resolution lane later writes with `create_request_id: None`.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn resolve_pending_records_the_markers_origin_create_request_id() {
+    // THE FINDING'S WRITE-SIDE SHAPE: an in-flight codex create leaves a
+    // pending marker keyed by the create's terminal id and carrying the
+    // pane's createRequestId; the pane is X-closed (the CRID-only close
+    // record lands); the conn-less resolution hook (`ledger_resolve_identity`
+    // — `create_request_id: None` DELIBERATELY, D4) later resolves the
+    // identity. The row must still carry the ORIGIN pane's lineage key so the
+    // recovery inventory's close coverage can join record→row by lineage.
+    let root = temp_root("origin-lineage");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            Some("req-origin"), // the pane's createRequestId (spawn-time create)
+            ProvenanceStamps::default(),
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&BindingWrite {
+            create_request_id: None, // the conn-less lane's deliberate None
+            origin_create_request_id: None,
+            ..write("codex", "th-1", "t1", 2_000)
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(
+        row.create_request_id, None,
+        "the dynamic-identity CRID rule is UNCHANGED: resolution never joins on it"
+    );
+    assert_eq!(
+        row.origin_create_request_id.as_deref(),
+        Some("req-origin"),
+        "the row durable-records its ORIGIN pane's lineage key from the consumed marker"
+    );
+    // Durable across a reload (a second ledger over the same dir).
+    drop(ledger);
+    let reload = PaneLedger::new(Some(root.clone()));
+    let row = reload.load_binding("codex", "th-1").expect("binding row");
+    assert_eq!(row.origin_create_request_id.as_deref(), Some("req-origin"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn record_binding_origins_the_row_to_its_own_create_request_id() {
+    // Uniform lineage: a conn-scoped create's binding write (the create's
+    // createRequestId rides `create_request_id`) IS that row's origin — no
+    // marker consultation exists on this lane, so the origin falls back to
+    // the write's own pane key.
+    let root = temp_root("origin-fallback");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-1", "t1", 1_000))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-1").expect("row");
+    assert_eq!(row.create_request_id.as_deref(), Some("req-1"));
+    assert_eq!(
+        row.origin_create_request_id.as_deref(),
+        Some("req-1"),
+        "origin == the create's createRequestId on the conn-scoped lane"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn a_crid_less_rebind_preserves_the_rows_origin_lineage() {
+    // A later conn-less write carrying NO pane identity (the mid-session
+    // rebind shape — no marker in play) must not ERASE the lineage the row
+    // already carries: lineage is a fact about the identity's pane ancestry,
+    // and a re-asserting write that knows nothing of panes preserves it
+    // (the advisory ids stay wholesale-replaced; the ORIGIN only ever moves
+    // when a write KNOWS a new pane owns the row).
+    let root = temp_root("origin-preserved");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            Some("req-origin"),
+            ProvenanceStamps::default(),
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&BindingWrite {
+            create_request_id: None,
+            origin_create_request_id: None,
+            ..write("codex", "th-1", "t1", 2_000)
+        })
+        .unwrap();
+    // Same key, conn-less, no marker left (consumed above): the rebind
+    // rewrites the advisory ids (create_request_id wholesale → None) but
+    // keeps the origin lineage.
+    ledger
+        .resolve_pending(&BindingWrite {
+            create_request_id: None,
+            origin_create_request_id: None,
+            ..write("codex", "th-1", "t1", 3_000)
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("row");
+    assert_eq!(row.create_request_id, None);
+    assert_eq!(
+        row.origin_create_request_id.as_deref(),
+        Some("req-origin"),
+        "a pane-identity-less rebind NEVER erases the recorded origin lineage"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn note_pane_reattach_rekeys_the_origin_lineage_wholesale() {
+    // The restamp (delta-r7-r2 Finding F3) moves the row onto the ATTACHING
+    // pane COMPLETELY — lineage included: otherwise the OLD pane's close
+    // record would still key the row through the new origin arm and a
+    // genuinely re-opened session would stay suppressed (the reattach lapse
+    // the restamp exists to restore).
+    let root = temp_root("origin-restamp");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            Some("req-OLD-original"),
+            ProvenanceStamps::default(),
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .resolve_pending(&BindingWrite {
+            create_request_id: None,
+            origin_create_request_id: None,
+            ..write("codex", "th-1", "t1", 2_000)
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("row");
+    assert_eq!(row.origin_create_request_id.as_deref(), Some("req-OLD-original"));
+    // A new pane (fresh createRequestId) reattaches the still-running
+    // terminal: the row's pane keys move wholesale — create_request_id AND
+    // origin — leaving NO key the closed old pane's record can match.
+    ledger
+        .note_pane_reattach(&ReattachWrite {
+            provider: "codex",
+            session_id: "th-1",
+            terminal_id: "t1",
+            create_request_id: "req-NEW-pane",
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 3_000,
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").expect("row");
+    assert_eq!(row.create_request_id.as_deref(), Some("req-NEW-pane"));
+    assert_eq!(
+        row.origin_create_request_id.as_deref(),
+        Some("req-NEW-pane"),
+        "the origin lineage moves to the attaching pane wholesale"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn old_rows_and_markers_without_the_lineage_fields_still_deserialize() {
+    // Serde-additive under LEDGER_VERSION 1 (the provenance-fields
+    // precedent): rows and markers persisted by intermediate builds carry no
+    // `originCreateRequestId` / `createRequestId` keys and parse to `None` —
+    // their close coverage falls back to the pre-existing arms (the
+    // conn-less CRID-less row + terminal-id arm, unchanged).
+    let root = temp_root("origin-legacy-parse");
+    let ledger_dir = root.join("bindings").join("codex");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("th-legacy.json"),
+        serde_json::json!({
+            "ledgerVersion": LEDGER_VERSION,
+            "provider": "codex",
+            "sessionId": "th-legacy",
+            "mode": "codex",
+            "liveTerminalId": "t-legacy",
+            "createdAt": 1_000i64,
+            "updatedAt": 1_000i64,
+            "lastObservedAt": 1_000i64,
+            "state": "bound",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let marker_dir = root.join("pending");
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(
+        marker_dir.join("t-legacy-pending.json"),
+        serde_json::json!({
+            "ledgerVersion": LEDGER_VERSION,
+            "terminalId": "t-legacy-pending",
+            "mode": "codex",
+            "spawnedAt": 1_000i64,
+            "assertedAt": 1_000i64,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let row = ledger.load_binding("codex", "th-legacy").expect("row parses");
+    assert_eq!(row.origin_create_request_id, None, "legacy row: no origin key");
+    let marker = ledger
+        .pending_for_terminal("t-legacy-pending")
+        .expect("marker parses");
+    assert_eq!(marker.create_request_id, None, "legacy marker: no crid key");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn stamped_marker_retention_keys_on_creation_time_never_assertion_time() {
     // The stamps are payload, not lifetime: retention reads only
@@ -2609,12 +2850,14 @@ fn stamped_marker_retention_keys_on_creation_time_never_assertion_time() {
             "young-t",
             "codex",
             Some("/tmp/p"),
+            None,
             stamps_at(1_000), // a 30+ days stale ASSERTION…
             now - 60_000,     // …but the marker itself was CREATED a minute ago
         )
         .unwrap();
     ledger
-        .record_pending("aged-t", "codex", Some("/tmp/p"), stamps_at(1_000), 1_000)
+        .record_pending("aged-t", "codex", Some("/tmp/p"),
+        None, stamps_at(1_000), 1_000)
         .unwrap();
     let report = ledger.gc(now, &never_absent, None, Some(&no_snapshot_refs()));
     assert_eq!(
@@ -2669,7 +2912,8 @@ fn sigkill_inside_locator_window_leaves_a_durable_marker() {
     let root = temp_root("sigkill-window");
     {
         let gen1 = PaneLedger::new(Some(root.clone()));
-        gen1.record_pending("t1", "opencode", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        gen1.record_pending("t1", "opencode", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
             .unwrap();
         // gen1 "dies" here — dropped without resolving.
     }
@@ -2790,7 +3034,8 @@ fn crash_between_binding_write_and_marker_delete_is_repaired_at_boot() {
     let root = temp_root("crash-window");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger
         .record_binding(&write("codex", "th-1", "t1", 2_000))
@@ -2813,7 +3058,8 @@ fn boot_scan_never_sweeps_a_marker_merely_because_the_terminal_is_not_live() {
     let root = temp_root("marker-preserved");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "opencode", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "opencode", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     let report = ledger.boot_scan(2_000, &never_absent, Some(&no_snapshot_refs()));
     assert!(report.stale_markers_removed.is_empty());
@@ -2831,7 +3077,8 @@ fn aged_out_marker_is_swept_after_its_ttl() {
     let root = temp_root("marker-ttl");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     let report = ledger.boot_scan(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent, Some(&no_snapshot_refs()));
     assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
@@ -2848,7 +3095,8 @@ fn periodic_gc_sweeps_aged_markers_without_a_restart() {
     let root = temp_root("marker-ttl-gc");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"), ProvenanceStamps::default(), 1_000)
+        .record_pending("t1", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     // A fresh marker survives a GC pass (never swept merely for age < TTL)...
     let report = ledger.gc(2_000, &never_absent, None, Some(&no_snapshot_refs()));
@@ -2874,13 +3122,16 @@ fn orphaned_pending_marker_is_gced_after_orphan_ttl() {
     let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
     let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
     ledger
-        .record_pending("dead-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), orphan_age)
+        .record_pending("dead-t", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), orphan_age)
         .unwrap();
     ledger
-        .record_pending("live-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), orphan_age)
+        .record_pending("live-t", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), orphan_age)
         .unwrap();
     ledger
-        .record_pending("young-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), now - 60_000)
+        .record_pending("young-t", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), now - 60_000)
         .unwrap();
     let live: HashSet<String> = HashSet::from(["live-t".to_string()]);
 
@@ -2912,7 +3163,8 @@ fn boot_path_never_runs_the_orphan_rule() {
     let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
     let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
     ledger
-        .record_pending("dead-t", "codex", Some("/tmp/p"), ProvenanceStamps::default(), orphan_age)
+        .record_pending("dead-t", "codex", Some("/tmp/p"),
+        None, ProvenanceStamps::default(), orphan_age)
         .unwrap();
 
     let report = ledger.boot_scan(now, &never_absent, Some(&no_snapshot_refs()));
@@ -2949,6 +3201,7 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             cwd: None,
             live_terminal_id: Some("t1".into()),
             create_request_id: None,
+            origin_create_request_id: None,
             created_at: at,
             updated_at: at,
             last_observed_at: at,
@@ -4847,6 +5100,7 @@ fn a_resolve_pending_after_a_close_pane_lands_the_row_retired_never_bound() {
             "term-cr",
             "codex",
             Some("/tmp/proj"),
+            None,
             ProvenanceStamps::default(),
             1_000,
         )
@@ -4907,6 +5161,7 @@ fn a_close_pane_parked_behind_a_mid_write_resolve_retires_the_row_the_resolver_w
             "term-rc",
             "opencode",
             Some("/tmp/proj"),
+            None,
             ProvenanceStamps::default(),
             1_000,
         )
@@ -4996,7 +5251,8 @@ fn a_close_pane_whose_writes_all_fail_leaves_nothing_durable() {
         .record_binding(&write("codex", "sess-nofail", "term-nofail", 1_000))
         .unwrap();
     ledger
-        .record_pending("term-nofail", "codex", None, ProvenanceStamps::default(), 1_000)
+        .record_pending("term-nofail", "codex", None,
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     // Baseline: the marker exists before the close attempt.
     assert!(ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-nofail"));
@@ -5194,7 +5450,8 @@ fn a_close_envelope_whose_record_write_fails_reports_clean_and_leaves_nothing_du
         .record_binding(&write("codex", "sess-cl", "term-cl", 1_000))
         .unwrap();
     ledger
-        .record_pending("term-cl", "codex", None, ProvenanceStamps::default(), 1_000)
+        .record_pending("term-cl", "codex", None,
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     let env_dir = PaneLedger::close_envelope_dir(&root);
     std::fs::create_dir_all(&env_dir).unwrap();
@@ -5315,7 +5572,8 @@ fn a_close_envelope_whose_rollback_delete_fails_reports_persisted_close() {
         .record_binding(&write("codex", "sess-pe", "term-pe", 1_000))
         .unwrap();
     ledger
-        .record_pending("term-pe", "codex", None, ProvenanceStamps::default(), 1_000)
+        .record_pending("term-pe", "codex", None,
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger.land_then_fail_next_close_envelope_writes(1);
     ledger.fail_next_close_envelope_deletes(1);
@@ -5373,7 +5631,8 @@ fn a_close_identities_envelope_is_one_journal_record() {
         .record_binding(&write("opencode", "ses-a", "term-a", 1_000))
         .unwrap();
     ledger
-        .record_pending("ph-x", "opencode", None, ProvenanceStamps::default(), 1_000)
+        .record_pending("ph-x", "opencode", None,
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     // Side A: the write never lands — clean failure, nothing durable.
     ledger.fail_next_close_envelope_writes(1);
@@ -5446,7 +5705,8 @@ fn a_close_pane_writes_the_close_record_before_the_pending_marker_is_deleted() {
     let root = temp_root("record-before-marker");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("term-rbm", "codex", None, ProvenanceStamps::default(), 1_000)
+        .record_pending("term-rbm", "codex", None,
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     assert!(ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-rbm"));
     // The close-envelope dir is read-only: the record write fails. Nothing
@@ -5594,7 +5854,8 @@ fn a_close_identities_batch_closes_every_identity_and_deletes_markers_last() {
         .record_binding(&write("claude", "sess-b", "term-b", 1_000))
         .unwrap();
     ledger
-        .record_pending("ph-a", "claude", None, ProvenanceStamps::default(), 1_000)
+        .record_pending("ph-a", "claude", None,
+        None, ProvenanceStamps::default(), 1_000)
         .unwrap();
     ledger
         .close_identities(
@@ -5776,6 +6037,7 @@ fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() 
             mode: "claude",
             cwd: Some("/tmp/proj"),
             create_request_id: Some("req-det"),
+            origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
             now_ms: 1_000,
         })
@@ -5889,6 +6151,7 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_its_create_request_id(
             mode: "claude",
             cwd: Some("/tmp/proj"),
             create_request_id: Some("req-kept"),
+            origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
             now_ms: 1_000,
         })

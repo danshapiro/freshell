@@ -148,7 +148,8 @@ impl PaneIdentitySink for TestLedgerSink {
         let now = Self::now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                ledger.record_pending(&p, &m, c.as_deref(), Default::default(), now)
+                ledger.record_pending(&p, &m, c.as_deref(),
+                None, Default::default(), now)
             })
             .await
             .map_err(std::io::Error::other)?

@@ -44,7 +44,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 61,
+    "count": 62,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -75,6 +75,7 @@
       "hoststats.snapshot",
       "opencode.activity.list.response",
       "opencode.activity.updated",
+      "pane.closed.result",
       "pane.reconcile.result",
       "perf.logging",
       "pong",
@@ -111,5 +112,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket message inventory — T0 conformance surface",
-  "wsProtocolVersion": 8
+  "wsProtocolVersion": 9
 }

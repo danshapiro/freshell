@@ -16,6 +16,7 @@ import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
   applyReconcileAttach,
   applyReattachToLiveTerminal,
+  clearPaneCloseError,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
@@ -92,7 +93,7 @@ import {
   type DeferredAttachReason,
   type TerminalAttachPriority,
 } from '@/lib/terminal-attach-policy'
-import { collectAllTerminalIds, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { collectAllTerminalIds, findPaneContent, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
@@ -576,6 +577,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const isMobile = useMobile()
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const serverInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
+  // Delta-r7-r3 (F2): the close gate's failure surface lives on the STORE'S
+  // pane content (the pane prop is a mount-time snapshot — a set-on-failure
+  // close error must reach an already-mounted pane).
+  const closeError = useAppSelector((s) => {
+    const root = s.panes.layouts[tabId]
+    const content = root ? findPaneContent(root, paneId) : null
+    return content?.kind === 'terminal' ? content.closeError : undefined
+  })
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -1288,6 +1297,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     lastSessionActivityAtRef.current = 0
   }, [terminalContent?.resumeSessionId])
+
+  // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close gate's
+  // failure surface — a terminal pane whose close the server did NOT
+  // confirm durable stays open wearing `closeError`; render it NOW on the
+  // pane's own error chrome (the xterm "[Close failed]" notice — the
+  // terminal.killed{success:false} fold's convention) and clear the field
+  // from the store. One-shot per set; a re-failed close re-sets it.
+  useEffect(() => {
+    if (!isTerminal || !closeError) return
+    const term = termRef.current
+    if (!term) return
+    writeLocalXtermNotice(term, `\r\n[Close failed] ${closeError}\r\n`)
+    dispatch(clearPaneCloseError({ tabId, paneId: paneIdRef.current }))
+  }, [isTerminal, closeError, dispatch, tabId, writeLocalXtermNotice])
 
   const notifyPendingInputLoss = useCallback((reason: PendingInputLossReason) => {
     log.warn('pending_input_dropped', { tabId, paneId: paneIdRef.current, reason })

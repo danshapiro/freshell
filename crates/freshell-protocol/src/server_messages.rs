@@ -127,6 +127,12 @@ pub enum ServerMessage {
     // `terminal.kill` answer — see [`TerminalKilled`].
     #[serde(rename = "terminal.killed")]
     TerminalKilled(TerminalKilled),
+    // Additive (delta-r7-r3, focused-episode-7 round 2): the correlated
+    // `pane.closed` answer — see [`PaneClosedResult`]. Introduced WITH the
+    // protocol version bump 8 → 9 (the client now depends on the answer —
+    // see `shared/ws-version.ts`).
+    #[serde(rename = "pane.closed.result")]
+    PaneClosedResult(PaneClosedResult),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
     #[serde(rename = "terminal.modes.sync")]
@@ -157,7 +163,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 61] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 62] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -187,6 +193,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 61] = [
     "hoststats.snapshot",
     "opencode.activity.list.response",
     "opencode.activity.updated",
+    "pane.closed.result",
     "pane.reconcile.result",
     "perf.logging",
     "pong",
@@ -386,6 +393,28 @@ pub struct TerminalIdOnly {
 pub struct TerminalKilled {
     pub request_id: String,
     pub terminal_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `pane.closed` answer (delta-r7-round-3, focused-episode-7
+/// round 2, Finding F2): sent once per `pane.closed`, AFTER the durable
+/// pane-close journal write resolved, so the closing client can await the
+/// evidence's durability before dropping the pane (the kill lane's
+/// close-ack rule). Correlated by the pane identity itself — the close is
+/// keyed by `createRequestId` end to end, so no separate request id exists.
+/// `terminalId` echoes the message's when present (absent on the
+/// in-flight-create close shape). `success: false` (with `error`) means the
+/// durable record could NOT be written — the pane must stay open and the
+/// failure must surface on it; a persisted-despite-reported-error record
+/// still answers `success: true` (the evidence IS durable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneClosedResult {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

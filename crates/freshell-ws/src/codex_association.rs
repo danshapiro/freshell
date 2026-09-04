@@ -614,6 +614,7 @@ mod tests {
                 "t1",
                 "codex",
                 Some("/tmp"),
+                None,
                 crate::pane_ledger::ProvenanceStamps::default(),
                 now_ms(),
             )
