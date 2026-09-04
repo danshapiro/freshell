@@ -130,13 +130,19 @@ pub struct FreshClaudeState {
     /// tombstones. When a session's `cli_index` aliases are evicted (consumer
     /// exit, kill, a lease-revoked/rollback teardown), the mapping is DEMOTED
     /// here (placeholder map key -> every durable id it answered to), TTL'd,
-    /// instead of dropped. Consulted ONLY by [`Self::handle_kill`]: the client
-    /// closes a pane by its ORIGINAL bare placeholder sessionId, and without
-    /// this record a kill arriving after the sidecar's exit-eviction cannot
-    /// recover the durable id the ledger row is keyed on — the retire silently
-    /// missed it (the finding). Never consulted by live-resolution paths
-    /// (`resolve_session_key`, send/interrupt/attach, snapshots): a
-    /// tombstoned session is DEAD, and this record answers ids for RETIRE
+    /// instead of dropped. Read for RETIRE resolution ONLY by
+    /// [`Self::handle_kill`]: the client closes a pane by its ORIGINAL bare
+    /// placeholder sessionId, and without this record a kill arriving after
+    /// the sidecar's exit-eviction cannot recover the durable id the ledger
+    /// row is keyed on — the retire silently missed it (the finding). Round
+    /// 3 lifecycle (focused-ep5-r2 Finding 2): a genuine claim (resume/
+    /// attach of the durable) CONSUMES its records
+    /// ([`AliasTombstones::clear_for_durable`] via `commit_session_claim`),
+    /// and `collect_kill_retire_ids` additionally skips any surviving record
+    /// whose durable id is live on a DIFFERENT session — a stale alias can
+    /// never retire a reopened session. Never consulted by live-resolution
+    /// paths (`resolve_session_key`, send/interrupt/attach, snapshots): a
+    /// tombstoned session is DEAD, and this record answers ids for retire
     /// writes only — it makes nothing look alive.
     alias_tombstones: Arc<std::sync::Mutex<AliasTombstones>>,
 }
@@ -188,6 +194,29 @@ impl AliasTombstones {
             .get(placeholder)
             .map(|entries| entries.iter().map(|e| e.durable.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Focused-ep5-r2 Finding 2 (retire-on-kill round 3): a genuine claim of
+    /// `durable` CONSUMES every demoted alias record pointing to it — the
+    /// reopened identity is live again, so a later kill naming one of those
+    /// old placeholders must no longer retire the live durable row. Returns
+    /// the placeholder keys whose records pointed at `durable` (the claim
+    /// clears their LEDGER kill fences too — every known alias of the
+    /// reopened identity reopens together). Other durables' records under
+    /// the same placeholder (a same-key re-registration answered to several)
+    /// are untouched.
+    fn clear_for_durable(&mut self, durable: &str, now_ms: i64) -> Vec<String> {
+        self.sweep(now_ms);
+        let mut cleared = Vec::new();
+        self.by_placeholder.retain(|placeholder, entries| {
+            let before = entries.len();
+            entries.retain(|e| e.durable != durable);
+            if entries.len() != before {
+                cleared.push(placeholder.clone());
+            }
+            !entries.is_empty()
+        });
+        cleared
     }
 
     fn sweep(&mut self, now_ms: i64) {
@@ -660,18 +689,15 @@ impl FreshClaudeState {
             }
         }
 
-        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): an explicit
-        // create-with-resume GENUINELY CLAIMS the durable identity — clear the
-        // kill tombstone the close recorded BEFORE this resume's own binding
-        // write (the consumer's sdk.session.init corrector) can be suppressed
-        // as a stale orphan of the killed session. Placement: after the lease
-        // claim (a loser never claims) and before the spawn — a failed spawn
-        // leaves no writer, so the early clear is harmless. The HAS-LIVE
-        // adopt arms above never clear: a live session was never killed, so
-        // no tombstone can exist for it.
-        if let Some(sid) = resume_sid.as_deref() {
-            self.clear_kill_tombstone_for(sid).await;
-        }
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
+        // 4+5): an explicit create-with-resume GENUINELY CLAIMS the durable
+        // identity — but the claim COMMITS only further down, once the
+        // replacement session is established (sidecar created + `created`
+        // answered). Clearing the fence before the spawn (round 2's
+        // placement) left a failed create's identity UNFENCED — an older
+        // in-flight binding write of the killed epoch could then resurrect
+        // Bound. The HAS-LIVE adopt arms above never commit: a live session
+        // was never killed, so no tombstone can exist for it.
 
         let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
             Ok(parts) => parts,
@@ -738,6 +764,24 @@ impl FreshClaudeState {
                 return;
             }
         };
+
+        // Retire-on-kill round 3 (focused-ep5-r2 Findings 4+5): the genuine
+        // claim COMMITS here — the replacement session is ESTABLISHED
+        // (sidecar created + `created` answered), so the durable kill fence
+        // the close recorded is cleared, the stale placeholder alias
+        // tombstones pointing at this durable are consumed, and a
+        // kill-closed ledger row returns to Bound. Every failure arm ABOVE
+        // precedes the commit, so a failed spawn/write/create keeps the
+        // fence by never touching it (Finding 5); the lease-revoke arm below
+        // is the ONE post-commit failure and rolls the claim back
+        // (`rollback_session_claim` re-raises the fence and re-retires the
+        // row). The commit runs BEFORE `spawn_consumer` by construction, so
+        // the consumer's `sdk.session.init` adoption write can never consult
+        // a fence whose clear it raced — the ordering is structural, not
+        // scheduled.
+        if let Some(sid) = resume_sid.as_deref() {
+            self.commit_session_claim(sid).await;
+        }
 
         // Start the stdout consumer (the completion edge normalization + the Task 2
         // pending-set fold live here). `Some(settings)` => the consumer records a
@@ -809,6 +853,11 @@ impl FreshClaudeState {
                     reap_owned_claude_sidecars(&session.ownership_id);
                 }
                 if let Some(sid) = resume_sid.as_deref() {
+                    // Finding 5's re-raise: the ONE post-commit failure arm —
+                    // the session is torn back down, so the close the commit
+                    // undid is durable again (fence re-raised, the revived
+                    // row re-retired) before any orphan write can land.
+                    self.rollback_session_claim(sid).await;
                     // Finding 1: demote (not drop) the torn-down alias.
                     self.evict_cli_index_aliases(&created).await;
                     let _ = sid;
@@ -949,15 +998,6 @@ impl FreshClaudeState {
         // second post-teardown retire pass (a scheduling hedge); the write
         // now consults durable state, so no timing window remains.
         let mut retire_ids = vec![session_id.clone()];
-        {
-            let now = crate::session_lease::now_epoch_ms() as i64;
-            let mut tombstones = self.alias_tombstones.lock().expect("alias tombstones lock");
-            for durable in tombstones.durables_for(&session_id, now) {
-                if !retire_ids.iter().any(|id| id == &durable) {
-                    retire_ids.push(durable);
-                }
-            }
-        }
         if let Some(session) = removed {
             // Abort AND JOIN the consumer before collecting the kill's durable
             // ids: after the join, no consumer arm (the sdk.session.init
@@ -969,19 +1009,13 @@ impl FreshClaudeState {
             // kill tombstone whenever it lands.
             session.consumer.abort();
             let _ = session.consumer.await;
-            if let Some(cli_id) = session.cli_session_id.as_deref() {
-                if cli_id != map_key && !retire_ids.iter().any(|id| id == cli_id) {
-                    retire_ids.push(cli_id.to_string());
-                }
-            }
-            {
-                let index = self.cli_index.lock().await;
-                for (durable, mapped) in index.iter() {
-                    if mapped == &map_key && !retire_ids.iter().any(|id| id == durable) {
-                        retire_ids.push(durable.clone());
-                    }
-                }
-            }
+            self.collect_kill_retire_ids(
+                &session_id,
+                &map_key,
+                session.cli_session_id.as_deref(),
+                &mut retire_ids,
+            )
+            .await;
             // ONE awaited retire pass BEFORE the heavy teardown: the durable
             // tombstone + row retire land even if a server crash interrupts
             // the process kill, and the tombstone fences every later-landing
@@ -997,6 +1031,14 @@ impl FreshClaudeState {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&session.ownership_id);
         } else {
+            // The session entry is already gone — but the retire set must
+            // still consult LIVE aliases: in the exit-eviction gap (focused
+            // -ep5-r2 Finding 3 — the consumer eviction removed the map entry
+            // but has not yet demoted its cli_index alias) the tombstones
+            // answer nothing AND the live index still has the mapping, so
+            // consulting both under one critical section closes the hole.
+            self.collect_kill_retire_ids(&session_id, &map_key, None, &mut retire_ids)
+                .await;
             self.retire_closed_rows(&retire_ids).await;
         }
 
@@ -1041,23 +1083,152 @@ impl FreshClaudeState {
         }
     }
 
-    /// Retire-on-kill round 2 (focused-ep5-r1 Finding 2), the tombstone
-    /// lifecycle's CLEAR transition: an explicit resume/attach of a durable
-    /// id is a NEW pane GENUINELY CLAIMING that identity, so the kill
-    /// tombstone the close recorded is cleared BEFORE the claim's own
-    /// binding write (the attach lane's `sdk.session.init` adoption or the
-    /// resume-create's corrector) can be mistaken for the killed session's
-    /// orphaned write and suppressed. Unconditional by design — idempotent
-    /// on a never-killed identity — warn-logged on failure, never a resume
-    /// blocker. All OTHER binding-write lanes (fork children, crash
-    /// respawns, in-stream adoptions) deliberately do NOT clear: none of
-    /// them claims an identity a user just closed.
-    async fn clear_kill_tombstone_for(&self, durable_id: &str) {
+    /// Retire-on-kill round 3 (focused-ep5-r2 Findings 2+3): the kill's
+    /// retire-set completion — ONE critical section across all three
+    /// alias-resolution sources, with the lock order `cli_index` →
+    /// `sessions` → `alias_tombstones` held for the whole consult (no awaits
+    /// inside). Called AFTER any removed session's consumer abort+join (no
+    /// adoption arm can mint a new alias past the join; an adoption that had
+    /// started pre-abort has its cli_index insert done BEFORE its ledger
+    /// write, so its durable id is already visible here).
+    ///
+    /// Finding 3 (the exit-eviction gap): the consumer eviction removes the
+    /// session entry and demotes the cli_index aliases as two separate map
+    /// operations — a kill landing between them previously saw NEITHER
+    /// source and retired only the placeholder. This consult sees both
+    /// representations atomically: the demotion either already ran (the
+    /// alias TOMBSTONES answer) or it has not (the LIVE aliases answer), so
+    /// every interleaving resolves the durable id.
+    ///
+    /// Finding 2 (the tightened tombstone rule): a TOMBSTONE-sourced
+    /// candidate is followed only when live session state does not
+    /// contradict it — if the durable id currently resolves to a DIFFERENT
+    /// placeholder whose session is live, the identity was genuinely
+    /// reopened after the close, and the stale alias record is dead. (The
+    /// genuine claim normally CONSUMES those records at reopen —
+    /// `commit_session_claim`; this check is the belt to that suspenders,
+    /// catching any record that escapes consumption.) Live aliases of THIS
+    /// kill's own map key and the removed session's recorded cli id always
+    /// retire: they ARE the identity the kill is closing.
+    async fn collect_kill_retire_ids(
+        &self,
+        wire_session_id: &str,
+        map_key: &str,
+        removed_cli_id: Option<&str>,
+        retire_ids: &mut Vec<String>,
+    ) {
+        let now = crate::session_lease::now_epoch_ms() as i64;
+        // Lock order: cli_index -> sessions -> alias_tombstones. All reads
+        // below are synchronous once the guards are held (the std Mutex is
+        // never held across an await).
+        let index = self.cli_index.lock().await;
+        let sessions = self.sessions.lock().await;
+        let mut tombstones = self.alias_tombstones.lock().expect("alias tombstones lock");
+        if let Some(cli_id) = removed_cli_id {
+            if cli_id != map_key && !retire_ids.iter().any(|id| id == cli_id) {
+                retire_ids.push(cli_id.to_string());
+            }
+        }
+        for (durable, mapped) in index.iter() {
+            if mapped == map_key && !retire_ids.iter().any(|id| id == durable) {
+                retire_ids.push(durable.clone());
+            }
+        }
+        for durable in tombstones.durables_for(wire_session_id, now) {
+            // The live-contradiction check: a stale alias tombstone is
+            // followed only when the durable id it names is not now owned by
+            // a DIFFERENT live session. `mk == map_key` is this kill's own
+            // identity (its session entry is gone — removed above, or the
+            // eviction mid-flight took it), so it always retires.
+            let contradicted = match index.get(&durable) {
+                Some(mk) if mk != map_key => sessions.contains_key(mk),
+                _ => false,
+            };
+            if contradicted {
+                tracing::info!(target: "freshell_freshagent::claude",
+                    durable = %durable,
+                    placeholder = %wire_session_id,
+                    "freshagent.claude.stale_alias_tombstone_skipped: the durable is live on \
+                     another session; the old placeholder's close cannot reach it");
+                continue;
+            }
+            if !retire_ids.iter().any(|id| id == &durable) {
+                retire_ids.push(durable);
+            }
+        }
+    }
+
+    /// Retire-on-kill round 3 (focused-ep5-r2 Findings 2+4), the claim
+    /// lifecycle's COMMIT: an explicit resume/attach of a durable id —
+    /// invoked ONLY after the replacement session is established (Finding 5:
+    /// never before, or a failed create would leave the identity unfenced) —
+    /// reopens the identity on every axis at once:
+    ///
+    /// 1. the durable kill tombstone for `durable_id` is cleared, so the
+    ///    claim's own binding write (this lane's `sdk.session.init`
+    ///    adoption) is never suppressed as the killed session's stale orphan;
+    /// 2. every demoted placeholder→durable ALIAS tombstone pointing at
+    ///    `durable_id` is consumed (Finding 2: a later kill naming the OLD
+    ///    pane's placeholder can no longer follow a stale alias record to
+    ///    retire the newly-live row);
+    /// 3. the ledger kill fence of each consumed placeholder alias is
+    ///    cleared too (the reopened identity's every known alias reopens
+    ///    with it);
+    /// 4. the kill-closed ledger ROW returns to Bound (Finding 4:
+    ///    unconditional — the settings-gated adoption write would skip a
+    ///    lineage-only row and leave the live session marked Closed; the
+    ///    revive is deliberately NOT the refresh write's job).
+    ///
+    /// Unconditional by design — idempotent on a never-killed identity —
+    /// warn-logged per step on failure, never a resume blocker. All OTHER
+    /// binding-write lanes (fork children, crash respawns, in-stream
+    /// adoptions) deliberately do NOT commit: none of them claims an
+    /// identity a user just closed.
+    async fn commit_session_claim(&self, durable_id: &str) {
         let Some(sink) = self.identity_sink() else {
             return;
         };
+        let now = crate::session_lease::now_epoch_ms() as i64;
+        let cleared_aliases = self
+            .alias_tombstones
+            .lock()
+            .expect("alias tombstones lock")
+            .clear_for_durable(durable_id, now);
+        if !cleared_aliases.is_empty() {
+            tracing::info!(target: "freshell_freshagent::claude",
+                durable = %durable_id,
+                aliases = ?cleared_aliases,
+                "freshagent.claude.claim_consumed_alias_tombstones: the reopened \
+                 identity can no longer be retired through the old placeholders"
+            );
+        }
         if let Err(e) = sink.clear_kill_tombstone(PROVIDER, durable_id).await {
             tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.kill_tombstone_clear_failed");
+        }
+        for alias in &cleared_aliases {
+            if let Err(e) = sink.clear_kill_tombstone(PROVIDER, alias).await {
+                tracing::warn!(error = %e, session = %alias, "freshagent.claude.alias_kill_tombstone_clear_failed");
+            }
+        }
+        if let Err(e) = sink.revive_closed(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.closed_row_revive_failed");
+        }
+    }
+
+    /// The commit's inverse (retire-on-kill round 3, Finding 5's
+    /// "re-raise/keep" arm): a claim whose lease was REVOKED at completion
+    /// tears its freshly-spawned session back down — the identity is dead
+    /// again, so the close's durable record is restored exactly:
+    /// `retire_closed` re-raises the durable kill fence AND re-retires the
+    /// row the commit revived (idempotent; no bound row re-retires to Ok).
+    /// An older in-flight binding write of the prior epoch is fenced again,
+    /// never a Bound resurrection.
+    async fn rollback_session_claim(&self, durable_id: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        if let Err(e) = sink.retire_closed(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.claude.claim_rollback_failed");
         }
     }
 
@@ -2961,14 +3132,18 @@ impl FreshClaudeState {
             }
         };
 
-        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this attach is a
-        // NEW pane GENUINELY CLAIMING `durable` — clear the kill tombstone
-        // BEFORE the consumer below can run its sdk.session.init adoption
-        // write, so the claim is never suppressed as the killed session's
-        // stale orphan. (Every error return above precedes the claim: no
-        // spawn-sidecar/no-created failure clears a tombstone it never
-        // claimed.)
-        self.clear_kill_tombstone_for(durable).await;
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
+        // 4+5): this attach is a NEW pane GENUINELY CLAIMING `durable` — the
+        // claim COMMITS here: the replacement session is established (sidecar
+        // created + `created` answered), every error return above precedes
+        // the commit (no spawn-sidecar/no-created failure disturbs a fence it
+        // never claimed), the commit still strictly precedes the consumer
+        // below (so its sdk.session.init adoption write is never suppressed
+        // as the killed session's stale orphan), and the commit now also
+        // consumes the stale placeholder alias tombstones pointing at
+        // `durable` (Finding 2) and returns a kill-closed row to Bound
+        // (Finding 4 — unconditional, independent of the settings snapshot).
+        self.commit_session_claim(durable).await;
 
         let session_type = session_type_str(msg.session_type).to_string();
         // Register under the CLIENT's id: the consumer stamps the map key on every
@@ -3039,6 +3214,10 @@ impl FreshClaudeState {
                     let _ = child.start_kill();
                     reap_owned_claude_sidecars(&session.ownership_id);
                 }
+                // Finding 5's re-raise: the ONE post-commit failure arm — the
+                // session is torn back down, so the close the commit undid is
+                // durable again (fence re-raised, the revived row re-retired).
+                self.rollback_session_claim(durable).await;
                 self.evict_cli_index_aliases(&msg.session_id).await; // Finding 1: demote, never drop
                 g.fail(); // own tree torn down -- reopen the key
                 return Err(ResumeClaudeError::Transient(
@@ -6307,6 +6486,482 @@ rl.on('line', (line) => {
             "the claim's own write is never suppressed"
         );
         drop(env);
+    }
+
+    // ── Retire-on-kill round 3 (focused-ep5-r2 Findings 2/3/5 + Finding 4 claude) ──
+
+    fn kill_msg(session_id: &str) -> FreshAgentKill {
+        FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        }
+    }
+
+    /// Bounded-wait until `cli_index[durable] == expected` — the same poll the
+    /// round-1/2 kill tests use to observe the consumer's adoption fold
+    /// without racing it.
+    async fn await_alias(st: &FreshClaudeState, durable: &str, expected: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let present = st
+                .cli_index
+                .lock()
+                .await
+                .get(durable)
+                .is_some_and(|mapped| mapped == expected);
+            if present {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the alias {durable} -> {expected} never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Focused-ep5-r2 Finding 2 (retire-on-kill round 3), THE pin: reopen the
+    /// durable session D, then kill via the OLD pane's placeholder P — the
+    /// live row must SURVIVE. The reopen (the genuine claim) consumes the
+    /// stale P→D alias tombstone (and clears the ledger fence for every known
+    /// alias of D), so the late placeholder-addressed kill retires only the
+    /// placeholder it names.
+    #[tokio::test]
+    async fn reopened_session_survives_a_late_kill_naming_the_old_placeholder() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        // Epoch 1: create + adoption, then the close (bare placeholder — the
+        // real wire shape), which retires D and demotes P1→D to the alias
+        // tombstones.
+        st.handle_create(dedup_create_msg("req-reopen-1"), None).await;
+        let created = await_claude_created(&mut rx, "req-reopen-1").await;
+        let placeholder_old = created["sessionId"].as_str().unwrap().to_string();
+        await_alias(&st, durable, &placeholder_old).await;
+        st.handle_kill(kill_msg(&placeholder_old)).await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), durable.to_string())),
+            "epoch 1 close folded D's fence"
+        );
+
+        // Epoch 2: the genuine claim — resume the SAME durable id (the fake
+        // sidecar echoes resumeSessionId as the cliSessionId).
+        let mut resume = dedup_create_msg("req-reopen-2");
+        resume.resume_session_id = Some(durable.to_string());
+        resume.cwd = Some("/tmp".to_string());
+        st.handle_create(resume, None).await;
+        let recreated = await_claude_created(&mut rx, "req-reopen-2").await;
+        assert_eq!(recreated["type"].as_str().unwrap(), "freshAgent.created");
+        let placeholder_new = recreated["sessionId"].as_str().unwrap().to_string();
+        await_alias(&st, durable, &placeholder_new).await;
+
+        // The late kill naming the OLD placeholder (the finding's shape — a
+        // stale pane closes against its original session id).
+        st.handle_kill(kill_msg(&placeholder_old)).await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert_eq!(
+            retires
+                .iter()
+                .filter(|(p, s)| p == "claude" && s == durable)
+                .count(),
+            1,
+            "the reopened durable must NOT be retired by the old placeholder's kill: {retires:?}"
+        );
+        assert!(
+            retires
+                .iter()
+                .any(|(p, s)| p == "claude" && s == &placeholder_old),
+            "the wire id still retires by name: {retires:?}"
+        );
+        // The claim consumed the stale alias record at reopen time.
+        let now = crate::session_lease::now_epoch_ms() as i64;
+        assert!(
+            st.alias_tombstones
+                .lock()
+                .unwrap()
+                .durables_for(&placeholder_old, now)
+                .is_empty(),
+            "the genuine claim must consume the old placeholder's alias tombstone"
+        );
+        // ...and the ledger fence of the consumed alias was cleared at the
+        // same commit (the reopened identity's every known alias reopens).
+        assert!(
+            fake.tombstone_clears
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), placeholder_old.clone())),
+            "the claim also cleared the old placeholder's own ledger fence"
+        );
+        assert!(
+            fake.revives
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), durable.to_string())),
+            "the claim revived the durable row its close had retired"
+        );
+        drop(env);
+    }
+
+    /// Focused-ep5-r2 Finding 2, the defense-in-depth half: even if a demoted
+    /// P→D alias tombstone somehow SURVIVES the claim's consumption, kill
+    /// handling must not follow it while a DIFFERENT live session owns D
+    /// (live session state contradicts the stale alias).
+    #[tokio::test]
+    async fn a_surviving_alias_tombstone_never_retires_a_durable_a_live_session_claims() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        // A live session owning D under a NEW placeholder (the reopened shape).
+        st.handle_create(dedup_create_msg("req-live-owner"), None).await;
+        let created = await_claude_created(&mut rx, "req-live-owner").await;
+        let placeholder_live = created["sessionId"].as_str().unwrap().to_string();
+        await_alias(&st, durable, &placeholder_live).await;
+
+        // Fabricate the surviving stale record: the OLD epoch's placeholder
+        // demoted to a tombstone that (hypothetically) escaped consumption.
+        let now = crate::session_lease::now_epoch_ms() as i64;
+        st.alias_tombstones
+            .lock()
+            .expect("alias tombstones lock")
+            .record("placeholder-old-epoch", durable, now);
+
+        st.handle_kill(kill_msg("placeholder-old-epoch")).await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("claude".to_string(), "placeholder-old-epoch".to_string())),
+            "the wire id still retires by name: {retires:?}"
+        );
+        assert!(
+            !retires.iter().any(|(_, s)| s == durable),
+            "the stale alias tombstone must not reach a LIVE durable identity: {retires:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-ep5-r2 Finding 3 (retire-on-kill round 3), the exact
+    /// interleaving from the report, constructed deterministically: the
+    /// consumer-exit eviction has removed the session entry but has NOT YET
+    /// demoted its cli_index alias (and no alias tombstone exists yet) when
+    /// the kill lands. The kill must still resolve the durable identity via
+    /// the LIVE alias — consulting only the tombstones misses it (the old
+    /// no-session branch read tombstones alone).
+    #[tokio::test]
+    async fn kill_in_the_exit_eviction_gap_retires_the_durable_via_the_live_alias() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        st.handle_create(dedup_create_msg("req-evict-gap"), None).await;
+        let created = await_claude_created(&mut rx, "req-evict-gap").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        await_alias(&st, durable, &placeholder).await;
+
+        // THE WINDOW: the eviction's first half (sessions-map removal) has
+        // run; its second half (cli_index demotion) has NOT.
+        assert!(
+            st.sessions.lock().await.remove(&placeholder).is_some(),
+            "fixture: remove the session entry exactly like the eviction's first half"
+        );
+        assert!(
+            st.alias_tombstones
+                .lock()
+                .expect("alias tombstones lock")
+                .durables_for(&placeholder, crate::session_lease::now_epoch_ms() as i64)
+                .is_empty(),
+            "fixture: no alias tombstone exists yet either"
+        );
+
+        // The kill lands NOW — inside the eviction gap.
+        st.handle_kill(kill_msg(&placeholder)).await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("claude".to_string(), durable.to_string())),
+            "a kill inside the exit-eviction gap must still resolve the live alias and \
+             retire the durable row: {retires:?}"
+        );
+        drop(env);
+    }
+
+    /// Focused-ep5-r2 Finding 5 (retire-on-kill round 3): the durable kill
+    /// fence is cleared only once the replacement session is ESTABLISHED
+    /// (sidecar created + answered). A resume whose create fails mid-way must
+    /// KEEP the fence — and then an older in-flight binding write (the
+    /// orphan-gate shape, released AFTER the failure) is still fenced instead
+    /// of resurrecting Bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_create_that_fails_midway_keeps_the_fence_and_no_orphan_rebounds_the_row() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        // Arm the orphan gate for D BEFORE the create: the epoch-1 adoption
+        // write detaches (in-flight when the kill lands).
+        let gate = fake.arm_orphan_binding_gate("claude", durable);
+        st.set_identity_sink(fake.clone());
+
+        let mut msg = dedup_create_msg("req-fence-orphan");
+        msg.cwd = Some("/tmp".to_string()); // settings-bearing => the adoption writes
+        st.handle_create(msg, None).await;
+        let created = await_claude_created(&mut rx, "req-fence-orphan").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the adoption write entered (in flight)");
+
+        st.handle_kill(kill_msg(&placeholder)).await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), durable.to_string())),
+            "the kill folded D's fence"
+        );
+
+        // The resume attempt fails MID-WAY: the provider's create dies before
+        // `created` (the fake sidecar's fail knob — the replacement session
+        // is never established).
+        std::env::set_var("FRESHELL_TEST_CLAUDE_FAIL_CREATE", "1");
+        let mut resume = dedup_create_msg("req-fence-resume");
+        resume.resume_session_id = Some(durable.to_string());
+        st.handle_create(resume, None).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let raw = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame arrives")
+                .expect("bus open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.create.failed"
+                && frame["requestId"] == "req-fence-resume"
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the failed resume never answered create.failed: {frame}"
+            );
+        }
+
+        // The orphaned epoch-1 write lands NOW — against whatever fence state
+        // the failed resume left behind.
+        gate.release.send(()).expect("release the orphan write");
+        gate.applied
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the detached apply ran");
+
+        assert!(
+            fake.suppressed
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), durable.to_string())),
+            "the fence must OUTLIVE the failed resume — the orphan stays fenced; \
+             clears={:?}",
+            fake.tombstone_clears.lock().unwrap()
+        );
+        // The pin is "no Bound resurrection": the gated epoch-1 write is the
+        // ONLY binding attempt this lane ever ran, so the durable's row never
+        // reached Bound on the fake's state map at all — the fence held from
+        // kill through failed resume through orphan release.
+        assert_ne!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), durable.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "no Bound resurrection after a mid-way-failed resume"
+        );
+        drop(env);
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), the claude attach
+    /// lane: a kill-closed, LINEAGE-ONLY row (load_settings answers None, so
+    /// the settings-gated adoption writes nothing) must still return to Bound
+    /// on a successful attach — the claim records the row live-again
+    /// unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_of_a_killed_lineage_only_session_revives_the_closed_row() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The lineage-only seed: a binding row exists, with an all-blank
+        // settings snapshot (load_settings answers None).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: DURABLE.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage seed write");
+        state.set_identity_sink(fake.clone());
+        assert!(
+            fake.load_settings("claude", DURABLE).is_none(),
+            "fixture: the lineage-only row answers no settings snapshot"
+        );
+
+        // The close: row Closed + fence (the evicted-id arm — no session is
+        // tracked; the row is durable).
+        state.handle_kill(kill_msg(DURABLE)).await;
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), DURABLE.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "fixture: the kill closed the row"
+        );
+
+        // The attach (conn-less): resume succeeds; the row must be Bound
+        // again even though no settings-bearing adoption write ever runs.
+        state
+            .handle_attach(attach_msg_with_resume("client-lineage-attach", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), DURABLE.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "a successful attach must return the kill-closed row to Bound \
+             (bindings log: {:?})",
+            fake.bindings.lock().unwrap()
+        );
+        assert!(
+            fake.revives
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), DURABLE.to_string())),
+            "the claim's revive fired even though no settings snapshot exists"
+        );
+        drop(env);
+    }
+
+    /// The claim lifecycle pair at helper level (retire-on-kill round 3,
+    /// Findings 2+4+5): `commit_session_claim` clears BOTH fence kinds (the
+    /// durable ledger fence AND every demoted alias tombstone pointing at
+    /// the durable, whose own ledger fences go too) and revives the closed
+    /// row; `rollback_session_claim` restores the close exactly (fence
+    /// re-raised, the revived row re-retired Closed).
+    #[tokio::test]
+    async fn commit_session_claim_clears_every_fence_and_revives_rollback_re_raises_all_of_it() {
+        let (st, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        // The closed epoch: a Bound row, killed; the alias demoted (as a
+        // post-eviction close would leave it).
+        fake.seed(
+            "claude",
+            durable,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        st.handle_kill(kill_msg(durable)).await;
+        let now = crate::session_lease::now_epoch_ms() as i64;
+        st.alias_tombstones
+            .lock()
+            .expect("alias tombstones lock")
+            .record("placeholder-old", durable, now);
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), durable.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed)
+        );
+
+        st.commit_session_claim(durable).await;
+        assert!(
+            !fake
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), durable.to_string())),
+            "the durable ledger fence is cleared"
+        );
+        assert!(
+            !fake
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), "placeholder-old".to_string())),
+            "the consumed alias's ledger fence is cleared too"
+        );
+        assert!(
+            st.alias_tombstones
+                .lock()
+                .expect("alias tombstones lock")
+                .durables_for("placeholder-old", now)
+                .is_empty(),
+            "the alias tombstone is consumed"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), durable.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "the closed row revived"
+        );
+
+        // The rollback (Finding 5's re-raise): the close is durable again.
+        st.rollback_session_claim(durable).await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), durable.to_string())),
+            "the fence is re-raised"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), durable.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the revived row is re-retired"
+        );
     }
 
     // ── freshAgent.approval.respond / question.respond / compact (Task 2) ─────────

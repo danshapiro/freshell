@@ -3259,6 +3259,115 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
     assert_eq!(entry["tabKey"], "dev1:t9");
 }
 
+/// Focused-ep5-r2 Finding 1 (retire-on-kill round 3), the route-level pin the
+/// finding demands: `retire_closed`'s two durable writes (kill tombstone,
+/// then row retire) can split across a crash or a failed second write. The
+/// surviving UNEXPIRED tombstone is the author of truth — the inventory must
+/// treat the still-Bound row it dominates as Retired and never offer it.
+/// (Reload included: the fresh ledger over the seeded root loads the remnant
+/// exactly as a restarted server would.)
+#[tokio::test]
+async fn route_never_offers_a_bound_row_whose_kill_tombstone_survived_its_retire_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = now_ms_u64();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        now - 10_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":now - 10_000,
+             "paneCount":1,"panes":[{"paneId":"pj","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    let seed_bound = |session_id: &str| {
+        std::fs::write(
+            broot.join("bindings").join("claude").join(format!("{session_id}.json")),
+            serde_json::to_vec(&json!({
+                "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
+                "cwd": "/w", "createdAt": now - 10_000, "updatedAt": now - 10_000,
+                "lastObservedAt": now - 10_000, "state": "bound",
+                "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+                "lastAttributedAt": now - 10_000
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    // Both rows satisfy EVERY D8 clause (the S2 control proves the fixture
+    // would offer S1 absent the tombstone).
+    seed_bound("S1-killed");
+    seed_bound("S2-survivor");
+    // THE REMNANT: S1's tombstone landed (durably) and its row retire never
+    // did — exactly the finding's split-writes shape.
+    std::fs::create_dir_all(broot.join("kill-tombstones").join("claude")).unwrap();
+    std::fs::write(
+        broot.join("kill-tombstones").join("claude").join("S1-killed.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": "S1-killed",
+            "killedAtMs": now
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let only = body["ledgerOnly"].as_array().unwrap();
+    assert!(
+        !only.iter().any(|e| e["sessionId"] == "S1-killed"),
+        "a Bound row dominated by a surviving kill tombstone must read as Retired (got {body})"
+    );
+    assert!(
+        only.iter().any(|e| e["sessionId"] == "S2-survivor"),
+        "the plain Bound control row stays offered (the fixture discriminates): {body}"
+    );
+}
+
+/// Focused-ep5-r2 Finding 1: the dominance transform's exact contract —
+/// ONLY a Bound row whose identity the caller's fresh-tombstone set names
+/// becomes Retired(Closed); everything else passes through untouched
+/// (already-retired rows keep their verdict, untombstoned Bound rows stay
+/// Bound). Row field preservation beyond the state pair is verbatim.
+#[test]
+fn kill_tombstone_dominance_rewrites_only_fresh_tombstoned_bound_rows() {
+    let fresh: HashSet<(String, String)> = [("claude".to_string(), "S-killed".to_string())]
+        .into_iter()
+        .collect();
+    let mut killed = binding_row_at("claude", "S-killed", bound(), 1_000);
+    killed.model = Some("opus".into());
+    let plain = binding_row_at("claude", "S-plain", bound(), 1_000);
+    let already = binding_row_at("claude", "S-retired", retired_gc_expired(), 1_000);
+    let out = apply_kill_tombstone_dominance(vec![killed, plain, already], &fresh);
+    assert_eq!(out[0].state, RowState::Retired);
+    assert_eq!(out[0].retired_reason, Some(RetiredReason::Closed));
+    assert_eq!(out[0].model.as_deref(), Some("opus"), "payload preserved");
+    assert_eq!(
+        out[0].updated_at, 1_000,
+        "the read-side transform never re-stamps row keeping"
+    );
+    assert_eq!(out[1].state, RowState::Bound, "untombstoned Bound untouched");
+    assert_eq!(
+        out[2].retired_reason,
+        Some(RetiredReason::GcExpired),
+        "an already-retired row keeps its own verdict"
+    );
+    // An empty fresh set is identity.
+    let plain2 = binding_row_at("claude", "S-plain", bound(), 1_000);
+    let out = apply_kill_tombstone_dominance(vec![plain2], &HashSet::new());
+    assert_eq!(out[0].state, RowState::Bound);
+}
+
 #[tokio::test]
 async fn route_correlates_a_late_bound_row_onto_its_ref_less_snapshot_pane() {
     // Focused-ep3 end-to-end JSON contract — the duplicate-restore shape the

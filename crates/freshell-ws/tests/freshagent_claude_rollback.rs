@@ -375,6 +375,19 @@ impl PaneIdentitySink for TestLedgerSink {
                 .map_err(std::io::Error::other)?
         })
     }
+
+    // Focused-ep5-r2 Finding 4: same real-ledger pass-through shape.
+    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.revive_closed(&p, &s, TestLedgerSink::now_ms()).map(|_| ())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
 }
 
 fn test_settings_value() -> Value {

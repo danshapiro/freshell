@@ -299,6 +299,20 @@ pub trait PaneIdentitySink: Send + Sync {
     /// non-rollback lane (failures surface as `Err` for the caller to
     /// warn-log, never a resume blocker).
     fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite;
+    /// The claim lifecycle's ROW-side transition (focused-ep5-r2 Finding 4,
+    /// retire-on-kill round 3): a SUCCESSFUL attach/resume records the row
+    /// live-again — a row the kill retired `Closed` moves back to Bound. The
+    /// claim lanes call this ONLY after the replacement session is
+    /// established, regardless of what the settings-based refresh lane knows
+    /// (a lineage-only row's refresh write is V7-gated away, and the row once
+    /// stayed Closed forever while the live session ran — the recovery
+    /// inventory then omitted a genuinely open session). Narrow by
+    /// construction: only Retired(Closed) rows revive, a missing row is a
+    /// no-op (never-recorded identities gain no row), and the kill tombstone
+    /// is never consulted (the claim clears it first). Awaited like every
+    /// non-rollback lane; failures surface as `Err` for the caller to
+    /// warn-log, never a resume blocker.
+    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -346,6 +360,14 @@ pub(crate) struct FakeIdentitySink {
     /// recorded here (never in `bindings`) so tests assert the suppression
     /// positively instead of inferring it from absence.
     pub suppressed: std::sync::Mutex<Vec<(String, String)>>,
+    /// Retire-on-kill round 3: the row's CURRENT state per identity (see
+    /// [`FakeRowState`]). Keyed only by identities a binding write ever
+    /// landed for — the real "missing row" answer for anything else.
+    pub states:
+        std::sync::Mutex<std::collections::HashMap<(String, String), FakeRowState>>,
+    /// Every `revive_closed` call (the claim lanes' row-side lifecycle
+    /// transition), in order, whether or not a Closed row existed.
+    pub revives: std::sync::Mutex<Vec<(String, String)>>,
     /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
     /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
     /// through [`RollbackRecord::from_stored_payload`] exactly like the real
@@ -363,9 +385,22 @@ pub(crate) struct FakeIdentitySink {
     self_weak: std::sync::Mutex<std::sync::Weak<FakeIdentitySink>>,
 }
 
-/// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
-#[cfg(test)]
-struct OrphanBindingGate {
+    /// Retire-on-kill round 3: the fake's ROW-STATE model (the in-memory twin
+    /// of the real ledger's `state`/`retired_reason` columns), so kill/claim
+    /// lanes can be pinned on "the row ends Retired(Closed), never Bound"
+    /// instead of on call traces. `record_binding` produces a Bound row;
+    /// `retire_closed` flips a Bound row to Closed (a missing or
+    /// already-retired row is unaffected — the real retire's no-op shape).
+    #[cfg(test)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FakeRowState {
+        Bound,
+        Closed,
+    }
+
+    /// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
+    #[cfg(test)]
+    struct OrphanBindingGate {
     /// The (provider, session_id) key this gate intercepts.
     key: (String, String),
     /// Signaled when `record_binding` was INVOKED for the key (the
@@ -394,6 +429,12 @@ pub(crate) struct OrphanGateHandles {
 impl FakeIdentitySink {
     #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10 tests)
     pub fn seed(&self, provider: &str, session_id: &str, s: FreshAgentSettings) {
+        // A seed mirrors a real binding write: the row is Bound (the round-3
+        // states map gets the same answer `apply_binding_mutations` gives).
+        self.states
+            .lock()
+            .unwrap()
+            .insert((provider.into(), session_id.into()), FakeRowState::Bound);
         // A seed mirrors a real binding write: the lineage row lands on the
         // `bindings` log, and the key counts as "recorded" only when the
         // snapshot is settings-bearing (Task 3 keying).
@@ -512,6 +553,12 @@ impl FakeIdentitySink {
     #[cfg(test)]
     fn apply_binding_mutations(&self, upsert: FreshAgentBindingUpsert) {
         let key = (upsert.provider.clone(), upsert.session_id.clone());
+        // Retire-on-kill round 3 row-state mirror: the ledger's fresh-agent
+        // upsert is unconditionally Bound — a landed write resurrects the row.
+        self.states
+            .lock()
+            .unwrap()
+            .insert(key.clone(), FakeRowState::Bound);
         // Task 3 keying (mirrors `PaneLedger::fresh_agent_settings_recorded`
         // and the ledger sink's `load_settings` blank guard): settings are
         // a FULL snapshot (replace), so a blank snapshot REPLACES any prior
@@ -728,6 +775,12 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .lock()
                 .unwrap()
                 .insert((provider.into(), session_id.into()));
+            // Retire-on-kill round 3 row-state mirror: a Bound row retires
+            // Closed; a missing or already-retired row is unaffected.
+            let mut states = self.states.lock().unwrap();
+            if states.get(&(provider.into(), session_id.into())) == Some(&FakeRowState::Bound) {
+                states.insert((provider.into(), session_id.into()), FakeRowState::Closed);
+            }
         }
         self.write_result()
     }
@@ -741,6 +794,21 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .lock()
                 .unwrap()
                 .remove(&(provider.into(), session_id.into()));
+        }
+        self.write_result()
+    }
+    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.revives
+                .lock()
+                .unwrap()
+                .push((provider.into(), session_id.into()));
+            // The real-ledger mirror: ONLY a Retired(Closed) row revives; a
+            // missing row is a no-op (never-recorded identities gain none).
+            let mut states = self.states.lock().unwrap();
+            if states.get(&(provider.into(), session_id.into())) == Some(&FakeRowState::Closed) {
+                states.insert((provider.into(), session_id.into()), FakeRowState::Bound);
+            }
         }
         self.write_result()
     }

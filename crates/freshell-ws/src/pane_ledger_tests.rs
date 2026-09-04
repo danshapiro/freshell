@@ -3784,3 +3784,247 @@ fn record_vs_retire_closed_converges_to_never_bound_under_concurrent_interleavin
         std::fs::remove_dir_all(&root).ok();
     }
 }
+
+// ── Focused-ep5-r2 Finding 1 (retire-on-kill round 3) — tombstone dominance ──
+//
+// `retire_closed` is TWO durable writes (tombstone, then row retire). A crash
+// (or a failed second write) between them leaves a surviving tombstone next
+// to a still-Bound row. The tombstone is the author of truth: a fresh one
+// DOMINATES the row, and the boot/periodic sweep re-applies the lost
+// retirement durably. Pin domain: the hand-crafted remnant survives a
+// reload; the sweep must then converge the ROW to Retired(Closed).
+
+/// Hand-craft the crash remnant (the pattern
+/// `a_bound_row_with_a_tombstone_is_force_retired_by_the_next_write_attempt`
+/// established): the Bound row exists and its tombstone file is down, but the
+/// row's retire write never landed. Written AFTER the constructing load, so
+/// the caller reloads a fresh ledger to get the post-restart index state.
+fn hand_craft_remnant(root: &std::path::Path, provider: &str, session_id: &str, killed_at: i64) {
+    let tombstone = KillTombstone {
+        ledger_version: LEDGER_VERSION,
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        killed_at_ms: killed_at,
+    };
+    write_row_atomic(
+        &PaneLedger::kill_tombstone_path(root, provider, session_id),
+        &tombstone,
+    )
+    .unwrap();
+}
+
+#[test]
+fn boot_scan_retires_a_bound_row_dominated_by_a_fresh_kill_tombstone() {
+    let root = temp_root("tombstone-dominance-boot");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "remnant-boot", 1_000))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "expired-boot", 1_000))
+        .unwrap();
+    // FRESH tombstone on the remnant row; the twin's tombstone is already
+    // past the TTL at scan time (the dominance ends with the TTL).
+    let now = 21_701_000;
+    hand_craft_remnant(&root, "claude", "remnant-boot", now - 1_000);
+    hand_craft_remnant(&root, "claude", "expired-boot", 10_000);
+    // A fresh boot loads the remnant as-is: Bound row + its tombstone.
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger2.load_binding("claude", "remnant-boot").unwrap().state,
+        RowState::Bound,
+        "fixture: the crash remnant loads Bound"
+    );
+    assert_eq!(
+        ledger2.kill_tombstone_at("claude", "remnant-boot"),
+        Some(now - 1_000)
+    );
+
+    ledger2.boot_scan(now, &never_absent);
+    let row = ledger2.load_binding("claude", "remnant-boot").unwrap();
+    assert_eq!(
+        row.state,
+        RowState::Retired,
+        "the boot scan re-applies the retirement the crash lost: a fresh tombstone dominates"
+    );
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    // The repair is DURABLE — a fresh reload agrees (not an in-memory read patch).
+    let ledger3 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger3.load_binding("claude", "remnant-boot").unwrap().state,
+        RowState::Retired,
+        "the boot-scan repair is durable on disk"
+    );
+
+    // The expired-tombstone twin stays untouched: no dominance past the TTL.
+    assert_eq!(
+        ledger2.load_binding("claude", "expired-boot").unwrap().state,
+        RowState::Bound,
+        "an expired tombstone never retires a Bound row"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn periodic_gc_retires_a_bound_row_dominated_by_a_fresh_kill_tombstone() {
+    let root = temp_root("tombstone-dominance-gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "remnant-gc", 1_000))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "expired-gc", 1_000))
+        .unwrap();
+    let now = 21_701_000;
+    hand_craft_remnant(&root, "claude", "remnant-gc", now - 1_000);
+    hand_craft_remnant(&root, "claude", "expired-gc", 10_000);
+    // The process-lived-on shape: a FRESH load would also see this, but the
+    // periodic pass must converge the truth on the long-lived ledger too —
+    // construct the successor view (the post-crash restart index) and sweep
+    // that: identical re-read discipline, one helper for both schedules.
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+
+    let report = ledger2.gc(now, &never_absent, None);
+    let row = ledger2.load_binding("claude", "remnant-gc").unwrap();
+    assert_eq!(
+        row.state,
+        RowState::Retired,
+        "the periodic sweep re-applies the retirement the failed second write lost"
+    );
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    let ledger3 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger3.load_binding("claude", "remnant-gc").unwrap().state,
+        RowState::Retired,
+        "the periodic repair is durable on disk"
+    );
+    assert!(
+        report
+            .kill_tombstone_enforced_retires
+            .iter()
+            .any(|l| l.provider == "claude" && l.session_id == "remnant-gc"),
+        "the re-applied retirement is loudly reported: {:?}",
+        report.kill_tombstone_enforced_retires
+    );
+    assert!(
+        report
+            .kill_tombstones_swept
+            .iter()
+            .all(|l| !(l.provider == "claude" && l.session_id == "remnant-gc")),
+        "the dominating tombstone is FRESH — never swept by the same pass"
+    );
+
+    // The expired-tombstone twin is untouched by the dominance rule (its own
+    // tombstone sweep still applies over the same pass).
+    assert_eq!(
+        ledger2.load_binding("claude", "expired-gc").unwrap().state,
+        RowState::Bound,
+        "an expired tombstone never retires a Bound row"
+    );
+    assert_eq!(
+        ledger2.load_binding("claude", "expired-gc").unwrap().state,
+        RowState::Bound
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ── Focused-ep5-r2 Findings 1+4 (retire-on-kill round 3) — read surface and revive ──
+
+#[test]
+fn fresh_kill_tombstone_keys_partitions_by_freshness() {
+    let root = temp_root("kill-tombstone-keys");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger.retire_closed("claude", "fresh-a", 10_000).unwrap();
+    ledger.retire_closed("codex", "fresh-b", 10_000).unwrap();
+    let keys = ledger.fresh_kill_tombstone_keys(11_000);
+    assert!(keys.contains(&("claude".to_string(), "fresh-a".to_string())));
+    assert!(keys.contains(&("codex".to_string(), "fresh-b".to_string())));
+    // Past the TTL those drop out; a tombstone killed only 1s before the
+    // read is still inside its protective window.
+    let t3 = 10_000 + KILL_TOMBSTONE_TTL_MS + 59_000;
+    ledger.retire_closed("claude", "fresh-later", t3).unwrap();
+    let later = 10_000 + KILL_TOMBSTONE_TTL_MS + 60_000;
+    let keys = ledger.fresh_kill_tombstone_keys(later);
+    assert_eq!(
+        keys.into_iter().collect::<Vec<_>>(),
+        vec![("claude".to_string(), "fresh-later".to_string())],
+        "only the still-fresh tombstone dominates"
+    );
+    // A disabled ledger answers empty (never an error).
+    assert!(PaneLedger::disabled().fresh_kill_tombstone_keys(later).is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The claim lifecycle's ROW-side transition (Finding 4): ONLY a row the kill
+/// retired `Closed` revives to Bound — a missing row gains nothing (never a
+/// laundered row for a never-recorded identity), and Superseded /
+/// SessionMissing / GcExpired verdicts are never rewritten by a claim. A flip
+/// is durable (reload agrees) and preserves the row's fields.
+#[test]
+fn revive_closed_returns_only_kill_closed_rows_to_bound() {
+    let root = temp_root("revive-closed");
+    let ledger = PaneLedger::new(Some(root.clone()));
+
+    // Closed ⇒ Bound (the claim case).
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "revive-c", 9_000))
+        .unwrap();
+    ledger.retire_closed("claude", "revive-c", 10_000).unwrap();
+    assert!(ledger.revive_closed("claude", "revive-c", 11_000).unwrap());
+    let row = ledger.load_binding("claude", "revive-c").unwrap();
+    assert_eq!(row.state, RowState::Bound);
+    assert_eq!(row.retired_reason, None);
+    assert_eq!(row.updated_at, 11_000);
+    assert_eq!(row.last_observed_at, 11_000);
+    assert_eq!(
+        row.created_at, 9_000,
+        "the row's own keeping is preserved through the flip"
+    );
+    // Durable: a fresh reload agrees.
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger2.load_binding("claude", "revive-c").unwrap().state,
+        RowState::Bound,
+        "the revive is durable on disk"
+    );
+    // Idempotent: a second revive of an already-Bound row is a no-op.
+    assert!(!ledger2.revive_closed("claude", "revive-c", 12_000).unwrap());
+    assert_eq!(ledger2.load_binding("claude", "revive-c").unwrap().updated_at, 11_000);
+
+    // Missing row: no-op, no row created (V7's no-laundering intact).
+    assert!(!ledger.revive_closed("claude", "never-existed", 11_000).unwrap());
+    assert!(ledger.load_binding("claude", "never-existed").is_none());
+
+    // SessionMissing: never revived.
+    ledger
+        .record_binding(&write("amplifier", "sid-m", "t1", 1_000))
+        .unwrap();
+    assert!(ledger.retire_missing("amplifier", "sid-m"));
+    assert!(!ledger.revive_closed("amplifier", "sid-m", 11_000).unwrap());
+    assert_eq!(
+        ledger.load_binding("amplifier", "sid-m").unwrap().retired_reason,
+        Some(RetiredReason::SessionMissing)
+    );
+
+    // Superseded: chain linkage untouched.
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "parent-s", 9_000))
+        .unwrap();
+    let mut child = fa_write("claude", "child-s", 9_100);
+    child.supersedes = Some("parent-s");
+    ledger.record_fresh_agent_binding(&child).unwrap();
+    assert_eq!(
+        ledger.load_binding("claude", "parent-s").unwrap().retired_reason,
+        Some(RetiredReason::Superseded)
+    );
+    assert!(!ledger.revive_closed("claude", "parent-s", 11_000).unwrap());
+    assert_eq!(
+        ledger.load_binding("claude", "parent-s").unwrap().state,
+        RowState::Retired,
+        "a superseded row is never revived back over its chain"
+    );
+
+    // Disabled ledger: a polite no-op.
+    assert!(!PaneLedger::disabled().revive_closed("claude", "x", 1).unwrap());
+    std::fs::remove_dir_all(&root).ok();
+}

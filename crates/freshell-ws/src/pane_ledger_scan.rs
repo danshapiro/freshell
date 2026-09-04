@@ -45,6 +45,10 @@ pub struct BootScanReport {
     pub tombstones_deleted: Vec<SessionLocator>,
     /// Focused-ep5-r1 Finding 2: expired kill tombstones swept this pass.
     pub kill_tombstones_swept: Vec<SessionLocator>,
+    /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3): still-Bound rows a
+    /// FRESH kill tombstone dominated — the split-write crash remnant's
+    /// retirement re-applied durably this pass.
+    pub kill_tombstone_enforced_retires: Vec<SessionLocator>,
 }
 
 impl PaneLedger {
@@ -188,6 +192,7 @@ impl PaneLedger {
         report.gc_tombstoned = gc_report.gc_tombstoned;
         report.tombstones_deleted = gc_report.tombstones_deleted;
         report.kill_tombstones_swept = gc_report.kill_tombstones_swept;
+        report.kill_tombstone_enforced_retires = gc_report.kill_tombstone_enforced_retires;
         report
     }
 
@@ -419,6 +424,18 @@ impl PaneLedger {
     /// guard acquisition is re-evaluated against its CURRENT state (e.g. a
     /// re-bound row with a fresh `last_observed_at` no longer qualifies and
     /// is skipped).
+    ///
+    /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3): the kill-tombstone
+    /// dominance rule's DURABLE convergence lives here (boot scan AND the
+    /// periodic pass share this helper): a Bound row whose identity carries a
+    /// FRESH kill tombstone is the split-write crash remnant
+    /// (`retire_closed`'s tombstone landed; its row retire never did) — the
+    /// tombstone is the author of truth, so the row is retired Closed NOW,
+    /// durably. The re-read discipline covers the claim-lane interleaving by
+    /// construction: under THIS guard instant a fresh tombstone and a Bound
+    /// row genuinely coexist, so retiring can never undo a claim that
+    /// already cleared the fence (cleared tombstone ⇒ the check misses) and
+    /// a later claim's clear+revive simply lands after.
     fn gc_row_locked(
         &self,
         root: &Path,
@@ -437,6 +454,38 @@ impl PaneLedger {
         };
         match row.state {
             RowState::Bound => {
+                if let Some(killed_at) = index.kill_tombstones.get(key).copied() {
+                    if kill_tombstone_is_fresh(killed_at, now_ms) {
+                        row.state = RowState::Retired;
+                        row.retired_reason = Some(RetiredReason::Closed);
+                        row.updated_at = now_ms;
+                        match self.write_binding(root, index, &row) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %sref.provider,
+                                    session_id = %sref.session_id,
+                                    killed_at_ms = killed_at,
+                                    "pane_ledger_kill_tombstone_dominates_row: re-applied the \
+                                     retirement the split-write crash window lost"
+                                );
+                                report.kill_tombstone_enforced_retires.push(sref);
+                            }
+                            Err(err) => {
+                                // Fail loud, never silent: the row stays
+                                // Bound on disk; the next sweep retries.
+                                tracing::error!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %sref.provider,
+                                    session_id = %sref.session_id,
+                                    error = %err,
+                                    "pane_ledger_kill_tombstone_dominance_failed: retire write failed; row left bound"
+                                );
+                            }
+                        }
+                        return;
+                    }
+                }
                 if now_ms - row.last_observed_at > BOUND_GC_TTL_MS {
                     row.state = RowState::Retired;
                     row.retired_reason = Some(RetiredReason::GcExpired);

@@ -471,21 +471,29 @@ impl FreshOpencodeState {
         }
     }
 
-    /// Retire-on-kill round 2 (focused-ep5-r1 Finding 2), the tombstone
-    /// lifecycle's CLEAR transition: an explicit resume/attach of a durable
-    /// `ses_*` id is a NEW pane GENUINELY CLAIMING that identity, so the kill
-    /// tombstone the close recorded is cleared BEFORE the claim's own binding
-    /// writes can be mistaken for the killed session's orphaned write and
-    /// suppressed. Unconditional by design — idempotent on a never-killed
-    /// identity — warn-logged on failure, never a resume blocker. The
-    /// first-send materialization lane never clears: its `ses_*` id is
-    /// freshly minted server-side (never tombstoned).
-    async fn clear_kill_tombstone_for(&self, durable_id: &str) {
+    /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
+    /// the claim lifecycle's COMMIT: an explicit resume/attach of a durable
+    /// `ses_*` id is a NEW pane GENUINELY CLAIMING that identity — invoked
+    /// only once the rebuilt session is registered (the replacement session
+    /// is established) — clearing the durable kill fence BEFORE the claim's
+    /// own binding writes can be mistaken for the killed session's orphaned
+    /// write and suppressed, AND returning a kill-closed ledger row to Bound
+    /// (Finding 4: unconditional — the V7-gated refresh write below skips a
+    /// lineage-only record for a conn-less attach, and the row once stayed
+    /// Closed while the live session ran, so the next recovery omitted a
+    /// genuinely open session). Unconditional by design — idempotent on a
+    /// never-killed identity — warn-logged on failure, never a resume
+    /// blocker. The first-send materialization lane never commits: its
+    /// `ses_*` id is freshly minted server-side (never tombstoned).
+    async fn commit_session_claim(&self, durable_id: &str) {
         let Some(sink) = self.identity_sink() else {
             return;
         };
         if let Err(e) = sink.clear_kill_tombstone(PROVIDER, durable_id).await {
             tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.kill_tombstone_clear_failed");
+        }
+        if let Err(e) = sink.revive_closed(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.closed_row_revive_failed");
         }
     }
 
@@ -2719,14 +2727,18 @@ impl FreshOpencodeState {
             lease_guard.fail();
         }
 
-        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this resume/attach
-        // GENUINELY CLAIMS the durable session — clear the kill tombstone the
-        // close recorded BEFORE any binding write of this rebuilt session (the
-        // refresh below AND every later per-send refresh), so the claim is
-        // never suppressed as the killed session's stale orphan. Idempotent
-        // (a never-killed id clears to Ok), warn-only on failure — never a
-        // resume blocker.
-        self.clear_kill_tombstone_for(session_id).await;
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding
+        // 4): this resume/attach GENUINELY CLAIMS the durable session — the
+        // claim COMMITS here (the rebuilt session is registered, the lease
+        // resolution is final): clear the durable kill fence BEFORE any
+        // binding write of this rebuilt session (the refresh below AND every
+        // later per-send refresh), so the claim is never suppressed as the
+        // killed session's stale orphan, AND return a kill-closed row to
+        // Bound now — the refresh write below is V7-gated on a recovered
+        // settings snapshot / connection provenance, so a lineage-only row
+        // attached conn-less would otherwise stay Closed while the session
+        // runs live (the finding).
+        self.commit_session_claim(session_id).await;
 
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
         // (durable-before-answer). The SETTINGS payload rides only when a record was
@@ -4725,6 +4737,99 @@ mod tests {
         assert!(
             !saw_settings_reset,
             "a lineage-only row must never arm SETTINGS_RESET on resume"
+        );
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), the headline shape
+    /// (`opencode_ws.rs` resume lane): a kill-closed, LINEAGE-ONLY row plus a
+    /// CONN-LESS attach — `load_settings` answers None and no connection
+    /// provenance exists, so the conditional refresh write is skipped and the
+    /// row once stayed Closed forever. A successful attach must record the
+    /// row live-again regardless: Bound again, fence cleared, and STILL no
+    /// laundered settings write (V7 untouched — revive is not a settings
+    /// concern).
+    #[tokio::test]
+    async fn attach_of_a_killed_lineage_only_session_revives_the_row_without_a_settings_write() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The lineage-only seed (blank settings — same construction the Task 3
+        // keying test uses).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-lineage-killed".into()),
+            resolves_pending: Some("freshopencode-cr-lineage-killed".into()),
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage seed write");
+        state.set_identity_sink(fake.clone());
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "fixture: lineage-only — the refresh gate's skip case"
+        );
+
+        // The close: row Closed + fence (the evicted-becomes-live arm is the
+        // durable serve session the local map never tracked — retired by name).
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "fixture: the kill closed the row"
+        );
+
+        // The conn-less attach: the resume rebuilds the live session; the
+        // row must follow it back to Bound.
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "a successful attach must return the kill-closed row to Bound"
+        );
+        assert!(
+            fake.tombstone_clears
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim cleared the fence"
+        );
+        assert!(
+            fake.revives
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim's revive fired even though the conditional refresh write was skipped"
+        );
+        // The V7 gate held: the ONLY bindings entry for the session is the
+        // lineage seed — no laundered defaults row was written by the resume.
+        assert_eq!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+                .count(),
+            1,
+            "no laundered settings write for the lineage-only attach"
         );
     }
 

@@ -23,7 +23,7 @@
 //!   `rollback/<enc(provider)>/<enc(sessionId)>.json`.
 //! * **Kill tombstones** (focused-ep5-r1 Finding 2, retire-on-kill round 2) —
 //!   the durable record that an explicit close (`retire_closed`) happened for
-//!   a `(provider, sessionId)` identity, consulted ONLY by
+//!   a `(provider, sessionId)` identity, consulted by
 //!   [`PaneLedger::record_fresh_agent_binding`] (a fresh one suppresses the
 //!   late in-flight write that would otherwise resurrect a Bound row the kill
 //!   just retired; an expired one is swept). TTL'd
@@ -31,6 +31,19 @@
 //!   [`PaneLedger::clear_kill_tombstone`] on a genuine claim (explicit
 //!   resume/attach). Layout:
 //!   `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
+//!
+//!   Retire-on-kill round 3 (focused-ep5-r2): the tombstone is THE AUTHOR OF
+//!   TRUTH for the identity's closedness — `retire_closed`'s two durable
+//!   writes (tombstone, then row retire) can split across a crash or a failed
+//!   second write, so a fresh tombstone DOMINATES a still-Bound row by ONE
+//!   rule enforced twice: the boot/periodic sweep re-applies the retirement
+//!   durably ([`PaneLedger::gc`]'s per-row pass;
+//!   `BootScanReport::kill_tombstone_enforced_retires`), and the recovery
+//!   inventory reads a dominated row as Retired at offer-build time (via
+//!   [`PaneLedger::fresh_kill_tombstone_keys`]). The claim lifecycle's row
+//!   side is [`PaneLedger::revive_closed`]: a successful resume/attach
+//!   returns a kill-closed row to Bound (Closed-only; never creates a row),
+//!   invoked by the provider claim lanes together with the tombstone clear.
 //!
 //! Deliberately NOT stored: scrollback (own store, P2.19), transcripts
 //! (provider-owned), layout (client-owned). NOT keyed on `createRequestId`
@@ -119,11 +132,13 @@ pub const KILL_TOMBSTONE_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 /// Deliberately a separate subtree from binding rows (NOT a row state): the
 /// tombstone must fence identities whose row does NOT EXIST YET (the kill
 /// beat the in-flight adoption write), which a row-state marker can never
-/// express. Nothing else reads this subtree — the recovery inventory scans
-/// binding rows only, and the terminal-lineage binder (`record_binding` /
-/// `resolve_pending`) deliberately does not consult it (a terminal kill's
-/// own resume lanes must rebind freely; see the audit table in
-/// usual-sdd/retire-on-kill-r2-fix-report.md).
+/// express. The terminal-lineage binder (`record_binding` / `resolve_pending`)
+/// deliberately does not consult it (a terminal kill's own resume lanes must
+/// rebind freely). Round 3 (focused-ep5-r2) widened the READER set under one
+/// rule — a fresh tombstone means the identity is Closed — to the row
+/// sweep's dominance repair (`gc_row_locked`) and the recovery inventory's
+/// offer-time read ([`PaneLedger::fresh_kill_tombstone_keys`]); see the audit
+/// table in usual-sdd/retire-on-kill-r3-fix-report.md.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KillTombstone {
@@ -1292,6 +1307,32 @@ impl PaneLedger {
             .copied()
     }
 
+    /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3): the identities
+    /// whose kill tombstone is still INSIDE its protective TTL at `now_ms` —
+    /// the read-side dominance input. The recovery inventory treats a Bound
+    /// row whose identity appears here as Retired (the surviving tombstone
+    /// dominates the row the crash-window split-write left Bound), and the
+    /// boot/periodic sweep re-applies that retirement durably — ONE rule (a
+    /// fresh kill tombstone means the identity is Closed), enforced at the
+    /// offer read and converged by the sweeps. Memory-only (V1.md read
+    /// policy); expired tombstones are NOT included (their dominance ended
+    /// with the TTL; the sweep owns their deletion). A disabled ledger
+    /// answers empty.
+    pub fn fresh_kill_tombstone_keys(
+        &self,
+        now_ms: i64,
+    ) -> std::collections::HashSet<(String, String)> {
+        if self.root.is_none() {
+            return std::collections::HashSet::new();
+        }
+        self.guard()
+            .kill_tombstones
+            .iter()
+            .filter(|(_, killed_at)| kill_tombstone_is_fresh(**killed_at, now_ms))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// The tombstone lifecycle transition (focused-ep5-r1 Finding 2): a NEW
     /// pane/session GENUINELY CLAIMING the identity (an explicit
     /// resume/attach) clears the tombstone, so that claim's own binding
@@ -1317,6 +1358,55 @@ impl PaneLedger {
         result
     }
 
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3) — the claim
+    /// lifecycle's ROW-side transition (the companion of
+    /// [`Self::clear_kill_tombstone`]): a successful attach/resume returned
+    /// the session to live, so a row the kill retired `Closed` moves back to
+    /// Bound. Deliberately NARROW: ONLY Retired(Closed) rows revive (a
+    /// `Superseded` row's chain linkage and a `GcExpired` row's GC verdict
+    /// are never rewritten by a claim), a missing row is a no-op (a
+    /// never-recorded identity gains NO row — the V7/A10 no-laundering
+    /// discipline survives intact), and the kill tombstone is NOT consulted
+    /// here (the claim lanes clear it first — the clearing IS the claim's
+    /// authorization, so a revive can never resurrect an identity whose
+    /// fence still stands). Returns true iff a row flipped. Refreshes
+    /// `updated_at`/`last_observed_at` on a flip (the identity is observed
+    /// alive NOW); every other field (settings, stamps, created_at) is
+    /// preserved from the retired row.
+    pub fn revive_closed(
+        &self,
+        provider: &str,
+        session_id: &str,
+        now_ms: i64,
+    ) -> std::io::Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(false);
+        };
+        let mut index = self.guard();
+        let Some(mut row) = index
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if row.state != RowState::Retired || row.retired_reason != Some(RetiredReason::Closed) {
+            return Ok(false);
+        }
+        row.state = RowState::Bound;
+        row.retired_reason = None;
+        row.updated_at = now_ms;
+        row.last_observed_at = now_ms;
+        self.write_binding(root, &mut index, &row)?;
+        tracing::info!(
+            target: "freshell_ws::pane_ledger",
+            provider = %provider,
+            session_id = %session_id,
+            "pane_ledger_closed_row_revived: a genuine claim returned the killed identity to Bound"
+        );
+        Ok(true)
+    }
+
     /// Best-effort retire on observed clean close (trigger e). Missing or
     /// already-retired rows are Ok — this path is never load-bearing.
     ///
@@ -1334,7 +1424,9 @@ impl PaneLedger {
     /// no-op (kill-before-row is exactly the finding's shape). Both writes
     /// are attempted on partial failure; the tombstone's error wins the
     /// return (it is the load-bearing half now — a missed row retire was
-    /// already this function's accepted outcome).
+    /// already this function's accepted outcome, and focused-ep5-r2's
+    /// dominance rule keeps the split-write remnant never-offered until the
+    /// next sweep converges it durably — see the module doc).
     pub fn retire_closed(
         &self,
         provider: &str,

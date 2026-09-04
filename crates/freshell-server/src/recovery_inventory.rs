@@ -298,6 +298,37 @@ fn correlation_candidates<'a>(
     candidates
 }
 
+/// Focused-ep5-r2 Finding 1 (retire-on-kill round 3) — the kill-tombstone
+/// dominance rule AT THE OFFER BOUNDARY: `retire_closed` is two durable
+/// writes (tombstone, then row retire) and a crash or failed second write
+/// can split them, leaving a still-Bound row next to a surviving UNEXPIRED
+/// kill tombstone. The tombstone is the author of truth: such a row is
+/// rewritten to Retired(Closed) BEFORE the pure builder sees it, so it
+/// never reaches `ledgerOnly`, and a snapshot pane that claims the identity
+/// gets the `closed` verdict (the retired tier) instead of a spurious
+/// `bound`. One rule with the sweep: the boot/periodic GC re-applies the
+/// same retirement durably (`pane_ledger_scan.rs`); this read-side
+/// enforcement covers the window BEFORE the sweep runs (including the
+/// no-restart process-lived-on case). Rows that are already Retired, and
+/// Bound rows whose tombstone (if any) has EXPIRED, pass through untouched.
+fn apply_kill_tombstone_dominance(
+    bindings: Vec<BindingRow>,
+    fresh: &HashSet<(String, String)>,
+) -> Vec<BindingRow> {
+    bindings
+        .into_iter()
+        .map(|mut row| {
+            if row.state == RowState::Bound
+                && fresh.contains(&(row.provider.clone(), row.session_id.clone()))
+            {
+                row.state = RowState::Retired;
+                row.retired_reason = Some(RetiredReason::Closed);
+            }
+            row
+        })
+        .collect()
+}
+
 pub fn build_inventory(
     device_unions: Vec<DeviceUnion>,
     bindings: Vec<BindingRow>,
@@ -1041,9 +1072,13 @@ async fn inventory_handler(
         }
     };
     let live = live_session_keys(&state.registry, &state.identity);
+    // Focused-ep5-r2 Finding 1: a still-Bound row dominated by an unexpired
+    // kill tombstone (the split-write crash remnant) reads as Retired at
+    // inventory-build time — never offered.
+    let fresh_tombstones = state.ledger.fresh_kill_tombstone_keys(now_ms() as i64);
     Json(build_inventory(
         unions,
-        state.ledger.list_bindings(),
+        apply_kill_tombstone_dominance(state.ledger.list_bindings(), &fresh_tombstones),
         live,
         &evidence,
     ))

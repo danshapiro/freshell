@@ -414,22 +414,46 @@ impl FreshCodexState {
         self.identity_sink.get().cloned()
     }
 
-    /// Retire-on-kill round 2 (focused-ep5-r1 Finding 2), the tombstone
-    /// lifecycle's CLEAR transition: an explicit resume/attach of a durable
-    /// thread is a NEW pane GENUINELY CLAIMING that identity, so the kill
-    /// tombstone the close recorded is cleared BEFORE the claim's own binding
-    /// write can be mistaken for the killed session's orphaned write and
-    /// suppressed. Unconditional by design — idempotent on a never-killed
-    /// identity — warn-logged on failure, never a resume blocker. Deliberately
-    /// NOT called by the crash-recovery / fork / adopt-live lanes: none of
-    /// them claims an identity a user just closed (and the crash lanes'
-    /// writes must stay fenced when a kill raced the respawn).
-    async fn clear_kill_tombstone_for(&self, durable_id: &str) {
+    /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
+    /// the claim lifecycle's COMMIT: an explicit resume/attach of a durable
+    /// thread is a NEW pane GENUINELY CLAIMING that identity — invoked ONLY
+    /// once the replacement session is established (the sidecar's
+    /// `thread/resume` answered, id-verified) — clearing its durable kill
+    /// fence so the claim's own binding write is never mistaken for the
+    /// killed session's orphaned write and suppressed, AND returning a
+    /// kill-closed ledger row to Bound (Finding 4: unconditional — the
+    /// V7-gated refresh write skips a lineage-only record, and the row once
+    /// stayed Closed while the live thread ran). Unconditional by design —
+    /// idempotent on a never-killed identity — warn-logged on failure, never
+    /// a resume blocker. Deliberately NOT called by the crash-recovery /
+    /// fork / adopt-live lanes: none of them claims an identity a user just
+    /// closed (and the crash lanes' writes must stay fenced when a kill
+    /// raced the respawn).
+    async fn commit_session_claim(&self, durable_id: &str) {
         let Some(sink) = self.identity_sink() else {
             return;
         };
         if let Err(e) = sink.clear_kill_tombstone(PROVIDER, durable_id).await {
             tracing::warn!(error = %e, session = %durable_id, "freshagent.codex.kill_tombstone_clear_failed");
+        }
+        if let Err(e) = sink.revive_closed(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.codex.closed_row_revive_failed");
+        }
+    }
+
+    /// The commit's inverse (retire-on-kill round 3, Finding 5's "re-raise"
+    /// arm): a claim whose lease was REVOKED at completion tears its
+    /// freshly-spawned session back down — the identity is dead again, so
+    /// `retire_closed` restores the close's durable record exactly (the kill
+    /// fence re-raised, the revived row re-retired — both idempotent). An
+    /// older in-flight binding write of the prior epoch is fenced again,
+    /// never a Bound resurrection.
+    async fn rollback_session_claim(&self, durable_id: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        if let Err(e) = sink.retire_closed(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.codex.claim_rollback_failed");
         }
     }
 
@@ -812,6 +836,8 @@ impl FreshCodexState {
             // Threads freshell starts are paginated (we SET the mode at start).
             Some(HistoryMode::Paginated),
             provenance,
+            // The plain create lane never commits a claim — nothing to roll back.
+            None,
         )
         .await;
     }
@@ -945,13 +971,16 @@ impl FreshCodexState {
         let thread_id = resume_session_id;
         self.clear_dead_thread(&thread_id).await;
 
-        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this explicit
-        // create-with-resume GENUINELY CLAIMS the thread — clear the kill
-        // tombstone the close recorded BEFORE finish_create's durable binding
-        // write, so the claim is never suppressed as a stale orphan of the
-        // killed session. Idempotent (a never-killed thread clears to Ok) and
-        // warn-only on failure — never a resume blocker.
-        self.clear_kill_tombstone_for(&thread_id).await;
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding
+        // 4+5): this explicit create-with-resume GENUINELY CLAIMS the thread
+        // — the claim COMMITS here, after the sidecar's `thread/resume`
+        // answered and its id was verified (the replacement session is
+        // established): clear the durable kill fence BEFORE finish_create's
+        // binding write, AND return a kill-closed row to Bound. Idempotent
+        // (a never-killed thread clears to Ok) and warn-only on failure —
+        // never a resume blocker. finish_create's lease-revoke arm rolls the
+        // commit back (`commit_rollback_id`).
+        self.commit_session_claim(&thread_id).await;
 
         // Kata 1wxv Task 2 (r3): the durable rollout meta is the ONE source of
         // truth for the resumed thread's history mode (thread/resume takes no
@@ -967,7 +996,7 @@ impl FreshCodexState {
 
         self.finish_create(
             request_id,
-            thread_id,
+            thread_id.clone(),
             client,
             notifs,
             ownership_id,
@@ -980,6 +1009,9 @@ impl FreshCodexState {
             lease_guard,
             history_mode,
             provenance,
+            // This lane committed the claim above: its lease-revoke arm in
+            // `finish_create` must roll the commit back.
+            Some(thread_id.as_str()),
         )
         .await;
     }
@@ -1011,6 +1043,13 @@ impl FreshCodexState {
         // D8: the creating connection's provenance for the binding write below
         // (`None` on conn-less lanes; the ledger merge keeps prior stamps).
         provenance: Option<crate::BindProvenance>,
+        // Retire-on-kill round 3 (Finding 5): `Some(<the resumed durable id>)`
+        // when the caller already COMMITTED the claim (create-with-resume);
+        // the lease-revoke arm below then rolls the commit back before
+        // answering failed, so a torn-down claim never leaves the identity
+        // unfenced / Bound. `None` on the plain create lane (nothing was
+        // committed — nothing to roll back).
+        commit_rollback_id: Option<&str>,
     ) {
         // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
         // initialized client's hello — all fields absent) behaves like `None`
@@ -1129,6 +1168,13 @@ impl FreshCodexState {
                         let _ = kill_tx.send(());
                     }
                     let _ = session.watcher.await;
+                }
+                // Finding 5's re-raise: a committed claim (the resume lane)
+                // that gets torn down here dies again — restore the close's
+                // durable record (fence re-raised, the revived row
+                // re-retired) before answering failed.
+                if let Some(claim) = commit_rollback_id {
+                    self.rollback_session_claim(claim).await;
                 }
                 g.fail(); // own tree torn down -- reopen the key
                 self.fail_create(
@@ -3874,12 +3920,16 @@ impl FreshCodexState {
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
 
-        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this
-        // attach-resume GENUINELY CLAIMS the thread — clear the kill
-        // tombstone the close recorded BEFORE the refresh write below (and
-        // before any later write for this rebuilt session), so the claim is
-        // never suppressed as a stale orphan of the killed session.
-        self.clear_kill_tombstone_for(thread_id).await;
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
+        // 4+5): this attach-resume GENUINELY CLAIMS the thread — the claim
+        // COMMITS here, after `thread/resume` answered id-verified (the
+        // replacement session is established): clear the durable kill fence
+        // BEFORE the refresh write below (and before any later write for
+        // this rebuilt session), AND return a kill-closed row to Bound
+        // (Finding 4 — unconditional: the V7-gated refresh below skips a
+        // lineage-only record; the revive is not its job). The lease-revoke
+        // arm below rolls the commit back (Finding 5's re-raise).
+        self.commit_session_claim(thread_id).await;
 
         // Registration tail (shared with `handle_fork`). P1.13 (Task 5, R3): the ledger
         // record's settings snapshot -- blank only when no record was recoverable
@@ -3922,6 +3972,10 @@ impl FreshCodexState {
                     }
                     let _ = session.watcher.await;
                 }
+                // Finding 5's re-raise: the ONE post-commit failure arm — the
+                // close the commit undid is durable again (fence re-raised,
+                // the revived row re-retired).
+                self.rollback_session_claim(thread_id).await;
                 g.fail();
                 return Err(ResumeSessionError::Transient(
                     "session lease revoked during attach-resume; torn down".to_string(),
@@ -10966,6 +11020,101 @@ pub(crate) mod tests {
                 .await
                 .contains_key("historical-thread-attach"),
             "the resumed thread must be registered for reuse by a later send/attach"
+        );
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), the codex lane: an
+    /// attach-resume of a kill-closed thread whose record is LINEAGE-ONLY
+    /// (load_settings answers None, so the V7-gated refresh write is skipped)
+    /// must still return the row to Bound — a successful attach records the
+    /// row live-again unconditionally.
+    #[tokio::test]
+    async fn attach_resume_of_a_killed_lineage_only_thread_revives_the_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, rx, fake) = state_with_sink();
+        let thread = "historical-thread-lineage";
+        // The lineage-only seed: a row exists with a blank settings snapshot.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: thread.into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage seed write");
+        assert!(
+            fake.load_settings("codex", thread).is_none(),
+            "fixture: lineage-only — no settings snapshot (the refresh gate's skip case)"
+        );
+
+        // The close: row Closed + fence (by name — the map never held it).
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "fixture: the kill closed the row"
+        );
+
+        // The attach-resume (the fake app server answers thread/resume with
+        // the requested id — the donor test's fixture).
+        st.handle_attach(attach_msg(thread)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if st.sessions.lock().await.contains_key(thread) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attach-resume never registered the session"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Drain any pending frame so the bus receiver's lifetime is not the
+        // resume's completion signal.
+        drop(rx);
+
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "a successful attach-resume must return the kill-closed row to Bound"
+        );
+        assert!(
+            fake.revives
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread.to_string())),
+            "the claim's revive fired even though the V7 refresh gate skipped the settings write"
+        );
+        // The V7 gate held: NO refresh binding write landed for the thread
+        // (the lone bindings entry is the seed) — revive is not a settings concern.
+        assert_eq!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.provider == "codex" && b.session_id == thread)
+                .count(),
+            1,
+            "no laundered settings write for the lineage-only resume"
         );
     }
 

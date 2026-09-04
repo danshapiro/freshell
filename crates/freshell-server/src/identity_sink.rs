@@ -285,6 +285,21 @@ impl PaneIdentitySink for LedgerIdentitySink {
         })
     }
 
+    /// The claim lifecycle's row-side transition (focused-ep5-r2 Finding 4):
+    /// a successful attach/resume returns a kill-closed row to Bound. Same
+    /// awaited-spawn_blocking discipline; the narrowness (Closed-only,
+    /// never-creates) lives in the ledger itself.
+    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.revive_closed(&p, &s, now).map(|_| ()))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
     /// kata 1wxv: await the rollback-record row write BEFORE the provider
     /// mutation runs (durable-BEFORE-mutation; a pre-write failure refuses
     /// the rollback with `LEDGER_WRITE_REFUSAL_COPY`).
@@ -1097,6 +1112,80 @@ mod tests {
                 "iteration {i}: a killed identity converged to not-Bound, got {state:?}"
             );
         }
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3) over the REAL
+    /// ledger, through the sink seam the claim lanes use: the kill closes
+    /// (and fences) the row; the claim's clear+revive pair returns it to
+    /// Bound — durably (a fresh ledger over the same root agrees) — and the
+    /// binding write the claim then lands is never suppressed. The narrow
+    /// cases: reviving a never-killed Bound row is a no-op (no timestamp
+    /// churn), and reviving an unknown id creates nothing (the V7
+    /// no-laundering discipline holds through the new lane).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revive_closed_restores_a_killed_row_through_the_real_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: session_id.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+
+        sink.record_binding(upsert("revive-1")).await.expect("seed write");
+        sink.retire_closed("claude", "revive-1").await.expect("kill closes");
+        assert_eq!(
+            ledger.load_binding("claude", "revive-1").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Retired,
+            "the kill closed the row"
+        );
+
+        // The claim's exact sequence: clear the fence, then revive the row.
+        sink.clear_kill_tombstone("claude", "revive-1").await.expect("clear");
+        sink.revive_closed("claude", "revive-1").await.expect("revive");
+        let row = ledger.load_binding("claude", "revive-1").unwrap();
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+        assert_eq!(row.retired_reason, None);
+        let ledger2 = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            ledger2.load_binding("claude", "revive-1").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the revive is durable on disk"
+        );
+        // And the claim's own binding write is never fenced afterwards.
+        sink.record_binding(upsert("revive-1")).await.expect("claim write");
+        assert_eq!(
+            ledger.load_binding("claude", "revive-1").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the claim's write landed Bound"
+        );
+
+        // Narrow cases: a plain Bound row is untouched (updated_at frozen),
+        // and an unknown id gains no row.
+        let before = ledger.load_binding("claude", "revive-1").unwrap().updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        sink.revive_closed("claude", "revive-1").await.expect("noop revive");
+        assert_eq!(
+            ledger.load_binding("claude", "revive-1").unwrap().updated_at,
+            before,
+            "reviving an already-Bound row is a true no-op"
+        );
+        sink.revive_closed("claude", "never-existed").await.expect("unknown revive ok");
+        assert!(
+            ledger.load_binding("claude", "never-existed").is_none(),
+            "a never-recorded identity gains no row from a revive"
+        );
     }
 
     /// Task 3 semantics change (`was_recorded` rekeying): a lineage-only
