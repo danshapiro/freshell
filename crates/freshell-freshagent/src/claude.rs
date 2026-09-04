@@ -1191,7 +1191,12 @@ impl FreshClaudeState {
         // THE durable close — ONE envelope over the whole set, BEFORE any
         // live-state destruction (the map removal, the consumer abort). On
         // failure the kill aborts with NOTHING touched and NOTHING durable.
-        if !self.retire_closed_rows(&retire_ids).await {
+        // Delta-r6-r4 (round 3 Finding 3): the PERSISTED class — the close
+        // IS durable despite the reported error — proceeds instead (the
+        // session ends, consistent with the durable close) while the answer
+        // still reports `success:false` (the kill visibly fails).
+        let close_answer = self.retire_closed_rows(&retire_ids).await;
+        if close_answer == crate::identity_sink::CloseAnswer::Failed {
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),
                 session_id,
@@ -1200,6 +1205,8 @@ impl FreshClaudeState {
             }));
             return;
         }
+        let main_close_reported_failure =
+            close_answer == crate::identity_sink::CloseAnswer::Persisted;
         // Live-state destruction begins (every durable id the collection
         // could see is durably closed by this point).
         let removed = self.sessions.lock().await.remove(&map_key);
@@ -1227,7 +1234,8 @@ impl FreshClaudeState {
         let diff_ok = if late_ids.is_empty() {
             true
         } else {
-            let ok = self.retire_closed_rows(&late_ids).await;
+            let ok = self.retire_closed_rows(&late_ids).await
+                == crate::identity_sink::CloseAnswer::Recorded;
             retire_ids.extend(late_ids);
             ok
         };
@@ -1265,7 +1273,7 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: diff_ok,
+            success: diff_ok && !main_close_reported_failure,
         }));
     }
 
@@ -1377,24 +1385,35 @@ impl FreshClaudeState {
     /// `retire_closed`), so the passes `handle_kill` runs cannot be undone by
     /// a binding write that was already in flight.
     ///
-    /// Delta-r6 failure propagation: returns `false` when the envelope
-    /// failed (nothing durable survives it). The caller treats the main
-    /// envelope's failure as a kill ABORT (no live state touched,
-    /// `success:false`) and a completion-diff failure as an unacknowledged
-    /// answer (the teardown it precedes has already mutated live state, so
-    /// the kill must not claim success).
-    async fn retire_closed_rows(&self, ids: &[String]) -> bool {
+    /// Delta-r6-r4 failure propagation (focused-episode-6 round 3, Finding
+    /// 3): the close's answer is [`CloseAnswer`]. The caller treats the main
+    /// envelope's `Failed` as a kill ABORT (nothing durable; no live state
+    /// touched, `success:false`), a `Persisted` as the durable-but-erroring
+    /// close (the kill proceeds — the session ends consistently — and
+    /// answers `success:false`), and a completion-diff non-`Recorded` as an
+    /// unacknowledged answer (the close has already committed durably — the
+    /// teardown it precedes runs regardless, so the kill must not claim
+    /// success).
+    async fn retire_closed_rows(&self, ids: &[String]) -> crate::identity_sink::CloseAnswer {
         let Some(sink) = self.identity_sink() else {
-            return true;
+            return crate::identity_sink::CloseAnswer::Recorded;
         };
         if ids.is_empty() {
-            return true;
+            return crate::identity_sink::CloseAnswer::Recorded;
         }
-        if let Err(e) = sink.retire_closed_batch(PROVIDER, ids, &[]).await {
-            tracing::warn!(error = %e, sessions = ?ids, "freshagent.claude.retire_on_kill_failed");
-            return false;
+        match sink.retire_closed_batch(PROVIDER, ids, &[]).await {
+            Ok(()) => crate::identity_sink::CloseAnswer::Recorded,
+            Err(e) => {
+                if e.is_persisted() {
+                    tracing::error!(error = %e, sessions = ?ids,
+                        "freshagent.claude.retire_on_kill_persisted_despite_error: the close is durable; \
+                         the kill ends the session and answers failure");
+                } else {
+                    tracing::warn!(error = %e, sessions = ?ids, "freshagent.claude.retire_on_kill_failed");
+                }
+                crate::identity_sink::CloseAnswer::of(Err(e))
+            }
         }
-        true
     }
 
     /// Retire-on-kill round 3 (focused-ep5-r2 Findings 2+3): the kill's
@@ -6977,6 +6996,55 @@ rl.on('line', (line) => {
         assert_eq!(
             killed_frame["success"], false,
             "a kill whose durable close failed must report success:false: {killed_frame}"
+        );
+    }
+
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the claude lane's
+    /// PERSISTED class on the pre-destruction envelope: the whole identity
+    /// set's journal record IS durable although its write reports failure.
+    /// The kill must END the session (map removal, consumer abort, teardown —
+    /// never a live session beside durable close evidence) while the answer
+    /// reports `success:false`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly() {
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        insert_fake_claude_session(&st, "sess-kill-pers").await;
+        fake.fail_retires_as_persisted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: "sess-kill-pers".to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            !st.sessions.lock().await.contains_key("sess-kill-pers"),
+            "the close IS durable: the session ends (never a live session beside close evidence)"
+        );
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), "sess-kill-pers".to_string())),
+            "the close's facts are on record"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill fails VISIBLY even though the close is durable: {killed_frame}"
         );
     }
 

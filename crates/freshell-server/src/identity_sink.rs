@@ -4,10 +4,21 @@
 
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    RollbackRecord, SinkAliasClearWrite, SinkCommitWrite, SinkWrite,
+    RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
 };
-use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
+use freshell_ws::pane_ledger::{CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
+
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the ledger's classed
+/// close-envelope error maps onto the fresh-agent crate's mirror type —
+/// the kill lanes' [`crate`]-visible contract (`Clean` ⇒ touch nothing;
+/// `Persisted` ⇒ the close is durable: end the session, fail visibly).
+fn map_close_envelope_error(err: CloseEnvelopeError) -> SinkCloseError {
+    match err {
+        CloseEnvelopeError::Clean(e) => SinkCloseError::Clean(e),
+        CloseEnvelopeError::Persisted(e) => SinkCloseError::Persisted(e),
+    }
+}
 
 pub struct LedgerIdentitySink {
     ledger: Arc<PaneLedger>,
@@ -244,49 +255,60 @@ impl PaneIdentitySink for LedgerIdentitySink {
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): the
     /// kill handlers' awaited retire batch — the same awaited-spawn_blocking
-    /// discipline as `record_binding`. Delta-r6 failure propagation: NOT
-    /// best-effort — a kill whose durable close cannot be recorded is
-    /// FAILED, not warn-and-continued (the caller reports `success:false`
-    /// and leaves the live session untouched); a `Bound` row beside an
-    /// unacknowledged close stays self-consistent and retryable, which the
-    /// recovery pipeline's exactness contract relies on. Delta-r6-r2
-    /// (focused-episode-6 round 1, Finding 6): routed through the ledger's
-    /// COMPENSATED close — a tombstone-persisted + retire-failed pair is
-    /// retried once and, failing that, has its just-written tombstone
-    /// removed, so dominance never suppresses the still-live session the
-    /// caller then reports as not-killed.
-    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+    /// discipline as `record_binding`. Delta-r6-r4 (focused-episode-6 round
+    /// 3, Finding 3): the ledger's close is ONE journal record and its error
+    /// is CLASSED — `Clean` (nothing durable; the caller fails the kill and
+    /// touches nothing) vs `Persisted` (the close IS durable despite the
+    /// reported error; the caller ends the session and fails visibly). The
+    /// pre-journal model's tombstone/retire split pair and its compensation
+    /// machinery are gone — there is no second write to fail past the first.
+    /// The class maps through to the lanes unchanged.
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
         let now = now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.retire_closed_compensated(&p, &s, now))
-                .await
-                .map_err(std::io::Error::other)?
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.retire_closed(&p, &s, now)
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(
+                    std::io::Error::other(join),
+                )
+            })?;
+            result.map_err(map_close_envelope_error)
         })
     }
 
-    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5): the batched
-    /// close every fresh-agent kill lane uses — the whole identity set (plus
-    /// the pending markers, last) closes through the ledger's ONE guarded
-    /// envelope, failure-atomic across the set (see the trait doc; the
-    /// envelope's rollback lives in the ledger). Same awaited-spawn_blocking
-    /// discipline as `retire_closed`.
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5), re-durabled by
+    /// delta-r6-r4 (round 3, Finding 3): the batched close every fresh-agent
+    /// kill lane uses — the whole identity set (plus the pending markers,
+    /// last) journals into the ledger's ONE close-envelope record (see the
+    /// trait doc; the wire id — the caller's first id — addresses it). Same
+    /// awaited-spawn_blocking + class-mapping discipline as `retire_closed`.
     fn retire_closed_batch(
         &self,
         provider: &str,
         session_ids: &[String],
         pending_ids: &[String],
-    ) -> SinkWrite {
+    ) -> SinkCloseWrite {
         let ledger = self.ledger.clone();
         let p = provider.to_string();
         let ids = session_ids.to_vec();
         let pendings = pending_ids.to_vec();
         let now = now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.close_identities(&p, &ids, &pendings, now))
-                .await
-                .map_err(std::io::Error::other)?
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.close_identities(&p, &ids, &pendings, now)
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(
+                    std::io::Error::other(join),
+                )
+            })?;
+            result.map_err(map_close_envelope_error)
         })
     }
 
@@ -1213,19 +1235,16 @@ mod tests {
         assert!(disk.kill_tombstone_at("opencode", "ses_y").is_some());
 
         // FAILURE: re-seed two Bound rows, then break the ledger's
-        // kill-tombstone subtree for the provider — the batch must Err and
-        // leave NOTHING durable of its own.
+        // close-envelope subtree (delta-r6-r4: THE durable act of the batch)
+        // — the batch must Err CLEAN (nothing durable of its own survives).
         sink.record_binding(bind("ses_p", "cr-p")).await.expect("seed p");
         sink.record_binding(bind("ses_q", "cr-q")).await.expect("seed q");
         sink.record_pending("ph-batch-sink-2", "freshopencode", Some("/w"))
             .await
             .expect("pending write ok");
-        let kt_dir = tmp
-            .path()
-            .join("kill-tombstones")
-            .join("opencode");
-        std::fs::create_dir_all(&kt_dir).unwrap();
-        std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let env_dir = tmp.path().join("close-envelopes");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let err = sink
             .retire_closed_batch(
                 "opencode",
@@ -1233,26 +1252,41 @@ mod tests {
                 &["ph-batch-sink-2".to_string()],
             )
             .await
-            .expect_err("the broken tombstone subtree fails the batch");
+            .expect_err("the broken close-envelope subtree fails the batch");
+        assert!(
+            !err.is_persisted(),
+            "the record provably never landed: a CLEAN failure (nothing durable)"
+        );
         assert!(!err.to_string().is_empty());
-        std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         for id in ["ses_p", "ses_q"] {
             let row = ledger.load_binding("opencode", id).expect("row");
             assert_eq!(
                 row.state,
                 freshell_ws::pane_ledger::RowState::Bound,
-                "rollback: {id}'s row is untouched by the failed envelope"
+                "clean failure: {id}'s row is untouched by the failed close"
             );
             assert_eq!(
                 ledger.kill_tombstone_at("opencode", id),
                 None,
-                "rollback: no tombstone residue for {id}"
+                "clean failure: no fence residue for {id}"
             );
         }
         assert!(
             ledger.pending_for_terminal("ph-batch-sink-2").is_some(),
             "markers delete only on a COMPLETE close"
         );
+        // Healed retry: lands idempotently.
+        sink.retire_closed_batch(
+            "opencode",
+            &["ses_p".to_string(), "ses_q".to_string()],
+            &["ph-batch-sink-2".to_string()],
+        )
+        .await
+        .expect("the retried close lands");
+        for id in ["ses_p", "ses_q"] {
+            assert!(ledger.kill_tombstone_at("opencode", id).is_some());
+        }
     }
 
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): `row_is_bound`
@@ -1294,16 +1328,16 @@ mod tests {
         assert!(!sink.row_is_bound("claude", "never-written"));
     }
 
-    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 6) — the sink routes
-    /// through the ledger's COMPENSATED close: a tombstone-write lands while
-    /// its row retire cannot (the bindings dir read-only; the kill-tombstone
-    /// tree writable), the retire retry also fails against the same perms,
-    /// and the compensation removes the just-written tombstone. The caller
-    /// sees `Err` — and the DISK answer is "nothing durable": row Bound, no
-    /// dominant tombstone to suppress the still-live session from recovery.
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) through the sink
+    /// seam: only the row's bindings dir is read-only, so the ROW
+    /// PROJECTION cannot land while the journal record can. The close is the
+    /// record: the sink answers `Ok`, the fence stands durable (fed by the
+    /// record), and the Bound row reads dominated (never offered) until a
+    /// healed sweep converges it — the pre-journal model's compensated
+    /// split-pair cannot exist.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_retire_whose_row_write_fails_compensates_the_tombstone_through_the_sink() {
+    async fn a_retire_whose_row_projection_fails_still_closes_through_the_sink() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
@@ -1326,31 +1360,36 @@ mod tests {
         .await
         .expect("seed write");
 
-        // Only the row's bindings dir goes read-only (the retire's rename
-        // needs dir-write); the tombstone tree stays writable.
+        // Only the row's bindings dir goes read-only (the projection's
+        // rename needs dir-write); the close-envelope tree stays writable.
         let bindings_dir = tmp.path().join("bindings").join("claude");
         std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let err = sink
-            .retire_closed("claude", "ses-comp")
+        sink.retire_closed("claude", "ses-comp")
             .await
-            .expect_err("the failing row write surfaces as Err through the sink");
+            .expect("the journal record lands; the projection is hygiene");
         std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!err.to_string().is_empty());
         assert_eq!(
             ledger.load_binding("claude", "ses-comp").unwrap().state,
             freshell_ws::pane_ledger::RowState::Bound,
-            "the row stands (the kill reports failure)"
+            "the projection never landed: raw Bound, masked by dominance (never offered)"
         );
         assert!(
-            ledger.kill_tombstone_at("claude", "ses-comp").is_none(),
-            "compensation removed the just-written tombstone (index)"
+            ledger.kill_tombstone_at("claude", "ses-comp").is_some(),
+            "the close fence stands (fed by the journal record)"
         );
-        // And the FILE is gone — the disk never held a dominant pair.
+        assert!(
+            ledger
+                .dominant_kill_tombstone_keys()
+                .contains(&("claude".to_string(), "ses-comp".to_string())),
+            "the Bound row reads closed at every offer boundary"
+        );
         let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
         assert!(
-            disk.kill_tombstone_at("claude", "ses-comp").is_none(),
-            "compensation removed the just-written tombstone (disk)"
+            disk.kill_tombstone_at("claude", "ses-comp").is_some(),
+            "the fence is durable on disk (record-fed, restart-proof)"
         );
+        // Healed sweep convergence is pinned at the ledger level
+        // (`a_close_is_one_record_and_a_failed_row_projection_is_dominance_covered_hygiene`).
     }
 
     /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6) over the REAL
@@ -1504,15 +1543,17 @@ mod tests {
             let write_sink = LedgerIdentitySink::new(ledger.clone());
             let kill_sink = LedgerIdentitySink::new(ledger.clone());
             let (w, k) = if i % 2 == 0 {
-                tokio::join!(
+                let (w, k) = tokio::join!(
                     write_sink.record_binding(upsert(&session_id)),
                     kill_sink.retire_closed("claude", &session_id)
-                )
+                );
+                (w, k)
             } else {
-                tokio::join!(
+                let (k, w) = tokio::join!(
                     kill_sink.retire_closed("claude", &session_id),
                     write_sink.record_binding(upsert(&session_id))
-                )
+                );
+                (w, k)
             };
             w.expect("write ok");
             k.expect("retire ok");

@@ -2706,7 +2706,13 @@ impl FreshCodexState {
         // would leave the row Bound — recoverable — while the client believes
         // the pane is closed. The session stays live and Bound,
         // self-consistent, and a retried kill re-attempts idempotently.
-        if !self.retire_closed_row(&session_id).await {
+        // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the
+        // PERSISTED class is different — the close IS durable despite the
+        // reported error, so the kill PROCEEDS (the session ends, consistent
+        // with the durable close) while the answer still reports
+        // `success:false` (the kill visibly fails).
+        let close_answer = self.retire_closed_row(&session_id).await;
+        if close_answer == crate::identity_sink::CloseAnswer::Failed {
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),
                 session_id,
@@ -2715,6 +2721,7 @@ impl FreshCodexState {
             }));
             return;
         }
+        let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
 
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
         // also clears it; idempotent -- this covers watcher-less test sessions too).
@@ -2746,27 +2753,39 @@ impl FreshCodexState {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: SESSION_TYPE.to_string(),
-            success: true,
+            // A persisted-despite-error close ends the session (consistent
+            // with the durable close) but the kill visibly fails
+            // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
+            success: !close_reported_failure,
         }));
     }
 
     /// The kill-side lane of `retire_closed` (delta-review round 5):
     /// AWAITED retire of this provider's ledger row before the
     /// `freshAgent.killed` broadcast (durable-before-answer, like the
-    /// create-path binding write). Delta-r6 failure propagation: returns
-    /// `false` (warn-logged) when the durable write failed — the caller
-    /// FAILS the kill (`success:false`, no live state touched) because a
-    /// close it cannot record must never be acknowledged as done. With no
-    /// sink wired there is nothing to record: `true`.
-    async fn retire_closed_row(&self, session_id: &str) -> bool {
+    /// create-path binding write). Delta-r6-r4: the answer is
+    /// [`CloseAnswer`] — `Failed` (nothing durable; the caller FAILS the
+    /// kill, no live state touched) vs `Persisted` (the close IS durable;
+    /// the caller ends the session and fails visibly). With no sink wired
+    /// there is nothing to record: `Recorded`.
+    async fn retire_closed_row(&self, session_id: &str) -> crate::identity_sink::CloseAnswer {
         let Some(sink) = self.identity_sink() else {
-            return true;
+            return crate::identity_sink::CloseAnswer::Recorded;
         };
-        if let Err(e) = sink.retire_closed(PROVIDER, session_id).await {
-            tracing::warn!(error = %e, session = %session_id, "freshagent.codex.retire_on_kill_failed");
-            return false;
+        match sink.retire_closed(PROVIDER, session_id).await {
+            Ok(()) => crate::identity_sink::CloseAnswer::Recorded,
+            Err(e) => {
+                let persisted = e.is_persisted();
+                if persisted {
+                    tracing::error!(error = %e, session = %session_id,
+                        "freshagent.codex.retire_on_kill_persisted_despite_error: the close is durable; \
+                         the kill ends the session and answers failure");
+                } else {
+                    tracing::warn!(error = %e, session = %session_id, "freshagent.codex.retire_on_kill_failed");
+                }
+                crate::identity_sink::CloseAnswer::of(Err(e))
+            }
         }
-        true
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -6741,6 +6760,68 @@ pub(crate) mod tests {
         assert_eq!(
             killed_frame["success"], false,
             "a kill whose durable close failed must report success:false: {killed_frame}"
+        );
+    }
+
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the codex lane's
+    /// PERSISTED class: the durable close IS recorded although its write
+    /// reports failure (the journal record landed — the rename-committed
+    /// class, staged by the fake sink's persisted arm). Keeping the session
+    /// live beside durable close evidence would misclassify it `closed` at
+    /// recovery — so the kill ENDS the session (teardown runs, the map is
+    /// cleaned) while the answer still reports `success:false`: the kill
+    /// visibly fails, never masquerading as clean success nor clean failure.
+    #[tokio::test]
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx, fake) = state_with_sink();
+        let child = spawn_sleeper();
+        insert_fake_session(
+            &st,
+            "thread-kill-pers",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill-pers",
+        )
+        .await;
+        // The close's record is durable but the write "reports failure".
+        fake.fail_retires_as_persisted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-kill-pers".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-kill-pers"),
+            "the close IS durable: the session ends (never a live session beside close evidence)"
+        );
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), "thread-kill-pers".to_string())),
+            "the close's facts are on record (the journal record stands)"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill fails VISIBLY even though the close is durable: {killed_frame}"
         );
     }
 

@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_freshagent::{
     ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
-    SinkAliasClearWrite, SinkCommitWrite, SinkWrite,
+    SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
@@ -345,15 +345,27 @@ impl PaneIdentitySink for TestLedgerSink {
 
     // Retire-on-kill (delta-review round 5): the same real-ledger pass-through
     // the LedgerIdentitySink this double mirrors now implements.
-    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.retire_closed_compensated(&p, &s, TestLedgerSink::now_ms())
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
             })
             .await
-            .map_err(std::io::Error::other)?
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(|err| match err {
+                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
+                }
+                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
+                }
+            })
         })
     }
 
@@ -365,17 +377,29 @@ impl PaneIdentitySink for TestLedgerSink {
         provider: &str,
         session_ids: &[String],
         pending_ids: &[String],
-    ) -> SinkWrite {
+    ) -> SinkCloseWrite {
         let ledger = self.ledger.clone();
         let p = provider.to_string();
         let ids = session_ids.to_vec();
         let pendings = pending_ids.to_vec();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 ledger.close_identities(&p, &ids, &pendings, TestLedgerSink::now_ms())
             })
             .await
-            .map_err(std::io::Error::other)?
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(|err| match err {
+                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
+                }
+                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
+                }
+            })
         })
     }
     fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {

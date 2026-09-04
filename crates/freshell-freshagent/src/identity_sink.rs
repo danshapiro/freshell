@@ -185,6 +185,75 @@ impl FreshAgentBindingUpsert {
 pub type SinkWrite =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
 
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close envelope's
+/// failure classes — this crate's mirror of
+/// `freshell_ws::pane_ledger::CloseEnvelopeError` (it cannot see the ledger;
+/// the server-side sink maps between them). The envelope's durable act is
+/// ONE journal record, so a failing close has exactly two honest outcomes:
+#[derive(Debug)]
+pub enum SinkCloseError {
+    /// NOTHING the close wrote is durable. The kill lane leaves ALL live
+    /// state untouched and answers `success:false` — the session stays live
+    /// and self-consistent, and a retried kill re-attempts idempotently.
+    Clean(std::io::Error),
+    /// The close IS durable (the journal record stands) although its write
+    /// reported failure. The kill lane ENDS the session (a live session
+    /// beside durable close evidence is exactly the recovery
+    /// misclassification the finding outlawed) while STILL answering
+    /// `success:false` — the kill visibly fails; it masquerades as neither
+    /// clean success nor clean failure.
+    Persisted(std::io::Error),
+}
+
+impl SinkCloseError {
+    pub fn is_persisted(&self) -> bool {
+        matches!(self, SinkCloseError::Persisted(_))
+    }
+}
+
+impl std::fmt::Display for SinkCloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SinkCloseError::Clean(e) => write!(f, "the durable close failed cleanly: {e}"),
+            SinkCloseError::Persisted(e) => {
+                write!(f, "the durable close reported failure but IS recorded: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SinkCloseError {}
+
+/// The close writes' completion future (the `retire_closed` /
+/// `retire_closed_batch` lanes) — the [`SinkWrite`] discipline with the
+/// classed error.
+pub type SinkCloseWrite =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SinkCloseError>> + Send + 'static>>;
+
+/// How a kill lane reads the durable close's answer (delta-r6-r4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAnswer {
+    /// The close is durable and reported cleanly — proceed, answer success.
+    Recorded,
+    /// The close is durable but its write reported an error — END the
+    /// session anyway (consistent with the durable close) while answering
+    /// `success:false` (the kill visibly fails).
+    Persisted,
+    /// Nothing durable — abort: `success:false`, every live-state artifact
+    /// untouched (a retried kill re-attempts idempotently).
+    Failed,
+}
+
+impl CloseAnswer {
+    pub fn of(result: Result<(), SinkCloseError>) -> Self {
+        match result {
+            Ok(()) => CloseAnswer::Recorded,
+            Err(SinkCloseError::Persisted(_)) => CloseAnswer::Persisted,
+            Err(SinkCloseError::Clean(_)) => CloseAnswer::Failed,
+        }
+    }
+}
+
 /// The claim commit's outcome (focused-ep5-r3 Finding 1, retire-on-kill
 /// round 4) — the freshagent-crate mirror of `freshell_ws::pane_ledger`'s
 /// `ClaimCommitOutcome` (this crate cannot see the ledger; the server-side
@@ -311,34 +380,41 @@ pub trait PaneIdentitySink: Send + Sync {
     /// retried kill re-attempts): acknowledging a close that was never
     /// recorded leaves the row Bound and offerable while the client believes
     /// the pane is gone. Same discipline as the WS `terminal.kill` path's
-    /// `retire_closed` ("P1.8 trigger (e)", same failure rule).
+    /// close ("P1.8 trigger (e)", same failure rule).
+    ///
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) splits the `Err`:
+    /// [`SinkCloseError::Clean`] means NOTHING is durable (the caller reports
+    /// `success:false` and leaves all live state untouched — a retried kill
+    /// re-attempts); [`SinkCloseError::Persisted`] means the close IS durable
+    /// despite the reported error — the caller ENDS the session consistently
+    /// while still answering `success:false` (the kill visibly fails; a live
+    /// session must never sit beside durable close evidence — recovery would
+    /// suppress it).
     ///
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): ledger-side this
-    /// ALSO records the durable KILL TOMBSTONE for the identity (same
-    /// awaited batch), which the ledger's `record_fresh_agent_binding`
+    /// ALSO records the durable close fence for the identity (same awaited
+    /// batch), which the ledger's `record_fresh_agent_binding`
     /// consults before writing — so a binding write already in flight when
     /// the kill landed (an aborted consumer's orphaned spawn_blocking
     /// closure) suppresses itself instead of restoring Bound after the
     /// retire. See [`Self::clear_kill_tombstone`] for the lifecycle exit.
-    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite;
-    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5) — the kill
-    /// lanes' ONE durable close envelope: EVERY identity the kill covers (the
-    /// wire id, a bare placeholder, every alias-resolved durable id) closes
-    /// in ONE guarded ledger mutation (kill tombstones first, row retires
-    /// after), and pending markers delete LAST. The envelope is
-    /// failure-atomic across the set: `Err` means NOTHING this call wrote is
-    /// left durable (the ledger rolled its own writes back), so a failed
-    /// kill never leaves a retired row or standing fence over the still-live
-    /// session — recovery can never misread it as closed. Awaited like every
-    /// non-rollback lane; callers treat `Err` as a KILL FAILURE (report
-    /// `success:false`, touch no live state — a retried kill re-attempts
-    /// idempotently).
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite;
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5), re-durabled by
+    /// delta-r6-r4 (round 3, Finding 3) — the kill lanes' ONE durable close:
+    /// EVERY identity the kill covers (the wire id FIRST — it addresses the
+    /// journal record — followed by every alias-resolved durable id) closes
+    /// in ONE guarded ledger record (ONE atomic file — the pre-journal
+    /// multi-write split and its compensation machinery are gone), and
+    /// pending markers delete LAST. `Err` is [`SinkCloseError`] (see
+    /// [`Self::retire_closed`]): `Clean` ⇒ NOTHING durable (touch no live
+    /// state, answer failure — a retried kill re-attempts idempotently);
+    /// `Persisted` ⇒ the close IS durable (end the session, fail visibly).
     fn retire_closed_batch(
         &self,
         provider: &str,
         session_ids: &[String],
         pending_ids: &[String],
-    ) -> SinkWrite;
+    ) -> SinkCloseWrite;
     /// The PENDING companion of [`Self::retire_closed`]: a kill observed
     /// before identity resolution also deletes the pending marker, so a
     /// marker-driven resolution that lands later can never carry evidence
@@ -570,6 +646,12 @@ pub(crate) struct FakeIdentitySink {
     /// split-phase failure (the kill's first close lands, its completion
     /// close misses) `fail_writes` cannot stage. `None` disarms.
     fail_retires_after: std::sync::Mutex<Option<i64>>,
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): when armed, every
+    /// retire answer is [`SinkCloseError::Persisted`] — the close's facts
+    /// fold (the real ledger's journal record stands) but the write
+    /// "reports failure", the landed-despite-error class the kill lanes must
+    /// honor by ending the session while answering `success:false`.
+    pub fail_retires_as_persisted: std::sync::atomic::AtomicBool,
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook — see
     /// [`Self::arm_post_commit_stall`].
     post_commit_stall: std::sync::Mutex<Option<PostCommitStallGate>>,
@@ -1208,7 +1290,7 @@ impl PaneIdentitySink for FakeIdentitySink {
         }
         self.write_result()
     }
-    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
         // Delta-r6-r2 (focused-episode-6 round 1, F3/F4) knob: the kill's
         // DURABLE phases split (wire id first, alias-resolved/late ids after),
         // and only a SEQUENCED failure can stage the second half failing —
@@ -1257,12 +1339,25 @@ impl PaneIdentitySink for FakeIdentitySink {
         // between its completed close and its teardown, deterministically.
         // Never engages on the failure knob (a failed retire is no stall).
         if budget_fail {
-            return Box::pin(std::future::ready(Err(std::io::Error::other(
-                "fake write failure",
+            return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
+                std::io::Error::other("fake write failure"),
             ))));
         }
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-            return self.write_result();
+            return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
+                std::io::Error::other("fake write failure"),
+            ))));
+        }
+        // Delta-r6-r4 (Finding 3): the persisted arm — the close's facts ARE
+        // folded (above: the journal record stands) but the answer reports
+        // failure; the lane must end the session and answer success:false.
+        if self
+            .fail_retires_as_persisted
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Box::pin(std::future::ready(Err(SinkCloseError::Persisted(
+                std::io::Error::other("fake persisted-close failure"),
+            ))));
         }
         let stall_arm = {
             let gate = self.retire_stall.lock().unwrap();
@@ -1284,14 +1379,14 @@ impl PaneIdentitySink for FakeIdentitySink {
                 Ok(())
             });
         }
-        self.write_result()
+        Box::pin(std::future::ready(Ok(())))
     }
     fn retire_closed_batch(
         &self,
         provider: &str,
         session_ids: &[String],
         pending_ids: &[String],
-    ) -> SinkWrite {
+    ) -> SinkCloseWrite {
         // Delta-r6-r3 (focused-episode-6 round 2) fake mirror of the ledger's
         // `close_identities` envelope: failure-atomic across the set — a
         // failed call applies NOTHING (the rollback is exact, so applying
@@ -1313,8 +1408,8 @@ impl PaneIdentitySink for FakeIdentitySink {
             }
         };
         if budget_fail || self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-            return Box::pin(std::future::ready(Err(std::io::Error::other(
-                "fake write failure",
+            return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
+                std::io::Error::other("fake write failure"),
             ))));
         }
         self.retire_batches.lock().unwrap().push((
@@ -1351,6 +1446,16 @@ impl PaneIdentitySink for FakeIdentitySink {
             for p in pending_ids {
                 pendings.retain(|(id, _, _)| id != p);
             }
+        }
+        // Delta-r6-r4 (Finding 3): the persisted arm — the facts ARE folded
+        // (above: the journal record stands) but the answer reports failure.
+        if self
+            .fail_retires_as_persisted
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Box::pin(std::future::ready(Err(SinkCloseError::Persisted(
+                std::io::Error::other("fake persisted-close failure"),
+            ))));
         }
         // Retire-stall arm (same contract as the single close: the envelope's
         // mutations are ON RECORD, only its ANSWER parks) — an armed gate

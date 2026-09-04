@@ -5557,26 +5557,42 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let tid = kill.terminal_id.clone();
     let now = now_ms();
-    let recorded = spawn_blocking_in_span(move || {
-        ledger
-            .close_pane(&crate::pane_ledger::PaneCloseWrite {
-                terminal_id: tid.clone(),
-                create_request_id,
-                resolved: sref.into_iter().collect(),
-                now_ms: now,
-            })
-            .map_err(|err| {
-                tracing::warn!(error = %err, "pane_ledger_close_pane_failed_on_kill");
-                err
-            })
-            .is_ok()
+    // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's error
+    // is CLASSED, never flattened — `Clean` means nothing is durable (leave
+    // the terminal running, answer failure); `Persisted` means the journal
+    // record stands despite the reported error, so the kill PROCEEDS (the
+    // live terminal ends, consistent with the durable close) while the
+    // answer still reports failure visibly.
+    let close_outcome = spawn_blocking_in_span(move || {
+        ledger.close_pane(&crate::pane_ledger::PaneCloseWrite {
+            terminal_id: tid.clone(),
+            create_request_id,
+            resolved: sref.into_iter().collect(),
+            now_ms: now,
+        })
     })
     .await
     .unwrap_or_else(|err| {
         tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
-        false
+        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+            std::io::Error::other(format!("close task join failed: {err}")),
+        ))
     });
-    if !recorded {
+    let persisted_despite_error = match &close_outcome {
+        Ok(()) => false,
+        Err(err) => {
+            if err.is_persisted() {
+                tracing::error!(terminal_id = %kill.terminal_id, error = %err,
+                    "pane_ledger_close_persisted_despite_error_on_kill: the close is durable; \
+                     the terminal ends consistently and the answer reports the failure");
+                true
+            } else {
+                tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_pane_failed_on_kill");
+                false
+            }
+        }
+    };
+    if close_outcome_is_clean_failure(&close_outcome) {
         const CLOSE_FAILURE_COPY: &str =
             "the terminal close could not be recorded durably; the terminal was left running";
         if let Some(request_id) = &kill.request_id {
@@ -5602,24 +5618,54 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         });
         return send(ws_tx, &msg).await;
     }
-    // The durable close stands; the correlated answer reports success
-    // regardless of whether a reaper beat the process kill (a missing
-    // registry row means the terminal is already gone — not a close
-    // failure). The requestId-less arms keep their legacy shapes.
+    // The durable close stands (cleanly, or persisted-despite-error). The
+    // correlated answer reports success regardless of whether a reaper beat
+    // the process kill (a missing registry row means the terminal is already
+    // gone — not a close failure); the requestId-less arms keep their legacy
+    // shapes. The persisted-despite-error arm answers success:false — the
+    // kill visibly failed — but still ends the terminal (the close IS
+    // durable; keeping it live would misclassify it at recovery).
+    const PERSISTED_CLOSE_COPY: &str =
+        "the terminal close is recorded durably, but the ledger reported an error; \
+         the terminal was closed to keep state consistent";
     if let Some(request_id) = &kill.request_id {
         kill_and_broadcast(state, &kill.terminal_id);
         let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
             request_id: request_id.clone(),
             terminal_id: kill.terminal_id,
-            success: true,
-            error: None,
+            success: !persisted_despite_error,
+            error: persisted_despite_error.then(|| PERSISTED_CLOSE_COPY.to_string()),
         });
         return send(ws_tx, &msg).await;
     }
     if kill_and_broadcast(state, &kill.terminal_id) {
+        if persisted_despite_error {
+            let msg = ServerMessage::Error(ErrorMsg {
+                code: ErrorCode::InternalError,
+                message: PERSISTED_CLOSE_COPY.to_string(),
+                timestamp: crate::now_iso(),
+                actual_session_ref: None,
+                expected_session_ref: None,
+                request_id: None,
+                retry_after_ms: None,
+                terminal_id: Some(kill.terminal_id.clone()),
+                terminal_exit_code: None,
+                live_terminal_id: None,
+            });
+            return send(ws_tx, &msg).await;
+        }
         return true;
     }
     send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await
+}
+
+/// True iff the close envelope reported a CLEAN failure (nothing durable —
+/// the kill must leave the terminal running). `Ok` and `Persisted` both
+/// mean the close is durable.
+fn close_outcome_is_clean_failure(
+    outcome: &Result<(), crate::pane_ledger::CloseEnvelopeError>,
+) -> bool {
+    matches!(outcome, Err(err) if !err.is_persisted())
 }
 
 /// The kill core, split from the socket reply for testability: `true` = the

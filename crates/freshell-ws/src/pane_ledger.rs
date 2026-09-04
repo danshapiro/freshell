@@ -22,15 +22,15 @@
 //!   lives in that crate's sink layer). Layout:
 //!   `rollback/<enc(provider)>/<enc(sessionId)>.json`.
 //! * **Kill tombstones** (focused-ep5-r1 Finding 2, retire-on-kill round 2) —
-//!   the durable record that an explicit close (`retire_closed`) happened for
-//!   a `(provider, sessionId)` identity, consulted by
-//!   [`PaneLedger::record_fresh_agent_binding`] (a fresh one suppresses the
-//!   late in-flight write that would otherwise resurrect a Bound row the kill
-//!   just retired; an expired one is swept). TTL'd
-//!   ([`KILL_TOMBSTONE_TTL_MS`]); cleared by
-//!   [`PaneLedger::clear_kill_tombstone`] on a genuine claim (explicit
-//!   resume/attach). Layout:
-//!   `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
+//!   a durable close fence for a `(provider, sessionId)` identity, consulted
+//!   by [`PaneLedger::record_fresh_agent_binding`] (a fresh one suppresses
+//!   the late in-flight write that would otherwise resurrect a Bound row the
+//!   kill just retired; an expired one is swept). Since delta-r6-r4
+//!   (focused-episode-6 round 3, Finding 3) close fences are DERIVED from the
+//!   close-envelope journal records below (never written as per-identity
+//!   files by a close); the `kill-tombstones/` subtree is the LEGACY shape —
+//!   loaded, cleared, and swept exactly as before, but no longer written.
+//!   Layout: `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
 //! * **Alias tombstones** (focused-ep5-r5 Finding 2, retire-on-kill round 6) —
 //!   the durable placeholder→durable records the claude lane's kills consult:
 //!   a claude pane closes by its ORIGINAL bare placeholder while its ledger
@@ -44,31 +44,44 @@
 //!   GC under the SAME lifetime discipline the round-5 in-memory store uses:
 //!   a record outlives the TTL for as long as the row it can resolve to is
 //!   Bound. Layout: `alias-tombstones/<enc(provider)>/<enc(placeholder)>.json`.
-//! * **Pane close records** (delta-r6-r2, focused-episode-6 round 1) — the
-//!   terminal lane's PANE-keyed durable close: every explicit terminal kill
-//!   (`terminal.kill` → [`PaneLedger::close_pane`]) records the close under
-//!   the identity the close KNOWS — the pane's `terminalId`, plus its
-//!   `createRequestId` lineage — even when no binding row exists yet (the
-//!   pre-resolution kill window). `resolve_pending` consults it (a closed
-//!   pane's late resolution lands its row Retired(Closed), never Bound), and
-//!   the recovery inventory's verdict join reads it wholesale (a snapshot
-//!   pane covered by a record verdicts `closed`, never `unknown`). The
-//!   fresh-agent lanes have no pane-keyed record: their placeholder-keyed
-//!   kill tombstone IS their close record, and the verdict join consults it
-//!   the same way. Layout: `close-records/<enc(terminalId)>.json`.
+//! * **Close-envelope journal records** (delta-r6-r4, focused-episode-6
+//!   round 3, Finding 3 — THE durability model of every explicit close). One
+//!   close = ONE record = ONE atomic file write
+//!   (`close-envelopes/<enc(key)>.json`; `pane:<terminalId>` keys the
+//!   terminal lane's record, `<provider>:<addressedSessionId>` the
+//!   fresh-agent lanes'). The record carries everything the close knows: the
+//!   pane linkage (`terminalId`/`createRequestId`) when the close keyed on a
+//!   pane, and the FULL identity set's close fences (`kills`). Its write
+//!   either lands wholly or not at all (temp+rename), so a failed close can
+//!   NEVER leave durable Closed residue over a session the killer then keeps
+//!   live — the pre-journal model's split tombstone+row writes could
+//!   ([`CloseEnvelopeError`] makes the landed-despite-error case a
+//!   persisted-close the caller honors by ending the session, never a
+//!   falsely-clean failure). Rollback of a failed envelope is deleting ONE
+//!   file (never N best-effort row restores); the row flips to
+//!   Retired(Closed) are projections the record dominates until the sweep
+//!   converges them, not the close itself. The close fences the record
+//!   carries feed the in-memory `kill_tombstones` index at persist and load
+//!   time, so every pre-existing consult (the binder's suppress arm, the
+//!   dominance sweep, the claim commit's conditional, the recovery
+//!   inventory's verdict join) reads them unchanged. `resolve_pending`
+//!   consults the record (a closed pane's late resolution lands its row
+//!   Retired(Closed), never Bound) and folds the identity into it. The
+//!   legacy `close-records/` tree (delta-r6-r2's pane-keyed records) loads
+//!   into the same index — the verdict join reads both identically. Layout:
+//!   `close-envelopes/<enc(key)>.json` (written) + `close-records/<enc(terminalId)>.json`
+//!   (legacy: loaded and swept, never written).
 //!
-//!   Retire-on-kill round 3 (focused-ep5-r2): the tombstone is THE AUTHOR OF
-//!   TRUTH for the identity's closedness — `retire_closed`'s two durable
-//!   writes (tombstone, then row retire) can split across a crash or a failed
-//!   second write, so a fresh tombstone DOMINATES a still-Bound row by ONE
-//!   rule enforced twice: the boot/periodic sweep re-applies the retirement
-//!   durably ([`PaneLedger::gc`]'s per-row pass;
+//!   Retire-on-kill round 3 (focused-ep5-r2): the close fence is THE AUTHOR
+//!   OF TRUTH for the identity's closedness — a fresh fence DOMINATES a
+//!   still-Bound row by ONE rule enforced twice: the boot/periodic sweep
+//!   re-applies the retirement durably ([`PaneLedger::gc`]'s per-row pass;
 //!   `BootScanReport::kill_tombstone_enforced_retires`), and the recovery
 //!   inventory reads a dominated row as Retired at offer-build time (via
-//!   [`PaneLedger::fresh_kill_tombstone_keys`]). The claim lifecycle's row
-//!   side is [`PaneLedger::revive_closed`]: a successful resume/attach
-//!   returns a kill-closed row to Bound (Closed-only; never creates a row),
-//!   invoked by the provider claim lanes together with the tombstone clear.
+//!   [`PaneLedger::dominant_kill_tombstone_keys`]). The claim lifecycle's row
+//!   side lives inside [`PaneLedger::commit_claim`]: a successful
+//!   resume/attach returns a kill-closed row to Bound and clears the fence
+//!   as ONE conditional transition (Closed-only; never creates a row).
 //!
 //! Deliberately NOT stored: scrollback (own store, P2.19), transcripts
 //! (provider-owned), layout (client-owned). NOT keyed on `createRequestId`
@@ -156,41 +169,46 @@ pub const KILL_TOMBSTONE_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 pub const ALIAS_TOMBSTONE_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// A kill tombstone (focused-ep5-r1 Finding 2, restore-open-sessions-only):
-/// the durable record that an explicit `retire_closed` (the retire-on-kill
-/// trigger) happened for this `(provider, session_id)` identity.
-/// [`PaneLedger::record_fresh_agent_binding`] consults it under the SAME
-/// index guard as the write it gates, so a binding write that was already in
-/// flight when the kill landed (an aborted consumer's orphaned
-/// `spawn_blocking` closure — task abort can never cancel it) is suppressed
-/// by CONSULTING STATE, never by task-abort ordering: whichever way the
-/// lock serializes, a fresh tombstone seen by the write means the identity
-/// stays dead. TTL'd (see [`KILL_TOMBSTONE_TTL_MS`]); cleared by
+/// the durable fence that an explicit close happened for this `(provider,
+/// session_id)` identity. [`PaneLedger::record_fresh_agent_binding`] consults
+/// it under the SAME index guard as the write it gates, so a binding write
+/// that was already in flight when the kill landed (an aborted consumer's
+/// orphaned `spawn_blocking` closure — task abort can never cancel it) is
+/// suppressed by CONSULTING STATE, never by task-abort ordering: whichever
+/// way the lock serializes, a fresh tombstone seen by the write means the
+/// identity stays dead. TTL'd (see [`KILL_TOMBSTONE_TTL_MS`]); cleared by
 /// [`PaneLedger::clear_kill_tombstone`] when a NEW pane/session genuinely
-/// claims the identity (an explicit resume/attach). Layout:
-/// `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
+/// claims the identity (an explicit resume/attach).
 ///
-/// Deliberately a separate subtree from binding rows (NOT a row state): the
-/// tombstone must fence identities whose row does NOT EXIST YET (the kill
-/// beat the in-flight adoption write), which a row-state marker can never
-/// express. The terminal-lineage binder (`record_binding` / `resolve_pending`)
-/// deliberately does not consult it (a terminal kill's own resume lanes must
-/// rebind freely). Round 3 (focused-ep5-r2) widened the READER set under one
-/// rule — a fresh tombstone means the identity is Closed — to the row
-/// sweep's dominance repair (`gc_row_locked`) and the recovery inventory's
-/// offer-time read ([`PaneLedger::fresh_kill_tombstone_keys`]); see the audit
-/// table in usual-sdd/retire-on-kill-r3-fix-report.md.
+/// LEGACY SHAPE (delta-r6-r4, focused-episode-6 round 3, Finding 3): the
+/// per-identity `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json` file
+/// is the PRE-journal durability model — closes since round 3 journal their
+/// identities into ONE [`CloseEnvelopeRecord`] instead (the record's `kills`
+/// feed the SAME in-memory fence index consults read). Files under this
+/// subtree are loaded, cleared, and swept as before, but never written.
+///
+/// Deliberately separate evidence from binding rows (NOT a row state): the
+/// fence must cover identities whose row does NOT EXIST YET (the kill beat
+/// the in-flight adoption write), which a row-state marker can never
+/// express. The terminal-lineage binder (`record_binding` /
+/// `resolve_pending`) deliberately does not consult it (a terminal kill's
+/// own resume lanes must rebind freely). Round 3 (focused-ep5-r2) widened
+/// the READER set under one rule — a fresh tombstone means the identity is
+/// Closed — to the row sweep's dominance repair (`gc_row_locked`) and the
+/// recovery inventory's offer-time read
+/// ([`PaneLedger::dominant_kill_tombstone_keys`]); see the audit table in
+/// usual-sdd/retire-on-kill-r3-fix-report.md.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KillTombstone {
     pub ledger_version: u32,
     pub provider: String,
     pub session_id: String,
-    /// When the explicit close happened (the `retire_closed` call's
-    /// `now_ms`). The TTL clock (freshness compare in
-    /// [`PaneLedger::record_fresh_agent_binding`] and the GC sweep) keys on
-    /// this; a backward wall-clock step counts tombstones as FRESH (the
-    /// fail-closed direction — subtraction-based compare, never expiry-sum
-    /// overflow).
+    /// When the explicit close happened (the close's `now_ms`). The TTL
+    /// clock (freshness compare in [`PaneLedger::record_fresh_agent_binding`]
+    /// and the GC sweep) keys on this; a backward wall-clock step counts
+    /// tombstones as FRESH (the fail-closed direction — subtraction-based
+    /// compare, never expiry-sum overflow).
     pub killed_at_ms: i64,
 }
 
@@ -237,6 +255,58 @@ pub struct PaneCloseKill {
     pub at_ms: i64,
 }
 
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) — the close envelope's
+/// ONE journal record: `close-envelopes/<enc(key)>.json`, THE durable act of
+/// every explicit close. ONE file (atomic temp+rename), so the envelope's
+/// write either lands wholly or not at all — a failed close can never leave
+/// durable Closed residue over a session the killer keeps live (the round-3
+/// finding), and rollback of the failed write is deleting the single file,
+/// never N best-effort row restores.
+///
+/// Keys: `pane:<terminalId>` for the terminal lane (`close_pane` — the close
+/// keyed by the PANE, with its `terminalId`/`createRequestId` linkage the
+/// recovery verdict join's pane-cover arm consumes) and
+/// `<provider>:<addressedSessionId>` for the fresh-agent lanes
+/// (`close_identities` — the kill's wire id, the identity the close knew
+/// first; a later kill naming a different alias journals a second record and
+/// the fences merge in the index). The mixed flat subtree cannot collide:
+/// every key carries a `:` (encoded), terminal ids are 32-hex.
+///
+/// What it carries:
+/// * `terminal_id` / `create_request_id` — the pane linkage when the close
+///   knew it (the terminal lane; absent on fresh-agent records).
+/// * `kills` — EVERY session identity this close fenced/retired, with the
+///   close stamp. These ARE the close fences: they feed the in-memory
+///   `kill_tombstones` index at persist and load time (max stamp wins across
+///   records), so the binder's suppress arm, the dominance sweep, the claim
+///   commit's conditional, and the recovery verdict join all consume them
+///   identically to the legacy per-identity tombstone files.
+/// * `closed_at` — the first close's stamp for this key; the retention
+///   clock is the newest of it and every `kills.at_ms`.
+///
+/// The row flip to Retired(Closed) is a PROJECTION the ledger attempts
+/// after the record stands (hygiene — never the close): a failed projection
+/// leaves a still-Bound row DOMINATED by the record-fed fence (reads closed
+/// at every boundary) until the sweep converges it durably.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseEnvelopeRecord {
+    pub ledger_version: u32,
+    /// The pane linkage when the close knew it (the terminal lane). `None`
+    /// on fresh-agent envelope records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
+    /// The first close's stamp for this key. The sweep's retention clock is
+    /// the newest of this and every `kills.at_ms`.
+    pub closed_at: i64,
+    /// Every session identity this key's closes fenced/retired. Same-key
+    /// repeats refresh the stamp.
+    #[serde(default)]
+    pub kills: Vec<PaneCloseKill>,
+}
+
 /// Delta-r6-r2 (focused-episode-6 round 1, Findings 1+2) — the PANE-keyed
 /// durable close record: `close-records/<enc(terminalId)>.json`. Every
 /// explicit terminal close issues one under the identity the close KNOWS —
@@ -267,6 +337,13 @@ pub struct PaneCloseKill {
 /// shorter. Key-collision honesty: `terminalId`s are 32-hex server mints,
 /// never re-minted (see the module doc) — a record can never shadow a later
 /// pane reusing an id.
+///
+/// LEGACY/READ-MODEL (delta-r6-r4): records under `close-records/` are the
+/// pre-journal shape — loaded into the same index the close-envelope records
+/// live in (and swept by the same retention rule), but never written. The
+/// struct survives as (a) that legacy schema and (b) the recovery verdict
+/// join's pane-keyed read model (`list_pane_closes` /
+/// `pane_close_for_terminal` derive it from the envelope records).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneCloseRecord {
@@ -286,21 +363,62 @@ pub struct PaneCloseRecord {
     pub kills: Vec<PaneCloseKill>,
 }
 
-/// Delta-r6-r3 (focused-episode-6 round 2) — the per-identity undo a close
-/// envelope captures BEFORE mutating, so the envelope's failure can roll
-/// back exactly its own writes and nothing else. Not serialized; pure
-/// in-memory span state (see [`PaneLedger::close_identities_locked`]).
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) — the close envelope's
+/// failure classes. The envelope's durable act is ONE journal record (one
+/// atomic file write), so a failing close has exactly two honest outcomes:
 #[derive(Debug)]
-struct IdentityCloseUndo {
-    provider: String,
-    session_id: String,
-    /// A kill fence stood for this identity BEFORE this envelope (refreshing
-    /// it re-stamps, it is never this envelope's to remove).
-    prior_tombstone: bool,
-    /// The FULL pre-close row. A rollback restores it when this op flipped
-    /// it Bound→Retired; `None` (or a non-Bound prior) means no row restore.
-    prior_row: Option<BindingRow>,
+pub enum CloseEnvelopeError {
+    /// NOTHING this close wrote is durable: the journal record does not
+    /// exist (the write never landed, or the rollback delete of the
+    /// landed-then-reported-failed record completed). The kill lane leaves
+    /// ALL live state untouched and answers failure — the session stays
+    /// live and self-consistent, and a retried close re-attempts
+    /// idempotently.
+    Clean(std::io::Error),
+    /// The journal record IS durable although its write reported failure
+    /// (the rename-committed / post-rename-fsync / EINTR class whose rollback
+    /// delete then failed — the finding's continuing-failure shape), OR a
+    /// pre-existing record at the key already covers the close. The kill
+    /// lane's contract: the close is durable, so the lane ENDS the session
+    /// (live state stays consistent with the durable close — a live session
+    /// beside close evidence is exactly what the finding outlawed) while
+    /// STILL answering `success:false` — the kill visibly failed; it did
+    /// not masquerade as either clean success or clean failure.
+    Persisted(std::io::Error),
 }
+
+impl CloseEnvelopeError {
+    /// The caller-side contract check: `true` means the close evidence is
+    /// durable (the session must end; the failure is still reported
+    /// visibly).
+    pub fn is_persisted(&self) -> bool {
+        matches!(self, CloseEnvelopeError::Persisted(_))
+    }
+
+    /// The underlying io error, either arm.
+    pub fn source_io(&self) -> &std::io::Error {
+        match self {
+            CloseEnvelopeError::Clean(e) | CloseEnvelopeError::Persisted(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for CloseEnvelopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CloseEnvelopeError::Clean(e) => {
+                write!(f, "the close envelope failed and nothing of it is durable: {e}")
+            }
+            CloseEnvelopeError::Persisted(e) => write!(
+                f,
+                "the close envelope reported failure but its journal record is durable \
+                 (persisted-close; the kill must end the session consistently): {e}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CloseEnvelopeError {}
 
 /// The pane-identifying inputs of [`PaneLedger::close_pane`]: everything the
 /// terminal kill knows at close time, captured OUTSIDE the ledger guard and
@@ -332,53 +450,6 @@ pub enum ClaimCommitOutcome {
     /// the identity stays durably closed and the caller tears its just-built
     /// session down.
     RefusedStale,
-}
-
-/// Delta-r6-r2 (focused-episode-6 round 1, Finding 6): WHICH durable write of
-/// [`PaneLedger::retire_closed`] failed. The close is two writes (the kill
-/// tombstone, then the row retire) and a partial pair reads WRONG either
-/// direction, so callers may never flatten to "Err == nothing persisted":
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClosePhase {
-    /// The kill-tombstone write failed (the row retire was still attempted,
-    /// per the both-attempted discipline) — nothing fenced, no dominance to
-    /// undo.
-    KillTombstone,
-    /// The tombstone persisted but the row retire did not: a DOMINANT pair
-    /// over the still-Bound row would read the LIVE session as closed at the
-    /// offer boundary and suppress it — the compensatable shape.
-    RowRetire,
-}
-
-/// The phase-attributed close failure ([`ClosePhase`]). `source` is the
-/// underlying io error of the phase that failed (the tombstone's error wins
-/// the pair when both failed, matching the pre-existing error precedence).
-#[derive(Debug)]
-pub struct RetireClosedError {
-    pub phase: ClosePhase,
-    pub source: std::io::Error,
-}
-
-impl RetireClosedError {
-    pub fn phase(&self) -> ClosePhase {
-        self.phase
-    }
-}
-
-impl std::fmt::Display for RetireClosedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let phase = match self.phase {
-            ClosePhase::KillTombstone => "kill-tombstone write",
-            ClosePhase::RowRetire => "row retire",
-        };
-        write!(f, "the durable close failed at its {phase}: {}", self.source)
-    }
-}
-
-impl std::error::Error for RetireClosedError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
 }
 
 /// Focused-ep5-r1 Finding 2: tombstone freshness — subtraction-based so a
@@ -448,6 +519,39 @@ fn classify_kill_tombstone(
             }
         }
     }
+}
+
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): feed ONE close-envelope
+/// journal record into the write-through index — the SAME discipline at
+/// persist time and at load. The record's `kills` ARE the close fences: each
+/// folds into the `kill_tombstones` index, max stamp winning across records
+/// and legacy files (a re-kill re-stamps forward).
+fn feed_close_envelope(
+    index: &mut LedgerIndex,
+    key: String,
+    record: CloseEnvelopeRecord,
+) {
+    for kill in &record.kills {
+        index
+            .kill_tombstones
+            .entry((kill.provider.clone(), kill.session_id.clone()))
+            .and_modify(|stamp| *stamp = (*stamp).max(kill.at_ms))
+            .or_insert(kill.at_ms);
+    }
+    index.close_envelopes.insert(key, record);
+}
+
+/// Does any STANDING close-envelope record fence this identity? The fence
+/// sweep's retention gate: a record-covered fence lives and dies with its
+/// record (the record's own retention rule is the reference-time rule), so
+/// the fence sweep never outruns it.
+fn any_envelope_fences(index: &LedgerIndex, provider: &str, session_id: &str) -> bool {
+    index.close_envelopes.values().any(|record| {
+        record
+            .kills
+            .iter()
+            .any(|k| k.provider == provider && k.session_id == session_id)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -849,11 +953,19 @@ struct LedgerIndex {
     /// (provider, session_id) -> rollback payload (kata 1wxv), OPAQUE JSON.
     rollback: std::collections::HashMap<(String, String), serde_json::Value>,
     /// (provider, session_id) -> killed_at_ms (focused-ep5-r1 Finding 2),
-    /// the write-through image of the `kill-tombstones/` subtree. Consulted
-    /// ONLY by [`PaneLedger::record_fresh_agent_binding`] (plus the GC sweep
-    /// and test/diagnostic reads) — never a liveness signal (a tombstoned
-    /// session is DEAD; this map says "its write is poison", nothing more).
+    /// the write-through image of the durable close fences: the LEGACY
+    /// `kill-tombstones/` files PLUS, since delta-r6-r4, every close-envelope
+    /// journal record's `kills` (both feed at persist and load; the max
+    /// stamp wins). Consulted by [`PaneLedger::record_fresh_agent_binding`]
+    /// (the suppress arm), the dominance sweep, the claim commit's
+    /// conditional, and the recovery inventory's verdict joins — never a
+    /// liveness signal.
     kill_tombstones: std::collections::HashMap<(String, String), i64>,
+    /// The fence keys backed by a LEGACY `kill-tombstones/` file (the
+    /// pre-journal shape). Tracked so the record sweep's un-feed only ever
+    /// drops fences no other durable source carries, and the fence sweep's
+    /// file delete targets real files.
+    legacy_tombstone_keys: std::collections::HashSet<(String, String)>,
     /// (provider, placeholder) -> [(durable, at_ms)] (focused-ep5-r5 Finding
     /// 2), the write-through image of the `alias-tombstones/` subtree.
     /// Consulted by the claude lane's kill retire-set resolution (a close
@@ -862,13 +974,17 @@ struct LedgerIndex {
     /// tombstoned placeholder's session is DEAD; this map answers ids for
     /// retire writes only).
     alias_tombstones: std::collections::HashMap<(String, String), Vec<(String, i64)>>,
-    /// terminal_id -> record (delta-r6-r2, focused-episode-6 round 1), the
-    /// write-through image of the `close-records/` subtree. Consulted by
-    /// `resolve_pending` (a closed pane's resolution lands Retired, never
-    /// Bound) and read wholesale by the recovery inventory's verdict join —
-    /// never a liveness answer: a standing record says THIS PANE was closed,
-    /// nothing about the identities' later lives on other panes.
-    pane_closes: std::collections::HashMap<String, PaneCloseRecord>,
+    /// Record key -> journal record (delta-r6-r4, focused-episode-6 round
+    /// 3), the write-through image of BOTH close-record subtrees: the
+    /// `close-envelopes/` journal records (`pane:<terminalId>` keys, or
+    /// `<provider>:<addressedSessionId>` for the fresh-agent lanes) and the
+    /// legacy `close-records/` pane records (folded in under their `pane:`
+    /// key). Consulted by `resolve_pending` (a closed pane's resolution
+    /// lands Retired, never Bound), read wholesale by the recovery
+    /// inventory's verdict join (and the record-fence retention gate), and
+    /// swept by the close-record retention rule. Never a liveness answer: a
+    /// standing record says THIS PANE / these identities were closed.
+    close_envelopes: std::collections::HashMap<String, CloseEnvelopeRecord>,
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -887,11 +1003,20 @@ pub struct PaneLedger {
     #[allow(dead_code)] // populated + read by the boot scan (Task 4)
     quarantined: RwLock<Vec<QuarantinedRow>>,
     /// Test-only staged-failure knob: the next N `write_binding` calls fail
-    /// (the compensated close's retry half needs a deterministic first-write
-    /// failure; read-only-dir staging cannot express "first attempt fails,
-    /// retry succeeds" without it). Zero in every non-test path.
+    /// (read-only-dir staging cannot express "first attempt fails, retry
+    /// succeeds" without it). Zero in every non-test path.
     #[cfg(test)]
     binding_write_failures: std::sync::atomic::AtomicUsize,
+    /// Test-only staged-failure knobs (delta-r6-r4 Finding 3): the next N
+    /// close-envelope record writes fail before landing / land-then-report /
+    /// and the next N rollback deletes fail. See
+    /// [`PaneLedger::fail_next_close_envelope_writes`]. Zero in production.
+    #[cfg(test)]
+    close_envelope_write_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    close_envelope_land_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    close_envelope_delete_failures: std::sync::atomic::AtomicUsize,
     /// Test-only suspension gate for the kill-vs-resolver interleave pin
     /// (delta-r6-r2 Finding 2): when armed, `resolve_pending` signals it has
     /// entered its guarded section and then BLOCKS on the test's release
@@ -917,6 +1042,12 @@ impl PaneLedger {
             quarantined: RwLock::new(Vec::new()),
             #[cfg(test)]
             binding_write_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            close_envelope_write_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            close_envelope_land_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             resolve_gate: Mutex::new(None),
         }
@@ -1036,14 +1167,41 @@ impl PaneLedger {
             .join(format!("{}.json", encode_segment(placeholder)))
     }
 
-    /// Pane close records (delta-r6-r2, focused-episode-6 round 1) — see
-    /// [`PaneCloseRecord`]. `close-records/<enc(terminalId)>.json`.
+    /// Legacy pane close records (delta-r6-r2) — see [`PaneCloseRecord`].
+    /// Loaded and swept, never written since delta-r6-r4 (closes journal into
+    /// `close-envelopes/`). `close-records/<enc(terminalId)>.json`.
     fn pane_close_dir(root: &Path) -> PathBuf {
         root.join("close-records")
     }
 
     fn pane_close_path(root: &Path, terminal_id: &str) -> PathBuf {
         Self::pane_close_dir(root).join(format!("{}.json", encode_segment(terminal_id)))
+    }
+
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close-envelope
+    /// journal subtree — THE durable act of every explicit close.
+    /// `close-envelopes/<enc(key)>.json`.
+    fn close_envelope_dir(root: &Path) -> PathBuf {
+        root.join("close-envelopes")
+    }
+
+    fn close_envelope_path(root: &Path, key: &str) -> PathBuf {
+        Self::close_envelope_dir(root).join(format!("{}.json", encode_segment(key)))
+    }
+
+    /// The envelope record's key. `pane:<terminalId>` for the terminal lane
+    /// (`close_pane`), `<provider>:<addressedSessionId>` for the fresh-agent
+    /// lanes (`close_identities` — the kill's wire id; a later kill naming a
+    /// different alias journals a second record and the fences merge). The
+    /// `:` never collides with the 32-hex terminal ids, and legacy
+    /// `close-records/` files fold in under their `pane:` key.
+    fn pane_envelope_key(terminal_id: &str) -> String {
+        format!("pane:{terminal_id}")
+    }
+
+    /// The fresh-agent lane's envelope key (see [`Self::pane_envelope_key`]).
+    fn agent_envelope_key(provider: &str, addressed_session_id: &str) -> String {
+        format!("{provider}:{addressed_session_id}")
     }
 
     fn rollback_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
@@ -1125,7 +1283,11 @@ impl PaneLedger {
         // keyed like the bindings subtree; expired entries are loaded anyway
         // and swept by the boot/GC pass or the write consult (mirroring the
         // marker discipline — `load_index` keeps only clean current-version
-        // parses; aging is the sweep's job, never the loader's).
+        // parses; aging is the sweep's job, never the loader's). LEGACY
+        // (delta-r6-r4): closes no longer write here — the load keeps the
+        // pre-journal files' fences alive; `legacy_tombstone_keys` tracks
+        // their provenance so the record sweep's un-feed never drops what a
+        // real file still carries.
         if let Ok(providers) = std::fs::read_dir(Self::kill_tombstone_dir(root)) {
             for provider in providers.flatten() {
                 let Ok(files) = std::fs::read_dir(provider.path()) else {
@@ -1138,10 +1300,16 @@ impl PaneLedger {
                     }
                     if let Ok(tombstone) = load_row::<KillTombstone>(&path) {
                         if tombstone.ledger_version == LEDGER_VERSION {
-                            index.kill_tombstones.insert(
-                                (tombstone.provider.clone(), tombstone.session_id.clone()),
-                                tombstone.killed_at_ms,
+                            let key = (
+                                tombstone.provider.clone(),
+                                tombstone.session_id.clone(),
                             );
+                            index.legacy_tombstone_keys.insert(key.clone());
+                            index
+                                .kill_tombstones
+                                .entry(key)
+                                .and_modify(|stamp| *stamp = (*stamp).max(tombstone.killed_at_ms))
+                                .or_insert(tombstone.killed_at_ms);
                         }
                     }
                 }
@@ -1176,8 +1344,11 @@ impl PaneLedger {
                 }
             }
         }
-        // Close-record subtree (delta-r6-r2): same discipline — every clean
-        // current-version record loads; retention is the sweep's call.
+        // Legacy close-record subtree (delta-r6-r2): the pre-journal
+        // pane-keyed records — folded into the SAME envelope index under
+        // their `pane:<terminalId>` key, their `kills` feeding the fence
+        // index exactly like a journal record's. Retention is the sweep's
+        // call, never the loader's.
         if let Ok(files) = std::fs::read_dir(Self::pane_close_dir(root)) {
             for file in files.flatten() {
                 let path = file.path();
@@ -1186,7 +1357,41 @@ impl PaneLedger {
                 }
                 if let Ok(record) = load_row::<PaneCloseRecord>(&path) {
                     if record.ledger_version == LEDGER_VERSION {
-                        index.pane_closes.insert(record.terminal_id.clone(), record);
+                        let envelope = CloseEnvelopeRecord {
+                            ledger_version: record.ledger_version,
+                            terminal_id: Some(record.terminal_id.clone()),
+                            create_request_id: record.create_request_id.clone(),
+                            closed_at: record.closed_at,
+                            kills: record.kills.clone(),
+                        };
+                        feed_close_envelope(
+                            &mut index,
+                            Self::pane_envelope_key(&record.terminal_id),
+                            envelope,
+                        );
+                    }
+                }
+            }
+        }
+        // The close-envelope journal subtree (delta-r6-r4): every clean
+        // current-version record loads; the map key comes from the FILENAME
+        // (encoded `pane:<terminalId>` / `<provider>:<addressedSessionId>`).
+        if let Ok(files) = std::fs::read_dir(Self::close_envelope_dir(root)) {
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue; // *.tmp-* / *.quarantined-* residue
+                }
+                let Some(key) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(decode_segment)
+                else {
+                    continue;
+                };
+                if let Ok(record) = load_row::<CloseEnvelopeRecord>(&path) {
+                    if record.ledger_version == LEDGER_VERSION {
+                        feed_close_envelope(&mut index, key, record);
                     }
                 }
             }
@@ -1509,24 +1714,21 @@ impl PaneLedger {
                 // (the Bound row outranks it) — never suppress the claim's own
                 // write; prune the residue instead so it cannot linger.
                 KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue => {
-                    index.kill_tombstones.remove(&key);
-                    if let Err(err) = std::fs::remove_file(Self::kill_tombstone_path(
-                        root,
-                        w.provider,
-                        w.session_id,
-                    )) {
-                        if err.kind() != std::io::ErrorKind::NotFound {
-                            // Fail loud, never silent: the sweep prunes at the
-                            // next GC pass regardless (a ClaimResidue file left
-                            // behind is inert either way — the row outranks it).
-                            tracing::warn!(
-                                target: "freshell_ws::pane_ledger",
-                                provider = %w.provider,
-                                session_id = %w.session_id,
-                                error = %err,
-                                "pane_ledger_stale_tombstone_sweep_failed: file left behind; GC retries"
-                            );
-                        }
+                    if let Err(err) =
+                        Self::clear_kill_fence_locked(root, &mut index, w.provider, w.session_id)
+                    {
+                        // Fail loud, never silent: the sweep prunes at the
+                        // next GC pass regardless (a ClaimResidue fence left
+                        // behind is inert either way — the row outranks it;
+                        // a record-fed fence simply re-derives at the next
+                        // load and dies with its record).
+                        tracing::warn!(
+                            target: "freshell_ws::pane_ledger",
+                            provider = %w.provider,
+                            session_id = %w.session_id,
+                            error = %err,
+                            "pane_ledger_stale_tombstone_sweep_failed: fence left behind; GC retries"
+                        );
                     }
                 }
             }
@@ -1741,29 +1943,34 @@ impl PaneLedger {
         }
     }
 
-    /// The kill-tombstone record (focused-ep5-r1 Finding 2): file FIRST,
-    /// then the write-through index — the `write_binding` discipline. Under
-    /// the caller's index guard. Idempotent refresh (a re-kill re-stamps
-    /// `killed_at_ms`).
-    fn record_kill_tombstone_locked(
-        &self,
+    /// Delta-r6-r4 (focused-episode-6 round 3): drop ONE identity's close
+    /// fence — the claim-lifecycle clear, the binder's lazy sweep, and the
+    /// fence sweep's prune all share it. The fence's durable sources: the
+    /// LEGACY per-identity file (deleted when present) and any standing
+    /// close-envelope journal records (append-only — never edited here; a
+    /// fence that re-derives from its record at the next load lands beside
+    /// the committed claim's newer row stamps and classifies inert
+    /// [`KillTombstoneVerdict::ClaimResidue`], or sweeps with the record).
+    /// The index drops only when the file delete succeeded-or-was-absent —
+    /// the file-first-then-index delete discipline.
+    fn clear_kill_fence_locked(
         root: &Path,
         index: &mut LedgerIndex,
         provider: &str,
         session_id: &str,
-        now_ms: i64,
     ) -> std::io::Result<()> {
-        let tombstone = KillTombstone {
-            ledger_version: LEDGER_VERSION,
-            provider: provider.to_string(),
-            session_id: session_id.to_string(),
-            killed_at_ms: now_ms,
+        let result = match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id))
+        {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         };
-        write_row_atomic(&Self::kill_tombstone_path(root, provider, session_id), &tombstone)?;
-        index
-            .kill_tombstones
-            .insert((provider.to_string(), session_id.to_string()), now_ms);
-        Ok(())
+        if result.is_ok() {
+            let key = (provider.to_string(), session_id.to_string());
+            index.kill_tombstones.remove(&key);
+            index.legacy_tombstone_keys.remove(&key);
+        }
+        result
     }
 
     /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): record (or refresh)
@@ -1978,18 +2185,7 @@ impl PaneLedger {
             return Ok(());
         };
         let mut index = self.guard();
-        let result = match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id))
-        {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
-        if result.is_ok() {
-            index
-                .kill_tombstones
-                .remove(&(provider.to_string(), session_id.to_string()));
-        }
-        result
+        Self::clear_kill_fence_locked(root, &mut index, provider, session_id)
     }
 
     /// Focused-ep5-r3 Findings 1+3 (retire-on-kill round 4) — the claim
@@ -2135,377 +2331,383 @@ impl PaneLedger {
             }
         }
         if tombstone_present {
-            let result =
-                match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id)) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                };
-            match result {
-                Ok(()) => {
-                    index.kill_tombstones.remove(&key);
-                }
-                Err(err) => {
-                    // The transition itself already committed durably above; a
-                    // failed ONLY-CLEANUP delete leaves claim residue (inert at
-                    // every consult, pruned by any sweep). Fail loud, never
-                    // silent — but never fail the accepted commit over it.
-                    tracing::warn!(
-                        target: "freshell_ws::pane_ledger",
-                        provider = %provider,
-                        session_id = %session_id,
-                        error = %err,
-                        "pane_ledger_claim_tombstone_delete_failed: inert claim residue left behind; the next sweep prunes it"
-                    );
-                }
+            // Delta-r6-r4: the fence's LEGACY file delete + the index drop
+            // ride one helper; a fence a standing journal record re-feeds at
+            // the next load lands beside this transition's refreshed row
+            // stamps and classifies ClaimResidue — inert at every consult,
+            // prunable with its record (never the accepted commit's undo).
+            if let Err(err) = Self::clear_kill_fence_locked(root, &mut index, provider, session_id)
+            {
+                // The transition itself already committed durably above; a
+                // failed ONLY-CLEANUP delete leaves claim residue (inert at
+                // every consult, pruned by any sweep). Fail loud, never
+                // silent — but never fail the accepted commit over it.
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %provider,
+                    session_id = %session_id,
+                    error = %err,
+                    "pane_ledger_claim_tombstone_delete_failed: inert claim residue left behind; the next sweep prunes it"
+                );
             }
         }
         Ok(ClaimCommitOutcome::Committed)
     }
 
-    /// Retire a row Closed on an explicit close (trigger e). Missing or
-    /// already-retired rows are Ok (idempotent). Delta-r6: this close is
+    /// Retire a row Closed on an explicit close (trigger e): the envelope of
+    /// one — the identity journals into its close-envelope record and its
+    /// Bound row flips Retired(Closed) as the projection. Missing or
+    /// already-retired rows are idempotent no-ops. Delta-r6: this close is
     /// load-bearing for the kill/close lanes that call it — the durable
     /// write precedes any live-state teardown, and the callers fail the
-    /// close (never a success acknowledgement) when it returns `Err`.
+    /// close (never a success acknowledgement) on `Err` — with
+    /// [`CloseEnvelopeError::Persisted`] telling the lane the close IS
+    /// durable despite the reported error (the lane ends the session
+    /// consistently and fails visibly).
     ///
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): an explicit close
-    /// is an intentional session END, so this call ALSO records the durable
-    /// kill tombstone for the identity BEFORE retiring the row (when one
-    /// exists), inside the same guard. The tombstone — not task-abort
-    /// ordering — is what fences a binding write already in flight at kill
-    /// time (an aborted consumer's orphaned spawn_blocking closure survives
-    /// its task and can land after every retire pass over a row that does
-    /// not exist yet): [`PaneLedger::record_fresh_agent_binding`] consults
-    /// the tombstone under this same index guard, so the write suppresses
-    /// itself (or force-retires a stale Bound remnant) instead of restoring
-    /// Bound. The tombstone write is attempted even when the row retire is a
-    /// no-op (kill-before-row is exactly the finding's shape).
+    /// is an intentional session END — the fence the record carries
+    /// suppresses a binding write already in flight at kill time (an aborted
+    /// consumer's orphaned `spawn_blocking` closure survives its task and
+    /// can land over a row that does not exist yet):
+    /// [`PaneLedger::record_fresh_agent_binding`] consults the fence under
+    /// the same index guard, so the write suppresses itself (or
+    /// force-retires a stale Bound remnant) instead of restoring Bound.
     ///
-    /// Delta-r6-r3 (focused-episode-6 round 2, Finding 3): the phases are
-    /// FAIL-FAST — a failed tombstone write returns immediately WITHOUT
-    /// attempting the row retire. The earlier dual-attempt could durably
-    /// retire a Bound row while the answer reported failure, suppressing a
-    /// still-live session from the recovery inventory.
-    ///
-    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 6): the failure is
-    /// PHASE-ATTRIBUTED ([`RetireClosedError`]) — a caller may never infer
-    /// "Err == nothing persisted": the tombstone write can land while the
-    /// row retire misses. Kill lanes must run the
-    /// compensated variant ([`PaneLedger::retire_closed_compensated`]), which
-    /// retries the retire once and, when it still fails, removes the
-    /// just-written tombstone so dominance never suppresses a still-live
-    /// session.
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): ONE close = ONE
+    /// journal record (see [`CloseEnvelopeRecord`]); the two-write
+    /// tombstone/then-retire split (and its compensation/rollback machinery)
+    /// is gone — there is no second write to fail past the first.
     pub fn retire_closed(
         &self,
         provider: &str,
         session_id: &str,
         now_ms: i64,
-    ) -> Result<(), RetireClosedError> {
-        let Some(root) = &self.root else {
-            return Ok(());
-        };
-        let mut index = self.guard();
-        self.retire_closed_locked(root, &mut index, provider, session_id, now_ms)
+    ) -> Result<(), CloseEnvelopeError> {
+        self.close_identities(provider, &[session_id.to_string()], &[], now_ms)
     }
 
-    /// The `retire_closed` body under the caller's guard (the pane-close op
-    /// and the resolve-time close adoption share it).
+    /// The close envelope's shared engine (delta-r6-r4, focused-episode-6
+    /// round 3, Finding 3): under the caller's index guard, merge the
+    /// identity set into the key's journal record, persist it (THE durable
+    /// act — ONE atomic file write), feed the write-through index, then
+    /// project the row flips as hygiene. The failure protocol:
     ///
-    /// Delta-r6-r3 (focused-episode-6 round 2, Finding 3) — FAIL-FAST per
-    /// phase: a failed KILL-TOMBSTONE write must never be followed by the
-    /// row-retire attempt. The pre-fix dual-attempt could durably flip a
-    /// Bound row to Retired(Closed) while the kill reports failure and
-    /// leaves the live session intact — the inventory would then exclude a
-    /// genuinely open session. With fail-fast, a KillTombstone-phase `Err`
-    /// means NOTHING durable moved; a RowRetire-phase `Err` means the
-    /// tombstone stands and the row is still Bound (the compensated close
-    /// owns that split-write repair).
-    fn retire_closed_locked(
+    /// * write OK ⇒ the close is durable (`Ok`). The row flips are
+    ///   PROJECTIONS: a projection failure is logged (struct ERROR), never a
+    ///   close failure — the still-Bound row is dominated by the record-fed
+    ///   fence (reads closed at every boundary) until the sweep converges
+    ///   it. This is exactly the finding's continuing-failure staging, now
+    ///   consistent: the close stands, the kill proceeds, the session ends.
+    /// * write error ⇒ rollback = deleting the ONE file — but ONLY when
+    ///   this op created it (a pre-existing record at the key is prior close
+    ///   evidence, never this op's to erase). The delete succeeding (or the
+    ///   file never landing) ⇒ [`CloseEnvelopeError::Clean`] and NOTHING is
+    ///   durable. The delete failing while the covering record stands ⇒
+    ///   [`CloseEnvelopeError::Persisted`]: the caller's error reports
+    ///   persisted-close, and the index is fed to match the disk truth.
+    fn close_envelope_locked(
         &self,
         root: &Path,
         index: &mut LedgerIndex,
-        provider: &str,
-        session_id: &str,
+        key: &str,
+        identities: &[(String, String)],
+        terminal_id: Option<&str>,
+        create_request_id: Option<&str>,
         now_ms: i64,
-    ) -> Result<(), RetireClosedError> {
-        self.record_kill_tombstone_locked(root, index, provider, session_id, now_ms)
-            .map_err(|source| RetireClosedError {
-                phase: ClosePhase::KillTombstone,
-                source,
-            })?;
-        let Some(mut row) = index
-            .bindings
-            .get(&(provider.to_string(), session_id.to_string()))
-            .cloned()
-        else {
-            return Ok(());
-        };
-        if row.state != RowState::Bound {
-            return Ok(());
+    ) -> Result<(), CloseEnvelopeError> {
+        let prior = index.close_envelopes.get(key).cloned();
+        let mut record = prior.clone().unwrap_or(CloseEnvelopeRecord {
+            ledger_version: LEDGER_VERSION,
+            terminal_id: terminal_id.map(str::to_string),
+            create_request_id: create_request_id.map(str::to_string),
+            closed_at: now_ms,
+            kills: Vec::new(),
+        });
+        if record.create_request_id.is_none() {
+            record.create_request_id = create_request_id.map(str::to_string);
         }
-        row.state = RowState::Retired;
-        row.retired_reason = Some(RetiredReason::Closed);
-        row.updated_at = now_ms;
-        self.retry_row_retire_locked(root, index, &row)
-            .map_err(|source| RetireClosedError {
-                phase: ClosePhase::RowRetire,
-                source,
-            })
+        for (provider, session_id) in identities {
+            match record
+                .kills
+                .iter_mut()
+                .find(|k| &k.provider == provider && &k.session_id == session_id)
+            {
+                Some(existing) => existing.at_ms = now_ms,
+                None => record.kills.push(PaneCloseKill {
+                    provider: provider.clone(),
+                    session_id: session_id.clone(),
+                    at_ms: now_ms,
+                }),
+            }
+        }
+        let outcome =
+            self.persist_close_envelope_locked(root, index, key, &record, prior.is_some());
+        if outcome.is_ok() || outcome.as_ref().err().is_some_and(|e| e.is_persisted()) {
+            // The close stands (durably). Project the row flips — hygiene,
+            // never the close: a failed projection leaves a fence-dominated
+            // Bound row (reads closed at every boundary) until the sweep
+            // converges it durably. Loud, never silent.
+            self.project_row_flips_locked(root, index, identities, now_ms);
+        }
+        outcome
     }
 
-    /// The row-retire half of a close on an already-mutated row value
-    /// (file first, then the write-through index — the `write_binding`
-    /// discipline). Factored out so the compensated close's bounded retry is
-    /// the SAME write the first attempt ran.
-    fn retry_row_retire_locked(
+    /// THE durable act of the close envelope: write the ONE journal record.
+    /// See [`PaneLedger::close_envelope_locked`] for the failure protocol.
+    fn persist_close_envelope_locked(
         &self,
         root: &Path,
         index: &mut LedgerIndex,
-        row: &BindingRow,
-    ) -> std::io::Result<()> {
-        self.write_binding(root, index, row)
-    }
-
-    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 6) — the close every
-    /// kill lane uses: `retire_closed` with the partial-pair repair. A
-    /// RowRetire-phase failure (the tombstone landed; the row is still
-    /// Bound) is retried ONCE in-process; when the retry also fails the
-    /// just-written tombstone is REMOVED before the caller hears the
-    /// failure, so the tombstone's dominance can never read a still-live,
-    /// still-Bound session as closed (suppressing it from recovery). A
-    /// KillTombstone-phase failure has nothing durable to compensate. The
-    /// io error the caller sees is the retire's.
-    pub fn retire_closed_compensated(
-        &self,
-        provider: &str,
-        session_id: &str,
-        now_ms: i64,
-    ) -> std::io::Result<()> {
-        let Some(root) = self.root.clone() else {
-            return Ok(());
-        };
-        let mut index = self.guard();
-        self.retire_closed_compensated_locked(&root, &mut index, provider, session_id, now_ms)
-    }
-
-    /// The compensated close under the caller's guard ([`PaneLedger::close_pane`]
-    /// batches several identities under ONE hold).
-    fn retire_closed_compensated_locked(
-        &self,
-        root: &Path,
-        index: &mut LedgerIndex,
-        provider: &str,
-        session_id: &str,
-        now_ms: i64,
-    ) -> std::io::Result<()> {
-        match self.retire_closed_locked(root, index, provider, session_id, now_ms) {
-            Ok(()) => Ok(()),
-            Err(err) if err.phase == ClosePhase::KillTombstone => Err(err.source),
-            Err(_first_err) => {
-                // Tombstone persisted, row retire failed: retry the retire
-                // ONCE (the bounded in-process retry — the same write the
-                // first attempt ran).
-                let mut row = index
-                    .bindings
-                    .get(&(provider.to_string(), session_id.to_string()))
-                    .cloned();
-                if let Some(r) = row.as_mut() {
-                    if r.state == RowState::Bound {
-                        r.state = RowState::Retired;
-                        r.retired_reason = Some(RetiredReason::Closed);
-                        r.updated_at = now_ms;
+        key: &str,
+        record: &CloseEnvelopeRecord,
+        had_prior: bool,
+    ) -> Result<(), CloseEnvelopeError> {
+        let path = Self::close_envelope_path(root, key);
+        match self.envelope_write_outcome(&path, record) {
+            Ok(()) => {
+                feed_close_envelope(index, key.to_string(), record.clone());
+                Ok(())
+            }
+            Err(write_err) => {
+                if had_prior {
+                    // A close record at this key stood BEFORE this op: the
+                    // pane/addressed-identity's close evidence is durable
+                    // regardless of whether our write landed (ours lands as
+                    // its superset; a missed write leaves the prior intact).
+                    // Deleting is NEVER legal here (that would erase the
+                    // prior close) — the honest answer is persisted-close.
+                    // Feed the index from the disk truth.
+                    if let Some(probed) = Self::probe_close_envelope(&path) {
+                        feed_close_envelope(index, key.to_string(), probed);
                     }
+                    tracing::error!(
+                        target: "freshell_ws::pane_ledger",
+                        key = %key,
+                        error = %write_err,
+                        "pane_ledger_close_envelope_repersist_failed: the write reported an                          error, but a close record at this key already stands — reporting                          persisted-close (the kill ends its session consistently)"
+                    );
+                    return Err(CloseEnvelopeError::Persisted(write_err));
                 }
-                let retry = match &row {
-                    Some(r) if r.state == RowState::Retired => {
-                        self.retry_row_retire_locked(root, index, r)
+                // No prior record: rollback = deleting the ONE file.
+                match self.envelope_delete_outcome(&path) {
+                    Ok(()) => {
+                        // Rolled back (or never landed): NOTHING durable
+                        // survives — no record, no fence, no projection.
+                        Err(CloseEnvelopeError::Clean(write_err))
                     }
-                    // Nothing to retry (row missing / already retired): the
-                    // tombstone-only close is COMPLETE — the first error was
-                    // the pair's tombstone-precedence answer, and the state
-                    // is exactly "closed cleanly".
-                    _ => Ok(()),
-                };
-                match retry {
-                    Ok(()) => Ok(()),
-                    Err(retry_err) => {
-                        // Compensation: the tombstone we just wrote must NOT
-                        // stay dominant over a still-Bound row (a live
-                        // session the kill just failed to close would be
-                        // suppressed from recovery).
-                        if let Err(comp_err) =
-                            Self::remove_kill_tombstone_locked(root, index, provider, session_id)
-                        {
-                            tracing::error!(
-                                target: "freshell_ws::pane_ledger",
-                                provider = %provider,
-                                session_id = %session_id,
-                                error = %comp_err,
-                                "pane_ledger_close_compensation_failed: the just-written \
-                                 tombstone could not be removed after the retire retry failed; \
-                                 it dominates the still-Bound row until a sweep or claim heals it"
-                            );
+                    Err(delete_err) => {
+                        // The rollback target itself failed (the finding's
+                        // continuing failure). Probe the durable truth: a
+                        // record that stands AND covers this envelope's whole
+                        // close set is a PERSISTED close — reported as such,
+                        // never again "Err as though rollback completed".
+                        match Self::probe_close_envelope(&path) {
+                            Some(probed) if Self::record_covers(&probed, record) => {
+                                feed_close_envelope(index, key.to_string(), probed);
+                                tracing::error!(
+                                    target: "freshell_ws::pane_ledger",
+                                    key = %key,
+                                    error = %write_err,
+                                    rollback_error = %delete_err,
+                                    "pane_ledger_close_envelope_rollback_failed_but_durable:                                      the write landed despite its error and the rollback                                      delete failed — the close is DURABLE; reporting                                      persisted-close (the kill ends its session consistently)"
+                                );
+                                Err(CloseEnvelopeError::Persisted(write_err))
+                            }
+                            _ => {
+                                // No covering record stands (the temp+rename
+                                // never committed): the delete error was
+                                // noise on an absent path. Nothing durable.
+                                tracing::error!(
+                                    target: "freshell_ws::pane_ledger",
+                                    key = %key,
+                                    error = %write_err,
+                                    rollback_error = %delete_err,
+                                    "pane_ledger_close_envelope_rollback_failed_nothing_durable:                                      probe found no covering record — reporting a clean failure"
+                                );
+                                Err(CloseEnvelopeError::Clean(write_err))
+                            }
                         }
-                        Err(retry_err)
                     }
                 }
             }
         }
     }
 
-    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 2–5) — ONE close
-    /// envelope per kill: the whole identity set closes through
-    /// [`PaneLedger::close_identities_locked`] under ONE guard hold, and ANY
-    /// failure rolls the envelope's OWN writes back before the caller hears
-    /// `Err` — a failed kill must NEVER leave a retired row or a standing
-    /// tombstone over a session that stays live (recovery reads both as
-    /// closed and would suppress the genuinely-open session).
-    ///
-    /// Undo capture per identity: whether a tombstone PRE-EXISTED (never
-    /// removed by rollback — a refreshed prior fence is the identity's own
-    /// earlier evidence, not this envelope's) and the FULL pre-close row
-    /// (restored file+index on rollback when this op flipped Bound→Retired;
-    /// `None` means the close was tombstone-only and nothing row-wise moves
-    /// back). A rollback write that itself fails logs a structured ERROR:
-    /// the residual is the campaign's documented compensation class (the
-    /// next sweep/claim heals it), loud never silent.
-    ///
-    /// The retire half per identity keeps the compensated close's bounded
-    /// retry (one in-process retry of the same write) — a transient fs fault
-    /// converges instead of failing the whole envelope.
-    fn close_identities_locked(
+    /// Read + parse a close-envelope record (the rollback probe). A version
+    /// mismatch or a parse failure answers `None` — never mistaken for
+    /// covering evidence.
+    fn probe_close_envelope(path: &Path) -> Option<CloseEnvelopeRecord> {
+        let record = load_row::<CloseEnvelopeRecord>(path).ok()?;
+        (record.ledger_version == LEDGER_VERSION).then_some(record)
+    }
+
+    /// Does the on-disk `probed` record cover everything this envelope meant
+    /// to close? Every intended identity fenced (any stamp — the close FACT
+    /// is what covers) and the same pane linkage.
+    fn record_covers(probed: &CloseEnvelopeRecord, intended: &CloseEnvelopeRecord) -> bool {
+        probed.terminal_id == intended.terminal_id
+            && intended.kills.iter().all(|k| {
+                probed
+                    .kills
+                    .iter()
+                    .any(|p| p.provider == k.provider && p.session_id == k.session_id)
+            })
+    }
+
+    /// The row-projection half of a durable close: flip every still-Bound
+    /// row the close covers to Retired(Closed). HYGIENE, never the close —
+    /// failures log a structured ERROR; the fence-dominates-Bound shape it
+    /// leaves reads closed at every boundary (the sweep converges it).
+    fn project_row_flips_locked(
         &self,
         root: &Path,
         index: &mut LedgerIndex,
         identities: &[(String, String)],
         now_ms: i64,
-    ) -> std::io::Result<(Vec<PaneCloseKill>, Vec<IdentityCloseUndo>)> {
-        let mut kills: Vec<PaneCloseKill> = Vec::new();
-        let mut undos: Vec<IdentityCloseUndo> = Vec::new();
-        for (provider, session_id) in identities {
-            undos.push(IdentityCloseUndo {
-                provider: provider.clone(),
-                session_id: session_id.clone(),
-                prior_tombstone: index
-                    .kill_tombstones
-                    .contains_key(&(provider.clone(), session_id.clone())),
-                prior_row: index
-                    .bindings
-                    .get(&(provider.clone(), session_id.clone()))
-                    .cloned(),
-            });
-            let close = self.retire_closed_locked(root, index, provider, session_id, now_ms);
-            let close = match close {
-                Ok(()) => Ok(()),
-                Err(err) if err.phase == ClosePhase::KillTombstone => Err(err.source),
-                // RowRetire phase (the tombstone landed): the bounded retry of
-                // the SAME write — the compensated close's discipline.
-                Err(err) => {
-                    let mut row = index
-                        .bindings
-                        .get(&(provider.clone(), session_id.clone()))
-                        .cloned();
-                    if let Some(r) = row.as_mut() {
-                        if r.state == RowState::Bound {
-                            r.state = RowState::Retired;
-                            r.retired_reason = Some(RetiredReason::Closed);
-                            r.updated_at = now_ms;
-                        }
-                    }
-                    match &row {
-                        Some(r) if r.state == RowState::Retired => self
-                            .retry_row_retire_locked(root, index, r)
-                            .map_err(|_| err.source),
-                        // Row missing / already retired: the tombstone-only
-                        // close is complete.
-                        _ => Ok(()),
-                    }
-                }
-            };
-            match close {
-                Ok(()) => kills.push(PaneCloseKill {
-                    provider: provider.clone(),
-                    session_id: session_id.clone(),
-                    at_ms: now_ms,
-                }),
-                Err(err) => {
-                    self.rollback_closes_locked(root, index, &undos);
-                    return Err(err);
-                }
-            }
-        }
-        Ok((kills, undos))
-    }
-
-    /// Undo THIS close envelope's own durable writes (its callers' shared
-    /// compensation): rows this op flipped Bound→Retired are restored to
-    /// their captured pre-close state (file first, then the write-through
-    /// index — the `write_binding` discipline), and tombstones this op
-    /// CREATED (no prior fence standing) are removed. Prior fences are the
-    /// identity's own earlier evidence and stay.
-    fn rollback_closes_locked(
-        &self,
-        root: &Path,
-        index: &mut LedgerIndex,
-        undos: &[IdentityCloseUndo],
     ) {
-        for undo in undos.iter().rev() {
-            if let Some(prior) = &undo.prior_row {
-                if prior.state == RowState::Bound {
-                    if let Err(err) = self.write_binding(root, index, prior) {
-                        tracing::error!(
-                            target: "freshell_ws::pane_ledger",
-                            provider = %undo.provider,
-                            session_id = %undo.session_id,
-                            error = %err,
-                            "pane_ledger_close_envelope_rollback_failed: the row could not be \
-                             restored to its pre-close state; the Retired(Closed) residue reads \
-                             as closed until a sweep or reopen heals it"
-                        );
-                    }
+        for (provider, session_id) in identities {
+            let key = (provider.clone(), session_id.clone());
+            if let Some(mut row) = index.bindings.get(&key).cloned() {
+                if row.state != RowState::Bound {
+                    continue;
                 }
-            }
-            if !undo.prior_tombstone {
-                if let Err(err) =
-                    Self::remove_kill_tombstone_locked(root, index, &undo.provider, &undo.session_id)
-                {
+                row.state = RowState::Retired;
+                row.retired_reason = Some(RetiredReason::Closed);
+                row.updated_at = now_ms;
+                if let Err(err) = self.write_binding(root, index, &row) {
                     tracing::error!(
                         target: "freshell_ws::pane_ledger",
-                        provider = %undo.provider,
-                        session_id = %undo.session_id,
+                        provider = %provider,
+                        session_id = %session_id,
                         error = %err,
-                        "pane_ledger_close_envelope_rollback_failed: the tombstone this close \
-                         created could not be removed; it dominates the still-live identity \
-                         until a sweep or claim heals it"
+                        "pane_ledger_close_row_projection_failed: the close IS durable (its                          journal record stands); the still-Bound row is dominated by the                          close fence and the next sweep converges it durably"
                     );
                 }
             }
         }
     }
 
-    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5) — the fresh-agent
-    /// kill lanes' ONE durable close envelope: every session identity this
-    /// kill covers (the wire id, a bare placeholder, every alias-resolved
-    /// durable id) closes in ONE guarded mutation — tombstones written first,
-    /// row retires after, fail-fast with a FULL rollback of the envelope's
-    /// own writes on any failure (no multi-pass partials over a session the
-    /// lane then leaves live). The pending markers delete LAST, once the
-    /// closes are durable, and marker failures are warn-only hygiene: markers
-    /// are never recovery-offer inputs (the verdict join reads rows, close
-    /// records, and kill fences), a stale one TTL-sweeps, and every resolve
-    /// lane consults the close-through evidence first.
+    /// The envelope record's write step (the temp+rename). Test builds can
+    /// stage the two failure shapes: fail-before-landing ("doesn't exist"
+    /// side) and land-then-report-failure (the rename-committed class).
+    #[cfg(not(test))]
+    fn envelope_write_outcome(
+        &self,
+        path: &Path,
+        record: &CloseEnvelopeRecord,
+    ) -> std::io::Result<()> {
+        write_row_atomic(path, record)
+    }
+
+    /// The rollback's delete step. Test builds can fail it (the continuing
+    /// failure AT the rollback target). `NotFound` is already-gone.
+    #[cfg(not(test))]
+    fn envelope_delete_outcome(&self, path: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(test)]
+    fn envelope_write_outcome(
+        &self,
+        path: &Path,
+        record: &CloseEnvelopeRecord,
+    ) -> std::io::Result<()> {
+        let land_then_fail = self
+            .close_envelope_land_failures
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if land_then_fail > 0 {
+            self.close_envelope_land_failures
+                .store(land_then_fail - 1, std::sync::atomic::Ordering::SeqCst);
+            write_row_atomic(path, record)?;
+            return Err(std::io::Error::other(
+                "injected post-landing close-envelope write failure",
+            ));
+        }
+        let fail = self
+            .close_envelope_write_failures
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if fail > 0 {
+            self.close_envelope_write_failures
+                .store(fail - 1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::other("injected close-envelope write failure"));
+        }
+        write_row_atomic(path, record)
+    }
+
+    #[cfg(test)]
+    fn envelope_delete_outcome(&self, path: &Path) -> std::io::Result<()> {
+        let fail = self
+            .close_envelope_delete_failures
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if fail > 0 {
+            self.close_envelope_delete_failures
+                .store(fail - 1, std::sync::atomic::Ordering::SeqCst);
+            return Err(std::io::Error::other("injected close-envelope delete failure"));
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Test-only knob (delta-r6-r4 Finding 3): the next `n` close-envelope
+    /// record writes fail BEFORE anything lands — the "doesn't exist" side
+    /// of the forward-write failure.
+    #[cfg(test)]
+    pub(crate) fn fail_next_close_envelope_writes(&self, n: usize) {
+        self.close_envelope_write_failures
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only knob (delta-r6-r4 Finding 3): the next `n` close-envelope
+    /// record writes genuinely LAND, then report failure — the
+    /// rename-committed class that engages the rollback.
+    #[cfg(test)]
+    pub(crate) fn land_then_fail_next_close_envelope_writes(&self, n: usize) {
+        self.close_envelope_land_failures
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only knob (delta-r6-r4 Finding 3): the next `n` close-envelope
+    /// rollback deletes fail — the continuing failure AT the rollback target.
+    #[cfg(test)]
+    pub(crate) fn fail_next_close_envelope_deletes(&self, n: usize) {
+        self.close_envelope_delete_failures
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5), re-durabled by
+    /// delta-r6-r4 (round 3, Finding 3) — the fresh-agent kill lanes' ONE
+    /// durable close: every session identity the kill covers (the wire id
+    /// FIRST — it addresses the record's key — followed by every
+    /// alias-resolved durable id) journals into ONE close-envelope record in
+    /// ONE guarded op. `Ok` means the whole close set is durable; `Err` is
+    /// split by [`CloseEnvelopeError`]: `Clean` leaves NOTHING durable (a
+    /// retried kill re-attempts idempotently; the lane touches no live
+    /// state), `Persisted` means the close IS durable despite the reported
+    /// error (the lane ends the session consistently and fails visibly).
+    /// The pending markers delete LAST, once the close is durable, and
+    /// marker failures are warn-only hygiene: markers are never
+    /// recovery-offer inputs (the verdict join reads rows, close records,
+    /// and fences), a stale one TTL-sweeps, and every resolve lane consults
+    /// the close evidence first.
     ///
-    /// Identities are deduped; unknown ids are idempotent. `Ok` means the
-    /// whole close set is durable; `Err` means NOTHING this call wrote is
-    /// left durable (a retried kill re-attempts idempotently).
+    /// Identities are deduped; unknown ids are idempotent. An EMPTY
+    /// identity set writes no record (there is nothing to close — the lanes'
+    /// own contract since round 3 is that a kill always names itself).
     pub fn close_identities(
         &self,
         provider: &str,
         session_ids: &[String],
         pending_ids: &[String],
         now_ms: i64,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), CloseEnvelopeError> {
         let Some(root) = self.root.clone() else {
             return Ok(());
         };
@@ -2517,7 +2719,17 @@ impl PaneLedger {
                 keys.push(key);
             }
         }
-        self.close_identities_locked(&root, &mut index, &keys, now_ms)?;
+        if let Some((_, first_id)) = keys.first() {
+            self.close_envelope_locked(
+                &root,
+                &mut index,
+                &Self::agent_envelope_key(provider, first_id),
+                &keys,
+                None,
+                None,
+                now_ms,
+            )?;
+        }
         for pending_id in pending_ids {
             if let Err(err) = Self::remove_pending(&root, &mut index, pending_id) {
                 tracing::warn!(
@@ -2525,35 +2737,11 @@ impl PaneLedger {
                     provider = %provider,
                     pending_id = %pending_id,
                     error = %err,
-                    "pane_ledger_close_envelope_marker_delete_failed: the closes are durable; \
-                     the stale marker TTL-sweeps (resolve lanes consult the close evidence first)"
+                    "pane_ledger_close_envelope_marker_delete_failed: the closes are durable;                      the stale marker TTL-sweeps (resolve lanes consult the close evidence first)"
                 );
             }
         }
         Ok(())
-    }
-
-    /// Tombstone removal (file first, then the index): the compensated
-    /// close's compensation, extracted so the claim commit's cleanup arm can
-    /// share it later. `NotFound` is already-gone, like every ledger delete.
-    fn remove_kill_tombstone_locked(
-        root: &Path,
-        index: &mut LedgerIndex,
-        provider: &str,
-        session_id: &str,
-    ) -> std::io::Result<()> {
-        let result = match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id))
-        {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
-        if result.is_ok() {
-            index
-                .kill_tombstones
-                .remove(&(provider.to_string(), session_id.to_string()));
-        }
-        result
     }
 
     /// Delta-r6-r2 (focused-episode-6 round 1, Findings 1+2+6) — the terminal
@@ -2564,34 +2752,28 @@ impl PaneLedger {
     ///    when the kill captured one) UNION every binding row this pane owns
     ///    (`live_terminal_id == terminal_id`) — discovered under the guard,
     ///    so a resolution that beat the kill's in-memory capture but not its
-    ///    ledger turn is retired anyway (Finding 2's race, kill-side).
-    /// 2. The identity set closes as ONE envelope
-    ///    ([`PaneLedger::close_identities_locked`], delta-r6-r3 round 2,
-    ///    Findings 2–5): tombstones first, row retires after, fail-fast; ANY
-    ///    failure rolls the envelope's OWN writes back and returns `Err` —
-    ///    the caller (the terminal kill) answers a failure and leaves the
-    ///    terminal running, with no durable residue mis-reading the
-    ///    still-live session as closed.
-    /// 3. The [`PaneCloseRecord`] is merged (re-kills re-stamp; a record
-    ///    carrying the pane's earlier close gains the new identities) and
-    ///    persisted — written BEFORE the pending marker is deleted (round-2
-    ///    Finding at `:2430/:2456`: for a pre-resolution close the marker is
-    ///    the ONLY pre-existing evidence tying the pane to the attempted
-    ///    creation; deleting it first stranding-neither-artifact shapes left
-    ///    stale snapshots without a closed verdict). A record-write failure
-    ///    rolls the identity closes back — a failed kill leaves nothing
-    ///    durable.
+    ///    ledger turn closes under it (Finding 2's race, kill-side).
+    /// 2. The pane's close-envelope journal record is merged (re-kills
+    ///    re-stamp; a record carrying the pane's earlier close gains the new
+    ///    identities) and persisted — THE ONE durable act (delta-r6-r4):
+    ///    pane cover AND identity fences are the same single file, written
+    ///    BEFORE the pending marker is deleted (for a pre-resolution close
+    ///    the marker is the ONLY pre-existing evidence tying the pane to the
+    ///    attempted creation). The [`CloseEnvelopeError`] split drives the
+    ///    caller: `Clean` means nothing durable (the terminal kill leaves
+    ///    the process running and answers failure); `Persisted` means the
+    ///    close IS durable despite the reported error (the kill proceeds and
+    ///    fails visibly).
+    /// 3. The row flips land as projections (hygiene, never the close).
     /// 4. The pending marker is deleted (a live marker must not outlive the
-    ///    pane it names — same rule the pre-existing kill applied). After
-    ///    step 3 the close IS durable: a marker-delete failure here is
-    ///    warn-only hygiene (markers never feed recovery offers; every
-    ///    resolve lane consults the close evidence first; TTL sweeps the
-    ///    rest) — failing the kill now would strand a live session beside
-    ///    close evidence.
+    ///    pane it names). After step 2 the close IS durable: a
+    ///    marker-delete failure here is warn-only hygiene (markers never
+    ///    feed recovery offers; every resolve lane consults the close
+    ///    evidence first; TTL sweeps the rest).
     ///
     /// Every choice is idempotent: a retried kill re-derives the same set,
-    /// re-stamps the same fences, and re-merges the same record.
-    pub fn close_pane(&self, w: &PaneCloseWrite) -> std::io::Result<()> {
+    /// re-stamps the same record, and re-merges the same fences.
+    pub fn close_pane(&self, w: &PaneCloseWrite) -> Result<(), CloseEnvelopeError> {
         let Some(root) = self.root.clone() else {
             return Ok(());
         };
@@ -2610,73 +2792,71 @@ impl PaneLedger {
                 }
             }
         }
-        // Step 2 — the identity set closes as ONE failure-atomic envelope.
-        let (kills, undos) =
-            self.close_identities_locked(&root, &mut index, &keys, w.now_ms)?;
-        // Step 3 — the record (merge + persist + write-through) BEFORE the
-        // marker goes (it is the only pre-existing evidence for a
-        // pre-resolution close). A record-write failure rolls the identity
-        // closes back: the pane close is reported failed with nothing durable
-        // claiming otherwise.
-        let mut record = index
-            .pane_closes
-            .get(&w.terminal_id)
-            .cloned()
-            .unwrap_or_else(|| PaneCloseRecord {
-                ledger_version: LEDGER_VERSION,
-                terminal_id: w.terminal_id.clone(),
-                create_request_id: w.create_request_id.clone(),
-                closed_at: w.now_ms,
-                kills: Vec::new(),
-            });
-        if record.create_request_id.is_none() {
-            record.create_request_id = w.create_request_id.clone();
-        }
-        for kill in kills {
-            match record
-                .kills
-                .iter_mut()
-                .find(|k| k.provider == kill.provider && k.session_id == kill.session_id)
-            {
-                Some(existing) => existing.at_ms = kill.at_ms,
-                None => record.kills.push(kill),
-            }
-        }
-        if let Err(err) = write_row_atomic(&Self::pane_close_path(&root, &w.terminal_id), &record) {
-            self.rollback_closes_locked(&root, &mut index, &undos);
-            return Err(err);
-        }
-        index.pane_closes.insert(w.terminal_id.clone(), record);
-        // Step 4 — the marker (LAST; warn-only hygiene — see the struct doc
-        // step 4: the close is durable by now).
+        // Step 2 — THE durable act: the pane's journal record.
+        self.close_envelope_locked(
+            &root,
+            &mut index,
+            &Self::pane_envelope_key(&w.terminal_id),
+            &keys,
+            Some(&w.terminal_id),
+            w.create_request_id.as_deref(),
+            w.now_ms,
+        )?;
+        // Step 4 — the marker (LAST; warn-only hygiene — the close is
+        // durable by now).
         if let Err(err) = Self::remove_pending(&root, &mut index, &w.terminal_id) {
             tracing::warn!(
                 target: "freshell_ws::pane_ledger",
                 terminal_id = %w.terminal_id,
                 error = %err,
-                "pane_ledger_close_pane_marker_delete_failed: the close is durable (record \
-                 persisted); the stale marker TTL-sweeps and every resolve lane consults the \
-                 close record first"
+                "pane_ledger_close_pane_marker_delete_failed: the close is durable (record                  persisted); the stale marker TTL-sweeps and every resolve lane consults the                  close record first"
             );
         }
         Ok(())
     }
 
-    /// Every standing pane close record (the recovery inventory's verdict
-    /// join input). Memory-only (V1.md read policy); a disabled ledger
-    /// answers empty.
+    /// Every standing pane-keyed close record (the recovery inventory's
+    /// verdict join input), derived from the journal records — the
+    /// fresh-agent envelopes carry no pane linkage and never surface here.
+    /// Memory-only (V1.md read policy); a disabled ledger answers empty.
     pub fn list_pane_closes(&self) -> Vec<PaneCloseRecord> {
         if self.root.is_none() {
             return Vec::new();
         }
-        self.guard().pane_closes.values().cloned().collect()
+        self.guard()
+            .close_envelopes
+            .values()
+            .filter_map(|record| {
+                record
+                    .terminal_id
+                    .clone()
+                    .map(|terminal_id| PaneCloseRecord {
+                        ledger_version: record.ledger_version,
+                        terminal_id,
+                        create_request_id: record.create_request_id.clone(),
+                        closed_at: record.closed_at,
+                        kills: record.kills.clone(),
+                    })
+            })
+            .collect()
     }
 
     /// One pane's standing close record (`resolve_pending`'s consult shape).
     /// Memory-only; a disabled ledger answers `None`.
     pub fn pane_close_for_terminal(&self, terminal_id: &str) -> Option<PaneCloseRecord> {
         self.root.as_ref()?;
-        self.guard().pane_closes.get(terminal_id).cloned()
+        let record = self
+            .guard()
+            .close_envelopes
+            .get(&Self::pane_envelope_key(terminal_id))
+            .cloned()?;
+        Some(PaneCloseRecord {
+            ledger_version: record.ledger_version,
+            terminal_id: record.terminal_id.clone().unwrap_or_default(),
+            create_request_id: record.create_request_id.clone(),
+            closed_at: record.closed_at,
+            kills: record.kills.clone(),
+        })
     }
 
     /// Every standing kill-tombstone key, TTL- and class-agnostic — the
@@ -3097,20 +3277,20 @@ impl PaneLedger {
         // under the same index guard as the close pane's own act, so the two
         // interleavings are decided here: the close ran first ⇒ the record
         // stands and this arm fires; the close lands later ⇒ it discovers
-        // this row by `live_terminal_id` and retires it under ITS guard. The
-        // row is still written (retired evidence is real evidence — the
-        // verdict join's retired-correlation reads it) but lands
-        // Retired(Closed); the identity's kill fence folds (a late orphan
-        // write for the resolved id can never re-Bind it); the record
-        // LEARNS the now-known identity key.
-        if let Some(mut close) = index.pane_closes.get(w.terminal_id).cloned() {
-            self.record_binding_locked(root, &mut index, w)?; // the row, first
-            // …then retires it in the SAME guarded section (a crash between
-            // the two leaves the row Bound beside a FRESH tombstone stamped
-            // at/after its update — the dominance rule converges it, never
-            // offers it).
-            self.retire_closed_locked(root, &mut index, w.provider, w.session_id, w.now_ms)
-                .map_err(|err| err.source)?;
+        // this row by `live_terminal_id` and closes it under ITS guard.
+        // Delta-r6-r4 ordering: the record LEARNS the now-known identity key
+        // FIRST (the journal act — the fence it feeds is what dominates the
+        // row-write window), then the row is written Bound and immediately
+        // flipped Retired(Closed) — a crash between leaves the row Bound
+        // beside the standing fence (the dominance rule converges it, never
+        // offers it). A record-rewrite failure that landed nothing (`Clean`)
+        // fails the resolve with NO new evidence written; a persisted-close
+        // (`Persisted`) means the fold IS durable and the resolve proceeds.
+        if let Some(mut close) = index
+            .close_envelopes
+            .get(&Self::pane_envelope_key(w.terminal_id))
+            .cloned()
+        {
             if !close
                 .kills
                 .iter()
@@ -3122,10 +3302,29 @@ impl PaneLedger {
                     at_ms: w.now_ms,
                 });
             }
-            write_row_atomic(&Self::pane_close_path(root, w.terminal_id), &close)?;
-            index
-                .pane_closes
-                .insert(w.terminal_id.to_string(), close);
+            match self.persist_close_envelope_locked(
+                root,
+                &mut index,
+                &Self::pane_envelope_key(w.terminal_id),
+                &close,
+                true, // a record stands by construction on this arm
+            ) {
+                Ok(()) | Err(CloseEnvelopeError::Persisted(_)) => {}
+                Err(CloseEnvelopeError::Clean(err)) => return Err(err),
+            }
+            self.record_binding_locked(root, &mut index, w)?; // the row
+            if let Some(mut row) = index
+                .bindings
+                .get(&(w.provider.to_string(), w.session_id.to_string()))
+                .cloned()
+            {
+                if row.state == RowState::Bound {
+                    row.state = RowState::Retired;
+                    row.retired_reason = Some(RetiredReason::Closed);
+                    row.updated_at = w.now_ms;
+                    self.write_binding(root, &mut index, &row)?;
+                }
+            }
             if let Err(err) = Self::remove_pending(root, &mut index, w.terminal_id) {
                 tracing::warn!(
                     target: "freshell_ws::pane_ledger",

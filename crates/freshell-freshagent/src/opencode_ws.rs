@@ -1188,11 +1188,24 @@ impl FreshOpencodeState {
             let mut retire_ids: Vec<String> = Vec::new();
             let mut marker_ids: Vec<String> = Vec::new();
             let mut consider = |id: &str| {
+                // Focused-episode-6 round 3, Finding 1: EVERY key this kill
+                // answers to — durable `ses_*` ids AND placeholders — is
+                // close evidence (the durable record the recovery verdict
+                // join consults); a placeholder additionally names its
+                // pending marker for deletion. The pre-first-send shape
+                // (placeholders only) used to skip the identity set entirely
+                // (`retire_ids` empty ⇒ marker delete only), leaving a
+                // retained snapshot claiming the placeholder with no standing
+                // close fence — verdict `unknown`, re-offerable. The
+                // placeholder-keyed close IS the fresh-agent lane's close
+                // record (delta-r6-r2), so a kill with nothing else to close
+                // still writes it.
                 if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX) {
                     if !marker_ids.iter().any(|m| m == id) {
                         marker_ids.push(id.to_string());
                     }
-                } else if !retire_ids.iter().any(|r| r == id) {
+                }
+                if !retire_ids.iter().any(|r| r == id) {
                     retire_ids.push(id.to_string());
                 }
             };
@@ -1228,25 +1241,44 @@ impl FreshOpencodeState {
         // phase 2 of 5: it precedes the session-lock wait (phase 3), so no
         // park-prone await stands between the kill and its durable record,
         // and no durable write survives a failure the kill reports.
+        // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's
+        // answer is classed. `Failed` (Clean): nothing durable — the kill
+        // must NOT acknowledge success and must leave ALL live state
+        // untouched: the session stays live and Bound (self-consistent:
+        // nothing has been closed), and a retried kill re-attempts
+        // idempotently. `Persisted`: the close IS durable despite the
+        // reported error — the kill PROCEEDS (the session ends, consistent
+        // with the durable close) while the answer still reports
+        // `success:false` (the kill visibly fails).
+        let mut close_reported_failure = false;
         if let Some(sink) = self.identity_sink() {
-            if let Err(e) = sink
+            match sink
                 .retire_closed_batch(PROVIDER, &retire_ids, &marker_ids)
                 .await
             {
-                tracing::warn!(error = %e, sessions = ?retire_ids, "freshagent.opencode.retire_on_kill_failed");
-                // Failure propagation (delta-r6, envelope-atomic delta-r6-r3):
-                // the durable close did not land — NOTHING of it survived —
-                // so the kill must NOT acknowledge success and must leave ALL
-                // live state untouched: the session stays live and Bound
-                // (self-consistent: nothing has been closed), and a retried
-                // kill re-attempts idempotently.
-                self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                    provider: PROVIDER.to_string(),
-                    session_id: msg.session_id,
-                    session_type: SESSION_TYPE.to_string(),
-                    success: false,
-                }));
-                return;
+                Ok(()) => {}
+                Err(e) => {
+                    let persisted = e.is_persisted();
+                    if persisted {
+                        tracing::error!(error = %e, sessions = ?retire_ids,
+                            "freshagent.opencode.retire_on_kill_persisted_despite_error: the close \
+                             is durable; the kill ends the session and answers failure");
+                        close_reported_failure = true;
+                    } else {
+                        tracing::warn!(error = %e, sessions = ?retire_ids, "freshagent.opencode.retire_on_kill_failed");
+                        // Failure propagation: the durable close did not
+                        // land — NOTHING of it survived — so the kill must
+                        // NOT acknowledge success and must leave ALL live
+                        // state untouched.
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                        }));
+                        return;
+                    }
+                }
             }
         }
 
@@ -1287,17 +1319,31 @@ impl FreshOpencodeState {
                     if !retire_ids.iter().any(|id| id == real_id) {
                         if let Some(sink) = self.identity_sink() {
                             if let Err(e) = sink.retire_closed(PROVIDER, real_id).await {
-                                tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.retire_on_kill_failed");
-                                close_failed = true;
+                                if e.is_persisted() {
+                                    // Delta-r6-r4 (round 3 Finding 3): the
+                                    // late id's close IS durable despite the
+                                    // reported error — the kill proceeds
+                                    // (aborting would strand a live session
+                                    // beside standing close evidence — the
+                                    // finding's shape) and answers failure.
+                                    tracing::error!(error = %e, session = %real_id,
+                                        "freshagent.opencode.retire_on_kill_persisted_despite_error: \
+                                         the late close is durable; the kill proceeds and answers failure");
+                                    close_reported_failure = true;
+                                } else {
+                                    tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.retire_on_kill_failed");
+                                    close_failed = true;
+                                }
                             }
                         }
                     }
                 }
                 if close_failed {
                     // Delta-r6-r2 (Finding 4): ABORT — the completion retire
-                    // is not durable, and nothing live may be touched until
-                    // it is. The map stands, the killed flag was never set,
-                    // no teardown ran; the kill answers failure.
+                    // is not durable (nothing stands for the late id), and
+                    // nothing live may be touched until it is. The map
+                    // stands, the killed flag was never set, no teardown
+                    // ran; the kill answers failure.
                     None
                 } else {
                     s.killed.store(true, Ordering::SeqCst);
@@ -1352,14 +1398,16 @@ impl FreshOpencodeState {
         // `adapter.ts kill()` is unconditional (`return true` even for an
         // already-removed/unknown session) — idempotent, matching the codex/claude
         // `freshAgent.killed{success:true}` pattern. Every durable-close
-        // failure aborts BEFORE any live state is touched (delta-r6 phase 2;
-        // delta-r6-r2 Finding 4's completion retire, inside phase 3 ahead of
-        // the killed flag) — reaching here means the whole close is durable.
+        // CLEAN failure aborts BEFORE any live state is touched (delta-r6
+        // phase 2; delta-r6-r2 Finding 4's completion retire, inside phase 3
+        // ahead of the killed flag); a PERSISTED-despite-error close ends
+        // the session (consistent with the durable close) while the kill
+        // visibly fails (delta-r6-r4, round 3 Finding 3).
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
-            success: true,
+            success: !close_reported_failure,
         }));
     }
 
@@ -3946,6 +3994,29 @@ mod tests {
             !fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
             "the pre-materialization kill must delete the pending marker"
         );
+        // Focused-episode-6 round 3, Finding 1: the marker delete alone is
+        // NOT the close — a kill whose retire set is empty leaves NO durable
+        // close evidence for the placeholder, so a retained snapshot claiming
+        // it verdicts `unknown` and can re-offer the pane the user closed.
+        // The envelope's IDENTITY set must carry the placeholder itself (the
+        // placeholder-keyed close record the verdict join consults).
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the pre-lock close is ONE envelope call: {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "opencode");
+        assert!(
+            ids.contains(&placeholder.to_string()),
+            "a no-retire-ids kill must STILL close the placeholder durably \
+             (the verdict join's closed evidence): {ids:?}"
+        );
+        assert!(
+            pendings.contains(&placeholder.to_string()),
+            "the envelope's marker deletes still cover the placeholder: {pendings:?}"
+        );
 
         // The evicted-session arm: a durable id no longer in the session map
         // still retires the row it names (idempotent when no row exists).
@@ -4219,6 +4290,78 @@ mod tests {
         );
     }
 
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the opencode
+    /// lane's PERSISTED class on the pre-lock envelope: the whole identity
+    /// set's journal record IS durable although its write reports failure.
+    /// The kill must END the session (map removal, killed flag, teardown —
+    /// never a live session beside durable close evidence) while the answer
+    /// reports `success:false`.
+    #[tokio::test]
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-pers"), None).await;
+        let placeholder = "freshopencode-req-kill-pers";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+        while rx.try_recv().is_ok() {}
+
+        fake.fail_retires_as_persisted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        {
+            let sessions = st.sessions.lock().await;
+            assert!(
+                !sessions.contains_key(placeholder) && !sessions.contains_key("ses_1"),
+                "the close IS durable: the session ends (never a live session beside close evidence)"
+            );
+        }
+        assert!(
+            session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "the session was torn down"
+        );
+        let retires = fake.retires.lock().unwrap().clone();
+        for id in [placeholder, "ses_1"] {
+            assert!(
+                retires.contains(&("opencode".to_string(), id.to_string())),
+                "the close's facts are on record for {id}: {retires:?}"
+            );
+        }
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill fails VISIBLY even though the close is durable: {killed_frame}"
+        );
+    }
+
     /// Delta-r6 close-durability (the completion pass): the kill's retire set
     /// is derived WITHOUT the session lock (from the map's placeholder/durable
     /// mirror), so a first send that materializes WHILE the kill sits between
@@ -4267,6 +4410,14 @@ mod tests {
         let (provider, ids, pendings) = &batches[0];
         assert_eq!(provider, "opencode");
         assert!(ids.contains(&"ses_1".to_string()), "the envelope covers the durable id: {ids:?}");
+        // Focused-episode-6 round 3, Finding 1: the placeholder is close
+        // evidence too, not only a marker — it belongs in the IDENTITY set of
+        // every kill's envelope (a placeholder-claiming retained snapshot
+        // verdicts closed only while a standing close fence exists).
+        assert!(
+            ids.contains(&placeholder.to_string()),
+            "the envelope covers the placeholder itself (durable close evidence): {ids:?}"
+        );
         assert!(
             pendings.contains(&placeholder.to_string()),
             "the envelope's marker deletes cover the placeholder: {pendings:?}"
@@ -4326,10 +4477,23 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
-        assert!(
-            fake.retires.lock().unwrap().is_empty(),
-            "pre-condition: the un-materialized session exposes no durable id to retire"
-        );
+        // Post-F1 (focused-episode-6 round 3): phase 2 now closes the
+        // PLACEHOLDER itself (durable close evidence for a pre-materialization
+        // kill), so `retires` is no longer empty here — the pre-condition is
+        // that no DURABLE id was visible to the pre-lock scan (the late
+        // `ses_late` must be absent), which is what makes the session-lock
+        // completion pass load-bearing.
+        {
+            let retired_so_far = fake.retires.lock().unwrap().clone();
+            assert!(
+                retired_so_far.iter().all(|(_, id)| !id.starts_with("ses_")),
+                "pre-condition: the un-materialized session exposed no durable id to phase 2: {retired_so_far:?}"
+            );
+            assert!(
+                retired_so_far.contains(&("opencode".to_string(), placeholder.to_string())),
+                "pre-condition: phase 2 durably closed the placeholder itself: {retired_so_far:?}"
+            );
+        }
 
         // The first send's materialization completes NOW (mid-kill): the
         // durable id appears behind the kill's already-taken map read — folded

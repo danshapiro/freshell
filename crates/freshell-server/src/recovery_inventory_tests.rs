@@ -3188,6 +3188,71 @@ async fn route_never_offers_ledger_only_rows_without_parent_evidence() {
     assert_eq!(body["ledgerOnly"].as_array().unwrap().len(), 0);
 }
 
+/// Focused-episode-6 round 3, Finding 1 — the end-to-end pin: a fresh-agent
+/// (opencode) pane killed BEFORE its first send holds no row, only the
+/// placeholder-keyed close evidence the kill's envelope writes; a retained
+/// snapshot claiming that placeholder must verdict `closed` and never be
+/// offered. The chain pinned: ledger close (placeholder-only) -> the route's
+/// `CloseEvidence` read -> the verdict join -> the answer.
+#[tokio::test]
+async fn route_verdicts_a_pre_materialization_opencode_close_closed_never_offered() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "oldclient",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"fresh-agent",
+               "payload":{"provider":"opencode","sessionType":"freshopencode",
+                          "createRequestId":"req-oc-9",
+                          "sessionRef":{"provider":"opencode","sessionId":"freshopencode-req-oc-9"}}}]}
+        ]),
+    );
+    // The kill's ONE durable act (the placeholder-only close; what the fixed
+    // opencode lane's `retire_closed_batch` envelope persists).
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    let seeder = freshell_ws::pane_ledger::PaneLedger::new(Some(broot.clone()));
+    seeder
+        .close_identities(
+            "opencode",
+            &["freshopencode-req-oc-9".to_string()],
+            &["freshopencode-req-oc-9".to_string()],
+            1_000_100,
+        )
+        .expect("the pre-materialization close persists");
+    drop(seeder);
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let panes = body["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes[0]["ledgerState"], "closed",
+        "the placeholder-claiming snapshot pane is closed by the kill's durable evidence: {body}"
+    );
+    assert!(
+        panes[0]["sessionRef"].is_null(),
+        "a closed pane carries no resume ref — the verdict, never the offer: {body}"
+    );
+    // The offer-side exclusion itself (the closed pane leaves the restore
+    // plan and the count) is the client's `isRestorablePane` predicate —
+    // pinned in build-recovery-plan.test.ts (delta-r6): the server's half
+    // pinned here is that the pane NEVER reads unknown/offerable again.
+    assert_eq!(
+        body["ledgerOnly"].as_array().unwrap().len(),
+        0,
+        "no row exists to offer ledger-only: {body}"
+    );
+}
+
 #[tokio::test]
 async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
     // D8 route-level positive: a surviving generation for the row's OWN parent

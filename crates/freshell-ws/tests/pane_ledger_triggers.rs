@@ -974,17 +974,21 @@ async fn a_registry_less_kill_uses_the_message_carried_create_request_id_for_the
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// F6, the terminal half through the REAL failure surface: only the ROW
-/// retire write can fail (its bindings dir read-only; the tombstone's tree
-/// stays writable). The compensated close must NOT leave the just-written
-/// tombstone dominating the still-Bound row — the kill answers with an
-/// error, the terminal runs, and the disk shows row Bound + NO tombstone +
-/// NO close record.
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the terminal half
+/// through the REAL failure surface: only the row FLIP can fail (its
+/// bindings dir read-only; the journal record's tree stays writable). The
+/// close is the ONE journal record: the kill SUCCEEDS (the terminal ends —
+/// the close is durable, never an error frame), the fence stands on disk
+/// (fed by the record), and the still-Bound row is dominated — reads closed
+/// at every offer boundary — until a healed sweep converges it. NEVER the
+/// pre-journal shape: a kill reporting failure over durable Closed evidence
+/// while the terminal stays live (recovery suppressing a genuinely open
+/// session).
 #[cfg(unix)]
 #[tokio::test]
-async fn a_kill_whose_row_retire_fails_compensates_the_just_written_tombstone() {
+async fn a_kill_whose_row_projection_fails_still_ends_the_terminal_and_converges_at_the_sweep() {
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
-    let dir = unique_ledger_dir("kill-partial-close");
+    let dir = unique_ledger_dir("kill-projection-close");
     let (url, registry, server_ledger) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
@@ -992,7 +996,7 @@ async fn a_kill_whose_row_retire_fails_compensates_the_just_written_tombstone() 
     let session_id = "11111111-2222-3333-4444-777777777777";
     let create = serde_json::json!({
         "type": "terminal.create",
-        "requestId": "req-kill-partial-close",
+        "requestId": "req-kill-projection-close",
         "mode": "codex",
         "shell": "system",
         "cwd": std::env::temp_dir().to_string_lossy(),
@@ -1010,42 +1014,76 @@ async fn a_kill_whose_row_retire_fails_compensates_the_just_written_tombstone() 
         "precondition: the row stands Bound before the kill"
     );
 
-    // Only the row's bindings dir goes read-only: the tombstone can land,
-    // the retire cannot (its rename needs dir-write).
+    // Only the row's bindings dir goes read-only: the journal record can
+    // land, the row flip cannot (its rename needs dir-write).
     let bindings_dir = dir.join("bindings").join("codex");
     set_permissions_recursive(&bindings_dir, 0o555, 0o555);
 
     let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id });
     ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
-    let err = next_frame_of_type(&mut ws, "error").await;
+    // The close is durable (the journal record IS the close; the row flip
+    // is a projection): the terminal ends, no error frame arrives. Wait the
+    // registry removal out deterministically (pumping the socket).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if registry.probe(&terminal_id).is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the durable close ended the terminal (registry row removed)"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await;
+    }
+    let disk = PaneLedger::new(Some(dir.clone()));
+    let row = disk
+        .load_binding("codex", session_id)
+        .expect("row on disk");
     assert_eq!(
-        err["code"], "INTERNAL_ERROR",
-        "a failed durable close surfaces an error frame: {err}"
+        row.state,
+        RowState::Bound,
+        "the projection never landed: raw Bound on disk"
     );
-    assert_eq!(err["terminalId"], terminal_id);
-
     assert!(
-        registry.probe(&terminal_id).is_some(),
-        "a failed close leaves the terminal running"
+        disk.kill_tombstone_at("codex", session_id).is_some(),
+        "the close fence stands durable (fed by the journal record)"
+    );
+    assert!(
+        disk
+            .dominant_kill_tombstone_keys()
+            .contains(&("codex".to_string(), session_id.to_string())),
+        "the Bound row is dominated: it reads closed at every offer boundary (never restored)"
+    );
+    assert!(
+        disk.pane_close_for_terminal(&terminal_id).is_some(),
+        "the journal record (the pane close) is durable"
+    );
+
+    // Heal, then run the dominance sweep against the dir: the remnant
+    // converges to Retired(Closed) durably.
+    set_permissions_recursive(&dir, 0o755, 0o644);
+    let sweeper = PaneLedger::new(Some(dir.clone()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let report = sweeper.gc(now, &|_, _| false, None);
+    assert!(
+        report
+            .kill_tombstone_enforced_retires
+            .iter()
+            .any(|s| s.session_id == session_id),
+        "the sweep re-applied the retirement durably: {report:?}"
     );
     let disk = PaneLedger::new(Some(dir.clone()));
     assert_eq!(
         disk.load_binding("codex", session_id)
             .expect("row on disk")
             .state,
-        RowState::Bound,
-        "the row was never retired — no mis-restore"
-    );
-    assert!(
-        disk.kill_tombstone_at("codex", session_id).is_none(),
-        "compensation removed the just-written tombstone: no dominance over the live session"
-    );
-    assert!(
-        disk.list_pane_closes().is_empty(),
-        "no close record exists for a close that failed"
+        RowState::Retired,
+        "converged after the sweep"
     );
 
-    set_permissions_recursive(&dir, 0o755, 0o644);
     registry.kill(&terminal_id);
     std::fs::remove_dir_all(&dir).ok();
 }

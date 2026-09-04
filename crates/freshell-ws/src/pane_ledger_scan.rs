@@ -59,11 +59,12 @@ pub struct BootScanReport {
     /// TTL and only when the row it resolves to is Retired-or-GC'd (the
     /// round-5 lifetime-is-row-lifetime rule, on durable storage).
     pub alias_tombstones_swept: Vec<SessionLocator>,
-    /// Delta-r6-r2 (focused-episode-6 round 1): pane close records swept
-    /// this pass (the terminal ids). A record drops only once its NEWEST
-    /// stamp (`closed_at`, every `kills.at_ms`) is past
-    /// [`KILL_TOMBSTONE_TTL_MS`] — the same protective horizon as the kill
-    /// fences it stands beside.
+    /// Delta-r6-r2 (focused-episode-6 round 1), delta-r6-r4 (round 3): close
+    /// records swept this pass (the record keys — `pane:<terminalId>` /
+    /// `<provider>:<addressedSessionId>`). A record drops only once its
+    /// NEWEST stamp (`closed_at`, every `kills.at_ms`) is past
+    /// [`KILL_TOMBSTONE_TTL_MS`] — the same protective horizon as the close
+    /// fences it carries.
     pub pane_closes_swept: Vec<String>,
 }
 
@@ -264,7 +265,11 @@ impl PaneLedger {
                     .keys()
                     .cloned()
                     .collect::<Vec<(String, String)>>(),
-                index.pane_closes.keys().cloned().collect::<Vec<String>>(),
+                index
+                    .close_envelopes
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>(),
             )
         };
         for terminal_id in marker_ids {
@@ -335,32 +340,41 @@ impl PaneLedger {
         for key in alias_keys {
             self.gc_alias_tombstone_locked(root, index, &key, now_ms, &mut report);
         }
-        let pane_close_ids: Vec<String> = index.pane_closes.keys().cloned().collect();
+        let pane_close_ids: Vec<String> = index.close_envelopes.keys().cloned().collect();
         for terminal_id in pane_close_ids {
             self.gc_pane_close_locked(root, index, &terminal_id, now_ms, &mut report);
         }
         report
     }
 
-    /// Retention sweep for ONE pane close record, under the caller's guard
-    /// (delta-r6-r2, focused-episode-6 round 1): the record lives under the
-    /// SAME protective horizon as the kill fences its closes wrote — it is
-    /// pruned once its NEWEST stamp (`closed_at`, every `kills.at_ms`) is
-    /// past [`KILL_TOMBSTONE_TTL_MS`]. The record's live purpose is the
-    /// recovery evidence window around the close (push-cadence + staleness,
-    /// far under six hours); a stale record must not verdict a re-minted
-    /// pane... (terminal ids are never re-minted, so this ages out forensic
-    /// residue, never live meaning). Fail loud per record, never silent —
-    /// a failed delete keeps the record and retries next pass.
+    /// Retention sweep for ONE close record (delta-r6-r4: the journal
+    /// envelopes AND the legacy `close-records/` pane records — both live in
+    /// the `close_envelopes` index): the record lives under the SAME
+    /// protective horizon as the close fences it carries — it is pruned once
+    /// its NEWEST stamp (`closed_at`, every `kills.at_ms`) is past
+    /// [`KILL_TOMBSTONE_TTL_MS`]. The record's live purpose is the recovery
+    /// evidence window around the close (push-cadence + staleness, far under
+    /// six hours); a stale record must not verdict a re-minted pane...
+    /// (terminal ids are never re-minted, so this ages out forensic residue,
+    /// never live meaning). Fail loud per record, never silent — a failed
+    /// delete keeps the record and retries next pass.
+    ///
+    /// Delete paths: the journal tree (`close-envelopes/<enc(key)>.json`)
+    /// and, for pane-linked records, the legacy tree
+    /// (`close-records/<enc(terminalId)>.json`) — whichever a record was
+    /// loaded from is removed; `NotFound` on either is already-gone.
+    /// Un-feeding the fences it carried drops only what NO other durable
+    /// source (another standing record, or a legacy per-identity tombstone
+    /// file) still carries.
     fn gc_pane_close_locked(
         &self,
         root: &Path,
         index: &mut LedgerIndex,
-        terminal_id: &str,
+        key: &str,
         now_ms: i64,
         report: &mut BootScanReport,
     ) {
-        let Some(record) = index.pane_closes.get(terminal_id).cloned() else {
+        let Some(record) = index.close_envelopes.get(key).cloned() else {
             return; // consumed/removed since the snapshot — no longer qualifies
         };
         let newest = record
@@ -373,24 +387,69 @@ impl PaneLedger {
         if now_ms - newest < KILL_TOMBSTONE_TTL_MS {
             return;
         }
-        match std::fs::remove_file(Self::pane_close_path(root, terminal_id)) {
-            Ok(()) => {
-                index.pane_closes.remove(terminal_id);
+        // Dominance has no TTL (focused-ep5-r3 Finding 4, carried to the
+        // journal record): a fence this record feeds that still DOMINATES a
+        // Bound row is unconverged close evidence — the record stays until
+        // the row's projection converges (the sweep retires it durably,
+        // then a later pass prunes the settled record).
+        let still_dominant = record.kills.iter().any(|k| {
+            let ikey = (k.provider.clone(), k.session_id.clone());
+            let row_view = index.bindings.get(&ikey).map(|r| (r.state, r.updated_at));
+            // The fence stamp readers see (max across sources) governs.
+            let stamp = index.kill_tombstones.get(&ikey).copied().unwrap_or(k.at_ms);
+            classify_kill_tombstone(stamp, row_view, now_ms) == KillTombstoneVerdict::Dominant
+        });
+        if still_dominant {
+            return;
+        }
+        let mut paths = vec![PaneLedger::close_envelope_path(root, key)];
+        if let Some(terminal_id) = &record.terminal_id {
+            paths.push(PaneLedger::pane_close_path(root, terminal_id));
+        }
+        let mut first_err: Option<std::io::Error> = None;
+        for path in &paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        match first_err {
+            None => {
+                index.close_envelopes.remove(key);
+                // Un-feed the fences this record carried — but only where no
+                // OTHER durable source stands: another record fencing the
+                // same identity, or a legacy per-identity tombstone file.
+                for kill in &record.kills {
+                    let ikey = (kill.provider.clone(), kill.session_id.clone());
+                    if index.legacy_tombstone_keys.contains(&ikey) {
+                        continue;
+                    }
+                    let still_fenced = index.close_envelopes.values().any(|other| {
+                        other
+                            .kills
+                            .iter()
+                            .any(|k| k.provider == kill.provider && k.session_id == kill.session_id)
+                    });
+                    if !still_fenced {
+                        index.kill_tombstones.remove(&ikey);
+                    }
+                }
                 tracing::info!(
                     target: "freshell_ws::pane_ledger",
-                    terminal_id = %terminal_id,
+                    key = %key,
                     "pane_ledger_pane_close_swept: protective TTL elapsed"
                 );
-                report.pane_closes_swept.push(terminal_id.to_string());
+                report.pane_closes_swept.push(key.to_string());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                index.pane_closes.remove(terminal_id);
-                report.pane_closes_swept.push(terminal_id.to_string());
-            }
-            Err(err) => {
+            Some(err) => {
                 tracing::warn!(
                     target: "freshell_ws::pane_ledger",
-                    terminal_id = %terminal_id,
+                    key = %key,
                     error = %err,
                     "pane_ledger_pane_close_sweep_failed: file left behind; will retry next pass"
                 );
@@ -428,6 +487,12 @@ impl PaneLedger {
         let Some(killed_at) = index.kill_tombstones.get(key).copied() else {
             return; // cleared since the snapshot — no longer qualifies
         };
+        // Delta-r6-r4: a fence a standing close-envelope journal record feeds
+        // lives and dies WITH its record (the record's retention sweep is the
+        // reference-gated one); the fence sweep never outruns it.
+        if any_envelope_fences(index, &key.0, &key.1) {
+            return;
+        }
         let row_view = index.bindings.get(key).map(|r| (r.state, r.updated_at));
         let prunable = matches!(
             classify_kill_tombstone(killed_at, row_view, now_ms),
@@ -440,9 +505,8 @@ impl PaneLedger {
             provider: key.0.clone(),
             session_id: key.1.clone(),
         };
-        match std::fs::remove_file(Self::kill_tombstone_path(root, &key.0, &key.1)) {
+        match Self::clear_kill_fence_locked(root, index, &key.0, &key.1) {
             Ok(()) => {
-                index.kill_tombstones.remove(key);
                 tracing::info!(
                     target: "freshell_ws::pane_ledger",
                     provider = %sref.provider,
@@ -450,10 +514,6 @@ impl PaneLedger {
                     killed_at_ms = killed_at,
                     "pane_ledger_kill_tombstone_swept: protective TTL elapsed"
                 );
-                report.kill_tombstones_swept.push(sref);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                index.kill_tombstones.remove(key);
                 report.kill_tombstones_swept.push(sref);
             }
             Err(err) => {
@@ -809,15 +869,20 @@ impl PaneLedger {
                 }
             }
         }
-        // Delta-r6-r2: the pane close records subtree participates the same
-        // way (typed rows, version-gated).
+        // Delta-r6-r2 / delta-r6-r4: BOTH close-record subtrees participate
+        // the same way (typed rows, version-gated) — the legacy
+        // `close-records/` pane records and the close-envelope journal files.
         if let Ok(files) = std::fs::read_dir(Self::pane_close_dir(root)) {
+            candidates.extend(files.flatten().map(|f| f.path()));
+        }
+        if let Ok(files) = std::fs::read_dir(Self::close_envelope_dir(root)) {
             candidates.extend(files.flatten().map(|f| f.path()));
         }
         let rollback_root = Self::rollback_dir(root);
         let kill_tombstone_root = Self::kill_tombstone_dir(root);
         let alias_tombstone_root = Self::alias_tombstone_dir(root);
         let pane_close_root = Self::pane_close_dir(root);
+        let close_envelope_root = Self::close_envelope_dir(root);
         for path in candidates {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.contains(".tmp-") {
@@ -853,6 +918,7 @@ impl PaneLedger {
                         let is_kill_tombstone = path.starts_with(&kill_tombstone_root);
                         let is_alias_tombstone = path.starts_with(&alias_tombstone_root);
                         let is_pane_close = path.starts_with(&pane_close_root);
+                        let is_close_envelope = path.starts_with(&close_envelope_root);
                         let typed_ok = if is_pending {
                             serde_json::from_value::<PendingMarker>(value).is_ok()
                         } else if is_kill_tombstone {
@@ -861,6 +927,8 @@ impl PaneLedger {
                             serde_json::from_value::<AliasTombstoneRecord>(value).is_ok()
                         } else if is_pane_close {
                             serde_json::from_value::<PaneCloseRecord>(value).is_ok()
+                        } else if is_close_envelope {
+                            serde_json::from_value::<CloseEnvelopeRecord>(value).is_ok()
                         } else {
                             serde_json::from_value::<BindingRow>(value).is_ok()
                         };
