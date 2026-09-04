@@ -51,6 +51,14 @@ pub struct BootScanReport {
     /// DOMINANT kill tombstone retired (fresh-or-any-age — the split-write
     /// crash remnant's retirement re-applied durably this pass).
     pub kill_tombstone_enforced_retires: Vec<SessionLocator>,
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): alias-tombstone
+    /// records swept this pass (locator `session_id` carries the
+    /// PLACEHOLDER). One entry per placeholder whose file changed — a
+    /// partial prune (dead-half records dropped, file rewritten) and a whole
+    /// sweep (file deleted) both report here. A record drops only past the
+    /// TTL and only when the row it resolves to is Retired-or-GC'd (the
+    /// round-5 lifetime-is-row-lifetime rule, on durable storage).
+    pub alias_tombstones_swept: Vec<SessionLocator>,
 }
 
 impl PaneLedger {
@@ -195,6 +203,7 @@ impl PaneLedger {
         report.tombstones_deleted = gc_report.tombstones_deleted;
         report.kill_tombstones_swept = gc_report.kill_tombstones_swept;
         report.kill_tombstone_enforced_retires = gc_report.kill_tombstone_enforced_retires;
+        report.alias_tombstones_swept = gc_report.alias_tombstones_swept;
         report
     }
 
@@ -229,7 +238,7 @@ impl PaneLedger {
             return BootScanReport::default();
         };
         let mut report = BootScanReport::default();
-        let (marker_ids, row_keys, tombstone_keys) = {
+        let (marker_ids, row_keys, tombstone_keys, alias_keys) = {
             let index = self.guard();
             (
                 index.pending.keys().cloned().collect::<Vec<String>>(),
@@ -240,6 +249,11 @@ impl PaneLedger {
                     .collect::<Vec<(String, String)>>(),
                 index
                     .kill_tombstones
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<(String, String)>>(),
+                index
+                    .alias_tombstones
                     .keys()
                     .cloned()
                     .collect::<Vec<(String, String)>>(),
@@ -271,6 +285,10 @@ impl PaneLedger {
             let mut index = self.guard();
             self.gc_kill_tombstone_locked(&root, &mut index, &key, now_ms, &mut report);
         }
+        for key in alias_keys {
+            let mut index = self.guard();
+            self.gc_alias_tombstone_locked(&root, &mut index, &key, now_ms, &mut report);
+        }
         report
     }
 
@@ -300,6 +318,10 @@ impl PaneLedger {
         let tombstone_keys: Vec<(String, String)> = index.kill_tombstones.keys().cloned().collect();
         for key in tombstone_keys {
             self.gc_kill_tombstone_locked(root, index, &key, now_ms, &mut report);
+        }
+        let alias_keys: Vec<(String, String)> = index.alias_tombstones.keys().cloned().collect();
+        for key in alias_keys {
+            self.gc_alias_tombstone_locked(root, index, &key, now_ms, &mut report);
         }
         report
     }
@@ -371,6 +393,96 @@ impl PaneLedger {
                     session_id = %sref.session_id,
                     error = %err,
                     "pane_ledger_kill_tombstone_sweep_failed: file left behind; will retry next pass"
+                );
+            }
+        }
+    }
+
+    /// Retention sweep for ONE placeholder's alias records, under the
+    /// caller's guard (focused-ep5-r5 Finding 2, retire-on-kill round 6):
+    /// the round-5 lifetime rule on durable storage. A record drops only
+    /// when its durable row is already Retired-or-GC'd (or never existed)
+    /// AND it is past [`ALIAS_TOMBSTONE_TTL_MS`]; a record resolving to a
+    /// still-Bound row is kept at ANY age — the alias lifetime is the row
+    /// lifetime, so a pane's close by its bare placeholder still resolves
+    /// the live row days later. A partial prune REWRITES the file (keeping
+    /// the live half); a whole-swept placeholder's file is deleted. Fail
+    /// loud per placeholder, never silent — a failed mutation keeps the
+    /// file and retries next pass.
+    fn gc_alias_tombstone_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        key: &(String, String),
+        now_ms: i64,
+        report: &mut BootScanReport,
+    ) {
+        let Some(records) = index.alias_tombstones.get(key).cloned() else {
+            return; // consumed since the snapshot — no longer qualifies
+        };
+        let kept: Vec<(String, i64)> = records
+            .iter()
+            .filter(|(durable, at_ms)| {
+                let row_bound = index
+                    .bindings
+                    .get(&(key.0.clone(), durable.clone()))
+                    .is_some_and(|row| row.state == RowState::Bound);
+                row_bound || now_ms - at_ms < ALIAS_TOMBSTONE_TTL_MS
+            })
+            .cloned()
+            .collect();
+        if kept.len() == records.len() {
+            return;
+        }
+        let sref = SessionLocator {
+            provider: key.0.clone(),
+            session_id: key.1.clone(),
+        };
+        let outcome: std::io::Result<()> = if kept.is_empty() {
+            match std::fs::remove_file(Self::alias_tombstone_path(root, &key.0, &key.1)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        } else {
+            let row = AliasTombstoneRecord {
+                ledger_version: LEDGER_VERSION,
+                provider: key.0.clone(),
+                placeholder: key.1.clone(),
+                records: kept
+                    .iter()
+                    .map(|(d, at)| AliasTombstoneEntry {
+                        durable: d.clone(),
+                        at_ms: *at,
+                    })
+                    .collect(),
+            };
+            write_row_atomic(&Self::alias_tombstone_path(root, &key.0, &key.1), &row)
+        };
+        match outcome {
+            Ok(()) => {
+                if kept.is_empty() {
+                    index.alias_tombstones.remove(key);
+                } else {
+                    index.alias_tombstones.insert(key.clone(), kept);
+                }
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %sref.provider,
+                    placeholder = %sref.session_id,
+                    "pane_ledger_alias_tombstone_swept: records dropped whose rows are Retired-or-GC'd past the TTL"
+                );
+                report.alias_tombstones_swept.push(sref);
+            }
+            Err(err) => {
+                // Fail loud, never silent: the file stays; the next GC pass
+                // retries naturally.
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %sref.provider,
+                    placeholder = %sref.session_id,
+                    error = %err,
+                    "pane_ledger_alias_tombstone_sweep_failed: file left behind; will retry next pass"
                 );
             }
         }
@@ -616,8 +728,18 @@ impl PaneLedger {
                 }
             }
         }
+        // Focused-ep5-r5 Finding 2: the alias-tombstone subtree participates
+        // the same way (typed rows, version-gated).
+        if let Ok(providers) = std::fs::read_dir(Self::alias_tombstone_dir(root)) {
+            for provider in providers.flatten() {
+                if let Ok(files) = std::fs::read_dir(provider.path()) {
+                    candidates.extend(files.flatten().map(|f| f.path()));
+                }
+            }
+        }
         let rollback_root = Self::rollback_dir(root);
         let kill_tombstone_root = Self::kill_tombstone_dir(root);
+        let alias_tombstone_root = Self::alias_tombstone_dir(root);
         for path in candidates {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.contains(".tmp-") {
@@ -651,10 +773,13 @@ impl PaneLedger {
                             .map(|p| p.ends_with("pending"))
                             .unwrap_or(false);
                         let is_kill_tombstone = path.starts_with(&kill_tombstone_root);
+                        let is_alias_tombstone = path.starts_with(&alias_tombstone_root);
                         let typed_ok = if is_pending {
                             serde_json::from_value::<PendingMarker>(value).is_ok()
                         } else if is_kill_tombstone {
                             serde_json::from_value::<KillTombstone>(value).is_ok()
+                        } else if is_alias_tombstone {
+                            serde_json::from_value::<AliasTombstoneRecord>(value).is_ok()
                         } else {
                             serde_json::from_value::<BindingRow>(value).is_ok()
                         };

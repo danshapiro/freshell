@@ -4435,3 +4435,224 @@ fn commit_claim_mid_revive_failure_leaves_the_close_untouched() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── focused-ep5-r5 Finding 2 (retire-on-kill round 6): durable alias tombstones ──
+
+/// The persisted placeholder→durable alias records round-trip across the
+/// restart boundary (a fresh `PaneLedger` over the same root IS one): the
+/// consult serves the reloaded records (freshest stamp per durable), and the
+/// claim lifecycle's `clear_alias_tombstones_for_durable` consumes every
+/// placeholder's record for the claimed durable (files deleted when emptied,
+/// rewritten when only partially consumed).
+#[test]
+fn persisted_alias_tombstones_survive_a_restart_and_clear_per_durable() {
+    let root = temp_root("alias-tombstone-persist");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_alias_tombstone("claude", "ph-1", "d-a", 1_000)
+        .unwrap();
+    ledger
+        .record_alias_tombstone("claude", "ph-1", "d-b", 2_000)
+        .unwrap();
+    ledger
+        .record_alias_tombstone("claude", "ph-2", "d-a", 3_000)
+        .unwrap();
+    // UPSERT: an existing (placeholder, durable) record refreshes its stamp.
+    ledger
+        .record_alias_tombstone("claude", "ph-1", "d-a", 4_000)
+        .unwrap();
+
+    // The restart boundary: a fresh ledger over the same root.
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    let mut records = ledger2.alias_tombstone_records("claude", "ph-1");
+    records.sort();
+    assert_eq!(
+        records,
+        vec![("d-a".to_string(), 4_000), ("d-b".to_string(), 2_000)],
+        "the persisted records survive the reload (freshest stamp kept)"
+    );
+    assert!(
+        ledger2
+            .alias_tombstone_records("claude", "ph-none")
+            .is_empty(),
+        "an unknown placeholder answers empty"
+    );
+    assert!(
+        ledger2
+            .alias_tombstone_records("codex", "ph-1")
+            .is_empty(),
+        "the records are provider-namespaced"
+    );
+
+    // The claim consumption: d-a's every record is consumed (across ph-1 AND
+    // ph-2, sorted for a stable contract); d-b's stands.
+    let cleared = ledger2
+        .clear_alias_tombstones_for_durable("claude", "d-a")
+        .unwrap();
+    assert_eq!(cleared, vec!["ph-1".to_string(), "ph-2".to_string()]);
+    assert_eq!(
+        ledger2.alias_tombstone_records("claude", "ph-1"),
+        vec![("d-b".to_string(), 2_000)],
+        "the partially-consumed placeholder keeps its other durable (rewritten file)"
+    );
+    assert!(
+        ledger2.alias_tombstone_records("claude", "ph-2").is_empty(),
+        "the fully-consumed placeholder is gone"
+    );
+    assert!(
+        !PaneLedger::alias_tombstone_path(&root, "claude", "ph-2").exists(),
+        "the emptied record's FILE is deleted"
+    );
+
+    // The consumption is durable too: one more restart sees the same shape.
+    let ledger3 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger3.alias_tombstone_records("claude", "ph-1"),
+        vec![("d-b".to_string(), 2_000)]
+    );
+    assert!(ledger3.alias_tombstone_records("claude", "ph-2").is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The alias record lifetime IS the row lifetime (the round-5 discipline,
+/// now durable): the sweep drops a record past the TTL only when its durable
+/// row is already Retired-or-GC'd; a still-Bound row's record answers at ANY
+/// age. A partial expiry REWRITES the placeholder's file (dropping the dead
+/// half, keeping the live); a fully-expired placeholder's file is deleted.
+#[test]
+fn the_alias_tombstone_sweep_drops_only_records_whose_rows_are_gone() {
+    let root = temp_root("alias-tombstone-gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "d-bound", 1_000))
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "d-gone", 1_000))
+        .unwrap();
+    ledger.retire_closed("claude", "d-gone", 2_000).unwrap();
+    ledger
+        .record_alias_tombstone("claude", "ph-live", "d-bound", 3_000)
+        .unwrap();
+    ledger
+        .record_alias_tombstone("claude", "ph-live", "d-gone", 3_000)
+        .unwrap();
+    ledger
+        .record_alias_tombstone("claude", "ph-dead", "d-gone", 3_000)
+        .unwrap();
+
+    let now = 3_000 + ALIAS_TOMBSTONE_TTL_MS + 60_000; // every record past TTL
+    let report = ledger.gc(now, &|_, _| false, None);
+
+    assert_eq!(
+        ledger.alias_tombstone_records("claude", "ph-live"),
+        vec![("d-bound".to_string(), 3_000)],
+        "the half whose row is still Bound is kept at ANY age; the Retired half is pruned"
+    );
+    assert!(
+        PaneLedger::alias_tombstone_path(&root, "claude", "ph-live").exists(),
+        "the partially-kept placeholder's file was rewritten, not deleted"
+    );
+    assert!(
+        ledger.alias_tombstone_records("claude", "ph-dead").is_empty(),
+        "a placeholder whose every record's row is gone is swept whole"
+    );
+    assert!(
+        !PaneLedger::alias_tombstone_path(&root, "claude", "ph-dead").exists(),
+        "its file is deleted"
+    );
+    assert!(
+        report
+            .alias_tombstones_swept
+            .iter()
+            .any(|l| l.provider == "claude" && l.session_id == "ph-dead"),
+        "the whole-record sweep is loudly reported: {:?}",
+        report.alias_tombstones_swept
+    );
+
+    // The kept half ages out only once its row is gone (retire it now; the
+    // next sweep at the same clock prunes it).
+    ledger.retire_closed("claude", "d-bound", now).unwrap();
+    let report2 = ledger.gc(now, &|_, _| false, None);
+    assert!(ledger.alias_tombstone_records("claude", "ph-live").is_empty());
+    assert!(
+        report2
+            .alias_tombstones_swept
+            .iter()
+            .any(|l| l.provider == "claude" && l.session_id == "ph-live"),
+        "now its row is gone, the aged record sweeps too"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The commit's PLACEHOLDER-fence consult (Finding 2's second half): a fence
+/// recorded under ANY placeholder the claim rides blocks the commit exactly
+/// like one recorded under the durable id — refusal is side-effect-free on
+/// every axis (no fence clear, no row mutation) and loudly logged; an
+/// unfenced placeholder commits through the ordinary durable compare.
+#[test]
+fn commit_claim_aliased_refuses_on_a_placeholder_fence_and_commits_past_a_clean_one() {
+    let root = temp_root("commit-claim-aliased");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "d", 9_000))
+        .unwrap();
+    // No durable close — the durable compare is CLEAN; the close fence lives
+    // only under the pane seat the claim rides.
+    ledger.retire_closed("claude", "seat-ph", 10_000).unwrap();
+
+    let outcome = ledger
+        .commit_claim_aliased("claude", "d", None, &["seat-ph".to_string()], 11_000)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ClaimCommitOutcome::RefusedStale,
+        "a fence under the placeholder blocks the commit exactly like one under the durable"
+    );
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "seat-ph"),
+        Some(10_000),
+        "the refusal never clears the placeholder's fence"
+    );
+    let row = ledger.load_binding("claude", "d").unwrap();
+    assert_eq!(row.state, RowState::Bound);
+    assert_eq!(row.updated_at, 9_000, "the refusal never touches the row");
+
+    // The UNFENCED seat commits through the ordinary durable compare (kill
+    // then claim — the genuine reopen shape, carried from round 4).
+    ledger.retire_closed("claude", "d", 12_000).unwrap();
+    let outcome = ledger
+        .commit_claim_aliased("claude", "d", Some(12_000), &["seat-clean".to_string()], 13_000)
+        .unwrap();
+    assert_eq!(outcome, ClaimCommitOutcome::Committed);
+    let row = ledger.load_binding("claude", "d").unwrap();
+    assert_eq!(row.state, RowState::Bound, "the commit revived the row");
+    assert_eq!(ledger.kill_tombstone_at("claude", "d"), None);
+    // ...never touching the refused placeholder's fence (two identities).
+    assert_eq!(ledger.kill_tombstone_at("claude", "seat-ph"), Some(10_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The new subtree participates in per-row quarantine (typed row, version
+/// gate): a corrupt alias record is renamed aside loudly, never crashes the
+/// boot, and never shadows the healthy records around it.
+#[test]
+fn a_corrupt_alias_tombstone_row_quarantines_loudly() {
+    let root = temp_root("alias-tombstone-corrupt");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_alias_tombstone("claude", "ph-good", "d-a", 1_000)
+        .unwrap();
+    let bad = PaneLedger::alias_tombstone_path(&root, "claude", "ph-bad");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, b"{ not json").unwrap();
+
+    let report = ledger.boot_scan(2_000, &never_absent);
+    assert_eq!(report.quarantined.len(), 1, "the corrupt row is quarantined");
+    assert!(!bad.exists(), "renamed aside, not deleted");
+    assert_eq!(
+        ledger.alias_tombstone_records("claude", "ph-good"),
+        vec![("d-a".to_string(), 1_000)],
+        "the healthy record is still served"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

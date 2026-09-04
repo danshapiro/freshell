@@ -31,6 +31,19 @@
 //!   [`PaneLedger::clear_kill_tombstone`] on a genuine claim (explicit
 //!   resume/attach). Layout:
 //!   `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
+//! * **Alias tombstones** (focused-ep5-r5 Finding 2, retire-on-kill round 6) —
+//!   the durable placeholder→durable records the claude lane's kills consult:
+//!   a claude pane closes by its ORIGINAL bare placeholder while its ledger
+//!   row is keyed on the durable cli UUID, and a process restart killed the
+//!   only place the mapping used to live (the provider's in-memory store), so
+//!   a post-restart close by placeholder could fence and retire only the
+//!   meaningless placeholder. Records are written when an alias is minted
+//!   (adoption / resume registration) and re-stamped when it demotes, read
+//!   by the kill's retire-set consult, consumed by a claim commit
+//!   (`clear_alias_tombstones_for_durable`), and swept by the boot/periodic
+//!   GC under the SAME lifetime discipline the round-5 in-memory store uses:
+//!   a record outlives the TTL for as long as the row it can resolve to is
+//!   Bound. Layout: `alias-tombstones/<enc(provider)>/<enc(placeholder)>.json`.
 //!
 //!   Retire-on-kill round 3 (focused-ep5-r2): the tombstone is THE AUTHOR OF
 //!   TRUTH for the identity's closedness — `retire_closed`'s two durable
@@ -115,6 +128,16 @@ pub const PENDING_MARKER_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// kill→resume horizon a human actually spans.
 pub const KILL_TOMBSTONE_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 
+/// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the protective TTL for
+/// a DURABLE alias record whose target row is already Retired-or-GC'd — the
+/// exact mirror of the claude lane's in-memory `ALIAS_TOMBSTONE_TTL_MS`
+/// (crates/freshell-freshagent/src/claude.rs; the crate edge runs the other
+/// way, so the constant is duplicated, documented as one rule). A record
+/// whose durable row is still BOUND never ages out (the alias lifetime is
+/// the row lifetime — the r5 rule the in-memory store enforces via its
+/// row-state probe; this sweep reads the ledger's own rows).
+pub const ALIAS_TOMBSTONE_TTL_MS: i64 = 6 * 60 * 60 * 1000;
+
 /// A kill tombstone (focused-ep5-r1 Finding 2, restore-open-sessions-only):
 /// the durable record that an explicit `retire_closed` (the retire-on-kill
 /// trigger) happened for this `(provider, session_id)` identity.
@@ -152,6 +175,39 @@ pub struct KillTombstone {
     /// fail-closed direction — subtraction-based compare, never expiry-sum
     /// overflow).
     pub killed_at_ms: i64,
+}
+
+/// A durable placeholder→durable alias record (focused-ep5-r5 Finding 2,
+/// retire-on-kill round 6), keyed `(provider, placeholder)` — see the module
+/// doc. One file carries EVERY durable id the placeholder ever answered to
+/// (a same-key re-registration answered to several): the claude lane's kill
+/// consult answers all of them for its retire set.
+///
+/// Retention obeys the round-5 discipline verbatim: a record lives as long
+/// as the row it can resolve to — the boot/periodic sweep
+/// ([`PaneLedger::gc`]/`boot_scan`) may drop a record only once that row is
+/// Retired-or-GC'd AND the record is past [`ALIAS_TOMBSTONE_TTL_MS`]; a
+/// still-Bound row's record survives any age. Consumed wholesale (any age)
+/// when a genuine claim commits for the durable id
+/// ([`PaneLedger::clear_alias_tombstones_for_durable`]) — the reopened
+/// identity's known placeholders reopen with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AliasTombstoneRecord {
+    pub ledger_version: u32,
+    pub provider: String,
+    pub placeholder: String,
+    pub records: Vec<AliasTombstoneEntry>,
+}
+
+/// One `(durable, at_ms)` pair inside an [`AliasTombstoneRecord`]: the
+/// durable claude UUID the placeholder aliased and the record's stamp (the
+/// TTL clock — mint/demotion time, refreshed on a repeat).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AliasTombstoneEntry {
+    pub durable: String,
+    pub at_ms: i64,
 }
 
 /// Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the outcome of
@@ -623,6 +679,14 @@ struct LedgerIndex {
     /// and test/diagnostic reads) — never a liveness signal (a tombstoned
     /// session is DEAD; this map says "its write is poison", nothing more).
     kill_tombstones: std::collections::HashMap<(String, String), i64>,
+    /// (provider, placeholder) -> [(durable, at_ms)] (focused-ep5-r5 Finding
+    /// 2), the write-through image of the `alias-tombstones/` subtree.
+    /// Consulted by the claude lane's kill retire-set resolution (a close
+    /// names the bare placeholder; the row lives under the durable) and by
+    /// the claim commit's consumption — never a liveness answer (a
+    /// tombstoned placeholder's session is DEAD; this map answers ids for
+    /// retire writes only).
+    alias_tombstones: std::collections::HashMap<(String, String), Vec<(String, i64)>>,
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -760,6 +824,19 @@ impl PaneLedger {
             .join(format!("{}.json", encode_segment(session_id)))
     }
 
+    /// Alias tombstones (focused-ep5-r5 Finding 2) — see
+    /// [`AliasTombstoneRecord`].
+    /// `alias-tombstones/<enc(provider)>/<enc(placeholder)>.json`.
+    fn alias_tombstone_dir(root: &Path) -> PathBuf {
+        root.join("alias-tombstones")
+    }
+
+    fn alias_tombstone_path(root: &Path, provider: &str, placeholder: &str) -> PathBuf {
+        Self::alias_tombstone_dir(root)
+            .join(encode_segment(provider))
+            .join(format!("{}.json", encode_segment(placeholder)))
+    }
+
     fn rollback_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
         Self::rollback_dir(root)
             .join(encode_segment(provider))
@@ -855,6 +932,35 @@ impl PaneLedger {
                             index.kill_tombstones.insert(
                                 (tombstone.provider.clone(), tombstone.session_id.clone()),
                                 tombstone.killed_at_ms,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Alias-tombstone subtree (focused-ep5-r5 Finding 2): the same
+        // discipline — every clean current-version record loads (expiry is
+        // the sweep's call, never the loader's: a still-Bound row's record
+        // answers at any age).
+        if let Ok(providers) = std::fs::read_dir(Self::alias_tombstone_dir(root)) {
+            for provider in providers.flatten() {
+                let Ok(files) = std::fs::read_dir(provider.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue; // *.tmp-* / *.quarantined-* residue
+                    }
+                    if let Ok(record) = load_row::<AliasTombstoneRecord>(&path) {
+                        if record.ledger_version == LEDGER_VERSION {
+                            index.alias_tombstones.insert(
+                                (record.provider.clone(), record.placeholder.clone()),
+                                record
+                                    .records
+                                    .iter()
+                                    .map(|e| (e.durable.clone(), e.at_ms))
+                                    .collect(),
                             );
                         }
                     }
@@ -1394,6 +1500,155 @@ impl PaneLedger {
         Ok(())
     }
 
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): record (or refresh)
+    /// the placeholder→durable alias — written when the claude lane MINTS
+    /// the alias (the adoption / resume registration) and re-stamped when it
+    /// DEMOTES it (the exit/kill eviction funnel). File first, then the
+    /// write-through index (the `write_binding` discipline); the upsert
+    /// refreshes an existing (placeholder, durable) stamp. Durability-side
+    /// expiry is the sweep's call (never the writer's).
+    pub fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let key = (provider.to_string(), placeholder.to_string());
+        let mut records = index.alias_tombstones.get(&key).cloned().unwrap_or_default();
+        if let Some(existing) = records.iter_mut().find(|(d, _)| d == durable) {
+            existing.1 = at_ms;
+        } else {
+            records.push((durable.to_string(), at_ms));
+        }
+        let row = AliasTombstoneRecord {
+            ledger_version: LEDGER_VERSION,
+            provider: provider.to_string(),
+            placeholder: placeholder.to_string(),
+            records: records
+                .iter()
+                .map(|(d, at)| AliasTombstoneEntry {
+                    durable: d.clone(),
+                    at_ms: *at,
+                })
+                .collect(),
+        };
+        write_row_atomic(&Self::alias_tombstone_path(root, provider, placeholder), &row)?;
+        index.alias_tombstones.insert(key, records);
+        Ok(())
+    }
+
+    /// The placeholder's recorded durable ids, TTL-agnostic (the sweep owns
+    /// expiry; the claude kill consult applies the row-state rule).
+    /// Memory-only (V1.md read policy); a disabled ledger answers empty.
+    pub fn alias_tombstone_records(
+        &self,
+        provider: &str,
+        placeholder: &str,
+    ) -> Vec<(String, i64)> {
+        if self.root.is_none() {
+            return Vec::new();
+        }
+        self.guard()
+            .alias_tombstones
+            .get(&(provider.to_string(), placeholder.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The claim lifecycle's consumption (Finding 2): a genuine claim of
+    /// `durable` consumed every alias record pointing at it — the reopened
+    /// identity can no longer be retired through those old placeholders.
+    /// Returns the placeholder keys whose records pointed at `durable`
+    /// (sorted, for a stable caller contract; the caller clears their own
+    /// kill fences), with holes cleaned UP: a placeholder left with no
+    /// records has its file deleted; a partially-consumed one is rewritten.
+    /// Best-effort per file (fail loud, never silent): a failed rewrite is
+    /// reported `Err` after the successful ones still landed (the index
+    /// tracks exactly the file states that persisted).
+    pub fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> std::io::Result<Vec<String>> {
+        let Some(root) = &self.root else {
+            return Ok(Vec::new());
+        };
+        let mut index = self.guard();
+        let placeholders: Vec<String> = index
+            .alias_tombstones
+            .iter()
+            .filter(|((p, _), records)| {
+                p == provider && records.iter().any(|(d, _)| d == durable)
+            })
+            .map(|((_, placeholder), _)| placeholder.clone())
+            .collect();
+        let mut first_err: Option<std::io::Error> = None;
+        let mut cleared: Vec<String> = Vec::new();
+        for placeholder in placeholders {
+            let key = (provider.to_string(), placeholder.clone());
+            let Some(records) = index.alias_tombstones.get(&key).cloned() else {
+                continue;
+            };
+            let kept: Vec<(String, i64)> =
+                records.iter().filter(|(d, _)| d != durable).cloned().collect();
+            let outcome = if kept.is_empty() {
+                match std::fs::remove_file(Self::alias_tombstone_path(root, provider, &placeholder))
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                let row = AliasTombstoneRecord {
+                    ledger_version: LEDGER_VERSION,
+                    provider: provider.to_string(),
+                    placeholder: placeholder.clone(),
+                    records: kept
+                        .iter()
+                        .map(|(d, at)| AliasTombstoneEntry {
+                            durable: d.clone(),
+                            at_ms: *at,
+                        })
+                        .collect(),
+                };
+                write_row_atomic(&Self::alias_tombstone_path(root, provider, &placeholder), &row)
+            };
+            match outcome {
+                Ok(()) => {
+                    if kept.is_empty() {
+                        index.alias_tombstones.remove(&key);
+                    } else {
+                        index.alias_tombstones.insert(key, kept);
+                    }
+                    cleared.push(placeholder);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %provider,
+                        placeholder = %placeholder,
+                        durable = %durable,
+                        error = %e,
+                        "pane_ledger_alias_tombstone_clear_failed: record left behind; the next claim re-consumes it"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        cleared.sort();
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(cleared),
+        }
+    }
+
     /// The recorded kill-tombstone time for this identity, TTL-agnostic (the
     /// binder consult applies the TTL; the GC sweep owns expiry deletion).
     /// Diagnostic/test surface: nothing in production reads tombstones
@@ -1506,7 +1761,8 @@ impl PaneLedger {
     /// V7/A10 no-laundering discipline survives intact). With NO tombstone
     /// on record the commit is a pure no-op (no row-write churn on an
     /// unfenced re-claim). A disabled ledger is the polite `Committed`
-    /// no-op.
+    /// no-op. Delegates to [`Self::commit_claim_aliased`] with no alias
+    /// consult (round 6 keeps ONE transition implementation).
     pub fn commit_claim(
         &self,
         provider: &str,
@@ -1514,10 +1770,53 @@ impl PaneLedger {
         expect_killed_at_ms: Option<i64>,
         now_ms: i64,
     ) -> std::io::Result<ClaimCommitOutcome> {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[], now_ms)
+    }
+
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the claim commit
+    /// with the PLACEHOLDER-fence consult. `fence_checked_aliases` are the
+    /// one-shot pane-seat placeholders the claude claim's identity resolves
+    /// through (the attach lane registers the durable under the attaching
+    /// pane's seat, the create lane under the just-minted one). A close
+    /// fence recorded under ANY of them blocks the commit exactly like one
+    /// recorded under the durable id — same `RefusedStale` refusal, same
+    /// side-effect freedom, loudly logged naming the offending alias — with
+    /// one DELIBERATE simplification: the alias compare is EXISTENCE-based,
+    /// not snapshot-based. A durable id supports the genuine reopen (the
+    /// snapshot compare's whole point — a resume the user meant), but a
+    /// placeholder seat never does: it is sidecar-minted/requestId-derived,
+    /// one-shot by construction, and a fence under it means THAT seat's pane
+    /// was closed — any later claim riding it is the finding's disconnected
+    /// late attach, never a genuine reopen this decision must admit. After
+    /// the alias gate passes the transition is byte-for-byte
+    /// [`Self::commit_claim`]'s.
+    pub fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+        now_ms: i64,
+    ) -> std::io::Result<ClaimCommitOutcome> {
         let Some(root) = &self.root else {
             return Ok(ClaimCommitOutcome::Committed);
         };
         let mut index = self.guard();
+        for alias in fence_checked_aliases {
+            let alias_key = (provider.to_string(), alias.clone());
+            if let Some(killed_at) = index.kill_tombstones.get(&alias_key).copied() {
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %provider,
+                    session_id = %session_id,
+                    placeholder = %alias,
+                    killed_at_ms = killed_at,
+                    "pane_ledger_claim_refused_placeholder_fence: a close landed under the \
+                     one-shot pane seat this claim rides; the claim commits nothing"
+                );
+                return Ok(ClaimCommitOutcome::RefusedStale);
+            }
+        }
         let key = (provider.to_string(), session_id.to_string());
         let current = index.kill_tombstones.get(&key).copied();
         let dead_state_advanced = match (current, expect_killed_at_ms) {

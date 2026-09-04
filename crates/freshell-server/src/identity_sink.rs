@@ -4,7 +4,7 @@
 
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    RollbackRecord, SinkCommitWrite, SinkWrite,
+    RollbackRecord, SinkAliasClearWrite, SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -312,12 +312,26 @@ impl PaneIdentitySink for LedgerIdentitySink {
         session_id: &str,
         expect_killed_at_ms: Option<i64>,
     ) -> SinkCommitWrite {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
+    }
+
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): pass-through like
+    /// [`Self::commit_claim`] — the alias-existence gate and the conditional
+    /// transition both live atomically inside the ledger's guarded section.
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
+        let aliases: Vec<String> = fence_checked_aliases.to_vec();
         let now = now_ms();
         Box::pin(async move {
             let outcome = tokio::task::spawn_blocking(move || {
-                ledger.commit_claim(&p, &s, expect_killed_at_ms, now)
+                ledger.commit_claim_aliased(&p, &s, expect_killed_at_ms, &aliases, now)
             })
             .await
             .map_err(std::io::Error::other)??;
@@ -327,6 +341,50 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     ClaimCommit::RefusedStale
                 }
             })
+        })
+    }
+
+    /// Focused-ep5-r5 Finding 2: the durable alias record — same
+    /// awaited-spawn_blocking discipline as `retire_closed`.
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, ph, d) = (
+            provider.to_string(),
+            placeholder.to_string(),
+            durable.to_string(),
+        );
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    /// The kill consult's sync read — memory-only inline pass-through like
+    /// [`Self::kill_tombstone_at_ms`].
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
+        self.ledger.alias_tombstone_records(provider, placeholder)
+    }
+
+    /// The claim consumption's awaited pass-through (the durable half of
+    /// clear-for-durable).
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite {
+        let ledger = self.ledger.clone();
+        let (p, d) = (provider.to_string(), durable.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
+                .await
+                .map_err(std::io::Error::other)?
         })
     }
 
@@ -1094,6 +1152,92 @@ mod tests {
             "a retired row answers false"
         );
         assert!(!sink.row_is_bound("claude", "never-written"));
+    }
+
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6) over the REAL
+    /// ledger, through the sink seam the claude lanes use: the alias record
+    /// writes round-trip durably (a fresh `PaneLedger` — the restart —
+    /// answers the consult), the claim consumption deletes per-durable
+    /// across placeholders, and `commit_claim_aliased`'s placeholder-fence
+    /// gate refuses under a fenced seat and commits over a clean one (with
+    /// the durable revive landing for real).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alias_tombstones_and_the_aliased_commit_round_trip_through_the_real_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "d-alias".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("row write");
+        sink.record_alias_tombstone("claude", "ph-a", "d-alias", 1_000)
+            .await
+            .expect("alias write a");
+        sink.record_alias_tombstone("claude", "ph-b", "d-alias", 2_000)
+            .await
+            .expect("alias write b");
+
+        // The restart boundary: a fresh ledger (and sink) over the same root
+        // answers the kill consult.
+        let ledger2 = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink2 = LedgerIdentitySink::new(ledger2.clone());
+        let mut records = sink2.alias_tombstone_records("claude", "ph-a");
+        records.sort();
+        assert_eq!(
+            records,
+            vec![("d-alias".to_string(), 1_000)],
+            "the persisted record answers across the scripted restart"
+        );
+
+        // The placeholder-fence gate: the pane seat's close blocks the commit.
+        sink2.retire_closed("claude", "ph-seat").await.expect("seat fence");
+        let outcome = sink2
+            .commit_claim_aliased("claude", "d-alias", None, &["ph-seat".to_string()])
+            .await
+            .expect("the commit answers");
+        assert_eq!(outcome, ClaimCommit::RefusedStale);
+        assert!(
+            ledger2.load_binding("claude", "d-alias").unwrap().state
+                == freshell_ws::pane_ledger::RowState::Bound,
+            "the refusal never touched the row"
+        );
+
+        // The clean-seat claim commits (durable closed first — the genuine
+        // reopen), and the consumption sweeps both placeholders.
+        sink2.retire_closed("claude", "d-alias").await.expect("close");
+        let fence = ledger2.kill_tombstone_at("claude", "d-alias");
+        let outcome = sink2
+            .commit_claim_aliased("claude", "d-alias", fence, &["ph-clean".to_string()])
+            .await
+            .expect("commit answers");
+        assert_eq!(outcome, ClaimCommit::Committed);
+        let cleared = sink2
+            .clear_alias_tombstones_for_durable("claude", "d-alias")
+            .await
+            .expect("consumption");
+        assert_eq!(cleared, vec!["ph-a".to_string(), "ph-b".to_string()]);
+        assert!(sink2.alias_tombstone_records("claude", "ph-a").is_empty());
+        assert!(sink2.alias_tombstone_records("claude", "ph-b").is_empty());
+        assert_eq!(
+            ledger2.load_binding("claude", "d-alias").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the committed reopen revived the row for real"
+        );
     }
 
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2) over the REAL ledger,

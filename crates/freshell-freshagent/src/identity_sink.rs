@@ -209,6 +209,15 @@ pub enum ClaimCommit {
 pub type SinkCommitWrite =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<ClaimCommit>> + Send + 'static>>;
 
+/// The alias-tombstone consumption's completion future (focused-ep5-r5
+/// Finding 2, retire-on-kill round 6) — the [`SinkWrite`] discipline whose
+/// payload is the placeholder keys whose records were consumed (the claim
+/// clears their LEDGER kill fences next — the reopened identity's every
+/// known alias reopens together).
+pub type SinkAliasClearWrite = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<Vec<String>>> + Send + 'static>,
+>;
+
 /// AWAITED writes (wave-A durable-before-answer policy, V8/A11): callers
 /// `.await` the returned future before replying/broadcasting/proceeding.
 /// Implementations run fsync work on `spawn_blocking` and propagate failures
@@ -380,9 +389,69 @@ pub trait PaneIdentitySink: Send + Sync {
         session_id: &str,
         expect_killed_at_ms: Option<i64>,
     ) -> SinkCommitWrite;
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the claim commit
+    /// with the PLACEHOLDER-fence consult. `fence_checked_aliases` are the
+    /// one-shot pane-seat placeholders the claim's identity resolves through
+    /// (the claude attach lane's attaching seat; the create lane's
+    /// just-minted one). A close fence recorded under ANY of them blocks the
+    /// commit exactly like one recorded under the durable id — same
+    /// side-effect-free [`ClaimCommit::RefusedStale`] — with one deliberate
+    /// simplification over the durable compare: the alias check is
+    /// EXISTENCE-based, not snapshot-based. A durable id supports the
+    /// genuine reopen (a resume the user meant), but a placeholder seat
+    /// never does: it is one-shot by construction, and a fence under it
+    /// means THAT seat's pane was closed — a later claim riding it is the
+    /// finding's disconnected late attach regardless of WHEN the fence
+    /// landed. The durable's own snapshot compare stands verbatim.
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite;
+    /// Focused-ep5-r5 Finding 2, the durable half of the claude lane's alias
+    /// tombstones: persist (or refresh — repeat mint/demotion re-stamps) the
+    /// placeholder→durable mapping the kill consult resolves across a
+    /// restart. Awaited like every non-rollback lane (failures surface as
+    /// `Err` for the caller to warn-log, never a lane blocker — the
+    /// in-memory store still answers this process's consults; the missed
+    /// file is the restart-boundary hole the lane logs loudly). The
+    /// record's retention (drop only once its row is Retired-or-GC'd and
+    /// past the TTL) is the store's own sweep, never the writer's call.
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite;
+    /// The placeholder's persisted durable ids (TTL-agnostic — the claude
+    /// kill consult applies the row-state retention rule). Memory-fast +
+    /// sync like [`Self::kill_tombstone_at_ms`]: the kill's single
+    /// critical-section consult calls it under held guards.
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)>;
+    /// The claim lifecycle's consumption of the DURABLE store: every alias
+    /// record pointing at the claimed durable is consumed (the in-memory
+    /// store's `clear_for_durable` twin), returning the placeholder keys
+    /// whose records were consumed — the claim then clears their LEDGER
+    /// kill fences (the reopened identity's every known alias reopens
+    /// together). Awaited; failures warn at the caller, never block the
+    /// commit that already accepted.
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
+
+/// The alias-tombstone map shape (focused-ep5-r5 Finding 2): (provider,
+/// placeholder) -> [(durable, at_ms)]. Factored for readability (and the
+/// type-complexity lint) at the fake store below.
+#[cfg(test)]
+pub(crate) type AliasRecordMap = std::collections::HashMap<(String, String), Vec<(String, i64)>>;
 
 /// In-memory sink for tests, crate-wide. Mutations happen synchronously
 /// before the (already-completed) future is returned, so tests can assert
@@ -464,6 +533,22 @@ pub(crate) struct FakeIdentitySink {
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook — see
     /// [`Self::arm_post_commit_stall`].
     post_commit_stall: std::sync::Mutex<Option<PostCommitStallGate>>,
+    /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1) test hook — see
+    /// [`Self::arm_retire_stall`].
+    retire_stall: std::sync::Mutex<Option<RetireStallGate>>,
+    /// Focused-ep5-r5 Finding 2: the fake mirror of the ledger's durable
+    /// alias tombstones — (provider, placeholder) -> [(durable, at_ms)],
+    /// written by `record_alias_tombstone`, consulted by
+    /// `alias_tombstone_records`, consumed by
+    /// `clear_alias_tombstones_for_durable`. The
+    /// lifetime-is-the-row's discipline is the PROVIDER-side store's concern
+    /// (its row-state probe consults [`Self::states`]); the fake keeps the
+    /// verbatim record set like the ledger's write-through index does.
+    pub alias_records: std::sync::Mutex<AliasRecordMap>,
+    /// Every `record_alias_tombstone` call's (provider, placeholder, durable), in order.
+    pub alias_record_writes: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// Every `clear_alias_tombstones_for_durable` call's (provider, durable), in order.
+    pub alias_clears: std::sync::Mutex<Vec<(String, String)>>,
     /// Focused-ep5-r1 Finding 2 test hook — see [`Self::arm_orphan_binding_gate`].
     orphan_gate: std::sync::Mutex<Option<OrphanBindingGate>>,
     /// Weak self-handle so the orphan gate's detached apply task can reach
@@ -569,6 +654,35 @@ struct PostCommitStallGate {
 #[cfg(test)]
 pub(crate) struct PostCommitStallHandles {
     pub applied: std::sync::mpsc::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Retire-on-kill round 6 (focused-ep5-r5 Finding 1) test hook: the armed
+/// retire stall's state. The close's mutations (the `retires` log, the
+/// kill-tombstone fold, the row-state flip) land EAGERLY at call time —
+/// exactly like the real ledger's `retire_closed`, which records the close
+/// durably inside the call — and only the returned FUTURE parks behind the
+/// test's release, so the test can hold the kill lane between its completed
+/// durable close and its teardown awaits (the deterministic mid-lane stop
+/// the round-6 lock-order pins stage around).
+#[cfg(test)]
+struct RetireStallGate {
+    /// The (provider, session_id) key this gate intercepts.
+    key: (String, String),
+    /// Signaled when the stalled `retire_closed` was INVOKED (its mutations
+    /// already applied — the close is on record and only the answer stalls).
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the returned future resolves only after this.
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// Retire-on-kill round 6 test hook: the handles
+/// [`FakeIdentitySink::arm_retire_stall`] hands the test. `entered` fires
+/// when the stalled retire's mutations LANDED (close recorded, answer
+/// parked); `release` lets the stalled answer resolve.
+#[cfg(test)]
+pub(crate) struct RetireStallHandles {
+    pub entered: std::sync::mpsc::Receiver<()>,
     pub release: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -741,18 +855,64 @@ impl FakeIdentitySink {
             release: release_tx,
         }
     }
+    /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1) test hook: arm the
+    /// RETIRE stall for one identity key. The next `retire_closed` for
+    /// exactly that key applies its mutations INLINE (the retires log, the
+    /// kill-tombstone fold, the row-state flip — the durable close is
+    /// recorded) and then parks the returned future behind the test's
+    /// release — so a kill lane sits between its completed close and its
+    /// teardown while the test holds whichever lock the teardown must wait
+    /// on. One-shot: later retires proceed inline.
+    pub(crate) fn arm_retire_stall(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> RetireStallHandles {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.self_weak.lock().unwrap() = std::sync::Arc::downgrade(self);
+        *self.retire_stall.lock().unwrap() = Some(RetireStallGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        RetireStallHandles {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
     /// The shared claim-commit decide+apply (the direct path AND the claim
-    /// gate's detached task): EXACTLY `PaneLedger::commit_claim`'s
+    /// gate's + stall's tasks): EXACTLY `PaneLedger::commit_claim`'s
     /// conditional-transition contract against the fake's state. Refusal
     /// mutates NOTHING (no clear, no revive, no row flip); a commit clears
-    /// the fence and flips a Closed row to Bound in the same breath.
+    /// the fence and flips a Closed row to Bound in the same breath. The
+    /// round-6 form (focused-ep5-r5 Finding 2): the
+    /// alias-existence consult mirrors the ledger's
+    /// `commit_claim_aliased` — a fence under ANY placeholder the claim
+    /// rides refuses first (snapshots never consulted for seats; see the
+    /// trait doc), before the durable's own snapshot compare runs.
+    /// alias-existence consult mirrors the ledger's
+    /// `commit_claim_aliased` — a fence under ANY placeholder the claim
+    /// rides refuses first (snapshots never consulted for seats; see the
+    /// trait doc), before the durable's own snapshot compare runs.
     #[cfg(test)]
-    fn apply_claim_commit(
+    fn apply_claim_commit_aliased(
         &self,
         provider: &str,
         session_id: &str,
         expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
     ) -> ClaimCommit {
+        for alias in fence_checked_aliases {
+            let alias_key = (provider.to_string(), alias.clone());
+            if self.kill_tombstones.lock().unwrap().contains_key(&alias_key) {
+                self.claim_refusals
+                    .lock()
+                    .unwrap()
+                    .push((provider.to_string(), session_id.to_string()));
+                return ClaimCommit::RefusedStale;
+            }
+        }
         let key = (provider.to_string(), session_id.to_string());
         let current = self.kill_tombstones.lock().unwrap().get(&key).copied();
         let advanced = match (current, expect_killed_at_ms) {
@@ -1027,6 +1187,34 @@ impl PaneIdentitySink for FakeIdentitySink {
                 states.insert((provider.into(), session_id.into()), FakeRowState::Closed);
             }
         }
+        // Retire-on-kill round 6 (Finding 1) stall arm: the close's mutations
+        // landed INLINE above (the durable record of the close); only the
+        // ANSWER parks behind the test's release — the kill lane sits
+        // between its completed close and its teardown, deterministically.
+        // Never engages on the failure knob (a failed retire is no stall).
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.write_result();
+        }
+        let stall_arm = {
+            let gate = self.retire_stall.lock().unwrap();
+            gate.as_ref().and_then(|g| {
+                if g.key == (provider.to_string(), session_id.to_string()) {
+                    let release_rx = g.release_rx.lock().unwrap().take();
+                    release_rx.map(|rx| (g.entered_tx.clone(), rx))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((entered_tx, release_rx)) = stall_arm {
+            // One-shot: disarm so later retires proceed inline.
+            *self.retire_stall.lock().unwrap() = None;
+            let _ = entered_tx.send(());
+            return Box::pin(async move {
+                let _ = release_rx.await;
+                Ok(())
+            });
+        }
         self.write_result()
     }
     fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
@@ -1064,11 +1252,21 @@ impl PaneIdentitySink for FakeIdentitySink {
         session_id: &str,
         expect_killed_at_ms: Option<i64>,
     ) -> SinkCommitWrite {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
+    }
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite {
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
             return Box::pin(std::future::ready(Err(std::io::Error::other(
                 "fake write failure",
             ))));
         }
+        let aliases: Vec<String> = fence_checked_aliases.to_vec();
         // Finding 1 claim-gate arm (the orphan-gate twin): an armed gate for
         // this EXACT key holds the decide+apply behind the test's release;
         // the awaiting claimant's future resolves with the decided outcome.
@@ -1092,7 +1290,7 @@ impl PaneIdentitySink for FakeIdentitySink {
             tokio::spawn(async move {
                 let _ = release_rx.await;
                 let outcome = if let Some(me) = me.upgrade() {
-                    me.apply_claim_commit(&p, &s, expect_killed_at_ms)
+                    me.apply_claim_commit_aliased(&p, &s, expect_killed_at_ms, &aliases)
                 } else {
                     // The fake outlived the test's reference cycle: decide
                     // nothing, report refusal-safe stale. Never reached in
@@ -1127,15 +1325,79 @@ impl PaneIdentitySink for FakeIdentitySink {
         if let Some((applied_tx, release_rx)) = stall_arm {
             // One-shot: disarm so later commits proceed inline.
             *self.post_commit_stall.lock().unwrap() = None;
-            let outcome = self.apply_claim_commit(provider, session_id, expect_killed_at_ms);
+            let outcome =
+                self.apply_claim_commit_aliased(provider, session_id, expect_killed_at_ms, &aliases);
             let _ = applied_tx.send(());
             return Box::pin(async move {
                 let _ = release_rx.await;
                 Ok(outcome)
             });
         }
-        let outcome = self.apply_claim_commit(provider, session_id, expect_killed_at_ms);
+        let outcome =
+            self.apply_claim_commit_aliased(provider, session_id, expect_killed_at_ms, &aliases);
         Box::pin(std::future::ready(Ok(outcome)))
+    }
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.alias_record_writes.lock().unwrap().push((
+                provider.into(),
+                placeholder.into(),
+                durable.into(),
+            ));
+            let key = (provider.to_string(), placeholder.to_string());
+            let mut records = self.alias_records.lock().unwrap();
+            let entries = records.entry(key).or_default();
+            if let Some(existing) = entries.iter_mut().find(|(d, _)| d == durable) {
+                existing.1 = at_ms;
+            } else {
+                entries.push((durable.to_string(), at_ms));
+            }
+        }
+        self.write_result()
+    }
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
+        self.alias_records
+            .lock()
+            .unwrap()
+            .get(&(provider.to_string(), placeholder.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(std::future::ready(Err(std::io::Error::other(
+                "fake write failure",
+            ))));
+        }
+        self.alias_clears
+            .lock()
+            .unwrap()
+            .push((provider.into(), durable.into()));
+        let mut records = self.alias_records.lock().unwrap();
+        let mut cleared: Vec<String> = Vec::new();
+        records.retain(|(p, placeholder), entries| {
+            if p != provider {
+                return true;
+            }
+            let before = entries.len();
+            entries.retain(|(d, _)| d != durable);
+            if entries.len() != before {
+                cleared.push(placeholder.clone());
+            }
+            !entries.is_empty()
+        });
+        cleared.sort();
+        Box::pin(std::future::ready(Ok(cleared)))
     }
     fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
         if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {

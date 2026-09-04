@@ -97,6 +97,22 @@ pub struct FreshOpencodeState {
     /// mirrors `adapter.ts`'s `remember()` (`sessions.set(placeholderId, state);
     /// sessions.set(realSessionId, state)`), so a `freshAgent.send`/`kill` addressed by
     /// either id resolves to the SAME session record.
+    ///
+    /// LOCK ORDER (retire-on-kill round 6, focused-ep5-r5 Finding 1): the
+    /// `sessions` map guard is NEVER held across a per-session lock
+    /// acquisition — clone the session's `Arc` out under a short map section,
+    /// drop the guard, THEN await `session_arc.lock()`. The reverse direction
+    /// is the one permitted pair: `handle_send` re-acquires `sessions` while
+    /// holding the session lock (the materialization insert), so the wait-for
+    /// graph carries edges only session→map, never map→session, and no cycle
+    /// can close. (The finding's deadlock: `handle_kill`'s capture phase held
+    /// the map while awaiting the session lock, and a first send held that
+    /// session lock across its cold-start `create_session` before awaiting
+    /// the map to register the durable key — kill owns the map and waits for
+    /// the session, send owns the session and waits for the map, freezing the
+    /// close BEFORE its durable retire and wedging every other opencode map
+    /// reader. Pinned by `handle_kill_never_holds_the_sessions_map_across_
+    /// its_session_lock_wait` and its teardown/refusal-teardown twins.)
     sessions: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
@@ -1154,21 +1170,30 @@ impl FreshOpencodeState {
         // removal and every settlement await. Order (2) before (3) also makes
         // this kill visible to a claim's ledger-conditional commit before the
         // session leaves the map (kill always wins vs an in-flight claim).
+        //
+        // Round 6 lock order (focused-ep5-r5 Finding 1): clone the Arc out
+        // under a short map section, DROP the map guard, and only then await
+        // the session lock — the killed-flag set may legitimately wait out a
+        // first send's cold-start materialization (which re-acquires the map
+        // at its end), and holding the map across this wait is the finding's
+        // deadlock half.
         let session_arc = {
             let guard = self.sessions.lock().await;
-            let found = guard.get(&msg.session_id).cloned();
-            if let Some(session_arc) = &found {
-                let s = session_arc.lock().await;
-                // Retire-on-kill (delta-review round 5): mark the session
-                // killed INSIDE this session-lock phase, BEFORE removing the
-                // map keys — a send that took this Arc just before the
-                // removal parks on this very lock and must observe the flag
-                // (never materialize + re-bind a row for the pane that is
-                // going away).
-                s.killed.store(true, Ordering::SeqCst);
-            }
-            found
+            guard.get(&msg.session_id).cloned()
         };
+        if let Some(session_arc) = &session_arc {
+            // Retire-on-kill (delta-review round 5): mark the session killed
+            // INSIDE this session-lock phase, BEFORE removing the map keys —
+            // a send that took this Arc just before the removal parks on
+            // this very lock and must observe the flag (never materialize +
+            // re-bind a row for the pane that is going away). The session
+            // mutex serializes the check: a send whose materialization
+            // critical section ran FIRST completed its map insert before
+            // releasing the lock, so the teardown below still finds (and
+            // removes) its durable key.
+            let s = session_arc.lock().await;
+            s.killed.store(true, Ordering::SeqCst);
+        }
 
         let mut real_session_id = None;
         let mut placeholder_id = None;
@@ -1220,17 +1245,26 @@ impl FreshOpencodeState {
         // The durable close is recorded; everything from here is best-effort
         // continuation (round 5: settlement failure never loses the close).
         if let Some(session_arc) = session_arc {
-            // Remove the map keys now that the close is durable (map lock →
-            // session lock, the phase-1 order — no awaits past these takes).
-            let (turn_task, bridge, real) = {
+            // Round 6 lock order (focused-ep5-r5 Finding 1): TWO narrow
+            // critical sections, never the map guard held across the
+            // session-lock take. The removal keys come from the phase-2 read
+            // above and are COMPLETE: every send that could materialize held
+            // the session lock through its durable-key insert and finished
+            // that hold before phase 1 could set `killed` (later sends
+            // refuse at the flag), so the durable key — if any — is already
+            // in the map.
+            {
                 let mut guard = self.sessions.lock().await;
-                let mut s = session_arc.lock().await;
-                let real = s.real_session_id.clone();
-                guard.remove(&s.placeholder_id);
-                if let Some(real) = real.as_deref() {
+                if let Some(placeholder) = placeholder_id.as_deref() {
+                    guard.remove(placeholder);
+                }
+                if let Some(real) = real_session_id.as_deref() {
                     guard.remove(real);
                 }
-                (s.turn_task.take(), s.serve_bridge.take(), real)
+            }
+            let (turn_task, bridge, real) = {
+                let mut s = session_arc.lock().await;
+                (s.turn_task.take(), s.serve_bridge.take(), s.real_session_id.clone())
             };
             if let Some(task) = turn_task {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
@@ -2817,7 +2851,19 @@ impl FreshOpencodeState {
         // dead-state is UNCHANGED (an expired handle-less holder, no kill)
         // still commits and keeps the registered session (the round-3 keep).
         if !self.commit_session_claim(session_id, claim_dead_state).await {
-            if let Some(removed) = self.sessions.lock().await.remove(session_id) {
+            // Round 6 lock order (focused-ep5-r5 Finding 1): the map removal
+            // is its OWN synchronous critical section, completed before the
+            // session-lock teardown begins. (The pre-fix `if let Some(removed)
+            // = self.sessions.lock().await.remove(...)` kept the scrutinee
+            // guard alive through the whole body on edition 2021 — the map
+            // stayed locked across `removed.lock().await` and the settle
+            // await, wedging every other opencode map reader for the
+            // duration of an arbitrarily slow settle.)
+            let removed = {
+                let mut guard = self.sessions.lock().await;
+                guard.remove(session_id)
+            };
+            if let Some(removed) = removed {
                 let mut s = removed.lock().await;
                 s.killed.store(true, Ordering::SeqCst);
                 if let Some(task) = s.turn_task.take() {
@@ -4069,6 +4115,297 @@ mod tests {
             fake.bindings.lock().unwrap().is_empty(),
             "the refused send must not record a binding row: {:?}",
             fake.bindings.lock().unwrap()
+        );
+    }
+
+    /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1): the ONE lock rule —
+    /// `sessions` is NEVER held across a per-session lock acquisition (clone
+    /// the Arc out, drop the map guard, THEN await the session lock). The
+    /// finding's deadlock: `handle_kill`'s capture phase held the map guard
+    /// while awaiting the session lock, and a first send holds that session
+    /// lock across its cold-start `create_session` before re-acquiring the
+    /// map to register the materialized key — kill owns the map and waits
+    /// for the session, send owns the session and waits for the map. This
+    /// test holds the session lock directly (the exact gate the first send's
+    /// materialization hold applies, per the struct's lock-order rule) while
+    /// a kill runs: the map must stay acquirable THROUGHOUT the kill's
+    /// session-lock wait, and the kill must still complete (killed flag set,
+    /// map keys removed, `freshAgent.killed` broadcast) once the in-flight
+    /// hold releases.
+    #[tokio::test]
+    async fn handle_kill_never_holds_the_sessions_map_across_its_session_lock_wait() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-lock-order"), None).await;
+        let placeholder = "freshopencode-req-lock-order";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+
+        // The gate: the test holds the per-session lock, exactly the hold a
+        // first send's materialization critical section applies (its
+        // `create_session` cold start awaits while the lock is held).
+        let session_guard = session_arc.lock().await;
+
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // After one scheduler pass the kill has run to its session-lock
+        // park; every observation while it parks there must find the map
+        // FREE (the pre-fix shape held the map across this wait — the
+        // finding's deadlock half). A bounded yield loop, never a wall-clock
+        // sleep: the interleave gate is the session lock itself.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            assert!(
+                st.sessions.try_lock().is_ok(),
+                "the sessions map must stay acquirable while the kill waits on the session lock"
+            );
+            assert!(
+                !kill.is_finished(),
+                "fixture: the kill is still parked on the session lock"
+            );
+        }
+
+        // Release the in-flight hold: the kill completes its full lane.
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the in-flight hold releases")
+            .expect("kill task completed");
+        assert!(
+            session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "the kill's session-lock phase ran (the killed flag is set)"
+        );
+        assert!(
+            st.sessions.lock().await.get(placeholder).is_none(),
+            "the map key is removed"
+        );
+        let mut saw_killed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("\"freshAgent.killed\"") {
+                saw_killed = true;
+            }
+        }
+        assert!(saw_killed, "the kill answers freshAgent.killed");
+    }
+
+    /// Finding 1, the kill's TEARDOWN half: the map removal + session-field
+    /// extraction (the pre-fix `let mut guard = sessions.lock(); let mut s =
+    /// session_arc.lock();` block) must obey the same rule — the map guard is
+    /// never held across the session-lock take. Staged deterministically: the
+    /// fake sink's retire stall parks the kill between its completed durable
+    /// close and its teardown, the test takes the session lock, and the
+    /// release lets the kill reach its teardown — where its session-lock
+    /// acquisition must park WITHOUT the map held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_teardown_never_holds_the_sessions_map_across_its_session_lock_wait() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-lock-order-teardown"), None).await;
+        let placeholder = "freshopencode-req-lock-order-teardown";
+        // Materialize (a first send through the fake serve), so the kill's
+        // retire batch has the durable id (`ses_1`) to close.
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+
+        let stall = fake.arm_retire_stall("opencode", "ses_1");
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the kill parked inside its durable close");
+        assert!(
+            fake.kill_tombstone_at_ms("opencode", "ses_1") .is_some(),
+            "the close is already recorded (the stall only parks the answer)"
+        );
+
+        // NOW the test holds the session lock when the kill's teardown needs
+        // it; the release moves the kill to its teardown session-lock wait.
+        // The discriminating observation, while the kill parks there: the
+        // keys must ALREADY be removed from a FREELY ACQUIRABLE map (the
+        // teardown's removal is its own synchronous map critical section,
+        // taken BEFORE the session-lock wait). A map guard held ACROSS the
+        // session-lock wait (the finding's shape) fails both halves at once:
+        // try_lock never succeeds AND both keys are still in the map. The
+        // observation is deadline-bounded (the suite convention) because a
+        // full-suite run schedules the kill task lazily; the interleaving
+        // itself is lock-gated, never slept.
+        let session_guard = session_arc.lock().await;
+        stall.release.send(()).expect("release the stalled close");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let removed_while_parked = loop {
+            if let Ok(map) = st.sessions.try_lock() {
+                if !map.contains_key(placeholder) && !map.contains_key("ses_1") {
+                    break true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            removed_while_parked,
+            "the teardown's map removal must run before its session-lock wait — \
+             both keys were still held (or the map stayed locked) while the kill parked"
+        );
+        assert!(
+            !kill.is_finished(),
+            "fixture: the kill is parked at the teardown's session-lock take"
+        );
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the hold releases")
+            .expect("kill task completed");
+        assert!(st.sessions.lock().await.is_empty(), "both map keys removed");
+        let mut saw_killed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("\"freshAgent.killed\"") {
+                saw_killed = true;
+            }
+        }
+        assert!(saw_killed, "the kill answers freshAgent.killed");
+    }
+
+    /// Finding 1, the resume-refusal teardown (`resume_durable_session`'s
+    /// refused-commit arm): the pre-fix `if let Some(removed) =
+    /// self.sessions.lock().await.remove(session_id)` kept the map guard
+    /// alive through the whole `if let` body (edition 2021 scrutinee
+    /// temporaries) — the map stayed locked across `removed.lock().await`
+    /// AND the settle await. Same rule, same probe: the refusal's teardown
+    /// must acquire the session lock only after the map guard is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_refusal_teardown_never_holds_the_sessions_map_across_its_session_lock_wait() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // Park the resume AT its commit gate, then advance the fence
+        // mid-resume WITHOUT touching the map (a kill that landed before the
+        // registration — the refusal arm runs with the session still
+        // registered, so its real teardown body is what the probe covers).
+        let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
+        let st2 = state.clone();
+        let mut attach = tokio::spawn(async move { st2.handle_attach(attach_msg(DURABLE_ID)).await });
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the resume reached its commit");
+        let session_arc = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(DURABLE_ID)
+                .expect("the resume registers before its commit")
+                .clone()
+        };
+        let session_guard = session_arc.lock().await;
+        fake.retire_closed("opencode", DURABLE_ID)
+            .await
+            .expect("the mid-resume close records");
+        gate.release.send(()).expect("release the commit decision");
+
+        // Same discriminating probe while the refusal teardown parks on the
+        // session lock: the DURABLE_ID key must ALREADY be removed from a
+        // FREELY ACQUIRABLE map (the removal is its own synchronous critical
+        // section). A guard held across the session-lock take (the finding's
+        // `if let` scrutinee shape) fails both halves at once. Deadline-
+        // bounded observation, lock-gated interleaving (the test convention).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let removed_while_parked = loop {
+            if let Ok(map) = state.sessions.try_lock() {
+                if !map.contains_key(DURABLE_ID) {
+                    break true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            removed_while_parked,
+            "the refusal teardown's map removal must run before its session-lock wait — \
+             the key was still present (or the map stayed locked) while the lane parked"
+        );
+        assert!(
+            !attach.is_finished(),
+            "fixture: the refusal teardown is parked on the session lock"
+        );
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut attach)
+            .await
+            .expect("the attach completes once the hold releases")
+            .expect("attach task completed");
+
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("OPENCODE_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "the refused resume fails loudly (never registers over a Closed row)"
+        );
+        assert!(
+            state.sessions.lock().await.get(DURABLE_ID).is_none(),
+            "the refusal teardown removed the just-registered session"
+        );
+        assert!(
+            fake.claim_refusals
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the refusal is positively logged"
         );
     }
 

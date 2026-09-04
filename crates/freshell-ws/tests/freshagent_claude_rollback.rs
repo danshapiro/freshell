@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_freshagent::{
     ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
-    SinkCommitWrite, SinkWrite,
+    SinkAliasClearWrite, SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
@@ -397,11 +397,30 @@ impl PaneIdentitySink for TestLedgerSink {
         session_id: &str,
         expect_killed_at_ms: Option<i64>,
     ) -> SinkCommitWrite {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
+    }
+    // Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the aliased commit's
+    // faithful pass-through (the alias gate lives inside the ledger's
+    // guarded transition).
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
+        let aliases: Vec<String> = fence_checked_aliases.to_vec();
         Box::pin(async move {
             let outcome = tokio::task::spawn_blocking(move || {
-                ledger.commit_claim(&p, &s, expect_killed_at_ms, TestLedgerSink::now_ms())
+                ledger.commit_claim_aliased(
+                    &p,
+                    &s,
+                    expect_killed_at_ms,
+                    &aliases,
+                    TestLedgerSink::now_ms(),
+                )
             })
             .await
             .map_err(std::io::Error::other)??;
@@ -411,6 +430,43 @@ impl PaneIdentitySink for TestLedgerSink {
                     ClaimCommit::RefusedStale
                 }
             })
+        })
+    }
+    // Finding 2's alias-record pass-throughs (same disciplines as the rest of
+    // the test double).
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, ph, d) = (
+            provider.to_string(),
+            placeholder.to_string(),
+            durable.to_string(),
+        );
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
+        self.ledger.alias_tombstone_records(provider, placeholder)
+    }
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite {
+        let ledger = self.ledger.clone();
+        let (p, d) = (provider.to_string(), durable.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
+                .await
+                .map_err(std::io::Error::other)?
         })
     }
 }
