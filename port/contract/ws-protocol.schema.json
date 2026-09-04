@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 79,
+  "schemaCount": 81,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -555,7 +555,7 @@
               "type": "string"
             },
             "protocolVersion": {
-              "const": 9,
+              "const": 10,
               "type": "number"
             },
             "sessions": {
@@ -1079,6 +1079,74 @@
           "required": [
             "type",
             "createRequestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "panes": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "createRequestId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "terminalId": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "createRequestId"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "panes.closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "tabId",
+            "panes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "pane.opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "createRequestId",
+            "tabId"
           ],
           "type": "object"
         },
@@ -4203,7 +4271,7 @@
           "type": "string"
         },
         "protocolVersion": {
-          "const": 9,
+          "const": 10,
           "type": "number"
         },
         "sessions": {
@@ -6824,6 +6892,30 @@
       ],
       "type": "object"
     },
+    "PaneOpenedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.opened",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "createRequestId",
+        "tabId"
+      ],
+      "type": "object"
+    },
     "PaneReconcileRequestSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -7056,6 +7148,52 @@
       "required": [
         "paneKey",
         "verdict"
+      ],
+      "type": "object"
+    },
+    "PanesClosedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "panes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "createRequestId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "createRequestId"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "panes.closed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "tabId",
+        "panes"
       ],
       "type": "object"
     },
@@ -8395,5 +8533,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket wire protocol — frozen contract",
-  "wsProtocolVersion": 9
+  "wsProtocolVersion": 10
 }

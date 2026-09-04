@@ -557,6 +557,51 @@ export const PaneClosedSchema = z.object({
   terminalId: z.string().min(1).optional(),
 })
 
+/** Focused-episode-7 round 3 (Finding F1) — the whole-tab BATCH close. The
+ * gated `closeTab` sends ONE `panes.closed` carrying the tab's full
+ * terminal-pane identity set; the server journals ONE durable NON-retiring
+ * envelope record (`pane-detach-batch:<tabId>`) covering the whole set in
+ * ONE atomic write, then answers ONE correlated
+ * `panes.closed.result{requestId, success}` (handled by the same types as
+ * `pane.closed.result`'s floor). A partial per-pane durable outcome is
+ * impossible by construction — the finding's mechanism was a pane-A ack +
+ * pane-B failure pair leaving pane A durably closed under a still-standing
+ * tab. `requestId` is the close op's own correlation key (the batch answers
+ * the OP, not a pane — terminal.kill's precedent). Additive with the
+ * protocol version bump 9 → 10: the client gates tab removal on the answer,
+ * so a server that predates the frame fails the strict hello handshake
+ * instead of silently dropping it (see `shared/ws-version.ts`).
+ * The single-pane removals (pane-X, replace-pane) keep the degenerate
+ * per-pane `pane.closed` envelope above; BOTH route through the same
+ * server-side envelope writer. */
+export const PanesClosedSchema = z.object({
+  type: z.literal('panes.closed'),
+  requestId: z.string().min(1),
+  tabId: z.string().min(1),
+  panes: z.array(z.object({
+    createRequestId: z.string().min(1),
+    terminalId: z.string().min(1).optional(),
+  })).min(1),
+})
+
+/** Focused-episode-7 round 3 (Finding F2) — the durable OPEN re-assertion.
+ * Sent for a pane the client is STILL DISPLAYING after its close evidence
+ * failed to confirm (a server-answered failure, or the ambiguous timeout
+ * whose record may have committed durably with the ack lost on the wire).
+ * The server consumes the pane's standing `pane-detach[-batch]` close
+ * record durably and re-asserts the row's attribution from the connection
+ * identity + this tabId, so the recovery judgment re-agrees with the
+ * displayed layout (a consumed close reads the pane OPEN again). The
+ * client's send path queues it until `ready`, so a socket-down close
+ * replays BEFORE this re-assertion on the returned socket — the ordering is
+ * the fix, not a race. Fire-and-forget (no result frame): idempotent, and
+ * replayed on every reconnect until consumed. */
+export const PaneOpenedSchema = z.object({
+  type: z.literal('pane.opened'),
+  createRequestId: z.string().min(1),
+  tabId: z.string().min(1),
+})
+
 export const TerminalAutoResumeCancelSchema = z.object({
   type: z.literal('terminal.autoResumeCancel'),
   /** The OLD (crashed) terminal id from the recovering notice frame. */
@@ -942,6 +987,8 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalAutoResumeCancelSchema,
   TerminalDetachSchema,
   PaneClosedSchema,
+  PanesClosedSchema,
+  PaneOpenedSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
@@ -1102,6 +1149,25 @@ export type PaneClosedResultMessage = {
   type: 'pane.closed.result'
   createRequestId: string
   terminalId?: string
+  success: boolean
+  error?: string
+}
+
+/**
+ * The correlated `panes.closed` answer (focused-episode-7 round 3, Finding
+ * F1): sent ONCE per batch close, AFTER the ONE durable batch envelope write
+ * resolved, so the closing client can await the whole tab's close evidence
+ * before dropping the tab. Correlated by the close op's own `requestId`
+ * (the batch answers the op, not a pane — terminal.kill's precedent).
+ * `success: false` (with `error`) means NOTHING of the set is durable — the
+ * client keeps the whole tab and shows the failure on every gated pane.
+ *
+ * server→client only. Introduced WITH the protocol version bump 9 → 10 —
+ * see `shared/ws-version.ts` for the mixed-version note.
+ */
+export type PanesClosedResultMessage = {
+  type: 'panes.closed.result'
+  requestId: string
   success: boolean
   error?: string
 }
@@ -1476,6 +1542,7 @@ export type ServerMessage =
   | TerminalDetachedMessage
   | TerminalKilledMessage
   | PaneClosedResultMessage
+  | PanesClosedResultMessage
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalReplacedMessage

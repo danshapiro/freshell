@@ -520,35 +520,18 @@ pub fn build_inventory(
     // be covered by ANOTHER pane's terminal-keyed close record (two panes
     // sharing one terminal: closing only the sibling must not suppress this
     // pane's row).
+    // Delta-r7-round-4 (focused-episode-7 round-3, Finding F3): this closure
+    // IS the ledger's shared predicate — ONE implementation
+    // (`freshell_ws::pane_ledger::close_record_covers_row`) serves BOTH the
+    // verdict computation here and the retention sweep's pruning (pre-fix
+    // the sweep re-implemented a narrower raw-CRID equality and dropped the
+    // origin lineage + terminal arms).
     let row_close_covered = |r: &BindingRow| -> bool {
-        let crid_hit = r
-            .create_request_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .is_some_and(|id| covered_crids.contains(id))
-            || r
-                .origin_create_request_id
-                .as_deref()
-                .filter(|id| !id.is_empty())
-                .is_some_and(|id| covered_crids.contains(id));
-        if crid_hit {
-            return true;
-        }
-        let lineage_keyed = r
-            .create_request_id
-            .as_deref()
-            .is_some_and(|id| !id.is_empty())
-            || r
-                .origin_create_request_id
-                .as_deref()
-                .is_some_and(|id| !id.is_empty());
-        if lineage_keyed {
-            return false; // a lineage-keyed row answers its keys alone (the reattach lapse)
-        }
-        r.live_terminal_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .is_some_and(|id| detach_terminal_ids.contains(id))
+        freshell_ws::pane_ledger::close_record_covers_row(
+            r,
+            &|id: &str| covered_crids.contains(id),
+            &|id: &str| detach_terminal_ids.contains(id),
+        )
     };
     // Bind-by-correlation advisory secondary indices (focused-ep3), Bound
     // rows only. A codex/opencode CLI pane snapshotted INSIDE its

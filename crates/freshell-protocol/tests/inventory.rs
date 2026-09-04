@@ -31,12 +31,12 @@ fn client_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["clientToServer"]["count"].as_u64(),
-        Some(37),
-        "inventory declares 37 client→server types"
+        Some(39),
+        "inventory declares 39 client→server types"
     );
     let expected = json_type_set(&inv["clientToServer"]["types"]);
     let actual: BTreeSet<String> = CLIENT_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 37, "crate declares 37 client types (no dups)");
+    assert_eq!(actual.len(), 39, "crate declares 39 client types (no dups)");
     assert_eq!(
         actual, expected,
         "CLIENT_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -48,12 +48,12 @@ fn server_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(62),
-        "inventory declares 62 server→client types"
+        Some(63),
+        "inventory declares 63 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 62, "crate declares 62 server types (no dups)");
+    assert_eq!(actual.len(), 63, "crate declares 63 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_99() {
+fn combined_surface_is_102() {
     let all = all_message_types();
-    assert_eq!(all.len(), 99, "37 client + 62 server = 99 discriminants");
+    assert_eq!(all.len(), 102, "39 client + 63 server = 102 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        99,
+        102,
         "no discriminant collides across directions"
     );
 }
@@ -139,6 +139,45 @@ fn pane_closed_result_roundtrips_camel_case() {
     let v: serde_json::Value = serde_json::to_value(&fail).unwrap();
     assert_eq!(v["success"], false);
     assert_eq!(v["error"], "the record could not be written durably");
+}
+
+/// Focused-episode-7 round 3 (Findings F1+F2, protocol v10): the batch
+/// tab-close and the durable open re-assertion roundtrip camelCase; the batch
+/// result elides the absent error. The in-flight-create linkage elides
+/// terminalId.
+#[test]
+fn panes_closed_batch_and_pane_opened_roundtrip_camel_case() {
+    let batch: freshell_protocol::ClientMessage = serde_json::from_str(
+        r#"{"type":"panes.closed","requestId":"bc-1","tabId":"tab-9","panes":[{"createRequestId":"req-a","terminalId":"t-a"},{"createRequestId":"req-b"}]}"#,
+    )
+    .expect("parse batch");
+    let v: serde_json::Value = serde_json::to_value(&batch).expect("serialize");
+    assert_eq!(v["type"], "panes.closed");
+    assert_eq!(v["requestId"], "bc-1");
+    assert_eq!(v["tabId"], "tab-9");
+    assert_eq!(v["panes"][0]["createRequestId"], "req-a");
+    assert_eq!(v["panes"][0]["terminalId"], "t-a");
+    assert_eq!(v["panes"][1]["createRequestId"], "req-b");
+    assert!(v["panes"][1].get("terminalId").is_none(), "{v}");
+
+    let opened: freshell_protocol::ClientMessage = serde_json::from_str(
+        r#"{"type":"pane.opened","createRequestId":"req-a","tabId":"tab-9"}"#,
+    )
+    .expect("parse opened");
+    let v: serde_json::Value = serde_json::to_value(&opened).expect("serialize");
+    assert_eq!(v["type"], "pane.opened");
+    assert_eq!(v["createRequestId"], "req-a");
+    assert_eq!(v["tabId"], "tab-9");
+
+    let result: freshell_protocol::ServerMessage = serde_json::from_str(
+        r#"{"type":"panes.closed.result","requestId":"bc-1","success":true}"#,
+    )
+    .expect("parse result");
+    let v: serde_json::Value = serde_json::to_value(&result).expect("serialize");
+    assert_eq!(v["type"], "panes.closed.result");
+    assert_eq!(v["requestId"], "bc-1");
+    assert_eq!(v["success"], true);
+    assert!(v.get("error").is_none(), "no error key without a failure");
 }
 
 #[test]

@@ -14,10 +14,18 @@ const { paneCloseAckHandlers } = vi.hoisted(() => ({
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: (msg: unknown) => {
-      const m = msg as { type?: string; createRequestId?: string }
+      const m = msg as { type?: string; createRequestId?: string; requestId?: string }
       if (m?.type === 'pane.closed' && m.createRequestId) {
         for (const handler of [...paneCloseAckHandlers]) {
           handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+        }
+      }
+      // Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+      // batch envelope — answer the correlated `panes.closed.result` (the
+      // healthy-server shape), same as the per-pane lane above.
+      if (m?.type === 'panes.closed' && m.requestId) {
+        for (const handler of [...paneCloseAckHandlers]) {
+          handler({ type: 'panes.closed.result', requestId: m.requestId, success: true })
         }
       }
     },

@@ -54,6 +54,25 @@ function ackAllPaneCloses(extra: Record<string, unknown> = {}) {
   }
 }
 
+/** Answer every outstanding panes.closed batch with a result (the healthy server). */
+function ackPanesClosedBatches(extra: Record<string, unknown> = {}) {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; requestId?: string }
+    if (m?.type === 'panes.closed' && m.requestId) {
+      emit({ type: 'panes.closed.result', requestId: m.requestId, success: true, ...extra })
+    }
+  }
+}
+
+/** The call-sequence index of the first send of `type` (-1 when never sent). */
+function firstSendIndexOf(type: string): number {
+  return mockSend.mock.calls.findIndex(([m]) => (m as { type?: string }).type === type)
+}
+
+function sentCallsOf(type: string): Array<Record<string, unknown>> {
+  return mockSend.mock.calls.map(([m]) => m as Record<string, unknown>).filter((m) => m.type === type)
+}
+
 function terminalContent(crid: string, terminalId?: string): PaneContent {
   return {
     kind: 'terminal',
@@ -145,6 +164,11 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     })
     // The detach loop never ran for the still-present pane's terminal.
     expect(mockSend.mock.calls.some(([m]) => (m as { type?: string }).type === 'terminal.detach')).toBe(false)
+    // F2: the kept pane re-asserts open (after the close on the wire).
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+    expect(firstSendIndexOf('pane.closed')).toBeLessThan(firstSendIndexOf('pane.opened'))
   })
 
   it('a closed pane whose close EVIDENCE came back clean is retryable — a second close re-sends and succeeds', async () => {
@@ -160,7 +184,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     expect(mockSend.mock.calls.filter(([m]) => (m as { type?: string }).type === 'pane.closed').length).toBeGreaterThanOrEqual(2)
   })
 
-  it('timeout: the pane stays and the timeout copy lands on the pane', async () => {
+  it('timeout: the pane stays, the timeout copy lands on the pane, and the pane re-asserts open (F2)', async () => {
     vi.useFakeTimers()
     const store = createTwoPaneStore()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
@@ -170,6 +194,9 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     expect(paneCloseErrors(store, 'tab-1')).toEqual({
       'pane-2': 'the server did not acknowledge the pane close in time; the pane was left open',
     })
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
   })
 
   it('an in-flight create close (NO terminalId yet) is gated the same way — CRID-only message, acked before removal', async () => {
@@ -261,41 +288,78 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
   })
 })
 
-describe('closeTab — the all-or-nothing close gate (F2)', () => {
-  it('success: every pane acked → the whole tab is gone', async () => {
+describe('closeTab — the all-or-nothing close gate (F2) + ONE envelope per tab close (F1)', () => {
+  it('success: ONE acknowledged batch envelope covers the whole pane set → the whole tab is gone', async () => {
     const store = createTwoPaneStore()
     const close = store.dispatch(closeTab('tab-1'))
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
-    expect(mockSend.mock.calls.filter(([m]) => (m as { type?: string }).type === 'pane.closed'))
-      .toEqual(expect.arrayContaining([
-        [expect.objectContaining({ createRequestId: 'req-a' })],
-        [expect.objectContaining({ createRequestId: 'req-b' })],
-      ]))
-    ackAllPaneCloses()
+    // F1: exactly one batch message carrying the tab's FULL pane-identity set —
+    // no per-pane pane.closed traffic from the gated lane, so a partial
+    // per-pane durable outcome is impossible by construction.
+    const batches = sentCallsOf('panes.closed')
+    expect(batches).toHaveLength(1)
+    expect(sentCallsOf('pane.closed')).toEqual([])
+    expect(batches[0]).toMatchObject({
+      type: 'panes.closed',
+      tabId: 'tab-1',
+      panes: [
+        { createRequestId: 'req-a', terminalId: 'term-a' },
+        { createRequestId: 'req-b', terminalId: 'term-b' },
+      ],
+    })
+    expect(typeof batches[0].requestId).toBe('string')
+    ackPanesClosedBatches()
     await close
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
     expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
   })
 
-  it('one failing pane keeps the WHOLE tab (and only that pane wears the error)', async () => {
+  it('a failed batch keeps the WHOLE tab and EVERY gated pane wears the error (F1: a partial per-pane outcome is impossible)', async () => {
     const store = createTwoPaneStore()
     const close = store.dispatch(closeTab('tab-1'))
-    for (const [msg] of mockSend.mock.calls) {
-      const m = msg as { type?: string; createRequestId?: string }
-      if (m?.type === 'pane.closed' && m.createRequestId) {
-        emit({
-          type: 'pane.closed.result',
-          createRequestId: m.createRequestId,
-          success: m.createRequestId !== 'req-b',
-        })
-      }
-    }
+    ackPanesClosedBatches({ success: false })
     await close
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
     expect(store.getState().panes.layouts['tab-1']).toBeDefined()
     expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-1': 'the pane close could not be recorded durably; the pane was left open',
       'pane-2': 'the pane close could not be recorded durably; the pane was left open',
     })
+  })
+
+  it('F2: a failed close re-asserts every kept pane open (pane.opened AFTER the close on the wire)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches({ success: false })
+    await close
+    const opened = sentCallsOf('pane.opened')
+    expect(opened).toEqual([
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-a', tabId: 'tab-1' }),
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+    // The messaging order the server replays: the close journals BEFORE the
+    // re-assertions consume it (a socket-down close never leaves the record
+    // durable-standing once the client re-asserts).
+    expect(firstSendIndexOf('panes.closed')).toBeGreaterThanOrEqual(0)
+    expect(firstSendIndexOf('pane.opened')).toBeGreaterThan(firstSendIndexOf('panes.closed'))
+  })
+
+  it('F2: a timed-out close re-asserts every kept pane open (the ambiguous-timeout reconciliation)', async () => {
+    vi.useFakeTimers()
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-1': 'the server did not acknowledge the pane close in time; the pane was left open',
+      'pane-2': 'the server did not acknowledge the pane close in time; the pane was left open',
+    })
+    const opened = sentCallsOf('pane.opened')
+    expect(opened).toEqual([
+      expect.objectContaining({ createRequestId: 'req-a', tabId: 'tab-1' }),
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
   })
 
   it('a tab with no terminal panes closes with no gate traffic', async () => {
@@ -314,16 +378,20 @@ describe('closeTab — the all-or-nothing close gate (F2)', () => {
 })
 
 describe('closePaneWithCleanup last-pane cascade (F2)', () => {
-  it('closing the last pane routes through the SAME gate (the whole-tab close)', async () => {
+  it('closing the last pane routes through the SAME gate (the whole-tab close — one batch envelope, F1)', async () => {
     const store = createStore()
     store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', 'term-a') }))
     mockSend.mockClear()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }))
-    // gated: neither pane nor tab moves before the ack
+    // gated: neither pane nor tab moves before the ack — and the cascade
+    // sends the BATCH envelope (the whole tab closes), not a lone pane.closed.
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
     expect(store.getState().panes.layouts['tab-1']).toBeDefined()
-    ackAllPaneCloses()
+    const batches = sentCallsOf('panes.closed')
+    expect(batches).toHaveLength(1)
+    expect(batches[0].panes).toEqual([{ createRequestId: 'req-a', terminalId: 'term-a' }])
+    ackPanesClosedBatches()
     await close
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
   })
@@ -345,7 +413,7 @@ describe('replacePaneWithCleanup — the context-menu replace gate (F2)', () => 
     expect(entries.find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
   })
 
-  it('failure: the original terminal content stays and wears the error', async () => {
+  it('failure: the original terminal content stays, wears the error, and re-asserts open (F2)', async () => {
     const store = createTwoPaneStore()
     const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
     emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: false })
@@ -355,6 +423,9 @@ describe('replacePaneWithCleanup — the context-menu replace gate (F2)', () => 
     expect((entry?.content as { closeError?: string }).closeError).toBe(
       'the pane close could not be recorded durably; the pane was left open',
     )
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
   })
 })
 

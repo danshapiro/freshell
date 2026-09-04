@@ -4509,6 +4509,79 @@ async fn route_never_offers_a_detach_close_covered_row() {
     );
 }
 
+/// Focused-episode-7 round 3, Finding F2, route level — the finding's
+/// verbatim pin: a committed close + lost ack + `pane.opened` re-assertion ⇒
+/// the pane is RECOVERABLE again. The close enveloped durably (the ack was
+/// lost on the wire — the pane visibly stayed open), then the client's
+/// re-assertion consumed the record through the same real ledger API the
+/// `pane.opened` handler drives (`note_pane_opened`). Pre-fix, the truncated
+/// record stood forever and recovery suppressed the still-open pane; pre-F2
+/// there was no re-assertion at all.
+#[tokio::test]
+async fn route_offers_a_row_after_its_committed_close_is_re_asserted_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    std::fs::write(
+        broot.join("bindings").join("claude").join("S-kept-open.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": "S-kept-open", "mode": "claude",
+            "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
+            "state": "bound", "createRequestId": "req-kept-open", "liveTerminalId": "term-kept-open",
+            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+            "lastAttributedAt": 995_000
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // THE COMMITTED CLOSE — durable; its ack was lost on the wire.
+    let seeder = PaneLedger::new(Some(broot.clone()));
+    seeder
+        .close_pane_detached("req-kept-open", Some("term-kept-open"), 996_000)
+        .expect("the committed close lands");
+    // THE RE-ASSERTION: the still-open pane's `pane.opened` (the same API the
+    // handler drives), attributed to its tab at the assertion's own time.
+    seeder
+        .note_pane_opened(
+            "req-kept-open",
+            ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("dev1"),
+                tab_key: Some("dev1:t9"),
+                asserted_at: 997_000,
+            }),
+            997_000,
+        )
+        .expect("the re-assertion lands");
+    drop(seeder);
+
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let only = body["ledgerOnly"].as_array().unwrap();
+    assert!(
+        only.iter().any(|e| e["sessionId"] == "S-kept-open"),
+        "committed-close + lost-ack + pane.opened ⇒ the pane is recoverable again: {body}"
+    );
+}
+
 /// Delta-r7-round-2 (Finding F3), route level — the finding's verbatim repair
 /// shape: the pane X-closes (its non-retiring `pane.closed` evidence stands),
 /// then a NEW pane reattaches the SAME still-running terminal through the real

@@ -2,6 +2,8 @@ import { nanoid } from 'nanoid'
 import { createLogger } from './client-logger'
 import { markTerminalReleased } from './terminal-release-marks'
 import { getWsClient } from './ws-client'
+import { collectPaneEntries } from './pane-utils'
+import type { PaneNode } from '@/store/paneTypes'
 
 /**
  * Correlated close-acknowledgement waits (focused-episode-6 round 2,
@@ -170,6 +172,128 @@ export const PANE_CLOSE_FAILED_MESSAGE =
   'the pane close could not be recorded durably; the pane was left open'
 export const PANE_CLOSE_ACK_TIMEOUT_MESSAGE =
   'the server did not acknowledge the pane close in time; the pane was left open'
+
+/** One pane identity inside a batch close (`panes.closed[].panes`). */
+export type PaneCloseIdentityInput = { createRequestId: string; terminalId?: string }
+
+/**
+ * The whole-tab BATCH close (focused-episode-7 round 3, Finding F1): the
+ * gated `closeTab` sends ONE `panes.closed` carrying the tab's full
+ * terminal-pane identity set and resolves on the ONE correlated
+ * `panes.closed.result{requestId, success, error?}` the server answers once
+ * the single batch envelope write resolved — a partial per-pane durable
+ * outcome is impossible by construction (the server journals ONE record
+ * covering the whole set atomically). Correlation is the close op's own
+ * minted `requestId` (terminal.kill's precedent — the batch answers the OP,
+ * not a pane). The wait SUBSCRIBES BEFORE THE SEND, so a server answering
+ * inline during `send()` still lands. No legacy fallbacks BY DESIGN: v10's
+ * strict hello handshake makes a result-less server unreachable in
+ * principle.
+ */
+export function sendPanesClosedAndAwait(
+  tabId: string,
+  panes: PaneCloseIdentityInput[],
+  opts?: { timeoutMs?: number; send?: (msg: unknown) => void },
+): Promise<KillAck> {
+  const requestId = nanoid()
+  const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
+  const wait = awaitCloseFrame((msg) => {
+    const m = msg as Record<string, unknown>
+    if (m.type === 'panes.closed.result' && m.requestId === requestId) {
+      return { ok: m.success !== false, error: typeof m.error === 'string' ? m.error : undefined }
+    }
+    return null
+  }, opts?.timeoutMs ?? KILL_ACK_TIMEOUT_MS)
+  send({
+    type: 'panes.closed',
+    requestId,
+    tabId,
+    panes: panes.map((p) => ({
+      createRequestId: p.createRequestId,
+      ...(p.terminalId ? { terminalId: p.terminalId } : {}),
+    })),
+  })
+  return wait.then((ack) => {
+    if (!ack.ok) {
+      log.warn('tab close was not acknowledged as durably recorded — the tab stays', {
+        tabId,
+        paneCount: panes.length,
+        ...ack,
+      })
+    }
+    return ack
+  })
+}
+
+/**
+ * The durable OPEN re-assertion (focused-episode-7 round 3, Finding F2):
+ * sent for a pane the client is STILL DISPLAYING after its close evidence
+ * failed to confirm (a server-answered failure — nothing durable; or the
+ * ambiguous TIMEOUT whose record may have committed durably with the ack
+ * lost on the wire). The server consumes the pane's standing
+ * `pane-detach[-batch]` close record durably and re-asserts the row's
+ * attribution, so recovery re-agrees with the displayed layout.
+ *
+ * Fire-and-forget BY DESIGN: `getWsClient().send` queues the message until
+ * `ready`, so over a socket-down close the replay delivers the close BEFORE
+ * this re-assertion on the returned socket (the ordering is the fix, not a
+ * race). There is deliberately no result frame: the assert is idempotent (a
+ * no-op when nothing stands). The per-ready sweep below is the healing half
+ * for every shape that outlives the queue (a page reload drops queued
+ * sends): on EVERY ws `ready` the client re-asserts every terminal pane it
+ * is displaying, so a standing-but-contradicted close record is consumed on
+ * the next connection regardless of how the page got there.
+ */
+export function sendPaneOpened(
+  identity: { createRequestId: string; tabId: string },
+  opts?: { send?: (msg: unknown) => void },
+): void {
+  const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
+  send({
+    type: 'pane.opened',
+    createRequestId: identity.createRequestId,
+    tabId: identity.tabId,
+  })
+  log.debug('re-asserted an unconfirmed-close pane as open', {
+    createRequestId: identity.createRequestId,
+    tabId: identity.tabId,
+  })
+}
+
+/**
+ * The per-ready OPEN re-assertion sweep (focused-episode-7 round 3, Finding
+ * F2): on every ws `ready` (first connect AND every reconnect), assert every
+ * terminal pane the client is displaying — ONE message per pane, keyed by
+ * its createRequestId, exactly the close gate's identity criterion. The
+ * server consumes any standing detach-family close record for a displayed
+ * pane and re-asserts its row attribution: server state re-agrees with the
+ * layout the client is displaying, durably. Closed panes are absent from the
+ * layouts by then, so a genuine close is never revoked; createRequestIds are
+ * never reused, so a re-opened pane asserts only its own new key. Idempotent
+ * and fsync-free server-side when nothing stands and attribution is
+ * unchanged, so every-viewport reconnect stays cheap.
+ */
+export function reassertAllOpenTerminalPanes(
+  layouts: Record<string, PaneNode | undefined>,
+  opts?: { send?: (msg: unknown) => void },
+): void {
+  let count = 0
+  for (const [tabId, root] of Object.entries(layouts)) {
+    if (!root) continue
+    for (const { content } of collectPaneEntries(root)) {
+      if (content.kind !== 'terminal') continue
+      const createRequestId = typeof content.createRequestId === 'string' && content.createRequestId
+        ? content.createRequestId
+        : undefined
+      if (!createRequestId) continue
+      sendPaneOpened({ createRequestId, tabId }, opts)
+      count++
+    }
+  }
+  if (count > 0) {
+    log.debug('re-asserted the displayed open panes on ready', { count })
+  }
+}
 
 /**
  * The correlated durable-pane-close (delta-r7-round-3, focused-episode-7

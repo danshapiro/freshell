@@ -21,8 +21,11 @@ vi.mock('@/lib/ws-client', () => ({
 import {
   EXIT_FALLBACK_GRACE_MS,
   KILL_ACK_TIMEOUT_MS,
+  reassertAllOpenTerminalPanes,
   sendFreshAgentKillAndAwait,
   sendPaneClosedAndAwait,
+  sendPaneOpened,
+  sendPanesClosedAndAwait,
   sendTerminalKillAndAwait,
 } from '@/lib/kill-ack'
 
@@ -301,6 +304,137 @@ describe('kill-ack', () => {
       await Promise.resolve()
       // still settled as the timeout — a second resolution would be a bug
       await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+    })
+  })
+
+  describe('sendPanesClosedAndAwait (focused-episode-7 round 3 Finding F1 — the whole-tab close is ONE envelope)', () => {
+    const tabIdentities = [
+      { paneId: 'pane-1', createRequestId: 'cr-a', terminalId: 'term-a' },
+      { paneId: 'pane-2', createRequestId: 'cr-b' }, // mid-create: CRID only
+    ]
+
+    it('sends ONE panes.closed carrying the whole set and resolves ok on the correlated panes.closed.result', async () => {
+      const pending = sendPanesClosedAndAwait('tab-9', tabIdentities)
+      expect(mockSend).toHaveBeenCalledTimes(1)
+      const sent = mockSend.mock.calls[0][0] as Record<string, unknown>
+      expect(sent.type).toBe('panes.closed')
+      expect(sent.tabId).toBe('tab-9')
+      expect(typeof sent.requestId).toBe('string')
+      expect((sent.requestId as string).length).toBeGreaterThan(0)
+      expect(sent.panes).toEqual([
+        { createRequestId: 'cr-a', terminalId: 'term-a' },
+        { createRequestId: 'cr-b' },
+      ])
+      emit({ type: 'panes.closed.result', requestId: sent.requestId, success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
+    it('never resolves on a result for another close op (the requestId correlation is exact)', async () => {
+      const pending = sendPanesClosedAndAwait('tab-9', tabIdentities)
+      const sent = mockSend.mock.calls[0][0] as { requestId: string }
+      const probe = vi.fn()
+      void pending.then(probe)
+      emit({ type: 'panes.closed.result', requestId: 'someone-else', success: true })
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-a', success: true })
+      await Promise.resolve()
+      expect(probe).not.toHaveBeenCalled()
+      emit({ type: 'panes.closed.result', requestId: sent.requestId, success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
+    it('success:false resolves as ONE failure for the whole set (a partial outcome is impossible)', async () => {
+      const pending = sendPanesClosedAndAwait('tab-9', tabIdentities)
+      const sent = mockSend.mock.calls[0][0] as { requestId: string }
+      emit({
+        type: 'panes.closed.result',
+        requestId: sent.requestId,
+        success: false,
+        error: 'the pane-close record could not be written durably',
+      })
+      await expect(pending).resolves.toEqual({
+        ok: false,
+        error: 'the pane-close record could not be written durably',
+      })
+    })
+
+    it('an answer delivered INSIDE the send call resolves — the wait subscribes BEFORE the send', async () => {
+      const send = vi.fn((msg: unknown) => {
+        const m = msg as { requestId?: string }
+        emit({ type: 'panes.closed.result', requestId: m.requestId, success: true })
+      })
+      await expect(sendPanesClosedAndAwait('tab-9', tabIdentities, { send })).resolves.toEqual({ ok: true })
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(mockSend).not.toHaveBeenCalled()
+    })
+
+    it('times out as a UI failure (unconfirmed close — the whole tab stays)', async () => {
+      vi.useFakeTimers()
+      const pending = sendPanesClosedAndAwait('tab-9', tabIdentities)
+      await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+    })
+  })
+
+  describe('sendPaneOpened (focused-episode-7 round 3 Finding F2 — the durable open re-assertion)', () => {
+    it('sends pane.opened{createRequestId, tabId} for the still-present pane', () => {
+      sendPaneOpened({ createRequestId: 'cr-open', tabId: 'tab-9' })
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'pane.opened',
+        createRequestId: 'cr-open',
+        tabId: 'tab-9',
+      })
+    })
+
+    it('honors an injected send (the test-double shape, same as the await helpers)', () => {
+      const send = vi.fn()
+      sendPaneOpened({ createRequestId: 'cr-open', tabId: 'tab-9' }, { send })
+      expect(send).toHaveBeenCalledWith({
+        type: 'pane.opened',
+        createRequestId: 'cr-open',
+        tabId: 'tab-9',
+      })
+      expect(mockSend).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('reassertAllOpenTerminalPanes (F2 — the per-ready sweep)', () => {
+    const leaf = (paneId: string, content: Record<string, unknown>) => ({
+      type: 'leaf' as const,
+      id: paneId,
+      content,
+    })
+
+    it('asserts every DISPLAYED terminal pane (per tab, keyed by createRequestId) and skips the rest', () => {
+      const send = vi.fn()
+      reassertAllOpenTerminalPanes(
+        {
+          'tab-1': {
+            type: 'split',
+            id: 's1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              leaf('p1', { kind: 'terminal', createRequestId: 'cr-a', terminalId: 'term-a', mode: 'shell', status: 'running' }),
+              leaf('p2', { kind: 'terminal', createRequestId: 'cr-b', mode: 'claude', status: 'creating' }), // in-flight create: CRID-only
+            ],
+          },
+          'tab-2': leaf('p3', { kind: 'terminal', createRequestId: 'cr-c', terminalId: 'term-c', mode: 'shell', status: 'running' }),
+          'tab-3': leaf('p4', { kind: 'browser', url: 'https://example.com' }), // non-terminal: never
+          'tab-4': undefined, // dead entry: never
+        } as never,
+        { send },
+      )
+      expect(send.mock.calls.map(([m]) => m)).toEqual([
+        { type: 'pane.opened', createRequestId: 'cr-a', tabId: 'tab-1' },
+        { type: 'pane.opened', createRequestId: 'cr-b', tabId: 'tab-1' },
+        { type: 'pane.opened', createRequestId: 'cr-c', tabId: 'tab-2' },
+      ])
+    })
+
+    it('sends nothing when no terminal pane is displayed (cheap every-ready call)', () => {
+      const send = vi.fn()
+      reassertAllOpenTerminalPanes({}, { send })
+      expect(send).not.toHaveBeenCalled()
     })
   })
 })

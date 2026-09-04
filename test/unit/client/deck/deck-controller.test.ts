@@ -10,10 +10,18 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: (msg: unknown) => {
       sendMock(msg)
-      const m = msg as { type?: string; createRequestId?: string }
+      const m = msg as { type?: string; createRequestId?: string; requestId?: string }
       if (m?.type === 'pane.closed' && m.createRequestId) {
         for (const handler of [...closeAckHandlers]) {
           handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+        }
+      }
+      // Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+      // batch envelope — answer the correlated `panes.closed.result` too
+      // (the healthy-server shape), or a mid-press closeTab wedges its gate.
+      if (m?.type === 'panes.closed' && m.requestId) {
+        for (const handler of [...closeAckHandlers]) {
+          handler({ type: 'panes.closed.result', requestId: m.requestId, success: true })
         }
       }
     },

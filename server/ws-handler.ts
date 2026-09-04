@@ -83,6 +83,8 @@ import {
   TerminalAttachSchema,
   TerminalDetachSchema,
   PaneClosedSchema,
+  PanesClosedSchema,
+  PaneOpenedSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
@@ -847,6 +849,8 @@ export class WsHandler {
       TerminalAttachSchema,
       TerminalDetachSchema,
       PaneClosedSchema,
+      PanesClosedSchema,
+      PaneOpenedSchema,
       TerminalInputSchema,
       TerminalResizeSchema,
       TerminalKillSchema,
@@ -4000,6 +4004,27 @@ export class WsHandler {
           ...(typeof m.terminalId === 'string' && m.terminalId ? { terminalId: m.terminalId } : {}),
           success: true,
         })
+        return
+
+      case 'panes.closed':
+        // Focused-episode-7 round 3 (Finding F1): the whole-tab BATCH close.
+        // Same floor rule as pane.closed — the v10 client gates tab removal
+        // on the ONE correlated `panes.closed.result`, and this server
+        // journals nothing (no recovery ledger), so answer success by the
+        // batch's requestId. Answer, never ignore: a v10 client treats
+        // silence as an unconfirmed close.
+        this.send(ws, {
+          type: 'panes.closed.result',
+          requestId: m.requestId,
+          success: true,
+        })
+        return
+
+      case 'pane.opened':
+        // Focused-episode-7 round 3 (Finding F2): the durable open
+        // re-assertion. Fire-and-forget by design; only the Rust pane ledger
+        // consumes the pane's standing close record (this server records
+        // nothing, so there is nothing to consume and no answer to wedge).
         return
 
       default:

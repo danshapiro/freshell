@@ -1045,6 +1045,203 @@ async fn a_pane_closed_is_answered_by_a_correlated_result_after_the_journal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Focused-episode-7 round 3, Finding F1 — the whole-tab close is ONE
+/// envelope: `panes.closed` carries the tab's full pane-identity set, the
+/// server journals a SINGLE non-retiring batch envelope record (the same
+/// atomic close-envelope machinery — a mid-set partial outcome is
+/// impossible), and answers ONE correlated `panes.closed.result{requestId,
+/// success}` AFTER the durable write resolved. Malformed batches (no request
+/// id, no panes, an empty createRequestId) answer `success:false` immediately
+/// — never an unacknowledged wedge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panes_closed_batch_is_journaled_as_one_envelope_and_answered_once() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("panes-closed-batch");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // An identified pane (created + bound with the pane's CRID) plus a second
+    // pane whose close arrives CRID-only (the in-flight-create shape).
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-batch-a",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    ws.send(
+        WsMessage::Text(
+            serde_json::json!({
+                "type": "panes.closed",
+                "requestId": "batch-close-1",
+                "tabId": "tab-batch",
+                "panes": [
+                    { "createRequestId": "req-batch-a", "terminalId": terminal_id },
+                    { "createRequestId": "req-batch-b" },
+                ],
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    let result = next_frame_of_type(&mut ws, "panes.closed.result").await;
+    assert_eq!(result["requestId"], "batch-close-1");
+    assert_eq!(result["success"], true, "the batch journaled: {result}");
+
+    // ONE envelope covers the whole set: the read model flattens both
+    // linkages; nothing fenced, nothing retired.
+    let mut closes = server_ledger.list_pane_detach_closes();
+    closes.sort_by(|a, b| a.create_request_id.cmp(&b.create_request_id));
+    assert_eq!(closes.len(), 2, "both panes covered: {closes:?}");
+    assert_eq!(closes[0].create_request_id, "req-batch-a");
+    assert_eq!(
+        closes[0].terminal_id.as_deref(),
+        Some(terminal_id.as_str())
+    );
+    assert_eq!(closes[1].create_request_id, "req-batch-b");
+    assert_eq!(closes[1].terminal_id, None, "the CRID-only pane shape");
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("row");
+    assert_eq!(row.state, RowState::Bound, "the batch is non-retiring");
+    assert!(server_ledger.all_kill_tombstone_keys().is_empty());
+    // One journal file, durable across a restart reload.
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert_eq!(disk.list_pane_detach_closes().len(), 2);
+
+    // Malformed shapes answer failure immediately (never an unanswered wait):
+    // no panes, and an empty createRequestId member.
+    for malformed in [
+        serde_json::json!({
+            "type": "panes.closed",
+            "requestId": "batch-close-empty",
+            "tabId": "tab-batch",
+            "panes": [],
+        }),
+        serde_json::json!({
+            "type": "panes.closed",
+            "requestId": "batch-close-badcrid",
+            "tabId": "tab-batch",
+            "panes": [{ "createRequestId": "" }],
+        }),
+    ] {
+        ws.send(WsMessage::Text(malformed.to_string())).await.unwrap();
+        let bad = next_frame_of_type(&mut ws, "panes.closed.result").await;
+        assert_eq!(bad["success"], false, "malformed batch: {bad}");
+        assert!(bad["error"].is_string(), "the error names it: {bad}");
+    }
+    assert_eq!(
+        server_ledger.list_pane_detach_closes().len(),
+        2,
+        "malformed batches journal nothing"
+    );
+
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Focused-episode-7 round 3, Finding F2 — the durable open re-assertion,
+/// end to end over the wire: the pane close COMMITS (its ack was lost on the
+/// wire — the finding's exact mechanism), the visibly-still-open pane then
+/// sends `pane.opened{createRequestId, tabId}`, and the server consumes the
+/// standing close record durably while advancing the row's attribution to
+/// the re-assertion — recovery re-agrees with the layout the client is
+/// displaying (a restart never re-feeds the consumed close).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pane_opened_consumes_the_committed_close_durably() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("pane-opened");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) =
+        connect_and_capture_inventory_with_identity(&url, "device-po", "client-po").await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-po",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-po",
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bound = server_ledger.load_binding("claude", &session_id).expect("row");
+    assert_eq!(bound.tab_key.as_deref(), Some("device-po:tab-po"));
+
+    // THE COMMITTED CLOSE — acknowledged server-side, the ack lost on the wire
+    // (the client keeps the pane; only the record proves "closed").
+    ws.send(
+        WsMessage::Text(
+            serde_json::json!({
+                "type": "pane.closed",
+                "createRequestId": "req-po",
+                "terminalId": terminal_id,
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    let ack = next_frame_of_type(&mut ws, "pane.closed.result").await;
+    assert_eq!(ack["success"], true);
+    assert_eq!(server_ledger.list_pane_detach_closes().len(), 1);
+
+    // THE RE-ASSERTION (socket returned; the client re-asserts the layout it
+    // is displaying): the record is consumed.
+    ws.send(
+        WsMessage::Text(
+            serde_json::json!({
+                "type": "pane.opened",
+                "createRequestId": "req-po",
+                "tabId": "tab-po",
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    // Order the read: the ONE socket loop processes messages sequentially, so
+    // once this later frame's answer arrives the re-assertion has landed.
+    ws.send(WsMessage::Text("{\"type\":\"ping\"}".to_string()))
+        .await
+        .unwrap();
+    let _ = next_frame_of_type(&mut ws, "pong").await;
+
+    assert!(
+        server_ledger.list_pane_detach_closes().is_empty(),
+        "the re-assertion consumed the committed close: {:?}",
+        server_ledger.list_pane_detach_closes()
+    );
+    let row = server_ledger.load_binding("claude", &session_id).expect("row");
+    assert_eq!(row.state, RowState::Bound);
+    assert_eq!(row.create_request_id.as_deref(), Some("req-po"));
+    // Durable: a restart over the same dir never re-feeds the consumed close.
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert!(
+        disk.list_pane_detach_closes().is_empty(),
+        "the consumption is durable"
+    );
+
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Delta-r7-round-2 (Finding F3) — the sidebar-reattach restamp, end to end:
 /// the pane X-closes (its `pane.closed` journals the non-retiring record
 /// keyed by the OLD createRequestId), then a NEW pane reattaches to the SAME

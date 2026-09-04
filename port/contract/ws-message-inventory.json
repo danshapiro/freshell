@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 37,
+    "count": 39,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -26,7 +26,9 @@
       "hoststats.unsubscribe",
       "opencode.activity.list",
       "pane.closed",
+      "pane.opened",
       "pane.reconcile.request",
+      "panes.closed",
       "ping",
       "sessions.prefs",
       "terminal.attach",
@@ -44,7 +46,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 62,
+    "count": 63,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -77,6 +79,7 @@
       "opencode.activity.updated",
       "pane.closed.result",
       "pane.reconcile.result",
+      "panes.closed.result",
       "perf.logging",
       "pong",
       "ready",
@@ -112,5 +115,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket message inventory — T0 conformance surface",
-  "wsProtocolVersion": 9
+  "wsProtocolVersion": 10
 }

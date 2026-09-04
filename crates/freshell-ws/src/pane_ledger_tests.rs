@@ -6185,6 +6185,460 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_its_create_request_id(
     std::fs::remove_dir_all(&root).ok();
 }
 
+// ── Focused-episode-7 round 3 ──
+//
+// Finding F1 (the whole-tab close is ONE envelope): `panes.closed` carries the
+// tab's full pane-identity set and journals a SINGLE non-retiring envelope
+// record (`pane-detach-batch:<tabId>`, the SAME close-envelope machinery), so
+// a mid-set write failure can never leave PART of the tab's close durable —
+// either the whole close is durable or nothing is.
+//
+// Finding F2 (the durable open re-assertion): a committed close whose
+// acknowledgement was lost (socket down / half-open) leaves durable closed
+// evidence under a STILL-OPEN pane. The client's `pane.opened` re-assertion
+// consumes the standing record durably (the claim-consumes-fences discipline
+// carried to the detach family), so the recovery judgment and the server
+// state re-agree with the layout the client is displaying.
+//
+// Finding F3 (retention IS the recovery predicate): the retention sweep keeps
+// close evidence while ANY row it covers stands, judged by the ONE shared
+// coverage predicate (`close_record_covers_row`), never by a narrower
+// raw-CRID equality — a lineage-only (origin CRID) record + a standing row
+// survives past the TTL edge.
+
+/// One full batch close, ONE journal record: the read model flattens every
+/// carried linkage, no fence is fed, no row is touched, a repeated close of
+/// the SAME tab is an idempotent merge under the one key, and the envelope is
+/// durable across a restart reload.
+#[test]
+fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
+    let root = temp_root("batch-close");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    for (session_id, terminal_id, crid) in
+        [("sess-b1", "term-b1", "req-b1"), ("sess-b2", "term-b2", "req-b2")]
+    {
+        ledger
+            .record_binding(&BindingWrite {
+                provider: "claude",
+                session_id,
+                terminal_id,
+                mode: "claude",
+                cwd: Some("/tmp/proj"),
+                create_request_id: Some(crid),
+                origin_create_request_id: None,
+                provenance: ProvenancePolicy::Inherit,
+                now_ms: 1_000,
+            })
+            .unwrap();
+    }
+
+    // THE BATCH CLOSE: the tab's full pane set — pane 2 closed mid-create
+    // (CRID-only; the client never learned the terminal id).
+    ledger
+        .close_panes_detached(
+            "tab-batch",
+            &[
+                PaneCloseLinkage {
+                    create_request_id: "req-b1".to_string(),
+                    terminal_id: Some("term-b1".to_string()),
+                },
+                PaneCloseLinkage {
+                    create_request_id: "req-b2".to_string(),
+                    terminal_id: None,
+                },
+            ],
+            2_000,
+        )
+        .expect("the batch close persists");
+
+    // ONE record under the batch key — the per-pane keys were never written.
+    let batch_path =
+        PaneLedger::close_envelope_path(&root, &PaneLedger::pane_detach_batch_envelope_key("tab-batch"));
+    assert!(batch_path.exists(), "the batch envelope is one journal file");
+    for crid in ["req-b1", "req-b2"] {
+        assert!(
+            !PaneLedger::close_envelope_path(&root, &PaneLedger::pane_detach_envelope_key(crid))
+                .exists(),
+            "no per-pane record exists beside the batch envelope for {crid}"
+        );
+    }
+
+    // The recovery read model flattens the set — downstream coverage needs no
+    // knowledge of the batch shape at all.
+    let mut closes = ledger.list_pane_detach_closes();
+    closes.sort_by(|a, b| a.create_request_id.cmp(&b.create_request_id));
+    assert_eq!(
+        closes,
+        vec![
+            PaneDetachClose {
+                create_request_id: "req-b1".to_string(),
+                terminal_id: Some("term-b1".to_string()),
+            },
+            PaneDetachClose {
+                create_request_id: "req-b2".to_string(),
+                terminal_id: None,
+            },
+        ]
+    );
+    // Nothing fenced, nothing retired — the batch is the same NON-retiring
+    // family (the kill-lane read model never surfaces it either).
+    assert!(ledger.all_kill_tombstone_keys().is_empty());
+    assert!(ledger.list_pane_closes().is_empty());
+    for (session_id, terminal_id, crid) in
+        [("sess-b1", "term-b1", "req-b1"), ("sess-b2", "term-b2", "req-b2")]
+    {
+        let row = ledger.load_binding("claude", session_id).unwrap();
+        assert_eq!(row.state, RowState::Bound);
+        assert_eq!(row.updated_at, 1_000);
+        let _ = (terminal_id, crid);
+    }
+
+    // The gate retry / cross-device shape: a repeated close of the same tab
+    // re-journals under the ONE key — still one record, same flattened view.
+    ledger
+        .close_panes_detached(
+            "tab-batch",
+            &[
+                PaneCloseLinkage {
+                    create_request_id: "req-b2".to_string(),
+                    terminal_id: None,
+                },
+                PaneCloseLinkage {
+                    create_request_id: "req-b1".to_string(),
+                    terminal_id: Some("term-b1".to_string()),
+                },
+            ],
+            3_000,
+        )
+        .expect("the repeated close re-journals idempotently");
+    assert_eq!(ledger.list_pane_detach_closes().len(), 2);
+
+    // Durable across a restart reload (the SIGKILL premise).
+    let disk = PaneLedger::new(Some(root.clone()));
+    let mut disk_closes = disk.list_pane_detach_closes();
+    disk_closes.sort_by(|a, b| a.create_request_id.cmp(&b.create_request_id));
+    assert_eq!(disk_closes.len(), 2);
+    assert_eq!(disk_closes[0].create_request_id, "req-b1");
+    assert_eq!(disk_closes[1].create_request_id, "req-b2");
+
+    // Retention is coverage-keyed over the whole set (F3): while EITHER
+    // covered row stands, the envelope outlives the TTL.
+    let aged = 3_000 + KILL_TOMBSTONE_TTL_MS + 60_000;
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "row-covered batch evidence never prunes: {report:?}"
+    );
+    ledger.delete_binding("claude", "sess-b1").unwrap();
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "the surviving sibling linkage's row still covers it: {report:?}"
+    );
+    ledger.delete_binding("claude", "sess-b2").unwrap();
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report
+            .pane_closes_swept
+            .contains(&PaneLedger::pane_detach_batch_envelope_key("tab-batch")),
+        "with no covered row standing, the aged envelope prunes: {report:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The durable open re-assertion (F2): a committed close whose ack was lost
+/// leaves the record standing under a still-open pane. `pane.opened` consumes
+/// the pane's linkage from every DETACH-family record — deleting a record
+/// whose whole linkage it was, rewriting a batch record down to its surviving
+/// linkages — DURABLY (a restart never re-feeds it), while advancing the
+/// still-open pane's row attribution to the assertion's own clock (the claim
+/// lifecycle's "consume the fence on a genuine open" carried to this family).
+#[test]
+fn a_pane_open_re_assertion_consumes_the_detach_close_durably() {
+    let root = temp_root("pane-opened");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The still-open pane's row: attributed at 1_000 to dev1/c1/tab t9.
+    ledger
+        .record_binding(&write_provenance(
+            "claude",
+            "sess-open",
+            "term-open",
+            1_000,
+            Some("c1"),
+            Some("dev1"),
+            Some("dev1:tab-x"),
+        ))
+        .unwrap();
+    // THE COMMITTED CLOSE (its ack was then lost — the visible pane stayed).
+    ledger
+        .close_pane_detached("req-1", Some("term-open"), 2_000)
+        .expect("the committed close lands");
+    assert_eq!(ledger.list_pane_detach_closes().len(), 1);
+
+    // THE RE-ASSERTION, at the assertion's own clock time.
+    ledger
+        .note_pane_opened(
+            "req-1",
+            ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("dev1"),
+                tab_key: Some("dev1:tab-x"),
+                asserted_at: 3_000,
+            }),
+            3_000,
+        )
+        .expect("the re-assertion lands");
+
+    // The record is GONE — index AND disk (a restart never re-feeds it).
+    assert!(ledger.list_pane_detach_closes().is_empty());
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert!(
+        disk.list_pane_detach_closes().is_empty(),
+        "consumed durably: a reload never resurrects the close"
+    );
+    // …and the still-open pane's row was never retired by the close (the
+    // non-retiring family) and now advanced its attribution to the asserted
+    // time — the row and the displayed layout agree again.
+    let row = disk.load_binding("claude", "sess-open").expect("row");
+    assert_eq!(row.state, RowState::Bound);
+    assert_eq!(
+        row.last_attributed_at,
+        Some(3_000),
+        "the assertion advances the attribution clock (monotone)"
+    );
+    assert_eq!(row.create_request_id.as_deref(), Some("req-1"));
+
+    // Idempotent: no-row/no-record re-assertions are no-op Oks (the client
+    // re-flushes until landed; re-flush after consumption must stay cheap).
+    ledger
+        .note_pane_opened(
+            "req-1",
+            ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("dev1"),
+                tab_key: Some("dev1:tab-x"),
+                asserted_at: 3_000,
+            }),
+            3_000,
+        )
+        .unwrap();
+    ledger
+        .note_pane_opened("req-never-existed", ProvenancePolicy::Inherit, 4_000)
+        .unwrap();
+
+    // The batch cousin: a tab-wide envelope is rewritten DOWN to its
+    // surviving linkages when ONE pane re-asserts — the sibling's close
+    // evidence stands byte-for-byte (and survives a reload).
+    ledger
+        .close_panes_detached(
+            "tab-y",
+            &[
+                PaneCloseLinkage {
+                    create_request_id: "req-gone".to_string(),
+                    terminal_id: Some("term-gone".to_string()),
+                },
+                PaneCloseLinkage {
+                    create_request_id: "req-kept".to_string(),
+                    terminal_id: Some("term-kept".to_string()),
+                },
+            ],
+            4_000,
+        )
+        .unwrap();
+    ledger
+        .note_pane_opened("req-gone", ProvenancePolicy::Inherit, 5_000)
+        .unwrap();
+    assert_eq!(
+        ledger.list_pane_detach_closes(),
+        vec![PaneDetachClose {
+            create_request_id: "req-kept".to_string(),
+            terminal_id: Some("term-kept".to_string()),
+        }],
+        "the re-assertion consumes exactly its own linkage — the sibling stays closed"
+    );
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(disk.list_pane_detach_closes().len(), 1);
+    assert_eq!(disk.list_pane_detach_closes()[0].create_request_id, "req-kept");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F3's pin: a record past the 6h TTL whose ONLY join to a standing row is
+/// the ORIGIN lineage arm (the conn-less resolution lane's row shape: an
+/// in-flight `pane.closed` journaled CRID-only; the resolve then wrote the
+/// row with `create_request_id: None` and the ORIGIN crid) must survive
+/// retention exactly as long as the row does — the pre-shared-predicate sweep
+/// required raw `create_request_id` equality and pruned it, so the supposedly
+/// closed session could be offered and restored days later.
+#[test]
+fn a_fully_aged_detach_close_survives_while_a_row_carries_only_its_origin_lineage() {
+    let root = temp_root("retention-origin");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "sess-origin",
+            terminal_id: "term-origin",
+            mode: "codex",
+            cwd: Some("/tmp/proj"),
+            create_request_id: None, // the deliberate conn-less lane shape
+            origin_create_request_id: Some("req-origin"),
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    ledger
+        .close_pane_detached("req-origin", None, 1_500)
+        .unwrap();
+    let aged = 1_500 + KILL_TOMBSTONE_TTL_MS + 60_000;
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "the ORIGIN arm covers the row ⇒ the record outlives the TTL while the row stands: {report:?}"
+    );
+    assert_eq!(ledger.list_pane_detach_closes().len(), 1);
+
+    // And once the row is gone the aged record prunes (the keep lapses).
+    ledger.delete_binding("codex", "sess-origin").unwrap();
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report
+            .pane_closes_swept
+            .contains(&"pane-detach:req-origin".to_string()),
+        "no covered row ⇒ the aged record prunes on schedule: {report:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F3's terminal-arm half: a FULLY lineage-less legacy row (neither pane key)
+/// whose live terminal IS the closed pane's is covered by the record, so the
+/// record outlives the TTL while that row stands. Control (the sibling-shared
+/// -terminal overreach the inventory's gating already pins): a LINEAGE-KEYED
+/// row answering its own keys alone must NOT retain ANOTHER pane's close
+/// record via a shared terminal id.
+#[test]
+fn a_fully_aged_detach_close_survives_while_a_lineage_less_row_names_its_terminal() {
+    let root = temp_root("retention-terminal-arm");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The legacy conn-less row shape: NEITHER pane key — only the terminal id.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "sess-legacy",
+            terminal_id: "term-legacy",
+            mode: "codex",
+            cwd: Some("/tmp/proj"),
+            create_request_id: None,
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    // A lineage-keyed surviving row on a DIFFERENT (shared) terminal: this
+    // pane stayed OPEN — it must never anchor the sibling's close record.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "sess-survivor",
+            terminal_id: "term-shared",
+            mode: "codex",
+            cwd: Some("/tmp/proj"),
+            create_request_id: Some("req-survivor"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    ledger
+        .close_pane_detached("req-legacy-close", Some("term-legacy"), 1_500)
+        .unwrap();
+    // The closed SIBLING's record, naming the shared terminal.
+    ledger
+        .close_pane_detached("req-sibling", Some("term-shared"), 1_500)
+        .unwrap();
+    let aged = 1_500 + KILL_TOMBSTONE_TTL_MS + 60_000;
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        !report
+            .pane_closes_swept
+            .contains(&"pane-detach:req-legacy-close".to_string()),
+        "the lineage-less row's terminal names the closed pane ⇒ kept: {report:?}"
+    );
+    assert!(
+        report
+            .pane_closes_swept
+            .contains(&"pane-detach:req-sibling".to_string()),
+        "a lineage-keyed row answers its keys alone — the sibling's record prunes: {report:?}"
+    );
+    assert_eq!(
+        ledger.list_pane_detach_closes(),
+        vec![PaneDetachClose {
+            create_request_id: "req-legacy-close".to_string(),
+            terminal_id: Some("term-legacy".to_string()),
+        }]
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The ONE shared coverage predicate (F3) — consumed by BOTH the inventory
+/// verdict computation and the scan-retention pruning: the CRID arm consults
+/// EITHER pane key (advisory + origin lineage, non-empty only); a lineage-
+/// keyed row answers its keys ALONE (the detach terminal arm must never reach
+/// across to a closed SIBLING's record); only a fully lineage-less row
+/// consults the terminal fallback.
+#[test]
+fn close_record_covers_row_is_the_shared_recovery_predicate() {
+    fn row(
+        create_request_id: Option<&str>,
+        origin_create_request_id: Option<&str>,
+        live_terminal_id: Option<&str>,
+    ) -> BindingRow {
+        BindingRow {
+            ledger_version: LEDGER_VERSION,
+            provider: "claude".to_string(),
+            session_id: "sess-shared".to_string(),
+            mode: "claude".to_string(),
+            cwd: None,
+            live_terminal_id: live_terminal_id.map(str::to_string),
+            create_request_id: create_request_id.map(str::to_string),
+            origin_create_request_id: origin_create_request_id.map(str::to_string),
+            created_at: 1_000,
+            updated_at: 1_000,
+            last_observed_at: 1_000,
+            state: RowState::Bound,
+            retired_reason: None,
+            superseded_by: None,
+            pane_kind: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            client_instance_id: None,
+            device_id: None,
+            tab_key: None,
+            last_attributed_at: None,
+        }
+    }
+    let crid = |id: &str| id == "req-closed";
+    let tid = |id: &str| id == "term-closed";
+    let none = |_: &str| false;
+
+    // The advisory-crid arm and the origin-lineage arm each cover alone.
+    assert!(close_record_covers_row(&row(Some("req-closed"), None, None), &crid, &none));
+    assert!(close_record_covers_row(&row(None, Some("req-closed"), None), &crid, &none));
+    // The terminal arm covers ONLY the fully lineage-less row…
+    assert!(close_record_covers_row(&row(None, None, Some("term-closed")), &none, &tid));
+    // …never a lineage-keyed one (an empty-string key is not lineage).
+    assert!(!close_record_covers_row(&row(Some("req-other"), None, Some("term-closed")), &none, &tid));
+    assert!(!close_record_covers_row(&row(None, Some("req-other"), Some("term-closed")), &none, &tid));
+    // Nothing covers when no arm matches; empty-string keys are never
+    // lineage (an empty advisory crid does NOT take the row out of the
+    // terminal arm — only a real pane key does).
+    assert!(!close_record_covers_row(&row(Some("req-other"), None, Some("term-closed")), &crid, &none));
+    assert!(!close_record_covers_row(&row(Some(""), None, Some("term-closed")), &none, &none));
+    assert!(close_record_covers_row(&row(Some(""), None, Some("term-closed")), &none, &tid));
+    assert!(!close_record_covers_row(&row(None, None, None), &crid, &tid));
+}
+
 // ── Delta-r6-r4 (focused-episode-6 round 3, Finding 2): reference-time close-evidence retention ──
 
 /// The finding: the 6h TTL deleted the only closed verdict while stale

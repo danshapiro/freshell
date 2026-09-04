@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 60 discriminants).
+//! Server → client messages (`ServerMessage`, 63 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -133,6 +133,11 @@ pub enum ServerMessage {
     // see `shared/ws-version.ts`).
     #[serde(rename = "pane.closed.result")]
     PaneClosedResult(PaneClosedResult),
+    // Additive (focused-episode-7 round 3, Finding F1): the correlated
+    // `panes.closed` batch answer — see [`PanesClosedResult`]. Introduced
+    // WITH the protocol version bump 9 → 10.
+    #[serde(rename = "panes.closed.result")]
+    PanesClosedResult(PanesClosedResult),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
     #[serde(rename = "terminal.modes.sync")]
@@ -163,7 +168,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 62] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 63] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -195,6 +200,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 62] = [
     "opencode.activity.updated",
     "pane.closed.result",
     "pane.reconcile.result",
+    "panes.closed.result",
     "perf.logging",
     "pong",
     "ready",
@@ -415,6 +421,24 @@ pub struct PaneClosedResult {
     pub create_request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `panes.closed` answer (focused-episode-7 round 3, Finding
+/// F1): sent ONCE per batch close, AFTER the ONE durable batch envelope
+/// write resolved, so the closing client can await the whole tab's close
+/// evidence before dropping the tab. Correlated by the close op's own
+/// `requestId` (the batch answers the op, not a pane — terminal.kill's
+/// precedent; a cross-device retry of the same tab is an idempotent
+/// re-journal). `success: false` (with `error`) means NOTHING of the set is
+/// durable — the client keeps the whole tab and shows the failure on every
+/// gated pane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosedResult {
+    pub request_id: String,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

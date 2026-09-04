@@ -61,7 +61,7 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    PaneClosed, PaneClosedResult, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
+    PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
     TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly,
     TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
     LEGACY_RESUME_IDENTITY_REFUSAL,
@@ -984,6 +984,8 @@ async fn handle_client_text(
             }
         }
         ClientMessage::PaneClosed(closed) => handle_pane_closed(&closed, state, ws_tx).await,
+        ClientMessage::PanesClosed(closed) => handle_panes_closed(&closed, state, ws_tx).await,
+        ClientMessage::PaneOpened(opened) => handle_pane_opened(&opened, state, conn_identity).await,
         ClientMessage::TerminalInput(input) => {
             // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
             // the opencode lane (see input_session_identity_ok): a
@@ -5632,6 +5634,160 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState, ws_tx: &mut Ws
             .await
         }
     }
+}
+
+/// `panes.closed` (focused-episode-7 round 3, Finding F1) — the whole-tab
+/// BATCH close: the client's gated `closeTab` sends ONE message carrying the
+/// tab's full terminal-pane identity set; the server journals ONE durable,
+/// NON-retiring envelope record (`pane-detach-batch:<tabId>`,
+/// [`PaneLedger::close_panes_detached`]) covering the whole set in ONE
+/// atomic write, then answers ONE correlated
+/// `panes.closed.result{requestId, success}`. A partial per-pane durable
+/// outcome is impossible by construction — pre-fix, each `pane.closed`
+/// committed independently while the UI failure handling was all-or-nothing,
+/// so a pane-A-ack + pane-B-failure pair left pane A durably closed under a
+/// still-standing tab and recovery suppressed the visibly OPEN pane. The
+/// same failure protocol as [`handle_pane_closed`] applies: persisted-close
+/// answers success (the evidence IS durable), a Clean failure answers
+/// `success:false` AND surfaces through the ledger's loud degradation seam
+/// (the client keeps the whole tab), and a malformed batch answers
+/// `success:false` immediately so the client's bounded wait never wedges.
+async fn handle_panes_closed(
+    closed: &freshell_protocol::PanesClosed,
+    state: &WsState,
+    ws_tx: &mut WsSink,
+) -> bool {
+    let answer = |success: bool, error: Option<String>| {
+        ServerMessage::PanesClosedResult(PanesClosedResult {
+            request_id: closed.request_id.clone(),
+            success,
+            error,
+        })
+    };
+    if closed.request_id.is_empty()
+        || closed.tab_id.is_empty()
+        || closed.panes.is_empty()
+        || closed
+            .panes
+            .iter()
+            .any(|p| p.create_request_id.is_empty())
+    {
+        return send(
+            ws_tx,
+            &answer(
+                false,
+                Some("requestId/tabId/panes must be non-empty and every pane createRequestId must be non-empty".to_string()),
+            ),
+        )
+        .await;
+    }
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let tab_id = closed.tab_id.clone();
+    let linkages: Vec<crate::pane_ledger::PaneCloseLinkage> = closed
+        .panes
+        .iter()
+        .map(|p| crate::pane_ledger::PaneCloseLinkage {
+            create_request_id: p.create_request_id.clone(),
+            terminal_id: p.terminal_id.clone(),
+        })
+        .collect();
+    let now = now_ms();
+    let result = spawn_blocking_in_span(move || {
+        ledger.close_panes_detached(&tab_id, &linkages, now)
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+            std::io::Error::other(format!("panes.closed record task join failed: {join_err}")),
+        ))
+    });
+    match result {
+        Ok(()) => send(ws_tx, &answer(true, None)).await,
+        Err(err) if err.is_persisted() => {
+            // The record IS durable despite the reported error — the close
+            // evidence stands, so the answer is success; loud, structured,
+            // never silent.
+            tracing::error!(
+                target: "freshell_ws::terminal",
+                request_id = %closed.request_id,
+                error = %err,
+                "panes_close_persisted_despite_error: the non-retiring batch close \
+                 record is durable; the write layer reported an error"
+            );
+            send(ws_tx, &answer(true, None)).await
+        }
+        Err(err) => {
+            crate::pane_ledger::surface_write_failure(
+                state,
+                &closed.request_id,
+                Err(std::io::Error::other(format!(
+                    "panes-close record write failed: {err}"
+                ))),
+            );
+            send(
+                ws_tx,
+                &answer(
+                    false,
+                    Some("the pane-close record could not be written durably".to_string()),
+                ),
+            )
+            .await
+        }
+    }
+}
+
+/// `pane.opened` (focused-episode-7 round 3, Finding F2) — the durable OPEN
+/// re-assertion: the client is still DISPLAYING this pane (its close's ack
+/// was lost or failed), so the server re-agrees with the displayed layout —
+/// [`PaneLedger::note_pane_opened`] consumes the pane's standing
+/// detach-family close record durably (a later genuine close of the same
+/// pane re-journals after it on the client's own wire order) and re-asserts
+/// the Bound row's attribution from this connection's identity + the
+/// message's tab (the full-triple advance rule). Fire-and-forget: the
+/// client replays it on every reconnect until the consumption lands, and a
+/// write failure surfaces through the ledger's standard loud seam (the same
+/// `surface_write_failure` the close lanes use) — never a client-visible
+/// failure (nothing ends server-side; the pane's own display IS the state).
+async fn handle_pane_opened(
+    opened: &freshell_protocol::PaneOpened,
+    state: &WsState,
+    conn_identity: &ConnectionIdentity,
+) -> bool {
+    if opened.create_request_id.is_empty() {
+        // Loud, never silent — but fire-and-forget by design, so no reply
+        // frame (and no client waiter to wedge).
+        tracing::warn!(
+            target: "freshell_ws::terminal",
+            "pane.opened dropped: createRequestId must not be empty"
+        );
+        return true;
+    }
+    let asserted_at = now_ms();
+    let provenance =
+        conn_identity.bind_provenance(Some(opened.tab_id.as_str()).filter(|t| !t.is_empty()), asserted_at);
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let crid = opened.create_request_id.clone();
+    let now = now_ms();
+    let result = spawn_blocking_in_span(move || {
+        ledger.note_pane_opened(
+            &crid,
+            crate::pane_ledger::ProvenancePolicy::Replace(crate::pane_ledger::ProvenanceStamps {
+                client_instance_id: provenance.client_instance_id.as_deref(),
+                device_id: provenance.device_id.as_deref(),
+                tab_key: provenance.tab_key.as_deref(),
+                asserted_at: provenance.asserted_at,
+            }),
+            now,
+        )
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(std::io::Error::other(format!(
+            "pane.opened task join failed: {join_err}"
+        )))
+    });
+    crate::pane_ledger::surface_write_failure(state, &opened.create_request_id, result);
+    true
 }
 
 /// `terminal.kill` — SIGKILL + reap the shared PTY and remove it. The registry fans

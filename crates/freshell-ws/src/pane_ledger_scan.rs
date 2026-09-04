@@ -447,11 +447,37 @@ impl PaneLedger {
         // evidence plus an unconverged row outlive the TTL") the fence side
         // already applies below. Once the row leaves the ledger (its own GC
         // lifecycle), this keep lapses and the aged record prunes.
-        let row_covered = record.create_request_id.as_deref().is_some_and(|c| {
-            index
-                .bindings
-                .values()
-                .any(|r| r.create_request_id.as_deref() == Some(c))
+        //
+        // Focused-episode-7 round 3 (Finding F3) — the keep is judged by the
+        // ONE SHARED coverage predicate ([`close_record_covers_row`]), never
+        // a re-implemented snapshot of it: pre-fix this consult demanded raw
+        // `create_request_id` equality while the recovery verdict ALSO joins
+        // the row's ORIGIN lineage key and the lineage-less terminal arm, so
+        // a lineage-only in-flight close record pruned past the 6h TTL while
+        // its bound row lived on for up to 30 days — the supposedly closed
+        // session returned to the offer. The record's OWN carried linkage
+        // (crid set; terminal ids only for the detach family — a kill
+        // record's terminal id covers PANES, never rows) is the coverage
+        // answer the inventory computes wholesale, applied per record here.
+        let linkages = detach_linkages(&record);
+        let record_crids: Vec<&str> = linkages
+            .iter()
+            .map(|l| l.create_request_id.as_str())
+            .collect();
+        let detach_terminal_ids: Vec<&str> = if PaneLedger::is_detach_close_key(key) {
+            linkages
+                .iter()
+                .filter_map(|l| l.terminal_id.as_deref())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let row_covered = index.bindings.values().any(|row| {
+            close_record_covers_row(
+                row,
+                &|id: &str| record_crids.contains(&id),
+                &|id: &str| detach_terminal_ids.contains(&id),
+            )
         });
         if row_covered {
             return;

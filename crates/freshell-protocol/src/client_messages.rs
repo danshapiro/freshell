@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 37 discriminants).
+//! Client → server messages (`ClientMessage`, 39 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -38,6 +38,15 @@ pub enum ClientMessage {
     /// evidence message (see [`PaneClosed`]). Additive.
     #[serde(rename = "pane.closed")]
     PaneClosed(PaneClosed),
+    /// Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+    /// batch envelope (see [`PanesClosed`]). Additive with the protocol
+    /// version bump 9 → 10 (the client gates on the answer).
+    #[serde(rename = "panes.closed")]
+    PanesClosed(PanesClosed),
+    /// Focused-episode-7 round 3 (Finding F2): the durable open re-assertion
+    /// for a still-present pane (see [`PaneOpened`]). Fire-and-forget.
+    #[serde(rename = "pane.opened")]
+    PaneOpened(PaneOpened),
     #[serde(rename = "terminal.input")]
     TerminalInput(TerminalInput),
     #[serde(rename = "terminal.resize")]
@@ -99,7 +108,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 37] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 39] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -124,7 +133,9 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 37] = [
     "hoststats.unsubscribe",
     "opencode.activity.list",
     "pane.closed",
+    "pane.opened",
     "pane.reconcile.request",
+    "panes.closed",
     "ping",
     "sessions.prefs",
     "terminal.attach",
@@ -357,12 +368,70 @@ pub struct TerminalDetach {
 /// session survives: nothing is fenced or retired). The detach channel
 /// itself stays identity-driven: detach is about the terminal, never the
 /// pane.
+///
+/// Focused-episode-7 round 3 (Finding F1): this stays the DEGENERATE
+/// envelope for single-pane removals (pane-X, replace-pane); the whole-tab
+/// close carries its full pane set in ONE [`PanesClosed`] message instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneClosed {
     pub create_request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+}
+
+/// Focused-episode-7 round 3 (Finding F1) — the whole-tab BATCH close. The
+/// gated `closeTab` sends ONE `panes.closed` carrying the tab's full
+/// terminal-pane identity set, and the server journals ONE durable
+/// NON-retiring envelope record (`pane-detach-batch:<tabId>`) covering the
+/// whole set in ONE atomic write, then answers ONE correlated
+/// `panes.closed.result{requestId, success}` — a partial per-pane durable
+/// outcome is impossible by construction (the finding's mechanism: a pane-A
+/// ack + pane-B failure pair could leave pane A durably closed under a
+/// still-standing tab). `requestId` is the close op's own correlation key
+/// (the batch answers the OP, not a pane — terminal.kill's precedent).
+/// Additive with the protocol version bump 9 → 10: the client gates tab
+/// removal on the answer, so a server that predates the frame fails the
+/// strict hello handshake instead of silently dropping it (see
+/// `shared/ws-version.ts` for the mixed-version note).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosed {
+    pub request_id: String,
+    pub tab_id: String,
+    pub panes: Vec<PanesClosedPane>,
+}
+
+/// One pane's identity inside the batch close (`panes` member of
+/// [`PanesClosed`]): the pane's createRequestId (never absent), terminalId
+/// when the pane has one (absent on the in-flight-create shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosedPane {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// Focused-episode-7 round 3 (Finding F2) — the durable OPEN re-assertion.
+/// Sent by the client for a pane it is STILL DISPLAYING after its close
+/// evidence failed to confirm (a server-answered failure, or the ambiguous
+/// timeout whose record may have committed durably with the ack lost on the
+/// wire). The server consumes the pane's standing `pane-detach[-batch]`
+/// close record durably (the claim lifecycle's fence consumption carried to
+/// the detach family) and re-asserts the row's attribution from the
+/// connection identity + this `tabId`, so the recovery judgment and the
+/// server state re-agree with the layout the client is displaying: a
+/// close-covered-by-consumed-record pane reads OPEN again. Queued by the
+/// client's send path until `ready`, so a socket-down close replays the
+/// close BEFORE this re-assertion on the returned socket (the ordering is
+/// the fix, not a race). Fire-and-forget (no result frame): idempotent and
+/// replayed on every reconnect until consumed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneOpened {
+    pub create_request_id: String,
+    pub tab_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

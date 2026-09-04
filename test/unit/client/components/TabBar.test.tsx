@@ -57,15 +57,23 @@ function ackAllTerminalKills() {
   }
 }
 
-/** Answer every in-flight pane.closed with success (delta-r7-r3, F2: the
- * healthy-server close acknowledgment the close gate awaits). */
+/** Answer every in-flight pane.closed AND every whole-tab panes.closed batch
+ * with success (delta-r7-r3, F2 + focused-episode-7 round 3, F1: the
+ * healthy-server close acknowledgments the close gate awaits). */
 function ackAllPaneCloses() {
   for (const [msg] of mockSend.mock.calls) {
-    const m = msg as { type?: string; createRequestId?: string }
+    const m = msg as { type?: string; createRequestId?: string; requestId?: string }
     if (m?.type === 'pane.closed' && m.createRequestId) {
       emitWsMessage({
         type: 'pane.closed.result',
         createRequestId: m.createRequestId,
+        success: true,
+      })
+    }
+    if (m?.type === 'panes.closed' && m.requestId) {
+      emitWsMessage({
+        type: 'panes.closed.result',
+        requestId: m.requestId,
         success: true,
       })
     }
@@ -699,12 +707,16 @@ describe('TabBar', () => {
       // Delta-r7-r3 (Finding F2): the close gate sends the durable pane-close
       // evidence FIRST and awaits the server's answer before the layout loses
       // the pane; on ack the identity-driven detach follows (about the
-      // terminal, never the pane).
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'pane.closed',
-        createRequestId: 'req-pane-1',
-        terminalId: 'term-123',
-      })
+      // terminal, never the pane). Focused-episode-7 round 3 (Finding F1):
+      // the whole-tab close is ONE batch envelope.
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'panes.closed',
+          tabId: 'tab-1',
+          requestId: expect.any(String),
+          panes: [{ createRequestId: 'req-pane-1', terminalId: 'term-123' }],
+        }),
+      )
       ackAllPaneCloses()
       await waitFor(() => {
         expect(mockSend).toHaveBeenCalledWith({
@@ -759,10 +771,14 @@ describe('TabBar', () => {
       expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
       ackAllTerminalKills()
       // The kill-succeeded closeTab then runs the pane-close evidence gate
-      // (delta-r7-r3, F2): the tab still stands until pane.closed is acked.
+      // (delta-r7-r3, F2): the tab still stands until the batch envelope is
+      // acked (focused-episode-7 round 3, F1).
       await waitFor(() => {
         expect(mockSend).toHaveBeenCalledWith(
-          expect.objectContaining({ type: 'pane.closed', createRequestId: 'req-pane-1' }),
+          expect.objectContaining({
+            type: 'panes.closed',
+            panes: [{ createRequestId: 'req-pane-1', terminalId: 'term-456' }],
+          }),
         )
       })
       expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
@@ -806,13 +822,18 @@ describe('TabBar', () => {
       fireEvent.click(closeButton)
 
       // Exactly ONE pane-close evidence message — the gate's acknowledged
-      // send (the middleware belt skips it via the one-shot confirmation
+      // BATCH send (the whole-tab close, focused-episode-7 round 3 F1; the
+      // middleware belt skips its duplicate via the one-shot confirmation
       // mark, delta-r7-r3 F2).
       const paneClosed = mockSend.mock.calls
-        .map(([msg]) => msg as { type?: string; createRequestId?: string; terminalId?: string })
-        .filter((msg) => msg?.type === 'pane.closed')
+        .map(([msg]) => msg as { type?: string; tabId?: string; panes?: unknown })
+        .filter((msg) => msg?.type === 'panes.closed')
       expect(paneClosed).toEqual([
-        { type: 'pane.closed', createRequestId: 'req-pane-1', terminalId: 'term-123' },
+        expect.objectContaining({
+          type: 'panes.closed',
+          tabId: 'tab-1',
+          panes: [{ createRequestId: 'req-pane-1', terminalId: 'term-123' }],
+        }),
       ])
       ackAllPaneCloses()
       await waitFor(() => {
@@ -821,7 +842,7 @@ describe('TabBar', () => {
           .filter((msg) => msg?.type === 'terminal.detach')
         // Exactly ONE identity-driven detach (never a CRID rider —
         // delta-r7-r2 F2); the pane-close evidence is the separate
-        // pane.closed message above.
+        // panes.closed batch message above.
         expect(detachMessages).toEqual([
           { type: 'terminal.detach', terminalId: 'term-123' },
         ])
@@ -948,27 +969,26 @@ describe('TabBar', () => {
       fireEvent.click(closeButton)
 
       // Delta-r7-r2 (Finding F2): EVERY removed pane's close evidence lands
-      // FIRST (one pane.closed per removed pane identity); delta-r7-r3 (F2)
-      // then gates — the identity-driven detaches fire only once the close
-      // evidence is acknowledged.
-      expect(mockSend).toHaveBeenNthCalledWith(1, {
-        type: 'pane.closed',
-        createRequestId: 'req-pane-1',
-        terminalId: 'term-a',
-      })
-      expect(mockSend).toHaveBeenNthCalledWith(2, {
-        type: 'pane.closed',
-        createRequestId: 'req-pane-2',
-        terminalId: 'term-b',
-      })
+      // FIRST; focused-episode-7 round 3 (Finding F1) carries the tab's full
+      // pane set in ONE batch envelope — then the identity-driven detaches
+      // fire only once the close evidence is acknowledged (delta-r7-r3 F2
+      // gate).
+      expect(mockSend).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        type: 'panes.closed',
+        tabId: 'tab-1',
+        panes: [
+          { createRequestId: 'req-pane-1', terminalId: 'term-a' },
+          { createRequestId: 'req-pane-2', terminalId: 'term-b' },
+        ],
+      }))
       ackAllPaneCloses()
       await waitFor(() => {
-        expect(mockSend).toHaveBeenCalledTimes(4)
-        expect(mockSend).toHaveBeenNthCalledWith(3, {
+        expect(mockSend).toHaveBeenCalledTimes(3)
+        expect(mockSend).toHaveBeenNthCalledWith(2, {
           type: 'terminal.detach',
           terminalId: 'term-a',
         })
-        expect(mockSend).toHaveBeenNthCalledWith(4, {
+        expect(mockSend).toHaveBeenNthCalledWith(3, {
           type: 'terminal.detach',
           terminalId: 'term-b',
         })

@@ -269,12 +269,17 @@ pub struct PaneCloseKill {
 /// `<provider>:<addressedSessionId>` for the fresh-agent lanes
 /// (`close_identities` — the kill's wire id, the identity the close knew
 /// first; a later kill naming a different alias journals a second record and
-/// the fences merge in the index), and `pane-detach:<createRequestId>` for
+/// the fences merge in the index), `pane-detach:<createRequestId>` for
 /// the NON-RETIRING detach close (delta-round-7 Finding F2,
 /// `close_pane_detached` — "this PANE was closed" evidence with empty
 /// `kills`: the session survives by design, so nothing is fenced or retired,
-/// and the kill lanes' merges/consults at `pane:` must never see it). The
-/// mixed flat subtree cannot collide: every key carries a `:` (encoded),
+/// and the kill lanes' merges/consults at `pane:` must never see it), and
+/// `pane-detach-batch:<tabId>` for the whole-tab close (focused-episode-7
+/// round 3 Finding F1, `close_panes_detached` — ONE envelope covering the
+/// tab's full pane-identity set in its `panes` list: a mid-set write failure
+/// is impossible by construction, so the client's all-or-nothing tab close
+/// never leaves PART of the set durably closed under a still-open tab).
+/// The mixed flat subtree cannot collide: every key carries a `:` (encoded),
 /// terminal ids are 32-hex.
 ///
 /// What it carries:
@@ -310,6 +315,58 @@ pub struct CloseEnvelopeRecord {
     /// repeats refresh the stamp.
     #[serde(default)]
     pub kills: Vec<PaneCloseKill>,
+    /// Focused-episode-7 round 3 (Finding F1) — the whole-tab batch
+    /// envelope's FULL pane-identity set: a `pane-detach-batch:<tabId>`
+    /// record carries one linkage per closed pane, so ONE journal record
+    /// covers the tab's whole close (ONE atomic file — never a partial
+    /// per-pane durable outcome). Non-batch records leave this empty; the
+    /// read models/GC/consumption treat a record's carried linkage as the
+    /// UNION of the legacy top-level fields and this list
+    /// ([`PaneLedger::detach_linkages`]), so pre-batch records read
+    /// unchanged. Serde-optional under LEDGER_VERSION 1: pre-round-3 records
+    /// parse to empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<PaneCloseLinkage>,
+}
+
+/// A record's carried linkage as the read models see it: the union of the
+/// legacy top-level `(create_request_id, terminal_id)` fields and the batch
+/// envelope's `panes` list, deduped by createRequestId (first wins — the
+/// top-level linkage was written with the same identity). Empty for the
+/// fresh-agent/identity lanes (their coverage is the kill fences).
+fn detach_linkages(record: &CloseEnvelopeRecord) -> Vec<PaneCloseLinkage> {
+    let mut seen: Vec<PaneCloseLinkage> = Vec::new();
+    if let Some(crid) = record.create_request_id.as_deref() {
+        if !crid.is_empty() {
+            seen.push(PaneCloseLinkage {
+                create_request_id: crid.to_string(),
+                terminal_id: record.terminal_id.clone(),
+            });
+        }
+    }
+    for linkage in &record.panes {
+        if linkage.create_request_id.is_empty()
+            || seen
+                .iter()
+                .any(|l| l.create_request_id == linkage.create_request_id)
+        {
+            continue;
+        }
+        seen.push(linkage.clone());
+    }
+    seen
+}
+
+/// Focused-episode-7 round 3 (Finding F1) — one pane's linkage inside a
+/// close record: the pane's createRequestId (never absent) plus its terminal
+/// id when the close knew it (absent on the in-flight-create close shape).
+/// Carried by the batch envelope (`CloseEnvelopeRecord::panes`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneCloseLinkage {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
 }
 
 /// Delta-r6-r2 (focused-episode-6 round 1, Findings 1+2) — the PANE-keyed
@@ -384,6 +441,59 @@ pub struct PaneCloseRecord {
 pub struct PaneDetachClose {
     pub create_request_id: String,
     pub terminal_id: Option<String>,
+}
+
+/// Focused-episode-7 round 3 (Finding F3) — THE ONE close-record⇒row
+/// coverage predicate, shared by BOTH consumers so the inventory's verdict
+/// computation and the retention sweep's pruning can never disagree about
+/// what a close record covers (pre-fix, retention re-implemented a narrower
+/// raw-`create_request_id`-equality and pruned close evidence a standing
+/// ORIGIN-lineage-only row still needed):
+///
+/// * The CRID arm: the record covers the row when ANY carried createRequestId
+///   (the caller's `crid_covered` answer) equals the row's advisory
+///   `create_request_id` OR its ORIGIN lineage key — non-empty only. A pane
+///   closed before `terminal.created` journals a CRID-only record and the
+///   conn-less resolution lane writes the row crid-less; the lineage arm is
+///   what lets that record cover the row (`delta-r7-round-3`, the inventory
+///   side's precedent).
+/// * The lineage short-circuit: a row carrying EITHER pane key answers its
+///   keys ALONE — the terminal fallback must never reach a lineage-keyed row
+///   (two panes sharing one terminal: closing only the SIBLING must not
+///   suppress this pane's row — nor keep the sibling's record alive for it).
+/// * The terminal arm (`detach_terminal_covered`; the caller passes the
+///   DETACH-family terminal set only — a kill record's terminal id covers
+///   PANES, never rows): only a FULLY lineage-less row (neither pane key —
+///   the conn-less legacy residual) reads covered by its live terminal
+///   naming the closed pane's terminal (terminal ids are never re-minted).
+///
+/// The callers pass look-ups, not data (`&dyn Fn(&str) -> bool`, the
+/// `transcript_absent` convention): the inventory aggregates ALL close
+/// evidence into two sets once; the retention sweep evaluates ONE record's
+/// carried linkage against the rows index.
+pub fn close_record_covers_row(
+    row: &BindingRow,
+    crid_covered: &dyn Fn(&str) -> bool,
+    detach_terminal_covered: &dyn Fn(&str) -> bool,
+) -> bool {
+    let advisory = row
+        .create_request_id
+        .as_deref()
+        .filter(|id| !id.is_empty());
+    let origin = row
+        .origin_create_request_id
+        .as_deref()
+        .filter(|id| !id.is_empty());
+    if advisory.is_some_and(crid_covered) || origin.is_some_and(crid_covered) {
+        return true;
+    }
+    if advisory.is_some() || origin.is_some() {
+        return false; // a lineage-keyed row answers its keys alone
+    }
+    row.live_terminal_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .is_some_and(detach_terminal_covered)
 }
 
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) — the close envelope's
@@ -1384,13 +1494,25 @@ impl PaneLedger {
         format!("pane-detach:{create_request_id}")
     }
 
+    /// Focused-episode-7 round 3 (Finding F1) — the whole-tab BATCH close's
+    /// key: `pane-detach-batch:<tabId>`. Keyed by the closing TAB: one tab
+    /// close = ONE envelope record covering its whole pane set (the client's
+    /// all-or-nothing close maps to one atomic file). The prefix deliberately
+    /// shares the detach family discriminator ([`Self::is_detach_close_key`]).
+    fn pane_detach_batch_envelope_key(tab_id: &str) -> String {
+        format!("pane-detach-batch:{tab_id}")
+    }
+
     /// The detach-close key family (the read models' lane discriminator —
     /// [`Self::list_pane_closes`] EXCLUDES these keys from the kill-lane pane
-    /// view; [`Self::list_pane_detach_closes`] projects exactly them).
+    /// view; [`Self::list_pane_detach_closes`] projects exactly them). The
+    /// batch prefix shares it.
     const PANE_DETACH_ENVELOPE_PREFIX: &'static str = "pane-detach:";
+    const PANE_DETACH_BATCH_ENVELOPE_PREFIX: &'static str = "pane-detach-batch:";
 
     fn is_detach_close_key(key: &str) -> bool {
         key.starts_with(Self::PANE_DETACH_ENVELOPE_PREFIX)
+            || key.starts_with(Self::PANE_DETACH_BATCH_ENVELOPE_PREFIX)
     }
 
     fn rollback_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
@@ -1552,6 +1674,7 @@ impl PaneLedger {
                             create_request_id: record.create_request_id.clone(),
                             closed_at: record.closed_at,
                             kills: record.kills.clone(),
+                            panes: Vec::new(),
                         };
                         feed_close_envelope(
                             &mut index,
@@ -2737,7 +2860,8 @@ impl PaneLedger {
     ///   [`CloseEnvelopeError::Persisted`]: the caller's error reports
     ///   persisted-close, and the index is fed to match the disk truth.
     // The arity allowance mirrors `tabs_persist::persist_generation`'s: the
-    // record's optional pane linkage travels as two slots.
+    // record's optional pane linkage travels as two slots, and the batch
+    // envelope's carried set as one more.
     #[allow(clippy::too_many_arguments)]
     fn close_envelope_locked(
         &self,
@@ -2747,6 +2871,7 @@ impl PaneLedger {
         identities: &[(String, String)],
         terminal_id: Option<&str>,
         create_request_id: Option<&str>,
+        panes: &[PaneCloseLinkage],
         now_ms: i64,
     ) -> Result<(), CloseEnvelopeError> {
         let prior = index.close_envelopes.get(key).cloned();
@@ -2756,6 +2881,7 @@ impl PaneLedger {
             create_request_id: create_request_id.map(str::to_string),
             closed_at: now_ms,
             kills: Vec::new(),
+            panes: Vec::new(),
         });
         if record.create_request_id.is_none() {
             record.create_request_id = create_request_id.map(str::to_string);
@@ -2772,6 +2898,24 @@ impl PaneLedger {
                     session_id: session_id.clone(),
                     at_ms: now_ms,
                 }),
+            }
+        }
+        // The batch envelope's carried set merges by createRequestId (the
+        // pane identity — a repeated close of the same pane re-derives the
+        // same linkage; a cross-device retry that saw MORE panes widens the
+        // cover exactly like a widened kill set).
+        for linkage in panes {
+            match record
+                .panes
+                .iter_mut()
+                .find(|p| p.create_request_id == linkage.create_request_id)
+            {
+                Some(existing) => {
+                    if linkage.terminal_id.is_some() {
+                        existing.terminal_id = linkage.terminal_id.clone();
+                    }
+                }
+                None => record.panes.push(linkage.clone()),
             }
         }
         let outcome =
@@ -2895,7 +3039,8 @@ impl PaneLedger {
 
     /// Does the on-disk `probed` record cover everything this envelope meant
     /// to close? Every intended identity fenced (any stamp — the close FACT
-    /// is what covers) and the same pane linkage.
+    /// is what covers), the same pane linkage, and the whole carried pane
+    /// set (every batched linkage's createRequestId stands).
     fn record_covers(probed: &CloseEnvelopeRecord, intended: &CloseEnvelopeRecord) -> bool {
         probed.terminal_id == intended.terminal_id
             && intended.kills.iter().all(|k| {
@@ -2903,6 +3048,12 @@ impl PaneLedger {
                     .kills
                     .iter()
                     .any(|p| p.provider == k.provider && p.session_id == k.session_id)
+            })
+            && intended.panes.iter().all(|linkage| {
+                probed
+                    .panes
+                    .iter()
+                    .any(|p| p.create_request_id == linkage.create_request_id)
             })
     }
 
@@ -3078,6 +3229,7 @@ impl PaneLedger {
                 &keys,
                 None,
                 None,
+                &[],
                 now_ms,
             )?;
         }
@@ -3151,6 +3303,7 @@ impl PaneLedger {
             &keys,
             Some(&w.terminal_id),
             w.create_request_id.as_deref(),
+            &[],
             w.now_ms,
         )?;
         // Step 4 — the marker (LAST; warn-only hygiene — the close is
@@ -3210,6 +3363,41 @@ impl PaneLedger {
             &[], // kills EMPTY: the pane-close record fences/retires nothing
             terminal_id,
             Some(create_request_id),
+            &[],
+            now_ms,
+        )
+    }
+
+    /// Focused-episode-7 round 3 (Finding F1) — the whole-tab BATCH close:
+    /// `panes.closed` carries the tab's FULL pane-identity set and the ledger
+    /// journals ONE record (`pane-detach-batch:<tabId>`) covering every
+    /// linkage in ONE atomic write — the same envelope machinery as the
+    /// degenerate single-pane [`Self::close_pane_detached`]. Either the whole
+    /// set is durable or nothing is: the client's all-or-nothing tab close can
+    /// never leave PART of the set durably closed under a still-standing tab
+    /// (the per-pane-ack window Finding F1 named). Same non-retiring family:
+    /// `kills` EMPTY (nothing fenced/retired — the sessions survive), same
+    /// `Clean`/`Persisted` protocol, and the read models flatten the carried
+    /// set ([`Self::list_pane_detach_closes`]) so coverage needs no knowledge
+    /// of the batch shape.
+    pub fn close_panes_detached(
+        &self,
+        tab_id: &str,
+        panes: &[PaneCloseLinkage],
+        now_ms: i64,
+    ) -> Result<(), CloseEnvelopeError> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        self.close_envelope_locked(
+            &root,
+            &mut index,
+            &Self::pane_detach_batch_envelope_key(tab_id),
+            &[], // kills EMPTY: same non-retiring family as the single-pane lane
+            None,
+            None,
+            panes,
             now_ms,
         )
     }
@@ -3251,7 +3439,10 @@ impl PaneLedger {
     /// (the createRequestId the record is keyed by, plus the terminal id the
     /// detach knew — the row-side terminal arm: a row whose live terminal IS
     /// the closed pane's terminal is that pane's row; terminal ids are never
-    /// re-minted). Memory-only; a disabled ledger answers empty.
+    /// re-minted). Focused-episode-7 round 3 (Finding F1): batch envelopes
+    /// FLATTEN — one entry per carried pane linkage, so the downstream
+    /// coverage logic needs no knowledge of the batch shape. Memory-only; a
+    /// disabled ledger answers empty.
     pub fn list_pane_detach_closes(&self) -> Vec<PaneDetachClose> {
         if self.root.is_none() {
             return Vec::new();
@@ -3260,16 +3451,191 @@ impl PaneLedger {
             .close_envelopes
             .iter()
             .filter(|(key, _)| Self::is_detach_close_key(key))
-            .filter_map(|(_, record)| {
-                record
-                    .create_request_id
-                    .clone()
-                    .map(|create_request_id| PaneDetachClose {
-                        create_request_id,
-                        terminal_id: record.terminal_id.clone(),
-                    })
+            .flat_map(|(_, record)| detach_linkages(record))
+            .map(|linkage| PaneDetachClose {
+                create_request_id: linkage.create_request_id,
+                terminal_id: linkage.terminal_id,
             })
             .collect()
+    }
+
+    /// Focused-episode-7 round 3 (Finding F2) — the durable OPEN re-assertion:
+    /// `pane.opened{createRequestId, tabId}` answers the ambiguous-timeout
+    /// class (the close COMMITTED durably but its ack was lost; the client
+    /// kept the pane — durable closed evidence under a live pane). Under ONE
+    /// guard hold, for the pane the client is still displaying:
+    ///
+    /// 1. CONSUME every standing detach-family close record's linkage for
+    ///    this createRequestId — durably, file-first (the claim lifecycle's
+    ///    `consume_kill_fence_locked` discipline carried to this family): a
+    ///    record whose whole linkage it was is DELETED; a batch record is
+    ///    REWRITTEN down to its surviving linkages. The index mirrors exactly
+    ///    what persisted; a failed file op is loud and does not pretend the
+    ///    consumption landed. createRequestIds are never reused, so the
+    ///    assertion always names the pane that genuinely stayed open. Only
+    ///    records older than any LATER genuine close can interleave, and the
+    ///    client's own wire order (close re-attempts queue behind the
+    ///    re-assertion) makes the later close win — the same claim-consumes
+    ///    -only-older-fences semantics.
+    /// 2. RE-ASSERT the still-open pane's row attribution: every Bound row
+    ///    keyed by this pane (advisory OR origin lineage) merges the
+    ///    connection's stamps through the ONE shared
+    ///    [`resolve_provenance_merge`] ruleset (the full-triple
+    ///    attach/advance gates, monotone in the assertion's own time) — the
+    ///    row and the displayed layout agree again. Unchanged rows cost no
+    ///    durable write (the re-flush/reconnect replay stays fsync-free).
+    ///
+    /// No kill fences are touched: the detach family feeds none, and the
+    /// kill family's `pane:<terminalId>` records belong to a genuinely ended
+    /// session (a different truth — the resumption of THAT flows through the
+    /// claim/resume lanes, never through this re-assertion).
+    pub fn note_pane_opened(
+        &self,
+        create_request_id: &str,
+        provenance: ProvenancePolicy<'_>,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let mut first_err: Option<std::io::Error> = None;
+
+        // 1. Consume the pane's standing detach-family close evidence.
+        if let Err(err) =
+            Self::consume_pane_opened_close_locked(&root, &mut index, create_request_id)
+        {
+            first_err = Some(err);
+        }
+
+        // 2. Re-assert the pane's row attribution (Bound rows keyed by this
+        //    pane, either lineage key).
+        let touched: Vec<(String, String)> = index
+            .bindings
+            .values()
+            .filter(|r| {
+                r.state == RowState::Bound
+                    && (r.create_request_id.as_deref() == Some(create_request_id)
+                        || r.origin_create_request_id.as_deref() == Some(create_request_id))
+            })
+            .map(|r| (r.provider.clone(), r.session_id.clone()))
+            .collect();
+        for key in touched {
+            let Some(existing) = index.bindings.get(&key).cloned() else {
+                continue; // retired/removed since the snapshot — nothing to stamp
+            };
+            let (client_instance_id, device_id, tab_key, last_attributed_at) =
+                resolve_provenance_merge(Some(&existing), &provenance, now_ms);
+            if client_instance_id == existing.client_instance_id
+                && device_id == existing.device_id
+                && tab_key == existing.tab_key
+                && last_attributed_at == existing.last_attributed_at
+            {
+                continue; // nothing advanced — a repeat re-flush pays no fsync
+            }
+            let row = BindingRow {
+                client_instance_id,
+                device_id,
+                tab_key,
+                last_attributed_at,
+                ..existing
+            };
+            if let Err(err) = self.write_binding(&root, &mut index, &row) {
+                tracing::error!(
+                    target: "freshell_ws::pane_ledger",
+                    create_request_id = %create_request_id,
+                    error = %err,
+                    "pane_ledger_pane_opened_attribution_failed: the close consumption resolved \
+                     what it could; the attribution write stays for the next re-assertion"
+                );
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// The open re-assertion's consumption half ([`Self::note_pane_opened`]):
+    /// remove ONE createRequestId's linkage from every standing DETACH-family
+    /// record — a record whose whole linkage it was is deleted, a batch
+    /// record is rewritten without it. File-first; the index mirrors exactly
+    /// what persisted (the `consume_kill_fence_locked` discipline), and a
+    /// failed op is reported Err after every other consumption still landed.
+    fn consume_pane_opened_close_locked(
+        root: &Path,
+        index: &mut LedgerIndex,
+        create_request_id: &str,
+    ) -> std::io::Result<()> {
+        let affected: Vec<String> = index
+            .close_envelopes
+            .iter()
+            .filter(|(key, record)| {
+                Self::is_detach_close_key(key)
+                    && detach_linkages(record)
+                        .iter()
+                        .any(|l| l.create_request_id == create_request_id)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut first_err: Option<std::io::Error> = None;
+        for key in affected {
+            let Some(mut record) = index.close_envelopes.get(&key).cloned() else {
+                continue; // consumed/rewritten since the snapshot — nothing to do
+            };
+            record
+                .panes
+                .retain(|l| l.create_request_id != create_request_id);
+            if record.create_request_id.as_deref() == Some(create_request_id) {
+                // The whole top-level linkage was this pane's (its terminal id
+                // travels with it — see detach_linkages).
+                record.create_request_id = None;
+                record.terminal_id = None;
+            }
+            let delete_record =
+                record.create_request_id.is_none() && record.panes.is_empty() && record.kills.is_empty();
+            let path = Self::close_envelope_path(root, &key);
+            let outcome = if delete_record {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                write_row_atomic(&path, &record)
+            };
+            match outcome {
+                Ok(()) => {
+                    if delete_record {
+                        index.close_envelopes.remove(&key);
+                    } else {
+                        index.close_envelopes.insert(key.clone(), record);
+                    }
+                }
+                Err(err) => {
+                    // Fail loud, never pretend: the record's linkage stands;
+                    // the next re-assertion retries the consumption.
+                    tracing::error!(
+                        target: "freshell_ws::pane_ledger",
+                        create_request_id = %create_request_id,
+                        key = %key,
+                        error = %err,
+                        "pane_ledger_pane_opened_consumption_failed: the close record stands; \
+                         the next re-assertion retries"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// One pane's standing close record (`resolve_pending`'s consult shape).

@@ -874,6 +874,43 @@ describe('WebSocket edge cases', () => {
 
       close()
     })
+
+    // Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+    // envelope ON EVERY FLOOR — the v10 client's close gate awaits the ONE
+    // correlated `panes.closed.result`, so the Node server accepts the batch
+    // and answers success by requestId (it journals nothing: no ledger, no
+    // recovery pipeline). Focused-episode-7 round 3 (Finding F2): the durable
+    // open re-assertion is fire-and-forget — the Node server accepts and
+    // ignores it (nothing recorded, nothing to answer).
+    it('accepts panes.closed with a correlated success result, and accepts pane.opened silently (no error frames)', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({
+        type: 'panes.closed',
+        requestId: 'batch-node-accept',
+        tabId: 'tab-node',
+        panes: [
+          { createRequestId: 'req-node-a', terminalId: 'term-node-a' },
+          { createRequestId: 'req-node-b' },
+        ],
+      }))
+      ws.send(JSON.stringify({ type: 'pane.opened', createRequestId: 'req-node-a', tabId: 'tab-node' }))
+
+      ws.send(JSON.stringify({ type: 'ping' }))
+      const messages = await collectMessages(ws, 400)
+      expect(messages.some((m) => m.type === 'pong')).toBe(true)
+      const results = messages.filter((m) => m.type === 'panes.closed.result')
+      expect(results).toEqual([
+        { type: 'panes.closed.result', requestId: 'batch-node-accept', success: true },
+      ])
+      expect(
+        messages.filter((m) => m.type === 'error'),
+        `the batch close and the re-assertion must never draw an error frame: ${JSON.stringify(messages)}`,
+      ).toEqual([])
+      expect(ws.readyState).toBe(WebSocket.OPEN)
+
+      close()
+    })
   })
 
   describe('Terminal stream v2 replay and pressure handling', () => {

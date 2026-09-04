@@ -2,7 +2,7 @@
 //!
 //! The Rust constant must equal the version pinned in every committed contract
 //! artifact and in `shared/ws-version.ts`. This is the compile-time half of the
-//! T0 gate ("`WS_PROTOCOL_VERSION == 9`").
+//! T0 gate ("`WS_PROTOCOL_VERSION == 10`").
 
 use std::path::PathBuf;
 
@@ -22,8 +22,8 @@ fn read_json(rel: &str) -> serde_json::Value {
 }
 
 #[test]
-fn rust_const_is_nine() {
-    assert_eq!(WS_PROTOCOL_VERSION, 9);
+fn rust_const_is_ten() {
+    assert_eq!(WS_PROTOCOL_VERSION, 10);
 }
 
 #[test]
