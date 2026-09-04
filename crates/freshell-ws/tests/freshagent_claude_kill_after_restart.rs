@@ -232,7 +232,7 @@ impl PaneIdentitySink for TestLedgerSink {
         let (p, s) = (provider.to_string(), session_id.to_string());
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
+                ledger.retire_closed_compensated(&p, &s, TestLedgerSink::now_ms())
             })
             .await
             .map_err(std::io::Error::other)?

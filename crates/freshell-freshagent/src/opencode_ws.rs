@@ -1250,8 +1250,25 @@ impl FreshOpencodeState {
             }
         }
 
-        // Phase 3 — ONE per-session lock take: the killed flag, the
-        // completion pass, and the teardown-field extraction.
+        // Phase 3 — ONE per-session lock take: the LATE-materialized retire,
+        // THEN the killed flag, then the teardown-field extraction.
+        //
+        // Delta-r6-r2 (focused-episode-6 round 1, Finding 4): the completion
+        // retire is failure/cancellation-safe — it runs INSIDE this lock hold
+        // but BEFORE the killed flag is set, so a failed retire (or a task
+        // cancel at the await) can never leave a newly-Bound row behind a
+        // half-closed session: the failure aborts the kill HERE, with the
+        // flag unset and the map intact (a retried kill re-attempts
+        // idempotently). The delta-r6 order (flag first, retire awaited
+        // after) meant a stop inside the await left teardown running with
+        // the new durable row still Bound.
+        //
+        // Why this acquisition covers every mid-kill materialization: a first
+        // send holds this same session lock across its materialization (the
+        // cold-start `create_session` await) and completes its map insert +
+        // binding-row write before releasing — so this lock's acquisition
+        // provably post-dates any such materialization, and its durable id
+        // is visible HERE.
         //
         // Retire-on-kill (delta-review round 5): mark the session killed
         // BEFORE removing the map keys — a send that took this Arc just
@@ -1260,32 +1277,41 @@ impl FreshOpencodeState {
         // away). The session mutex serializes the check: a send whose
         // materialization critical section ran FIRST completed its map insert
         // before releasing the lock, so the map removal below still finds
-        // (and removes) its durable key.
-        //
-        // The completion pass: that same serialization makes this acquisition
-        // provably LATER than any in-flight materialization's completion, so
-        // a durable id minted behind phase 1's map read (a first send held
-        // this lock from before our scan) is visible HERE — retire it too, or
-        // its row would outlive the close. A retire failure at this point is
-        // past the last safe abort (the killed flag is set): the kill
-        // continues its teardown but MUST still answer failure.
-        let mut late_close_failed = false;
+        // (and removes) its durable key — and its row was retired above.
         if let Some(session_arc) = &session_arc {
-            let (turn_task, bridge, real) = {
+            let extracted = {
                 let mut s = session_arc.lock().await;
-                s.killed.store(true, Ordering::SeqCst);
                 let real = s.real_session_id.clone();
+                let mut close_failed = false;
                 if let Some(real_id) = real.as_deref() {
                     if !retire_ids.iter().any(|id| id == real_id) {
                         if let Some(sink) = self.identity_sink() {
                             if let Err(e) = sink.retire_closed(PROVIDER, real_id).await {
                                 tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.retire_on_kill_failed");
-                                late_close_failed = true;
+                                close_failed = true;
                             }
                         }
                     }
                 }
-                (s.turn_task.take(), s.serve_bridge.take(), real)
+                if close_failed {
+                    // Delta-r6-r2 (Finding 4): ABORT — the completion retire
+                    // is not durable, and nothing live may be touched until
+                    // it is. The map stands, the killed flag was never set,
+                    // no teardown ran; the kill answers failure.
+                    None
+                } else {
+                    s.killed.store(true, Ordering::SeqCst);
+                    Some((s.turn_task.take(), s.serve_bridge.take(), real))
+                }
+            };
+            let Some((turn_task, bridge, real)) = extracted else {
+                self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                    provider: PROVIDER.to_string(),
+                    session_id: msg.session_id,
+                    session_type: SESSION_TYPE.to_string(),
+                    success: false,
+                }));
+                return;
             };
 
             // Phase 4 — the map removal, its own short synchronous section
@@ -1325,15 +1351,15 @@ impl FreshOpencodeState {
 
         // `adapter.ts kill()` is unconditional (`return true` even for an
         // already-removed/unknown session) — idempotent, matching the codex/claude
-        // `freshAgent.killed{success:true}` pattern. A durable-close failure
-        // past the point of no safe abort (phase 3's completion pass) is the
-        // ONE exception: the kill ran, but the answer must not claim the
-        // close is durable.
+        // `freshAgent.killed{success:true}` pattern. Every durable-close
+        // failure aborts BEFORE any live state is touched (delta-r6 phase 2;
+        // delta-r6-r2 Finding 4's completion retire, inside phase 3 ahead of
+        // the killed flag) — reaching here means the whole close is durable.
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
-            success: !late_close_failed,
+            success: true,
         }));
     }
 
@@ -4273,6 +4299,186 @@ mod tests {
                 .contains(&("opencode".to_string(), "ses_late".to_string())),
             "the kill's session-lock phase completes the close for the late-materialized id: {:?}",
             fake.retires.lock().unwrap()
+        );
+    }
+
+    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 4), the ORDER half:
+    /// the late-materialized durable id's retirement lands BEFORE the killed
+    /// flag is set (which is what makes the kill cancellation-safe: a task
+    /// cancel or a failed retire BEFORE that flag can never strand a Bound
+    /// row behind a destroyed session). The retire answer parks (the
+    /// retire-stall hook) with its mutation landed — and the flag must still
+    /// read false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_late_materialized_close_is_durable_before_the_killed_flag_is_set() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-late-order"), None).await;
+        let placeholder = "freshopencode-req-kill-late-order";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        let killed_flag = session_arc.lock().await.killed.clone();
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "fixture: the session has NOT materialized"
+        );
+
+        let stall = fake.arm_retire_stall("opencode", "ses_late");
+        let mut session_guard = session_arc.lock().await;
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // Wait for the kill's pre-lock durable phase (the pending marker
+        // delete is its observable), then materialize mid-kill.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let marker_gone = !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == placeholder);
+            if marker_gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the kill's pre-lock durable phase did not run"
+            );
+            tokio::task::yield_now().await;
+        }
+        session_guard.real_session_id = Some("ses_late".to_string());
+        drop(session_guard);
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the late retire's mutation landed (answer parked)");
+        assert!(
+            !killed_flag.load(Ordering::SeqCst),
+            "the killed flag must NOT be set before the late retire is durable"
+        );
+        stall.release.send(()).expect("release the stall");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+        assert!(killed_flag.load(Ordering::SeqCst), "post-close the flag stands");
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), "ses_late".to_string())),
+            "the late id retired"
+        );
+    }
+
+    /// Delta-r6-r2 (Finding 4), the FAILURE half: when the late retire fails,
+    /// the kill ABORTS before the point of no return — the killed flag is
+    /// never set, the map stands, no teardown runs — and the answer reports
+    /// `success:false`. The delta-r6 order set the flag FIRST and merely
+    /// reported failure afterward: a task cancel or server stop inside the
+    /// retire await left the new row Bound while teardown proceeded (or the
+    /// server restarted with it Bound).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_whose_late_materialized_close_fails_aborts_before_the_killed_flag() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-late-fails"), None).await;
+        let placeholder = "freshopencode-req-kill-late-fails";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        let killed_flag = session_arc.lock().await.killed.clone();
+
+        // EVERY retire fails — the pre-lock phase has no durable ids to
+        // retire (the session is unmaterialized at the scan), so the failure
+        // lands on the late retire inside the session-lock phase.
+        fake.fail_retires_after(0);
+
+        let mut session_guard = session_arc.lock().await;
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let marker_gone = !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == placeholder);
+            if marker_gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the kill's pre-lock durable phase did not run"
+            );
+            tokio::task::yield_now().await;
+        }
+        session_guard.real_session_id = Some("ses_late".to_string());
+        drop(session_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+
+        assert!(
+            !killed_flag.load(Ordering::SeqCst),
+            "a failed late retire aborts BEFORE the kill point of no return: the flag is never set"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key(placeholder),
+            "the map stands — nothing was torn down"
+        );
+        assert!(
+            !fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), "ses_late".to_string())),
+            "sanity: the failed retire recorded nothing"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill reports failure: {killed_frame}"
         );
     }
 

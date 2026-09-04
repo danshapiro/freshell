@@ -4,13 +4,48 @@
 //! snapshot store, the ledger, and the terminal registry, and consumes
 //! `select_foreign_recent_generation_ids` when composing each device's union.
 
-use freshell_ws::pane_ledger::{BindingRow, RetiredReason, RowState};
+use freshell_ws::pane_ledger::{BindingRow, PaneCloseRecord, RetiredReason, RowState};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 pub struct DeviceUnion {
     pub device_id: String,
     pub union_doc: Value,
+}
+
+/// Delta-r6-r2 (focused-episode-6 round 1, Finding 1): the verdict join's
+/// CLOSE evidence — both shapes a close takes when no binding row exists to
+/// carry the verdict:
+///
+/// * `pane_closes`: the terminal lane's pane-keyed close records (a kill
+///   that beat identity resolution). A snapshot pane is COVERED by a record
+///   through its payload's `createRequestId` or `liveTerminal.terminalId`
+///   (the keys the close knew), and a covered pane verdicts `closed` — the
+///   pane ITSELF was deliberately closed; whatever later happened to its
+///   session identities on other panes is irrelevant to it.
+/// * `standing_kill_tombstones`: the fresh-agent lanes' identity-keyed
+///   fences (fresh-claude/codex/opencode kills write no pane record — the
+///   placeholder-keyed tombstone their `retire_closed` folds IS their
+///   durable close). A pane whose snapshot claim resolves to NO row
+///   anywhere and whose claimed key carries a standing fence was closed
+///   before its identity ever landed as a row: verdict `closed`. A genuine
+///   reopen clears the fence through the claim commit (round 4), so a
+///   STANDING fence means the identity was never genuinely reclaimed.
+pub struct CloseEvidence {
+    pub standing_kill_tombstones: HashSet<(String, String)>,
+    pub pane_closes: Vec<PaneCloseRecord>,
+}
+
+#[cfg(test)]
+impl CloseEvidence {
+    /// The empty verdict join input (no closes recorded anywhere) — the test
+    /// fixtures' default.
+    pub fn none() -> Self {
+        Self {
+            standing_kill_tombstones: HashSet::new(),
+            pane_closes: Vec::new(),
+        }
+    }
 }
 
 /// One device dir's A15/A16 survivor selection: the retained generation ids
@@ -338,12 +373,44 @@ pub fn build_inventory(
     bindings: Vec<BindingRow>,
     live_session_keys: HashSet<(String, String)>,
     evidence: &DeviceEvidence,
+    closes: &CloseEvidence,
 ) -> Value {
     let by_key: HashMap<String, &BindingRow> = bindings
         .iter()
         .map(|r| (ref_key(&row_provider(r), &row_session_id(r)), r))
         .collect();
     let is_live = |p: &str, s: &str| live_session_keys.contains(&(p.to_string(), s.to_string()));
+    // Delta-r6-r2 (Finding 1): the close-evidence joins. A pane is COVERED by
+    // a pane close record through either advisory key its snapshot payload
+    // carries (`createRequestId` / `liveTerminal.terminalId` — the same keys
+    // the close knew at kill time... and the correlation indexes use).
+    let mut close_by_terminal: HashMap<&str, &PaneCloseRecord> = HashMap::new();
+    let mut close_by_crid: HashMap<&str, &PaneCloseRecord> = HashMap::new();
+    for record in &closes.pane_closes {
+        close_by_terminal
+            .entry(record.terminal_id.as_str())
+            .or_insert(record);
+        if let Some(crid) = record.create_request_id.as_deref() {
+            close_by_crid.entry(crid).or_insert(record);
+        }
+    }
+    let pane_covered_by_close = |pane: &Value| -> bool {
+        let payload = &pane["payload"];
+        let crid_hit = payload
+            .get("createRequestId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .is_some_and(|id| close_by_crid.contains_key(id));
+        if crid_hit {
+            return true;
+        }
+        payload
+            .get("liveTerminal")
+            .and_then(|live| live.get("terminalId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .is_some_and(|id| close_by_terminal.contains_key(id))
+    };
     // Bind-by-correlation advisory secondary indices (focused-ep3), Bound
     // rows only. A codex/opencode CLI pane snapshotted INSIDE its
     // identity-association window persists with paneId/createRequestId/
@@ -451,6 +518,12 @@ pub fn build_inventory(
                 {
                     continue; // the D4 authority chain owns panes WITH a snapshot claim
                 }
+                // Delta-r6-r2 (Finding 1): a pane the close record covers
+                // claims NOTHING — counting its (would-be) candidates would
+                // taint rows that are, post-close, on their own track.
+                if pane_covered_by_close(pane) {
+                    continue;
+                }
                 let candidates =
                     correlation_candidates(pane, &by_create_request_id, &by_live_terminal_id);
                 if candidates.len() > 1 {
@@ -509,7 +582,18 @@ pub fn build_inventory(
                     .map(|pane| {
                         let payload = &pane["payload"];
                         let snap_ref = payload.get("sessionRef").filter(|v| !v.is_null()).cloned();
-                        let (ledger_state, eff_ref) = match &snap_ref {
+                        // Delta-r6-r2 (Finding 1) — the close consult sits at
+                        // the TOP of the verdict: a pane the close record
+                        // covers was deliberately closed pre-loss (kill
+                        // inside the evidence window), whatever its
+                        // identities did later on OTHER panes. Closed trumps
+                        // every correlation/claim; the pane is never
+                        // restored.
+                        let covered = pane_covered_by_close(pane);
+                        let (ledger_state, eff_ref) = if covered {
+                            ("closed", None)
+                        } else {
+                        match &snap_ref {
                             None => {
                                 // Focused-ep3 bind-by-correlation: the pane was
                                 // snapshotted inside its identity-association
@@ -631,9 +715,27 @@ pub fn build_inventory(
                                     }
                                     Verdict::Closed => ("closed", None),
                                     Verdict::GcExpired => ("gc_expired", Some(r.clone())),
-                                    Verdict::Unknown => ("unknown", Some(r.clone())),
+                                    // Delta-r6-r2 (Finding 1), the fresh-agent
+                                    // placeholder half: NO row carries this
+                                    // identity anywhere, but its kill fence
+                                    // stands — the pane was closed before its
+                                    // identity ever landed as a row. (A
+                                    // genuine reopen clears the fence through
+                                    // the claim commit, so a STANDING fence
+                                    // means the close was never redeemed.)
+                                    Verdict::Unknown => {
+                                        if closes.standing_kill_tombstones.contains(&(
+                                            p.to_string(),
+                                            s.to_string(),
+                                        )) {
+                                            ("closed", None)
+                                        } else {
+                                            ("unknown", Some(r.clone()))
+                                        }
+                                    }
                                 }
                             }
+                        }
                         };
                         let eff_str = eff_ref
                             .as_ref()
@@ -1083,11 +1185,18 @@ async fn inventory_handler(
     // plus an unconverged Bound row outlive the 6h TTL, so a post-outage
     // offer can never resurrect an identity the user closed before the crash.
     let dominant_tombstones = state.ledger.dominant_kill_tombstone_keys();
+    // Delta-r6-r2 (Finding 1): the verdict join's close evidence — memory-
+    // fast reads against the write-through index, same as the dominance set.
+    let closes = CloseEvidence {
+        standing_kill_tombstones: state.ledger.all_kill_tombstone_keys(),
+        pane_closes: state.ledger.list_pane_closes(),
+    };
     Json(build_inventory(
         unions,
         apply_kill_tombstone_dominance(state.ledger.list_bindings(), &dominant_tombstones),
         live,
         &evidence,
+        &closes,
     ))
     .into_response()
 }

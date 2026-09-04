@@ -4656,3 +4656,482 @@ fn a_corrupt_alias_tombstone_row_quarantines_loudly() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── Delta-r6-r2 (focused-episode-6 round 1): phase-attributed closes + pane close records ──
+
+/// F6: `retire_closed` is TWO durable writes (kill tombstone, then the row
+/// retire) — when only one can land, the caller must learn WHICH phase
+/// failed. Callers previously inferred "Err == nothing persisted", which
+/// mis-restores either direction.
+#[cfg(unix)]
+#[test]
+fn retire_closed_reports_which_phase_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("retire-phase");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-phase-row", "term-phase", 1_000))
+        .unwrap();
+
+    // (a) Retire-phase failure: tombstones writable, the row's bindings dir
+    // read-only (rename needs dir-write) — the tombstone lands, the retire
+    // misses.
+    let bindings_dir = PaneLedger::bindings_dir(&root).join(encode_segment("codex"));
+    std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = ledger
+        .retire_closed("codex", "sess-phase-row", 2_000)
+        .expect_err("the retire write fails against a read-only bindings dir");
+    assert_eq!(
+        err.phase(),
+        ClosePhase::RowRetire,
+        "the failed phase is the row retire: {err}"
+    );
+    // Honest split state: tombstone landed, row still Bound (this is exactly
+    // the hazard the compensated half exists to repair).
+    std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        ledger.kill_tombstone_at("codex", "sess-phase-row"),
+        Some(2_000)
+    );
+    assert_eq!(
+        ledger.load_binding("codex", "sess-phase-row").unwrap().state,
+        RowState::Bound
+    );
+
+    // (b) Tombstone-phase failure: the kill-tombstone PROVIDER dir read-only
+    // (the atomic write's temp file cannot be created in it), bindings
+    // writable — the retire still lands, the tombstone misses. The provider
+    // dir exists by now: (a)'s successful tombstone created it.
+    let kt_dir = PaneLedger::kill_tombstone_dir(&root).join(encode_segment("codex"));
+    std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = ledger
+        .retire_closed("codex", "sess-phase-tomb", 3_000)
+        .expect_err("the tombstone write fails against a read-only tombstone dir");
+    assert_eq!(
+        err.phase(),
+        ClosePhase::KillTombstone,
+        "the failed phase is the tombstone write: {err}"
+    );
+    std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(ledger.kill_tombstone_at("codex", "sess-phase-tomb"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F6: the compensated close retries the row retire ONCE — a transient
+/// first-write failure converges: the row ends durably Retired(Closed) and
+/// the tombstone stands (closed cleanly).
+#[test]
+fn a_compensated_close_retries_the_row_retire_once_and_closes_cleanly() {
+    let root = temp_root("compensated-retry");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-retry", "term-retry", 1_000))
+        .unwrap();
+    // The FIRST binding-file write of the close fails (transient fs fault);
+    // the retry succeeds.
+    ledger.fail_next_binding_writes(1);
+    ledger
+        .retire_closed_compensated("codex", "sess-retry", 2_000)
+        .expect("one transient failure is healed by the bounded retry");
+    let row = ledger.load_binding("codex", "sess-retry").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    assert_eq!(ledger.kill_tombstone_at("codex", "sess-retry"), Some(2_000));
+    // Durable on disk, not just in the write-through index.
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        disk.load_binding("codex", "sess-retry").unwrap().state,
+        RowState::Retired
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F6: when the retry ALSO fails, compensation removes the just-written
+/// tombstone — dominance must never suppress a genuinely live session — and
+/// the caller gets the failure (nothing durable: row Bound, no tombstone).
+#[test]
+fn a_compensated_close_removes_the_just_written_tombstone_when_the_retry_also_fails() {
+    let root = temp_root("compensated-fail");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-comp", "term-comp", 1_000))
+        .unwrap();
+    // Both retire attempts fail; only the tombstone persists without
+    // compensation.
+    ledger.fail_next_binding_writes(2);
+    let err = ledger
+        .retire_closed_compensated("codex", "sess-comp", 2_000)
+        .expect_err("both writes failing surfaces as Err");
+    assert!(
+        err.to_string().contains("injected binding write failure"),
+        "the caller sees the retire failure: {err}"
+    );
+    assert_eq!(
+        ledger.load_binding("codex", "sess-comp").unwrap().state,
+        RowState::Bound,
+        "the row was never retired — the kill reports failure"
+    );
+    assert_eq!(
+        ledger.kill_tombstone_at("codex", "sess-comp"),
+        None,
+        "compensation removed the just-written tombstone (no dominance over a live session)"
+    );
+    // Same on disk (the index alone proving nothing — the file must be gone).
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        disk.load_binding("codex", "sess-comp").unwrap().state,
+        RowState::Bound
+    );
+    assert_eq!(disk.kill_tombstone_at("codex", "sess-comp"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F1: a close records the pane identity durably — the `close-records`
+/// subtree survives a restart, keeps the createRequestId lineage, and lists
+/// every identity the close retired.
+#[test]
+fn a_close_pane_records_the_close_under_the_pane_identity_and_survives_a_restart() {
+    let root = temp_root("pane-close-roundtrip");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&BindingWrite {
+            create_request_id: Some("cr-close-1"),
+            ..write("codex", "sess-pc", "term-pc", 1_000)
+        })
+        .unwrap();
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-pc".to_string(),
+            create_request_id: Some("cr-close-1".to_string()),
+            resolved: vec![SessionLocator {
+                provider: "codex".into(),
+                session_id: "sess-pc".into(),
+            }],
+            now_ms: 2_000,
+        })
+        .unwrap();
+
+    let row = ledger.load_binding("codex", "sess-pc").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    assert_eq!(ledger.kill_tombstone_at("codex", "sess-pc"), Some(2_000));
+
+    // The record is durable: a fresh ledger over the same root serves it.
+    let disk = PaneLedger::new(Some(root.clone()));
+    let closes = disk.list_pane_closes();
+    assert_eq!(closes.len(), 1, "exactly one pane close record");
+    let record = &closes[0];
+    assert_eq!(record.terminal_id, "term-pc");
+    assert_eq!(record.create_request_id.as_deref(), Some("cr-close-1"));
+    assert_eq!(
+        record
+            .kills
+            .iter()
+            .map(|k| (k.provider.as_str(), k.session_id.as_str(), k.at_ms))
+            .collect::<Vec<_>>(),
+        vec![("codex", "sess-pc", 2_000)]
+    );
+    assert!(
+        disk.pane_close_for_terminal("term-pc").is_some(),
+        "the verdict consult finds the close by terminal id"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F1+F2: the close retires by PANE identity under the ledger's own
+/// serialization — a row bound to this terminal is retired even when the kill
+/// captured no in-memory sessionRef (the identity registry had not been
+/// upserted / the resolver had not run when the kill started).
+#[test]
+fn a_close_pane_retires_rows_by_pane_identity_when_no_identity_was_captured() {
+    let root = temp_root("pane-close-bytid");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("opencode", "sess-late-bind", "term-bytid", 1_000))
+        .unwrap();
+    // The kill captured NOTHING (`resolved` empty) — the row is discovered
+    // under the guard by its pane owner (live_terminal_id).
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-bytid".to_string(),
+            create_request_id: Some("cr-bytid".to_string()),
+            resolved: vec![],
+            now_ms: 2_000,
+        })
+        .unwrap();
+    let row = ledger.load_binding("opencode", "sess-late-bind").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    let record = ledger
+        .pane_close_for_terminal("term-bytid")
+        .expect("close record");
+    assert!(
+        record
+            .kills
+            .iter()
+            .any(|k| k.provider == "opencode" && k.session_id == "sess-late-bind"),
+        "the record lists the discovered identity: {record:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F2 (order A): the close lands FIRST; the resolver running afterwards must
+/// consult the close record — the row lands Retired(Closed), never Bound,
+/// the identity's kill fence folds, and the record gains the now-known
+/// identity key.
+#[test]
+fn a_resolve_pending_after_a_close_pane_lands_the_row_retired_never_bound() {
+    let root = temp_root("close-then-resolve");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending(
+            "term-cr",
+            "codex",
+            Some("/tmp/proj"),
+            ProvenanceStamps::default(),
+            1_000,
+        )
+        .unwrap();
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-cr".to_string(),
+            create_request_id: Some("cr-cr".to_string()),
+            resolved: vec![],
+            now_ms: 2_000,
+        })
+        .unwrap();
+    // The late resolver (locator/signal lane) makes the identity durable.
+    ledger
+        .resolve_pending(&write("codex", "sess-resolved-late", "term-cr", 3_000))
+        .unwrap();
+    let row = ledger
+        .load_binding("codex", "sess-resolved-late")
+        .expect("the row exists — as retired evidence, never Bound");
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    assert_eq!(row.live_terminal_id.as_deref(), Some("term-cr"));
+    assert_eq!(
+        ledger.kill_tombstone_at("codex", "sess-resolved-late"),
+        Some(3_000),
+        "the resolve folds the identity's kill fence"
+    );
+    assert!(
+        !ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == "term-cr"),
+        "the marker is consumed by the resolve"
+    );
+    let record = ledger.pane_close_for_terminal("term-cr").expect("record");
+    assert!(
+        record
+            .kills
+            .iter()
+            .any(|k| k.provider == "codex" && k.session_id == "sess-resolved-late"),
+        "the pane close record gained the now-known identity: {record:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F2 (order B — the finding's exact interleave): the resolver is SUSPENDED
+/// mid-write (inside `resolve_pending`, before its close-record consult sees
+/// anything) while the kill's durable phase queues behind the ledger guard.
+/// The resolver writes the row Bound; the kill — whose whole point is that it
+/// retires under the ledger's own serialization — retires the just-written
+/// row when it runs.
+#[test]
+fn a_close_pane_parked_behind_a_mid_write_resolve_retires_the_row_the_resolver_wrote() {
+    let root = temp_root("resolve-then-close");
+    let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
+    ledger
+        .record_pending(
+            "term-rc",
+            "opencode",
+            Some("/tmp/proj"),
+            ProvenanceStamps::default(),
+            1_000,
+        )
+        .unwrap();
+
+    let gate = ledger.arm_resolve_pending_gate();
+    let resolve_ledger = std::sync::Arc::clone(&ledger);
+    let resolver = std::thread::spawn(move || {
+        resolve_ledger
+            .resolve_pending(&write("opencode", "sess-raced", "term-rc", 2_000))
+            .expect("resolve completes")
+    });
+    gate.entered
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("the resolver entered resolve_pending (guard held, consult not yet run)");
+
+    // The kill's durable phase queues on the guard while the resolver is
+    // suspended: the row does not exist yet — the kill's captured identity
+    // set is EMPTY, exactly the finding's shape.
+    let close_ledger = std::sync::Arc::clone(&ledger);
+    let closer = std::thread::spawn(move || {
+        close_ledger
+            .close_pane(&PaneCloseWrite {
+                terminal_id: "term-rc".to_string(),
+                create_request_id: Some("cr-rc".to_string()),
+                resolved: vec![],
+                now_ms: 3_000,
+            })
+            .expect("close completes")
+    });
+    // Release the resolver: it writes the row Bound (no close record was
+    // consultable at its consult instant), then the queued close runs and
+    // must retire what the resolver just wrote.
+    gate.release.send(()).expect("release the resolver");
+    resolver.join().expect("resolver done");
+    closer.join().expect("closer done");
+
+    let row = ledger
+        .load_binding("opencode", "sess-raced")
+        .expect("the resolved row exists");
+    assert_eq!(
+        row.state,
+        RowState::Retired,
+        "the kill retired the row the resolver wrote mid-race (never a Bound orphan)"
+    );
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    let record = ledger.pane_close_for_terminal("term-rc").expect("record");
+    assert!(
+        record
+            .kills
+            .iter()
+            .any(|k| k.provider == "opencode" && k.session_id == "sess-raced"),
+        "the pane close record lists the raced identity: {record:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F6 for the pane close: when EVERY write fails, the close reports failure
+/// and leaves nothing durable — no tombstone, untouched row, no record.
+#[cfg(unix)]
+#[test]
+fn a_close_pane_whose_writes_all_fail_leaves_nothing_durable() {
+    use std::os::unix::fs::PermissionsExt;
+    fn deny_recursive(path: &std::path::Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap().flatten() {
+                deny_recursive(&entry.path());
+            }
+        }
+    }
+    fn allow_recursive(path: &std::path::Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap().flatten() {
+                if entry.path().is_dir() {
+                    allow_recursive(&entry.path());
+                } else {
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644)).ok();
+                }
+            }
+        }
+    }
+    let root = temp_root("pane-close-allfail");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-nofail", "term-nofail", 1_000))
+        .unwrap();
+    ledger
+        .record_pending("term-nofail", "codex", None, ProvenanceStamps::default(), 1_000)
+        .unwrap();
+    // Baseline: the marker exists before the close attempt.
+    assert!(ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-nofail"));
+
+    deny_recursive(&root);
+    let err = ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-nofail".to_string(),
+            create_request_id: Some("cr-nofail".to_string()),
+            resolved: vec![SessionLocator {
+                provider: "codex".into(),
+                session_id: "sess-nofail".into(),
+            }],
+            now_ms: 2_000,
+        })
+        .expect_err("a fully broken store fails the close");
+    allow_recursive(&root);
+    assert!(!err.to_string().is_empty());
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        disk.load_binding("codex", "sess-nofail").unwrap().state,
+        RowState::Bound,
+        "the row stands (the kill reports failure; nothing mis-restores)"
+    );
+    assert_eq!(disk.kill_tombstone_at("codex", "sess-nofail"), None);
+    assert!(
+        disk.list_pane_closes().is_empty(),
+        "no pane close record was written"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The boot/periodic sweep drops a pane close record only once its newest
+/// stamp aged past the protective TTL; a recent record always survives.
+#[test]
+fn the_pane_close_sweep_drops_only_fully_aged_records() {
+    let root = temp_root("pane-close-sweep");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-old".to_string(),
+            create_request_id: Some("cr-old".to_string()),
+            resolved: vec![],
+            now_ms: 1_000,
+        })
+        .unwrap();
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-fresh".to_string(),
+            create_request_id: Some("cr-fresh".to_string()),
+            resolved: vec![],
+            now_ms: 10_000,
+        })
+        .unwrap();
+    let now = 1_000 + KILL_TOMBSTONE_TTL_MS + 1; // only term-old's record aged out
+    let report = ledger.gc(now, &never_absent, None);
+    assert!(
+        report.pane_closes_swept.contains(&"term-old".to_string()),
+        "the aged record was swept: {report:?}"
+    );
+    assert!(ledger.pane_close_for_terminal("term-old").is_none());
+    assert!(
+        ledger.pane_close_for_terminal("term-fresh").is_some(),
+        "the fresh record survives"
+    );
+    // And the sweep's pair is durable: a reloaded ledger answers the same.
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert!(disk.pane_close_for_terminal("term-old").is_none());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The new subtree participates in per-row quarantine (typed row, version
+/// gate), exactly like the other ledger subtrees.
+#[test]
+fn a_corrupt_pane_close_record_quarantines_loudly() {
+    let root = temp_root("pane-close-corrupt");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-good".to_string(),
+            create_request_id: Some("cr-good".to_string()),
+            resolved: vec![],
+            now_ms: 1_000,
+        })
+        .unwrap();
+    let bad = PaneLedger::pane_close_path(&root, "term-bad");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, b"{ not json").unwrap();
+    let report = ledger.boot_scan(2_000, &never_absent);
+    assert_eq!(report.quarantined.len(), 1, "the corrupt record is quarantined");
+    assert!(!bad.exists(), "renamed aside, not deleted");
+    assert!(
+        ledger.pane_close_for_terminal("term-good").is_some(),
+        "the healthy record is still served"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

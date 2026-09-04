@@ -249,13 +249,18 @@ impl PaneIdentitySink for LedgerIdentitySink {
     /// FAILED, not warn-and-continued (the caller reports `success:false`
     /// and leaves the live session untouched); a `Bound` row beside an
     /// unacknowledged close stays self-consistent and retryable, which the
-    /// recovery pipeline's exactness contract relies on.
+    /// recovery pipeline's exactness contract relies on. Delta-r6-r2
+    /// (focused-episode-6 round 1, Finding 6): routed through the ledger's
+    /// COMPENSATED close — a tombstone-persisted + retire-failed pair is
+    /// retried once and, failing that, has its just-written tombstone
+    /// removed, so dominance never suppresses the still-live session the
+    /// caller then reports as not-killed.
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
         let now = now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.retire_closed(&p, &s, now))
+            tokio::task::spawn_blocking(move || ledger.retire_closed_compensated(&p, &s, now))
                 .await
                 .map_err(std::io::Error::other)?
         })
@@ -1156,6 +1161,65 @@ mod tests {
             "a retired row answers false"
         );
         assert!(!sink.row_is_bound("claude", "never-written"));
+    }
+
+    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 6) — the sink routes
+    /// through the ledger's COMPENSATED close: a tombstone-write lands while
+    /// its row retire cannot (the bindings dir read-only; the kill-tombstone
+    /// tree writable), the retire retry also fails against the same perms,
+    /// and the compensation removes the just-written tombstone. The caller
+    /// sees `Err` — and the DISK answer is "nothing durable": row Bound, no
+    /// dominant tombstone to suppress the still-live session from recovery.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retire_whose_row_write_fails_compensates_the_tombstone_through_the_sink() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "ses-comp".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("seed write");
+
+        // Only the row's bindings dir goes read-only (the retire's rename
+        // needs dir-write); the tombstone tree stays writable.
+        let bindings_dir = tmp.path().join("bindings").join("claude");
+        std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = sink
+            .retire_closed("claude", "ses-comp")
+            .await
+            .expect_err("the failing row write surfaces as Err through the sink");
+        std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(
+            ledger.load_binding("claude", "ses-comp").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the row stands (the kill reports failure)"
+        );
+        assert!(
+            ledger.kill_tombstone_at("claude", "ses-comp").is_none(),
+            "compensation removed the just-written tombstone (index)"
+        );
+        // And the FILE is gone — the disk never held a dominant pair.
+        let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert!(
+            disk.kill_tombstone_at("claude", "ses-comp").is_none(),
+            "compensation removed the just-written tombstone (disk)"
+        );
     }
 
     /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6) over the REAL

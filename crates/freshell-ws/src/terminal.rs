@@ -5512,40 +5512,45 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     if !state.registry.exists(&kill.terminal_id) {
         return send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await;
     }
-    // P1.8 trigger (e): explicit user close — retire the binding (`closed`)
-    // + marker cleanup. Delta-r6 close-durability ordering: the durable close
-    // is written BEFORE the process and the in-memory identity are destroyed
-    // — destroying first (the pre-fix `kill_and_broadcast`-first shape) lost
-    // the close entirely when the blocking write was cancelled or failed,
-    // leaving a Bound row the recovery inventory could offer for a terminal
-    // the user had killed. `session_ref_for` is answered here with the
-    // identity still LIVE (well inside its retired-inclusive window, which
-    // the broadcast side relies on). Awaited spawn_blocking: fsync must not
-    // pin the dispatch task (V1.md; the PTY-spawn precedent above).
+    // P1.8 trigger (e): explicit user close — THE durable close
+    // (focused-episode-6 round 1, delta-r6-r2 Findings 1+2+6): ONE
+    // `PaneLedger::close_pane` call, under the ledger's own serialization,
+    // BEFORE the process and the in-memory identity are destroyed. It
+    // retires every identity the pane owns — the in-memory `session_ref_for`
+    // capture AND any binding row keyed by this terminal (a resolution that
+    // beat the capture but not the ledger turn retires under the guard;
+    // one resolving LATER consults the pane close record and lands Retired,
+    // never Bound — `resolve_pending`'s consult) — deletes the pending
+    // marker, and persists the pane close record the recovery verdict joins
+    // on. Destroying first (the pre-delta-r6 shape) lost the close entirely
+    // when the blocking write was cancelled or failed; retiring only the
+    // captured sessionRef (the delta-r6 shape) missed the
+    // resolver-racing/pre-resolution window this pane close covers.
     //
-    // Failure propagation (delta-r6): a FAILED durable write FAILS the kill —
-    // the process is left running, the identity stands, and the client gets
-    // an error frame instead of a silent success. (Retire-on-close is no
-    // longer the spec's original "never load-bearing" best-effort: the
-    // recovery exactness contract made the close authoritative. DETACH stays
-    // non-retiring, unchanged.)
+    // Failure propagation (delta-r6, now compensated — delta-r6-r2 Finding
+    // 6): a FAILED durable close FAILS the kill — the process is left
+    // running, the identity stands, and the client gets an error frame
+    // instead of a silent success; `close_pane`'s per-identity compensated
+    // retire guarantees a partial failure left no dominant tombstone over
+    // the still-live row. (DETACH stays non-retiring, unchanged.)
     let sref = state.identity.session_ref_for(&kill.terminal_id);
+    let create_request_id = state.registry.probe_create_request_id(&kill.terminal_id);
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let tid = kill.terminal_id.clone();
     let now = now_ms();
     let recorded = spawn_blocking_in_span(move || {
-        let mut recorded = true;
-        if let Some(sref) = sref {
-            if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
-                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
-                recorded = false;
-            }
-        }
-        if let Err(err) = ledger.delete_pending(&tid) {
-            tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
-            recorded = false;
-        }
-        recorded
+        ledger
+            .close_pane(&crate::pane_ledger::PaneCloseWrite {
+                terminal_id: tid.clone(),
+                create_request_id,
+                resolved: sref.into_iter().collect(),
+                now_ms: now,
+            })
+            .map_err(|err| {
+                tracing::warn!(error = %err, "pane_ledger_close_pane_failed_on_kill");
+                err
+            })
+            .is_ok()
     })
     .await
     .unwrap_or_else(|err| {

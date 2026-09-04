@@ -476,6 +476,36 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 
+  it('keeps the session and surfaces an error when an event-wrapped killed reports success:false', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-kill-fails'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle' })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeDefined()
+
+    // The server's durable close FAILED (delta-r6-r2 Finding 5): the session
+    // was not killed server-side, so the client must not proceed as though
+    // it was — keep the record and surface the failure, like any other
+    // session-scoped error frame.
+    expect(sendEvent({ type: 'freshAgent.killed', success: false })).toBe(true)
+    const session = store.getState().freshAgent.sessions[key]
+    expect(session).toBeDefined()
+    expect(session.lastErrorCode).toBe('KILL_FAILED')
+    expect(session.lastError).toContain('still be running')
+
+    // A follow-up SUCCESS still folds to removal (idempotent close).
+    expect(sendEvent({ type: 'freshAgent.killed', success: true })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
+  })
+
   it('folds freshAgent.question.cancelled into removeQuestion and sits in the snapshot-invalidating set', async () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-question-cancel'

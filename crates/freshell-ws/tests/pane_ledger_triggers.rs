@@ -10,7 +10,7 @@ use common::{
     sleeper_cli_spec, spawn_server_with_ledger,
 };
 use freshell_ws::pane_ledger::{PaneLedger, RetiredReason, RowState};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Next text frame of ANY type. The harness's `next_frame_of_type` drops
@@ -478,9 +478,8 @@ async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
     // (fail loud, degrade to status quo) and a `durability.degraded` frame
     // MUST arrive at failure time — before any restart could make the
     // warning posthumous.
-    use std::os::unix::fs::PermissionsExt;
     let dir = unique_ledger_dir("write-fail");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    set_permissions_recursive(&dir, 0o555, 0o555);
 
     let (url, registry, _ledger_arc) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
@@ -519,7 +518,7 @@ async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
 
     let tid = created["terminalId"].as_str().unwrap();
     registry.kill(tid);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+    set_permissions_recursive(&dir, 0o755, 0o644);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -535,7 +534,6 @@ async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kill_whose_close_write_fails_leaves_the_terminal_running_and_answers_with_an_error() {
-    use std::os::unix::fs::PermissionsExt;
     // DEV-0006 S5.e: plain-CLI codex path (sleeper CLI spec, no app-server).
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     let dir = unique_ledger_dir("kill-close-fail");
@@ -571,15 +569,7 @@ async fn a_kill_whose_close_write_fails_leaves_the_terminal_running_and_answers_
     // recursively. Both halves of the close (the kill tombstone's new file,
     // the row's rename) now fail, and the "nothing durable" assertions below
     // read the honest post-failure disk.
-    fn deny_writes_recursive(path: &std::path::Path) {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
-        if path.is_dir() {
-            for entry in std::fs::read_dir(path).unwrap().flatten() {
-                deny_writes_recursive(&entry.path());
-            }
-        }
-    }
-    deny_writes_recursive(&dir);
+    set_permissions_recursive(&dir, 0o555, 0o555);
 
     let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id });
     ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
@@ -612,8 +602,235 @@ async fn a_kill_whose_close_write_fails_leaves_the_terminal_running_and_answers_
         disk.kill_tombstone_at("codex", session_id).is_none(),
         "the failed close left no durable kill tombstone"
     );
+    assert!(
+        disk.list_pane_closes().is_empty(),
+        "the failed close left no pane close record"
+    );
 
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+    // F7 cleanup: restore permissions RECURSIVELY (the nested
+    // bindings/<provider> and tombstone dirs stay 0555 under a root-only
+    // chmod, which a non-root run cannot remove — the tree leaked).
+    set_permissions_recursive(&dir, 0o755, 0o644);
+    registry.kill(&terminal_id);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── Delta-r6-r2 (focused-episode-6 round 1) ──────────────────────────────
+
+/// F7's helper, hoisted: recursively re-permission a store tree (the
+/// failure-staging deny AND the cleanup restore — every nested node must
+/// come back, or a non-root run leaks the whole tree: nested `0555` dirs
+/// are not removable by the owner).
+#[cfg(unix)]
+fn set_permissions_recursive(path: &std::path::Path, dir_mode: u32, file_mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(dir_mode)).unwrap();
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap().flatten() {
+            if entry.path().is_dir() {
+                set_permissions_recursive(&entry.path(), dir_mode, file_mode);
+            } else {
+                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(file_mode))
+                    .unwrap();
+            }
+        }
+    }
+}
+
+/// F1+F2, the whole terminal lane end to end: a kill landing BEFORE identity
+/// resolution (the marker-mode pane never identifies) records the close
+/// under the PANE identity any later verdict can join on — and a resolution
+/// arriving after the kill consults that record and lands its row
+/// Retired(Closed), never Bound.
+#[tokio::test]
+async fn a_kill_before_identity_resolution_records_a_pane_close_the_late_resolution_adopts() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-preidentity");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // A codex-mode create with NO sessionRef: the pending marker is the only
+    // evidence (identity arrives via the locator/signal lanes — never, for a
+    // sleeper CLI).
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-kill-preidentity",
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    wait_for(
+        || {
+            server_ledger
+                .list_pending_raw()
+                .iter()
+                .any(|m| m.terminal_id == terminal_id)
+        },
+        "the pending marker to land (identity in flight)",
+    );
+    assert!(
+        server_ledger.list_bindings().is_empty(),
+        "precondition: no binding row exists (identity never resolved)"
+    );
+
+    let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    // Yield to the runtime until the close lands (kill → spawn_blocking →
+    // record write). `wait_for` uses thread::sleep, which would starve a
+    // single-threaded test runtime — drain frames instead (terminal.exit /
+    // terminals.changed arrive on the success path).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server_ledger.pane_close_for_terminal(&terminal_id).is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pane close record never landed — the durable close under the pane's own identity"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await;
+    }
+    let record = server_ledger
+        .pane_close_for_terminal(&terminal_id)
+        .expect("close record");
+    assert_eq!(record.terminal_id, terminal_id);
+    assert_eq!(
+        record.create_request_id.as_deref(),
+        Some("req-kill-preidentity"),
+        "the record carries the pane's createRequestId (the verdict join key)"
+    );
+    assert!(
+        !server_ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == terminal_id),
+        "the marker is deleted by the kill"
+    );
+    assert!(
+        server_ledger.list_bindings().is_empty(),
+        "still no row (nothing identified before the kill)"
+    );
+
+    // NOW the orphaned resolution lands (the locator lane's shape: binding
+    // row + marker delete) — it must consult the close record and land the
+    // row Retired(Closed), folding the identity's fence and the record.
+    let resolve_ledger = std::sync::Arc::clone(&server_ledger);
+    let tid = terminal_id.clone();
+    tokio::task::spawn_blocking(move || {
+        resolve_ledger.resolve_pending(&freshell_ws::pane_ledger::BindingWrite {
+            provider: "codex",
+            session_id: "sess-late-resolve",
+            terminal_id: &tid,
+            mode: "codex",
+            cwd: Some("/tmp"),
+            create_request_id: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            now_ms: 9_000,
+        })
+    })
+    .await
+    .expect("join")
+    .expect("the resolve write succeeds (it lands as retired evidence)");
+    let row = server_ledger
+        .load_binding("codex", "sess-late-resolve")
+        .expect("the resolved row exists");
+    assert_eq!(
+        row.state,
+        freshell_ws::pane_ledger::RowState::Retired,
+        "the late resolution lands Retired, never Bound"
+    );
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    assert!(
+        server_ledger.kill_tombstone_at("codex", "sess-late-resolve").is_some(),
+        "the identity's kill fence folded"
+    );
+    let record = server_ledger
+        .pane_close_for_terminal(&terminal_id)
+        .expect("record");
+    assert!(
+        record
+            .kills
+            .iter()
+            .any(|k| k.provider == "codex" && k.session_id == "sess-late-resolve"),
+        "the record learned the now-known identity: {record:?}"
+    );
+    let _ = registry; // ownership only (terminal already reaped by the kill)
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// F6, the terminal half through the REAL failure surface: only the ROW
+/// retire write can fail (its bindings dir read-only; the tombstone's tree
+/// stays writable). The compensated close must NOT leave the just-written
+/// tombstone dominating the still-Bound row — the kill answers with an
+/// error, the terminal runs, and the disk shows row Bound + NO tombstone +
+/// NO close record.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_kill_whose_row_retire_fails_compensates_the_just_written_tombstone() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-partial-close");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let session_id = "11111111-2222-3333-4444-777777777777";
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-kill-partial-close",
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "sessionRef": { "provider": "codex", "sessionId": session_id },
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    assert_eq!(
+        server_ledger
+            .load_binding("codex", session_id)
+            .expect("resume create wrote the binding")
+            .state,
+        RowState::Bound,
+        "precondition: the row stands Bound before the kill"
+    );
+
+    // Only the row's bindings dir goes read-only: the tombstone can land,
+    // the retire cannot (its rename needs dir-write).
+    let bindings_dir = dir.join("bindings").join("codex");
+    set_permissions_recursive(&bindings_dir, 0o555, 0o555);
+
+    let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(
+        err["code"], "INTERNAL_ERROR",
+        "a failed durable close surfaces an error frame: {err}"
+    );
+    assert_eq!(err["terminalId"], terminal_id);
+
+    assert!(
+        registry.probe(&terminal_id).is_some(),
+        "a failed close leaves the terminal running"
+    );
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert_eq!(
+        disk.load_binding("codex", session_id)
+            .expect("row on disk")
+            .state,
+        RowState::Bound,
+        "the row was never retired — no mis-restore"
+    );
+    assert!(
+        disk.kill_tombstone_at("codex", session_id).is_none(),
+        "compensation removed the just-written tombstone: no dominance over the live session"
+    );
+    assert!(
+        disk.list_pane_closes().is_empty(),
+        "no close record exists for a close that failed"
+    );
+
+    set_permissions_recursive(&dir, 0o755, 0o644);
     registry.kill(&terminal_id);
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -1189,44 +1189,32 @@ impl FreshClaudeState {
             .resolve_session_key(&session_id)
             .await
             .unwrap_or_else(|| session_id.clone());
-        let removed = self.sessions.lock().await.remove(&map_key);
-        // Round 5 (focused-ep5-r4 Finding 4's claude half): the consumer ABORT
-        // is synchronous and suffices for the round-1 alias-mint guard: an
-        // adoption that STARTED pre-abort inserted its cli_index alias +
-        // cli_session_id copy BEFORE its ledger write (see
-        // `adopt_session_init`), so the collection below sees every minted
-        // id; an adoption that had not inserted yet can never insert (the
-        // task is dead) and its write is fenced by the kill tombstone
-        // whenever it lands. The consumer JOIN and every process-kill await
-        // are past the retire (pass 2, then the teardown) — a server crash
-        // inside them still leaves the close durable.
-        if let Some(session) = &removed {
-            session.consumer.abort();
-        }
-        // The retire-set COMPLETION (one critical section across live aliases,
-        // the alias tombstones, and — round 6 — the persisted alias records).
-        // When the map entry is already gone, LIVE aliases still answer in
-        // the exit-eviction gap (focused-ep5-r2 Finding 3 — the consumer
-        // eviction removed the entry but has not yet demoted its cli_index
-        // alias), so both shapes run the same consult.
-        self.collect_kill_retire_ids(
-            &session_id,
-            &map_key,
-            removed
-                .as_ref()
-                .and_then(|s| s.cli_session_id.as_deref()),
-            &mut retire_ids,
-        )
-        .await;
-        // PASS 2: the alias-resolved ids (pass 1 already retired the wire
-        // id). Completing the close is deliberately POST-abort — the round-1
-        // mint guard requires the collection to follow the abort, and the
-        // collection needs the map removal — so the alias-resolved durables
-        // cannot be retired earlier than this; pass 1 is what guarantees the
-        // kill's durable footprint precedes that whole chain. A failure here
-        // is past the last safe abort point (the consumer is aborted and the
-        // map entry removed): the teardown proceeds, but the kill answer MUST
-        // still report failure — never acknowledge an unrecorded close.
+        // Delta-r6-r2 (focused-episode-6 round 1, Finding 3): the FULL retire
+        // set is collected and closed BEFORE any live-state destruction (the
+        // map removal, the consumer abort). The delta-r6 order removed and
+        // aborted FIRST and retired the alias-resolved rows only afterward —
+        // a restart, task cancellation, or pass-2 write failure in that
+        // window left the durable Claude row Bound while the live session
+        // was already destroyed, and the placeholder tombstone from pass 1
+        // does not fence or retire the differently keyed durable row (the
+        // recovery offer's never-actually-open shape, exactly).
+        //
+        // The pre-destruction collection is safe against the round-1 mint
+        // guard by SPLITTING: the consumer is the only minter, and an
+        // adoption's `cli_index` insert PRECEDES its ledger write — so a mint
+        // whose insert predates this collection is covered by the retire set,
+        // and a mint still mid-flight is closed by the consumer abort below
+        // and caught by the post-abort COMPLETION DIFF (farther down): it
+        // re-collects, retires any newly visible id, and the folded tombstone
+        // fences that id's late-landing ledger write.
+        self.collect_kill_retire_ids(&session_id, &map_key, &mut retire_ids)
+            .await;
+        // The completion half of the durable close (pass 1 covered the wire
+        // id). Delta-r6-r2 (Finding 3): a FAILURE here ABORTS the kill —
+        // `success:false`, and NOTHING live was touched (no removal, no
+        // abort): the session stays live and Bound, self-consistent, and a
+        // retried kill re-attempts idempotently. The delta-r6 ordering
+        // destroyed first and reported after.
         let pass2_ok = self
             .retire_closed_rows(
                 &retire_ids
@@ -1236,6 +1224,46 @@ impl FreshClaudeState {
                     .collect::<Vec<_>>(),
             )
             .await;
+        if !pass2_ok {
+            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: session_type.to_string(),
+                success: false,
+            }));
+            return;
+        }
+        // Live-state destruction begins (every durable id the collection
+        // could see is durably closed by this point).
+        let removed = self.sessions.lock().await.remove(&map_key);
+        // Round 5 (focused-ep5-r4 Finding 4's claude half): the consumer ABORT
+        // is synchronous and closes the mint channel (an adoption that never
+        // completed its cli_index insert is cancelled at its await and can
+        // never insert; one whose insert landed is visible to the diff).
+        if let Some(session) = &removed {
+            session.consumer.abort();
+        }
+        // Delta-r6-r2 (Finding 3) COMPLETION DIFF: re-collect past the abort
+        // and retire any id minted between the pre-destruction collection and
+        // the abort. A diff retire failure is past the point of no safe
+        // return (the consumer is aborted, the map entry removed): the
+        // teardown proceeds, but the kill answer MUST still report failure —
+        // never acknowledge an unrecorded close.
+        let mut diff_set = vec![session_id.clone()];
+        self.collect_kill_retire_ids(&session_id, &map_key, &mut diff_set)
+            .await;
+        let late_ids: Vec<String> = diff_set
+            .iter()
+            .filter(|id| **id != session_id && !retire_ids.contains(*id))
+            .cloned()
+            .collect();
+        let diff_ok = if late_ids.is_empty() {
+            true
+        } else {
+            let ok = self.retire_closed_rows(&late_ids).await;
+            retire_ids.extend(late_ids);
+            ok
+        };
         if let Some(session) = removed {
             teardown_removed_session(session).await;
         }
@@ -1270,7 +1298,7 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: pass2_ok,
+            success: diff_ok,
         }));
     }
 
@@ -1402,18 +1430,13 @@ impl FreshClaudeState {
     /// retire-set completion — ONE critical section across all three
     /// alias-resolution sources, with the lock order `cli_index` →
     /// `sessions` → `alias_tombstones` held for the whole consult (no awaits
-    /// inside). Called AFTER any removed session's consumer abort+join (no
-    /// adoption arm can mint a new alias past the join; an adoption that had
-    /// started pre-abort has its cli_index insert done BEFORE its ledger
-    /// write, so its durable id is already visible here).
-    ///
-    /// Finding 3 (the exit-eviction gap): the consumer eviction removes the
-    /// session entry and demotes the cli_index aliases as two separate map
-    /// operations — a kill landing between them previously saw NEITHER
-    /// source and retired only the placeholder. This consult sees both
-    /// representations atomically: the demotion either already ran (the
-    /// alias TOMBSTONES answer) or it has not (the LIVE aliases answer), so
-    /// every interleaving resolves the durable id.
+    /// inside). Runs identically pre- and post-destruction (delta-r6-r2:
+    /// the pre-destruction pass collects the set the kill closes up front,
+    /// the post-abort diff catches a mint that raced the abort): pre-abort
+    /// it sees the still-mapped session's `cli_session_id` and live aliases;
+    /// post-abort the demoted tombstones/persisted records answer where the
+    /// live copies went (focused-ep5-r2 Finding 3's exit-eviction gap needs
+    /// both shapes).
     ///
     /// Finding 2 (the tightened tombstone rule): a TOMBSTONE-sourced
     /// candidate is followed only when live session state does not
@@ -1423,13 +1446,12 @@ impl FreshClaudeState {
     /// genuine claim normally CONSUMES those records at reopen —
     /// `commit_session_claim`; this check is the belt to that suspenders,
     /// catching any record that escapes consumption.) Live aliases of THIS
-    /// kill's own map key and the removed session's recorded cli id always
-    /// retire: they ARE the identity the kill is closing.
+    /// kill's own map key and the session's recorded cli id always retire:
+    /// they ARE the identity the kill is closing.
     async fn collect_kill_retire_ids(
         &self,
         wire_session_id: &str,
         map_key: &str,
-        removed_cli_id: Option<&str>,
         retire_ids: &mut Vec<String>,
     ) {
         let now = crate::session_lease::now_epoch_ms() as i64;
@@ -1457,7 +1479,15 @@ impl FreshClaudeState {
                 tombstones.record_persisted(wire_session_id, &durable, at_ms, now, &row_bound);
             }
         }
-        if let Some(cli_id) = removed_cli_id {
+        // The session's own recorded cli id (the live map holds it: keyed by
+        // the placeholder OR the durable, whichever addresses the session) —
+        // delta-r6-r2: read HERE inside the consult, since the kills lane
+        // calls this both pre-removal (the entry stands) and post-abort (a
+        // repurposed consult has nothing newly recorded to add).
+        if let Some(cli_id) = sessions
+            .get(map_key)
+            .and_then(|s| s.cli_session_id.as_deref())
+        {
             if cli_id != map_key && !retire_ids.iter().any(|id| id == cli_id) {
                 retire_ids.push(cli_id.to_string());
             }
@@ -5538,7 +5568,15 @@ pub(crate) mod tests {
     ) -> Value {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if frame["type"] == "freshAgent.event" && frame["event"]["type"] == inner_type {
                     return frame;
                 }
@@ -5555,7 +5593,15 @@ pub(crate) mod tests {
     async fn await_status_on_wire(rx: &mut tokio::sync::broadcast::Receiver<String>, status: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if frame["type"] == "freshAgent.event"
                     && frame["event"]["type"] == "freshAgent.status"
                     && frame["event"]["status"] == status
@@ -5572,7 +5618,15 @@ pub(crate) mod tests {
     async fn await_top_level_error(rx: &mut tokio::sync::broadcast::Receiver<String>) -> String {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if frame["type"] == "error" {
                     return frame["message"].as_str().unwrap_or_default().to_string();
                 }
@@ -6517,7 +6571,15 @@ rl.on('line', (line) => {
     ) -> Value {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if (frame["type"] == "freshAgent.created"
                     || frame["type"] == "freshAgent.create.failed")
                     && frame["requestId"] == request_id
@@ -6961,6 +7023,239 @@ rl.on('line', (line) => {
         );
     }
 
+    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 3): the FULL durable
+    /// close — the wire id AND every alias-resolved durable row — completes
+    /// BEFORE any live-state destruction (the map removal, the consumer
+    /// abort). The delta-r6 two-pass retired the alias-resolved rows only
+    /// AFTER removal/abort: a restart or task cancellation there left the
+    /// durable row Bound while the live session was already destroyed (the
+    /// recovery offer's exact never-actually-open shape). The gate: the
+    /// durable id's close mutation lands and its answer PARKS (the
+    /// retire-stall hook); while parked, nothing live may have been touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_alias_resolved_close_completes_before_any_live_state_destruction() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-close-before-teardown"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-close-before-teardown").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let present = st
+                .cli_index
+                .lock()
+                .await
+                .get(durable)
+                .is_some_and(|mapped| mapped == &placeholder);
+            if present {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sdk.session.init adoption must alias the durable id at the placeholder"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let stall = fake.arm_retire_stall("claude", durable);
+        let st2 = st.clone();
+        let ph = placeholder.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: ph,
+                session_type: SessionType::Freshclaude,
+                cwd: None,
+            })
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the alias-resolved durable close mutation landed (answer parked)");
+
+        // THE FINDING'S ASSERTION: while the durable close's answer is parked,
+        // the session must STILL be mapped and its consumer STILL running —
+        // live-state destruction follows the close, never the other way.
+        {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get(&placeholder)
+                .expect("the session is still mapped while the durable close is in flight");
+            assert!(
+                !session.consumer.is_finished(),
+                "the consumer abort must follow the durable close, never precede it"
+            );
+        }
+        stall.release.send(()).expect("release the stall");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+        assert!(
+            st.sessions.lock().await.get(&placeholder).is_none(),
+            "the lane completes: the session is removed AFTER the close"
+        );
+    }
+
+    /// Delta-r6-r2 (Finding 3), the failure half: the wire-id close landing
+    /// and the alias-resolved close FAILING must ABORT the kill before any
+    /// live state is touched — the session stays mapped, its consumer stays
+    /// running, and the answer reports `success:false`. The delta-r6 order
+    /// torn down first and merely REPORTED failure: a live-bound/destroyed
+    /// mismatch the client could never observe honestly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_whose_alias_resolved_close_fails_aborts_before_any_live_state_destruction() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-alias-close-fails"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-alias-close-fails").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let present = st
+                .cli_index
+                .lock()
+                .await
+                .get(durable)
+                .is_some_and(|mapped| mapped == &placeholder);
+            if present {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // First retire (the wire id's close) succeeds; every retire after —
+        // the alias-resolved durable's — fails.
+        fake.fail_retires_after(1);
+        while rx.try_recv().is_ok() {} // drain pre-kill frames
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get(&placeholder)
+                .expect("a failed alias-resolved close leaves the session MAPPED");
+            assert!(
+                !session.consumer.is_finished(),
+                "a failed alias-resolved close leaves the consumer RUNNING"
+            );
+        }
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), placeholder.clone())),
+            "the wire-id close landed (it precedes the alias-resolved failure)"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill reports failure: {killed_frame}"
+        );
+    }
+
+    /// Delta-r6-r2 (Finding 3), the mint-gap half: with the durable close
+    /// collected pre-destruction, an adoption that inserts its alias BETWEEN
+    /// the collection and the consumer abort (the consumer is the minter;
+    /// the abort closes that channel) is still retired — the kill's
+    /// completion DIFF re-collects post-abort and retires the newly visible
+    /// id. Its later landing ledger write is fenced by the folded tombstone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mint_landing_mid_close_still_has_its_row_retired() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-mint-mid-close"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-mint-mid-close").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let present = st
+                .cli_index
+                .lock()
+                .await
+                .get(durable)
+                .is_some_and(|mapped| mapped == &placeholder);
+            if present {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Park the kill between its pre-destruction close and its teardown
+        // (the durable's close answer stalls post-mutation), then insert the
+        // racing mint: an adoption's alias insert lands NOW; its ledger write
+        // lands later (fenced by the completion retire's folded tombstone).
+        let stall = fake.arm_retire_stall("claude", durable);
+        let st2 = st.clone();
+        let ph = placeholder.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: ph,
+                session_type: SessionType::Freshclaude,
+                cwd: None,
+            })
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the durable close is in flight");
+        st.cli_index
+            .lock()
+            .await
+            .insert("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(), placeholder.clone());
+        stall.release.send(()).expect("release the stall");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&(
+                    "claude".to_string(),
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string()
+                )),
+            "the mint landing mid-close is retired by the post-abort completion diff: {:?}",
+            fake.retires.lock().unwrap()
+        );
+    }
     /// Focused-ep5-r1 Finding 1 (retire-on-kill round 2), the REAL wire shape:
     /// the client closes a pane by its ORIGINAL BARE PLACEHOLDER sessionId,
     /// while the ledger row is keyed on the durable cli UUID. The round-1
@@ -9837,7 +10132,15 @@ rl.on('line', (line) => {
         // envelope proves the row already landed.
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if frame["event"]["type"] == "freshAgent.session.init" {
                     break;
                 }
@@ -9885,7 +10188,15 @@ rl.on('line', (line) => {
         // The init frame still broadcasts (the skip affects ONLY the ledger write).
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if frame["event"]["type"] == "freshAgent.session.init" {
                     break;
                 }
@@ -9933,7 +10244,15 @@ rl.on('line', (line) => {
         // witness idiom as `session_init_records_binding_with_create_settings`).
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
                 if frame["event"]["type"] == "freshAgent.session.init" {
                     break;
                 }

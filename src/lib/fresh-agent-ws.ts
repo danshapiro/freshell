@@ -77,6 +77,42 @@ interface FreshAgentMessageSink {
   send: (msg: unknown) => void
 }
 
+/**
+ * Delta-r6-r2 (focused-episode-6 round 1, Finding 5): the kill answer's
+ * `success` field is load-bearing. The server's durable close FAILED
+ * (`success:false`) — every provider then leaves the LIVE session untouched
+ * (the close was never recorded; a `Bound` row beside an unacknowledged
+ * close stays self-consistent and retryable). Folding the session away as
+ * closed would let the browser proceed as though the kill landed — leaving
+ * a live Bound server session that recreates exactly the stale recovery
+ * candidate the restore-exactness campaign exists to prevent. So a failed
+ * kill is NOT a close: keep the session record and surface the failure on
+ * the pane's ordinary session-error surface (the pane's error banner reads
+ * `lastError`/`lastErrorCode`), logged structured. `success` absent (the
+ * legacy wire shape) means the old unconditional-close server — current
+ * behavior.
+ */
+function foldFreshAgentKilled(
+  dispatch: AppDispatch,
+  locator: { sessionId: string; sessionType: FreshAgentSessionType; provider: FreshAgentRuntimeProvider },
+  success: boolean | undefined,
+): void {
+  if (success === false) {
+    log.warn('freshAgent.killed reported success:false — the close was not durably recorded; the session may still be running on the server', {
+      sessionId: locator.sessionId,
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+    })
+    dispatch(sessionError({
+      ...locator,
+      code: 'KILL_FAILED',
+      message: 'the session close could not be recorded durably; the session may still be running on the server',
+    }))
+    return
+  }
+  dispatch(removeSession(locator))
+}
+
 type FreshAgentEventMessage = {
   type: 'freshAgent.event'
   sessionId: string
@@ -175,11 +211,11 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
-      dispatch(removeSession({
+      foldFreshAgentKilled(dispatch, {
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
         provider: killed.provider,
-      }))
+      }, killed.success)
       return true
     }
     case 'freshAgent.event':
@@ -375,7 +411,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     case 'freshAgent.killed':
-      dispatch(removeSession(locator))
+      foldFreshAgentKilled(dispatch, locator, event.success as boolean | undefined)
       return true
     default:
       return false

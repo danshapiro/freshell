@@ -535,6 +535,11 @@ pub(crate) struct FakeIdentitySink {
         std::sync::Mutex<std::collections::HashMap<(String, String), serde_json::Value>>,
     /// When true, write futures resolve to Err — for failure-surfacing tests.
     pub fail_writes: std::sync::atomic::AtomicBool,
+    /// Delta-r6-r2 (F3/F4) sequenced-failure knob: `Some(n)` lets exactly n
+    /// `retire_closed` answers succeed, then fails every retire after — the
+    /// split-phase failure (the kill's first close lands, its completion
+    /// close misses) `fail_writes` cannot stage. `None` disarms.
+    fail_retires_after: std::sync::Mutex<Option<i64>>,
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook — see
     /// [`Self::arm_post_commit_stall`].
     post_commit_stall: std::sync::Mutex<Option<PostCommitStallGate>>,
@@ -742,6 +747,13 @@ impl FakeIdentitySink {
     pub fn set_fail_writes(&self, fail: bool) {
         self.fail_writes
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Delta-r6-r2 (F3/F4): let the first `ok_first` retire answers succeed,
+    /// then fail every retire — the split-phase close failure (wire-id close
+    /// lands, completion close misses).
+    #[allow(dead_code)] // used by the delta-r6-r2 kill-lane failure pins
+    pub(crate) fn fail_retires_after(&self, ok_first: u32) {
+        *self.fail_retires_after.lock().unwrap() = Some(i64::from(ok_first));
     }
     /// Focused ep1-r4 F2: seed the rollback row as RAW STORED BYTES (the legacy
     /// pre-epoch payload shape), replacing any typed seed — `load_rollback` then
@@ -1167,7 +1179,24 @@ impl PaneIdentitySink for FakeIdentitySink {
         self.write_result()
     }
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
-        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+        // Delta-r6-r2 (focused-episode-6 round 1, F3/F4) knob: the kill's
+        // DURABLE phases split (wire id first, alias-resolved/late ids after),
+        // and only a SEQUENCED failure can stage the second half failing —
+        // `fail_writes` fails everything from the start, which pins only the
+        // first-phase abort. `fail_retires_after(n)` lets the first n retires
+        // succeed and fails every one after.
+        let budget_fail = {
+            let mut budget = self.fail_retires_after.lock().unwrap();
+            match *budget {
+                Some(0) => true,
+                Some(n) => {
+                    *budget = Some(n - 1);
+                    false
+                }
+                None => false,
+            }
+        };
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) && !budget_fail {
             self.retires
                 .lock()
                 .unwrap()
@@ -1197,6 +1226,11 @@ impl PaneIdentitySink for FakeIdentitySink {
         // ANSWER parks behind the test's release — the kill lane sits
         // between its completed close and its teardown, deterministically.
         // Never engages on the failure knob (a failed retire is no stall).
+        if budget_fail {
+            return Box::pin(std::future::ready(Err(std::io::Error::other(
+                "fake write failure",
+            ))));
+        }
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
             return self.write_result();
         }
