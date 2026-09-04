@@ -30,7 +30,13 @@ import { createTray } from './tray.js'
 import { resolveTrayIconPath } from './icon-path.js'
 import { buildAppMenu } from './menu.js'
 import { runStartup, type StartupContext, type BrowserWindowLike } from './startup.js'
-import { initMainProcess } from './main.js'
+import { acquireInstanceLock, initMainProcess } from './main.js'
+import {
+  DEFAULT_PROFILE_ID,
+  readProfilesRegistry,
+  registryPathForHome,
+  resolveBootShape,
+} from './profile.js'
 import { createWizardWindow } from './setup-wizard/wizard-window.js'
 import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
 import { buildLaunchOptions } from './launch-options.js'
@@ -44,8 +50,41 @@ import type { RecoverableWebContents } from './renderer-recovery.js'
 const isPortAvailable = createPortAvailabilityCheck()
 
 const isDev = process.env.ELECTRON_DEV === '1'
-const configDir = path.join(os.homedir(), '.freshell')
+
+// --- Boot-shape resolution (must run before configDir/logger binding) -------
+// One process = one Chromium userData = one instance lock, ALWAYS. Named
+// profiles (--profile=<id> or FRESHELL_PROFILE) and the picker launcher each
+// get their own userData dir — which also re-keys the single-instance lock —
+// so the picker NEVER shares a userData dir with a resident Default instance
+// (two browser processes on one profile dir is a Chromium storage hazard).
+const registryAtBoot = readProfilesRegistry(
+  registryPathForHome(os.homedir()),
+  (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined),
+)
+const bootShape = resolveBootShape(
+  process.argv, process.env, registryAtBoot,
+  app.getName(), app.getPath('appData'), os.homedir(),
+)
+if (bootShape.userDataDir) {
+  // Electron's doc contract for app.setPath: the target directory must
+  // exist. Create-first is the documented-correct order.
+  fs.mkdirSync(bootShape.userDataDir, { recursive: true })
+  app.setPath('userData', bootShape.userDataDir)
+}
+const activeProfileId = bootShape.profileId
+const isPickerLauncher = bootShape.kind === 'picker'
+const configDir = bootShape.configDir
 const mainProcessLogger = createElectronMainLogger({ configDir })
+if (registryAtBoot.error) {
+  mainProcessLogger.log({ severity: 'warn', event: 'profiles_registry_invalid', error: registryAtBoot.error })
+}
+if (bootShape.error) {
+  mainProcessLogger.log({ severity: 'warn', component: 'electron-profile', event: 'profile_selection_invalid', error: bootShape.error })
+}
+
+/** True once this process holds its (userData-keyed) instance lock;
+ *  re-entrant main() calls (wizard completion) must not re-request it. */
+let instanceLockHeld = false
 
 type EntryBrowserWindow = InstanceType<typeof BrowserWindow>
 type WindowListener = { event: string; callback: (...args: any[]) => void }
@@ -242,7 +281,40 @@ async function main(): Promise<void> {
     event: 'electron_main_started',
     appVersion: app.getVersion(),
     isDev,
+    profile: activeProfileId,
   })
+
+  // Instance lock, acquired BEFORE any side effects (provisioning, server
+  // spawn). Keyed to the userData dir chosen at module top: an explicit
+  // profile's own dir, the default dir for a plain launch, or the launcher
+  // dir for a picker launch. A same-profile duplicate quits here (delivering
+  // `second-instance` to the resident, which then shows its window).
+  //
+  // The onDenied hook lifts the `will-quit` wizard-phase veto: at this point
+  // `wizardPhase` is still true (it only flips false once a chooser/main
+  // window is reached), and entry.ts's module-level `will-quit` guard would
+  // otherwise preventDefault() this quit, leaving the turned-away duplicate
+  // as a headless zombie process. A denied duplicate never enters the wizard,
+  // so flipping it is unconditionally correct here.
+  if (!instanceLockHeld) {
+    if (!acquireInstanceLock(app, () => { wizardPhase = false })) {
+      return
+    }
+    instanceLockHeld = true
+  }
+
+  // Canonical duplicate-launch surfacing, registered ONCE, as early as
+  // possible: covers the wizard, chooser, and (until initMainProcess's own
+  // handler supersedes it for the main window) every intermediate phase.
+  if (!app.listenerCount('second-instance')) {
+    app.on('second-instance', () => {
+      const win = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed())
+      if (!win) return
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    })
+  }
 
   // Consolidated window-all-closed handler: during the wizard phase we keep
   // the app alive so main() can re-run after the wizard closes. Once the main
@@ -269,7 +341,7 @@ async function main(): Promise<void> {
         /* best-effort cleanup */
       }
     },
-    patchDesktopConfig,
+    patchDesktopConfig: (p) => patchDesktopConfig(p, configDir),
   })
 
   // Consume any pending forced launch (set by the chooser handler before it
@@ -278,7 +350,7 @@ async function main(): Promise<void> {
   pendingForcedLaunch = undefined
 
   // Read desktop config (or use defaults for first run)
-  const desktopConfig = (await readDesktopConfig()) ?? getDefaultDesktopConfig()
+  const desktopConfig = (await readDesktopConfig(configDir)) ?? getDefaultDesktopConfig()
   const port = desktopConfig.port ?? 3001
 
   // Create DI implementations
@@ -286,7 +358,7 @@ async function main(): Promise<void> {
   const daemonManager = await createDaemonManager(resourcesPath)
   const serverSpawner = createServerSpawner()
   const hotkeyManager = createHotkeyManager(globalShortcut)
-  const windowStatePersistence = createWindowStatePersistence()
+  const windowStatePersistence = createWindowStatePersistence(configDir)
 
   // autoUpdater is only available when the app is packaged.
   // In dev mode, provide a no-op stub.
@@ -447,6 +519,7 @@ async function main(): Promise<void> {
             }
           },
         },
+        { tooltip: activeProfileId === DEFAULT_PROFILE_ID ? 'Freshell' : `Freshell (${activeProfileId})` },
       )
     },
   }
@@ -524,7 +597,7 @@ async function main(): Promise<void> {
       remoteToken: config.remoteToken || undefined,
       globalHotkey: config.globalHotkey,
       setupCompleted: true,
-    })
+    }, configDir)
   })
 
   ipcMain.handle('get-launch-options', () =>
@@ -532,7 +605,7 @@ async function main(): Promise<void> {
   )
 
   ipcMain.handle('choose-launch-option', createChooseLaunchOptionHandler({
-    patchDesktopConfig,
+    patchDesktopConfig: (patch) => patchDesktopConfig(patch, configDir),
     getCurrentPort: () => desktopConfig.port,
     validateServerAuth: (url: string, token: string) => ctx.fetchAuthenticated?.(`${url}/api/settings`, token) ?? Promise.resolve(false),
     isAllowedSender: (event) => {
