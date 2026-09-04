@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import { logger } from '../logger.js'
+import { getFreshellConfigDir } from '../freshell-home.js'
 
 export type RecoveryStoreData = {
   version: 1
@@ -56,7 +56,7 @@ export class FreshAgentRecoveryStore {
   private queue: Promise<unknown> = Promise.resolve()
 
   constructor(options?: { filePath?: string }) {
-    this.filePath = options?.filePath ?? path.join(os.homedir(), '.freshell', 'fresh-agent-recovery.json')
+    this.filePath = options?.filePath ?? path.join(getFreshellConfigDir(), 'fresh-agent-recovery.json')
   }
 
   async recordInterrupt(sessionId: string): Promise<void> {

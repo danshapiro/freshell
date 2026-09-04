@@ -176,3 +176,22 @@ describe('CodexDurabilityStore', () => {
     await expect(store.read('term-1')).resolves.toBeUndefined()
   })
 })
+
+describe('defaultCodexDurabilityStoreDir + FRESHELL_CONFIG_DIR', () => {
+  it('routes the default through FRESHELL_CONFIG_DIR with the explicit override keeping precedence', async () => {
+    const { defaultCodexDurabilityStoreDir } = await import(
+      '../../../../../server/coding-cli/codex-app-server/durability-store.js'
+    )
+    const original = { ...process.env }
+    try {
+      delete process.env.FRESHELL_CODEX_DURABILITY_DIR
+      process.env.FRESHELL_CONFIG_DIR = '/tmp/fx-work'
+      expect(defaultCodexDurabilityStoreDir()).toBe(path.join('/tmp/fx-work', 'codex-durability'))
+
+      process.env.FRESHELL_CODEX_DURABILITY_DIR = '/tmp/fx-codex'
+      expect(defaultCodexDurabilityStoreDir()).toBe('/tmp/fx-codex')
+    } finally {
+      process.env = original
+    }
+  })
+})
