@@ -154,11 +154,89 @@ pub struct KillTombstone {
     pub killed_at_ms: i64,
 }
 
+/// Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the outcome of
+/// [`PaneLedger::commit_claim`] — the claim lifecycle's conditional commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimCommitOutcome {
+    /// The identity's dead-state was unchanged (or absent, or older) since
+    /// the claim-start snapshot: the fence is cleared and a kill-closed row
+    /// is back to Bound, as ONE durable transition.
+    Committed,
+    /// A NEWER close landed mid-claim (the tombstone stamp advanced past the
+    /// claim-start snapshot — the user closed the pane while the provider
+    /// resume was still awaiting). NOTHING was cleared, revived, or mutated:
+    /// the identity stays durably closed and the caller tears its just-built
+    /// session down.
+    RefusedStale,
+}
+
 /// Focused-ep5-r1 Finding 2: tombstone freshness — subtraction-based so a
 /// backward clock step reads as FRESH (fail-closed: the suppression holds,
 /// never the resurrection).
 fn kill_tombstone_is_fresh(killed_at_ms: i64, now_ms: i64) -> bool {
     now_ms - killed_at_ms < KILL_TOMBSTONE_TTL_MS
+}
+
+/// Focused-ep5-r3 Findings 3+4 (retire-on-kill round 4): every kill-tombstone
+/// consult's shared view of ONE identity's tombstone against its row. ONE
+/// classification serves all four consult sites (the binder's write gate, the
+/// sweep's durability convergence, the sweep's pruning, and the recovery
+/// inventory's offer boundary), so no two readers can disagree about what a
+/// (tombstone, row) pair MEANS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillTombstoneVerdict {
+    /// The tombstone is as new as (or newer than) a Bound row's last liveness
+    /// stamp: the row's own evidence PREDATES the close — the split-write
+    /// crash remnant (`retire_closed` wrote the tombstone; the row retire
+    /// never landed). Dominance: retire the row, suppress its writes, never
+    /// offer it — and Finding 4: NEVER expires while the row reads Bound
+    /// (the TTL exists to prune converged pairs, not to outrun an
+    /// unconverged one).
+    Dominant,
+    /// A Bound row's liveness stamp POSTDATES the tombstone: the row is an
+    /// accepted claim's COMMITTED revive whose own tombstone-clear crashed
+    /// or failed mid-commit. Inert for every consult (the claim visibly
+    /// outran the close); the sweeps prune it at any age — it is resolved
+    /// bookkeeping, not protection.
+    ClaimResidue,
+    /// No Bound row to dominate (missing or already Retired) and still
+    /// inside the protective TTL: fences in-flight orphan writes of the
+    /// closed identity.
+    Fresh,
+    /// TTL elapsed with nothing Bound to protect: prunable noise.
+    Expired,
+}
+
+/// The one classification rule behind [`KillTombstoneVerdict`]. The row input
+/// is exactly `(state, updated_at)`: `updated_at` is the row's own liveness
+/// stamp — `retire_closed` re-stamps it on the retire half, and the claim
+/// commit writes the revived row with the claim's `now` BEFORE clearing the
+/// tombstone, so a crash mid-commit leaves a row that visibly outranks the
+/// surviving tombstone (ClaimResidue — Finding 3's "no observable
+/// intermediate state" guarantee). The dominance tie goes to the KILL
+/// (`killed_at >= updated_at`): a claim whose revive cannot be proven to
+/// postdate the close fails closed toward the close.
+fn classify_kill_tombstone(
+    killed_at_ms: i64,
+    row_view: Option<(RowState, i64)>,
+    now_ms: i64,
+) -> KillTombstoneVerdict {
+    match row_view {
+        Some((RowState::Bound, updated_at)) => {
+            if killed_at_ms >= updated_at {
+                KillTombstoneVerdict::Dominant
+            } else {
+                KillTombstoneVerdict::ClaimResidue
+            }
+        }
+        Some((RowState::Retired, _)) | None => {
+            if kill_tombstone_is_fresh(killed_at_ms, now_ms) {
+                KillTombstoneVerdict::Fresh
+            } else {
+                KillTombstoneVerdict::Expired
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1043,8 +1121,9 @@ impl PaneLedger {
 
         let key = (w.provider.to_string(), w.session_id.to_string());
         // Focused-ep5-r1 Finding 2 — the kill-tombstone consult (state, not
-        // scheduling): under the SAME guard the write below runs on. A FRESH
-        // tombstone for this identity means an explicit close beat this
+        // scheduling): under the SAME guard the write below runs on. A
+        // DOMINANT or FRESH tombstone for this identity
+        // ([`classify_kill_tombstone`]) means an explicit close beat this
         // write (the in-flight orphan shape — an aborted consumer's
         // spawn_blocking closure outliving every retire pass, or a
         // detached-lane write racing the kill); the write is SUPPRESSED
@@ -1052,52 +1131,73 @@ impl PaneLedger {
         // link below is skipped with it — a dead write must not retire a
         // live parent). A stale Bound remnant (a crash slipped between the
         // kill's tombstone write and its row retire) is force-retired
-        // Closed, self-healing it. An EXPIRED tombstone is swept lazily
-        // (index + file) and the write proceeds — the TTL bounds the
-        // protection; a genuine late bind (claims also clear explicitly via
-        // [`Self::clear_kill_tombstone`]) is never wedged by stale kills.
+        // Closed, self-healing it — and focused-ep5-r3 Finding 4: dominance
+        // NEVER expires while the remnant reads Bound (an expired tombstone
+        // still converges it, TTL notwithstanding). An EXPIRED tombstone over
+        // nothing-Bound is swept lazily (index + file) and the write proceeds
+        // — the TTL bounds the protection; a genuine late bind (claims also
+        // clear explicitly via their commit) is never wedged by stale kills.
+        // A CLAIM-RESIDUE tombstone (a committed claim's revive visibly
+        // outranks its own crashed clear) is inert: the write proceeds and
+        // the residue is pruned.
         if let Some(killed_at) = index.kill_tombstones.get(&key).copied() {
-            if kill_tombstone_is_fresh(killed_at, w.now_ms) {
-                tracing::info!(
-                    target: "freshell_ws::pane_ledger",
-                    provider = %w.provider,
-                    session_id = %w.session_id,
-                    killed_at_ms = killed_at,
-                    "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
-                     for an explicitly-closed identity writes nothing (never Bound)"
-                );
-                if let Some(mut remnant) = index.bindings.get(&key).cloned() {
-                    if remnant.state == RowState::Bound {
-                        remnant.state = RowState::Retired;
-                        remnant.retired_reason = Some(RetiredReason::Closed);
-                        remnant.updated_at = w.now_ms;
-                        tracing::info!(
-                            target: "freshell_ws::pane_ledger",
-                            provider = %w.provider,
-                            session_id = %w.session_id,
-                            "pane_ledger_tombstoned_remnant_retired: force-retiring the \
-                             crash-window Bound remnant alongside the suppressed write"
-                        );
-                        self.write_binding(root, &mut index, &remnant)?;
-                    }
-                }
-                return Ok(());
-            }
-            index.kill_tombstones.remove(&key);
-            if let Err(err) =
-                std::fs::remove_file(Self::kill_tombstone_path(root, w.provider, w.session_id))
-            {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    // Fail loud, never silent: the sweep retires at the next
-                    // GC pass regardless (the file is inert once the index
-                    // entry is gone).
-                    tracing::warn!(
+            let row_view = index
+                .bindings
+                .get(&key)
+                .map(|r| (r.state, r.updated_at));
+            match classify_kill_tombstone(killed_at, row_view, w.now_ms) {
+                KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh => {
+                    tracing::info!(
                         target: "freshell_ws::pane_ledger",
                         provider = %w.provider,
                         session_id = %w.session_id,
-                        error = %err,
-                        "pane_ledger_expired_tombstone_sweep_failed: file left behind; GC retries"
+                        killed_at_ms = killed_at,
+                        "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
+                         for an explicitly-closed identity writes nothing (never Bound)"
                     );
+                    if let Some(mut remnant) = index.bindings.get(&key).cloned() {
+                        if remnant.state == RowState::Bound {
+                            remnant.state = RowState::Retired;
+                            remnant.retired_reason = Some(RetiredReason::Closed);
+                            remnant.updated_at = w.now_ms;
+                            tracing::info!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %w.provider,
+                                session_id = %w.session_id,
+                                "pane_ledger_tombstoned_remnant_retired: force-retiring the \
+                                 crash-window Bound remnant alongside the suppressed write"
+                            );
+                            self.write_binding(root, &mut index, &remnant)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                // Finding 4: an expired tombstone over a missing/Retired row is
+                // pruned noise — the write proceeds and the consult sweeps it
+                // lazily. Finding 3: a ClaimResidue tombstone (the committed
+                // claim's own clear crashed/failed) is inert by construction
+                // (the Bound row outranks it) — never suppress the claim's own
+                // write; prune the residue instead so it cannot linger.
+                KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue => {
+                    index.kill_tombstones.remove(&key);
+                    if let Err(err) = std::fs::remove_file(Self::kill_tombstone_path(
+                        root,
+                        w.provider,
+                        w.session_id,
+                    )) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            // Fail loud, never silent: the sweep prunes at the
+                            // next GC pass regardless (a ClaimResidue file left
+                            // behind is inert either way — the row outranks it).
+                            tracing::warn!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %w.provider,
+                                session_id = %w.session_id,
+                                error = %err,
+                                "pane_ledger_stale_tombstone_sweep_failed: file left behind; GC retries"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1307,28 +1407,36 @@ impl PaneLedger {
             .copied()
     }
 
-    /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3): the identities
-    /// whose kill tombstone is still INSIDE its protective TTL at `now_ms` —
-    /// the read-side dominance input. The recovery inventory treats a Bound
-    /// row whose identity appears here as Retired (the surviving tombstone
-    /// dominates the row the crash-window split-write left Bound), and the
-    /// boot/periodic sweep re-applies that retirement durably — ONE rule (a
-    /// fresh kill tombstone means the identity is Closed), enforced at the
-    /// offer read and converged by the sweeps. Memory-only (V1.md read
-    /// policy); expired tombstones are NOT included (their dominance ended
-    /// with the TTL; the sweep owns their deletion). A disabled ledger
-    /// answers empty.
-    pub fn fresh_kill_tombstone_keys(
-        &self,
-        now_ms: i64,
-    ) -> std::collections::HashSet<(String, String)> {
+    /// The identities whose kill tombstone currently DOMINATES a Bound row
+    /// ([`classify_kill_tombstone`]) — the read-side dominance input the
+    /// recovery inventory consults (its Bound rows then read as Retired, so
+    /// the crash-window split-write remnant is never offered). Dominance has
+    /// NO TTL (focused-ep5-r3 Finding 4): a tombstone paired with a still-Bound
+    /// row whose liveness predates the close is the unconverged crash evidence
+    /// — it answers here forever (until a sweep retires the row), never aging
+    /// out at six hours the way a converged or never-Bound pair does.
+    /// Claim-residue tombstones (an accepted claim's revived row outranks the
+    /// stale name) are deliberately EXCLUDED: the revived session is genuinely
+    /// open and its row must stay Bound at the offer boundary. Memory-only
+    /// (V1.md read policy); a disabled ledger answers empty.
+    pub fn dominant_kill_tombstone_keys(&self) -> std::collections::HashSet<(String, String)> {
         if self.root.is_none() {
             return std::collections::HashSet::new();
         }
-        self.guard()
+        let index = self.guard();
+        index
             .kill_tombstones
             .iter()
-            .filter(|(_, killed_at)| kill_tombstone_is_fresh(**killed_at, now_ms))
+            .filter(|(key, killed_at)| {
+                let row_view = index
+                    .bindings
+                    .get(*key)
+                    .map(|r| (r.state, r.updated_at));
+                // Dominance is TTL-free; `now` only disambiguates the
+                // non-Bound arms, which this filter never selects anyway.
+                classify_kill_tombstone(**killed_at, row_view, i64::MAX)
+                    == KillTombstoneVerdict::Dominant
+            })
             .map(|(key, _)| key.clone())
             .collect()
     }
@@ -1339,6 +1447,11 @@ impl PaneLedger {
     /// write lands Bound again. Idempotent (a never-killed identity clears
     /// to `Ok`), so claim lanes call it unconditionally. File removal first,
     /// then the write-through index — the `delete_pending` discipline.
+    /// Round 4 (focused-ep5-r3) narrowed its callers: the claimed DURABLE's
+    /// own fence now moves inside [`Self::commit_claim`]'s conditional
+    /// transition; this op remains for the claude claim lane's consumed
+    /// PLACEHOLDER-alias fences (secondary identities, cleared only after
+    /// the durable's commit accepted).
     pub fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
         let Some(root) = &self.root else {
             return Ok(());
@@ -1358,53 +1471,131 @@ impl PaneLedger {
         result
     }
 
-    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3) — the claim
-    /// lifecycle's ROW-side transition (the companion of
-    /// [`Self::clear_kill_tombstone`]): a successful attach/resume returned
-    /// the session to live, so a row the kill retired `Closed` moves back to
-    /// Bound. Deliberately NARROW: ONLY Retired(Closed) rows revive (a
-    /// `Superseded` row's chain linkage and a `GcExpired` row's GC verdict
-    /// are never rewritten by a claim), a missing row is a no-op (a
-    /// never-recorded identity gains NO row — the V7/A10 no-laundering
-    /// discipline survives intact), and the kill tombstone is NOT consulted
-    /// here (the claim lanes clear it first — the clearing IS the claim's
-    /// authorization, so a revive can never resurrect an identity whose
-    /// fence still stands). Returns true iff a row flipped. Refreshes
-    /// `updated_at`/`last_observed_at` on a flip (the identity is observed
-    /// alive NOW); every other field (settings, stamps, created_at) is
-    /// preserved from the retired row.
-    pub fn revive_closed(
+    /// Focused-ep5-r3 Findings 1+3 (retire-on-kill round 4) — the claim
+    /// lifecycle's COMMIT as ONE CONDITIONAL, crash-atomic transition,
+    /// superseding round 3's separate `clear_kill_tombstone` + `revive_closed`
+    /// pair (whose two awaited, log-and-continue writes could split both ways:
+    /// a crash after the clear left a genuinely reopened session permanently
+    /// Closed; a failed clear after a successful revive left a Bound row
+    /// dominated by its own stale tombstone — Finding 3):
+    ///
+    /// * CONDITION (Finding 1): `expect_killed_at_ms` is the identity's
+    ///   dead-state snapshot taken at CLAIM START (the tombstone stamp the
+    ///   attach/resume read before spending work on the provider). If the
+    ///   tombstone ADVANCED past it (a newer [`Self::retire_closed`] landed
+    ///   mid-claim — the user closed the pane while the resume awaited its
+    ///   response), the commit is REFUSED with NO side effects at all: no
+    ///   clear, no revive, no index or file mutation. The resumed session is
+    ///   an orphan of a closed pane; the caller tears it down and the row
+    ///   stays Retired. An unchanged (or absent, or older) dead-state
+    ///   commits.
+    /// * TRANSITION (Finding 3): on commit the revived row file (Bound,
+    ///   liveness re-stamped at `now_ms`) lands FIRST and the tombstone
+    ///   delete lands SECOND, both under the one guard. A crash between them
+    ///   leaves a Bound row that visibly POSTDATES the surviving tombstone —
+    ///   [`classify_kill_tombstone`] reads that pair as ClaimResidue: inert
+    ///   at every consult (never suppresses, never dominates, never offered
+    ///   away) and pruned by any sweep. The reverse intermediate (clear
+    ///   persisted, revive lost) is impossible by ordering, so NO durable
+    ///   observation of a half-committed claim exists.
+    ///
+    /// Narrowness preserved from round 3's `revive_closed`: ONLY a
+    /// Retired(Closed) row flips to Bound (a `Superseded` row's chain
+    /// linkage and a `GcExpired`/`SessionMissing` verdict are never
+    /// rewritten); a missing row gains nothing (never a laundered row — the
+    /// V7/A10 no-laundering discipline survives intact). With NO tombstone
+    /// on record the commit is a pure no-op (no row-write churn on an
+    /// unfenced re-claim). A disabled ledger is the polite `Committed`
+    /// no-op.
+    pub fn commit_claim(
         &self,
         provider: &str,
         session_id: &str,
+        expect_killed_at_ms: Option<i64>,
         now_ms: i64,
-    ) -> std::io::Result<bool> {
+    ) -> std::io::Result<ClaimCommitOutcome> {
         let Some(root) = &self.root else {
-            return Ok(false);
+            return Ok(ClaimCommitOutcome::Committed);
         };
         let mut index = self.guard();
-        let Some(mut row) = index
-            .bindings
-            .get(&(provider.to_string(), session_id.to_string()))
-            .cloned()
-        else {
-            return Ok(false);
+        let key = (provider.to_string(), session_id.to_string());
+        let current = index.kill_tombstones.get(&key).copied();
+        let dead_state_advanced = match (current, expect_killed_at_ms) {
+            (Some(cur), Some(exp)) => cur > exp,
+            (Some(_), None) => true,
+            (None, _) => false,
         };
-        if row.state != RowState::Retired || row.retired_reason != Some(RetiredReason::Closed) {
-            return Ok(false);
+        if dead_state_advanced {
+            tracing::info!(
+                target: "freshell_ws::pane_ledger",
+                provider = %provider,
+                session_id = %session_id,
+                expected_killed_at_ms = ?expect_killed_at_ms,
+                current_killed_at_ms = ?current,
+                "pane_ledger_claim_refused_stale_dead_state: a close landed mid-claim; \
+                 the resumed session stays torn down and the row stays Retired"
+            );
+            return Ok(ClaimCommitOutcome::RefusedStale);
         }
-        row.state = RowState::Bound;
-        row.retired_reason = None;
-        row.updated_at = now_ms;
-        row.last_observed_at = now_ms;
-        self.write_binding(root, &mut index, &row)?;
-        tracing::info!(
-            target: "freshell_ws::pane_ledger",
-            provider = %provider,
-            session_id = %session_id,
-            "pane_ledger_closed_row_revived: a genuine claim returned the killed identity to Bound"
-        );
-        Ok(true)
+        // The durable transition: the ROW carries the committed truth first.
+        // The revived/refreshed `updated_at` is what demotes any tombstone
+        // that survives the delete below to inert claim residue.
+        let tombstone_present = current.is_some();
+        if tombstone_present {
+            if let Some(mut row) = index.bindings.get(&key).cloned() {
+                if row.state == RowState::Retired && row.retired_reason == Some(RetiredReason::Closed)
+                {
+                    row.state = RowState::Bound;
+                    row.retired_reason = None;
+                    row.updated_at = now_ms;
+                    row.last_observed_at = now_ms;
+                    self.write_binding(root, &mut index, &row)?;
+                    tracing::info!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %provider,
+                        session_id = %session_id,
+                        "pane_ledger_closed_row_revived: a genuine claim returned the killed identity to Bound"
+                    );
+                } else if row.state == RowState::Bound {
+                    // The crash-remnant claim shape (a Bound row whose retire
+                    // write was lost): the claim commits over it, so refresh
+                    // its liveness stamps — without this, a tombstone whose
+                    // delete fails below would keep dominating it.
+                    row.updated_at = now_ms;
+                    row.last_observed_at = now_ms;
+                    self.write_binding(root, &mut index, &row)?;
+                }
+                // Superseded / GcExpired / SessionMissing rows keep their
+                // verdict verbatim (the round-3 narrowness).
+            }
+        }
+        if tombstone_present {
+            let result =
+                match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id)) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                };
+            match result {
+                Ok(()) => {
+                    index.kill_tombstones.remove(&key);
+                }
+                Err(err) => {
+                    // The transition itself already committed durably above; a
+                    // failed ONLY-CLEANUP delete leaves claim residue (inert at
+                    // every consult, pruned by any sweep). Fail loud, never
+                    // silent — but never fail the accepted commit over it.
+                    tracing::warn!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %provider,
+                        session_id = %session_id,
+                        error = %err,
+                        "pane_ledger_claim_tombstone_delete_failed: inert claim residue left behind; the next sweep prunes it"
+                    );
+                }
+            }
+        }
+        Ok(ClaimCommitOutcome::Committed)
     }
 
     /// Best-effort retire on observed clean close (trigger e). Missing or

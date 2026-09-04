@@ -185,6 +185,30 @@ impl FreshAgentBindingUpsert {
 pub type SinkWrite =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
 
+/// The claim commit's outcome (focused-ep5-r3 Finding 1, retire-on-kill
+/// round 4) — the freshagent-crate mirror of `freshell_ws::pane_ledger`'s
+/// `ClaimCommitOutcome` (this crate cannot see the ledger; the server-side
+/// sink maps between them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimCommit {
+    /// The identity's dead-state was unchanged (or absent, or older) since
+    /// the claim-start snapshot: the durable kill fence is cleared AND a
+    /// kill-closed row is back to Bound, as ONE durable transition.
+    Committed,
+    /// A NEWER close landed mid-claim (the tombstone stamp advanced past the
+    /// claim-start snapshot — the user closed the pane while the provider
+    /// resume was still awaiting). NOTHING was cleared, revived, or mutated
+    /// durably: the identity stays durably closed and the caller MUST tear
+    /// its just-built session down (kill the sidecar, drop the session,
+    /// fail the lease) and leave the ledger row Retired.
+    RefusedStale,
+}
+
+/// The claim commit's completion future — the [`SinkWrite`] discipline with
+/// a payload: awaited at every claim lane before its binding writes.
+pub type SinkCommitWrite =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<ClaimCommit>> + Send + 'static>>;
+
 /// AWAITED writes (wave-A durable-before-answer policy, V8/A11): callers
 /// `.await` the returned future before replying/broadcasting/proceeding.
 /// Implementations run fsync work on `spawn_blocking` and propagate failures
@@ -298,21 +322,46 @@ pub trait PaneIdentitySink: Send + Sync {
     /// never-killed identity clears to `Ok`), awaited like every
     /// non-rollback lane (failures surface as `Err` for the caller to
     /// warn-log, never a resume blocker).
+    /// Round 4 (focused-ep5-r3) narrowed the callers: the claimed DURABLE's
+    /// own fence now moves inside [`Self::commit_claim`]'s conditional
+    /// transition; this lane remains for the claude claim's consumed
+    /// PLACEHOLDER-alias fences (secondary identities, cleared only after
+    /// the durable's commit accepted).
     fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite;
-    /// The claim lifecycle's ROW-side transition (focused-ep5-r2 Finding 4,
-    /// retire-on-kill round 3): a SUCCESSFUL attach/resume records the row
-    /// live-again — a row the kill retired `Closed` moves back to Bound. The
-    /// claim lanes call this ONLY after the replacement session is
-    /// established, regardless of what the settings-based refresh lane knows
-    /// (a lineage-only row's refresh write is V7-gated away, and the row once
-    /// stayed Closed forever while the live session ran — the recovery
-    /// inventory then omitted a genuinely open session). Narrow by
-    /// construction: only Retired(Closed) rows revive, a missing row is a
-    /// no-op (never-recorded identities gain no row), and the kill tombstone
-    /// is never consulted (the claim clears it first). Awaited like every
-    /// non-rollback lane; failures surface as `Err` for the caller to
-    /// warn-log, never a resume blocker.
-    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite;
+    /// Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the claim attempt's
+    /// dead-state SNAPSHOT — the identity's durable kill-tombstone stamp
+    /// (TTL-agnostic), read at claim START (before the provider spawn/resume
+    /// awaits). Memory-fast + sync like `load_settings`; `None` = no durable
+    /// close on record. The claim's [`Self::commit_claim`] compares the
+    /// CURRENT stamp against this snapshot: any advance means a close landed
+    /// mid-claim.
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64>;
+    /// Focused-ep5-r3 Findings 1+3 (retire-on-kill round 4) — the claim
+    /// lifecycle's COMMIT, superseding round 3's separate
+    /// `clear_kill_tombstone` + `revive_closed` pair. ONE conditional durable
+    /// transition run ONLY after the replacement session is established
+    /// (sidecar answered / thread resumed / session rebuilt):
+    /// - The durable kill fence clears AND a kill-closed row revives to
+    ///   Bound in one crash-atomic step (no split-write intermediate ever
+    ///   reads as "cleared but still Closed" or "Bound but still fenced").
+    /// - The transition runs ONLY when the identity's durable dead-state
+    ///   is unchanged since the claim-start snapshot
+    ///   (`expect_killed_at_ms`, from [`Self::kill_tombstone_at_ms`]): a
+    ///   NEWER close mid-claim refuses the commit with NO durable side
+    ///   effects ([`ClaimCommit::RefusedStale`]) — the resumed session is an
+    ///   orphan of the pane the user already closed, and the caller tears
+    ///   it down. The reviving claim must never undo a newer close.
+    ///
+    /// Awaited like every non-rollback lane. An `Err` (io failure deciding
+    /// or writing) is ambiguous about which side won: callers warn-log and
+    /// keep the session (the round-3 failure policy), because the commit is
+    /// deliberately idempotent and the next genuine claim converges it.
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -345,17 +394,37 @@ pub(crate) struct FakeIdentitySink {
     /// call, in order — kill-handler tests assert the (provider, sessionId)
     /// batch a kill retires.
     pub retires: std::sync::Mutex<Vec<(String, String)>>,
-    /// Focused-ep5-r1 Finding 2: the fake mirror of the ledger's kill
-    /// tombstones. `retire_closed` folds the tombstone in (exactly like the
-    /// real `PaneLedger::retire_closed`), and `record_binding`'s apply
-    /// consults it: a tombstoned identity's binding write is SUPPRESSED
-    /// (recorded in `suppressed`, never appended to `bindings` — the fake's
-    /// observable twin of "writes nothing"). TTL is NOT modeled (tests never
-    /// advance a clock — every tombstone counts fresh).
-    pub kill_tombstones: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// Focused-ep5-r1 Finding 2 (round-4 amended): the fake mirror of the
+    /// ledger's kill tombstones, stamped by `kill_clock` — a deterministic
+    /// monotone counter standing in for the real ledger's wall-clock
+    /// `killed_at_ms` (every `retire_closed` re-stamps strictly forward, the
+    /// same refresh the real tombstone write performs). `retire_closed`
+    /// folds the tombstone in (exactly like the real
+    /// `PaneLedger::retire_closed`), and `record_binding`'s apply consults
+    /// it: a tombstoned identity's binding write is SUPPRESSED (recorded in
+    /// `suppressed`, never appended to `bindings` — the fake's observable
+    /// twin of "writes nothing"). TTL + dominance-vs-claim-residue niceties
+    /// are deliberately NOT modeled (the fake's rows carry no liveness
+    /// stamps); what IS modeled faithfully is the round-4 claim
+    /// CONDITION: `commit_claim` compares the current stamp against the
+    /// claim-start snapshot and refuses on any advance.
+    pub kill_tombstones:
+        std::sync::Mutex<std::collections::HashMap<(String, String), i64>>,
+    /// The stamp source for [`Self::kill_tombstones`] (see its doc).
+    kill_clock: std::sync::Mutex<i64>,
     /// Every `clear_kill_tombstone` call (the genuine-claim lanes' lifecycle
     /// transition), in order, whether or not a tombstone existed.
     pub tombstone_clears: std::sync::Mutex<Vec<(String, String)>>,
+    /// Every ACCEPTED `commit_claim` (the round-4 conditional commit;
+    /// supersedes the round-3 `revives` log — a commit IS the claim's
+    /// revive+clear transition), in order.
+    pub claim_commits: std::sync::Mutex<Vec<(String, String)>>,
+    /// Every REFUSED `commit_claim` (Finding 1's stale-dead-state refusal),
+    /// in order — the positive assertion surface for "no commit side effect
+    /// ran" (paired with the tombstone/state maps staying put).
+    pub claim_refusals: std::sync::Mutex<Vec<(String, String)>>,
+    /// Finding 1 test hook — see [`Self::arm_claim_commit_gate`].
+    claim_gate: std::sync::Mutex<Option<ClaimCommitGate>>,
     /// Binding writes SUPPRESSED by a kill tombstone (the round-2 fence) —
     /// recorded here (never in `bindings`) so tests assert the suppression
     /// positively instead of inferring it from absence.
@@ -365,9 +434,6 @@ pub(crate) struct FakeIdentitySink {
     /// landed for — the real "missing row" answer for anything else.
     pub states:
         std::sync::Mutex<std::collections::HashMap<(String, String), FakeRowState>>,
-    /// Every `revive_closed` call (the claim lanes' row-side lifecycle
-    /// transition), in order, whether or not a Closed row existed.
-    pub revives: std::sync::Mutex<Vec<(String, String)>>,
     /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
     /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
     /// through [`RollbackRecord::from_stored_payload`] exactly like the real
@@ -423,6 +489,37 @@ pub(crate) struct OrphanGateHandles {
     pub entered: std::sync::mpsc::Receiver<()>,
     pub release: tokio::sync::oneshot::Sender<()>,
     pub applied: std::sync::mpsc::Receiver<()>,
+}
+
+/// Focused-ep5-r3 Finding 1 test hook: the armed claim-commit gate's state.
+#[cfg(test)]
+struct ClaimCommitGate {
+    /// The (provider, session_id) key this gate intercepts.
+    key: (String, String),
+    /// Signaled when `commit_claim` was INVOKED for the key (the claim has
+    /// reached its commit — in production terms, the provider resume
+    /// succeeded and the lane is committing).
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the conditional decide+apply runs only after this
+    /// resolves (the claim-commit twin of the orphan gate's detached apply —
+    /// the decision consults the tombstone state AT DECIDE TIME, so a kill
+    /// the test runs while the gate is held is exactly Finding 1's
+    /// kill-during-the-resume-await).
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Signaled when the decide+apply RAN (post-release), so the test's
+    /// assertions are deterministic (no sleep-and-hope).
+    decided_tx: std::sync::mpsc::Sender<()>,
+}
+
+/// Focused-ep5-r3 Finding 1 test hook: the handles
+/// [`FakeIdentitySink::arm_claim_commit_gate`] hands the test.
+/// `entered` fires when the claim reached its commit; `release` lets the
+/// conditional decide+apply run; `decided` fires when it actually ran.
+#[cfg(test)]
+pub(crate) struct ClaimGateHandles {
+    pub entered: std::sync::mpsc::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+    pub decided: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
@@ -534,6 +631,68 @@ impl FakeIdentitySink {
             applied: applied_rx,
         }
     }
+    /// Focused-ep5-r3 Finding 1 test hook: arm the CLAIM-COMMIT gate for one
+    /// identity key. The next `commit_claim` for exactly that key holds the
+    /// conditional decide+apply behind the test's release — the exact
+    /// scheduling twin of the orphan binding gate, so a test can land a REAL
+    /// kill (`handle_kill`) BETWEEN the claim's commit point and its durable
+    /// decision, deterministically reproducing the report's
+    /// kill-during-the-provider-resume-await interleaving. The decision
+    /// outcome still flows back to the awaiting caller (the lane's teardown
+    /// arm runs on it), exactly like a ledger commit that took the guard
+    /// late. One-shot: later commits proceed inline.
+    pub(crate) fn arm_claim_commit_gate(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> ClaimGateHandles {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (decided_tx, decided_rx) = std::sync::mpsc::channel();
+        *self.self_weak.lock().unwrap() = std::sync::Arc::downgrade(self);
+        *self.claim_gate.lock().unwrap() = Some(ClaimCommitGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+            decided_tx,
+        });
+        ClaimGateHandles {
+            entered: entered_rx,
+            release: release_tx,
+            decided: decided_rx,
+        }
+    }
+    /// The shared claim-commit decide+apply (the direct path AND the claim
+    /// gate's detached task): EXACTLY `PaneLedger::commit_claim`'s
+    /// conditional-transition contract against the fake's state. Refusal
+    /// mutates NOTHING (no clear, no revive, no row flip); a commit clears
+    /// the fence and flips a Closed row to Bound in the same breath.
+    #[cfg(test)]
+    fn apply_claim_commit(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> ClaimCommit {
+        let key = (provider.to_string(), session_id.to_string());
+        let current = self.kill_tombstones.lock().unwrap().get(&key).copied();
+        let advanced = match (current, expect_killed_at_ms) {
+            (Some(cur), Some(exp)) => cur > exp,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if advanced {
+            self.claim_refusals.lock().unwrap().push(key);
+            return ClaimCommit::RefusedStale;
+        }
+        self.kill_tombstones.lock().unwrap().remove(&key);
+        self.claim_commits.lock().unwrap().push(key.clone());
+        let mut states = self.states.lock().unwrap();
+        if states.get(&key) == Some(&FakeRowState::Closed) {
+            states.insert(key, FakeRowState::Bound);
+        }
+        ClaimCommit::Committed
+    }
     /// The shared binding-write apply (the normal path AND the orphan gate's
     /// detached task): mutations only — the caller owns the SinkWrite knob.
     /// The kill-tombstone consult lives HERE so both paths fence identically.
@@ -542,7 +701,7 @@ impl FakeIdentitySink {
         // Focused-ep5-r1 Finding 2 mirror: a tombstoned identity writes
         // NOTHING (the ledger's `record_fresh_agent_binding` suppression).
         let key0 = (upsert.provider.clone(), upsert.session_id.clone());
-        if self.kill_tombstones.lock().unwrap().contains(&key0) {
+        if self.kill_tombstones.lock().unwrap().contains_key(&key0) {
             self.suppressed.lock().unwrap().push(key0);
             return;
         }
@@ -770,11 +929,18 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .unwrap()
                 .push((provider.into(), session_id.into()));
             // Focused-ep5-r1 Finding 2 mirror: retire_closed folds the kill
-            // tombstone in (the real `PaneLedger::retire_closed` discipline).
+            // tombstone in (the real `PaneLedger::retire_closed` discipline),
+            // re-stamped strictly forward (the kill clock), exactly like the
+            // real tombstone write's `killed_at_ms` refresh.
+            let stamp = {
+                let mut clock = self.kill_clock.lock().unwrap();
+                *clock += 1;
+                *clock
+            };
             self.kill_tombstones
                 .lock()
                 .unwrap()
-                .insert((provider.into(), session_id.into()));
+                .insert((provider.into(), session_id.into()), stamp);
             // Retire-on-kill round 3 row-state mirror: a Bound row retires
             // Closed; a missing or already-retired row is unaffected.
             let mut states = self.states.lock().unwrap();
@@ -797,20 +963,65 @@ impl PaneIdentitySink for FakeIdentitySink {
         }
         self.write_result()
     }
-    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
-        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-            self.revives
-                .lock()
-                .unwrap()
-                .push((provider.into(), session_id.into()));
-            // The real-ledger mirror: ONLY a Retired(Closed) row revives; a
-            // missing row is a no-op (never-recorded identities gain none).
-            let mut states = self.states.lock().unwrap();
-            if states.get(&(provider.into(), session_id.into())) == Some(&FakeRowState::Closed) {
-                states.insert((provider.into(), session_id.into()), FakeRowState::Bound);
-            }
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.kill_tombstones
+            .lock()
+            .unwrap()
+            .get(&(provider.into(), session_id.into()))
+            .copied()
+    }
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(std::future::ready(Err(std::io::Error::other(
+                "fake write failure",
+            ))));
         }
-        self.write_result()
+        // Finding 1 claim-gate arm (the orphan-gate twin): an armed gate for
+        // this EXACT key holds the decide+apply behind the test's release;
+        // the awaiting claimant's future resolves with the decided outcome.
+        let gate_arm = {
+            let gate = self.claim_gate.lock().unwrap();
+            gate.as_ref().and_then(|g| {
+                if g.key == (provider.to_string(), session_id.to_string()) {
+                    let release_rx = g.release_rx.lock().unwrap().take();
+                    release_rx.map(|rx| (g.entered_tx.clone(), rx, g.decided_tx.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((entered_tx, release_rx, decided_tx)) = gate_arm {
+            *self.claim_gate.lock().unwrap() = None;
+            let _ = entered_tx.send(());
+            let me = self.self_weak.lock().unwrap().clone();
+            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let (p, s) = (provider.to_string(), session_id.to_string());
+            tokio::spawn(async move {
+                let _ = release_rx.await;
+                let outcome = if let Some(me) = me.upgrade() {
+                    me.apply_claim_commit(&p, &s, expect_killed_at_ms)
+                } else {
+                    // The fake outlived the test's reference cycle: decide
+                    // nothing, report refusal-safe stale. Never reached in
+                    // practice (the state holds the sink through the lane).
+                    ClaimCommit::RefusedStale
+                };
+                let _ = decided_tx.send(());
+                let _ = outcome_tx.send(outcome);
+            });
+            return Box::pin(async move {
+                outcome_rx
+                    .await
+                    .map_err(std::io::Error::other)
+            });
+        }
+        let outcome = self.apply_claim_commit(provider, session_id, expect_killed_at_ms);
+        Box::pin(std::future::ready(Ok(outcome)))
     }
     fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
         if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1301,6 +1512,92 @@ mod tests {
             fake.bindings.lock().unwrap().len(),
             1,
             "post-clear the genuine claim's write lands"
+        );
+    }
+
+    /// Focused-ep5-r3 Finding 1 (fake mirror): the conditional commit is
+    /// faithful to `PaneLedger::commit_claim` — an unchanged dead-state
+    /// commits (fence clear + row revive in one step, positively logged); an
+    /// ADVANCED dead-state refuses wholesale: no clear, no revive, and the
+    /// fence keeps fencing (a follow-up write still suppresses).
+    #[tokio::test]
+    async fn fake_commit_claim_is_conditional_like_the_real_ledger() {
+        let fake = Arc::new(FakeIdentitySink::default());
+        fake.seed(
+            "claude",
+            "durable-cc",
+            FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        );
+        fake.retire_closed("claude", "durable-cc").await.expect("kill");
+        let snap = fake.kill_tombstone_at_ms("claude", "durable-cc");
+        assert!(snap.is_some(), "the fence answers the snapshot read");
+
+        let outcome = fake
+            .commit_claim("claude", "durable-cc", snap)
+            .await
+            .expect("commit ok");
+        assert_eq!(outcome, ClaimCommit::Committed);
+        assert_eq!(
+            fake.claim_commits.lock().unwrap().as_slice(),
+            &[("claude".to_string(), "durable-cc".to_string())]
+        );
+        assert!(fake.kill_tombstone_at_ms("claude", "durable-cc").is_none());
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), "durable-cc".to_string()))
+                .copied(),
+            Some(FakeRowState::Bound),
+            "the Closed row revived in the same step"
+        );
+
+        // A NEWER close re-fences (stamp advances); a claim holding the
+        // stale (now-absent) snapshot is refused — and the fence stands.
+        fake.retire_closed("claude", "durable-cc").await.expect("re-kill");
+        let outcome = fake
+            .commit_claim("claude", "durable-cc", None)
+            .await
+            .expect("refusal ok");
+        assert_eq!(outcome, ClaimCommit::RefusedStale);
+        assert_eq!(
+            fake.claim_refusals.lock().unwrap().as_slice(),
+            &[("claude".to_string(), "durable-cc".to_string())]
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("claude", "durable-cc").is_some(),
+            "the refusal never cleared the newer fence"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("claude".to_string(), "durable-cc".to_string()))
+                .copied(),
+            Some(FakeRowState::Closed),
+            "the refusal never revived"
+        );
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "durable-cc".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("write ok");
+        assert!(
+            fake.suppressed
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), "durable-cc".to_string())),
+            "the surviving fence still fences"
         );
     }
 

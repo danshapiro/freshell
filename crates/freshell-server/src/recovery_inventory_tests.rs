@@ -3334,6 +3334,83 @@ async fn route_never_offers_a_bound_row_whose_kill_tombstone_survived_its_retire
     );
 }
 
+/// Focused-ep5-r3 Finding 4 (retire-on-kill round 4), the route-level twin
+/// of the split-write test above: the tombstone AND the row are BOTH hours
+/// past the 6h kill-tombstone TTL (the close happened before an overnight
+/// outage — tombstone write landed, row retire lost to the crash, server
+/// back up the next morning). TTL-scoped dominance would let the Bound row
+/// resurface in `ledgerOnly`; the TTL-free dominance is exactly what the
+/// finding demands. The grace judgment keys on stored-vs-stored timestamps,
+/// so the whole fixture is shifted back 7h and remains otherwise offerable
+/// (the S2 control discriminates: absent the tombstone, S1 WOULD be
+/// offered at this age).
+#[tokio::test]
+async fn route_never_offers_a_bound_row_dominated_by_a_past_ttl_kill_tombstone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let now = now_ms_u64();
+    // Every stored stamp 7h old (past the 6h TTL); the close 10s after the
+    // row's last liveness (the close outranks the row).
+    let t = now - (7 * 60 * 60 * 1000);
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        t,
+        1,
+        json!([
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":t,
+             "paneCount":1,"panes":[{"paneId":"pj","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    let seed_bound = |session_id: &str| {
+        std::fs::write(
+            broot.join("bindings").join("claude").join(format!("{session_id}.json")),
+            serde_json::to_vec(&json!({
+                "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
+                "cwd": "/w", "createdAt": t, "updatedAt": t,
+                "lastObservedAt": t, "state": "bound",
+                "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+                "lastAttributedAt": t
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    seed_bound("S1-killed-old");
+    seed_bound("S2-survivor-old");
+    std::fs::create_dir_all(broot.join("kill-tombstones").join("claude")).unwrap();
+    std::fs::write(
+        broot.join("kill-tombstones").join("claude").join("S1-killed-old.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": "S1-killed-old",
+            "killedAtMs": t + 10_000
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let only = body["ledgerOnly"].as_array().unwrap();
+    assert!(
+        !only.iter().any(|e| e["sessionId"] == "S1-killed-old"),
+        "a Bound row dominated by a kill tombstone NEVER resurfaces — TTL or not (got {body})"
+    );
+    assert!(
+        only.iter().any(|e| e["sessionId"] == "S2-survivor-old"),
+        "the plain Bound control row stays offered at this age (the fixture discriminates): {body}"
+    );
+}
+
 /// Focused-ep5-r2 Finding 1: the dominance transform's exact contract —
 /// ONLY a Bound row whose identity the caller's fresh-tombstone set names
 /// becomes Retired(Closed); everything else passes through untouched

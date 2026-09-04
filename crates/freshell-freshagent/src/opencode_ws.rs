@@ -485,16 +485,49 @@ impl FreshOpencodeState {
     /// never-killed identity — warn-logged on failure, never a resume
     /// blocker. The first-send materialization lane never commits: its
     /// `ses_*` id is freshly minted server-side (never tombstoned).
-    async fn commit_session_claim(&self, durable_id: &str) {
+    /// Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on the
+    /// claim-START dead-state snapshot — a kill landing mid-claim (the user
+    /// closed the pane while the resume awaited the serve manager) advances
+    /// the durable tombstone past it, and the commit is REFUSED with no
+    /// durable side effects: the caller tears the just-rebuilt session down
+    /// and the row the kill retired stays Retired. A reviving claim must
+    /// never undo a newer close — this also ends round 3's UNCONDITIONAL
+    /// commit on the lease-failure arm (a revoked lease caused by a kill now
+    /// tears the session down; a revocation with an UNCHANGED dead-state —
+    /// an expired handle-less holder, no kill — still commits and keeps the
+    /// registered session, the round-3 keep behavior). On commit the
+    /// fence-clear AND the row revive are ONE ledger transition (Finding 3:
+    /// no split-write intermediate). Returns true iff the claim committed;
+    /// an `Err` (io failure deciding or writing) is ambiguous about which
+    /// side won — warn-loud and proceed as committed (the round-3 failure
+    /// policy, never a resume blocker).
+    async fn commit_session_claim(&self, durable_id: &str, expect_killed_at_ms: Option<i64>) -> bool {
         let Some(sink) = self.identity_sink() else {
-            return;
+            return true;
         };
-        if let Err(e) = sink.clear_kill_tombstone(PROVIDER, durable_id).await {
-            tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.kill_tombstone_clear_failed");
+        match sink.commit_claim(PROVIDER, durable_id, expect_killed_at_ms).await {
+            Ok(crate::identity_sink::ClaimCommit::Committed) => true,
+            Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
+                tracing::info!(target: "freshell_freshagent::opencode",
+                    durable = %durable_id,
+                    "freshagent.opencode.claim_refused_stale_dead_state: a close landed while \
+                     this resume was in flight; the claim commits nothing and the lane tears down"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.claim_commit_failed");
+                true
+            }
         }
-        if let Err(e) = sink.revive_closed(PROVIDER, durable_id).await {
-            tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.closed_row_revive_failed");
-        }
+    }
+
+    /// Focused-ep5-r3 Finding 1: the claim attempt's dead-state snapshot,
+    /// read at claim START (before the serve-manager awaits) and handed to
+    /// [`Self::commit_session_claim`] at commit time.
+    fn claim_dead_state_snapshot(&self, durable_id: &str) -> Option<i64> {
+        self.identity_sink()
+            .and_then(|sink| sink.kill_tombstone_at_ms(PROVIDER, durable_id))
     }
 
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
@@ -2560,6 +2593,12 @@ impl FreshOpencodeState {
         // durable row's stamp seed, and the refresh gate never fires on
         // hollow alone.
         let provenance = provenance.filter(|p| p.is_meaningful());
+        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
+        // SNAPSHOT — taken at claim start, before the serve-manager awaits
+        // (`get_session` and friends) — so a kill landing while this resume
+        // is in flight advances the durable tombstone past it and the commit
+        // below REFUSES instead of undoing the newer close.
+        let claim_dead_state = self.claim_dead_state_snapshot(session_id);
         let manager = self.fresh_agent.ensure_manager().await;
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
@@ -2738,7 +2777,35 @@ impl FreshOpencodeState {
         // settings snapshot / connection provenance, so a lineage-only row
         // attached conn-less would otherwise stay Closed while the session
         // runs live (the finding).
-        self.commit_session_claim(session_id).await;
+        //
+        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
+        // the claim-start dead-state snapshot — including on the
+        // lease-revoked arm above (the round-3 lane committed UNCONDITIONALLY
+        // there, the finding's exact headline). A kill that landed while this
+        // resume was in flight advanced the tombstone; a revoked lease CAUSED
+        // by that kill therefore refuses the commit now with NO side effects,
+        // and the just-registered session is torn back down (map entry
+        // dropped, bridge aborted, lease failed open) — a revoked lease whose
+        // dead-state is UNCHANGED (an expired handle-less holder, no kill)
+        // still commits and keeps the registered session (the round-3 keep).
+        if !self.commit_session_claim(session_id, claim_dead_state).await {
+            if let Some(removed) = self.sessions.lock().await.remove(session_id) {
+                let mut s = removed.lock().await;
+                s.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = s.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
+                if let Some(bridge) = s.serve_bridge.take() {
+                    bridge.abort();
+                }
+            }
+            lease_guard.fail();
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} closed while the resume was in flight; torn down"
+                )),
+            ));
+        }
 
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
         // (durable-before-answer). The SETTINGS payload rides only when a record was
@@ -4652,7 +4719,7 @@ mod tests {
             fake.kill_tombstones
                 .lock()
                 .unwrap()
-                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
             "the kill folded the durable kill tombstone"
         );
 
@@ -4661,11 +4728,20 @@ mod tests {
         state.handle_attach(attach_msg(DURABLE_ID)).await;
 
         assert!(
-            fake.tombstone_clears
+            fake.claim_commits
                 .lock()
                 .unwrap()
                 .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
-            "the genuine claim clears the tombstone BEFORE its own write"
+            "the genuine claim COMMITS (round 4: fence-clear + revive in one conditional \
+             transition) BEFORE its own write"
+        );
+        assert!(
+            !fake
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the durable fence is gone post-commit"
         );
         let writes = fake
             .bindings
@@ -4806,14 +4882,15 @@ mod tests {
             "a successful attach must return the kill-closed row to Bound"
         );
         assert!(
-            fake.tombstone_clears
+            !fake
+                .kill_tombstones
                 .lock()
                 .unwrap()
-                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
-            "the claim cleared the fence"
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim cleared the fence (inside its one-transition commit)"
         );
         assert!(
-            fake.revives
+            fake.claim_commits
                 .lock()
                 .unwrap()
                 .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
@@ -4830,6 +4907,137 @@ mod tests {
                 .count(),
             1,
             "no laundered settings write for the lineage-only attach"
+        );
+    }
+
+    /// Focused-ep5-r3 Finding 1 (retire-on-kill round 4), the opencode lane
+    /// — including the finding's called-out sub-shape, round 3's
+    /// UNCONDITIONAL commit even when the lease failed or the kill had
+    /// already removed the newly-registered session: with the user's close
+    /// recorded mid-resume, the commit must REFUSE — the row stays Retired,
+    /// the newer fence stands, the just-registered session is torn back down
+    /// (its kill did that), and no binding write lands. (The fake sink's
+    /// claim gate holds the commit's decide point — the deterministic twin
+    /// of the ledger guard contended mid-claim.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_mid_resume_is_never_undone_by_the_claim_commit() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // The close the user will MEAN: row Closed + fence, before the resume.
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        let claim_start_snapshot = fake.kill_tombstone_at_ms("opencode", DURABLE_ID);
+        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+
+        // Gate the claim's commit, then start the resume.
+        let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
+        let st2 = state.clone();
+        let attach = tokio::spawn(async move {
+            st2.handle_attach(attach_msg(DURABLE_ID)).await;
+        });
+
+        // The resume reached its commit point (the rebuilt session IS
+        // registered at this point on the opencode lane).
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim reached its commit");
+        assert!(
+            state.sessions.lock().await.contains_key(DURABLE_ID),
+            "fixture: the rebuilt session registered before the commit"
+        );
+
+        // THE INTERLEAVING: the user closes the pane now — the kill removes
+        // the newly-registered session AND advances the dead-state before
+        // the commit decides.
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert_ne!(
+            fake.kill_tombstone_at_ms("opencode", DURABLE_ID),
+            claim_start_snapshot,
+            "fixture: the mid-claim close advanced the durable dead-state"
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(DURABLE_ID),
+            "the kill removed the session mid-claim"
+        );
+        gate.release.send(()).expect("release the claim decision");
+        gate.decided
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the commit decided");
+        tokio::time::timeout(std::time::Duration::from_secs(15), attach)
+            .await
+            .expect("the attach resolves")
+            .expect("attach task completed");
+
+        // No commit side effect ran: the row stays Retired and the newer
+        // fence stands — and the refresh writes never fired.
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the claim must never revive the row the newer close retired"
+        );
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the newer kill's fence stands — never cleared by the stale claim"
+        );
+        assert!(
+            fake.claim_refusals
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the refusal is positively logged"
+        );
+        assert!(
+            !fake
+                .claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "no commit side effect ran"
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(DURABLE_ID),
+            "the orphan session stays torn down"
+        );
+        let writes = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+            .count();
+        assert_eq!(
+            writes, 1,
+            "no refresh binding write landed for the identity the close outranked (the seed alone)"
         );
     }
 

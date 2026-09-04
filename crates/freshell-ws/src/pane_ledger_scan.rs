@@ -43,11 +43,13 @@ pub struct BootScanReport {
     pub supersession_repairs: Vec<(SessionLocator, SessionLocator)>,
     pub gc_tombstoned: Vec<SessionLocator>,
     pub tombstones_deleted: Vec<SessionLocator>,
-    /// Focused-ep5-r1 Finding 2: expired kill tombstones swept this pass.
+    /// Focused-ep5-r1 Finding 2: expired kill tombstones swept this pass
+    /// (finding-4 round-4: also accepted-claim RESIDUE pairs, pruned at any
+    /// age — never a DOMINANT pair, whose dominance no TTL may outrun).
     pub kill_tombstones_swept: Vec<SessionLocator>,
     /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3): still-Bound rows a
-    /// FRESH kill tombstone dominated — the split-write crash remnant's
-    /// retirement re-applied durably this pass.
+    /// DOMINANT kill tombstone retired (fresh-or-any-age — the split-write
+    /// crash remnant's retirement re-applied durably this pass).
     pub kill_tombstone_enforced_retires: Vec<SessionLocator>,
 }
 
@@ -310,6 +312,17 @@ impl PaneLedger {
     /// index: one cleared/rewritten between the snapshot and this guard
     /// acquisition is re-evaluated against its CURRENT state (a re-kill at a
     /// newer `killed_at_ms` is FRESH and skipped).
+    ///
+    /// Focused-ep5-r3 Findings 3+4 (retire-on-kill round 4): the sweep is
+    /// verdict-keyed, never raw-TTL-keyed — a DOMINANT tombstone (a Bound
+    /// row's liveness predates the close) NEVER expires (the TTL prunes
+    /// converged pairs, not unconverged crash evidence); a FRESH one is the
+    /// live fence. Pruned here: EXPIRED names over missing/Retired rows, and
+    /// CLAIM-RESIDUE pairs (an accepted claim's revived row outranks the
+    /// tombstone its own clear failed to delete — inert bookkeeping, pruned
+    /// at ANY age). The caller's pass is row-then-tombstone ordered: a
+    /// dominant pair's row converges FIRST, so the pair prunes only once the
+    /// row no longer reads Bound.
     fn gc_kill_tombstone_locked(
         &self,
         root: &Path,
@@ -321,7 +334,12 @@ impl PaneLedger {
         let Some(killed_at) = index.kill_tombstones.get(key).copied() else {
             return; // cleared since the snapshot — no longer qualifies
         };
-        if kill_tombstone_is_fresh(killed_at, now_ms) {
+        let row_view = index.bindings.get(key).map(|r| (r.state, r.updated_at));
+        let prunable = matches!(
+            classify_kill_tombstone(killed_at, row_view, now_ms),
+            KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue
+        );
+        if !prunable {
             return;
         }
         let sref = SessionLocator {
@@ -428,14 +446,22 @@ impl PaneLedger {
     /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3): the kill-tombstone
     /// dominance rule's DURABLE convergence lives here (boot scan AND the
     /// periodic pass share this helper): a Bound row whose identity carries a
-    /// FRESH kill tombstone is the split-write crash remnant
-    /// (`retire_closed`'s tombstone landed; its row retire never did) — the
-    /// tombstone is the author of truth, so the row is retired Closed NOW,
-    /// durably. The re-read discipline covers the claim-lane interleaving by
-    /// construction: under THIS guard instant a fresh tombstone and a Bound
-    /// row genuinely coexist, so retiring can never undo a claim that
-    /// already cleared the fence (cleared tombstone ⇒ the check misses) and
-    /// a later claim's clear+revive simply lands after.
+    /// DOMINANT kill tombstone ([`classify_kill_tombstone`] — the close is as
+    /// new as or newer than the row's own liveness stamp) is the split-write
+    /// crash remnant (`retire_closed`'s tombstone landed; its row retire
+    /// never did) — the tombstone is the author of truth, so the row is
+    /// retired Closed NOW, durably. Focused-ep5-r3 Finding 4: dominance has
+    /// NO TTL — a tombstone paired with a still-Bound row is the only durable
+    /// evidence of the close, and a restart hours past the TTL must still
+    /// converge it (the TTL only ever prunes converged/missing-row pairs).
+    /// A CLAIM-RESIDUE pair (the row's liveness visibly postdates the
+    /// tombstone) is deliberately NOT dominated: that row is an accepted
+    /// claim's committed revive whose clear crashed mid-commit, and retiring
+    /// it would undo the claim the crash froze half-way. The re-read
+    /// discipline covers the live claim-lane interleaving identically: under
+    /// THIS guard instant tombstone and row are evaluated together, so a
+    /// claim that already cleared the fence misses the check, and a claim
+    /// that lands after simply commits.
     fn gc_row_locked(
         &self,
         root: &Path,
@@ -454,37 +480,47 @@ impl PaneLedger {
         };
         match row.state {
             RowState::Bound => {
-                if let Some(killed_at) = index.kill_tombstones.get(key).copied() {
-                    if kill_tombstone_is_fresh(killed_at, now_ms) {
-                        row.state = RowState::Retired;
-                        row.retired_reason = Some(RetiredReason::Closed);
-                        row.updated_at = now_ms;
-                        match self.write_binding(root, index, &row) {
-                            Ok(()) => {
-                                tracing::info!(
-                                    target: "freshell_ws::pane_ledger",
-                                    provider = %sref.provider,
-                                    session_id = %sref.session_id,
-                                    killed_at_ms = killed_at,
-                                    "pane_ledger_kill_tombstone_dominates_row: re-applied the \
-                                     retirement the split-write crash window lost"
-                                );
-                                report.kill_tombstone_enforced_retires.push(sref);
-                            }
-                            Err(err) => {
-                                // Fail loud, never silent: the row stays
-                                // Bound on disk; the next sweep retries.
-                                tracing::error!(
-                                    target: "freshell_ws::pane_ledger",
-                                    provider = %sref.provider,
-                                    session_id = %sref.session_id,
-                                    error = %err,
-                                    "pane_ledger_kill_tombstone_dominance_failed: retire write failed; row left bound"
-                                );
-                            }
+                let dominant = index
+                    .kill_tombstones
+                    .get(key)
+                    .copied()
+                    .is_some_and(|killed_at| {
+                        classify_kill_tombstone(
+                            killed_at,
+                            Some((row.state, row.updated_at)),
+                            now_ms,
+                        ) == KillTombstoneVerdict::Dominant
+                    });
+                if dominant {
+                    let killed_at = index.kill_tombstones.get(key).copied().unwrap_or_default();
+                    row.state = RowState::Retired;
+                    row.retired_reason = Some(RetiredReason::Closed);
+                    row.updated_at = now_ms;
+                    match self.write_binding(root, index, &row) {
+                        Ok(()) => {
+                            tracing::info!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %sref.provider,
+                                session_id = %sref.session_id,
+                                killed_at_ms = killed_at,
+                                "pane_ledger_kill_tombstone_dominates_row: re-applied the \
+                                 retirement the split-write crash window lost"
+                            );
+                            report.kill_tombstone_enforced_retires.push(sref);
                         }
-                        return;
+                        Err(err) => {
+                            // Fail loud, never silent: the row stays
+                            // Bound on disk; the next sweep retries.
+                            tracing::error!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %sref.provider,
+                                session_id = %sref.session_id,
+                                error = %err,
+                                "pane_ledger_kill_tombstone_dominance_failed: retire write failed; row left bound"
+                            );
+                        }
                     }
+                    return;
                 }
                 if now_ms - row.last_observed_at > BOUND_GC_TTL_MS {
                     row.state = RowState::Retired;

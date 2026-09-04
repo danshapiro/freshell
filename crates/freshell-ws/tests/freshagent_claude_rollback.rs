@@ -28,7 +28,8 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_freshagent::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord, SinkWrite,
+    ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
+    SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
@@ -376,16 +377,34 @@ impl PaneIdentitySink for TestLedgerSink {
         })
     }
 
-    // Focused-ep5-r2 Finding 4: same real-ledger pass-through shape.
-    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+    // Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the snapshot read is
+    // a memory-only inline pass-through (the LedgerIdentitySink discipline).
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.ledger.kill_tombstone_at(provider, session_id)
+    }
+
+    // Focused-ep5-r3 Findings 1+3: the conditional single-transition claim
+    // commit — a faithful pass-through to the real ledger op.
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                ledger.revive_closed(&p, &s, TestLedgerSink::now_ms()).map(|_| ())
+            let outcome = tokio::task::spawn_blocking(move || {
+                ledger.commit_claim(&p, &s, expect_killed_at_ms, TestLedgerSink::now_ms())
             })
             .await
-            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)??;
+            Ok(match outcome {
+                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
+                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
+                    ClaimCommit::RefusedStale
+                }
+            })
         })
     }
 }

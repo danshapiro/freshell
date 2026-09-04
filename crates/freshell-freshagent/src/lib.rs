@@ -67,8 +67,8 @@ pub use claude_snapshot::{
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
-    BindProvenance, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    ProvenanceUpdate, SharedPaneIdentitySink, SinkWrite,
+    BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
+    ProvenanceUpdate, SharedPaneIdentitySink, SinkCommitWrite, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};

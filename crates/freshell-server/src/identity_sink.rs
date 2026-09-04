@@ -3,8 +3,8 @@
 //! injects this adapter at wiring time.
 
 use freshell_freshagent::{
-    BindProvenance, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
-    SinkWrite,
+    BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
+    RollbackRecord, SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -274,7 +274,9 @@ impl PaneIdentitySink for LedgerIdentitySink {
     /// genuine claim (explicit resume/attach) clears the kill tombstone so
     /// the claim's own binding write is never suppressed. Same
     /// awaited-spawn_blocking discipline as `retire_closed`; a missing
-    /// tombstone is the ledger's own `Ok` idempotence.
+    /// tombstone is the ledger's own `Ok` idempotence. Round 4 callership:
+    /// the claude claim lane's consumed placeholder-alias fences only (the
+    /// claimed durable's own fence moved into `commit_claim`).
     fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
@@ -285,18 +287,39 @@ impl PaneIdentitySink for LedgerIdentitySink {
         })
     }
 
-    /// The claim lifecycle's row-side transition (focused-ep5-r2 Finding 4):
-    /// a successful attach/resume returns a kill-closed row to Bound. Same
-    /// awaited-spawn_blocking discipline; the narrowness (Closed-only,
-    /// never-creates) lives in the ledger itself.
-    fn revive_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
+    /// The claim attempt's dead-state snapshot (focused-ep5-r3 Finding 1) —
+    /// read inline against the write-through index, like `load_settings`.
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.ledger.kill_tombstone_at(provider, session_id)
+    }
+
+    /// The claim commit (focused-ep5-r3 Findings 1+3): ONE conditional
+    /// durable transition — clear + revive atomically, refused wholesale
+    /// (no side effects) when the identity's dead-state advanced past the
+    /// claim-start snapshot. Same awaited-spawn_blocking discipline as every
+    /// write lane; the conditional semantics and the commit ordering live
+    /// entirely in the ledger.
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());
         let now = now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.revive_closed(&p, &s, now).map(|_| ()))
-                .await
-                .map_err(std::io::Error::other)?
+            let outcome = tokio::task::spawn_blocking(move || {
+                ledger.commit_claim(&p, &s, expect_killed_at_ms, now)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok(match outcome {
+                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
+                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
+                    ClaimCommit::RefusedStale
+                }
+            })
         })
     }
 
@@ -1114,16 +1137,20 @@ mod tests {
         }
     }
 
-    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3) over the REAL
-    /// ledger, through the sink seam the claim lanes use: the kill closes
-    /// (and fences) the row; the claim's clear+revive pair returns it to
-    /// Bound — durably (a fresh ledger over the same root agrees) — and the
-    /// binding write the claim then lands is never suppressed. The narrow
-    /// cases: reviving a never-killed Bound row is a no-op (no timestamp
-    /// churn), and reviving an unknown id creates nothing (the V7
-    /// no-laundering discipline holds through the new lane).
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), carried into round
+    /// 4's conditional single transition (focused-ep5-r3 Findings 1+3) over
+    /// the REAL ledger, through the sink seam the claim lanes use: the kill
+    /// closes (and fences) the row; `commit_claim` with the claim-START
+    /// snapshot (`kill_tombstone_at_ms`) returns it to Bound AND clears the
+    /// fence in one durable transition (a fresh ledger over the same root
+    /// agrees) — and the binding write the claim then lands is never
+    /// suppressed. A commit whose snapshot the dead-state has advanced past
+    /// REFUSES wholesale (no clear, no revive). The narrow cases: committing
+    /// over a never-fenced Bound row is a no-op (no timestamp churn), and an
+    /// unknown id gains no row (the V7 no-laundering discipline holds
+    /// through the new lane).
     #[tokio::test(flavor = "multi_thread")]
-    async fn revive_closed_restores_a_killed_row_through_the_real_ledger() {
+    async fn commit_claim_restores_a_killed_row_through_the_real_ledger() {
         let tmp = tempfile::tempdir().unwrap();
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
@@ -1151,17 +1178,28 @@ mod tests {
             "the kill closed the row"
         );
 
-        // The claim's exact sequence: clear the fence, then revive the row.
-        sink.clear_kill_tombstone("claude", "revive-1").await.expect("clear");
-        sink.revive_closed("claude", "revive-1").await.expect("revive");
+        // The claim's exact sequence: snapshot at claim start, then the ONE
+        // conditional commit — the fence clears AND the row revives together.
+        let snapshot = sink.kill_tombstone_at_ms("claude", "revive-1");
+        assert!(snapshot.is_some(), "the kill's fence is durable");
+        let outcome = sink
+            .commit_claim("claude", "revive-1", snapshot)
+            .await
+            .expect("claim commit ok");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
         let row = ledger.load_binding("claude", "revive-1").unwrap();
         assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
         assert_eq!(row.retired_reason, None);
+        assert_eq!(
+            sink.kill_tombstone_at_ms("claude", "revive-1"),
+            None,
+            "the fence cleared in the same transition"
+        );
         let ledger2 = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
         assert_eq!(
             ledger2.load_binding("claude", "revive-1").unwrap().state,
             freshell_ws::pane_ledger::RowState::Bound,
-            "the revive is durable on disk"
+            "the committed reopen is durable on disk"
         );
         // And the claim's own binding write is never fenced afterwards.
         sink.record_binding(upsert("revive-1")).await.expect("claim write");
@@ -1171,20 +1209,42 @@ mod tests {
             "the claim's write landed Bound"
         );
 
-        // Narrow cases: a plain Bound row is untouched (updated_at frozen),
-        // and an unknown id gains no row.
+        // Narrow cases: a plain Bound row with NO fence is untouched
+        // (updated_at frozen), and an unknown id gains no row.
         let before = ledger.load_binding("claude", "revive-1").unwrap().updated_at;
         std::thread::sleep(std::time::Duration::from_millis(2));
-        sink.revive_closed("claude", "revive-1").await.expect("noop revive");
+        let outcome = sink
+            .commit_claim("claude", "revive-1", None)
+            .await
+            .expect("noop commit ok");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
         assert_eq!(
             ledger.load_binding("claude", "revive-1").unwrap().updated_at,
             before,
-            "reviving an already-Bound row is a true no-op"
+            "an unfenced re-claim is a true no-op"
         );
-        sink.revive_closed("claude", "never-existed").await.expect("unknown revive ok");
+        let outcome = sink
+            .commit_claim("claude", "never-existed", None)
+            .await
+            .expect("unknown commit ok");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
         assert!(
             ledger.load_binding("claude", "never-existed").is_none(),
-            "a never-recorded identity gains no row from a revive"
+            "a never-recorded identity gains no row from a claim commit"
+        );
+
+        // The CONDITION (Finding 1): a newer close mid-claim refuses the
+        // commit wholesale — no clear, no revive, the row stays Retired.
+        sink.retire_closed("claude", "refuse-1").await.expect("kill #1");
+        let stale_snapshot = None; // the claim believed the identity untouched
+        let outcome = sink
+            .commit_claim("claude", "refuse-1", stale_snapshot)
+            .await
+            .expect("refusal surfaces as an outcome, never an error");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::RefusedStale);
+        assert!(
+            sink.kill_tombstone_at_ms("claude", "refuse-1").is_some(),
+            "the refusal never clears the newer fence"
         );
     }
 
