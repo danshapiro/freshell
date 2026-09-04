@@ -400,13 +400,17 @@ impl PaneLedger {
         // retention (the alias-tombstones' "lifetime is the referenced row's"
         // discipline, carried to close evidence): a record is prunable only
         // once NO retained snapshot generation can reference its pane
-        // identity — by `terminalId`, by `createRequestId`, or by a
-        // `sessionRef` claim matching one of its kills. Retained generations
-        // prune by COUNT caps, never by age, so the pre-fix raw-TTL sweep
-        // could delete the only closed verdict while the stale open-pane
-        // snapshot still claims it — the exact re-offer the campaign exists
-        // to kill. `None` is the UNKNOWN arm (the reference scan failed):
-        // never prune on doubt.
+        // identity — by `terminalId`, by `createRequestId`, by a `sessionRef`
+        // claim matching one of its kills, or (focused-episode-6 round 4,
+        // Finding F3) by a `sessionKeys` rings entry matching one of its
+        // kills — the ref-less pre-association payload shape claims its
+        // placeholder through nothing else, so its close envelope would
+        // otherwise TTL-sweep while the snapshot still stands. Retained
+        // generations prune by COUNT caps, never by age, so the pre-fix
+        // raw-TTL sweep could delete the only closed verdict while the stale
+        // open-pane snapshot still claims it — the exact re-offer the
+        // campaign exists to kill. `None` is the UNKNOWN arm (the reference
+        // scan failed): never prune on doubt.
         let referenced = match snapshot_refs {
             None => true,
             Some(refs) => {
@@ -420,6 +424,10 @@ impl PaneLedger {
                         .is_some_and(|c| refs.create_request_ids.contains(c))
                     || record.kills.iter().any(|k| {
                         refs.claims
+                            .contains(&(k.provider.clone(), k.session_id.clone()))
+                    })
+                    || record.kills.iter().any(|k| {
+                        refs.session_keys
                             .contains(&(k.provider.clone(), k.session_id.clone()))
                     })
             }

@@ -19,6 +19,7 @@ vi.mock('@/lib/ws-client', () => ({
 }))
 
 import {
+  EXIT_FALLBACK_GRACE_MS,
   KILL_ACK_TIMEOUT_MS,
   sendFreshAgentKillAndAwait,
   sendTerminalKillAndAwait,
@@ -52,10 +53,50 @@ describe('kill-ack', () => {
     })
 
     it('resolves ok via the terminal.exit fallback (a legacy server sends no terminal.killed)', async () => {
+      vi.useFakeTimers()
       const pending = sendTerminalKillAndAwait('term-2')
       emit({ type: 'terminal.exit', terminalId: 'term-2', exitCode: 0 })
+      // The exit fallback settles after the correlation grace (F7): no
+      // correlated frame ever arrives on a legacy server, the grace expires.
+      await vi.advanceTimersByTimeAsync(EXIT_FALLBACK_GRACE_MS)
       await expect(pending).resolves.toEqual({ ok: true })
       expect(consumeTerminalReleaseMark('term-2')).toBe(true)
+    })
+
+    it('never settles success on terminal.exit when the CORRELATED failure frame is a send behind it (persisted-despite-error order)', async () => {
+      // Focused-episode-6 round 4 (Finding F7): on a persisted-despite-error
+      // close the server broadcasts terminal.exit WHILE killing, and only
+      // afterward sends terminal.killed{success:false}. The legacy exit
+      // fallback must never win that race: the correlated result decides.
+      const pending = sendTerminalKillAndAwait('term-2b')
+      const sent = mockSend.mock.calls[mockSend.mock.calls.length - 1][0]
+      emit({ type: 'terminal.exit', terminalId: 'term-2b', exitCode: 0 })
+      emit({
+        type: 'terminal.killed',
+        requestId: sent.requestId,
+        terminalId: 'term-2b',
+        success: false,
+        error: 'the terminal close is recorded durably, but the ledger reported an error',
+      })
+      await expect(pending).resolves.toEqual({
+        ok: false,
+        error: 'the terminal close is recorded durably, but the ledger reported an error',
+      })
+      expect(consumeTerminalReleaseMark('term-2b')).toBe(false, 'a visibly-failed close is NOT released')
+    })
+
+    it('the correlated SUCCESS arriving inside the exit grace settles immediately (no gratuitous delay)', async () => {
+      vi.useFakeTimers()
+      const pending = sendTerminalKillAndAwait('term-2c')
+      const sent = mockSend.mock.calls[mockSend.mock.calls.length - 1][0]
+      emit({ type: 'terminal.exit', terminalId: 'term-2c', exitCode: 0 })
+      const probe = vi.fn()
+      void pending.then(probe)
+      await Promise.resolve()
+      expect(probe).not.toHaveBeenCalled()
+      emit({ type: 'terminal.killed', requestId: sent.requestId, terminalId: 'term-2c', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+      expect(consumeTerminalReleaseMark('term-2c')).toBe(true)
     })
 
     it('resolves ok via the INVALID_TERMINAL_ID error (the terminal was already gone)', async () => {

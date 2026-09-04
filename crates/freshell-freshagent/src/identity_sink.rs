@@ -646,6 +646,13 @@ pub(crate) struct FakeIdentitySink {
     /// split-phase failure (the kill's first close lands, its completion
     /// close misses) `fail_writes` cannot stage. `None` disarms.
     fail_retires_after: std::sync::Mutex<Option<i64>>,
+    /// Focused-episode-6 round 4 (Finding F6): identity-conditional close
+    /// failure — `Some(key)` fails Clean any close (`retire_closed` OR a
+    /// `retire_closed_batch` whose identity set covers the key) naming it.
+    /// The honest way to stage "the close fails for the late-id identity"
+    /// under the one-envelope discipline, where the single call covers BOTH
+    /// the placeholder and the durable id.
+    fail_retires_for: std::sync::Mutex<Option<(String, String)>>,
     /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): when armed, every
     /// retire answer is [`SinkCloseError::Persisted`] — the close's facts
     /// fold (the real ledger's journal record stands) but the write
@@ -866,6 +873,12 @@ impl FakeIdentitySink {
     #[allow(dead_code)] // used by the delta-r6-r2 kill-lane failure pins
     pub(crate) fn fail_retires_after(&self, ok_first: u32) {
         *self.fail_retires_after.lock().unwrap() = Some(i64::from(ok_first));
+    }
+    /// Focused-episode-6 round 4 (Finding F6): arm the identity-conditional
+    /// close failure (any close naming this key fails Clean).
+    #[allow(dead_code)] // used by the F6 kill gate tests
+    pub(crate) fn fail_retires_for(&self, provider: &str, session_id: &str) {
+        *self.fail_retires_for.lock().unwrap() = Some((provider.into(), session_id.into()));
     }
     /// Focused ep1-r4 F2: seed the rollback row as RAW STORED BYTES (the legacy
     /// pre-epoch payload shape), replacing any typed seed — `load_rollback` then
@@ -1291,6 +1304,18 @@ impl PaneIdentitySink for FakeIdentitySink {
         self.write_result()
     }
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
+        // Identity-conditional failure (F6): this close names the armed key.
+        let key_fail = self
+            .fail_retires_for
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(p, s)| p == provider && s == session_id);
+        if key_fail {
+            return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
+                std::io::Error::other("fake write failure (identity-conditional)"),
+            ))));
+        }
         // Delta-r6-r2 (focused-episode-6 round 1, F3/F4) knob: the kill's
         // DURABLE phases split (wire id first, alias-resolved/late ids after),
         // and only a SEQUENCED failure can stage the second half failing —
@@ -1387,6 +1412,20 @@ impl PaneIdentitySink for FakeIdentitySink {
         session_ids: &[String],
         pending_ids: &[String],
     ) -> SinkCloseWrite {
+        // Identity-conditional failure (F6): the envelope COVERS the armed key.
+        let key_fail = self
+            .fail_retires_for
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(p, s)| {
+                p == provider && session_ids.iter().any(|id| id == s)
+            });
+        if key_fail {
+            return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
+                std::io::Error::other("fake write failure (identity-conditional)"),
+            ))));
+        }
         // Delta-r6-r3 (focused-episode-6 round 2) fake mirror of the ledger's
         // `close_identities` envelope: failure-atomic across the set — a
         // failed call applies NOTHING (the rollback is exact, so applying

@@ -1944,13 +1944,14 @@ impl PaneLedger {
     }
 
     /// Delta-r6-r4 (focused-episode-6 round 3): drop ONE identity's close
-    /// fence — the claim-lifecycle clear, the binder's lazy sweep, and the
-    /// fence sweep's prune all share it. The fence's durable sources: the
-    /// LEGACY per-identity file (deleted when present) and any standing
-    /// close-envelope journal records (append-only — never edited here; a
-    /// fence that re-derives from its record at the next load lands beside
-    /// the committed claim's newer row stamps and classifies inert
-    /// [`KillTombstoneVerdict::ClaimResidue`], or sweeps with the record).
+    /// fence — the binder's lazy sweep and the fence sweep's prune share it.
+    /// This is the INDEX-ONLY drain for fences that are already DEAD
+    /// (Expired / ClaimResidue hygiene): the LEGACY per-identity file is
+    /// deleted when present, but a journal-record-fed fence's durable entry
+    /// is deliberately never edited here — it re-derives from its record at
+    /// the next load and dies WITH the record (the record sweep's
+    /// reference-time retention owns its life). A fence a CLAIM clears is a
+    /// different animal — see [`PaneLedger::consume_kill_fence_locked`].
     /// The index drops only when the file delete succeeded-or-was-absent —
     /// the file-first-then-index delete discipline.
     fn clear_kill_fence_locked(
@@ -1971,6 +1972,133 @@ impl PaneLedger {
             index.legacy_tombstone_keys.remove(&key);
         }
         result
+    }
+
+    /// Focused-episode-6 round 4 (Finding F1) — the CLAIM lifecycle's fence
+    /// clear, DURABLE end to end: a genuine claim (the commit's revive, or
+    /// the lane's consumed-alias clear) CONSUMES the identity's fence
+    /// wherever it stands —
+    ///
+    /// 1. the LEGACY per-identity file is deleted when present;
+    /// 2. every standing close-envelope journal record carrying the identity
+    ///    is REWRITTEN without the entry (the record's other fences stand),
+    ///    or DELETED when the entry was its only kill and the record carries
+    ///    no pane linkage (an empty agent record is forensic noise — a
+    ///    kills-less record justifies itself only by its `terminal_id` pane
+    ///    cover). Pane-keyed records survive: their terminal/crid linkage is
+    ///    the pane-cover verdict independent of identity fences.
+    ///
+    /// A restart must never resurrect a consumed fence as claim residue: the
+    /// re-derivation source (the record's `kills` entry) is gone. Per-file
+    /// fail-loud throughout: a failed file op is reported `Err` after every
+    /// other consumption still landed, and the in-memory index mirrors
+    /// exactly what persisted (a surviving carrier keeps the fence fed).
+    fn consume_kill_fence_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        provider: &str,
+        session_id: &str,
+    ) -> std::io::Result<()> {
+        let key = (provider.to_string(), session_id.to_string());
+        let mut first_err: Option<std::io::Error> = None;
+        // 1. the legacy per-identity file (the pre-journal fence shape).
+        let legacy_survives = match std::fs::remove_file(Self::kill_tombstone_path(
+            root, provider, session_id,
+        )) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                true
+            }
+        };
+        if !legacy_survives {
+            index.legacy_tombstone_keys.remove(&key);
+        }
+        // 2. the journal records (any record's `kills` entry can feed it).
+        let affected: Vec<String> = index
+            .close_envelopes
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .kills
+                    .iter()
+                    .any(|k| k.provider == provider && k.session_id == session_id)
+            })
+            .map(|(ekey, _)| ekey.clone())
+            .collect();
+        for ekey in affected {
+            let Some(mut record) = index.close_envelopes.get(&ekey).cloned() else {
+                continue; // consumed/rewritten between the snapshot and here — nothing to do
+            };
+            let kept: Vec<PaneCloseKill> = record
+                .kills
+                .iter()
+                .filter(|k| !(k.provider == provider && k.session_id == session_id))
+                .cloned()
+                .collect();
+            let delete_record = kept.is_empty() && record.terminal_id.is_none();
+            let path = Self::close_envelope_path(root, &ekey);
+            let outcome = if delete_record {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                record.kills = kept;
+                write_row_atomic(&path, &record)
+            };
+            match outcome {
+                Ok(()) => {
+                    if delete_record {
+                        index.close_envelopes.remove(&ekey);
+                    } else {
+                        index.close_envelopes.insert(ekey, record);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %provider,
+                        session_id = %session_id,
+                        key = %ekey,
+                        error = %e,
+                        "pane_ledger_fence_consumption_failed: the record's durable entry stands; \
+                         the fence stays fed (the read-side classify treats a revived row's \
+                         residue as inert, and the next claim retries the consumption)"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        // The index fence entry mirrors the durable truth exactly: only the
+        // SURVIVING carriers feed it (re-stamped forward to their max).
+        let recomputed: Option<i64> = index
+            .close_envelopes
+            .values()
+            .flat_map(|record| record.kills.iter())
+            .filter(|k| k.provider == provider && k.session_id == session_id)
+            .map(|k| k.at_ms)
+            .max();
+        match (legacy_survives, recomputed) {
+            (false, None) => {
+                index.kill_tombstones.remove(&key);
+            }
+            (true, None) => { /* the legacy file outlived its delete: keep its stamp */ }
+            (_, Some(stamp)) => {
+                index.kill_tombstones.insert(key, stamp);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): record (or refresh)
@@ -2173,19 +2301,22 @@ impl PaneLedger {
     /// pane/session GENUINELY CLAIMING the identity (an explicit
     /// resume/attach) clears the tombstone, so that claim's own binding
     /// write lands Bound again. Idempotent (a never-killed identity clears
-    /// to `Ok`), so claim lanes call it unconditionally. File removal first,
-    /// then the write-through index — the `delete_pending` discipline.
-    /// Round 4 (focused-ep5-r3) narrowed its callers: the claimed DURABLE's
-    /// own fence now moves inside [`Self::commit_claim`]'s conditional
-    /// transition; this op remains for the claude claim lane's consumed
-    /// PLACEHOLDER-alias fences (secondary identities, cleared only after
-    /// the durable's commit accepted).
+    /// to `Ok`), so claim lanes call it unconditionally. File/record
+    /// CONSUMPTION first, then the write-through index — the
+    /// `delete_pending` discipline. Round 4 (focused-ep5-r3) narrowed its
+    /// callers: the claimed DURABLE's own fence now moves inside
+    /// [`Self::commit_claim`]'s conditional transition; this op remains for
+    /// the claude claim lane's consumed PLACEHOLDER-alias fences (secondary
+    /// identities, cleared only after the durable's commit accepted).
+    /// Focused-episode-6 round 4 (Finding F1): the clear is DURABLE — the
+    /// journal-record entries are consumed, never just the in-memory index
+    /// (a restart must not resurrect a consumed fence as claim residue).
     pub fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
-        let Some(root) = &self.root else {
+        let Some(root) = &self.root.clone() else {
             return Ok(());
         };
         let mut index = self.guard();
-        Self::clear_kill_fence_locked(root, &mut index, provider, session_id)
+        self.consume_kill_fence_locked(root, &mut index, provider, session_id)
     }
 
     /// Focused-ep5-r3 Findings 1+3 (retire-on-kill round 4) — the claim
@@ -2331,23 +2462,29 @@ impl PaneLedger {
             }
         }
         if tombstone_present {
-            // Delta-r6-r4: the fence's LEGACY file delete + the index drop
-            // ride one helper; a fence a standing journal record re-feeds at
-            // the next load lands beside this transition's refreshed row
-            // stamps and classifies ClaimResidue — inert at every consult,
-            // prunable with its record (never the accepted commit's undo).
-            if let Err(err) = Self::clear_kill_fence_locked(root, &mut index, provider, session_id)
+            // Focused-episode-6 round 4 (Finding F1): the fence clear is a
+            // DURABLE CONSUMPTION — the journal records' entries for this
+            // identity are rewritten/deleted with it, so a restart never
+            // resurrects the consumed fence as "claim residue" for the
+            // class-agnostic consults (the recovery inventory's verdict
+            // join). Rides the same guarded transition as the revive above.
+            if let Err(err) = self.consume_kill_fence_locked(root, &mut index, provider, session_id)
             {
                 // The transition itself already committed durably above; a
-                // failed ONLY-CLEANUP delete leaves claim residue (inert at
-                // every consult, pruned by any sweep). Fail loud, never
-                // silent — but never fail the accepted commit over it.
-                tracing::warn!(
+                // failed consumption leaves the fence STANDING on disk (the
+                // surviving carriers stay fed) — the read-side classify
+                // treats it as inert ClaimResidue next to the revived row,
+                // and the next claim retries the consumption. Fail loud,
+                // never silent — but never fail the accepted commit over it
+                // (the session genuinely reopened).
+                tracing::error!(
                     target: "freshell_ws::pane_ledger",
                     provider = %provider,
                     session_id = %session_id,
                     error = %err,
-                    "pane_ledger_claim_tombstone_delete_failed: inert claim residue left behind; the next sweep prunes it"
+                    "pane_ledger_claim_fence_consumption_failed: the durable fence partially \
+                     stands; the revived row outranks it at the classify consults, and the \
+                     next claim retries the consumption"
                 );
             }
         }
@@ -2474,23 +2611,41 @@ impl PaneLedger {
             }
             Err(write_err) => {
                 if had_prior {
-                    // A close record at this key stood BEFORE this op: the
-                    // pane/addressed-identity's close evidence is durable
-                    // regardless of whether our write landed (ours lands as
-                    // its superset; a missed write leaves the prior intact).
-                    // Deleting is NEVER legal here (that would erase the
-                    // prior close) — the honest answer is persisted-close.
-                    // Feed the index from the disk truth.
-                    if let Some(probed) = Self::probe_close_envelope(&path) {
-                        feed_close_envelope(index, key.to_string(), probed);
+                    // A close record at this key stood BEFORE this op — but
+                    // prior EXISTENCE is not prior COVERAGE (focused-episode-6
+                    // round 4, Finding F4): the question is whether the
+                    // standing record fences this envelope's WHOLE intended
+                    // identity set. It does ⇒ the close the caller meant is
+                    // durable regardless of whether our superset write landed
+                    // (a missed write leaves the covering prior intact) —
+                    // persisted-close. It does NOT (a widening rewrite that
+                    // failed) ⇒ NOTHING of this op is durable: the kill FAILS
+                    // and no teardown is authorized — answering Persisted
+                    // here would let the lane end the session while the
+                    // widened identities stay Bound and recovery-offerable.
+                    // Deleting is NEVER legal either way (that would erase
+                    // the prior close) — the disk truth is only probed.
+                    match Self::probe_close_envelope(&path) {
+                        Some(probed) if Self::record_covers(&probed, record) => {
+                            feed_close_envelope(index, key.to_string(), probed);
+                            tracing::error!(
+                                target: "freshell_ws::pane_ledger",
+                                key = %key,
+                                error = %write_err,
+                                "pane_ledger_close_envelope_repersist_failed: the write reported an                                 error, but the standing record at this key covers the whole close                                 set — reporting persisted-close (the kill ends its session                                 consistently)"
+                            );
+                            return Err(CloseEnvelopeError::Persisted(write_err));
+                        }
+                        _ => {
+                            tracing::error!(
+                                target: "freshell_ws::pane_ledger",
+                                key = %key,
+                                error = %write_err,
+                                "pane_ledger_close_envelope_widening_failed: the write failed and the                                 prior record does NOT cover this close's full identity set — the                                 kill FAILS (clean), no teardown authorized; the prior close                                 evidence stands untouched (it is not this op's to erase)"
+                            );
+                            return Err(CloseEnvelopeError::Clean(write_err));
+                        }
                     }
-                    tracing::error!(
-                        target: "freshell_ws::pane_ledger",
-                        key = %key,
-                        error = %write_err,
-                        "pane_ledger_close_envelope_repersist_failed: the write reported an                          error, but a close record at this key already stands — reporting                          persisted-close (the kill ends its session consistently)"
-                    );
-                    return Err(CloseEnvelopeError::Persisted(write_err));
                 }
                 // No prior record: rollback = deleting the ONE file.
                 match self.envelope_delete_outcome(&path) {

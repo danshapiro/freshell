@@ -4125,11 +4125,13 @@ fn a_ref_less_fresh_agent_pane_claiming_an_unfenced_identity_via_session_keys_st
     );
 }
 
-/// Multi-key payloads: ANY fenced key closes the pane (a pane whose slice
-/// lists the killed placeholder beside a live durable id still verdicts
-/// closed), and an unfenced key list never fabricates a close.
+/// Multi-key payloads (retargeted by focused-episode-6 round 4, Findings
+/// F1+F2): a LIVE association in the pane's sessionKeys beats every stale
+/// fence (a fence beside a live alias no longer closes — the pre-fix pin
+/// enshrined the finding); the fenced-ONLY slice still closes; and
+/// empty/malformed/non-string keys name no identity.
 #[test]
-fn session_keys_fence_consult_reads_every_key_and_ignores_malformed_entries() {
+fn session_keys_consult_live_association_beats_fence_and_malformed_entries_close_nothing() {
     let d = DeviceUnion {
         device_id: "dev1".into(),
         union_doc: union_doc(
@@ -4143,18 +4145,190 @@ fn session_keys_fence_consult_reads_every_key_and_ignores_malformed_entries() {
                 { "paneId": "p2", "kind": "fresh-agent",
                   "payload": { "provider": "claude", "sessionType": "freshclaude",
                                "createRequestId": "req-fa-sk-md",
-                               "sessionKeys": ["", "claude:", ":orphan", 42, null] } }
+                               "sessionKeys": ["", "claude:", ":orphan", 42, null] } },
+                { "paneId": "p3", "kind": "fresh-agent",
+                  "payload": { "provider": "claude", "sessionType": "freshclaude",
+                               "createRequestId": "req-fa-sk-f",
+                               "sessionKeys": ["claude:ph-sk-killed"] } }
             ]),
         ),
     };
     let closes = closes_with("t-unrelated", None, &[], &[("claude", "ph-sk-killed")]);
-    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &closes);
+    let out = build_inventory(
+        vec![d],
+        vec![],
+        live(&[("claude", "ph-sk-live")]),
+        &no_evidence(),
+        &closes,
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
-    assert_eq!(panes[0]["ledgerState"], "closed", "any fenced key closes: {panes:?}");
+    assert_eq!(
+        panes[0]["live"], true,
+        "the pane claims a session that is live RIGHT NOW: live, never closed (F1/F2): {:?}",
+        panes[0]
+    );
+    assert_ne!(
+        panes[0]["ledgerState"], "closed",
+        "a fence beside the live alias never wins: {:?}",
+        panes[0]
+    );
+    assert_eq!(
+        panes[0]["sessionRef"],
+        json!({"provider": "claude", "sessionId": "ph-sk-live"}),
+        "the effective ref resolves from the LIVE key: {:?}",
+        panes[0]
+    );
     assert_eq!(
         panes[1]["ledgerState"], "unknown",
         "empty/malformed/non-string keys name no identity and never close anything: {panes:?}"
     );
+    assert_eq!(
+        panes[2]["ledgerState"], "closed",
+        "a slice whose only well-formed key is fenced still closes: {:?}",
+        panes[2]
+    );
+}
+
+/// F2: the pre-association snapshot shape the verdicts used to leave
+/// `unknown`+`live:false` — a ref-less fresh-agent pane whose UNFENCED
+/// sessionKeys entry is present in the live-session set gets the LIVE
+/// verdict (the offer never spawns a second session on top of the running
+/// one).
+#[test]
+fn a_ref_less_fresh_agent_pane_with_a_live_unfenced_session_key_verdicts_live() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "fresh-agent",
+                     "payload": { "provider": "claude", "sessionType": "freshclaude",
+                                  "createRequestId": "req-fa-sk-open",
+                                  "sessionKeys": ["claude:ph-sk-open"] } }]),
+        ),
+    };
+    let out = build_inventory(
+        vec![d],
+        vec![],
+        live(&[("claude", "ph-sk-open")]),
+        &no_evidence(),
+        &no_closes(),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["live"], true,
+        "the unfenced claim lives in the running-session set: live (never re-offered): {pane}"
+    );
+    assert_ne!(pane["ledgerState"], "closed", "never closed: {pane}");
+    assert_eq!(
+        pane["sessionRef"],
+        json!({"provider": "claude", "sessionId": "ph-sk-open"}),
+        "the effective ref resolves from the live key: {pane}"
+    );
+}
+
+/// F1: reopen-after-fence. A claim genuinely reopened the identity (the row
+/// revived Bound; the stale fence is claim residue the pre-consumption
+/// journal re-fed after a restart). A subsequently retained snapshot of the
+/// reopened pane is LIVE/BOUND, never closed — the current association beats
+/// the residue.
+#[test]
+fn a_reopened_panes_retained_snapshot_verdicts_live_not_closed() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "fresh-agent",
+                     "payload": { "provider": "claude", "sessionType": "freshclaude",
+                                  "createRequestId": "req-fa-sk-re",
+                                  "sessionKeys": ["claude:dur-reopened"] } }]),
+        ),
+    };
+    // The revived row (the claim's commit) is Bound; the residue fence
+    // stands beside it.
+    let bindings = vec![binding_row("claude", "dur-reopened", bound())];
+    let closes = closes_with("t-unrelated", None, &[], &[("claude", "dur-reopened")]);
+    let out = build_inventory(
+        vec![d],
+        bindings,
+        live(&[("claude", "dur-reopened")]),
+        &no_evidence(),
+        &closes,
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["live"], true, "genuinely reopened: live, not closed: {pane}");
+    assert_ne!(pane["ledgerState"], "closed", "{pane}");
+    assert_eq!(
+        pane["sessionRef"],
+        json!({"provider": "claude", "sessionId": "dur-reopened"}),
+        "the live association supplies the effective ref: {pane}"
+    );
+}
+
+/// F1's sessionRef-claim half: a fence over the claimed identity never wins
+/// against a LIVE claim — the pane's association is current (the fence is
+/// residue). The closed verdict survives only when nothing live/current
+/// contradicts it.
+#[test]
+fn a_fenced_placeholder_claim_that_is_still_live_verdicts_live_not_closed() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "fresh-agent",
+                     "payload": { "provider": "claude", "sessionType": "freshclaude",
+                                  "createRequestId": "req-fa-fl",
+                                  "sessionRef": { "provider": "claude", "sessionId": "ph-live" } } }]),
+        ),
+    };
+    let closes = closes_with("t-unrelated", None, &[], &[("claude", "ph-live")]);
+    let out = build_inventory(
+        vec![d],
+        vec![],
+        live(&[("claude", "ph-live")]),
+        &no_evidence(),
+        &closes,
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["live"], true,
+        "a live claim pre-empts the residue fence: live, not closed: {pane}"
+    );
+    assert_ne!(pane["ledgerState"], "closed", "{pane}");
+}
+
+/// The F1 consult's non-live current association: a Bound row a sessionKeys
+/// entry resolves to beats the fence on the slice's OTHER key (the same
+/// current-association rule, at ledger-state level).
+#[test]
+fn a_bound_row_association_beats_the_fence_on_another_key() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "fresh-agent",
+                     "payload": { "provider": "claude", "sessionType": "freshclaude",
+                                  "createRequestId": "req-fa-sk-b",
+                                  "sessionKeys": ["claude:ph-sk-gone", "claude:dur-alive"] } }]),
+        ),
+    };
+    let bindings = vec![binding_row("claude", "dur-alive", bound())];
+    let closes = closes_with("t-unrelated", None, &[], &[("claude", "ph-sk-gone")]);
+    let out = build_inventory(vec![d], bindings, no_live(), &no_evidence(), &closes);
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["ledgerState"], "bound",
+        "the current Bound association contradicts the stale fence: {pane}"
+    );
+    assert_eq!(
+        pane["sessionRef"],
+        json!({"provider": "claude", "sessionId": "dur-alive"}),
+        "{pane}"
+    );
+    assert_eq!(pane["live"], false, "not live (the row is Bound, not running): {pane}");
 }
 
 /// Control: the pre-existing fallback is untouched — a claim with no row and

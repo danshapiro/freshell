@@ -1465,10 +1465,13 @@ fn persist_lock_recovers_from_poison() {
     assert_eq!(outcome, PersistOutcome::Persisted);
 }
 
-/// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the collector behind
-/// the close-evidence retention gate — every pane identity ANY retained
-/// generation references, in all three shapes (createRequestId,
-/// liveTerminal.terminalId, sessionRef claims), across devices and clients.
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 2; round 4 extended it to
+/// the fourth shape, F3): the collector behind the close-evidence retention
+/// gate — every pane identity ANY retained generation references, in all
+/// FOUR claim shapes (createRequestId, liveTerminal.terminalId, sessionRef
+/// claims, and the `sessionKeys` rings stamp — the only shape a ref-less
+/// claude pre-association pane claims its placeholder through), across
+/// devices and clients.
 #[test]
 fn retained_snapshot_references_collect_every_pane_identity_shape() {
     let dir = tempfile::tempdir().unwrap();
@@ -1481,6 +1484,12 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
         { "paneId": "p2", "kind": "fresh-agent",
           "payload": { "provider": "opencode", "sessionType": "freshopencode",
                        "sessionRef": { "provider": "opencode", "sessionId": "freshopencode-cr-7" } } },
+        // The F3 shape: no sessionRef at all — the placeholder (and a
+        // well-formed durable slice) ride `sessionKeys` only.
+        { "paneId": "p4", "kind": "fresh-agent",
+          "payload": { "provider": "claude", "sessionType": "freshclaude",
+                       "createRequestId": "cr-sk",
+                       "sessionKeys": ["claude:ph-sk-1", "claude:dur-sk-1"] } },
         // Never referenced anywhere below: control rows.
         { "paneId": "p3", "kind": "terminal", "payload": { "mode": "shell" } }
     ]);
@@ -1489,7 +1498,8 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
     other["panes"] = json!([
         { "paneId": "p9", "kind": "terminal",
           "payload": { "mode": "claude", "createRequestId": "cr-other",
-                       "liveTerminal": { "terminalId": "term-other", "serverInstanceId": "srv-2" } } }
+                       "liveTerminal": { "terminalId": "term-other", "serverInstanceId": "srv-2" },
+                       "sessionKeys": ["", "claude:", ":orphan", 42, null] } }
     ]);
     put(dir.path(), "dev-b", "client-b", 1, 2_000, vec![other]);
 
@@ -1504,6 +1514,20 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
             .contains(&("opencode".to_string(), "freshopencode-cr-7".to_string())),
         "the placeholder claim is a reference: {refs:?}"
     );
+    assert!(
+        refs
+            .session_keys
+            .contains(&("claude".to_string(), "ph-sk-1".to_string()))
+            && refs
+                .session_keys
+                .contains(&("claude".to_string(), "dur-sk-1".to_string())),
+        "the sessionKeys rings stamp is a reference (both keys): {refs:?}"
+    );
+    assert_eq!(
+        refs.session_keys.len(),
+        2,
+        "empty/malformed/non-string sessionKeys entries name no identity: {refs:?}"
+    );
     // No junk: empty/absent fields contribute nothing.
     assert!(!refs.create_request_ids.contains(""));
     assert_eq!(refs.terminal_ids.len(), 2);
@@ -1514,6 +1538,7 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
     let empty = tempfile::tempdir().unwrap();
     let refs = retained_snapshot_references(empty.path()).expect("missing root io");
     assert!(refs.create_request_ids.is_empty() && refs.terminal_ids.is_empty() && refs.claims.is_empty());
+    assert!(refs.session_keys.is_empty());
 
     // Fail-loud like the store's other readers: a corrupt generation file is
     // an ERROR (the caller maps it to "unknown ⇒ keep everything"), never a

@@ -336,6 +336,20 @@ struct OpencodeSession {
     /// `handle_send` consults the flag BEFORE any side effect and refuses
     /// (SESSION_NOT_FOUND — the same answer the map-removed arm gives).
     killed: Arc<AtomicBool>,
+    /// Focused-episode-6 round 4 (Finding F6): the kill's enumeration gate —
+    /// nonzero while a kill is between its one critical-section enumeration
+    /// (under THIS session lock) and its durable-close outcome. `handle_send`
+    /// refuses (SESSION_NOT_FOUND — the same answer the killed arm gives)
+    /// instead of materializing, so the
+    /// enumerated identity set is COMPLETE by construction: no session id can
+    /// mint behind the envelope's back, and the post-envelope discovery +
+    /// second close the pre-fix code needed is gone. Guarded by the session
+    /// mutex (no lock ordering change — every read/write of it runs under
+    /// the session guard the kill/send already hold). Decremented only when
+    /// the envelope fails Clean (the kill aborts; the session is genuinely
+    /// untouched); a durable close tears the session down with the gate
+    /// still standing.
+    close_pending: usize,
     /// D8 (restore-open-sessions-only): the LATEST connection-scoped provenance
     /// this session was attached under. Parked by `handle_create` at create, by
     /// the in-memory-hit arm AND by `resume_durable_session` at a
@@ -389,6 +403,7 @@ impl OpencodeSession {
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
             killed: Arc::new(AtomicBool::new(false)),
+            close_pending: 0,
             provenance: None,
         }
     }
@@ -890,7 +905,12 @@ impl FreshOpencodeState {
         // send would materialize + re-bind a ledger row for the pane that just
         // closed (the finding class: a created-then-closed row re-offered in
         // the creation-race grace window).
-        if session.killed.load(Ordering::SeqCst) {
+        if session.killed.load(Ordering::SeqCst) || session.close_pending > 0 {
+            // Focused-episode-6 round 4 (Finding F6): the `close_pending`
+            // half — a kill has enumerated this session's identity set and
+            // is writing its ONE durable close; no materialization may land
+            // behind that envelope's back (a refused send retries cleanly if
+            // the close fails Clean and the gate drops).
             drop(session);
             self.send_error(
                 &request_id,
@@ -1177,29 +1197,40 @@ impl FreshOpencodeState {
         // per-session lock acquisition — the wait-for graph carries only
         // session→map edges.
         //
-        // Phase 1 (short map section): clone the session Arc AND enumerate
-        // every map key aliasing it (the create/materialize mirror stores the
-        // same record under its placeholder AND its durable `ses_*` id). The
-        // retire/marker sets are derived HERE, synchronously — the durable
-        // close below needs no session-lock read.
-        let (session_arc, retire_ids, marker_ids) = {
+        // Phase 1 — discovery completes BEFORE the envelope and BEFORE
+        // teardown (focused-episode-6 round 4, Finding F6). The session
+        // lock is the serialization point: a materialization holds it
+        // through its map insert + binding-row write, so acquiring it here
+        // parks behind any in-flight materialization and then sees its
+        // complete result. Under that ONE acquisition the kill BOTH
+        // enumerates the COMPLETE identity set (placeholder, the wire id,
+        // the durable id(s) resolvable from the map mirror and the
+        // session's `real_session_id`, plus the pending markers) AND arms
+        // the mint gate (`close_pending`) — so the set written to the ONE
+        // envelope below is complete by construction and no second close
+        // can ever exist. A send taking the lock past this point reads the
+        // gate and refuses; the gate releases ONLY if the envelope fails
+        // Clean (the kill aborts, the session untouched).
+        let session_arc = {
             let guard = self.sessions.lock().await;
-            let session_arc = guard.get(&msg.session_id).cloned();
-            let mut retire_ids: Vec<String> = Vec::new();
-            let mut marker_ids: Vec<String> = Vec::new();
-            let mut consider = |id: &str| {
-                // Focused-episode-6 round 3, Finding 1: EVERY key this kill
-                // answers to — durable `ses_*` ids AND placeholders — is
-                // close evidence (the durable record the recovery verdict
-                // join consults); a placeholder additionally names its
-                // pending marker for deletion. The pre-first-send shape
-                // (placeholders only) used to skip the identity set entirely
-                // (`retire_ids` empty ⇒ marker delete only), leaving a
-                // retained snapshot claiming the placeholder with no standing
-                // close fence — verdict `unknown`, re-offerable. The
-                // placeholder-keyed close IS the fresh-agent lane's close
-                // record (delta-r6-r2), so a kill with nothing else to close
-                // still writes it.
+            guard.get(&msg.session_id).cloned()
+        };
+        let mut retire_ids: Vec<String> = Vec::new();
+        let mut marker_ids: Vec<String> = Vec::new();
+        {
+            // Focused-episode-6 round 3, Finding 1: EVERY key this kill
+            // answers to — durable `ses_*` ids AND placeholders — is
+            // close evidence (the durable record the recovery verdict
+            // join consults); a placeholder additionally names its
+            // pending marker for deletion. The pre-first-send shape
+            // (placeholders only) used to skip the identity set entirely
+            // (`retire_ids` empty ⇒ marker delete only), leaving a
+            // retained snapshot claiming the placeholder with no standing
+            // close fence — verdict `unknown`, re-offerable. The
+            // placeholder-keyed close IS the fresh-agent lane's close
+            // record (delta-r6-r2), so a kill with nothing else to close
+            // still writes it.
+            let consider = |retire_ids: &mut Vec<String>, marker_ids: &mut Vec<String>, id: &str| {
                 if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
                     && !marker_ids.iter().any(|m| m == id)
                 {
@@ -1210,21 +1241,30 @@ impl FreshOpencodeState {
                 }
             };
             if let Some(session_arc) = &session_arc {
-                for (key, candidate) in guard.iter() {
-                    if Arc::ptr_eq(candidate, session_arc) {
-                        consider(key);
+                let mut s = session_arc.lock().await;
+                {
+                    let guard = self.sessions.lock().await;
+                    for (key, candidate) in guard.iter() {
+                        if Arc::ptr_eq(candidate, session_arc) {
+                            consider(&mut retire_ids, &mut marker_ids, key);
+                        }
                     }
                 }
+                if let Some(real_id) = s.real_session_id.clone() {
+                    consider(&mut retire_ids, &mut marker_ids, &real_id);
+                }
+                consider(&mut retire_ids, &mut marker_ids, &msg.session_id);
+                s.close_pending += 1;
+            } else {
+                // A kill naming an id the map never held still retires that
+                // DURABLE id by name (an evicted session's row is durable)
+                // and still clears a marker under that placeholder name.
+                consider(&mut retire_ids, &mut marker_ids, &msg.session_id);
             }
-            // A kill naming an id the map never held still retires that
-            // DURABLE id by name (an evicted session's row is durable) and
-            // still clears a marker under that placeholder name.
-            consider(&msg.session_id);
-            (session_arc, retire_ids, marker_ids)
-        };
+        }
 
         // Phase 2 — THE durable close: ONE failure-atomic envelope over the
-        // whole identity set plus the pending markers
+        // COMPLETE identity set plus the pending markers
         // (`retire_closed_batch` → `PaneLedger::close_identities`,
         // delta-r6-r3, focused-episode-6 round 2 Finding 5). An explicit
         // kill is an intentional session END: it retires the session's
@@ -1234,16 +1274,18 @@ impl FreshOpencodeState {
         // the 7s creation-race grace window; and deletes the pending marker
         // (LAST — once the closes are durable) so a late materialization
         // resolution can never carry evidence for a pane that provably no
-        // longer exists. The per-identity loop it replaces wrote several
+        // longer exists. The per-identity loop it replaced wrote several
         // retires + marker deletes BEFORE checking any failure: an early
         // success stayed durable over the still-live session a later failure
-        // left behind — recovery would classify that session closed. This is
-        // phase 2 of 5: it precedes the session-lock wait (phase 3), so no
-        // park-prone await stands between the kill and its durable record,
-        // and no durable write survives a failure the kill reports.
-        // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's
-        // answer is classed. `Failed` (Clean): nothing durable — the kill
-        // must NOT acknowledge success and must leave ALL live state
+        // left behind — recovery would classify that session closed. The
+        // delta-r6-r2 post-envelope completion retire (whose Clean failure
+        // could not roll back the phase-2 placeholder close, focused-
+        // episode-6 round 4 Finding F6) is gone: phase 1's session-lock
+        // enumeration + mint gate made post-envelope discovery impossible,
+        // and this envelope's Clean failure also rolls nothing back BY
+        // CONSTRUCTION — nothing stands yet. The answer is classed (delta-
+        // r6-r4, round 3 Finding 3): `Failed` (Clean): nothing durable —
+        // the kill releases the enumeration gate and leaves ALL live state
         // untouched: the session stays live and Bound (self-consistent:
         // nothing has been closed), and a retried kill re-attempts
         // idempotently. `Persisted`: the close IS durable despite the
@@ -1251,6 +1293,7 @@ impl FreshOpencodeState {
         // with the durable close) while the answer still reports
         // `success:false` (the kill visibly fails).
         let mut close_reported_failure = false;
+        let mut close_invariant_broken = false;
         if let Some(sink) = self.identity_sink() {
             match sink
                 .retire_closed_batch(PROVIDER, &retire_ids, &marker_ids)
@@ -1269,7 +1312,14 @@ impl FreshOpencodeState {
                         // Failure propagation: the durable close did not
                         // land — NOTHING of it survived — so the kill must
                         // NOT acknowledge success and must leave ALL live
-                        // state untouched.
+                        // state untouched. Release the enumeration gate
+                        // first: the session is resumable exactly as if the
+                        // kill never ran (F6: no placeholder close stands to
+                        // roll back — the one envelope landed nothing).
+                        if let Some(session_arc) = &session_arc {
+                            let mut s = session_arc.lock().await;
+                            s.close_pending = s.close_pending.saturating_sub(1);
+                        }
                         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                             provider: PROVIDER.to_string(),
                             session_id: msg.session_id,
@@ -1282,83 +1332,53 @@ impl FreshOpencodeState {
             }
         }
 
-        // Phase 3 — ONE per-session lock take: the LATE-materialized retire,
-        // THEN the killed flag, then the teardown-field extraction.
-        //
-        // Delta-r6-r2 (focused-episode-6 round 1, Finding 4): the completion
-        // retire is failure/cancellation-safe — it runs INSIDE this lock hold
-        // but BEFORE the killed flag is set, so a failed retire (or a task
-        // cancel at the await) can never leave a newly-Bound row behind a
-        // half-closed session: the failure aborts the kill HERE, with the
-        // flag unset and the map intact (a retried kill re-attempts
-        // idempotently). The delta-r6 order (flag first, retire awaited
-        // after) meant a stop inside the await left teardown running with
-        // the new durable row still Bound.
-        //
-        // Why this acquisition covers every mid-kill materialization: a first
-        // send holds this same session lock across its materialization (the
-        // cold-start `create_session` await) and completes its map insert +
-        // binding-row write before releasing — so this lock's acquisition
-        // provably post-dates any such materialization, and its durable id
-        // is visible HERE.
-        //
-        // Retire-on-kill (delta-review round 5): mark the session killed
-        // BEFORE removing the map keys — a send that took this Arc just
-        // before the removal parks on this very lock and must observe the
-        // flag (never materialize + re-bind a row for the pane that is going
-        // away). The session mutex serializes the check: a send whose
-        // materialization critical section ran FIRST completed its map insert
-        // before releasing the lock, so the map removal below still finds
-        // (and removes) its durable key — and its row was retired above.
+        // Phase 3 — ONE per-session lock take: the killed flag, then the
+        // teardown-field extraction. Retire-on-kill (delta-review round 5):
+        // mark the session killed BEFORE removing the map keys — a send
+        // that took this Arc just before the removal parks on this very
+        // lock and must observe the flag (never materialize + re-bind a row
+        // for the pane that is going away). The enumeration completeness is
+        // not re-PROVEN here: phase 1's gate made it structural (a send
+        // between the gate and this flag is refused by the gate; the flag
+        // and the gate observe under the same lock). A defect there would
+        // still be caught loud (the invariant probe below) and the kill
+        // would answer failure — never masquerade a broken gate as success.
         if let Some(session_arc) = &session_arc {
-            let extracted = {
+            let (turn_task, bridge, real, strays) = {
                 let mut s = session_arc.lock().await;
-                let real = s.real_session_id.clone();
-                let mut close_failed = false;
-                if let Some(real_id) = real.as_deref() {
-                    if !retire_ids.iter().any(|id| id == real_id) {
-                        if let Some(sink) = self.identity_sink() {
-                            if let Err(e) = sink.retire_closed(PROVIDER, real_id).await {
-                                if e.is_persisted() {
-                                    // Delta-r6-r4 (round 3 Finding 3): the
-                                    // late id's close IS durable despite the
-                                    // reported error — the kill proceeds
-                                    // (aborting would strand a live session
-                                    // beside standing close evidence — the
-                                    // finding's shape) and answers failure.
-                                    tracing::error!(error = %e, session = %real_id,
-                                        "freshagent.opencode.retire_on_kill_persisted_despite_error: \
-                                         the late close is durable; the kill proceeds and answers failure");
-                                    close_reported_failure = true;
-                                } else {
-                                    tracing::warn!(error = %e, session = %real_id, "freshagent.opencode.retire_on_kill_failed");
-                                    close_failed = true;
-                                }
-                            }
+                let strays: Vec<String> = s
+                    .real_session_id
+                    .clone()
+                    .filter(|real_id| !retire_ids.iter().any(|id| id == real_id))
+                    .into_iter()
+                    .collect();
+                s.killed.store(true, Ordering::SeqCst);
+                (s.turn_task.take(), s.serve_bridge.take(), s.real_session_id.clone(), strays)
+            };
+            // DEFENSIVE invariant probe (F6, must never fire): an identity
+            // discovered here slipped the phase-1 gate. Retire it under the
+            // teardown and make the kill visibly FAIL — the externally
+            // visible state is then: the session ended, the identity's close
+            // is whatever the probe's retire managed, and NO answer pretends
+            // consistency.
+            if !strays.is_empty() {
+                close_invariant_broken = true;
+                tracing::error!(target: "freshell_freshagent::opencode",
+                    strays = ?strays,
+                    session = %msg.session_id,
+                    "freshagent.opencode.kill_post_envelope_discovery_invariant_broken: a real \
+                     session id surfaced after the gated one-envelope enumeration; retiring it \
+                     under the teardown and answering failure"
+                );
+                if let Some(sink) = self.identity_sink() {
+                    for stray in &strays {
+                        if let Err(e) = sink.retire_closed(PROVIDER, stray).await {
+                            tracing::error!(error = %e, session = %stray,
+                                "freshagent.opencode.invariant_probe_retire_failed");
                         }
                     }
                 }
-                if close_failed {
-                    // Delta-r6-r2 (Finding 4): ABORT — the completion retire
-                    // is not durable (nothing stands for the late id), and
-                    // nothing live may be touched until it is. The map
-                    // stands, the killed flag was never set, no teardown
-                    // ran; the kill answers failure.
-                    None
-                } else {
-                    s.killed.store(true, Ordering::SeqCst);
-                    Some((s.turn_task.take(), s.serve_bridge.take(), real))
-                }
-            };
-            let Some((turn_task, bridge, real)) = extracted else {
-                self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                    provider: PROVIDER.to_string(),
-                    session_id: msg.session_id,
-                    session_type: SESSION_TYPE.to_string(),
-                    success: false,
-                }));
-                return;
-            };
+            }
 
             // Phase 4 — the map removal, its own short synchronous section
             // (every key aliasing this Arc goes; the killed flag has gated
@@ -1398,16 +1418,17 @@ impl FreshOpencodeState {
         // `adapter.ts kill()` is unconditional (`return true` even for an
         // already-removed/unknown session) — idempotent, matching the codex/claude
         // `freshAgent.killed{success:true}` pattern. Every durable-close
-        // CLEAN failure aborts BEFORE any live state is touched (delta-r6
-        // phase 2; delta-r6-r2 Finding 4's completion retire, inside phase 3
-        // ahead of the killed flag); a PERSISTED-despite-error close ends
-        // the session (consistent with the durable close) while the kill
-        // visibly fails (delta-r6-r4, round 3 Finding 3).
+        // CLEAN failure aborts BEFORE any live state is touched (the ONE
+        // envelope in phase 2 — the enumeration gate released with it; F6
+        // retired the post-envelope completion retire entirely); a
+        // PERSISTED-despite-error close ends the session (consistent with
+        // the durable close) while the kill visibly fails (delta-r6-r4,
+        // round 3 Finding 3).
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
-            success: !close_reported_failure,
+            success: !close_reported_failure && !close_invariant_broken,
         }));
     }
 
@@ -4120,17 +4141,18 @@ mod tests {
             .expect("kill task completed");
     }
 
-    /// Delta-r6 close-durability finding (opencode lane): the durable close
-    /// (row retire + pending-marker delete) must be recorded BEFORE the
-    /// per-session-lock wait — the pre-fix lane awaited the session lock (the
-    /// killed-flag phase) before writing either, and a restart or task
-    /// cancellation during that wait left the just-closed pane recoverable.
-    /// The test holds the session lock itself (the exact hold a first send's
-    /// cold-start materialization applies, per the struct's lock-order rule)
-    /// while a kill runs: the retire and the marker delete must BOTH be
-    /// observable while the kill parks there.
+    /// Delta-r6 close-durability finding, re-staged for the round-4 (F6)
+    /// topology: the enumeration's session-lock wait (the FIRST acquisition)
+    /// must carry NOTHING — no durable close ever waits behind a park, and
+    /// no live state is touched before it resolves. A restart or task
+    /// cancellation during that wait loses nothing (no close evidence, no
+    /// torn state), and once the hold releases the ONE envelope covers the
+    /// complete set and the lane runs to completion. This retargets the
+    /// pre-F6 pin "the close precedes the session-lock wait": the finding
+    /// that ordering caused was discovery AFTER the envelope — enumeration
+    /// now parks first, carrying nothing.
     #[tokio::test(flavor = "multi_thread")]
-    async fn handle_kill_records_the_close_before_the_session_lock_wait() {
+    async fn handle_kills_enumeration_park_carries_nothing_durable_then_the_one_envelope_lands() {
         let (st, _killed) = state().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -4149,7 +4171,8 @@ mod tests {
         );
 
         // The gate: the test holds the per-session lock (the cold-start
-        // materialization hold) — the kill's session-lock phase parks on it.
+        // materialization hold) — the kill's ENUMERATION parks on it.
+        let killed_flag = session_arc.lock().await.killed.clone();
         let session_guard = session_arc.lock().await;
 
         let st2 = st.clone();
@@ -4164,39 +4187,28 @@ mod tests {
             .await;
         });
 
-        // While the kill parks on the session lock, the durable close must
-        // ALREADY be on record: the durable row's retire AND the pending
-        // marker's delete both observable, with the kill still parked.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let close_observed = loop {
-            let retired = fake
-                .retires
-                .lock()
-                .unwrap()
-                .contains(&("opencode".to_string(), "ses_1".to_string()));
-            let marker_gone = !fake
-                .pendings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(p, _, _)| p == placeholder);
-            if retired && marker_gone {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
+        // While the kill parks, NOTHING is durable and nothing is torn: no
+        // retires, no pending-marker deletes, the killed flag unset. (A
+        // cancel here is a no-op.)
+        for _ in 0..4 {
             tokio::task::yield_now().await;
-        };
+            assert!(
+                !kill.is_finished(),
+                "fixture: the kill is still parked on the held session lock"
+            );
+        }
         assert!(
-            close_observed,
-            "the durable close (row retire + pending-marker delete) must be recorded \
-             BEFORE the per-session-lock wait — the kill parked without recording it \
-             (a restart/cancellation there leaves the pane recoverable)"
+            fake.retires.lock().unwrap().is_empty(),
+            "the enumeration park records nothing: {:?}",
+            fake.retires.lock().unwrap()
         );
         assert!(
-            !kill.is_finished(),
-            "fixture: the kill is still parked on the session lock (the close preceded the wait)"
+            fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p == placeholder),
+            "the pending marker stands (nothing deleted) while the kill parks"
+        );
+        assert!(
+            !killed_flag.load(Ordering::SeqCst),
+            "the killed flag is unset while the kill parks"
         );
         drop(session_guard);
         tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
@@ -4204,6 +4216,13 @@ mod tests {
             .expect("the kill completes once the hold releases")
             .expect("kill task completed");
         assert!(st.sessions.lock().await.is_empty(), "both map keys removed");
+        let retires = fake.retires.lock().unwrap().clone();
+        for id in [placeholder, "ses_1"] {
+            assert!(
+                retires.contains(&("opencode".to_string(), id.to_string())),
+                "the envelope covers {id}: {retires:?}"
+            );
+        }
     }
 
     /// Delta-r6 close-durability (failures propagate): a kill whose durable
@@ -4424,11 +4443,13 @@ mod tests {
         );
     }
 
-    /// that read. The session-lock phase — whose acquisition provably
-    /// post-dates any such materialization completing — completes the close:
-    /// the then-visible materialized id retires too.
+    /// Focused-episode-6 round 4 (Finding F6): a materialization that
+    /// completes while the kill is PARKED on the session lock (the send's
+    /// materialization critical section holds that same lock, so the kill's
+    /// enumeration provably post-dates it) joins the ONE envelope — never a
+    /// second close call, never a discovered-after-the-envelope identity.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_session_materialized_between_the_scan_and_the_flag_phase_still_has_its_durable_row_retired() {
+    async fn a_materialization_completing_behind_the_kills_park_joins_the_one_envelope() {
         let (st, _killed) = state().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -4444,6 +4465,8 @@ mod tests {
             "fixture: the session has NOT materialized"
         );
 
+        // Hold the session lock: the kill cannot even ENUMERATE until it
+        // drops — it parks before its envelope (nothing durable yet).
         let mut session_guard = session_arc.lock().await;
         let st2 = st.clone();
         let ph = placeholder.to_string();
@@ -4456,75 +4479,54 @@ mod tests {
             })
             .await;
         });
-
-        // Wait for the kill's pre-lock durable phase to run (the pending
-        // marker delete is its observable), asserting it did NOT see a
-        // durable id (the session had none at that point).
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let marker_gone = !fake
-                .pendings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(p, _, _)| p == placeholder);
-            if marker_gone {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the kill's pre-lock durable phase did not run"
-            );
-            tokio::task::yield_now().await;
-        }
-        // Post-F1 (focused-episode-6 round 3): phase 2 now closes the
-        // PLACEHOLDER itself (durable close evidence for a pre-materialization
-        // kill), so `retires` is no longer empty here — the pre-condition is
-        // that no DURABLE id was visible to the pre-lock scan (the late
-        // `ses_late` must be absent), which is what makes the session-lock
-        // completion pass load-bearing.
-        {
-            let retired_so_far = fake.retires.lock().unwrap().clone();
-            assert!(
-                retired_so_far.iter().all(|(_, id)| !id.starts_with("ses_")),
-                "pre-condition: the un-materialized session exposed no durable id to phase 2: {retired_so_far:?}"
-            );
-            assert!(
-                retired_so_far.contains(&("opencode".to_string(), placeholder.to_string())),
-                "pre-condition: phase 2 durably closed the placeholder itself: {retired_so_far:?}"
-            );
-        }
-
-        // The first send's materialization completes NOW (mid-kill): the
-        // durable id appears behind the kill's already-taken map read — folded
-        // through the guard the test still holds (a second acquisition would
-        // self-deadlock).
+        // Let the kill run to its park point (deterministic: it cannot pass
+        // the held guard), then the materialization completes behind it.
+        tokio::task::yield_now().await;
         session_guard.real_session_id = Some("ses_late".to_string());
+        // The mint observed by the enumeration... the gate the kill then
+        // arms is what the send half must refuse behind.
+        assert_eq!(session_guard.close_pending, 0, "pre-enumeration fixture");
         drop(session_guard);
 
         tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
             .await
             .expect("the kill completes once the hold releases")
             .expect("kill task completed");
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "ONE envelope — never a second, discovered-later close call (F6): {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "opencode");
         assert!(
+            ids.contains(&placeholder.to_string()) && ids.contains(&"ses_late".to_string()),
+            "the envelope covers the placeholder AND the mid-kill materialized id: {ids:?}"
+        );
+        assert!(pendings.contains(&placeholder.to_string()));
+        assert_eq!(
             fake.retires
                 .lock()
                 .unwrap()
-                .contains(&("opencode".to_string(), "ses_late".to_string())),
-            "the kill's session-lock phase completes the close for the late-materialized id: {:?}",
+                .iter()
+                .filter(|(_, id)| id == "ses_late")
+                .count(),
+            1,
+            "ses_late retires exactly once (the envelope's fold, not a second call): {:?}",
             fake.retires.lock().unwrap()
         );
     }
 
-    /// Delta-r6-r2 (focused-episode-6 round 1, Finding 4), the ORDER half:
-    /// the late-materialized durable id's retirement lands BEFORE the killed
-    /// flag is set (which is what makes the kill cancellation-safe: a task
-    /// cancel or a failed retire BEFORE that flag can never strand a Bound
-    /// row behind a destroyed session). The retire answer parks (the
-    /// retire-stall hook) with its mutation landed — and the flag must still
-    /// read false.
+    /// Focused-episode-6 round 4 (Finding F6), the ORDER half: the ONE
+    /// envelope — covering the mid-park materialized id — is durable BEFORE
+    /// the killed flag is set (which is what makes the kill
+    /// cancellation-safe: a task cancel or a failed close BEFORE that flag
+    /// can never strand a Bound row behind a destroyed session). The
+    /// envelope's answer parks on the retire stall with its mutation landed
+    /// — and the flag must still read false.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_late_materialized_close_is_durable_before_the_killed_flag_is_set() {
+    async fn the_one_envelope_is_durable_before_the_killed_flag_is_set() {
         let (st, _killed) = state().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -4555,35 +4557,19 @@ mod tests {
             .await;
         });
 
-        // Wait for the kill's pre-lock durable phase (the pending marker
-        // delete is its observable), then materialize mid-kill.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let marker_gone = !fake
-                .pendings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(p, _, _)| p == placeholder);
-            if marker_gone {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the kill's pre-lock durable phase did not run"
-            );
-            tokio::task::yield_now().await;
-        }
+        // The kill parks on the held session lock; the mid-park
+        // materialization lands behind it, then the hold releases.
+        tokio::task::yield_now().await;
         session_guard.real_session_id = Some("ses_late".to_string());
         drop(session_guard);
 
         stall
             .entered
             .recv_timeout(std::time::Duration::from_secs(15))
-            .expect("the late retire's mutation landed (answer parked)");
+            .expect("the one envelope's mutations landed (its answer is parked)");
         assert!(
             !killed_flag.load(Ordering::SeqCst),
-            "the killed flag must NOT be set before the late retire is durable"
+            "the killed flag must NOT be set before the whole identity set's close is durable"
         );
         stall.release.send(()).expect("release the stall");
         tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
@@ -4596,19 +4582,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .contains(&("opencode".to_string(), "ses_late".to_string())),
-            "the late id retired"
+            "the mid-park id retired in the one envelope"
         );
     }
 
-    /// Delta-r6-r2 (Finding 4), the FAILURE half: when the late retire fails,
-    /// the kill ABORTS before the point of no return — the killed flag is
-    /// never set, the map stands, no teardown runs — and the answer reports
-    /// `success:false`. The delta-r6 order set the flag FIRST and merely
-    /// reported failure afterward: a task cancel or server stop inside the
-    /// retire await left the new row Bound while teardown proceeded (or the
-    /// server restarted with it Bound).
+    /// Focused-episode-6 round 4 (Finding F6), the FAILURE half: the close
+    /// covering the COMPLETE identity set (placeholder AND the mid-park
+    /// materialized id) fails Clean — the kill ABORTS: NOTHING durable
+    /// stands (no placeholder fence to roll back — the one-envelope
+    /// construct makes the first/second-close split impossible by
+    /// construction; the finding's "placeholder close survives the failed
+    /// late close" shape cannot form), the enumeration gate releases, the
+    /// killed flag is never set, the map stands, no teardown runs, and the
+    /// answer reports `success:false`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_whose_late_materialized_close_fails_aborts_before_the_killed_flag() {
+    async fn a_failed_close_over_the_complete_set_leaves_nothing_durable_and_releases_the_gate() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let (manager, _killed) = started_manager().await;
@@ -4625,12 +4613,10 @@ mod tests {
         };
         let killed_flag = session_arc.lock().await.killed.clone();
 
-        // The pre-lock close SUCCEEDS (its envelope covers no durable ids —
-        // the session is unmaterialized at the scan — plus the pending
-        // marker), and every close AFTER it fails: the failure lands on the
-        // late retire inside the session-lock phase. (Delta-r6-r3 staged this
-        // per CALL: the pre-lock envelope is ONE batch call.)
-        fake.fail_retires_after(1);
+        // Identity-conditional failure (F6's honest staging under the
+        // one-envelope discipline): the close covering the materialized id
+        // fails Clean — the whole envelope fails, nothing of it lands.
+        fake.fail_retires_for("opencode", "ses_late");
 
         let mut session_guard = session_arc.lock().await;
         let st2 = st.clone();
@@ -4644,23 +4630,7 @@ mod tests {
             })
             .await;
         });
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let marker_gone = !fake
-                .pendings
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(p, _, _)| p == placeholder);
-            if marker_gone {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the kill's pre-lock durable phase did not run"
-            );
-            tokio::task::yield_now().await;
-        }
+        tokio::task::yield_now().await;
         session_guard.real_session_id = Some("ses_late".to_string());
         drop(session_guard);
 
@@ -4671,18 +4641,22 @@ mod tests {
 
         assert!(
             !killed_flag.load(Ordering::SeqCst),
-            "a failed late retire aborts BEFORE the kill point of no return: the flag is never set"
+            "a failed envelope aborts BEFORE the kill point of no return: the flag is never set"
+        );
+        assert_eq!(
+            session_arc.lock().await.close_pending,
+            0,
+            "the enumeration gate released with the abort"
         );
         assert!(
             st.sessions.lock().await.contains_key(placeholder),
             "the map stands — nothing was torn down"
         );
+        let retires = fake.retires.lock().unwrap().clone();
         assert!(
-            !fake.retires
-                .lock()
-                .unwrap()
-                .contains(&("opencode".to_string(), "ses_late".to_string())),
-            "sanity: the failed retire recorded nothing"
+            !retires.iter().any(|(_, id)| id == "ses_late" || id == placeholder),
+            "NOTHING of the close is durable — no placeholder fence stands to mis-close \
+             the preserved live session (F6's exact regression): {retires:?}"
         );
         let mut killed_frame = None;
         while let Ok(raw) = rx.try_recv() {
@@ -4828,6 +4802,80 @@ mod tests {
         );
     }
 
+    /// Focused-episode-6 round 4 (Finding F6): a send that lands between the
+    /// kill's gated enumeration and its durable close is REFUSED — never a
+    /// materialization behind the one envelope's back. Driven through the
+    /// real lane: the kill's close answer is parked (mutations landed, gate
+    /// armed); the send must answer SESSION_NOT_FOUND and record nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_is_refused_while_the_kills_close_gate_is_armed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-gate-send"), None).await;
+        let placeholder = "freshopencode-req-gate-send";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+
+        // Park the kill inside its one durable close: the gate is armed.
+        let stall = fake.arm_retire_stall("opencode", placeholder);
+        let st2 = st.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: placeholder.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the durable close is in flight (the gate is armed)");
+
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let frame: serde_json::Value = loop {
+            let frame: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.expect("a frame")).unwrap();
+            if frame["type"] == "error" || frame["type"] == "freshAgent.send.accepted" {
+                break frame;
+            }
+        };
+        assert_eq!(
+            frame["type"], "error",
+            "a send under the armed close gate is refused, never accepted: {frame}"
+        );
+        assert!(
+            frame["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND")),
+            "the refusal answers SESSION_NOT_FOUND (the map-removed arm's shape): {frame}"
+        );
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "the refused send must not materialize behind the envelope"
+        );
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "the refused send must not record a binding row: {:?}",
+            fake.bindings.lock().unwrap()
+        );
+
+        stall.release.send(()).expect("release the stall");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+    }
+
     /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1): the ONE lock rule —
     /// `sessions` is NEVER held across a per-session lock acquisition (clone
     /// the Arc out, drop the map guard, THEN await the session lock). The
@@ -4916,18 +4964,18 @@ mod tests {
         assert!(saw_killed, "the kill answers freshAgent.killed");
     }
 
-    /// Finding 1, the kill's TEARDOWN half, re-staged for the delta-r6
-    /// topology (the durable close now precedes the session-lock wait): the
+    /// Finding 1, the kill's TEARDOWN half, re-staged for the round-4 (F6)
+    /// topology (the gated one-envelope close precedes the flag phase): the
     /// pre-fix `let mut guard = sessions.lock(); let mut s =
     /// session_arc.lock();` block held the map guard across the session-lock
     /// take. The rule is unchanged — the map guard is NEVER held across a
     /// session-lock acquisition; every map touch is its own synchronous
     /// section. Staged deterministically: the fake sink's retire stall parks
     /// the kill inside its (already-applied) durable close, the test takes
-    /// the session lock, and the release lets the kill run to its ONE
-    /// session-lock phase (killed flag + completion pass + field extraction)
-    /// — where its acquisition must park on a FREELY ACQUIRABLE map. The map
-    /// removal lands after that phase completes, as its own short section.
+    /// the session lock, and the release lets the kill run to its flag +
+    /// field-extraction phase — where its re-acquisition must park on a
+    /// FREELY ACQUIRABLE map. The map removal lands after that phase
+    /// completes, as its own short section.
     #[tokio::test(flavor = "multi_thread")]
     async fn handle_kill_teardown_never_holds_the_sessions_map_across_its_session_lock_wait() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);

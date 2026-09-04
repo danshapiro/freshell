@@ -40,6 +40,13 @@ pub struct RetainedSnapshotReferences {
     /// Every retained generation's pane-payload `sessionRef`
     /// `(provider, sessionId)` claim.
     pub claims: std::collections::HashSet<(String, String)>,
+    /// Every retained generation's pane-payload `sessionKeys` entries
+    /// (focused-episode-6 round 4, Finding F3): the `provider:sessionId`
+    /// rings stamp — the ONLY shape a ref-less claude pane snapshotted
+    /// pre-association claims its placeholder through. Without it the
+    /// close-evidence TTL GC could delete exactly the envelope+fence that
+    /// keeps that pane's `closed` verdict alive.
+    pub session_keys: std::collections::HashSet<(String, String)>,
 }
 
 /// Scan every retained generation file across every device (the conservative
@@ -86,6 +93,20 @@ pub fn retained_snapshot_references(
                             if let (Some(p), Some(s)) = (provider, session) {
                                 if !p.is_empty() && !s.is_empty() {
                                     refs.claims.insert((p.to_string(), s.to_string()));
+                                }
+                            }
+                        }
+                        // F3: the fourth claim shape — the rings stamp. Same
+                        // well-formedness rule as the recovery verdict's
+                        // consult (`provider:sessionId`, both halves
+                        // non-empty); malformed entries name no identity.
+                        if let Some(keys) = payload.get("sessionKeys").and_then(Value::as_array) {
+                            for key in keys.iter().filter_map(Value::as_str) {
+                                if let Some((p, s)) = key
+                                    .split_once(':')
+                                    .filter(|(p, s)| !p.is_empty() && !s.is_empty())
+                                {
+                                    refs.session_keys.insert((p.to_string(), s.to_string()));
                                 }
                             }
                         }

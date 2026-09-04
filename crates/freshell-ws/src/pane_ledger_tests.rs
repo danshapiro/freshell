@@ -4222,24 +4222,23 @@ fn commit_claim_refuses_a_newer_close_and_commits_an_unchanged_dead_state() {
         RowState::Bound,
         "the committed reopen is durable on disk"
     );
-    // Delta-r6-r4: the close fence lives in the journal record (append-only —
-    // the claim clear is index+legacy-file). Re-derived at the reload it
-    // reads INERT: the committed row's stamps outrank it (claim residue —
-    // never dominant at the offer boundary, never suppressing, never a
-    // refusal parked on a committed identity).
+    // Focused-episode-6 round 4 (Finding F1): the commit's fence clear is a
+    // DURABLE CONSUMPTION — the journal record's entry for `d` went with it,
+    // so the reload re-derives NOTHING (no "claim residue" resurrection for
+    // the class-agnostic consults to misread).
     assert_eq!(
         ledger2.kill_tombstone_at("claude", "d"),
-        Some(10_000),
-        "the journal record re-feeds the fence (durable close history is never laundered)"
+        None,
+        "the consumed fence never re-feeds from its record"
     );
     assert!(
         !ledger2
             .dominant_kill_tombstone_keys()
             .contains(&("claude".to_string(), "d".to_string())),
-        "the re-derived fence classifies claim-residue — never dominant over the committed row"
+        "never dominant at the offer boundary"
     );
-    // And a LATER claim-against-present-fence reads its own snapshot
-    // honestly: expect = current ⇒ commits (never a false refusal).
+    // And a LATER claim-against-no-fence commits (its snapshot is stale but
+    // the dead-state only ever READS the present: unchanged/absent ⇒ commits).
     let outcome = ledger2
         .commit_claim("claude", "d", Some(10_000), 12_000)
         .unwrap();
@@ -4333,18 +4332,16 @@ fn commit_claim_keeps_the_round_3_revive_narrowness() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The claim-commit's crash-atomic transition over a JOURNAL-FED fence
-/// (delta-r6-r4): the fence's durable home is the append-only close record,
-/// so the commit's "clear" is in-process — and the fence necessarily
-/// re-derives at the next load. The pinned invariant is the committed
-/// transition's self-consistency: the committed row's refreshed stamps
-/// outrank the re-derived fence (claim residue) at EVERY consult — never
-/// dominant at the offer boundary, never suppressing the claim's own later
-/// writes, never retiring the committed row — until the RECORD's own
-/// retention sweep takes the fence with it.
+/// The claim-commit's transition over a JOURNAL-FED fence (delta-r6-r4),
+/// retargeted by focused-episode-6 round 4 (Finding F1): the commit's fence
+/// clear is a DURABLE CONSUMPTION — the single-kill agent record that fed
+/// the fence is deleted outright (emptied, no pane linkage) — so the reload
+/// re-derives NOTHING. No "claim residue" can ever seed a class-agnostic
+/// read (the inventory's verdict join) that would mis-close the reopened
+/// identity.
 #[test]
-fn commit_claim_over_a_journal_fed_fence_is_inert_claim_residue_everywhere() {
-    let root = temp_root("claim-journal-residue");
+fn commit_claim_consumes_the_journal_fed_fence_durably() {
+    let root = temp_root("claim-journal-consume");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_fresh_agent_binding(&fa_write("claude", "d-crash", 9_000))
@@ -4361,56 +4358,29 @@ fn commit_claim_over_a_journal_fed_fence_is_inert_claim_residue_everywhere() {
         None,
         "the accepted commit cleared the fence in-process"
     );
-    // The reload re-derives the fence from the standing journal record —
-    // and it classifies INERT everywhere (the committed row outranks it).
+    assert!(
+        !PaneLedger::close_envelope_path(&root, "claude:d-crash").exists(),
+        "the emptied agent record's file is deleted with the consumption"
+    );
+    // The reload re-derives NO fence: the consumed record is gone.
     let ledger2 = PaneLedger::new(Some(root.clone()));
     assert_eq!(
         ledger2.kill_tombstone_at("claude", "d-crash"),
-        Some(10_000),
-        "re-derived from the durable record (the close history is never laundered)"
-    );
-    assert!(
-        !ledger2
-            .dominant_kill_tombstone_keys()
-            .contains(&("claude".to_string(), "d-crash".to_string())),
-        "claim residue never dominates at the offer boundary"
+        None,
+        "nothing re-feeds from disk — the fence was consumed, not just cleared in memory"
     );
     assert_eq!(
         ledger2.load_binding("claude", "d-crash").unwrap().state,
         RowState::Bound,
-        "the committed row is never retired by the re-derived residue"
+        "the committed row is Bound across the restart"
     );
-    // The claim's own later write is never suppressed by the residue (the
-    // binder consult classifies claim-residue and proceeds).
+    // The claim's own later write is never suppressed (no fence anywhere).
     ledger2
         .record_fresh_agent_binding(&fa_write("claude", "d-crash", 12_000))
         .unwrap();
     assert_eq!(
         ledger2.load_binding("claude", "d-crash").unwrap().state,
         RowState::Bound
-    );
-    // The residue's lifetime is its RECORD's: the fence sweep leaves it
-    // standing while the record does; once the record is fully aged (and —
-    // F2 — unreferenced), the record sweep takes the fence with it.
-    let aged = 12_000 + KILL_TOMBSTONE_TTL_MS + 60_000;
-    let report = ledger2.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
-    assert!(
-        report
-            .pane_closes_swept
-            .iter()
-            .any(|k| k == "claude:d-crash"),
-        "the aged record swept: {:?}",
-        report.pane_closes_swept
-    );
-    assert_eq!(
-        ledger2.kill_tombstone_at("claude", "d-crash"),
-        None,
-        "the record's sweep took its fed fence with it"
-    );
-    assert_eq!(
-        ledger2.load_binding("claude", "d-crash").unwrap().state,
-        RowState::Bound,
-        "and never touched the committed row"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -5663,15 +5633,16 @@ fn a_close_identities_batch_closes_every_identity_and_deletes_markers_last() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The PRIOR-RECORD carve-out of the rollback rule: a failed envelope write
-/// against a key whose record already stood NEVER erases that prior close
-/// (it is not this op's to roll back) — the answer is persisted-close, the
-/// prior evidence stands exactly as before, and a healed retry merges the
-/// widened close set into the same record. (The pre-journal model had to
-/// reconstruct per-identity prior state; one record makes the rollback
-/// boundary the file itself.)
+/// Focused-episode-6 round 4 (Finding F4) — the envelope COVERAGE gate: a
+/// failed envelope write over a key whose PRIOR record does NOT cover the
+/// new close's full identity set is a CLEAN failure (this op landed nothing
+/// durable — the caller's kill FAILS, no teardown authority), never a
+/// "persisted" answer carried on the strength of the covering-less prior.
+/// The prior record itself is NEVER this op's to erase: it stands exactly as
+/// before, and a healed retry merges the widened close set into the same
+/// record.
 #[test]
-fn a_close_envelope_failure_over_a_prior_record_reports_persisted_and_never_erases_the_prior() {
+fn a_close_envelope_widening_whose_rewrite_fails_reports_clean_and_denies_teardown_authority() {
     let root = temp_root("prior-record");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
@@ -5687,7 +5658,9 @@ fn a_close_envelope_failure_over_a_prior_record_reports_persisted_and_never_eras
         RowState::Retired
     );
     // A widened close (a later kill naming the same wire id, now also
-    // carrying a late-resolved identity) whose write cannot land.
+    // carrying a late-resolved identity) whose write cannot land — the prior
+    // record covers sess-x but NOT sess-late, so NOTHING of this close is
+    // durable.
     ledger.fail_next_close_envelope_writes(1);
     let err = ledger
         .close_identities(
@@ -5698,8 +5671,16 @@ fn a_close_envelope_failure_over_a_prior_record_reports_persisted_and_never_eras
         )
         .expect_err("the armed write failure surfaces");
     assert!(
-        err.is_persisted(),
-        "a prior record stands at the key: persisted-close, never a falsely-clean failure"
+        !err.is_persisted(),
+        "a covering-less prior must NOT masquerade as persisted-close: the kill fails, \
+         no row teardown is authorized (F4)"
+    );
+    // sess-late keeps its Bound row (never torn down): the failed close
+    // projected nothing.
+    let late = ledger.load_binding("claude", "sess-late");
+    assert!(
+        late.as_ref().map(|r| r.state) != Some(RowState::Retired),
+        "no row retire without the durable close: {late:?}"
     );
     // The PRIOR record is untouched: it still covers exactly sess-x at its
     // own stamp; the failed write added nothing durable for sess-late.
@@ -5708,8 +5689,7 @@ fn a_close_envelope_failure_over_a_prior_record_reports_persisted_and_never_eras
     assert_eq!(
         disk.kill_tombstone_at("claude", "sess-late"),
         None,
-        "the widening never landed: no fence for the late identity (documented residual — \
-         the kill's session ends regardless)"
+        "the widening never landed: no fence for the late identity"
     );
     // The healed retry merges the full set into the same record.
     ledger
@@ -5722,6 +5702,46 @@ fn a_close_envelope_failure_over_a_prior_record_reports_persisted_and_never_eras
         .expect("the retry lands the widened close");
     assert_eq!(ledger.kill_tombstone_at("claude", "sess-x"), Some(4_000));
     assert_eq!(ledger.kill_tombstone_at("claude", "sess-late"), Some(4_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The other arm of the F4 coverage gate: a failed write over a key whose
+/// PRIOR record COVERS this close's whole identity set (a re-kill re-stamping
+/// the same identities) IS persisted-close — the close evidence the caller
+/// relies on is durable, so the lane ends its session consistently while
+/// reporting the failure.
+#[test]
+fn a_close_envelope_failure_over_a_prior_record_that_covers_the_whole_set_reports_persisted() {
+    let root = temp_root("prior-record-covers");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .close_identities(
+            "claude",
+            &["sess-x".to_string(), "sess-y".to_string()],
+            &[],
+            2_000,
+        )
+        .unwrap();
+    // A re-close of the SAME identity set (re-stamped) whose write cannot
+    // land: the standing record already fences every identity this close
+    // carries.
+    ledger.fail_next_close_envelope_writes(1);
+    let err = ledger
+        .close_identities(
+            "claude",
+            &["sess-x".to_string(), "sess-y".to_string()],
+            &[],
+            3_000,
+        )
+        .expect_err("the armed write failure surfaces");
+    assert!(
+        err.is_persisted(),
+        "the prior record covers the whole close set: persisted-close (the kill ends its \
+         session consistently): {err}"
+    );
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(disk.kill_tombstone_at("claude", "sess-x"), Some(2_000));
+    assert_eq!(disk.kill_tombstone_at("claude", "sess-y"), Some(2_000));
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -5796,6 +5816,34 @@ fn a_fully_aged_close_record_survives_while_a_retained_snapshot_references_it() 
     );
     assert!(ledger.pane_close_for_terminal("term-ref").is_none());
     assert_eq!(ledger.kill_tombstone_at("opencode", "freshopencode-cr-z"), None);
+
+    // The sessionKeys arm (focused-episode-6 round 4, Finding F3): a close
+    // whose identity a retained generation claims ONLY through the rings
+    // stamp (the ref-less pre-association payload shape) is referenced too —
+    // TTL GC must not sweep it out from under that snapshot.
+    ledger
+        .close_identities("claude", &["ph-sk-gc".to_string()], &[], 1_000)
+        .unwrap();
+    let mut refs = crate::tabs_persist::RetainedSnapshotReferences::default();
+    refs.session_keys
+        .insert(("claude".to_string(), "ph-sk-gc".to_string()));
+    let report = ledger.gc(aged, &never_absent, None, Some(&refs));
+    assert!(
+        report
+            .pane_closes_swept
+            .iter()
+            .all(|k| k != "claude:ph-sk-gc"),
+        "a sessionKeys-referenced close survives the TTL edge: {report:?}"
+    );
+    assert_eq!(ledger.kill_tombstone_at("claude", "ph-sk-gc"), Some(1_000));
+    // …and once that shape also stops referencing it, it prunes.
+    let report = ledger.gc(aged, &never_absent, None, Some(&empty));
+    assert!(
+        report
+            .pane_closes_swept
+            .contains(&"claude:ph-sk-gc".to_string()),
+        "unreferenced sessionKeys-only close evidence prunes: {report:?}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -5821,5 +5869,168 @@ fn an_unknown_reference_set_never_prunes_close_evidence() {
         "unknown references prune nothing: {report:?}"
     );
     assert!(ledger.pane_close_for_terminal("term-unk").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ── Focused-episode-6 round 4 (Finding F1) — claims consume their fences DURABLY ──
+//
+// The claim lifecycle clears the close fence in memory; before this finding
+// the fence re-derived from its close-envelope journal record at the next
+// load (the record is append-only, never edited), so a restart resurrected a
+// consumed fence — and the recovery inventory's class-agnostic consult read
+// the reopened identity as closed. The commit's fence clear now CONSUMES the
+// journal entries durably (the record is rewritten without the identity, or
+// deleted when nothing else justifies it) in the same ledger op.
+
+/// The commit consumes the claimed identity's fence entries across EVERY
+/// standing record, in the same durable transition as the revive: after a
+/// reload nothing re-feeds — the "claim residue" resurrection is gone. The
+/// record's OTHER identities (the pane-seat placeholder fence) stay fenced.
+#[test]
+fn a_claim_commit_consumes_the_fences_it_clears_durably_a_restart_never_refed_them() {
+    let root = temp_root("claim-consume");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "durable-1", "term-c1", 1_000))
+        .unwrap();
+    // The kill's envelope: the pane-seat placeholder + the durable id.
+    ledger
+        .close_identities(
+            "claude",
+            &["ph-c1".to_string(), "durable-1".to_string()],
+            &[],
+            2_000,
+        )
+        .unwrap();
+    assert_eq!(
+        ledger.load_binding("claude", "durable-1").unwrap().state,
+        RowState::Retired
+    );
+    // The genuine reopen: the commit revives the row AND consumes the
+    // durable identity's fence durably.
+    let outcome = ledger
+        .commit_claim("claude", "durable-1", Some(2_000), 3_000)
+        .unwrap();
+    assert_eq!(outcome, ClaimCommitOutcome::Committed);
+    assert_eq!(ledger.kill_tombstone_at("claude", "durable-1"), None);
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "ph-c1"),
+        Some(2_000),
+        "the pane-seat fence the commit did not claim stays standing"
+    );
+    // The journal record was REWRITTEN (not erased): it still carries the
+    // placeholder entry at its original stamp.
+    let reload = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        reload.kill_tombstone_at("claude", "durable-1"),
+        None,
+        "durable consumption: the reload must NOT re-feed the consumed fence"
+    );
+    assert_eq!(
+        reload.kill_tombstone_at("claude", "ph-c1"),
+        Some(2_000)
+    );
+    assert!(
+        !reload
+            .all_kill_tombstone_keys()
+            .contains(&("claude".to_string(), "durable-1".to_string())),
+        "the class-agnostic verdict read (the inventory's join) never sees the consumed fence"
+    );
+    // The revive is durable too (unchanged commit half).
+    assert_eq!(
+        reload.load_binding("claude", "durable-1").unwrap().state,
+        RowState::Bound
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A record the consumption EMPTIED — an agent-keyed envelope whose only
+/// entry was the claimed identity — is deleted outright (it carried no pane
+/// linkage; an empty agent record is forensic noise). The claim lane's
+/// alias-fence clear ([`PaneLedger::clear_kill_tombstone`]) consumes the same
+/// way.
+#[test]
+fn consuming_the_last_entry_of_an_agent_record_deletes_it_durably() {
+    let root = temp_root("claim-consume-empty");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "durable-2", "term-c2", 1_000))
+        .unwrap();
+    ledger
+        .close_identities("claude", &["durable-2".to_string()], &[], 2_000)
+        .unwrap();
+    assert!(PaneLedger::close_envelope_path(&root, "claude:durable-2").exists());
+    let outcome = ledger
+        .commit_claim("claude", "durable-2", Some(2_000), 3_000)
+        .unwrap();
+    assert_eq!(outcome, ClaimCommitOutcome::Committed);
+    assert!(
+        !PaneLedger::close_envelope_path(&root, "claude:durable-2").exists(),
+        "the emptied agent record's file is deleted with the consumption"
+    );
+    let reload = PaneLedger::new(Some(root.clone()));
+    assert!(reload.all_kill_tombstone_keys().is_empty());
+    // Idempotent: a second clear against no evidence is a no-op Ok.
+    ledger.clear_kill_tombstone("claude", "durable-2").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The claim lane's explicit clear ([`PaneLedger::clear_kill_tombstone`] —
+/// the consumed ALIAS fences) consumes journal entries durably too, so the
+/// reopened placeholder never re-fences across a restart.
+#[test]
+fn clear_kill_tombstone_consumes_journal_entries_durably() {
+    let root = temp_root("clear-consume");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .close_identities("claude", &["ph-c3".to_string()], &[], 2_000)
+        .unwrap();
+    assert_eq!(ledger.kill_tombstone_at("claude", "ph-c3"), Some(2_000));
+    ledger.clear_kill_tombstone("claude", "ph-c3").unwrap();
+    assert_eq!(ledger.kill_tombstone_at("claude", "ph-c3"), None);
+    let reload = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        reload.kill_tombstone_at("claude", "ph-c3"),
+        None,
+        "the reload must NOT re-feed the consumed alias fence"
+    );
+    assert!(!PaneLedger::close_envelope_path(&root, "claude:ph-c3").exists());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A PANE-keyed record whose last close fence is consumed KEEPS the record:
+/// its terminal/crid linkage is the pane-cover verdict independent of its
+/// kills. Only the identity entry leaves it.
+#[test]
+fn consuming_a_fence_from_a_pane_record_keeps_the_pane_cover() {
+    let root = temp_root("consume-pane-cover");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-pc", "term-pc", 1_000))
+        .unwrap();
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-pc".to_string(),
+            create_request_id: Some("cr-pc".to_string()),
+            resolved: vec![SessionLocator {
+                provider: "codex".into(),
+                session_id: "sess-pc".into(),
+            }],
+            now_ms: 2_000,
+        })
+        .unwrap();
+    assert_eq!(ledger.kill_tombstone_at("codex", "sess-pc"), Some(2_000));
+    // The session is genuinely re-claimed on ANOTHER pane: the pane-cover
+    // close stands for the CLOSED pane, but the identity's fence leaves it.
+    ledger.clear_kill_tombstone("codex", "sess-pc").unwrap();
+    let reload = PaneLedger::new(Some(root.clone()));
+    assert_eq!(reload.kill_tombstone_at("codex", "sess-pc"), None);
+    let record = reload
+        .pane_close_for_terminal("term-pc")
+        .expect("the pane-cover record survives the fence consumption");
+    assert!(
+        record.kills.is_empty(),
+        "only its kills were consumed: {record:?}"
+    );
     std::fs::remove_dir_all(&root).ok();
 }

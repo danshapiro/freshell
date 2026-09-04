@@ -145,6 +145,19 @@ pub struct FreshClaudeState {
     /// tombstoned session is DEAD, and this record answers ids for retire
     /// writes only — it makes nothing look alive.
     alias_tombstones: Arc<std::sync::Mutex<AliasTombstones>>,
+    /// Focused-episode-6 round 4 (Finding F5): the kill's enumeration gate —
+    /// map_key -> in-flight close count. A kill INCREMENTS this under the
+    /// same one critical section (cli_index → sessions → alias_tombstones →
+    /// this map — the only acquire order anywhere) that enumerates the
+    /// session's complete durable identity set, so that set is COMPLETE by
+    /// construction: any adoption minting a durable id behind the
+    /// enumeration reads a nonzero gate under the identical locks and
+    /// ABANDONS (never a post-envelope discovery). Decremented only when
+    /// the envelope fails Clean (the kill aborts and the session is
+    /// genuinely untouched — sends/mints resume); a successful or
+    /// persisted-durably close tears the session down and the gate entry
+    /// dies with it.
+    close_pending: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
 /// Focused-ep5-r1 Finding 1: retention for demoted alias records. The
@@ -554,6 +567,7 @@ impl FreshClaudeState {
             terminal_liveness: Arc::new(|_, _| false),
             rollback_in_flight: crate::InFlightRegistry::new(),
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
+            close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1177,26 +1191,56 @@ impl FreshClaudeState {
             .resolve_session_key(&session_id)
             .await
             .unwrap_or_else(|| session_id.clone());
-        // The pre-destruction collection is safe against the round-1 mint
-        // guard by SPLITTING: the consumer is the only minter, and an
-        // adoption's `cli_index` insert PRECEDES its ledger write — so a mint
-        // whose insert predates this collection is covered by the retire set,
-        // and a mint still mid-flight is closed by the consumer abort below
-        // and caught by the post-abort COMPLETION DIFF (farther down): it
-        // re-collects, retires any newly visible id, and the folded tombstone
-        // fences that id's late-landing ledger write.
+        // Focused-episode-6 round 4 (Finding F5) — discovery completes
+        // BEFORE the one envelope and BEFORE teardown. ONE critical section
+        // (cli_index → sessions → alias_tombstones → close_pending — the
+        // exact acquisition `adopt_session_init` duplicates) arms the mint
+        // gate AND enumerates the session's COMPLETE durable identity set:
+        // the wire id, the recorded cli id, every live cli_index alias,
+        // every evicted/persisted alias record pointing at the map key.
+        // From this instant every adoption abandons, so the enumerated set
+        // is complete by construction — nothing durable exists yet (the
+        // envelope writes next), and a Clean failure simply releases the
+        // gate with the session untouched.
         let mut retire_ids = vec![session_id.clone()];
-        self.collect_kill_retire_ids(&session_id, &map_key, &mut retire_ids)
-            .await;
+        {
+            let index = self.cli_index.lock().await;
+            let sessions = self.sessions.lock().await;
+            let mut tombstones = self.alias_tombstones.lock().expect("alias tombstones lock");
+            if sessions.contains_key(&map_key) {
+                let mut gates = self.close_pending.lock().expect("close-pending lock");
+                *gates.entry(map_key.clone()).or_insert(0) += 1;
+            }
+            self.collect_kill_retire_ids_under_guards(
+                &session_id,
+                &map_key,
+                &mut retire_ids,
+                &index,
+                &sessions,
+                &mut tombstones,
+            );
+        }
         // THE durable close — ONE envelope over the whole set, BEFORE any
         // live-state destruction (the map removal, the consumer abort). On
-        // failure the kill aborts with NOTHING touched and NOTHING durable.
+        // Clean failure the kill aborts with NOTHING touched and NOTHING
+        // durable: the mint gate releases (the session resumes untouched).
         // Delta-r6-r4 (round 3 Finding 3): the PERSISTED class — the close
         // IS durable despite the reported error — proceeds instead (the
         // session ends, consistent with the durable close) while the answer
         // still reports `success:false` (the kill visibly fails).
         let close_answer = self.retire_closed_rows(&retire_ids).await;
         if close_answer == crate::identity_sink::CloseAnswer::Failed {
+            {
+                let _index = self.cli_index.lock().await;
+                let _sessions = self.sessions.lock().await;
+                let mut gates = self.close_pending.lock().expect("close-pending lock");
+                if let Some(n) = gates.get_mut(&map_key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        gates.remove(&map_key);
+                    }
+                }
+            }
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),
                 session_id,
@@ -1207,38 +1251,45 @@ impl FreshClaudeState {
         }
         let main_close_reported_failure =
             close_answer == crate::identity_sink::CloseAnswer::Persisted;
-        // Live-state destruction begins (every durable id the collection
-        // could see is durably closed by this point).
+        // Live-state destruction begins (every durable id the one envelope
+        // covers is durably closed by this point). The consumer ABORT stays
+        // synchronous (the minter channel closes).
         let removed = self.sessions.lock().await.remove(&map_key);
-        // Round 5 (focused-ep5-r4 Finding 4's claude half): the consumer ABORT
-        // is synchronous and closes the mint channel (an adoption that never
-        // completed its cli_index insert is cancelled at its await and can
-        // never insert; one whose insert landed is visible to the diff).
+        // The gate entry dies with the session (the map rule was the gate's
+        // whole meaning; an aborted session adopts nothing more).
+        self.close_pending
+            .lock()
+            .expect("close-pending lock")
+            .remove(&map_key);
         if let Some(session) = &removed {
             session.consumer.abort();
         }
-        // Delta-r6-r2 (Finding 3) COMPLETION DIFF: re-collect past the abort
-        // and retire any id minted between the pre-destruction collection and
-        // the abort. A diff retire failure is past the point of no safe
-        // return (the consumer is aborted, the map entry removed): the
-        // teardown proceeds, but the kill answer MUST still report failure —
-        // never acknowledge an unrecorded close.
-        let mut diff_set = vec![session_id.clone()];
-        self.collect_kill_retire_ids(&session_id, &map_key, &mut diff_set)
+        // DEFENSIVE invariant probe — must never fire by construction (F5):
+        // any id surfacing only now would have slipped the close gate, so it
+        // is retired under the kill's teardown, loudly, and the kill answers
+        // failure (never masquerade a broken gate as success — the brief's
+        // visible-with-partial last resort).
+        let mut recheck = vec![session_id.clone()];
+        self.collect_kill_retire_ids(&session_id, &map_key, &mut recheck)
             .await;
-        let late_ids: Vec<String> = diff_set
+        let strays: Vec<String> = recheck
             .iter()
             .filter(|id| **id != session_id && !retire_ids.contains(*id))
             .cloned()
             .collect();
-        let diff_ok = if late_ids.is_empty() {
-            true
-        } else {
-            let ok = self.retire_closed_rows(&late_ids).await
-                == crate::identity_sink::CloseAnswer::Recorded;
-            retire_ids.extend(late_ids);
-            ok
-        };
+        let mut invariant_broken = false;
+        if !strays.is_empty() {
+            invariant_broken = true;
+            tracing::error!(target: "freshell_freshagent::claude",
+                strays = ?strays,
+                session = %map_key,
+                "freshagent.claude.kill_post_envelope_discovery_invariant_broken: an identity \
+                 surfaced after the one-envelope enumeration DESPITE the close gate; retiring \
+                 it under the teardown and answering failure"
+            );
+            let _ = self.retire_closed_rows(&strays).await;
+            retire_ids.extend(strays);
+        }
         if let Some(session) = removed {
             teardown_removed_session(session).await;
         }
@@ -1273,7 +1324,7 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: diff_ok && !main_close_reported_failure,
+            success: !main_close_reported_failure && !invariant_broken,
         }));
     }
 
@@ -1388,12 +1439,12 @@ impl FreshClaudeState {
     /// Delta-r6-r4 failure propagation (focused-episode-6 round 3, Finding
     /// 3): the close's answer is [`CloseAnswer`]. The caller treats the main
     /// envelope's `Failed` as a kill ABORT (nothing durable; no live state
-    /// touched, `success:false`), a `Persisted` as the durable-but-erroring
-    /// close (the kill proceeds — the session ends consistently — and
-    /// answers `success:false`), and a completion-diff non-`Recorded` as an
-    /// unacknowledged answer (the close has already committed durably — the
-    /// teardown it precedes runs regardless, so the kill must not claim
-    /// success).
+    /// touched, `success:false` — and the enumeration gate releases), a
+    /// `Persisted` as the durable-but-erroring close (the kill proceeds —
+    /// the session ends consistently — and answers `success:false`), and a
+    /// defensive-probe non-`Recorded` as an unacknowledged answer (the close
+    /// has already committed durably — the teardown it precedes runs
+    /// regardless, so the kill must not claim success).
     async fn retire_closed_rows(&self, ids: &[String]) -> crate::identity_sink::CloseAnswer {
         let Some(sink) = self.identity_sink() else {
             return crate::identity_sink::CloseAnswer::Recorded;
@@ -1420,13 +1471,14 @@ impl FreshClaudeState {
     /// retire-set completion — ONE critical section across all three
     /// alias-resolution sources, with the lock order `cli_index` →
     /// `sessions` → `alias_tombstones` held for the whole consult (no awaits
-    /// inside). Runs identically pre- and post-destruction (delta-r6-r2:
-    /// the pre-destruction pass collects the set the kill closes up front,
-    /// the post-abort diff catches a mint that raced the abort): pre-abort
-    /// it sees the still-mapped session's `cli_session_id` and live aliases;
-    /// post-abort the demoted tombstones/persisted records answer where the
-    /// live copies went (focused-ep5-r2 Finding 3's exit-eviction gap needs
-    /// both shapes).
+    /// inside). Focused-episode-6 round 4 (Finding F5): the kill calls it
+    /// ONCE, under the SAME acquisition that arms the close-pending mint
+    /// gate — identity discovery is complete BEFORE the one durable close
+    /// envelope is written, so post-envelope discovery is impossible by
+    /// construction (the round's "discovery before teardown" rule). A
+    /// post-removal re-run (the defensive probe) sees the demoted
+    /// tombstones/persisted records where the live copies went (focused-
+    /// ep5-r2 Finding 3's exit-eviction gap).
     ///
     /// Finding 2 (the tightened tombstone rule): a TOMBSTONE-sourced
     /// candidate is followed only when live session state does not
@@ -1444,17 +1496,41 @@ impl FreshClaudeState {
         map_key: &str,
         retire_ids: &mut Vec<String>,
     ) {
+        // Lock order: cli_index -> sessions -> alias_tombstones (-> the
+        // kill's close-pending gate). All reads are synchronous once the
+        // guards are held (the std Mutexes are never held across an await).
+        let index = self.cli_index.lock().await;
+        let sessions = self.sessions.lock().await;
+        let mut tombstones = self.alias_tombstones.lock().expect("alias tombstones lock");
+        self.collect_kill_retire_ids_under_guards(
+            wire_session_id,
+            map_key,
+            retire_ids,
+            &index,
+            &sessions,
+            &mut tombstones,
+        );
+    }
+
+    /// The consult body, running under the caller's already-held guard trio
+    /// (focused-episode-6 round 4, Finding F5): the kill's enumeration and
+    /// its close-pending gate increment share ONE critical section — the
+    /// exact acquisition `adopt_session_init`'s mint gate duplicates — so
+    /// the enumerated set is complete by construction.
+    fn collect_kill_retire_ids_under_guards(
+        &self,
+        wire_session_id: &str,
+        map_key: &str,
+        retire_ids: &mut Vec<String>,
+        index: &HashMap<String, String>,
+        sessions: &HashMap<String, ClaudeSession>,
+        tombstones: &mut AliasTombstones,
+    ) {
         let now = crate::session_lease::now_epoch_ms() as i64;
         // Round 5 (Finding 2): the tombstone consult carries the retention
         // probe — a still-Bound row's alias records never age out, so the
         // kill reaches the durable row however old the demotion is.
         let row_bound = self.alias_row_bound_probe();
-        // Lock order: cli_index -> sessions -> alias_tombstones. All reads
-        // below are synchronous once the guards are held (the std Mutex is
-        // never held across an await).
-        let index = self.cli_index.lock().await;
-        let sessions = self.sessions.lock().await;
-        let mut tombstones = self.alias_tombstones.lock().expect("alias tombstones lock");
         // Round 6 (focused-ep5-r5 Finding 2): fold the DURABLE alias records
         // into the consult — the restart-surviving half of the mapping (the
         // in-memory store dies with the process; the ledger's
@@ -3869,12 +3945,35 @@ impl FreshClaudeState {
         identity_sink: Option<SharedPaneIdentitySink>,
         provenance: Option<&crate::BindProvenance>,
     ) {
-        self.cli_index
-            .lock()
-            .await
-            .insert(cli_id.to_string(), session_id.to_string());
-        if let Some(session) = self.sessions.lock().await.get_mut(session_id) {
-            session.cli_session_id = Some(cli_id.to_string());
+        {
+            // Focused-episode-6 round 4 (Finding F5): the mint gate. The
+            // lock order (cli_index → sessions → close_pending) is THE order
+            // the kill's enumeration acquires, so a kill that already
+            // enumerated this session is read here under the identical
+            // acquisition: the durable id this adoption was about to mint
+            // is invisible to that close by construction, so this adoption
+            // must land NOTHING — no alias insert, no session field, no
+            // alias record, no ledger row (the kill's teardown owns the
+            // session now).
+            let mut index = self.cli_index.lock().await;
+            let mut sessions = self.sessions.lock().await;
+            let gated = {
+                let gates = self.close_pending.lock().expect("close-pending lock");
+                gates.get(session_id).copied().unwrap_or(0) > 0
+            };
+            if gated {
+                tracing::info!(target: "freshell_freshagent::claude",
+                    cli_id = %cli_id,
+                    session_id = %session_id,
+                    "freshagent.claude.adoption_abandoned_by_kill_gate: the kill's one \
+                     envelope already enumerated this session; the mint lands nowhere"
+                );
+                return;
+            }
+            index.insert(cli_id.to_string(), session_id.to_string());
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.cli_session_id = Some(cli_id.to_string());
+            }
         }
         // Round 6 (focused-ep5-r5 Finding 2): persist the alias AT MINT. The
         // finding's window needs the mapping durably recorded before ANY
@@ -7275,45 +7374,31 @@ rl.on('line', (line) => {
         assert!(pendings.is_empty(), "claude kills carry no marker ids");
     }
 
-    /// Delta-r6-r2 (Finding 3), the mint-gap half: with the durable close
-    /// collected pre-destruction, an adoption that inserts its alias BETWEEN
-    /// the collection and the consumer abort (the consumer is the minter;
-    /// the abort closes that channel) is still retired — the kill's
-    /// completion DIFF re-collects post-abort and retires the newly visible
-    /// id. Its later landing ledger write is fenced by the folded tombstone.
+    /// Focused-episode-6 round 4 (Finding F5) — the mint gate: with the
+    /// kill's close-pending enumeration armed, an adoption ABANDONS: no
+    /// cli_index insert, no alias-tombstone write, no binding-row write —
+    /// nothing the kill's ONE envelope could miss. This retires the
+    /// delta-r6-r2 completion-diff design (a SECOND close for an id
+    /// discovered only after the consumer abort, whose own clean failure
+    /// could never roll the teardown back): discovery completes before the
+    /// envelope now, by construction.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_mint_landing_mid_close_still_has_its_row_retired() {
+    async fn a_mint_adoption_abandons_once_the_kills_close_gate_is_set() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let _env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(dedup_create_msg("req-mint-mid-close"), None)
+        st.handle_create(dedup_create_msg("req-gate-mint"), None)
             .await;
-        let created = await_claude_created(&mut rx, "req-mint-mid-close").await;
+        let created = await_claude_created(&mut rx, "req-gate-mint").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
-        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let present = st
-                .cli_index
-                .lock()
-                .await
-                .get(durable)
-                .is_some_and(|mapped| mapped == &placeholder);
-            if present {
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
 
-        // Park the kill between its pre-destruction close and its teardown
-        // (the durable's close answer stalls post-mutation), then insert the
-        // racing mint: an adoption's alias insert lands NOW; its ledger write
-        // lands later (fenced by the completion retire's folded tombstone).
-        let stall = fake.arm_retire_stall("claude", durable);
+        // Park the kill INSIDE its one durable close (mutations recorded;
+        // the answer stalled): the enumeration + mint gate are provably in
+        // force — the placeholder rides the envelope.
+        let stall = fake.arm_retire_stall("claude", &placeholder);
         let st2 = st.clone();
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
@@ -7328,26 +7413,125 @@ rl.on('line', (line) => {
         stall
             .entered
             .recv_timeout(std::time::Duration::from_secs(15))
-            .expect("the durable close is in flight");
-        st.cli_index
-            .lock()
-            .await
-            .insert("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(), placeholder.clone());
+            .expect("the durable close is in flight (the gate is armed)");
+
+        // The mint that could slip the enumeration→teardown window in the
+        // completion-diff shape: discard it entirely.
+        let gated = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        st.adopt_session_init(
+            gated,
+            &placeholder,
+            "freshclaude",
+            Some(&crate::identity_sink::FreshAgentSettings {
+                model: Some("gate-model".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            }),
+            None,
+            Some(fake.clone()),
+            None,
+        )
+        .await;
+        assert!(
+            st.cli_index.lock().await.get(gated).is_none(),
+            "the gated mint inserts nothing: {:?}",
+            st.cli_index.lock().await
+        );
+
         stall.release.send(()).expect("release the stall");
         tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
             .await
             .expect("the kill completes")
             .expect("kill task completed");
         assert!(
-            fake.retires
+            !fake
+                .retires
                 .lock()
                 .unwrap()
-                .contains(&(
-                    "claude".to_string(),
-                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string()
-                )),
-            "the mint landing mid-close is retired by the post-abort completion diff: {:?}",
+                .iter()
+                .any(|(_, id)| id == gated),
+            "nothing retires an id the envelope never saw: {:?}",
             fake.retires.lock().unwrap()
+        );
+        assert!(
+            !fake
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.session_id == gated),
+            "the gated adoption writes no binding row: {:?}",
+            fake.bindings.lock().unwrap()
+        );
+        assert!(
+            !fake
+                .alias_record_writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, d)| d == gated),
+            "the gated adoption writes no alias record: {:?}",
+            fake.alias_record_writes.lock().unwrap()
+        );
+    }
+
+    /// F5's abort path: a kill whose ONE envelope fails Clean releases the
+    /// close gate it armed — the session is genuinely untouched (a later
+    /// adoption mints normally), exactly like the r2 abort the envelope
+    /// failure rules promised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_whose_envelope_fails_clean_reopens_the_close_gate() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-gate-abort"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-gate-abort").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+
+        fake.fail_retires_after(0); // every close call fails Clean
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            st.sessions.lock().await.contains_key(&placeholder),
+            "the failed kill leaves the session MAPPED"
+        );
+        assert!(
+            st.close_pending
+                .lock()
+                .expect("close-pending probe")
+                .get(&placeholder)
+                .is_none(),
+            "the aborted kill released the gate it armed"
+        );
+        // The mint channel is open again: an adoption lands exactly like on
+        // a never-killed session.
+        st.adopt_session_init(
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            &placeholder,
+            "freshclaude",
+            None,
+            None,
+            Some(fake.clone()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            st.cli_index
+                .lock()
+                .await
+                .get("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+                .cloned(),
+            Some(placeholder.clone()),
+            "the post-abort adoption mints normally"
         );
     }
     /// Focused-ep5-r1 Finding 1 (retire-on-kill round 2), the REAL wire shape:

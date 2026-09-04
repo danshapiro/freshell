@@ -29,8 +29,12 @@ pub struct DeviceUnion {
 ///   durable close). A pane whose snapshot claim resolves to NO row
 ///   anywhere and whose claimed key carries a standing fence was closed
 ///   before its identity ever landed as a row: verdict `closed`. A genuine
-///   reopen clears the fence through the claim commit (round 4), so a
-///   STANDING fence means the identity was never genuinely reclaimed.
+///   reopen CONSUMES its fences durably through the claim commit
+///   (focused-episode-6 round 4, F1: the journal records' entries leave
+///   with it), so a STANDING fence means the identity was never genuinely
+///   reclaimed — and even beside residue a live/current association (a key
+///   in the live-session set, or a claim resolving to a Bound row) always
+///   wins over a fence.
 pub struct CloseEvidence {
     pub standing_kill_tombstones: HashSet<(String, String)>,
     pub pane_closes: Vec<PaneCloseRecord>,
@@ -590,38 +594,84 @@ pub fn build_inventory(
                         // every correlation/claim; the pane is never
                         // restored.
                         let covered = pane_covered_by_close(pane);
+                        // Delta-r6-r4e (the kill-window e2e's actual payload
+                        // shape), ordered by focused-episode-6 round 4
+                        // (Findings F1+F2): claude panes snapshotted
+                        // pre-association carry NO `sessionRef` — the
+                        // placeholder rides the payload's `sessionKeys`
+                        // (`provider:sessionId`, the cross-device rings
+                        // stamp). The ref-less consult is ORDERED, and
+                        // closedness never beats a live/current association:
+                        //   1. a well-formed key in the supplied live-session
+                        //      set ⇒ LIVE (the session is running now — the
+                        //      offer must never spawn a second one on top);
+                        //   2. a key resolving to a BOUND row (the claim
+                        //      commit's genuine reopen — a re-fed residue
+                        //      fence beside it is stale bookkeeping) ⇒ the
+                        //      bound verdict off that row;
+                        //   3. ONLY then does a standing fence close the
+                        //      pane (the identity was killed and never
+                        //      redeemed, and nothing live/current
+                        //      contradicts it);
+                        //   4. otherwise the ref-less tiers below run
+                        //      unchanged. Panes WITH a snapshot claim take
+                        //      the D4 chain directly (its closed corridors
+                        //      carry the same never-beat-a-live-claim rule).
+                        // Let bindings — flat, so the consult chain below
+                        // keeps the pre-existing arms at their exact old
+                        // nesting depth.
+                        let session_keys: Vec<(String, String)> = if snap_ref.is_none() {
+                            payload
+                                .get("sessionKeys")
+                                .and_then(Value::as_array)
+                                .map(|keys| {
+                                    keys.iter()
+                                        .filter_map(Value::as_str)
+                                        .filter_map(|k| {
+                                            k.split_once(':')
+                                                .filter(|(p, s)| !p.is_empty() && !s.is_empty())
+                                                .map(|(p, s)| (p.to_string(), s.to_string()))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        let live_key = session_keys
+                            .iter()
+                            .find(|(p, s)| is_live(p, s))
+                            .cloned();
+                        let bound_key = if live_key.is_none() {
+                            session_keys.iter().find_map(|(p, s)| {
+                                match resolve(p, s, &by_key) {
+                                    Verdict::Bound(bp, bs) => Some((bp, bs)),
+                                    _ => None,
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        let fenced_key = live_key.is_none()
+                            && bound_key.is_none()
+                            && session_keys.iter().any(|(p, s)| {
+                                closes
+                                    .standing_kill_tombstones
+                                    .contains(&(p.clone(), s.clone()))
+                            });
                         let (ledger_state, eff_ref) = if covered {
                             ("closed", None)
-                        } else {
-                        // Delta-r6-r4e (the kill-window e2e's actual payload
-                        // shape): claude panes snapshotted pre-association
-                        // carry NO `sessionRef` — the placeholder rides the
-                        // payload's `sessionKeys` (`provider:sessionId`, the
-                        // cross-device rings stamp) instead. The ref-less
-                        // arms below are terminal-kind-gated, so without this
-                        // consult such a pane verdicts `unknown` even when
-                        // its identity's kill fence STANDS — re-offering a
-                        // pane the user just closed. A standing fence over
-                        // ANY well-formed sessionKeys entry IS the durable
-                        // close for the pane: the identity was killed and
-                        // never redeemed (a genuine reopen clears the fence
-                        // through the claim commit). Same verdict shape as
-                        // the sessionRef arm's fenced-Unknown case.
-                        if payload
-                            .get("sessionKeys")
-                            .and_then(Value::as_array)
-                            .is_some_and(|keys| {
-                                keys.iter().filter_map(Value::as_str).any(|k| {
-                                    k.split_once(':')
-                                        .filter(|(p, s)| !p.is_empty() && !s.is_empty())
-                                        .is_some_and(|(p, s)| {
-                                            closes
-                                                .standing_kill_tombstones
-                                                .contains(&(p.to_string(), s.to_string()))
-                                        })
-                                })
-                            })
-                        {
+                        } else if let Some((p, s)) = live_key {
+                            (
+                                "bound",
+                                Some(json!({"provider": p, "sessionId": s})),
+                            )
+                        } else if let Some((bp, bs)) = bound_key {
+                            (
+                                "bound",
+                                Some(json!({"provider": bp, "sessionId": bs})),
+                            )
+                        } else if fenced_key {
                             ("closed", None)
                         } else {
                         match &snap_ref {
@@ -750,15 +800,19 @@ pub fn build_inventory(
                                     // placeholder half: NO row carries this
                                     // identity anywhere, but its kill fence
                                     // stands — the pane was closed before its
-                                    // identity ever landed as a row. (A
-                                    // genuine reopen clears the fence through
-                                    // the claim commit, so a STANDING fence
-                                    // means the close was never redeemed.)
+                                    // identity ever landed as a row. A
+                                    // STANDING fence means the close was
+                                    // never redeemed — with ONE contradiction
+                                    // rule (focused-episode-6 round 4, F1): a
+                                    // claim in the live-session set is a
+                                    // CURRENT association (the fence is
+                                    // residue), so it never closes the pane.
                                     Verdict::Unknown => {
                                         if closes.standing_kill_tombstones.contains(&(
                                             p.to_string(),
                                             s.to_string(),
-                                        )) {
+                                        )) && !is_live(p, s)
+                                        {
                                             ("closed", None)
                                         } else {
                                             ("unknown", Some(r.clone()))
@@ -766,7 +820,6 @@ pub fn build_inventory(
                                     }
                                 }
                             }
-                        }
                         }
                         };
                         let eff_str = eff_ref

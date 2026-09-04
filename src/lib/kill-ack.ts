@@ -27,11 +27,27 @@ import { getWsClient } from './ws-client'
  * error for an already-gone id) — both satisfy the close intent. Never
  * resolved as failure: the waiter would fail-close every close against a
  * server one version old.
+ *
+ * Focused-episode-6 round 4 (Finding F7): the exit fallback is DEFERRED by
+ * EXIT_FALLBACK_GRACE_MS, never settled on sight. On a persisted-despite-
+ * error close a current server broadcasts `terminal.exit` WHILE killing and
+ * only afterward sends the correlated `terminal.killed{success:false}` — a
+ * fallbacks-of-sight settle would drop the pane and hide the failure the
+ * server sent to surface. The grace lets the correlated frame arrive first
+ * and decide; on a legacy server no such frame exists, the grace expires,
+ * and the exit fallback settles success exactly as before.
  */
 const log = createLogger('kill-ack')
 
 /** The bounded close-ack wait — 5s, per the round-2 brief. */
 export const KILL_ACK_TIMEOUT_MS = 5_000
+
+/**
+ * The exit-fallback deferral (F7): the correlated `terminal.killed` is one
+ * send behind the `terminal.exit` broadcast it races; the fallback settles
+ * success only once no correlated frame could still legitimately land.
+ */
+export const EXIT_FALLBACK_GRACE_MS = 250
 
 /**
  * The pane-banner copy for failed closes (the `KILL_FAILED` code is written
@@ -49,7 +65,7 @@ export type KillAck =
   | { ok: true }
   | { ok: false; error?: string; timedOut?: true }
 
-type FrameVerdict = { ok: boolean; error?: string }
+type FrameVerdict = { ok: boolean; error?: string; grace?: number }
 
 function awaitCloseFrame(
   match: (msg: unknown) => FrameVerdict | null,
@@ -59,16 +75,27 @@ function awaitCloseFrame(
     let settled = false
     let unsubscribe: () => void = () => {}
     let timer: ReturnType<typeof setTimeout> | undefined
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
     const finish = (ack: KillAck) => {
       if (settled) return
       settled = true
       if (timer !== undefined) clearTimeout(timer)
+      if (graceTimer !== undefined) clearTimeout(graceTimer)
       unsubscribe()
       resolve(ack)
     }
     unsubscribe = getWsClient().onMessage((msg) => {
       const verdict = match(msg)
       if (verdict === null) return
+      if (verdict.grace !== undefined) {
+        // F7: a deferred fallback (the legacy exit arm) arms the grace
+        // instead of settling — a correlated frame arriving inside the
+        // window decides; only an undecided expiry settles the fallback.
+        if (graceTimer === undefined) {
+          graceTimer = setTimeout(() => finish({ ok: true }), verdict.grace)
+        }
+        return
+      }
       finish(verdict.ok ? { ok: true } : { ok: false, error: verdict.error })
     })
     timer = setTimeout(() => finish({ ok: false, timedOut: true }), timeoutMs)
@@ -101,8 +128,12 @@ export function sendTerminalKillAndAwait(
     if (m.type === 'terminal.killed' && m.requestId === requestId) {
       return { ok: m.success !== false, error: typeof m.error === 'string' ? m.error : undefined }
     }
-    // Legacy-server fallbacks (see the module doc).
-    if (m.type === 'terminal.exit' && m.terminalId === terminalId) return { ok: true }
+    // Legacy-server fallbacks (see the module doc). The exit arm is
+    // DEFERRED (F7): on a current server the correlated terminal.killed
+    // trails the exit broadcast by one send and must decide instead.
+    if (m.type === 'terminal.exit' && m.terminalId === terminalId) {
+      return { ok: true, grace: EXIT_FALLBACK_GRACE_MS }
+    }
     if (m.type === 'error' && m.code === 'INVALID_TERMINAL_ID' && m.terminalId === terminalId) {
       return { ok: true }
     }
