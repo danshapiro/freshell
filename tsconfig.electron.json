@@ -21,6 +21,8 @@
     "electron/setup-wizard/**/*.tsx",
     "electron/setup-wizard/index.html",
     "electron/launch-chooser/**/*.tsx",
-    "electron/launch-chooser/index.html"
+    "electron/launch-chooser/index.html",
+    "electron/profile-picker/**/*.tsx",
+    "electron/profile-picker/index.html"
   ]
 }

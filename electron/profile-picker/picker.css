@@ -1,0 +1,45 @@
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #101418;
+  color: #f4f7fa;
+}
+
+.picker {
+  max-width: 400px;
+  margin: 3rem auto;
+  padding: 0 1.5rem;
+}
+
+.picker-subtitle {
+  font-size: 0.875rem;
+  opacity: 0.7;
+}
+
+.picker-list {
+  list-style: none;
+  padding: 0;
+  margin: 1.5rem 0 0;
+}
+
+.picker-list button {
+  width: 100%;
+  padding: 0.625rem 1rem;
+  margin-bottom: 0.5rem;
+  border-radius: 0.5rem;
+  border: 1px solid #2d3a4a;
+  background: #1a2230;
+  color: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.picker-list button:hover,
+.picker-list button:focus-visible {
+  background: #24304a;
+  outline: none;
+}
+
+.picker-error {
+  color: #f87171;
+}
