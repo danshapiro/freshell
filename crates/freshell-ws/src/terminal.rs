@@ -5495,44 +5495,88 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
 }
 
 async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
-    if kill_and_broadcast(state, &kill.terminal_id) {
-        // P1.8 trigger (e): explicit user close — best-effort retire of the
-        // binding (`closed`) + marker cleanup. Best-effort by spec: SIGKILL
-        // is the tested mode, so retire-on-close must never be load-bearing.
-        // `session_ref_for` is retired-INCLUSIVE, so it still answers after
-        // the retire() inside kill_and_broadcast. Awaited spawn_blocking:
-        // fsync must not pin the dispatch task (V1.md; the PTY-spawn
-        // precedent above).
-        let sref = state.identity.session_ref_for(&kill.terminal_id);
-        let ledger = std::sync::Arc::clone(&state.pane_ledger);
-        let tid = kill.terminal_id.clone();
-        let now = now_ms();
-        let _ = spawn_blocking_in_span(move || {
-            if let Some(sref) = sref {
-                if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
-                    tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
-                }
-            }
-            if let Err(err) = ledger.delete_pending(&tid) {
-                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
-            }
+    let unknown_terminal_error = |terminal_id: String| {
+        ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::InvalidTerminalId,
+            message: "Unknown terminalId".to_string(),
+            timestamp: crate::now_iso(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: None,
+            retry_after_ms: None,
+            terminal_id: Some(terminal_id),
+            terminal_exit_code: None,
+            live_terminal_id: None,
         })
-        .await;
+    };
+    if !state.registry.exists(&kill.terminal_id) {
+        return send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await;
+    }
+    // P1.8 trigger (e): explicit user close — retire the binding (`closed`)
+    // + marker cleanup. Delta-r6 close-durability ordering: the durable close
+    // is written BEFORE the process and the in-memory identity are destroyed
+    // — destroying first (the pre-fix `kill_and_broadcast`-first shape) lost
+    // the close entirely when the blocking write was cancelled or failed,
+    // leaving a Bound row the recovery inventory could offer for a terminal
+    // the user had killed. `session_ref_for` is answered here with the
+    // identity still LIVE (well inside its retired-inclusive window, which
+    // the broadcast side relies on). Awaited spawn_blocking: fsync must not
+    // pin the dispatch task (V1.md; the PTY-spawn precedent above).
+    //
+    // Failure propagation (delta-r6): a FAILED durable write FAILS the kill —
+    // the process is left running, the identity stands, and the client gets
+    // an error frame instead of a silent success. (Retire-on-close is no
+    // longer the spec's original "never load-bearing" best-effort: the
+    // recovery exactness contract made the close authoritative. DETACH stays
+    // non-retiring, unchanged.)
+    let sref = state.identity.session_ref_for(&kill.terminal_id);
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let tid = kill.terminal_id.clone();
+    let now = now_ms();
+    let recorded = spawn_blocking_in_span(move || {
+        let mut recorded = true;
+        if let Some(sref) = sref {
+            if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
+                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
+                recorded = false;
+            }
+        }
+        if let Err(err) = ledger.delete_pending(&tid) {
+            tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
+            recorded = false;
+        }
+        recorded
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
+        false
+    });
+    if !recorded {
+        let msg = ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::InternalError,
+            message: "the terminal close could not be recorded durably; the terminal was left running"
+                .to_string(),
+            timestamp: crate::now_iso(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: None,
+            retry_after_ms: None,
+            terminal_id: Some(kill.terminal_id),
+            terminal_exit_code: None,
+            live_terminal_id: None,
+        });
+        return send(ws_tx, &msg).await;
+    }
+    // The durable close stands; kill + broadcast. A reaper that beat this
+    // kill to the registry row makes `kill_and_broadcast` false — the answer
+    // for that race is the pre-fix one (the invalid-id error); the close
+    // already recorded is exactly the right end state for a terminal that is
+    // gone either way.
+    if kill_and_broadcast(state, &kill.terminal_id) {
         return true;
     }
-    let msg = ServerMessage::Error(ErrorMsg {
-        code: ErrorCode::InvalidTerminalId,
-        message: "Unknown terminalId".to_string(),
-        timestamp: crate::now_iso(),
-        actual_session_ref: None,
-        expected_session_ref: None,
-        request_id: None,
-        retry_after_ms: None,
-        terminal_id: Some(kill.terminal_id),
-        terminal_exit_code: None,
-        live_terminal_id: None,
-    });
-    send(ws_tx, &msg).await
+    send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await
 }
 
 /// The kill core, split from the socket reply for testability: `true` = the

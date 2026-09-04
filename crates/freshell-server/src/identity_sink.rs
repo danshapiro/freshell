@@ -244,8 +244,12 @@ impl PaneIdentitySink for LedgerIdentitySink {
 
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): the
     /// kill handlers' awaited retire batch — the same awaited-spawn_blocking
-    /// discipline as `record_binding`. Best-effort like every non-rollback
-    /// lane: the caller warn-logs `Err`, never block the kill.
+    /// discipline as `record_binding`. Delta-r6 failure propagation: NOT
+    /// best-effort — a kill whose durable close cannot be recorded is
+    /// FAILED, not warn-and-continued (the caller reports `success:false`
+    /// and leaves the live session untouched); a `Bound` row beside an
+    /// unacknowledged close stays self-consistent and retryable, which the
+    /// recovery pipeline's exactness contract relies on.
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite {
         let ledger = self.ledger.clone();
         let (p, s) = (provider.to_string(), session_id.to_string());

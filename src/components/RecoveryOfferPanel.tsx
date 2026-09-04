@@ -11,7 +11,7 @@ import {
   isDismissed,
   recordDismissal,
 } from '@/lib/recovery/dismissal'
-import { buildRecoveryPlan, countRecoverablePanes, placeLedgerEntries } from '@/lib/recovery/build-recovery-plan'
+import { buildRecoveryPlan, countRecoverablePanes, isRestorablePane, placeLedgerEntries } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { addTab } from '@/store/tabsSlice'
@@ -175,7 +175,14 @@ export function RecoveryOfferPanel(): JSX.Element | null {
 
   const paneCount = countRecoverablePanes(inventory)
   const device = inventory.device
-  const anyLive = device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false
+  // Delta-r6: the live note explains panes that ARE listed but reopen without
+  // resuming (the D7 terminal regime) — count only live panes that survive
+  // the restorability predicate (a live FRESH-AGENT pane is excluded from the
+  // restore entirely, so it never motivates the note). Same predicate as the
+  // count/listing/plan, so the note can never describe an excluded pane.
+  const anyLive =
+    device?.tabs.some((tab) => tab.panes.some((pane) => pane.live && isRestorablePane(pane))) ??
+    false
   // D8 placement: the listing must match the plan's physical destination, so
   // both consume the same partition — a kept ledger row whose stamped tabKey
   // names a restorable tab renders under THAT tab in the same line format as
@@ -238,7 +245,10 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         {/* Sole scroll region (R1): keeps heading, notes, and buttons out of the scrollable area. */}
         <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1 overflow-y-auto flex-1 min-h-0">
           {restorableTabs.flatMap((tab) => [
-            ...tab.panes.map((pane) => (
+            // Delta-r6 F1/F2: the listing consumes the SAME restorability
+            // predicate as the count and the plan — a closed-verdict pane (or
+            // a live fresh-agent pane, resumed-never) is never listed.
+            ...tab.panes.filter(isRestorablePane).map((pane) => (
               <li key={`${tab.tabKey}:${pane.paneId}`}>
                 {tab.tabName}: {pane.mode ?? pane.kind}
                 {pane.cwd ? ` — ${pane.cwd}` : ''}

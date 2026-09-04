@@ -70,6 +70,12 @@ function collectTerminalLeaves(node: PaneNode | undefined): Extract<PaneNode, { 
   return node.children.flatMap((child) => collectTerminalLeaves(child))
 }
 
+function collectAllLeaves(node: PaneNode | undefined): Extract<PaneNode, { type: 'leaf' }>[] {
+  if (!node) return []
+  if (node.type === 'leaf') return [node]
+  return node.children.flatMap((child) => collectAllLeaves(child))
+}
+
 function findRecoveredTerminalLeaves(store: TestStore, title: string) {
   const tab = store.getState().tabs.tabs.find((t) => t.title === title)
   expect(tab, `expected a recovered tab titled "${title}"`).toBeTruthy()
@@ -281,6 +287,111 @@ describe('RecoveryOfferPanel', () => {
     // Live sessions are left untouched: no resume ref, no restore arming
     expect(content.sessionRef).toBeUndefined()
     expect(consumeTerminalRestoreRequestId(content.createRequestId)).toBe(false)
+  })
+
+  // Delta-r6 F1 (closed verdicts are NOT restorable): a snapshot pane the
+  // server marked `ledgerState: "closed"` (its session was closed between the
+  // last registry push and the browser-state loss) must be excluded from the
+  // advertised count, the listing, AND the accepted plan — the offer restores
+  // exactly the sessions that were genuinely open.
+  it('a closed snapshot pane is excluded from the count, the listing, and the accepted plan', async () => {
+    const basePane = INVENTORY.device!.tabs[0].panes[0]
+    const closedPane = {
+      ...basePane,
+      paneId: 'p-closed',
+      ledgerState: 'closed' as const,
+      sessionRef: null,
+    }
+    const inventory: RecoveryInventory = {
+      ...INVENTORY,
+      device: {
+        ...INVENTORY.device!,
+        tabs: [{ tabKey: 'k', tabName: 'work', panes: [basePane, closedPane] }],
+      },
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    // Only the genuinely-open pane is advertised and listed.
+    expect(await screen.findByText(/restore 1 pane/i)).toBeInTheDocument()
+    const items = screen.getAllByRole('listitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).toContain('work: claude — /w')
+
+    await userEvent.click(screen.getByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'work')
+    expect(tab).toBeTruthy()
+    const leaves = collectAllLeaves(store.getState().panes.layouts[tab!.id])
+    expect(leaves).toHaveLength(1)
+    const content = leaves[0].content
+    if (content.kind !== 'terminal') throw new Error('unreachable')
+    expect(content.sessionRef?.sessionId).toBe('S2')
+  })
+
+  // F1, the all-closed arm: an inventory whose every snapshot pane closed
+  // before the state loss has NOTHING genuinely open — no offer at all (the
+  // count is 0), and the stale pending record is cleared like any dead offer.
+  it('an all-closed inventory renders no offer and clears the pending flag', async () => {
+    setPendingOffer('cid-1', 0)
+    const closedPane = {
+      ...INVENTORY.device!.tabs[0].panes[0],
+      ledgerState: 'closed' as const,
+      sessionRef: null,
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue({
+      ...INVENTORY,
+      device: {
+        ...INVENTORY.device!,
+        tabs: [{ tabKey: 'k', tabName: 'work', panes: [closedPane] }],
+      },
+    })
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(getPendingOffer()).toBeNull())
+  })
+
+  // Delta-r6 F2 (live fresh-agent panes are NOT restorable): a fresh-agent
+  // pane whose session is still running on the server (the top-level `live`
+  // verdict) is excluded from the count, the listing, and the accepted plan —
+  // restoring it would RESUME the live session despite D7. The live note is
+  // reserved for panes that ARE listed but reopen without resuming (the D7
+  // terminal regime), so it does not render here.
+  it('a live fresh-agent pane is excluded from the count, the listing, and the accepted plan (and raises no live note)', async () => {
+    const basePane = INVENTORY.device!.tabs[0].panes[0]
+    const liveFreshAgent = {
+      ...basePane,
+      paneId: 'p-live-fa',
+      kind: 'fresh-agent',
+      payload: {
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+      },
+      sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+      live: true,
+    }
+    const inventory: RecoveryInventory = {
+      ...INVENTORY,
+      device: {
+        ...INVENTORY.device!,
+        tabs: [{ tabKey: 'k', tabName: 'work', panes: [basePane, liveFreshAgent] }],
+      },
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    expect(await screen.findByText(/restore 1 pane/i)).toBeInTheDocument()
+    expect(screen.queryByTestId('recovery-live-note')).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'work')
+    expect(tab).toBeTruthy()
+    const leaves = collectAllLeaves(store.getState().panes.layouts[tab!.id])
+    expect(leaves).toHaveLength(1)
+    expect(leaves[0].content.kind).toBe('terminal')
   })
 
   it('a joinable ledgerOnly row lists under its tab (device-pane format) and joins it on accept (D8 placement)', async () => {

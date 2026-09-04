@@ -2699,7 +2699,22 @@ impl FreshCodexState {
         //    down) the claim's session once the claim registers — kill always
         //    wins vs an in-flight claim. (The claim half is the
         //    post-registration dead-state re-check, `claim_dead_state_advanced`.)
-        self.retire_closed_row(&session_id).await;
+        //
+        // Delta-r6 failure propagation: a FAILED durable write FAILS the
+        // kill — the answer reports `success:false` and NOTHING below runs
+        // (no lease clear, no map removal, no teardown): warn-and-continue
+        // would leave the row Bound — recoverable — while the client believes
+        // the pane is closed. The session stays live and Bound,
+        // self-consistent, and a retried kill re-attempts idempotently.
+        if !self.retire_closed_row(&session_id).await {
+            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: SESSION_TYPE.to_string(),
+                success: false,
+            }));
+            return;
+        }
 
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
         // also clears it; idempotent -- this covers watcher-less test sessions too).
@@ -2736,18 +2751,22 @@ impl FreshCodexState {
     }
 
     /// The kill-side lane of `retire_closed` (delta-review round 5):
-    /// best-effort AWAITED retire of this provider's ledger row — awaited
-    /// before the `freshAgent.killed` broadcast (durable-before-answer, like
-    /// the create-path binding write), warn-logged on failure, never a kill
-    /// blocker (the kill is a liveness operation; the ledger write is cheap
-    /// and the caller is already going away).
-    async fn retire_closed_row(&self, session_id: &str) {
+    /// AWAITED retire of this provider's ledger row before the
+    /// `freshAgent.killed` broadcast (durable-before-answer, like the
+    /// create-path binding write). Delta-r6 failure propagation: returns
+    /// `false` (warn-logged) when the durable write failed — the caller
+    /// FAILS the kill (`success:false`, no live state touched) because a
+    /// close it cannot record must never be acknowledged as done. With no
+    /// sink wired there is nothing to record: `true`.
+    async fn retire_closed_row(&self, session_id: &str) -> bool {
         let Some(sink) = self.identity_sink() else {
-            return;
+            return true;
         };
         if let Err(e) = sink.retire_closed(PROVIDER, session_id).await {
             tracing::warn!(error = %e, session = %session_id, "freshagent.codex.retire_on_kill_failed");
+            return false;
         }
+        true
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -6662,6 +6681,67 @@ pub(crate) mod tests {
             "fixture: the teardown is still stalled (the close preceded it, not followed it)"
         );
         kill.abort();
+    }
+
+    /// Delta-r6 close-durability (failures propagate), the codex lane: a kill
+    /// whose durable close could NOT be recorded must FAIL — the
+    /// `freshAgent.killed` answer reports `success:false` and NO live state
+    /// was touched (the session stays mapped, its lease binding stands, the
+    /// consumer/sidecar teardown never ran). Warn-and-continue would leave
+    /// the row Bound and recoverable while the client believes the pane is
+    /// closed.
+    #[tokio::test]
+    async fn a_kill_whose_durable_close_fails_reports_failure_and_touches_no_live_state() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx, fake) = state_with_sink();
+        let child = spawn_sleeper();
+        insert_fake_session(
+            &st,
+            "thread-kill-fail",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill-fail",
+        )
+        .await;
+        // The ledger fails every write (disk-full/permission shape).
+        fake.set_fail_writes(true);
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-kill-fail".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            st.sessions.lock().await.contains_key("thread-kill-fail"),
+            "a failed durable close must leave the session mapped (nothing torn down)"
+        );
+        assert!(
+            !fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), "thread-kill-fail".to_string())),
+            "sanity: the failed retire recorded nothing"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "a kill whose durable close failed must report success:false: {killed_frame}"
+        );
     }
 
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1), the codex

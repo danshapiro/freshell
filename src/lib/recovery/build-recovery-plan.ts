@@ -27,6 +27,36 @@ function terminalContent(p: {
   } as PaneContent
 }
 
+/**
+ * Delta-r6 (F1+F2) — THE restorability predicate, shared by the plan, the
+ * advertised count, the offer panel's listing, and the panel's live note so
+ * all four always agree (the same regime delta-r4 Finding 2 established for
+ * `placeLedgerEntries`). The server's correlation work stamps each snapshot
+ * pane with a verdict at the TOP level (the snapshot payload is left
+ * untouched); two verdicts make a pane NOT restorable:
+ *
+ * - `ledgerState === 'closed'`: the pane's session was CLOSED between the
+ *   last registry push and the browser-state loss (the effective sessionRef
+ *   is null). Restoring it would recreate a session the user deliberately
+ *   closed (the pre-fix shape — "closed panes come back fresh" — offered
+ *   exactly the never-open sessions this campaign exists to exclude).
+ * - `kind === 'fresh-agent' && live`: the pane's session is STILL RUNNING on
+ *   the server (D7). A fresh-agent restore resumes `content.sessionRef` via
+ *   `freshAgent.create`, so rebuilding this pane would resume the live
+ *   session — exclude it instead. (A live TERMINAL pane keeps the D7 regime:
+ *   the pane is recreated fresh WITHOUT the resume ref — `terminalContent`
+ *   strips it — which is authority-correct already, so it stays restorable.)
+ *
+ * Plain un-correlated panes (no snapshot claim, no correlation verdict —
+ * `ledgerState === 'unknown'`, null ref) are untouched: they still rebuild
+ * fresh with their cwd/mode and no resume ref.
+ */
+export function isRestorablePane(p: RecoveryPane): boolean {
+  if (p.ledgerState === 'closed') return false
+  if (p.kind === 'fresh-agent' && p.live) return false
+  return true
+}
+
 function paneContent(p: RecoveryPane): PaneContent {
   if (p.kind === 'terminal') return terminalContent(p)
   if (p.kind === 'editor') {
@@ -37,8 +67,22 @@ function paneContent(p: RecoveryPane): PaneContent {
   if (p.kind === 'fresh-agent') {
     // normalize's existingRestoreError branch would drop sessionRef; strip restoreError
     // and let normalize re-validate the ref itself (A10)
-    const { restoreError: _restoreError, ...payload } = p.payload
-    return { ...payload, kind: 'fresh-agent' } as PaneContent
+    //
+    // Delta-r6 F2 (server authority beats the stale payload copy): the server
+    // deliberately leaves the snapshot payload untouched and puts the
+    // D4-corrected verdict at the TOP level — the payload's own sessionRef is
+    // a pre-verdict copy. The top-level sessionRef WINS: a superseded pane
+    // resumes the corrected successor, never the payload's old ref (and a
+    // null top-level ref never resurrects a payload ref — the closed/live
+    // verdicts that produce one are excluded by `isRestorablePane` before
+    // this point, and this spread no longer carries the payload's copy
+    // regardless, as defense in depth).
+    const { restoreError: _restoreError, sessionRef: _snapshotSessionRef, ...payload } = p.payload
+    return {
+      ...payload,
+      kind: 'fresh-agent',
+      ...(p.sessionRef ? { sessionRef: p.sessionRef } : {}),
+    } as PaneContent
   }
   return { ...p.payload, kind: p.kind } as PaneContent
 }
@@ -201,7 +245,8 @@ export function placeLedgerEntries(inv: RecoveryInventory): LedgerPlacement {
  * cleared), so a vacuous "Restore 0 panes" prompt can never appear.
  */
 export function countRecoverablePanes(inv: RecoveryInventory): number {
-  const device = inv.device?.tabs.reduce((n, t) => n + t.panes.length, 0) ?? 0
+  const device =
+    inv.device?.tabs.reduce((n, t) => n + t.panes.filter(isRestorablePane).length, 0) ?? 0
   let joined = 0
   for (const entries of placeLedgerEntries(inv).joinedByTabKey.values()) joined += entries.length
   return device + joined
@@ -218,14 +263,23 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
   // straggler rather than reviving the trailing-tab fallback.
   return (inv.device?.tabs ?? [])
     .filter((t) => t.panes.length > 0)
+    // Delta-r6 F1/F2: excluded-verdict panes (closed; live fresh-agent) are
+    // dropped HERE, at leaf-build time — so a tab whose every snapshot pane
+    // is excluded (and that no ledger row joins) produces NO plan rather than
+    // an empty pane chain, and count/listing/plan exclude the same set.
     .map((t) => ({
+      tab: t,
+      leaves: [
+        ...t.panes.filter(isRestorablePane).map((p) => leaf(paneContent(p))),
+        ...(placement.joinedByTabKey.get(t.tabKey) ?? []).map((e) => leaf(ledgerEntryContent(e))),
+      ],
+    }))
+    .filter(({ leaves }) => leaves.length > 0)
+    .map(({ tab: t, leaves }) => ({
       tabId: nanoid(),
       title: t.tabName || 'Recovered',
       sourceTabKey: t.tabKey,
-      layout: chain([
-        ...t.panes.map((p) => leaf(paneContent(p))),
-        ...(placement.joinedByTabKey.get(t.tabKey) ?? []).map((e) => leaf(ledgerEntryContent(e))),
-      ]),
+      layout: chain(leaves),
       paneTitles: {},
     }))
 }

@@ -1127,15 +1127,6 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        // Task 10b: durable ids resolve through `cli_index` (alias, don't move) --
-        // a kill addressed by the durable id must tear down the live aliased session.
-        // Unresolvable ids keep today's idempotent success path.
-        let map_key = self
-            .resolve_session_key(&session_id)
-            .await
-            .unwrap_or_else(|| session_id.clone());
-        let removed = self.sessions.lock().await.remove(&map_key);
-
         // Retire-on-kill (delta-review round 5 + focused-ep5-r1 round 2,
         // restore-open-sessions-only): an explicit kill is an intentional
         // session END — every durable id this kill covers retires its
@@ -1160,48 +1151,93 @@ impl FreshClaudeState {
         // same index guard as the write — so a binding write already in
         // flight at kill time (an aborted consumer's orphaned spawn_blocking
         // closure, which NO task abort can cancel) suppresses itself instead
-        // of restoring Bound after the retire. That supersedes round 1's
-        // second post-teardown retire pass (a scheduling hedge); the write
-        // now consults durable state, so no timing window remains.
+        // of restoring Bound after the retire.
+        //
+        // Delta-r6 close-durability: the retire runs in TWO passes. PASS 1
+        // (immediately below) records the close for the identity the kill
+        // NAMES before ANY live-state change — before the alias-resolution
+        // await, the map removal, the consumer abort, and every collection
+        // lock — so a restart or task cancellation after this point can never
+        // strand an "already-closing" live session with nothing durable: the
+        // named id's tombstone + row retire stand, and from this instant the
+        // tombstone also fences every later-landing write for the named id.
+        // (For a kill naming the durable id — the common case once the pane
+        // learned it — pass 1 IS the row's own retirement; for a
+        // bare-placeholder kill it is the placeholder's fence, and the
+        // alias-resolved row completes in pass 2.)
+        //
+        // A FAILED pass-1 write fails the kill: the answer reports
+        // success:false and NO live state was touched (warn-and-continue
+        // would leave the row Bound — recoverable — while the client
+        // believes the pane is closed). The session stays live and Bound:
+        // self-consistent, and a retried kill re-attempts idempotently.
+        if !self.retire_closed_rows(std::slice::from_ref(&session_id)).await {
+            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: session_type.to_string(),
+                success: false,
+            }));
+            return;
+        }
         let mut retire_ids = vec![session_id.clone()];
-        if let Some(session) = removed {
-            // Round 5 (focused-ep5-r4 Finding 4's claude half — the batch
-            // design rule: the durable close is recorded BEFORE any
-            // teardown/settlement await, so teardown failure never loses the
-            // close). The consumer ABORT is synchronous and suffices for the
-            // round-1 alias-mint guard: an adoption that STARTED pre-abort
-            // inserted its cli_index alias + cli_session_id copy BEFORE its
-            // ledger write (see `adopt_session_init`), so the collection
-            // below sees every minted id; an adoption that had not inserted
-            // yet can never insert (the task is dead) and its write is
-            // fenced by the kill tombstone whenever it lands. The consumer
-            // JOIN and every process-kill await move past the retire into
-            // `teardown_removed_session` — a server crash inside them still
-            // leaves the close durable.
+
+        // Task 10b: durable ids resolve through `cli_index` (alias, don't move) --
+        // a kill addressed by the durable id must tear down the live aliased session.
+        // Unresolvable ids keep today's idempotent success path.
+        let map_key = self
+            .resolve_session_key(&session_id)
+            .await
+            .unwrap_or_else(|| session_id.clone());
+        let removed = self.sessions.lock().await.remove(&map_key);
+        // Round 5 (focused-ep5-r4 Finding 4's claude half): the consumer ABORT
+        // is synchronous and suffices for the round-1 alias-mint guard: an
+        // adoption that STARTED pre-abort inserted its cli_index alias +
+        // cli_session_id copy BEFORE its ledger write (see
+        // `adopt_session_init`), so the collection below sees every minted
+        // id; an adoption that had not inserted yet can never insert (the
+        // task is dead) and its write is fenced by the kill tombstone
+        // whenever it lands. The consumer JOIN and every process-kill await
+        // are past the retire (pass 2, then the teardown) — a server crash
+        // inside them still leaves the close durable.
+        if let Some(session) = &removed {
             session.consumer.abort();
-            self.collect_kill_retire_ids(
-                &session_id,
-                &map_key,
-                session.cli_session_id.as_deref(),
-                &mut retire_ids,
+        }
+        // The retire-set COMPLETION (one critical section across live aliases,
+        // the alias tombstones, and — round 6 — the persisted alias records).
+        // When the map entry is already gone, LIVE aliases still answer in
+        // the exit-eviction gap (focused-ep5-r2 Finding 3 — the consumer
+        // eviction removed the entry but has not yet demoted its cli_index
+        // alias), so both shapes run the same consult.
+        self.collect_kill_retire_ids(
+            &session_id,
+            &map_key,
+            removed
+                .as_ref()
+                .and_then(|s| s.cli_session_id.as_deref()),
+            &mut retire_ids,
+        )
+        .await;
+        // PASS 2: the alias-resolved ids (pass 1 already retired the wire
+        // id). Completing the close is deliberately POST-abort — the round-1
+        // mint guard requires the collection to follow the abort, and the
+        // collection needs the map removal — so the alias-resolved durables
+        // cannot be retired earlier than this; pass 1 is what guarantees the
+        // kill's durable footprint precedes that whole chain. A failure here
+        // is past the last safe abort point (the consumer is aborted and the
+        // map entry removed): the teardown proceeds, but the kill answer MUST
+        // still report failure — never acknowledge an unrecorded close.
+        let pass2_ok = self
+            .retire_closed_rows(
+                &retire_ids
+                    .iter()
+                    .filter(|id| **id != session_id)
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
             .await;
-            // ONE awaited retire pass BEFORE the heavy teardown: the durable
-            // tombstone + row retire land even if a server crash interrupts
-            // the process kill, and the tombstone fences every later-landing
-            // write (no sweep pass needed anymore).
-            self.retire_closed_rows(&retire_ids).await;
+        if let Some(session) = removed {
             teardown_removed_session(session).await;
-        } else {
-            // The session entry is already gone — but the retire set must
-            // still consult LIVE aliases: in the exit-eviction gap (focused
-            // -ep5-r2 Finding 3 — the consumer eviction removed the map entry
-            // but has not yet demoted its cli_index alias) the tombstones
-            // answer nothing AND the live index still has the mapping, so
-            // consulting both under one critical section closes the hole.
-            self.collect_kill_retire_ids(&session_id, &map_key, None, &mut retire_ids)
-                .await;
-            self.retire_closed_rows(&retire_ids).await;
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -1234,7 +1270,7 @@ impl FreshClaudeState {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: session_type.to_string(),
-            success: true,
+            success: pass2_ok,
         }));
     }
 
@@ -1338,20 +1374,28 @@ impl FreshClaudeState {
     /// The kill-side lane of `retire_closed` (delta-review round 5): retire
     /// every id in `ids` through the identity sink, AWAITED before the
     /// `freshAgent.killed` broadcast (durable-before-answer, like the
-    /// create-path binding write), warn-logged per id on failure, never a
-    /// kill blocker. Each call ALSO folds the durable kill tombstone in
-    /// (focused-ep5-r1 Finding 2 — the ledger-side `retire_closed`), so the
-    /// ONE pass `handle_kill` runs cannot be undone by a binding write that
-    /// was already in flight.
-    async fn retire_closed_rows(&self, ids: &[String]) {
+    /// create-path binding write). Each call ALSO folds the durable kill
+    /// tombstone in (focused-ep5-r1 Finding 2 — the ledger-side
+    /// `retire_closed`), so the passes `handle_kill` runs cannot be undone by
+    /// a binding write that was already in flight.
+    ///
+    /// Delta-r6 failure propagation: returns `false` when ANY retire failed
+    /// (warn-logged per id). The caller treats the first-pass failure as a
+    /// kill ABORT (no live state touched, `success:false`) and a completion
+    /// failure as an unacknowledged answer (the teardown it precedes has
+    /// already mutated live state, so the kill must not claim success).
+    async fn retire_closed_rows(&self, ids: &[String]) -> bool {
         let Some(sink) = self.identity_sink() else {
-            return;
+            return true;
         };
+        let mut all_recorded = true;
         for id in ids {
             if let Err(e) = sink.retire_closed(PROVIDER, id).await {
                 tracing::warn!(error = %e, session = %id, "freshagent.claude.retire_on_kill_failed");
+                all_recorded = false;
             }
         }
+        all_recorded
     }
 
     /// Retire-on-kill round 3 (focused-ep5-r2 Findings 2+3): the kill's
@@ -6785,6 +6829,135 @@ rl.on('line', (line) => {
         assert!(
             retires.contains(&("claude".to_string(), "evicted-durable".to_string())),
             "the kill must retire (claude, evicted-durable): {retires:?}"
+        );
+    }
+
+    /// Delta-r6 close-durability finding (claude lane): the durable close must
+    /// be recorded BEFORE the kill mutates any live state — the pre-fix lane
+    /// removed the session from its map, aborted its consumer, and awaited the
+    /// alias collection BEFORE the retire, so a restart or cancellation inside
+    /// those awaits left the row Bound for a pane the user had closed ("the
+    /// close has already altered live state" with nothing durable). The test
+    /// holds the `sessions` map guard (the removal's gate): the named
+    /// identity's retire must be observable while the removal parks there —
+    /// with the session still mapped (no live-state mutation yet).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_records_the_close_before_the_map_removal() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-close-before-removal"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-close-before-removal").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+
+        // The removal's gate: the test holds the sessions map guard, so the
+        // kill's removal parks on it. Everything BEFORE the removal — notably
+        // the durable close, which must NOT depend on that lock — still runs.
+        let sessions_guard = st.sessions.lock().await;
+
+        let st2 = st.clone();
+        let ph = placeholder.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Claude,
+                session_id: ph,
+                session_type: SessionType::Freshclaude,
+                cwd: None,
+            })
+            .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let close_recorded_first = loop {
+            let retired = fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), placeholder.clone()));
+            if retired {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            close_recorded_first,
+            "the durable close must be recorded BEFORE the map removal — the kill \
+             parked on the sessions lock without recording anything (a restart there \
+             leaves the row Bound behind an already-closing pane)"
+        );
+        assert!(
+            sessions_guard.contains_key(&placeholder),
+            "no live-state mutation yet: the session is still mapped while the removal parks"
+        );
+        assert!(
+            !kill.is_finished(),
+            "fixture: the kill is parked at the map removal"
+        );
+        drop(sessions_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the hold releases")
+            .expect("kill task completed");
+        assert!(
+            st.sessions.lock().await.get(&placeholder).is_none(),
+            "the full lane completed: the session is removed"
+        );
+    }
+
+    /// Delta-r6 close-durability (failures propagate), the claude lane: a kill
+    /// whose durable close could NOT be recorded must FAIL — the
+    /// `freshAgent.killed` answer reports `success:false` and NO live state
+    /// was touched (the session stays mapped, its consumer un-aborted; the
+    /// abort/removal/teardown never ran). Warn-and-continue would leave the
+    /// row Bound and recoverable while the client believes the pane closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_whose_durable_close_fails_reports_failure_and_touches_no_live_state() {
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        insert_fake_claude_session(&st, "sess-kill-fail").await;
+        // The ledger fails every write (disk-full/permission shape).
+        fake.set_fail_writes(true);
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: "sess-kill-fail".to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            st.sessions.lock().await.contains_key("sess-kill-fail"),
+            "a failed durable close must leave the session mapped (nothing torn down)"
+        );
+        assert!(
+            !fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("claude".to_string(), "sess-kill-fail".to_string())),
+            "sanity: the failed retire recorded nothing"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "a kill whose durable close failed must report success:false: {killed_frame}"
         );
     }
 

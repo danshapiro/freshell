@@ -1897,8 +1897,11 @@ impl PaneLedger {
         Ok(ClaimCommitOutcome::Committed)
     }
 
-    /// Best-effort retire on observed clean close (trigger e). Missing or
-    /// already-retired rows are Ok — this path is never load-bearing.
+    /// Retire a row Closed on an explicit close (trigger e). Missing or
+    /// already-retired rows are Ok (idempotent). Delta-r6: this close is
+    /// load-bearing for the kill/close lanes that call it — the durable
+    /// write precedes any live-state teardown, and the callers fail the
+    /// close (never a success acknowledgement) when it returns `Err`.
     ///
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): an explicit close
     /// is an intentional session END, so this call ALSO records the durable

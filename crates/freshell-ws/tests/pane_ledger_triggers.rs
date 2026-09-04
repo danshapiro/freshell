@@ -242,8 +242,10 @@ async fn resume_create_writes_binding_and_kill_retires_it_closed() {
     // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     // Trigger (a/e): a resume create (identity known at spawn) writes the
-    // binding row; an explicit user kill best-effort retires it `closed` —
-    // never load-bearing, but recorded.
+    // binding row; an explicit user kill retires it `closed`. Delta-r6: the
+    // durable close now precedes the process kill and a close-write failure
+    // FAILS the kill (the sibling `a_kill_whose_close_write_fails...` pin) —
+    // this pin is the success-path half of that contract.
     let dir = unique_ledger_dir("resume-retire");
     let (url, _registry, server_ledger) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
@@ -518,5 +520,100 @@ async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
     let tid = created["terminalId"].as_str().unwrap();
     registry.kill(tid);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Delta-r6 close-durability ordering (the ws terminal lane): the durable
+/// close must precede the process/identity teardown, and a close write that
+/// FAILS must FAIL the kill — the terminal stays running, the row stays
+/// Bound, and the client gets an error frame (never a silent success over a
+/// dead process with a live-looking Bound row). The pre-fix lane ran
+/// `kill_and_broadcast` FIRST and merely warned on the write failure — the
+/// registry row vanished and no error frame existed. Staging mirrors the
+/// create-side sibling above: create with the store writable, then drop the
+/// root to read-only so the close's tombstone/retire writes fail.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_whose_close_write_fails_leaves_the_terminal_running_and_answers_with_an_error() {
+    use std::os::unix::fs::PermissionsExt;
+    // DEV-0006 S5.e: plain-CLI codex path (sleeper CLI spec, no app-server).
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-close-fail");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let session_id = "11111111-2222-3333-4444-666666666666";
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-kill-close-fail",
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "sessionRef": { "provider": "codex", "sessionId": session_id },
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    assert_eq!(
+        server_ledger
+            .load_binding("codex", session_id)
+            .expect("resume create wrote the binding")
+            .state,
+        RowState::Bound,
+        "precondition: the row stands Bound before the kill"
+    );
+
+    // Break the store FULLY: write_row_atomic is temp-file+rename
+    // (`tabs_persist::atomic_write_durable`), and a rename needs write
+    // permission on the row's PARENT directory (`bindings/<enc(provider)>`,
+    // two levels down) — so every directory under the root goes read-only
+    // recursively. Both halves of the close (the kill tombstone's new file,
+    // the row's rename) now fail, and the "nothing durable" assertions below
+    // read the honest post-failure disk.
+    fn deny_writes_recursive(path: &std::path::Path) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap().flatten() {
+                deny_writes_recursive(&entry.path());
+            }
+        }
+    }
+    deny_writes_recursive(&dir);
+
+    let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(
+        err["code"], "INTERNAL_ERROR",
+        "a failed durable close must surface an error frame: {err}"
+    );
+    assert_eq!(err["terminalId"], terminal_id);
+
+    // Nothing was destroyed: the terminal still runs (self-consistent — a
+    // retried kill re-attempts the whole close), never a dead process beside
+    // a live-looking Bound row. And NOTHING durable recorded the close: the
+    // disk view (read by a fresh ledger instance, bypassing the live server's
+    // optimistically-updated write-through index) still has the row Bound
+    // with no kill tombstone.
+    assert!(
+        registry.probe(&terminal_id).is_some(),
+        "a failed durable close must leave the terminal running"
+    );
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert_eq!(
+        disk.load_binding("codex", session_id)
+            .expect("row on disk")
+            .state,
+        RowState::Bound,
+        "the failed close left nothing durable: the disk row stays Bound"
+    );
+    assert!(
+        disk.kill_tombstone_at("codex", session_id).is_none(),
+        "the failed close left no durable kill tombstone"
+    );
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+    registry.kill(&terminal_id);
     std::fs::remove_dir_all(&dir).ok();
 }

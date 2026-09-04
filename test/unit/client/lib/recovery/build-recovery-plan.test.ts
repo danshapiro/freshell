@@ -33,11 +33,148 @@ describe('buildRecoveryPlan', () => {
     expect(content.sessionRef).toEqual({ provider: 'claude', sessionId: 'S2' })
   })
 
-  it('closed panes come back fresh: no sessionRef, same cwd/mode', () => {
-    const [tab] = buildRecoveryPlan(inv([pane({ ledgerState: 'closed', mode: 'claude' })]))
+  // Delta-r6 F1 (closed verdicts are NOT restorable): the server's correlation
+  // work marks a pane whose session was closed between the last registry push
+  // and the browser-state loss with `ledgerState: "closed"` and a null
+  // effective sessionRef. Such a pane must be EXCLUDED from the plan, the
+  // advertised count, and the offer listing — accepting the offer restores
+  // exactly the sessions that were genuinely open. (The pre-fix behavior
+  // rebuilt a closed pane fresh — a never-open replacement session.)
+  it('a closed-verdict pane is EXCLUDED from the plan and the count', () => {
+    const inventory = inv([
+      pane(),
+      pane({ paneId: 'p2', ledgerState: 'closed', mode: 'claude' }),
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    const contents = leavesOf(tab.layout).map((l) => l.content)
+    expect(contents).toHaveLength(1)
+    expect(contents[0]).toMatchObject({ kind: 'terminal', mode: 'shell', initialCwd: '/w' })
+    expect(countRecoverablePanes(inventory)).toBe(1)
+  })
+
+  it('a tab whose every snapshot pane is closed produces NO plan (never an empty chain) and no count', () => {
+    const inventory = inv([pane({ ledgerState: 'closed', mode: 'claude' })])
+    expect(buildRecoveryPlan(inventory)).toHaveLength(0)
+    expect(countRecoverablePanes(inventory)).toBe(0)
+  })
+
+  // F1, the payload-divergence arm: a closed fresh-agent pane whose untouched
+  // snapshot payload still carries the stale sessionRef must never reclaim the
+  // killed session — the pane is excluded wholesale (the null top-level
+  // verdict ref is never overridden by the payload copy).
+  it('a closed fresh-agent pane is excluded even though its payload still carries the stale sessionRef', () => {
+    const inventory = inv([
+      pane(),
+      pane({
+        paneId: 'p2',
+        kind: 'fresh-agent',
+        mode: null,
+        payload: {
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          sessionRef: { provider: 'claude', sessionId: 'KILLED' },
+        },
+        sessionRef: null,
+        ledgerState: 'closed',
+      }),
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    const contents = leavesOf(tab.layout).map((l) => l.content)
+    expect(contents).toHaveLength(1)
+    expect(contents.every((c) => c.kind !== 'fresh-agent')).toBe(true)
+    expect(countRecoverablePanes(inventory)).toBe(1)
+  })
+
+  // The "plain un-correlated panes unchanged" guarantee (F1's scope bound): a
+  // pane with NO snapshot claim and NO correlation verdict (ledgerState
+  // "unknown", null ref) still rebuilds fresh with cwd/mode and no resume
+  // sessionRef — the pre-fix "come back fresh" behavior lives HERE, not on
+  // closed verdicts.
+  it('plain un-correlated panes (unknown verdict, no claim) still come back fresh: no sessionRef, same cwd/mode', () => {
+    const [tab] = buildRecoveryPlan(inv([pane({ ledgerState: 'unknown', mode: 'claude' })]))
     const content = (tab.layout as { content: Record<string, unknown> }).content
     expect(content.sessionRef).toBeUndefined()
     expect(content).toMatchObject({ mode: 'claude', initialCwd: '/w' })
+  })
+
+  // Delta-r6 F2 (server-authoritative verdicts beat the stale payload copy):
+  // the server deliberately leaves the snapshot payload untouched and puts
+  // the D4-corrected identity at the TOP level — a superseded pane's payload
+  // sessionRef names the OLD session while the top-level ref names the
+  // corrected successor. The fresh-agent reconstruction must resume the
+  // top-level ref (FreshAgentView sends content.sessionRef in
+  // freshAgent.create) — never the payload's stale one.
+  it('a superseded fresh-agent pane resumes the TOP-LEVEL corrected sessionRef, not the payload copy', () => {
+    const [tab] = buildRecoveryPlan(inv([pane({
+      kind: 'fresh-agent',
+      mode: null,
+      payload: {
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        initialCwd: '/proj',
+        sessionRef: { provider: 'claude', sessionId: 'OLD' },
+      },
+      sessionRef: { provider: 'claude', sessionId: 'S2' },
+      ledgerState: 'bound',
+    })]))
+    const content = (tab.layout as { content: Record<string, unknown> }).content
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionRef: { provider: 'claude', sessionId: 'S2' },
+      initialCwd: '/proj',
+    })
+  })
+
+  // F2, the no-divergence control: a fresh-agent pane whose verdict simply
+  // confirms the claim restores with that (identical) ref — authority and
+  // payload agree, behavior matches the pre-fix shape.
+  it('a fresh-agent pane whose top-level verdict ref matches the payload restores with it (no divergence)', () => {
+    const [tab] = buildRecoveryPlan(inv([pane({
+      kind: 'fresh-agent',
+      mode: null,
+      payload: {
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_1' },
+      },
+      sessionRef: { provider: 'opencode', sessionId: 'ses_1' },
+      ledgerState: 'bound',
+    })]))
+    const content = (tab.layout as { content: Record<string, unknown> }).content
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_1' },
+    })
+  })
+
+  // F2, the live arm: the top-level `live` verdict marks a fresh-agent pane
+  // whose session is still running on the server (D7) — restoring it would
+  // RESUME the live session. Non-restorable: excluded from the plan and the
+  // count, exactly like a closed verdict. (Live TERMINAL panes keep the D7
+  // behavior — recreated fresh without the resume ref — pinned by the
+  // dedicated test below.)
+  it('a LIVE fresh-agent pane is EXCLUDED from the plan and the count (never resumed mid-flight)', () => {
+    const inventory = inv([
+      pane(),
+      pane({
+        paneId: 'p2',
+        kind: 'fresh-agent',
+        mode: null,
+        payload: {
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+        },
+        sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+        ledgerState: 'bound',
+        live: true,
+      }),
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    const contents = leavesOf(tab.layout).map((l) => l.content)
+    expect(contents).toHaveLength(1)
+    expect(contents.every((c) => c.kind !== 'fresh-agent')).toBe(true)
+    expect(countRecoverablePanes(inventory)).toBe(1)
   })
 
   it('three panes -> right-leaning binary split chain', () => {
@@ -68,11 +205,15 @@ describe('buildRecoveryPlan', () => {
   })
 
   it('fresh-agent restoreError is stripped so normalize keeps the sessionRef', () => {
+    // Delta-r6 F2: the effective ref lives at the TOP level (the payload's
+    // copy is ignored); the fixture carries the agree-on-both-sides real
+    // shape (a payload restoreError arriving with a "bound" verdict).
     const [tab] = buildRecoveryPlan(inv([pane({ kind: 'fresh-agent',
-      payload: { sessionRef: { provider: 'freshclaude', sessionId: 'F1' }, restoreError: 'stale' }, mode: null, cwd: null })]))
+      payload: { sessionType: 'freshclaude', provider: 'claude', sessionRef: { provider: 'claude', sessionId: 'F1' }, restoreError: 'stale' },
+      sessionRef: { provider: 'claude', sessionId: 'F1' }, ledgerState: 'bound', mode: null, cwd: null })]))
     const content = (tab.layout as { content: Record<string, unknown> }).content
     expect(content.restoreError).toBeUndefined()
-    expect(content).toMatchObject({ kind: 'fresh-agent', sessionRef: { provider: 'freshclaude', sessionId: 'F1' } })
+    expect(content).toMatchObject({ kind: 'fresh-agent', sessionRef: { provider: 'claude', sessionId: 'F1' } })
   })
 
   it('extension and picker payloads pass through', () => {

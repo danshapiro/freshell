@@ -304,9 +304,14 @@ pub trait PaneIdentitySink: Send + Sync {
     /// (`UNSNAPSHOTTED_BINDING_GRACE_MS`) reproduced exactly the
     /// never-actually-open restore the task exists to kill. Idempotent (an
     /// unknown or already-retired row is a no-op), awaited like every
-    /// non-rollback lane (failures surface as `Err` for the caller to
-    /// warn-log, never a kill blocker). Same discipline as the WS
-    /// `terminal.kill` path's `retire_closed` ("P1.8 trigger (e)").
+    /// non-rollback lane. Delta-r6 failure propagation: `Err` (disk-full,
+    /// permission, join failure) is a KILL FAILURE, never warn-and-continue —
+    /// the caller reports `success:false` and leaves all live state
+    /// untouched (the session stays live and Bound, self-consistent, and a
+    /// retried kill re-attempts): acknowledging a close that was never
+    /// recorded leaves the row Bound and offerable while the client believes
+    /// the pane is gone. Same discipline as the WS `terminal.kill` path's
+    /// `retire_closed` ("P1.8 trigger (e)", same failure rule).
     ///
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): ledger-side this
     /// ALSO records the durable KILL TOMBSTONE for the identity (same
