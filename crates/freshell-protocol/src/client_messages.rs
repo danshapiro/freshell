@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 36 discriminants).
+//! Client → server messages (`ClientMessage`, 37 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -34,6 +34,10 @@ pub enum ClientMessage {
     TerminalAutoResumeCancel(TerminalAutoResumeCancel),
     #[serde(rename = "terminal.detach")]
     TerminalDetach(TerminalDetach),
+    /// Delta-r7-r2 (Findings F1+F2): the dedicated durable pane-close
+    /// evidence message (see [`PaneClosed`]). Additive.
+    #[serde(rename = "pane.closed")]
+    PaneClosed(PaneClosed),
     #[serde(rename = "terminal.input")]
     TerminalInput(TerminalInput),
     #[serde(rename = "terminal.resize")]
@@ -95,7 +99,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 36] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 37] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -119,6 +123,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 36] = [
     "hoststats.subscribe",
     "hoststats.unsubscribe",
     "opencode.activity.list",
+    "pane.closed",
     "pane.reconcile.request",
     "ping",
     "sessions.prefs",
@@ -321,21 +326,43 @@ pub struct TerminalAttach {
     pub priority: Option<TerminalAttachPriority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_seq: Option<i64>,
+    /// The attaching pane's createRequestId (delta-r7-r2, Finding F3): when
+    /// present, the server re-stamps the terminal's Bound ledger row onto
+    /// THIS pane's identity BEFORE the attach is observable (a sidebar
+    /// reattach becomes the row's pane key, so the OLD pane's close record
+    /// keeps covering only the old pane). Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
+    /// The attaching pane's tab id (delta-r7-r2, Finding F3): composes the
+    /// re-stamp's provenance `tabKey`, so the row's attribution can ADVANCE
+    /// to the attach's true tab and receipt time under the full-triple rule.
+    /// Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalDetach {
     pub terminal_id: String,
-    /// The closing pane's createRequestId (delta-round-7, Finding F2): when a
-    /// PANE-close detach carries it, the server journals a durable
-    /// NON-retiring pane-close record keyed by the createRequestId
-    /// BEFORE/ALONGSIDE the detach (the session survives — nothing is fenced
-    /// or retired). Absent on every other detach shape (legacy clients,
-    /// server-driven handle swaps, reconcile folds): additive optional, no
-    /// record is written.
+}
+
+/// Delta-r7-r2 (Findings F1+F2) — the dedicated durable pane-close evidence
+/// message. EVERY user- or system-initiated pane removal (pane-X,
+/// replace-pane, whole-tab close) sends ONE per removed terminal-pane
+/// identity, keyed by the pane's `createRequestId` (present from creation —
+/// never absent), `terminalId` carried when the pane has one (absent on the
+/// in-flight-create close shape). The server journals ONE durable,
+/// NON-retiring pane-close record per message (`pane-detach:<crid>` — the
+/// session survives: nothing is fenced or retired). The detach channel
+/// itself stays identity-driven: detach is about the terminal, never the
+/// pane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneClosed {
+    pub create_request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub create_request_id: Option<String>,
+    pub terminal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

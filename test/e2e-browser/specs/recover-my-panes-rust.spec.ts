@@ -78,6 +78,22 @@
  * still-Bound row was admitted and the offer recreated a pane the user had
  * explicitly closed.
  *
+ * Scenario 8 (delta-r7-round-2, F3 — close → sidebar reattach → early loss):
+ * a claude CLI pane is created beside the shell and closed via the PLAIN
+ * pane-X (the non-retiring close record stands, keyed by the OLD pane's
+ * createRequestId), then REOPENED through the sidebar session list in split
+ * mode — the new pane mints a NEW createRequestId and attaches to the SAME
+ * still-running terminal, and the attach-carried pane identity re-stamps the
+ * Bound row (new createRequestId, advanced attribution). The browser is then
+ * lost WITHOUT a server restart and before any snapshot containing the
+ * reopened pane survives (deterministic shaping): the row reaches the offer
+ * ONLY through the ledgerOnly pipeline and MUST be offered again (the old
+ * pane's close record covers only the old pane), live, with the original
+ * terminal id for the reattach arm; accepting reattaches it (never a
+ * respawn). Pre-fix the row kept the old close-covered createRequestId AND
+ * the close record's live-terminal arm keyed it, so the genuinely re-opened
+ * session was suppressed from the offer.
+ *
  * Fixture shapes (fake CLI, config seeding, shell-picker choreography) are
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
  * per-spec-ownership convention. The freshclaude helpers
@@ -1372,6 +1388,327 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     ).toBe(false)
 
     await ctxB.close()
+    await fs.rm(markerDir, { recursive: true, force: true })
+  })
+
+  /**
+   * Delta-r7-round-2 (Finding F3) — the close → SIDEBAR-REATTACH → early-loss
+   * lapse. A claude CLI pane is created beside the shell and closed via the
+   * PLAIN pane-X (the durable NON-retiring close record stands, keyed by the
+   * OLD pane's createRequestId — scenario 7's shape), then REOPENED through
+   * the sidebar session list in split mode: the new pane mints a NEW
+   * createRequestId and attaches to the SAME still-running terminal (whichever
+   * arm drives it — the live-handle direct mount or the sessionRef
+   * BoundElsewhere claim — both converge on `terminal.attach`, which carries
+   * the new pane's createRequestId+tabId). The attach re-stamps the Bound row
+   * onto the NEW pane's identity (the F3 restamp). The browser is then lost
+   * WITHOUT a server restart and BEFORE any snapshot containing the reopened
+   * pane survives (deterministic shaping): the row reaches the offer ONLY
+   * through the ledgerOnly pipeline and MUST be offered — the old pane's
+   * close covers only the old pane (the CRID arm re-keyed away; the
+   * live-terminal arm keys only CRID-less rows). Pre-fix the row kept the old
+   * close-covered createRequestId AND the record's terminal id, so both arms
+   * suppressed a genuinely re-opened session.
+   *
+   * Placement: after scenario 7 — it wipes the evidence base (safe at this
+   * serial boundary) and needs no later state.
+   */
+  test('scenario 8: close → sidebar reattach on the SAME terminal → early loss — the reopened pane is offered and reattached, never suppressed (delta-r7-r2 F3)', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+
+    // 1. Re-base the evidence base (the scenario 6/7 idiom: safe while no
+    //    client is connected at this serial boundary).
+    const snapshotsRoot = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    await fs.rm(snapshotsRoot, { recursive: true, force: true })
+
+    // 2. Context A: boot shell pane, then SPLIT a claude CLI pane beside it
+    //    (same producer shape as scenario 7).
+    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageA = await ctxA.newPage()
+    traceInventoryFailures(pageA, 'reattach-lapse-A')
+    const harnessA = await connect(pageA, info)
+    await selectShellIfPickerShowing(pageA)
+    await expect(pageA.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    const tabAId = (await harnessA.getActiveTabId())!
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reattach-lapse-cli-'))
+    const argvCountBeforeCreate = (await readArgvLog(argLog)).length
+    const picker = await openPanePicker(pageA)
+    await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
+    const directoryInput = pageA.getByRole('combobox', { name: /Starting directory/i })
+    await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+    await directoryInput.fill(markerDir)
+    await directoryInput.press('Enter')
+
+    // 3. The binding row is durable + attributed (scenario 7's premise read).
+    let sessionId = ''
+    await expect(async () => {
+      const sid = sessionIdsOf((await readArgvLog(argLog)).slice(argvCountBeforeCreate))[0]
+      expect(sid, 'context A fake claude received a pre-allocated --session-id').toBeTruthy()
+      sessionId = sid!
+    }).toPass({ timeout: 30_000 })
+    const rowPath = path.join(
+      capturedHome, '.freshell', 'pane-ledger', 'bindings', 'claude', `${sessionId}.json`,
+    )
+    await expect(async () => {
+      const raw = await fs.readFile(rowPath, 'utf8').catch(() => '')
+      const row = raw ? (JSON.parse(raw) as { state?: unknown; lastAttributedAt?: unknown }) : {}
+      expect(row.state).toBe('bound')
+      expect(typeof row.lastAttributedAt).toBe('number')
+    }).toPass({ timeout: 15_000 })
+
+    // 4. The pane's identities (close-record key + shaping needles).
+    let claudeLeafA: any
+    let claudeTerminalIdA: string | undefined
+    let claudeCrIdA = ''
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessA.getPaneLayout(tabAId))
+      claudeLeafA = leaves.find((l) => l.content?.kind === 'terminal' && l.content?.mode === 'claude')
+      claudeTerminalIdA = claudeLeafA?.content?.terminalId
+      claudeCrIdA = claudeLeafA?.content?.createRequestId ?? ''
+      expect(claudeTerminalIdA, "A's claude pane owns a live terminal id").toBeTruthy()
+      expect(claudeCrIdA, "A's claude pane owns its createRequestId").toBeTruthy()
+    }).toPass({ timeout: 15_000 })
+
+    // 5. Seed the claude session history for the sidebar entry the reattach
+    //    clicks (two user turns — a single-user-message session is flagged
+    //    isNonInteractive and hidden by the directory; the auto-title-rust
+    //    seed's shape). Written AFTER the session id is minted; the server's
+    //    live watcher indexes it without a restart.
+    const markerTitle = 'F3 reattach sidebar marker session'
+    const sessionDir = path.join(capturedHome, '.claude', 'projects', 'f3-reattach-project')
+    await fs.mkdir(sessionDir, { recursive: true })
+    const seededLines: string[] = [
+      JSON.stringify({
+        type: 'system', subtype: 'init', session_id: sessionId,
+        uuid: `${sessionId}-system`, timestamp: '2026-09-04T08:00:00.000Z',
+        cwd: markerDir, git: { branch: 'main', dirty: false },
+      }),
+    ]
+    let previousUuid = `${sessionId}-system`
+    for (const [turnIndex, userMessage] of [markerTitle, 'Any progress on that request?'].entries()) {
+      const userUuid = `${sessionId}-user-${turnIndex + 1}`
+      const assistantUuid = `${sessionId}-assistant-${turnIndex + 1}`
+      seededLines.push(JSON.stringify({
+        parentUuid: previousUuid, cwd: markerDir, sessionId,
+        version: '2.1.23', gitBranch: 'main', type: 'user',
+        message: { role: 'user', content: userMessage },
+        uuid: userUuid, timestamp: `2026-09-04T08:0${turnIndex}:01.000Z`,
+      }))
+      seededLines.push(JSON.stringify({
+        parentUuid: userUuid, cwd: markerDir, sessionId,
+        version: '2.1.23', gitBranch: 'main', type: 'assistant',
+        message: {
+          role: 'assistant', model: 'claude-opus-4-6-20260301',
+          content: [{ type: 'text', text: `Working on it (${turnIndex + 1}).` }],
+        },
+        uuid: assistantUuid, timestamp: `2026-09-04T08:0${turnIndex}:02.000Z`,
+      }))
+      previousUuid = assistantUuid
+    }
+    await fs.writeFile(path.join(sessionDir, `${sessionId}.jsonl`), `${seededLines.join('\n')}\n`)
+
+    // 6. Split-open mode for the sidebar click (the reattach must land IN
+    //    tabA — the surviving tab — so the re-stamped row's tabKey names a
+    //    tab the retained union knows; a brand-new tab would leave the
+    //    judgment nothing placeable — the placement clause, not the finding,
+    //    would then own the exclusion).
+    await pageA.evaluate(() => {
+      ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { sessionOpenMode: 'split' } },
+      })
+    })
+
+    // 7. Close via the PLAIN pane-X (the shell sibling keeps tabA alive):
+    //    the durable NON-retiring close record keyed by the OLD CRID lands.
+    await pageA
+      .locator(`[data-pane-id="${claudeLeafA.id}"][data-context='pane'] button[title='Close pane']`)
+      .click()
+    await expect(async () => {
+      const dir = path.join(capturedHome, '.freshell', 'pane-ledger', 'close-envelopes')
+      const files = await fs.readdir(dir).catch(() => [] as string[])
+      let found: any = null
+      for (const name of files.filter((f) => f.endsWith('.json'))) {
+        const body = await fs.readFile(path.join(dir, name), 'utf8').catch(() => '')
+        try {
+          found = JSON.parse(body)
+        } catch {
+          continue
+        }
+        if (found?.createRequestId === claudeCrIdA) break
+        found = null
+      }
+      expect(found, `the old pane's close record (createRequestId=${claudeCrIdA})`).toBeTruthy()
+    }).toPass({ timeout: 15_000 })
+
+    // 8. THE REATTACH: click the session in the sidebar. The directory
+    //    labels the row by its cwd basename (the marker dir is unique per
+    //    run); split mode puts the new pane IN tabA, attached to the SAME
+    //    terminal (the live-handle direct mount when the session reads
+    //    running, else the sessionRef claim's BoundElsewhere arm — both
+    //    converge on `terminal.attach`).
+    const markerDirBasename = path.basename(markerDir)
+    const sessionItem = pageA.getByRole('button', { name: new RegExp(markerDirBasename) }).first()
+    await expect(sessionItem).toBeVisible({ timeout: 30_000 })
+    await sessionItem.click()
+    let claudeCrIdReattached = ''
+    let claudePaneIdReattached = ''
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessA.getPaneLayout(tabAId))
+      const reattached = leaves.find(
+        (l) => l.content?.kind === 'terminal'
+          && l.content?.mode === 'claude'
+          && l.content?.terminalId === claudeTerminalIdA,
+      )
+      expect(
+        reattached,
+        'the reopened pane lands IN tabA attached to the SAME still-running terminal',
+      ).toBeTruthy()
+      expect(
+        reattached?.content?.createRequestId,
+        'the reopen minted a NEW pane identity',
+      ).not.toBe(claudeCrIdA)
+      claudeCrIdReattached = reattached?.content?.createRequestId ?? ''
+      claudePaneIdReattached = reattached?.id ?? ''
+    }).toPass({ timeout: 30_000 })
+
+    // 9. THE F3 RESTAMP PIN: the Bound row re-keys onto the NEW pane's
+    //    createRequestId, and its attribution clock advanced to the attach's
+    //    receipt (never backwards). Pre-fix the attach carried no pane
+    //    identity and performed no ledger write, so this poll timed out with
+    //    the row still keyed by the old close-covered CRID.
+    let reattachedAttributedAt = 0
+    await expect(async () => {
+      const raw = await fs.readFile(rowPath, 'utf8')
+      const row = JSON.parse(raw) as {
+        state?: unknown
+        createRequestId?: unknown
+        lastAttributedAt?: unknown
+      }
+      expect(row.state).toBe('bound')
+      expect(
+        row.createRequestId,
+        'the row re-keys onto the reattaching pane (the old pane stays closed)',
+      ).toBe(claudeCrIdReattached)
+      expect(typeof row.lastAttributedAt).toBe('number')
+      reattachedAttributedAt = row.lastAttributedAt as number
+    }).toPass({ timeout: 15_000 })
+
+    // The argv-log watermark for the anti-respawn assertions below: NOTHING
+    // spawned since the original create (the sidebar reattach attached — it
+    // never spawned a second process).
+    const argvCountAtReattach = (await readArgvLog(argLog)).length
+    expect(
+      (await readArgvLog(argLog)).slice(argvCountBeforeCreate).length,
+      'exactly one claude process exists (the original; the reattach attached, never spawned)',
+    ).toBe(1)
+
+    // 10. THE EARLY LOSS: the browser dies WITHOUT a server restart (the PTYs
+    //     keep running) and BEFORE any snapshot containing the reopened pane
+    //     survives.
+    await ctxA.close()
+    await waitForRecoverable(info)
+
+    // 11. Deterministic shaping: remove every retained generation referencing
+    //     ANY of the pane's identities across BOTH its epochs (old AND new
+    //     CRIDs/paneIds); the surviving keepsake generation holds tabA with
+    //     only the shell pane. The row's attribution is the attach's receipt
+    //     now, so newest-per-client must sit inside grace of THAT.
+    await shapeEvidenceExcluding({
+      snapshotsRoot,
+      needles: [
+        sessionId,
+        claudeCrIdA,
+        claudeCrIdReattached,
+        claudeTerminalIdA as string,
+        claudeLeafA.id as string,
+        claudePaneIdReattached,
+      ],
+      keepNeedles: [tabAId],
+      latestAllowedMs: reattachedAttributedAt + 7_000,
+      premiseLabel: `reattached lastAttributedAt=${reattachedAttributedAt}`,
+    })
+
+    // 12. Probe the inventory BEFORE any page is opened. THE F3 PIN: the row
+    //     must be OFFERED — live, with the still-running terminal for the
+    //     client-side reattach arm — while NO union pane references it.
+    const probe = await request.newContext({
+      baseURL: info.baseUrl,
+      extraHTTPHeaders: { 'x-auth-token': info.token },
+    })
+    try {
+      const res = await probe.get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
+      expect(res.ok(), `inventory probe must succeed (status ${res.status()})`).toBe(true)
+      const body = (await res.json()) as {
+        recoverable?: unknown
+        device?: unknown
+        ledgerOnly?: Array<{ sessionId?: unknown; live?: unknown; liveTerminalId?: unknown; tabKey?: unknown }>
+      }
+      expect(body.recoverable).toBe(true)
+      const deviceJson = JSON.stringify(body.device ?? null)
+      expect(deviceJson.includes(sessionId), 'no union pane may reference the reopened pane (session id)').toBe(false)
+      expect(
+        deviceJson.includes(claudeCrIdReattached),
+        'no union pane may reference the reopened pane (new createRequestId)',
+      ).toBe(false)
+      const entry = (body.ledgerOnly ?? []).find((e) => e.sessionId === sessionId)
+      expect(
+        entry,
+        `the REOPENED row ${sessionId} must be offered — the old pane's close covers only the old pane ` +
+          `(got ledgerOnly=${JSON.stringify(body.ledgerOnly)})`,
+      ).toBeTruthy()
+      expect(entry!.live, 'the entry carries the live verdict (reattach routing)').toBe(true)
+      expect(entry!.liveTerminalId, 'the entry forwards the still-running terminal').toBe(claudeTerminalIdA)
+      expect(String(entry!.tabKey), 'the entry joins the ORIGINAL (surviving) tab').toContain(tabAId)
+    } finally {
+      await probe.dispose()
+    }
+
+    // 13. The offer names the reattach (the live note); ACCEPTING puts the
+    //     pane back on the ORIGINAL terminal — never a second process.
+    const { ctx: ctxE, page: pageE } = await openFreshContextWithOffer(browser, 'reattach-lapse-E')
+    const panelE = pageE.getByTestId('recovery-offer-panel')
+    await expect(panelE.getByRole('listitem').first()).toBeVisible({ timeout: 15_000 })
+    await expect(
+      panelE.locator('ul li', { hasText: /: claude — \S*reattach-lapse-cli-/ }),
+    ).toHaveCount(1)
+    await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
+
+    await pageE.getByTestId('recovery-accept').click()
+    await expect(panelE).toHaveCount(0)
+    await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    await expect(async () => {
+      const ePanes = await pageE.evaluate(() => {
+        const harness = (window as any).__FRESHELL_TEST_HARNESS__
+        const state = harness?.getState()
+        const ids: string[] = []
+        for (const tab of state?.tabs?.tabs ?? []) {
+          const walk = (node: any): void => {
+            if (!node) return
+            if (node.type === 'leaf') {
+              if (node.content?.kind === 'terminal' && node.content?.terminalId) {
+                ids.push(node.content.terminalId)
+              }
+              return
+            }
+            for (const child of node.children ?? []) walk(child)
+          }
+          walk(state?.panes?.layouts?.[tab.id])
+        }
+        return ids
+      })
+      expect(
+        ePanes,
+        'the recovered claude pane reattached to the ORIGINAL still-running terminal',
+      ).toContain(claudeTerminalIdA!)
+    }).toPass({ timeout: 30_000 })
+    expect(
+      (await readArgvLog(argLog)).slice(argvCountAtReattach),
+      'the accept reattached — nothing spawned past the watermark',
+    ).toHaveLength(0)
+
+    await ctxE.close()
     await fs.rm(markerDir, { recursive: true, force: true })
   })
 

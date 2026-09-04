@@ -496,6 +496,16 @@ pub fn build_inventory(
     // liveTerminalId wholesale (and a re-opened session's pane re-references
     // the row through the snapshot unions), so the offer returns exactly
     // when the session is genuinely open again.
+    //
+    // Delta-r7-round-2 (Finding F3): the DETACH terminal arm keys ONLY rows
+    // with NO advisory createRequestId — the arm's own stated purpose (rows
+    // the conn-less resolution lane wrote without it). A row whose
+    // createRequestId is PRESENT and NOT covered belongs to a pane the
+    // ledger has since re-keyed (the attach restamp: a new pane reattached
+    // the SAME still-running terminal) — the old pane's close record covers
+    // the OLD pane alone, and the terminal arm must never reach across to
+    // the re-opened one (terminals are never re-minted, but they ARE
+    // re-attached).
     let row_close_covered = |r: &BindingRow| -> bool {
         let crid_hit = r
             .create_request_id
@@ -504,6 +514,9 @@ pub fn build_inventory(
             .is_some_and(|id| covered_crids.contains(id));
         if crid_hit {
             return true;
+        }
+        if r.create_request_id.as_deref().is_some_and(|id| !id.is_empty()) {
+            return false; // a keyed row answers its key alone (the reattach lapse)
         }
         r.live_terminal_id
             .as_deref()

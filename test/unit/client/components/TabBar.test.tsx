@@ -681,13 +681,18 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      // Delta-round-7 (Finding F2): the plain tab close is a pane close, so
-      // the detach carries the closing pane's createRequestId — the server
-      // journals the durable NON-retiring pane-close record keyed by it.
+      // Delta-r7-r2 (Finding F2): the plain tab close is a pane close, so its
+      // durable NON-retiring pane-close evidence rides the dedicated
+      // pane.closed message keyed by the closing pane's createRequestId, while
+      // the detach stays identity-driven (about the terminal, never the pane).
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'pane.closed',
+        createRequestId: 'req-pane-1',
+        terminalId: 'term-123',
+      })
       expect(mockSend).toHaveBeenCalledWith({
         type: 'terminal.detach',
         terminalId: 'term-123',
-        createRequestId: 'req-pane-1',
       })
     })
 
@@ -776,10 +781,16 @@ describe('TabBar', () => {
       const detachMessages = mockSend.mock.calls
         .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
-      // The single pane-close detach carries the closed pane's createRequestId
-      // (delta-round-7 F2) — exactly ONE message either way.
+      // Exactly ONE identity-driven detach (never a CRID rider — delta-r7-r2
+      // F2); the pane-close evidence is the separate pane.closed message.
       expect(detachMessages).toEqual([
-        { type: 'terminal.detach', terminalId: 'term-123', createRequestId: 'req-pane-1' },
+        { type: 'terminal.detach', terminalId: 'term-123' },
+      ])
+      const paneClosed = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; createRequestId?: string; terminalId?: string })
+        .filter((msg) => msg?.type === 'pane.closed')
+      expect(paneClosed).toEqual([
+        { type: 'pane.closed', createRequestId: 'req-pane-1', terminalId: 'term-123' },
       ])
     })
 
@@ -902,18 +913,27 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      // Delta-round-7 (Finding F2): each pane-close detach carries ITS OWN
-      // pane's createRequestId (the durable non-retiring close record's key).
-      expect(mockSend).toHaveBeenCalledTimes(2)
+      // Delta-r7-r2 (Finding F2): EVERY removed pane's close evidence lands
+      // FIRST (one pane.closed per removed pane identity), then the
+      // identity-driven detaches (one per vanished terminal).
+      expect(mockSend).toHaveBeenCalledTimes(4)
       expect(mockSend).toHaveBeenNthCalledWith(1, {
-        type: 'terminal.detach',
-        terminalId: 'term-a',
+        type: 'pane.closed',
         createRequestId: 'req-pane-1',
+        terminalId: 'term-a',
       })
       expect(mockSend).toHaveBeenNthCalledWith(2, {
+        type: 'pane.closed',
+        createRequestId: 'req-pane-2',
+        terminalId: 'term-b',
+      })
+      expect(mockSend).toHaveBeenNthCalledWith(3, {
+        type: 'terminal.detach',
+        terminalId: 'term-a',
+      })
+      expect(mockSend).toHaveBeenNthCalledWith(4, {
         type: 'terminal.detach',
         terminalId: 'term-b',
-        createRequestId: 'req-pane-2',
       })
     })
 

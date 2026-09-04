@@ -61,7 +61,7 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
+    PaneClosed, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
     TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly,
     TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
     LEGACY_RESUME_IDENTITY_REFUSAL,
@@ -964,6 +964,17 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
+                // Delta-r7-round-2 (Finding F3) — the attach-carried pane
+                // identity restamps the terminal's Bound ledger row BEFORE
+                // the attach is observable (the kill lane's
+                // durable-before-observable order): a sidebar reattach mints
+                // a new client createRequestId, and without the re-stamp the
+                // row keeps the OLD pane's close-covered key (the durable
+                // pane-close evidence for the pane the user X-closed) and the
+                // recovery inventory would suppress a genuinely re-opened
+                // session lost before its first snapshot.
+                let asserted_at = now_ms();
+                maybe_restamp_on_attach(&attach, state, conn_identity, asserted_at).await;
                 match handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1) {
                     Some(err) => send(ws_tx, &err).await,
                     None => true,
@@ -971,6 +982,10 @@ async fn handle_client_text(
             } else {
                 send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
             }
+        }
+        ClientMessage::PaneClosed(closed) => {
+            handle_pane_closed(&closed, state).await;
+            true
         }
         ClientMessage::TerminalInput(input) => {
             // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
@@ -5086,6 +5101,73 @@ fn wrap_terminal_spawn_error(
     }
 }
 
+/// Delta-r7-round-2 (Finding F3) — the pane-identity restamp an attach
+/// performs FIRST, when the attach carries the attaching pane's
+/// `createRequestId`. A pane reattaching to a still-running terminal (the
+/// sidebar background-session Attach; the recovery offer's reattach arm; any
+/// viewport mount) mints a fresh client createRequestId, and the terminal's
+/// Bound ledger row must follow it: otherwise the row keeps the OLD pane's
+/// close-covered key (the durable `pane.closed` evidence for the pane the
+/// user X-closed) and the recovery inventory suppresses a genuinely
+/// re-opened session lost before its first snapshot. The ordering is the
+/// kill lane's durable-before-observable discipline: the row write lands
+/// before `registry.attach` may enqueue `terminal.attach.ready`. Gated on a
+/// LIVE registry id (a doomed INVALID_TERMINAL_ID attach never re-points a
+/// row at a dead terminal) and no-op inside the ledger when the row already
+/// belongs to this pane (every keepalive attach would otherwise fsync it).
+/// Failures never block the attach (the attach's own semantics are
+/// unaffected) — they surface through the ledger's standard loud degradation
+/// seam.
+async fn maybe_restamp_on_attach(
+    attach: &TerminalAttach,
+    state: &WsState,
+    conn_identity: &ConnectionIdentity,
+    asserted_at: i64,
+) {
+    let Some(create_request_id) = attach
+        .create_request_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    else {
+        return; // legacy/headless attach: nothing asserted
+    };
+    if !state.registry.exists(&attach.terminal_id) {
+        return; // the attach INVALID_TERMINAL_IDs — never re-point a row at a dead terminal
+    }
+    let Some(canonical) = state.identity.session_ref_for(&attach.terminal_id) else {
+        return; // unresolved identity window: no row key to restamp
+    };
+    let provenance = conn_identity.bind_provenance(attach.tab_id.as_deref(), asserted_at);
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let terminal_id = attach.terminal_id.clone();
+    let write_crid = create_request_id.to_string();
+    let now = now_ms();
+    let result = spawn_blocking_in_span(move || {
+        ledger.note_pane_reattach(&crate::pane_ledger::ReattachWrite {
+            provider: &canonical.provider,
+            session_id: &canonical.session_id,
+            terminal_id: &terminal_id,
+            create_request_id: &write_crid,
+            provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                crate::pane_ledger::ProvenanceStamps {
+                    client_instance_id: provenance.client_instance_id.as_deref(),
+                    device_id: provenance.device_id.as_deref(),
+                    tab_key: provenance.tab_key.as_deref(),
+                    asserted_at: provenance.asserted_at,
+                },
+            ),
+            now_ms: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(std::io::Error::other(format!(
+            "attach restamp task join failed: {join_err}"
+        )))
+    });
+    crate::pane_ledger::surface_write_failure(state, &attach.terminal_id, result.map(|_| ()))
+}
+
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
 /// connection to it: the registry enqueues `terminal.attach.ready`, replays the
 /// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
@@ -5421,77 +5503,82 @@ fn handle_resize(resize: TerminalResize, state: &WsState) {
 /// `terminal.detach` — drop THIS connection's subscription (the terminal keeps
 /// running as a background session); reply `terminal.detached`.
 ///
-/// Delta-round-7 (Finding F2): a PANE-close detach carries the pane's
-/// `createRequestId` and journals ONE durable, NON-retiring pane-close record
-/// keyed by it BEFORE the detach is processed (BEFORE/ALONGSIDE the detach,
-/// mirroring the kill lane's durable-close-before-teardown order). The record
-/// fences and retires NOTHING (the session survives by design — sidebar
-/// reattach); without it, a created-then-closed-within-the-grace-window pane
-/// was indistinguishable from created-then-crashed, and the recovery offer
-/// could later recreate a pane the user explicitly removed. The write runs on
-/// the blocking pool (the kill lane's fsync idiom); unlike the kill lane a
-/// write failure does NOT fail the detach (the session state is already
-/// consistent — nothing ends) — it surfaces through the ledger's standard
-/// loud degradation seam instead. A CRID-less detach (legacy clients, the
-/// reconcile/server-swap folds, cleanup of server-dead handles) writes
-/// nothing, exactly as before.
+/// The detach is IDENTITY-DRIVEN ONLY (delta-r7-round-2, Findings F1+F2): it
+/// carries no pane identity and writes no ledger evidence. The durable
+/// pane-close record rides the dedicated [`pane.closed`](handle_pane_closed)
+/// message — close evidence is about the PANE (every removed pane identity
+/// counts, terminalId-less in-flight creates included), while detach is
+/// about the TERMINAL (last-reference subscription release).
 async fn handle_detach(
     detach: &TerminalDetach,
     ws_tx: &mut WsSink,
     state: &WsState,
     conn_id: u64,
 ) -> bool {
-    if let Some(create_request_id) = detach.create_request_id.as_deref() {
-        if !create_request_id.is_empty() {
-            let ledger = std::sync::Arc::clone(&state.pane_ledger);
-            let crid = create_request_id.to_string();
-            let tid = detach.terminal_id.clone();
-            let now = now_ms();
-            let result = spawn_blocking_in_span(move || {
-                ledger.close_pane_detached(&crid, Some(&tid), now)
-            })
-            .await
-            .unwrap_or_else(|join_err| {
-                Err(crate::pane_ledger::CloseEnvelopeError::Clean(
-                    std::io::Error::other(format!("detach close task join failed: {join_err}")),
-                ))
-            });
-            match result {
-                Ok(()) => {}
-                Err(err) if err.is_persisted() => {
-                    // The record IS durable despite the reported error — the
-                    // close evidence stands, so nothing is degraded; loud,
-                    // structured, never silent.
-                    tracing::error!(
-                        target: "freshell_ws::terminal",
-                        terminal_id = %detach.terminal_id,
-                        error = %err,
-                        "pane_detach_close_persisted_despite_error: the non-retiring \
-                         pane-close record is durable; the write layer reported an error"
-                    );
-                }
-                Err(err) => {
-                    // Clean: NOTHING is durable — genuine durability
-                    // degradation. Never fail the detach itself (nothing ends
-                    // server-side): surface through the ledger's standard
-                    // loud seam (structured ERROR + invariant counter + the
-                    // live broadcast) instead.
-                    crate::pane_ledger::surface_write_failure(
-                        state,
-                        &detach.terminal_id,
-                        Err(std::io::Error::other(format!(
-                            "pane-detach close record write failed: {err}"
-                        ))),
-                    );
-                }
-            }
-        }
-    }
     state.registry.detach(&detach.terminal_id, conn_id);
     let detached = ServerMessage::TerminalDetached(TerminalIdOnly {
         terminal_id: detach.terminal_id.clone(),
     });
     send(ws_tx, &detached).await
+}
+
+/// `pane.closed` (delta-r7-round-2, Findings F1+F2) — journal ONE durable,
+/// NON-retiring pane-close record keyed by the removed pane's
+/// `createRequestId` (BEFORE the client's detach, which arrives after on the
+/// wire — the kill lane's durable-close-before-teardown order). The record
+/// fences and retires NOTHING (the session survives by design — sidebar
+/// reattach); without it, a created-then-closed-within-the-grace-window pane
+/// was indistinguishable from created-then-crashed, and the recovery offer
+/// could later recreate a pane the user explicitly removed. The write runs
+/// on the blocking pool (the kill lane's fsync idiom); a write failure never
+/// fails anything client-visible (no live state changes — the record is the
+/// whole act), so it surfaces through the ledger's standard loud degradation
+/// seam (structured ERROR + invariant counter + the live broadcast). `Ok(())`
+/// always at the wire: there is no reply.
+async fn handle_pane_closed(closed: &PaneClosed, state: &WsState) {
+    if closed.create_request_id.is_empty() {
+        return; // never a malformed record key
+    }
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let crid = closed.create_request_id.clone();
+    let tid = closed.terminal_id.clone();
+    let now = now_ms();
+    let result = spawn_blocking_in_span(move || {
+        ledger.close_pane_detached(&crid, tid.as_deref(), now)
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+            std::io::Error::other(format!("pane.closed record task join failed: {join_err}")),
+        ))
+    });
+    match result {
+        Ok(()) => {}
+        Err(err) if err.is_persisted() => {
+            // The record IS durable despite the reported error — the close
+            // evidence stands, so nothing is degraded; loud, structured,
+            // never silent.
+            tracing::error!(
+                target: "freshell_ws::terminal",
+                create_request_id = %closed.create_request_id,
+                error = %err,
+                "pane_close_persisted_despite_error: the non-retiring pane-close \
+                 record is durable; the write layer reported an error"
+            );
+        }
+        Err(err) => {
+            // Clean: NOTHING is durable — genuine durability degradation.
+            // Surface through the ledger's standard loud seam (structured
+            // ERROR + invariant counter + the live broadcast).
+            crate::pane_ledger::surface_write_failure(
+                state,
+                closed.terminal_id.as_deref().unwrap_or(&closed.create_request_id),
+                Err(std::io::Error::other(format!(
+                    "pane-close record write failed: {err}"
+                ))),
+            );
+        }
+    }
 }
 
 /// `terminal.kill` — SIGKILL + reap the shared PTY and remove it. The registry fans

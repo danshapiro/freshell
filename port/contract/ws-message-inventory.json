@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 36,
+    "count": 37,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -25,6 +25,7 @@
       "hoststats.subscribe",
       "hoststats.unsubscribe",
       "opencode.activity.list",
+      "pane.closed",
       "pane.reconcile.request",
       "ping",
       "sessions.prefs",

@@ -1,8 +1,8 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
-import { collectAllTerminalIds } from '@/lib/pane-utils'
+import { collectAllTerminalIds, collectPaneEntries } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
-import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles, closePane, removeLayout } from './panesSlice'
+import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles, closePane, removeLayout, replacePane } from './panesSlice'
 import type { PaneNode } from './paneTypes'
 
 type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> } }
@@ -35,41 +35,76 @@ const skipDetachActionTypes = new Set<string>([
 ])
 
 /**
- * Delta-round-7 (Finding F2): the actions that mean "the user CLOSED pane(s)"
- * — the plain pane-X (`closePane`, via closePaneWithCleanup) and a whole-tab
- * close (`removeLayout`, via the closeTab thunk). When one of these removes
- * the last layout reference to a terminal, the detach carries the closing
- * pane's `createRequestId`, and the server journals a durable, NON-retiring
- * pane-close record keyed by it BEFORE/ALONGSIDE the detach (the session
- * survives — sidebar reattach; the record answers "was this PANE closed",
- * never "is the session dead"). No other detach shape carries the key:
- * reconcile folds, server-driven handle swaps, resume-create respawns (e.g.
- * resetPaneForReconcileCreate — which PRESERVES the pane's createRequestId
- * for the SAME still-open pane), and the dead-terminal cleanup reducers all
- * detach WITHOUT it, so a live handle swap can never mislabel the pane's
- * createRequestId as closed. MAINTENANCE WARNING (same discipline as the
- * skip-list above): register new genuine pane/tab-close actions here, and
- * NEVER register an action that merely swaps a live handle.
+ * The actions that mean "the user CLOSED pane(s)" (delta-round-7 Finding F2,
+ * hardened by delta-r7-round-2 Findings F1+F2):
+ *
+ * * `closePane` — the plain pane-X (via closePaneWithCleanup: PaneContainer,
+ *   context menu, ui-commands, DeadSessionPanel).
+ * * `removeLayout` — a whole-tab close (via the closeTab thunk), covering
+ *   every pane in the tab tree.
+ * * `replacePane` — the context-menu "Replace pane": the pane's content is
+ *   discarded for a picker — the user-visible REMOVAL of that pane identity
+ *   (F1: it previously sent a plain detach and journaled nothing).
+ *
+ * For EVERY removed terminal-pane identity the middleware sends ONE
+ * `pane.closed` message keyed by the pane's `createRequestId` — present from
+ * creation, never absent — and carrying the pane's terminalId when it has
+ * one. This is deliberately decoupled from the detach loop below (F2):
+ * close evidence is about the PANE (terminalId-less in-flight creates count;
+ * panes sharing one terminal each count; a multi-pane removal journals every
+ * pane's CRID), while the detach is about the TERMINAL (identity-driven,
+ * last-reference only — unchanged). The server journals a durable,
+ * NON-retiring pane-close record per message (the session survives —
+ * sidebar reattach; the record answers "was this PANE closed", never "is the
+ * session dead").
+ *
+ * Every non-close shape (reconcile folds, server-driven handle swaps,
+ * resume-create respawns like resetPaneForReconcileCreate — which PRESERVES
+ * the still-open pane's createRequestId; the dead-terminal cleanup reducers)
+ * sends NO pane.closed, so a live handle swap can never mislabel the pane's
+ * key as closed. MAINTENANCE WARNING (same discipline as the skip-list
+ * above): register new genuine pane/tab-close actions here, and NEVER
+ * register an action that merely swaps a live handle. Pre-killed flows (the
+ * reopen-as-type swap; fresh-agent kill+close) journal through the KILL lane
+ * already; their later layout removals still emit pane.closed, harmlessly —
+ * the record family is non-retiring and dedupes by key.
  */
-const paneCloseActionTypes = new Set<string>([closePane.type, removeLayout.type])
+const paneCloseActionTypes = new Set<string>([closePane.type, removeLayout.type, replacePane.type])
 
-/** The createRequestId of the (pre-action) pane that owned `terminalId`, if any. */
-function createRequestIdOfTerminal(layouts: PanesStateSlice['panes']['layouts'], terminalId: string): string | undefined {
-  for (const root of Object.values(layouts)) {
-    const stack: PaneNode[] = []
-    if (root && typeof root === 'object') stack.push(root)
-    while (stack.length) {
-      const node = stack.pop()!
-      if (node.type === 'leaf') {
-        if (node.content.kind === 'terminal' && node.content.terminalId === terminalId) {
-          return node.content.createRequestId || undefined
-        }
-      } else {
-        stack.push(...node.children)
-      }
+/** The terminal-pane identities (createRequestId) of every layout, keyed `tabId:paneId`. */
+function collectTerminalPaneIdentities(
+  layouts: PanesStateSlice['panes']['layouts'],
+): Map<string, { createRequestId: string; terminalId?: string }> {
+  const identities = new Map<string, { createRequestId: string; terminalId?: string }>()
+  for (const [tabId, root] of Object.entries(layouts)) {
+    if (!root) continue
+    for (const { paneId, content } of collectPaneEntries(root)) {
+      if (content.kind !== 'terminal') continue
+      const createRequestId = typeof content.createRequestId === 'string' && content.createRequestId
+        ? content.createRequestId
+        : undefined
+      if (!createRequestId) continue
+      identities.set(`${tabId}:${paneId}`, {
+        createRequestId,
+        ...(content.terminalId ? { terminalId: content.terminalId } : {}),
+      })
     }
   }
-  return undefined
+  return identities
+}
+
+/** The before-pane identities whose (tabId, paneId, createRequestId) no longer exists after. */
+function collectRemovedPaneIdentities(
+  before: PanesStateSlice['panes']['layouts'],
+  after: PanesStateSlice['panes']['layouts'],
+): Array<{ createRequestId: string; terminalId?: string }> {
+  const afterIdentities = collectTerminalPaneIdentities(after)
+  const removed: Array<{ createRequestId: string; terminalId?: string }> = []
+  for (const [key, identity] of collectTerminalPaneIdentities(before)) {
+    if (afterIdentities.get(key)?.createRequestId === identity.createRequestId) continue
+    removed.push(identity)
+  }
+  return removed
 }
 
 /**
@@ -94,8 +129,21 @@ export const terminalDetachMiddleware: Middleware = (store) => (next) => (action
   if (typeof actionType === 'string' && skipDetachActionTypes.has(actionType)) {
     return result
   }
-  // F2: only a genuine pane/tab close keys the durable pane-close record.
+  // Only a genuine pane/tab close keys the durable pane-close evidence.
   const isPaneClose = typeof actionType === 'string' && paneCloseActionTypes.has(actionType)
+
+  // Evidence first (the kill lane's durable-close-before-teardown order):
+  // one `pane.closed` per REMOVED pane identity — including terminalId-less
+  // in-flight creates and panes whose terminal retains other references.
+  if (isPaneClose) {
+    for (const removed of collectRemovedPaneIdentities(beforeLayouts, afterLayouts)) {
+      getWsClient().send({
+        type: 'pane.closed',
+        createRequestId: removed.createRequestId,
+        ...(removed.terminalId ? { terminalId: removed.terminalId } : {}),
+      })
+    }
+  }
 
   const before = collectAllTerminalIds(beforeLayouts)
   if (before.size === 0) return result
@@ -104,13 +152,9 @@ export const terminalDetachMiddleware: Middleware = (store) => (next) => (action
   for (const terminalId of before) {
     if (after.has(terminalId)) continue
     if (consumeTerminalReleaseMark(terminalId)) continue
-    const createRequestId = isPaneClose
-      ? createRequestIdOfTerminal(beforeLayouts, terminalId)
-      : undefined
     getWsClient().send({
       type: 'terminal.detach',
       terminalId,
-      ...(createRequestId ? { createRequestId } : {}),
     })
   }
   return result

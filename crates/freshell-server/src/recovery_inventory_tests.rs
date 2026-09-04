@@ -923,6 +923,108 @@ fn a_detach_close_covered_row_is_never_offered_live_or_dead() {
     );
 }
 
+/// Delta-r7-round-2 (Finding F3) — the reattach lapse: after the sidebar
+/// reattach re-stamps the Bound row onto the NEW pane's identity (the
+/// attach-carried createRequestId + provenance advance), the OLD pane's
+/// close record must never suppress it. Both row-side coverage arms are
+/// exercised because they must BOTH lapse: the createRequestId arm no longer
+/// keys the row (it was re-stamped), and the live-terminal arm CANNOT key a
+/// CRID-bearing row — that arm exists ONLY for rows the conn-less resolution
+/// lane wrote WITHOUT the advisory createRequestId. The row is offered
+/// again, LIVE or DEAD, with the reattach handle when live.
+#[test]
+fn a_reattached_row_is_offered_despite_the_old_panes_detach_close() {
+    let make = |live_keys: &[(&str, &str)]| {
+        let d = DeviceUnion {
+            device_id: "dev1".into(),
+            union_doc: union_doc_with_tab_key(
+                "dev1",
+                1_000_000,
+                "dev1:t1",
+                json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+            ),
+        };
+        // The RESTAMPED row: the reattaching pane's CRID (uncovered — the new
+        // pane was never closed), the SAME terminal the old pane's close
+        // record names, attribution ADVANCED to the reattach's assertion time
+        // (996_000 — inside grace of the parent's 1_000_000).
+        let restamped = with_attribution(
+            with_correlation_ids(
+                binding_row_at("claude", "S-reopened", bound(), 996_000),
+                Some("req-reopened"),
+                Some("term-closed"),
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        );
+        build_inventory(
+            vec![d],
+            vec![restamped],
+            live(live_keys),
+            &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+            &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+        )
+    };
+    for (label, keys, expect_live) in [
+        ("DEAD (post-restart)", &[][..], false),
+        (
+            "LIVE (still Running — the sidebar reattach's own shape)",
+            &[("claude", "S-reopened")][..],
+            true,
+        ),
+    ] {
+        let out = make(keys);
+        let only = out["ledgerOnly"].as_array().unwrap();
+        let entry = only
+            .iter()
+            .find(|e| e["sessionId"] == "S-reopened")
+            .unwrap_or_else(|| panic!("the reattached row lapses the old pane's close coverage and is offered ({label}): {out}"));
+        assert_eq!(entry["live"], expect_live, "{label}: {entry}");
+        if expect_live {
+            assert_eq!(
+                entry["liveTerminalId"], "term-closed",
+                "the live reattach forwards the still-running terminal: {entry}"
+            );
+        }
+    }
+
+    // The uncovered-CRID gate never opens the terminal arm for a row whose
+    // OWN pane IS covered: restamped-or-not, a row carrying the CLOSED
+    // pane's createRequestId on the closed pane's terminal stays suppressed
+    // (the anti-regression control proving the arm still bites its own key).
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1_000_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let still_closed = with_attribution(
+        with_correlation_ids(
+            binding_row_at("claude", "S-still-closed", bound(), 995_000),
+            Some("req-closed"),
+            Some("term-closed"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![still_closed],
+        live(&[("claude", "S-still-closed")]),
+        &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+        &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+    );
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "a row still keyed by the closed pane's CRID stays covered (never a lapse): {out}"
+    );
+}
+
 /// Delta-round-7 (Finding F2) — the PANE-side detach coverage via the
 /// createRequestId arm ONLY: a snapshot pane whose createRequestId a detach
 /// record keys verdicts CLOSED even though its session is still live (the
@@ -4163,6 +4265,133 @@ async fn route_never_offers_a_detach_close_covered_row() {
     assert!(
         only.iter().any(|e| e["sessionId"] == "S-detached-open"),
         "the uncovered sibling stays offered (the fixture discriminates): {body}"
+    );
+}
+
+/// Delta-r7-round-2 (Finding F3), route level — the finding's verbatim repair
+/// shape: the pane X-closes (its non-retiring `pane.closed` evidence stands),
+/// then a NEW pane reattaches the SAME still-running terminal through the real
+/// ledger restamp (`note_pane_reattach` — what the attach handler drives),
+/// re-keying the row onto the new pane's createRequestId and ADVANCING its
+/// attribution. The offer must then name the row again — pre-fix, the row
+/// kept the old close-covered createRequestId and the close record's
+/// terminal-id arm also keyed it, so a genuinely re-opened pane lost before
+/// its first snapshot was suppressed. The old pane's close record itself is
+/// untouched (loaded from disk and still covering only the old CRID).
+#[tokio::test]
+async fn route_offers_a_reattached_row_despite_the_old_panes_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    std::fs::write(
+        broot.join("bindings").join("claude").join("S-reopened.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": "S-reopened", "mode": "claude",
+            "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
+            "state": "bound", "createRequestId": "req-closed", "liveTerminalId": "term-rt",
+            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+            "lastAttributedAt": 995_000
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // THE DURABLE PANE CLOSE (non-retiring), keyed by the OLD pane's CRID and
+    // naming the row's live terminal — both coverage arms armed pre-fix.
+    let seeder = PaneLedger::new(Some(broot.clone()));
+    seeder
+        .close_pane_detached("req-closed", Some("term-rt"), 996_000)
+        .expect("the detach close persists");
+    // THE REATTACH (delta-r7-r2): the sidebar's new pane attaches the same
+    // terminal; the row re-keys onto the NEW pane and its attribution
+    // advances to the reattach's assertion (still in-grace of the parent's
+    // 1_000_000).
+    let restamped = seeder
+        .note_pane_reattach(&freshell_ws::pane_ledger::ReattachWrite {
+            provider: "claude",
+            session_id: "S-reopened",
+            terminal_id: "term-rt",
+            create_request_id: "req-reopened",
+            provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+                client_instance_id: Some("c1"),
+                device_id: Some("dev1"),
+                tab_key: Some("dev1:t9"),
+                asserted_at: 997_000,
+            }),
+            now_ms: 997_000,
+        })
+        .expect("the restamp persists");
+    assert!(restamped, "a Bound row with a different CRID restamps");
+    let row = seeder.load_binding("claude", "S-reopened").unwrap();
+    assert_eq!(row.create_request_id.as_deref(), Some("req-reopened"));
+    assert_eq!(row.last_attributed_at, Some(997_000));
+    drop(seeder);
+
+    let router_reattached = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router_reattached,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let only = body["ledgerOnly"].as_array().unwrap();
+    let entry = only
+        .iter()
+        .find(|e| e["sessionId"] == "S-reopened")
+        .unwrap_or_else(|| {
+            panic!(
+                "the reattached row is offered again — the old pane's close \
+                 covers only the old pane: {body}"
+            )
+        });
+    assert_eq!(entry["tabKey"], "dev1:t9", "the reattach's tabKey: {entry}");
+
+    // Anti-suppression control: the SAME close record, no reattach — the row
+    // keyed by the closed pane's CRID is never offered (the route still
+    // discriminates).
+    let broot2 = home.path().join("pane-ledger-control");
+    std::fs::create_dir_all(broot2.join("bindings").join("claude")).unwrap();
+    std::fs::write(
+        broot2.join("bindings").join("claude").join("S-still-closed.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": "S-still-closed", "mode": "claude",
+            "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
+            "state": "bound", "createRequestId": "req-closed", "liveTerminalId": "term-rt",
+            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+            "lastAttributedAt": 995_000
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let seeder2 = PaneLedger::new(Some(broot2.clone()));
+    seeder2
+        .close_pane_detached("req-closed", Some("term-rt"), 996_000)
+        .expect("the detach close persists");
+    drop(seeder2);
+    let router_control = router(test_state(Some(tmp.path().to_path_buf()), Some(broot2)));
+    let (code2, body2) = get(
+        router_control,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code2, axum::http::StatusCode::OK);
+    let only2 = body2["ledgerOnly"].as_array().unwrap();
+    assert!(
+        only2.iter().all(|e| e["sessionId"] != "S-still-closed"),
+        "un-reattached, the closed pane's row stays covered (the route discriminates): {body2}"
     );
 }
 

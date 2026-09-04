@@ -450,7 +450,7 @@ describe('PaneContainer', () => {
   })
 
   describe('terminal cleanup on pane close', () => {
-    it('sends terminal.detach message when closing a pane with terminalId — carrying the pane\'s createRequestId (delta-round-7 F2)', () => {
+    it('closing a pane sends the plain identity-driven detach AND the pane-close evidence keyed by the pane\'s createRequestId (delta-round-7 F2 / delta-r7-r2 F2)', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
       const terminalId = 'term-123'
@@ -488,13 +488,18 @@ describe('PaneContainer', () => {
       const closeButtons = screen.getAllByTitle('Close pane')
       fireEvent.click(closeButtons[0])
 
-      // Should have sent terminal.detach with the correct terminalId — AND
-      // the closing pane's createRequestId (the durable, NON-retiring
-      // pane-close record's key: the session survives the detach by design).
+      // The detach stays identity-driven (about the TERMINAL, never the pane).
       expect(mockSend).toHaveBeenCalledWith({
         type: 'terminal.detach',
         terminalId: terminalId,
+      })
+      // The durable, NON-retiring pane-close record rides its own message,
+      // keyed by the closing pane's createRequestId (the session survives the
+      // detach by design).
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'pane.closed',
         createRequestId: 'req-pane-1',
+        terminalId,
       })
     })
 
@@ -579,6 +584,10 @@ describe('PaneContainer', () => {
         .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
       expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-stale' }])
+      // …and NO pane-close evidence: nothing was closed (delta-r7-r2 F2).
+      expect(
+        mockSend.mock.calls.some(([msg]) => (msg as { type?: string })?.type === 'pane.closed'),
+      ).toBe(false)
       // The pane is STILL open with its createRequestId preserved.
       const layout = (store.getState() as { panes: PanesState }).panes.layouts['tab-1']
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content.createRequestId : undefined).toBe('req-preserved')
@@ -622,6 +631,11 @@ describe('PaneContainer', () => {
         .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
       expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-no-crid' }])
+      // A pane with no createRequestId never produces a record key
+      // (delta-r7-r2 F2): no pane.closed either.
+      expect(
+        mockSend.mock.calls.some(([msg]) => (msg as { type?: string })?.type === 'pane.closed'),
+      ).toBe(false)
     })
 
     it('does not send terminal.detach when closing a pane without terminalId', () => {

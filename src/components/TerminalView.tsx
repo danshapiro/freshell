@@ -2970,6 +2970,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send(buildTerminalAttachMessage({
       content: contentRef.current,
       terminalId: tid,
+      tabId,
       intent: wireIntent,
       cols,
       rows,
@@ -2994,6 +2995,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     suppressNetworkEffects,
     ws,
     appStore,
+    tabId,
     applySeqState,
     buildCheckpointReplayInput,
     clearQuarantineRepair,

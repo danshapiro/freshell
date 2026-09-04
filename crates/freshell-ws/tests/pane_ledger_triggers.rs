@@ -821,17 +821,20 @@ async fn a_kill_for_a_terminal_the_registry_lost_still_records_the_pane_close() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Delta-round-7 (Finding F2) — the terminal pane's deliberate X-close,
-/// end to end: the close DETACHES (the session keeps running — the
-/// sidebar-reattach feature) AND the detach carrying the pane's
-/// `createRequestId` journals ONE durable, NON-retiring pane-close record
-/// keyed by that creation key (the close-envelope family), BEFORE the detach
-/// is processed. Nothing is fenced and NO row flips: the closed pane's
-/// identity row stays Bound, the terminal stays Running, and
-/// `terminal.detached` answers as always. A CRID-less (legacy / reconcile /
-/// cleanup) detach writes NOTHING, exactly as before.
+/// Delta-round-7 (Finding F2), moved to its own channel by delta-r7-round-2
+/// (Findings F1+F2) — the terminal pane's deliberate X-close, end to end:
+/// the client sends `pane.closed{createRequestId, terminalId}` for the
+/// removed pane (evidence FIRST, the kill lane's durable-close-before-
+/// teardown order) and then the identity-driven `terminal.detach`. The
+/// server journals ONE durable, NON-retiring pane-close record keyed by the
+/// creation key (the close-envelope family). Nothing is fenced and NO row
+/// flips: the closed pane's identity row stays Bound, the terminal stays
+/// Running (the sidebar-reattach feature), and `terminal.detached` answers
+/// as always. The detach itself never carries pane identity anymore —
+/// including a legacy/detuned `createRequestId` rider, which is
+/// accept-and-stripped and journals NOTHING.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_detach_carrying_the_panes_create_request_id_journals_a_non_retiring_pane_close() {
+async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     let dir = unique_ledger_dir("detach-close-record");
     let (url, registry, server_ledger) =
@@ -859,15 +862,20 @@ async fn a_detach_carrying_the_panes_create_request_id_journals_a_non_retiring_p
         .expect("binding row written at create");
     assert_eq!(row_path_row.create_request_id.as_deref(), Some("req-detach-close-1"));
 
-    // THE PANE CLOSE: detach carrying the pane's createRequestId.
+    // THE PANE CLOSE: the dedicated evidence message, then the plain detach.
+    let pane_closed = serde_json::json!({
+        "type": "pane.closed",
+        "createRequestId": "req-detach-close-1",
+        "terminalId": terminal_id,
+    });
+    ws.send(WsMessage::Text(pane_closed.to_string())).await.unwrap();
     let detach = serde_json::json!({
         "type": "terminal.detach",
         "terminalId": terminal_id,
-        "createRequestId": "req-detach-close-1",
     });
     ws.send(WsMessage::Text(detach.to_string())).await.unwrap();
-    // The record is journaled BEFORE the detach is processed (the kill lane's
-    // durable-close-before-teardown order), so once `terminal.detached`
+    // The evidence message precedes the detach on the socket (and is itself
+    // journaled synchronously before the reply), so once `terminal.detached`
     // arrives the close is already durable.
     let detached = next_frame_of_type(&mut ws, "terminal.detached").await;
     assert_eq!(detached["terminalId"], terminal_id);
@@ -909,8 +917,14 @@ async fn a_detach_carrying_the_panes_create_request_id_journals_a_non_retiring_p
     assert_eq!(disk.list_pane_detach_closes().len(), 1);
     assert_eq!(disk.list_pane_detach_closes()[0].create_request_id, "req-detach-close-1");
 
-    // A CRID-less detach writes NOTHING (legacy/reconcile/cleanup shapes):
-    // second terminal, plain detach — no new record appears.
+    // A terminalId-less pane.closed (the in-flight-create close shape of F2)
+    // journals with NO terminal linkage.
+    let pane_closed_flight = serde_json::json!({
+        "type": "pane.closed",
+        "createRequestId": "req-inflight-close",
+    });
+    ws.send(WsMessage::Text(pane_closed_flight.to_string())).await.unwrap();
+    // Fire a follow-up whose reply orders the read AFTER the journal.
     let create2 = serde_json::json!({
         "type": "terminal.create",
         "requestId": "req-detach-plain-2",
@@ -921,20 +935,159 @@ async fn a_detach_carrying_the_panes_create_request_id_journals_a_non_retiring_p
     ws.send(WsMessage::Text(create2.to_string())).await.unwrap();
     let created2 = next_frame_of_type(&mut ws, "terminal.created").await;
     let terminal_id_2 = created2["terminalId"].as_str().unwrap().to_string();
+    let closes = server_ledger.list_pane_detach_closes();
+    assert_eq!(closes.len(), 2, "the in-flight close journaled too: {closes:?}");
+    assert!(
+        closes
+            .iter()
+            .any(|c| c.create_request_id == "req-inflight-close" && c.terminal_id.is_none()),
+        "the terminalId-less close record: {closes:?}"
+    );
+
+    // The detach itself NEVER journals close evidence anymore — including a
+    // legacy `createRequestId` rider (accept-and-stripped, no record).
     let detach2 = serde_json::json!({
         "type": "terminal.detach",
         "terminalId": terminal_id_2,
+        "createRequestId": "req-detach-plain-2",
     });
     ws.send(WsMessage::Text(detach2.to_string())).await.unwrap();
     let detached2 = next_frame_of_type(&mut ws, "terminal.detached").await;
     assert_eq!(detached2["terminalId"], terminal_id_2);
     assert_eq!(
         server_ledger.list_pane_detach_closes().len(),
-        1,
-        "a CRID-less detach journals no pane-close record"
+        2,
+        "the detach lane carries no pane identity (F2: evidence and detach are decoupled)"
     );
 
     let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Delta-r7-round-2 (Finding F3) — the sidebar-reattach restamp, end to end:
+/// the pane X-closes (its `pane.closed` journals the non-retiring record
+/// keyed by the OLD createRequestId), then a NEW pane reattaches to the SAME
+/// still-running terminal — the `terminal.attach` carries the new pane's
+/// `createRequestId` and `tabId`, and the Bound row is re-stamped onto the
+/// NEW pane's identity: a durable row write BEFORE the attach is observable,
+/// the attribution ADVANCING to the attach's tab+time (the full-triple rule),
+/// while the old close record still stands, covering only the old pane.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attach_carrying_the_new_panes_identity_restamps_the_bound_row() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("reattach-restamp");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) =
+        connect_and_capture_inventory_with_identity(&url, "device-rt", "client-rt").await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-OLD-pane",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-OLD",
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("binding row written at create");
+    assert_eq!(row.create_request_id.as_deref(), Some("req-OLD-pane"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-rt:tab-OLD"));
+    assert!(row.last_attributed_at.is_some(), "attributed at create");
+
+    // The pane X-closes: the durable NON-retiring record keyed by the OLD
+    // createRequestId, then the plain detach.
+    let pane_closed = serde_json::json!({
+        "type": "pane.closed",
+        "createRequestId": "req-OLD-pane",
+        "terminalId": terminal_id,
+    });
+    ws.send(WsMessage::Text(pane_closed.to_string())).await.unwrap();
+    let detach = serde_json::json!({
+        "type": "terminal.detach",
+        "terminalId": terminal_id,
+    });
+    ws.send(WsMessage::Text(detach.to_string())).await.unwrap();
+    let _ = next_frame_of_type(&mut ws, "terminal.detached").await;
+    assert_eq!(server_ledger.list_pane_detach_closes().len(), 1);
+
+    // THE REATTACH: a NEW pane (the sidebar's fresh createRequestId, a new
+    // tab) attaches to the SAME still-running terminal.
+    let attach = serde_json::json!({
+        "type": "terminal.attach",
+        "terminalId": terminal_id,
+        "intent": "viewport_hydrate",
+        "cols": 80,
+        "rows": 24,
+        "createRequestId": "req-NEW-pane",
+        "tabId": "tab-NEW",
+    });
+    ws.send(WsMessage::Text(attach.to_string())).await.unwrap();
+    // attach.ready is observable ONLY AFTER the restamp is durable (the kill
+    // lane's durable-before-observable order): once it arrives, the row must
+    // already carry the new pane's identity.
+    let ready = next_frame_of_type(&mut ws, "terminal.attach.ready").await;
+    assert_eq!(ready["terminalId"], terminal_id);
+
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("the row survives the restamp");
+    assert_eq!(row.state, RowState::Bound, "the restamp never retires");
+    assert_eq!(
+        row.create_request_id.as_deref(),
+        Some("req-NEW-pane"),
+        "the row's pane identity is the reattaching pane now"
+    );
+    assert_eq!(row.live_terminal_id.as_deref(), Some(terminal_id.as_str()));
+    assert_eq!(
+        row.tab_key.as_deref(),
+        Some("device-rt:tab-NEW"),
+        "the attribution ADVANCES to the attach's true tab (THE advance proof: \
+         only a full-triple, not-stale Replace moves tab_key)"
+    );
+    // Keepalive/idempotent attaches: attaching the SAME pane identity again
+    // pays no durable write.
+    let updated_at_after_restamp = row.updated_at;
+    let attach2 = serde_json::json!({
+        "type": "terminal.attach",
+        "terminalId": terminal_id,
+        "intent": "keepalive_delta",
+        "cols": 80,
+        "rows": 24,
+        "createRequestId": "req-NEW-pane",
+        "tabId": "tab-NEW",
+    });
+    ws.send(WsMessage::Text(attach2.to_string())).await.unwrap();
+    let _ = next_frame_of_type(&mut ws, "terminal.attach.ready").await;
+    let row = server_ledger.load_binding("claude", &session_id).expect("row");
+    assert_eq!(
+        row.updated_at, updated_at_after_restamp,
+        "a same-pane attach writes nothing"
+    );
+
+    // The OLD pane's close record still stands, keyed by its own CRID, and
+    // the terminal is genuinely attached/Running (the FEATURE survived).
+    assert_eq!(
+        server_ledger.list_pane_detach_closes()[0].create_request_id,
+        "req-OLD-pane",
+        "the old pane's close evidence is untouched (the old pane stays closed)"
+    );
+    assert!(registry.probe(&terminal_id).is_some());
+
+    // Durable across a restart.
+    let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    let row = disk.load_binding("claude", &session_id).expect("durable reload");
+    assert_eq!(row.create_request_id.as_deref(), Some("req-NEW-pane"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-rt:tab-NEW"));
+
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -6210,3 +6210,314 @@ fn consuming_a_fence_from_a_pane_record_keeps_the_pane_cover() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Delta-r7-r2 (Finding F3) — the attach restamp: `note_pane_reattach`. A pane
+// attaching to a live terminal (the sidebar reattach; the recovery-offer
+// reattach arm; any viewport attach) carries its createRequestId + tab and the
+// ledger re-stamps the Bound row onto THAT pane's identity — so a close record
+// keyed by the OLD pane's createRequestId keeps covering only the old pane.
+// ────────────────────────────────────────────────────────────────────────────
+
+fn reattach_write<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    terminal_id: &'a str,
+    create_request_id: &'a str,
+    now_ms: i64,
+) -> ReattachWrite<'a> {
+    ReattachWrite {
+        provider,
+        session_id,
+        terminal_id,
+        create_request_id,
+        provenance: ProvenancePolicy::Inherit,
+        now_ms,
+    }
+}
+
+/// The conn-scoped variant: what the WS attach handler passes — the
+/// connection's hello identity plus the attach-carried tab, asserted at the
+/// attach's receipt time.
+#[allow(clippy::too_many_arguments)]
+fn reattach_write_replace_at(
+    provider: &str,
+    session_id: &str,
+    terminal_id: &str,
+    create_request_id: &str,
+    now_ms: i64,
+    client_instance_id: Option<&str>,
+    device_id: Option<&str>,
+    tab_key: Option<&str>,
+    asserted_at: i64,
+) -> ReattachWrite<'static> {
+    let leak = |s: Option<&str>| s.map(|v| &*Box::leak(v.to_string().into_boxed_str()));
+    ReattachWrite {
+        provider: Box::leak(provider.to_string().into_boxed_str()),
+        session_id: Box::leak(session_id.to_string().into_boxed_str()),
+        terminal_id: Box::leak(terminal_id.to_string().into_boxed_str()),
+        create_request_id: Box::leak(create_request_id.to_string().into_boxed_str()),
+        provenance: ProvenancePolicy::Replace(ProvenanceStamps {
+            client_instance_id: leak(client_instance_id),
+            device_id: leak(device_id),
+            tab_key: leak(tab_key),
+            asserted_at,
+        }),
+        now_ms,
+    }
+}
+
+/// The finding's shape end to end: the pane's create stamps the row (CRID
+/// req-OLD, tab device-1:tab-OLD at t=1_000); the pane X-closes; the SAME
+/// session's background terminal is REATTACHED by a NEW pane (CRID req-NEW,
+/// tab device-1:tab-NEW at t=2_000). The row must carry the NEW pane's key,
+/// terminal, and the attach's advanced attribution (the full-triple advance
+/// rule) — while the record proves `created_at` never moves and `mode`/`cwd`
+/// ride untouched.
+#[test]
+fn reattach_restamps_the_bound_rows_pane_identity_and_advances_attribution() {
+    let root = temp_root("reattach-restamp");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write_provenance(
+            "claude",
+            "sess-rt",
+            "term-rt",
+            1_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-OLD"),
+        ))
+        .unwrap();
+    let stamped = ledger
+        .note_pane_reattach(&reattach_write_replace_at(
+            "claude",
+            "sess-rt",
+            "term-rt",
+            "req-NEW",
+            2_050,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-NEW"),
+            2_000,
+        ))
+        .unwrap();
+    assert!(stamped, "a Bound row with a different CRID restamps");
+    let row = ledger.load_binding("claude", "sess-rt").unwrap();
+    assert_eq!(row.create_request_id.as_deref(), Some("req-NEW"));
+    assert_eq!(row.live_terminal_id.as_deref(), Some("term-rt"));
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+    assert_eq!(row.device_id.as_deref(), Some("device-1"));
+    assert_eq!(
+        row.tab_key.as_deref(),
+        Some("device-1:tab-NEW"),
+        "the attribution ADVANCES to the attach's true tab"
+    );
+    assert_eq!(
+        row.last_attributed_at,
+        Some(2_000),
+        "the assertion time advances to the attach's receipt"
+    );
+    assert_eq!(row.created_at, 1_000, "row-keeping metadata never moves");
+    assert_eq!(row.mode, "claude");
+    assert_eq!(row.cwd.as_deref(), Some("/tmp/proj"));
+    assert_eq!(row.state, RowState::Bound, "the restamp never retires");
+    assert_eq!(row.updated_at, 2_050, "a genuine re-observation stamps the write's now");
+    assert_eq!(row.last_observed_at, 2_050);
+    // Durable: the restamp survives a reload.
+    let reload = PaneLedger::new(Some(root.clone()));
+    let row = reload.load_binding("claude", "sess-rt").unwrap();
+    assert_eq!(row.create_request_id.as_deref(), Some("req-NEW"));
+    assert_eq!(row.last_attributed_at, Some(2_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The keepalive case: an attach naming the row's CURRENT createRequestId
+/// must not pay a durable write at all (no-op) — every keepalive/viewport
+/// attach would otherwise fsync the row.
+#[test]
+fn reattach_with_the_rows_current_crid_writes_nothing() {
+    let root = temp_root("reattach-noop");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let mut w = write_provenance(
+        "claude",
+        "sess-same",
+        "term-same",
+        1_000,
+        Some("client-1"),
+        Some("device-1"),
+        Some("device-1:tab-1"),
+    );
+    w.create_request_id = Some("req-same");
+    ledger.record_binding(&w).unwrap();
+    let stamped = ledger
+        .note_pane_reattach(&reattach_write_replace_at(
+            "claude",
+            "sess-same",
+            "term-same",
+            "req-same",
+            9_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-1"),
+            8_900,
+        ))
+        .unwrap();
+    assert!(!stamped, "same-CRID attach: nothing to restamp");
+    let row = ledger.load_binding("claude", "sess-same").unwrap();
+    assert_eq!(row.updated_at, 1_000, "no write happened");
+    assert_eq!(row.last_attributed_at, Some(1_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The restamp NEVER manufactures or resurrects rows: no row, or a Retired
+/// one (a genuinely-killed identity), answers no-op — attach is not a create
+/// lane and never undoes a close.
+#[test]
+fn reattach_is_a_no_op_without_a_bound_row_and_never_resurrects_a_retired_one() {
+    let root = temp_root("reattach-no-row");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let stamped = ledger
+        .note_pane_reattach(&reattach_write("claude", "sess-absent", "term-x", "req-n1", 1_000))
+        .unwrap();
+    assert!(!stamped, "no row to restamp");
+    assert!(ledger.load_binding("claude", "sess-absent").is_none());
+
+    // A retired (killed) identity stays Retired: kill the pane, then a stale
+    // attach lands (e.g. a kill racing an in-flight attach) — the close wins.
+    ledger
+        .record_binding(&write("codex", "sess-killed", "term-killed", 1_000))
+        .unwrap();
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-killed".to_string(),
+            create_request_id: Some("req-killed".to_string()),
+            resolved: vec![SessionLocator {
+                provider: "codex".into(),
+                session_id: "sess-killed".into(),
+            }],
+            now_ms: 2_000,
+        })
+        .unwrap();
+    let stamped = ledger
+        .note_pane_reattach(&reattach_write("codex", "sess-killed", "term-killed", "req-n2", 3_000))
+        .unwrap();
+    assert!(!stamped, "a Retired row is never restamped");
+    let row = ledger.load_binding("codex", "sess-killed").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(
+        row.create_request_id.as_deref(),
+        Some("req-1"),
+        "the no-op restamp never touches the retired row (the `write()` helper seeds req-1)"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Provenance discipline on the restamp is EXACTLY the existing attribution
+/// rules: a tab-less legacy attach carries no full triple, so over an
+/// already-attributed row it never advances stamps+time (it only re-keys the
+/// pane identity); on a never-attributed row the meaningful halves ATTACH.
+#[test]
+fn reattach_provenance_follows_the_attach_and_advance_gates() {
+    let root = temp_root("reattach-gates");
+    let ledger = PaneLedger::new(Some(root.clone()));
+
+    // ADVANCE gate: tab-less attach over an attributed row — pane identity
+    // moves, stamps+time stay.
+    let mut w = write_provenance(
+        "claude",
+        "sess-adv",
+        "term-adv",
+        1_000,
+        Some("client-1"),
+        Some("device-1"),
+        Some("device-1:tab-1"),
+    );
+    w.create_request_id = Some("req-old-adv");
+    ledger.record_binding(&w).unwrap();
+    ledger
+        .note_pane_reattach(&reattach_write_replace_at(
+            "claude",
+            "sess-adv",
+            "term-adv",
+            "req-new-adv",
+            5_000,
+            Some("client-1"),
+            Some("device-1"),
+            None, // no tab: a legacy attach cannot compose the triple
+            4_900,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-adv").unwrap();
+    assert_eq!(row.create_request_id.as_deref(), Some("req-new-adv"));
+    assert_eq!(
+        row.tab_key.as_deref(),
+        Some("device-1:tab-1"),
+        "no triple => no advance (never launder freshness onto a stale tab)"
+    );
+    assert_eq!(row.last_attributed_at, Some(1_000));
+
+    // ATTACH gate: the row was born headless/conn-less (no stamps at all) —
+    // the attach's meaningful halves attach (client+device, plus tab when
+    // present), WITH the assertion time.
+    ledger
+        .record_binding(&write("codex", "sess-attach", "term-attach", 1_000))
+        .unwrap();
+    ledger
+        .note_pane_reattach(&reattach_write_replace_at(
+            "codex",
+            "sess-attach",
+            "term-attach",
+            "req-attach",
+            2_000,
+            Some("client-2"),
+            Some("device-2"),
+            Some("device-2:tab-2"),
+            1_950,
+        ))
+        .unwrap();
+    let row = ledger.load_binding("codex", "sess-attach").unwrap();
+    assert_eq!(row.client_instance_id.as_deref(), Some("client-2"));
+    assert_eq!(row.device_id.as_deref(), Some("device-2"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-2:tab-2"));
+    assert_eq!(row.last_attributed_at, Some(1_950));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The restamp's stamp-advance is MONOTONE (focused-ep4-r3 Finding 1, applied
+/// to the attach lane): a delayed/older attach assertion never drags the
+/// row's attribution back.
+#[test]
+fn reattach_never_moves_attribution_backwards() {
+    let root = temp_root("reattach-monotone");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let mut w = write_provenance(
+        "claude",
+        "sess-mono",
+        "term-mono",
+        5_000,
+        Some("client-1"),
+        Some("device-1"),
+        Some("device-1:tab-5"),
+    );
+    w.create_request_id = Some("req-old-mono");
+    ledger.record_binding(&w).unwrap();
+    ledger
+        .note_pane_reattach(&reattach_write_replace_at(
+            "claude",
+            "sess-mono",
+            "term-mono",
+            "req-new-mono",
+            6_000,
+            Some("client-1"),
+            Some("device-1"),
+            Some("device-1:tab-4"),
+            4_000, // an OLDER assertion than the row's 5_000
+        ))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-mono").unwrap();
+    assert_eq!(row.create_request_id.as_deref(), Some("req-new-mono"));
+    assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-5"));
+    assert_eq!(row.last_attributed_at, Some(5_000));
+    std::fs::remove_dir_all(&root).ok();
+}

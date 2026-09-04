@@ -892,6 +892,90 @@ fn applied_attribution_time(asserted_at: i64) -> Option<i64> {
     (asserted_at > 0).then_some(asserted_at)
 }
 
+/// The provenance writer rules (the attribution fact is ONE atomic,
+/// MONOTONE unit — stamps+time move together, focused-ep4-r3 Findings 1+2;
+/// the tri-state is delta-r2 Finding 2, [`ProvenancePolicy`]) as the ONE
+/// shared merge: [`PaneLedger::record_binding_locked`] and
+/// [`PaneLedger::note_pane_reattach`] both consume it so the two
+/// connection-scoped lanes can never drift on the attach/advance gates.
+///
+/// * `Inherit` (conn-less session-affiliated lane): the write asserts
+///   nothing — the row keeps every stamp AND the attribution time.
+/// * `Replace` splits on whether the row HAS a prior attribution
+///   (focused-ep4-r5 Finding 1):
+///   - ATTACH (no prior `last_attributed_at`): applies whatever MEANINGFUL
+///     provenance exists — the client+device halves, plus the tab and the
+///     assertion time when present (`attaches_attribution`; no triple
+///     requirement — a legacy client whose wire message omits `tabId` still
+///     attaches).
+///   - ADVANCE (a prior `last_attributed_at` exists): applies stamps AND
+///     time only when it is a COMPLETE, NOT-STALE attribution: the full
+///     client+device+tab triple is present (`advances_attribution`,
+///     focused-ep4-r3 finding 2) AND the stamps' `asserted_at` is >= the
+///     row's current `last_attributed_at` (finding 1; the exact tie
+///     replaces, keeping semantics deterministic). The assertion time is
+///     captured at message RECEIPT — before gated/async create/fork work —
+///     so an older delayed write can land AFTER a newer assertion for the
+///     same session; without the guard it would drag stamps+time back to
+///     the older tab/moment.
+/// * A `Replace` that fails its gate (hollow stamps on a never-attributed
+///   row, or a partial/older assertion over an attributed one) leaves
+///   stamps+time UNTOUCHED while the write's other fields still land.
+/// * `Clear` (explicitly-headless lineage lane): the row's IDENTITY stamps
+///   are erased, so a stale browser attribution can never launder the row
+///   into the D8 offer under a refreshed `updated_at` — but the attribution
+///   CLOCK is FLOORED, never erased (focused-ep4-r5 Finding 2):
+///   `last_attributed_at` becomes `max(existing, clear_now)`, so a delayed
+///   pre-Clear assertion can never pass a no-prior-attribution arm and
+///   resurrect the cleared stamps.
+///
+/// Returns `(client_instance_id, device_id, tab_key, last_attributed_at)`.
+fn resolve_provenance_merge(
+    existing: Option<&BindingRow>,
+    provenance: &ProvenancePolicy<'_>,
+    now_ms: i64,
+) -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+    let prior_attribution = existing.and_then(|r| r.last_attributed_at);
+    let apply = match provenance {
+        ProvenancePolicy::Replace(stamps) => match prior_attribution {
+            None => attaches_attribution(provenance),
+            Some(t) => advances_attribution(provenance) && stamps.asserted_at >= t,
+        },
+        _ => false,
+    };
+    match provenance {
+        ProvenancePolicy::Inherit => (
+            existing.and_then(|r| r.client_instance_id.clone()),
+            existing.and_then(|r| r.device_id.clone()),
+            existing.and_then(|r| r.tab_key.clone()),
+            existing.and_then(|r| r.last_attributed_at),
+        ),
+        ProvenancePolicy::Replace(stamps) => {
+            if apply {
+                (
+                    stamps.client_instance_id.map(str::to_string),
+                    stamps.device_id.map(str::to_string),
+                    stamps.tab_key.map(str::to_string),
+                    applied_attribution_time(stamps.asserted_at),
+                )
+            } else {
+                (
+                    existing.and_then(|r| r.client_instance_id.clone()),
+                    existing.and_then(|r| r.device_id.clone()),
+                    existing.and_then(|r| r.tab_key.clone()),
+                    existing.and_then(|r| r.last_attributed_at),
+                )
+            }
+        }
+        ProvenancePolicy::Clear => (
+            None,
+            None,
+            None,
+            Some(prior_attribution.map_or(now_ms, |t| t.max(now_ms))),
+        ),
+    }
+}
+
 /// One identity event's worth of binding-row input.
 pub struct BindingWrite<'a> {
     pub provider: &'a str,
@@ -905,6 +989,27 @@ pub struct BindingWrite<'a> {
     /// carries its OWN assertion time on the stamps' `asserted_at` (focused-
     /// ep4-r2 Findings 1+2): the value captured at message receipt flows to
     /// the row unchanged — there is no write-side time override to get wrong.
+    pub provenance: ProvenancePolicy<'a>,
+    pub now_ms: i64,
+}
+
+/// Delta-r7-r2 (Finding F3) — the attach-restamp input. A WS `terminal.attach`
+/// carrying the attaching pane's `createRequestId` re-keys the terminal's
+/// Bound row onto THAT pane's identity: the row's pane linkage becomes the
+/// attach's pane, so a durable close record for the OLD pane's
+/// `createRequestId` keeps covering only the old pane (it stays closed) and
+/// can never suppress a genuinely re-opened session.
+#[derive(Debug, Clone, Copy)]
+pub struct ReattachWrite<'a> {
+    pub provider: &'a str,
+    pub session_id: &'a str,
+    /// The terminal the pane attached to — becomes the row's live terminal.
+    pub terminal_id: &'a str,
+    /// The attaching pane's createRequestId — the row's new pane key.
+    pub create_request_id: &'a str,
+    /// The attach's provenance (the connection's hello identity + the
+    /// attach-carried tab), applied under the existing attribution rules —
+    /// see [`resolve_provenance_merge`].
     pub provenance: ProvenancePolicy<'a>,
     pub now_ms: i64,
 }
@@ -1491,58 +1596,11 @@ impl PaneLedger {
                 "pane_ledger_revived: gc_expired tombstone re-bound by a live identity event"
             );
         }
-        // Provenance writer rules (the attribution fact is ONE atomic,
-        // MONOTONE unit — stamps+time move together, focused-ep4-r3 Findings
-        // 1+2; the tri-state is delta-r2 Finding 2, [`ProvenancePolicy`]):
-        //
-        // * `Inherit` (conn-less session-affiliated lane): the write asserts
-        //   nothing — the row keeps every stamp AND the attribution time.
-        // * `Replace` splits on whether the row HAS a prior attribution
-        //   (focused-ep4-r5 Finding 1):
-        //   - ATTACH (no prior `last_attributed_at`): applies whatever
-        //     MEANINGFUL provenance exists — the client+device halves, plus
-        //     the tab and the assertion time when present
-        //     (`attaches_attribution`; no triple requirement — a legacy
-        //     client whose wire message omits `tabId` still attaches).
-        //   - ADVANCE (a prior `last_attributed_at` exists): applies stamps
-        //     AND time only when it is a COMPLETE, NOT-STALE attribution:
-        //     the full client+device+tab triple is present
-        //     (`advances_attribution`, focused-ep4-r3 finding 2) AND the
-        //     stamps' `asserted_at` is >= the row's current
-        //     `last_attributed_at` (finding 1; the exact tie replaces,
-        //     keeping semantics deterministic). The assertion time is
-        //     captured at message RECEIPT — before gated/async create/fork
-        //     work — so an older delayed write can land AFTER a newer
-        //     assertion for the same session; without the guard it would
-        //     drag stamps+time back to the older tab/moment.
-        // * A `Replace` that fails its gate (hollow stamps on a
-        //   never-attributed row, or a partial/older assertion over an
-        //   attributed one) leaves stamps+time UNTOUCHED while the write's
-        //   other fields still land. The pre-finding-2 per-field
-        //   keep-when-`None` merge is gone: it mixed marker/write and row
-        //   stamps into combinations no single browser assertion ever made.
-        // * `Clear` (explicitly-headless lineage lane): the row's IDENTITY
-        //   stamps are erased, so a stale browser attribution can never
-        //   launder the row into the D8 offer under a refreshed `updated_at`
-        //   — but the attribution CLOCK is FLOORED, never erased
-        //   (focused-ep4-r5 Finding 2): `last_attributed_at` becomes
-        //   `max(existing, clear_now)`, so a delayed pre-Clear assertion can
-        //   never pass a no-prior-attribution arm and resurrect the cleared
-        //   stamps. The row stays unofferable while the stamps are `None`
-        //   (the judgment gates on the stamps first).
-        //
-        // The advancing TIME is the stamps' own `asserted_at` — the
-        // provenance value's assertion time since message receipt
-        // (focused-ep4-r2 Findings 1+2); the write's `now_ms` never enters
-        // (a slow spawn or a late conn-less resolution must not manufacture
-        // freshness; a marker-stamped resolution carries the consumed
-        // marker's `asserted_at` in exactly this slot). A conn-less `Inherit`
-        // maintenance write (respawn/locator/resolution) refreshes
-        // `updated_at` but re-asserts nothing, so neither it nor a weaker
-        // `Replace` can launder the row into the D8 offer the way
-        // `updated_at` churn did. DELIBERATELY unlike this body's other
-        // advisory fields (`create_request_id`), which are
-        // wholesale-replaced.
+        // Provenance writer rules: see [`resolve_provenance_merge`] — the ONE
+        // shared merge (the attribution fact is ONE atomic, MONOTONE unit;
+        // the write's `now_ms` never enters the attribution clock).
+        // DELIBERATELY unlike this body's other advisory fields
+        // (`create_request_id`), which are wholesale-replaced.
         //
         // The monotonic compare is WALL-CLOCK: after a backward server-clock
         // step a genuinely-later assertion compares as older and is rejected
@@ -1551,45 +1609,8 @@ impl PaneLedger {
         // residual (`UNSNAPSHOTTED_BINDING_GRACE_MS` in
         // `recovery_inventory.rs`), and a sequence counter is deliberately
         // NOT built for it (focused-ep4-r5 Finding 2a).
-        let prior_attribution = existing.and_then(|r| r.last_attributed_at);
-        let apply = match w.provenance {
-            ProvenancePolicy::Replace(stamps) => match prior_attribution {
-                None => attaches_attribution(&w.provenance),
-                Some(t) => advances_attribution(&w.provenance) && stamps.asserted_at >= t,
-            },
-            _ => false,
-        };
-        let (client_instance_id, device_id, tab_key, last_attributed_at) = match w.provenance {
-            ProvenancePolicy::Inherit => (
-                existing.and_then(|r| r.client_instance_id.clone()),
-                existing.and_then(|r| r.device_id.clone()),
-                existing.and_then(|r| r.tab_key.clone()),
-                existing.and_then(|r| r.last_attributed_at),
-            ),
-            ProvenancePolicy::Replace(stamps) => {
-                if apply {
-                    (
-                        stamps.client_instance_id.map(str::to_string),
-                        stamps.device_id.map(str::to_string),
-                        stamps.tab_key.map(str::to_string),
-                        applied_attribution_time(stamps.asserted_at),
-                    )
-                } else {
-                    (
-                        existing.and_then(|r| r.client_instance_id.clone()),
-                        existing.and_then(|r| r.device_id.clone()),
-                        existing.and_then(|r| r.tab_key.clone()),
-                        existing.and_then(|r| r.last_attributed_at),
-                    )
-                }
-            }
-            ProvenancePolicy::Clear => (
-                None,
-                None,
-                None,
-                Some(prior_attribution.map_or(w.now_ms, |t| t.max(w.now_ms))),
-            ),
-        };
+        let (client_instance_id, device_id, tab_key, last_attributed_at) =
+            resolve_provenance_merge(existing, &w.provenance, w.now_ms);
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
             provider: w.provider.to_string(),
@@ -1630,6 +1651,65 @@ impl PaneLedger {
             )?;
         }
         Ok(())
+    }
+
+    /// Delta-r7-r2 (Finding F3) — re-stamp a Bound row's PANE identity on a
+    /// pane attach. The sidebar/reattach flows attach a brand-new client pane
+    /// (fresh `createRequestId`) to a still-running detached terminal; without
+    /// this write the row keeps the OLD pane's createRequestId, so the old
+    /// pane's durable close record (`pane-detach:<crid>`) — and its terminal
+    /// id — keep covering the row and the recovery inventory suppresses a
+    /// session that is genuinely open again.
+    ///
+    /// Discipline:
+    /// * NO-OP (returns `Ok(false)`, NO durable write) when the identity has
+    ///   no Bound row — attach is not a create lane; it never manufactures or
+    ///   resurrects rows (a Retired row stays Retired: a kill's durable close
+    ///   wins over a racing stale attach), and when the row already carries
+    ///   THIS pane's createRequestId (every keepalive/viewport attach would
+    ///   otherwise fsync the row).
+    /// * On a restamp, the row's `create_request_id` and `live_terminal_id`
+    ///   move to the attach's pane/terminal, `updated_at`/`last_observed_at`
+    ///   stamp the write's `now_ms` (a genuine re-observation — the same
+    ///   semantics `record_binding_locked` gives its liveness stamps), and
+    ///   provenance merges through the ONE shared
+    ///   [`resolve_provenance_merge`] ruleset: the attach's Replace either
+    ///   ATTACHES (a never-attributed row) or ADVANCES (full triple, not
+    ///   stale) — a tab-less legacy attach re-keys the pane identity but
+    ///   leaves the attribution stamps+time untouched.
+    /// * Everything else on the row (`mode`/`cwd`/`created_at`/identity
+    ///   fields/settings/`pane_kind`) rides untouched — the restamp is a
+    ///   pane-identity+provenance fact, never a re-create.
+    pub fn note_pane_reattach(&self, w: &ReattachWrite<'_>) -> std::io::Result<bool> {
+        let Some(root) = &self.root else {
+            return Ok(false);
+        };
+        let mut index = self.guard();
+        let key = (w.provider.to_string(), w.session_id.to_string());
+        let Some(existing) = index.bindings.get(&key) else {
+            return Ok(false); // attach never creates rows
+        };
+        if existing.state != RowState::Bound {
+            return Ok(false); // never resurrect a retired (closed) identity
+        }
+        if existing.create_request_id.as_deref() == Some(w.create_request_id) {
+            return Ok(false); // already this pane — keepalive attaches pay no write
+        }
+        let (client_instance_id, device_id, tab_key, last_attributed_at) =
+            resolve_provenance_merge(Some(existing), &w.provenance, w.now_ms);
+        let row = BindingRow {
+            live_terminal_id: Some(w.terminal_id.to_string()),
+            create_request_id: Some(w.create_request_id.to_string()),
+            updated_at: w.now_ms,
+            last_observed_at: w.now_ms,
+            client_instance_id,
+            device_id,
+            tab_key,
+            last_attributed_at,
+            ..existing.clone()
+        };
+        self.write_binding(root, &mut index, &row)?;
+        Ok(true)
     }
 
     /// Retire an old bound row and link it to the session that superseded it

@@ -625,6 +625,7 @@ function createStoreWithTerminalPane() {
               mode: 'shell',
               status: 'running',
               terminalId: 'term-1',
+              createRequestId: 'req-replace-1',
             },
           },
         },
@@ -2536,8 +2537,17 @@ describe('ContextMenuProvider', () => {
 
       await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
 
-      // Verify terminal.detach was sent via the actual handler
+      // Verify the plain identity-driven terminal.detach was sent (F1: the
+      // close evidence now rides its own pane.closed message, below)
       expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
+      // F1 (delta-r7-r2): 'Replace pane' is a user-visible pane REMOVAL — it
+      // journals the durable pane-close evidence keyed by the replaced pane's
+      // createRequestId, exactly like the pane-X.
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'pane.closed',
+        createRequestId: 'req-replace-1',
+        terminalId: 'term-1',
+      })
 
       // Verify pane content is now picker
       const layout = store.getState().panes.layouts['tab-1']
@@ -2580,6 +2590,13 @@ describe('ContextMenuProvider', () => {
         .map(([msg]) => msg as { type?: string; terminalId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
       expect(detachMessages).toHaveLength(1)
+      // Exactly one pane-close evidence message keyed by the replaced pane (F1).
+      const paneClosedMessages = wsMocks.send.mock.calls
+        .map(([msg]) => msg as { type?: string; createRequestId?: string })
+        .filter((msg) => msg?.type === 'pane.closed')
+      expect(paneClosedMessages).toEqual([
+        { type: 'pane.closed', createRequestId: 'req-replace-1', terminalId: 'term-1' },
+      ])
     })
 
   })

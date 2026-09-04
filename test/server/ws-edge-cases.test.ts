@@ -825,6 +825,39 @@ describe('WebSocket edge cases', () => {
     })
   })
 
+  describe('Rust-only message acceptance', () => {
+    // Delta-r7-r2 (Findings F1+F2): `pane.closed` is the dedicated durable
+    // pane-close evidence channel; only the Rust server journals it (the Node
+    // server has no recovery ledger). A valid pane.closed must be accepted
+    // and ignored — never answered with INVALID_MESSAGE/UNKNOWN_MESSAGE — so
+    // a mixed client never draws an error per close on the legacy server.
+    it('accepts and ignores pane.closed (no error frame, connection stays open)', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({
+        type: 'pane.closed',
+        createRequestId: 'req-node-accept',
+        terminalId: 'term-node-accept',
+      }))
+      // A terminalId-less close (the in-flight-create shape) is equally valid.
+      ws.send(JSON.stringify({ type: 'pane.closed', createRequestId: 'req-node-accept-2' }))
+
+      // Any protocol frame proves life-after-the-message; ping/pong is the
+      // lightest. An error frame for either pane.closed would also surface
+      // inside this collection window.
+      ws.send(JSON.stringify({ type: 'ping' }))
+      const messages = await collectMessages(ws, 400)
+      expect(messages.some((m) => m.type === 'pong')).toBe(true)
+      expect(
+        messages.filter((m) => m.type === 'error'),
+        `pane.closed must never draw an error frame: ${JSON.stringify(messages)}`,
+      ).toEqual([])
+      expect(ws.readyState).toBe(WebSocket.OPEN)
+
+      close()
+    })
+  })
+
   describe('Terminal stream v2 replay and pressure handling', () => {
     it('sinceSeq replays only missing frames on terminal.attach', async () => {
       const { ws: ws1, close: close1 } = await createAuthenticatedConnection()

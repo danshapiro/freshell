@@ -510,6 +510,17 @@ export const TerminalAttachSchema = z.object({
    * servers accept-and-strip it (WS_PROTOCOL_VERSION deliberately not
    * bumped — additive optional, all four old/new quadrants valid). */
   surfaceReset: z.boolean().optional(),
+  /** The attaching pane's createRequestId (delta-r7-r2, Finding F3): when an
+   * attach carries it, the server re-stamps the terminal's Bound ledger row
+   * onto THIS pane's identity (a sidebar reattach becomes the row's new pane
+   * key, so a stale pane-close record for the OLD pane's createRequestId can
+   * never suppress the genuinely re-opened session). Additive optional. */
+  createRequestId: z.string().min(1).optional(),
+  /** The attaching pane's tab id (delta-r7-r2, Finding F3): composes the
+   * re-stamp's provenance `tabKey` (`deviceId:tabId`), so the row's
+   * attribution advances to the attach's true tab and assertion time under
+   * the existing full-triple advance rule. Additive optional. */
+  tabId: z.string().min(1).optional(),
   intent: TerminalAttachIntentSchema,
   priority: TerminalAttachPrioritySchema.optional(),
   cols: z.number().int().min(2).max(1000),
@@ -519,12 +530,21 @@ export const TerminalAttachSchema = z.object({
 export const TerminalDetachSchema = z.object({
   type: z.literal('terminal.detach'),
   terminalId: z.string().min(1),
-  /** The closing pane's createRequestId (delta-round-7, Finding F2): present
-   * ONLY on a pane-close detach — the server journals a durable NON-retiring
-   * pane-close record keyed by it (the session survives: nothing is fenced or
-   * retired). Absent on every other detach shape (legacy clients, reconcile/
-   * cleanup folds): additive optional, no record is written. */
-  createRequestId: z.string().min(1).optional(),
+})
+
+/** Delta-r7-r2 (Findings F1+F2) — the dedicated durable pane-close evidence
+ * message. EVERY user- or system-initiated action that removes a pane from
+ * the layout (pane-X, replace-pane, whole-tab close) sends ONE per removed
+ * terminal-pane identity, keyed by the pane's createRequestId (present from
+ * creation — never absent) and carrying the pane's terminalId when it
+ * exists. The server journals a durable NON-retiring pane-close record (the
+ * session survives — nothing is fenced or retired). The detach channel
+ * itself stays identity-driven: detach is about the terminal, never the
+ * pane. */
+export const PaneClosedSchema = z.object({
+  type: z.literal('pane.closed'),
+  createRequestId: z.string().min(1),
+  terminalId: z.string().min(1).optional(),
 })
 
 export const TerminalAutoResumeCancelSchema = z.object({
@@ -911,6 +931,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalAttachSchema,
   TerminalAutoResumeCancelSchema,
   TerminalDetachSchema,
+  PaneClosedSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,

@@ -82,6 +82,7 @@ import {
   TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
+  PaneClosedSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
@@ -845,6 +846,7 @@ export class WsHandler {
       TerminalCodexCandidatePersistedSchema,
       TerminalAttachSchema,
       TerminalDetachSchema,
+      PaneClosedSchema,
       TerminalInputSchema,
       TerminalResizeSchema,
       TerminalKillSchema,
@@ -3980,6 +3982,13 @@ export class WsHandler {
         // Rust-only feature: agent auto-resume lives in freshell-ws. The
         // Node server has no auto-resume hub — accept and ignore so a valid
         // client message never triggers UNKNOWN_MESSAGE.
+        return
+
+      case 'pane.closed':
+        // Rust-only feature: durable pane-close evidence is journaled by the
+        // freshell-ws pane ledger (the Node server has no recovery ledger) —
+        // accept and ignore so a valid client message never triggers
+        // UNKNOWN_MESSAGE.
         return
 
       default:
