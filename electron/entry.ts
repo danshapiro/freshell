@@ -33,10 +33,14 @@ import { runStartup, type StartupContext, type BrowserWindowLike } from './start
 import { acquireInstanceLock, initMainProcess } from './main.js'
 import {
   DEFAULT_PROFILE_ID,
+  buildPickerEntries,
   readProfilesRegistry,
   registryPathForHome,
   resolveBootShape,
+  stripProfileArgs,
+  type PickerEntry,
 } from './profile.js'
+import { createChooseProfileHandler } from './profile-choice-handler.js'
 import { createWizardWindow } from './setup-wizard/wizard-window.js'
 import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
 import { buildLaunchOptions } from './launch-options.js'
@@ -85,6 +89,76 @@ if (bootShape.error) {
 /** True once this process holds its (userData-keyed) instance lock;
  *  re-entrant main() calls (wizard completion) must not re-request it. */
 let instanceLockHeld = false
+
+/**
+ * Show the profile picker and relaunch into the chosen profile.
+ *
+ * This launcher process holds the LAUNCHER-scoped instance lock (own
+ * userData dir), so a racing flag-less launch is turned away at the lock gate
+ * and delivers `second-instance` here, where we surface the existing picker
+ * window. Every confirmed choice — Default included — relaunches with an
+ * explicit `--profile=<id>` and exits; the relaunched process then takes the
+ * chosen profile's own lock. The returned promise never settles.
+ * Closing the picker without choosing exits the app.
+ */
+async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
+  const pickerWin = new BrowserWindow({
+    width: 520,
+    height: 480,
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  })
+  const pickerWebContentsId = pickerWin.webContents.id
+  const onSecondInstance = () => {
+    if (!pickerWin.isDestroyed()) {
+      pickerWin.show()
+      pickerWin.focus()
+    }
+  }
+  app.on('second-instance', onSecondInstance)
+
+  const cleanup = () => {
+    app.removeListener('second-instance', onSecondInstance)
+    ipcMain.removeHandler('get-profiles')
+    ipcMain.removeHandler('choose-profile')
+  }
+
+  ipcMain.removeHandler('get-profiles')
+  ipcMain.removeHandler('choose-profile')
+  ipcMain.handle('get-profiles', () => entries)
+  ipcMain.handle('choose-profile', createChooseProfileHandler({
+    entries,
+    isAllowedSender: (event) =>
+      (event as { sender?: { id?: number } }).sender?.id === pickerWebContentsId,
+    relaunchWithProfile: (id) => {
+      const args = [...stripProfileArgs(process.argv.slice(1)), `--profile=${id}`]
+      app.relaunch({ args })
+      app.exit(0)
+    },
+  }))
+
+  pickerWin.on('closed', () => {
+    cleanup()
+    app.exit(0)
+  })
+
+  if (isDev) {
+    void pickerWin.loadURL('http://localhost:5179')
+  } else {
+    const packaged = path.join(process.resourcesPath, 'profile-picker', 'index.html')
+    const unpackaged = path.join(app.getAppPath(), 'dist', 'profile-picker', 'index.html')
+    void pickerWin.loadFile(fs.existsSync(packaged) ? packaged : unpackaged)
+  }
+  pickerWin.show()
+  return new Promise<void>(() => {
+    // Never settles: this launcher exits via app.exit(0) on choice or close.
+  })
+}
 
 type EntryBrowserWindow = InstanceType<typeof BrowserWindow>
 type WindowListener = { event: string; callback: (...args: any[]) => void }
@@ -314,6 +388,16 @@ async function main(): Promise<void> {
       win.show()
       win.focus()
     })
+  }
+
+  // --- Profile picker -------------------------------------------------------
+  // A picker launch (no explicit profile + registry names ≥1 profile) parks
+  // its userData in the launcher dir, holds the launcher lock, shows only the
+  // picker, and ends here. See resolveBootShape (module top) for the shape
+  // decision and runProfilePicker for choice semantics.
+  if (isPickerLauncher) {
+    await runProfilePicker(buildPickerEntries(registryAtBoot))
+    return
   }
 
   // Consolidated window-all-closed handler: during the wizard phase we keep
