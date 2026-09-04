@@ -352,6 +352,14 @@ pub struct TerminalResize {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalKill {
     pub terminal_id: String,
+    /// Close-result correlation (delta-r6-r3): present ⇒ the server answers
+    /// with `terminal.killed{requestId,…}`; absent ⇒ legacy error frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The closing pane's createRequestId — the durable close envelope's key
+    /// when the registry probe cannot answer (reaper race / stale pane).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
 }
 
 // --- *.activity.list --------------------------------------------------------

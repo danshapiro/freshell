@@ -175,14 +175,14 @@ export function RecoveryOfferPanel(): JSX.Element | null {
 
   const paneCount = countRecoverablePanes(inventory)
   const device = inventory.device
-  // Delta-r6: the live note explains panes that ARE listed but reopen without
-  // resuming (the D7 terminal regime) — count only live panes that survive
-  // the restorability predicate (a live FRESH-AGENT pane is excluded from the
-  // restore entirely, so it never motivates the note). Same predicate as the
-  // count/listing/plan, so the note can never describe an excluded pane.
+  // Delta-r6-r3 (focused-episode-6 round 2, Finding F1): the live note now
+  // explains EXCLUDED panes — every live pane (any kind) is skipped by the
+  // restore (its session still runs server-side; recreating it would spawn a
+  // duplicate). The note's condition and copy describe that exclusion
+  // honestly: no live pane is ever listed or counted, so the note no longer
+  // shares the restorability predicate on purpose.
   const anyLive =
-    device?.tabs.some((tab) => tab.panes.some((pane) => pane.live && isRestorablePane(pane))) ??
-    false
+    device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false
   // D8 placement: the listing must match the plan's physical destination, so
   // both consume the same partition — a kept ledger row whose stamped tabKey
   // names a restorable tab renders under THAT tab in the same line format as
@@ -264,8 +264,8 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         </ul>
         {anyLive && (
           <p data-testid="recovery-live-note" className="mt-3 text-xs text-muted-foreground">
-            Some sessions are still running on the server — they were left untouched; their panes
-            reopen without resuming.
+            Some sessions are still running on the server — they are not restored; they stay open
+            as background sessions you can reattach from the sidebar.
           </p>
         )}
         <div className="mt-4 flex justify-end gap-2">

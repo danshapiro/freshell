@@ -4,6 +4,7 @@ import type { SessionRef } from '@shared/session-contract'
 import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
+import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
@@ -106,7 +107,7 @@ function foldFreshAgentKilled(
     dispatch(sessionError({
       ...locator,
       code: 'KILL_FAILED',
-      message: 'the session close could not be recorded durably; the session may still be running on the server',
+      message: KILL_FAILED_MESSAGE, // one copy for both writers (see kill-ack.ts)
     }))
     return
   }

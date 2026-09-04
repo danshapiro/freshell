@@ -49,6 +49,7 @@ const {
   saveServerSettingsPatchSpy,
   cancelCreateSpy,
   cancelWsCreateSpy,
+  wsMessageHandlers,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -69,14 +70,41 @@ const {
   })),
   cancelCreateSpy: vi.fn(),
   cancelWsCreateSpy: vi.fn(),
+  wsMessageHandlers: new Set<(msg: unknown) => void>(),
 }))
+
+/** Deliver a server frame to every subscribed ws handler (the kill-ack waits). */
+function emitWsMessage(msg: unknown) {
+  for (const handler of [...wsMessageHandlers]) handler(msg)
+}
+
+/** Answer the in-flight fresh-agent kills with success. */
+function ackFreshAgentKillsMocked() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; sessionId?: string; sessionType?: string; provider?: string }
+    if (m?.type === 'freshAgent.kill' && m.sessionId) {
+      emitWsMessage({
+        type: 'freshAgent.killed',
+        sessionId: m.sessionId,
+        sessionType: m.sessionType,
+        provider: m.provider,
+        success: true,
+      })
+    }
+  }
+}
 
 // Mock the ws-client module
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
     cancelCreate: cancelWsCreateSpy,
-    onMessage: () => () => {},
+    onMessage: (handler: (msg: unknown) => void) => {
+      wsMessageHandlers.add(handler)
+      return () => {
+        wsMessageHandlers.delete(handler)
+      }
+    },
   }),
 }))
 
@@ -1062,6 +1090,92 @@ describe('PaneContainer', () => {
         provider: 'opencode',
         cwd: '/repo/session-state',
       })
+    })
+
+    it('closes the fresh-agent pane only once the killed answer confirms the durable close', async () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent-ack',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-ack-close',
+          sessionId: 'thread-codex-ack',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent-ack' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      // The kill is in flight; the pane must NOT be dropped before the
+      // correlated answer arrives (focused-episode-6 round 2, Finding 6).
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-codex-ack' }),
+      )
+      expect(
+        (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>)?.id,
+      ).toBe('pane-fresh-agent-ack')
+
+      ackFreshAgentKillsMocked()
+      await waitFor(() => {
+        expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+      })
+    })
+
+    it('keeps the fresh-agent pane standing when the kill answers success:false', async () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent-fail',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-fail-close',
+          sessionId: 'thread-codex-fail',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent-fail' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      emitWsMessage({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-codex-fail',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(
+        store.getState().panes.layouts['tab-1'],
+        'an unacknowledged/unrecorded close is not a close: the pane stays',
+      ).toBeTruthy()
     })
 
     it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {

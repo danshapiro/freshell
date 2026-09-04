@@ -4786,6 +4786,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         // Ledger A2 / invariant 10b: also match the pane's last-known tid --
         // recovery paths clear terminalIdRef, and a backstop frame for the
         // just-dead id must stay visible.
+        if (msg.type === 'terminal.killed' && (msg.terminalId === tid || msg.terminalId === lastKnownTerminalIdRef.current)) {
+          // Focused-episode-6 round 2 (Findings 6+7): the correlated close
+          // answer. `success:false` means the durable close FAILED and this
+          // terminal still runs server-side — the close flow kept the pane
+          // for exactly this case; say so on the pane's own surface.
+          if (msg.success === false) {
+            log.warn('terminal_killed_reported_failure', {
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: msg.terminalId,
+              error: msg.error ?? null,
+            })
+            writeLocalXtermNotice(
+              term,
+              `\r\n[Close failed] ${msg.error ?? 'the terminal close could not be recorded durably; the terminal may still be running'}\r\n`,
+            )
+          }
+          return
+        }
+
         if (msg.type === 'terminal.input.blocked' && (msg.terminalId === tid || msg.terminalId === lastKnownTerminalIdRef.current)) {
           const reason = msg.reason as TerminalInputBlockedReason
           log.warn('terminal_input_blocked', {

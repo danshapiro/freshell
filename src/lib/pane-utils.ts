@@ -42,6 +42,33 @@ export function collectTerminalIds(node: PaneNode): string[] {
 }
 
 /**
+ * The terminal-close pairs for one tab's pane tree (focused-episode-6 round
+ * 2): each live terminal's `terminalId` PLUS the pane's `createRequestId` —
+ * the durable close envelope's createRequestId key on the server when the
+ * registry probe can no longer answer. First reference wins per
+ * terminalId (a terminal shared by two panes closes once).
+ */
+export function collectTerminalCloseTargets(
+  node: PaneNode,
+): Array<{ terminalId: string; createRequestId: string | null }> {
+  const seen = new Set<string>()
+  const out: Array<{ terminalId: string; createRequestId: string | null }> = []
+  const walk = (n: PaneNode): void => {
+    if (n.type === 'leaf') {
+      if (n.content.kind === 'terminal' && n.content.terminalId && !seen.has(n.content.terminalId)) {
+        seen.add(n.content.terminalId)
+        out.push({ terminalId: n.content.terminalId, createRequestId: n.content.createRequestId ?? null })
+      }
+      return
+    }
+    walk(n.children[0])
+    walk(n.children[1])
+  }
+  walk(node)
+  return out
+}
+
+/**
  * Union of every terminalId referenced by any pane in any tab layout.
  * This is the client's complete "terminals I currently reference" set —
  * the primitive the detach middleware diffs to spot dropped references.

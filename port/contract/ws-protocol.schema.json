@@ -1143,6 +1143,14 @@
         {
           "additionalProperties": false,
           "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "terminalId": {
               "minLength": 1,
               "type": "string"
@@ -7617,6 +7625,14 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "terminalId": {
           "minLength": 1,
           "type": "string"

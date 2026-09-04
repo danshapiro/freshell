@@ -258,24 +258,33 @@ describe('RecoveryOfferPanel', () => {
     expect(ul!.contains(screen.getByTestId('recovery-accept'))).toBe(false)
   })
 
-  it('shows the live note for live panes and recreates them without sessionRef (D7)', async () => {
-    const liveInventory: RecoveryInventory = {
+  // Delta-r6-r3 (focused-episode-6 round 2, Finding F1): live panes of EVERY
+  // kind are excluded from the count, the listing, and the accepted plan —
+  // recreating one would spawn a duplicate on top of the still-running
+  // server session. The live note now explains the EXCLUSION.
+  it('excludes live panes from the count, the listing, and the accepted plan — explaining them with the live note', async () => {
+    const basePane = INVENTORY.device!.tabs[0].panes[0]
+    const liveTerminal = {
+      ...basePane,
+      paneId: 'p-live-term',
+      sessionRef: { provider: 'claude', sessionId: 'S-LIVE' },
+      live: true,
+    }
+    const inventory: RecoveryInventory = {
       ...INVENTORY,
       device: {
         ...INVENTORY.device!,
-        tabs: [
-          {
-            tabKey: 'k',
-            tabName: 'work',
-            panes: [{ ...INVENTORY.device!.tabs[0].panes[0], live: true }],
-          },
-        ],
+        tabs: [{ tabKey: 'k', tabName: 'work', panes: [basePane, liveTerminal] }],
       },
     }
-    vi.mocked(getRecoveryInventory).mockResolvedValue(liveInventory)
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
     const store = makeTestStore()
     render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    expect(await screen.findByText(/restore 1 pane/i)).toBeInTheDocument()
     expect(await screen.findByTestId('recovery-live-note')).toBeVisible()
+    expect(screen.getByTestId('recovery-live-note')).toHaveTextContent(
+      /still running on the server — they are not restored/,
+    )
 
     await userEvent.click(screen.getByTestId('recovery-accept'))
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
@@ -284,9 +293,27 @@ describe('RecoveryOfferPanel', () => {
     expect(leaves).toHaveLength(1)
     const content = leaves[0].content
     if (content.kind !== 'terminal') throw new Error('unreachable')
-    // Live sessions are left untouched: no resume ref, no restore arming
-    expect(content.sessionRef).toBeUndefined()
-    expect(consumeTerminalRestoreRequestId(content.createRequestId)).toBe(false)
+    expect(
+      content.sessionRef?.sessionId,
+      'the accepted plan restored ONLY the restorable pane (the live one was never rebuilt)',
+    ).toBe('S2')
+    expect(consumeTerminalRestoreRequestId(content.createRequestId)).toBe(true)
+  })
+
+  it('an all-live inventory renders no offer and clears the pending flag', async () => {
+    const basePane = INVENTORY.device!.tabs[0].panes[0]
+    const liveInventory: RecoveryInventory = {
+      ...INVENTORY,
+      device: {
+        ...INVENTORY.device!,
+        tabs: [{ tabKey: 'k', tabName: 'work', panes: [{ ...basePane, live: true }] }],
+      },
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(liveInventory)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(getPendingOffer()).toBeNull())
   })
 
   // Delta-r6 F1 (closed verdicts are NOT restorable): a snapshot pane the
@@ -352,13 +379,13 @@ describe('RecoveryOfferPanel', () => {
     await waitFor(() => expect(getPendingOffer()).toBeNull())
   })
 
-  // Delta-r6 F2 (live fresh-agent panes are NOT restorable): a fresh-agent
-  // pane whose session is still running on the server (the top-level `live`
-  // verdict) is excluded from the count, the listing, and the accepted plan —
-  // restoring it would RESUME the live session despite D7. The live note is
-  // reserved for panes that ARE listed but reopen without resuming (the D7
-  // terminal regime), so it does not render here.
-  it('a live fresh-agent pane is excluded from the count, the listing, and the accepted plan (and raises no live note)', async () => {
+  // Delta-r6 F2 + delta-r6-r3: live fresh-agent panes are NOT restorable — a
+  // fresh-agent pane whose session is still running on the server (the
+  // top-level `live` verdict) is excluded from the count, the listing, and
+  // the accepted plan — restoring it would RESUME the live session despite
+  // D7. The live note now explains EXCLUDED panes of any kind (delta-r6-r3),
+  // so it renders here.
+  it('a live fresh-agent pane is excluded from the count, the listing, and the accepted plan (and the live note explains the exclusion)', async () => {
     const basePane = INVENTORY.device!.tabs[0].panes[0]
     const liveFreshAgent = {
       ...basePane,
@@ -383,7 +410,7 @@ describe('RecoveryOfferPanel', () => {
     const store = makeTestStore()
     render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
     expect(await screen.findByText(/restore 1 pane/i)).toBeInTheDocument()
-    expect(screen.queryByTestId('recovery-live-note')).not.toBeInTheDocument()
+    expect(await screen.findByTestId('recovery-live-note')).toBeVisible()
 
     await userEvent.click(screen.getByTestId('recovery-accept'))
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())

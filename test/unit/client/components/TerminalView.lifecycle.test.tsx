@@ -3508,6 +3508,43 @@ describe('TerminalView lifecycle updates', () => {
     expectTerminalWriteContaining(term, 'Terminal exited')
   })
 
+  it('writes an in-pane notice when the correlated terminal close reports a durable-close failure', async () => {
+    // Focused-episode-6 round 2 (Findings 6+7): a terminal.killed answer
+    // with success:false means the server could NOT record the close durably
+    // and left the terminal running — the close flow kept the pane for
+    // exactly this case, and the pane's own surface (the xterm notice, the
+    // input.blocked convention) explains why the close did not happen.
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-close-fail',
+      status: 'running',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.killed',
+        requestId: 'req-kill-close-fail',
+        terminalId: 'term-close-fail',
+        success: false,
+        error: 'the terminal close could not be recorded durably; the terminal was left running',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expectTerminalWriteContaining(term, '[Close failed] the terminal close could not be recorded durably')
+  })
+
   it('shows feedback when Codex input is blocked by the restore identity gate', async () => {
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({
       terminalId: 'term-codex',

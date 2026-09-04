@@ -12,10 +12,14 @@
  * Scenario 2 (decline path): a fresh context declines — the panel closes and
  * no recovered tabs are added.
  *
- * Scenario 3 (no-restart browser loss, D7): the browser is lost WITHOUT a
- * server restart, so the claude PTY stays Running (registry-owned). The next
- * fresh context's offer shows the live-session note, and accepting recreates
- * the pane WITHOUT `--resume` — the running session is left untouched.
+ * Scenario 3 (no-restart browser loss, live exclusion): the browser is lost
+ * WITHOUT a server restart, so D's claude PTY stays Running (registry-owned)
+ * and its pane verdicts LIVE. Live panes are excluded from restore for EVERY
+ * kind (delta-r6-r3): the offer lists only D's UNIDENTIFIED shell pane under
+ * the not-restored live note, accepting recreates the shell — and NEVER a
+ * second claude on top of the still-running session (argv-log proof: no
+ * fresh spawn past the watermark, never `--resume <sessionIdD>`). The live
+ * session stays available as a background session.
  *
  * Scenario 4 (phone containment, R1/R3): a populating context records a
  * 40-shell-tab layout and is lost WITHOUT a server restart; a fresh
@@ -588,7 +592,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await waitForRecoverable(info)
   })
 
-  test('scenario 3: no-restart browser loss — live session recreates WITHOUT resume (D7)', async ({ browser, e2eServerKind }) => {
+  test('scenario 3: no-restart browser loss — live sessions are NEVER recreated on top of the still-running ones (delta-r6-r3 live exclusion)', async ({ browser, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     test.setTimeout(240_000)
 
@@ -626,42 +630,55 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     }).toPass({ timeout: 15_000 })
     await waitForSnapshotContaining([sessionIdD])
 
-    // The argv-log watermark for the D7 negative assertion below.
+    // The argv-log watermark for the never-recreate assertions below.
     const argvCountAtD = (await readArgvLog(argLog)).length
 
-    // ---- Lose the browser WITHOUT restarting the server: the claude PTY
-    // stays Running (registry-owned, not connection-owned). ----
+    // ---- Lose the browser WITHOUT restarting the server: BOTH D's shell
+    // PTY and D's claude CLI keep running (registry-owned, not
+    // connection-owned), so every recoverable candidate verdicts LIVE. ----
     await ctxD.close()
-    // Guard (R2a): context E's boot below REQUIRES the offer for D's layout.
+    // Guard (R2a): the server's inventory still sees the recoverable
+    // substance (the exclusion lives in the plan layer — the poller is the
+    // transition guard, not an assertion).
     await waitForRecoverable(info)
 
-    // ---- Context E: the offer appears (the new session changed the
-    // recoverable substance — scenario 2's dismissal cannot suppress it, and
-    // E is a different fresh context anyway) with the live-session note. ----
-    const { ctx: ctxE, page: pageE } = await openFreshContextWithOffer(browser, 'contextE')
+    // ---- Context E (fresh storage): the offer lists ONLY the unidentified
+    // shell pane — the claude pane verdicts LIVE (its session still runs),
+    // and live panes are excluded for EVERY kind (focused-episode-6 round 2
+    // Finding F1: the pre-repair build recreated the live terminal pane as a
+    // SECOND claude spawn on top of the still-running session). ----
+    const ctxE: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageE = await ctxE.newPage()
+    traceInventoryFailures(pageE, 'contextE')
+    await connect(pageE, info)
 
     const panelE = pageE.getByTestId('recovery-offer-panel')
+    await expect(panelE).toBeVisible({ timeout: 15_000 })
+    await expect(
+      pageE.getByRole('heading', { name: /restore 1 pane from server memory/i }),
+    ).toBeVisible()
     await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
+    await expect(pageE.getByTestId('recovery-live-note')).toHaveText(/not restored/)
 
     await pageE.getByTestId('recovery-accept').click()
     await expect(panelE).toHaveCount(0)
 
-    // A terminal pane is recreated.
+    // The accept DID run: the unidentified shell pane is recreated.
     await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
-    // D7 negative assertion, non-vacuously: FIRST wait until the recreated
-    // claude spawn is OBSERVED in the log (the live pane recreates as a fresh
-    // claude — a new entry past the watermark), THEN assert none of the new
-    // entries carries `--resume <sessionIdD>`. The matcher itself is proven
-    // non-vacuous by scenario 1's PRIMARY poll, which matched a real pair.
-    await expect(async () => {
-      const entries = await readArgvLog(argLog)
-      expect(entries.length, 'accept must re-spawn a claude CLI for the live pane').toBeGreaterThan(argvCountAtD)
-    }).toPass({ timeout: 30_000 })
-    const newEntries = (await readArgvLog(argLog)).slice(argvCountAtD)
+    // And the live claude pane was NOT recreated on top of the still-running
+    // session — no fresh claude spawn past the watermark, and never
+    // `--resume <sessionIdD>`. The positive window: the recreated shell is
+    // already visible above, so any wrongly-recreated claude spawn would be
+    // in flight now.
+    const entriesAfterAccept = (await readArgvLog(argLog)).slice(argvCountAtD)
     expect(
-      newEntries.some((e) => hasClaudeResumePair(e.argv, sessionIdD)),
-      'live session must be recreated WITHOUT --resume (left untouched, D7)',
+      entriesAfterAccept,
+      'the live claude pane was never recreated (a second claude spawn past the watermark)',
+    ).toHaveLength(0)
+    expect(
+      entriesAfterAccept.some((e) => hasClaudeResumePair(e.argv, sessionIdD)),
+      'the live session is never resumed onto a recreated pane',
     ).toBe(false)
 
     // Deliberately UNGUARDED close (R2a): scenario 4's populating boot never

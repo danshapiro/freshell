@@ -821,6 +821,159 @@ async fn a_kill_for_a_terminal_the_registry_lost_still_records_the_pane_close() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Delta-r6-r3 (focused-episode-6 round 2, Finding 7's server half): a kill
+/// carrying `requestId` answers ONCE with a correlated `terminal.killed`
+/// frame — `success:true` after the durable close envelope landed and the
+/// process is gone — so the closing client can AWAIT the kill instead of
+/// dropping the pane optimistically.
+#[tokio::test]
+async fn a_kill_carrying_a_request_id_answers_with_a_correlated_terminal_killed_frame() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-correlated");
+    let (url, registry, _server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-kill-correlated-create",
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+    let kill = serde_json::json!({
+        "type": "terminal.kill",
+        "terminalId": terminal_id,
+        "requestId": "req-kill-correlated",
+        "createRequestId": "req-kill-correlated-create",
+    });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let killed = next_frame_of_type(&mut ws, "terminal.killed").await;
+    assert_eq!(killed["requestId"], "req-kill-correlated");
+    assert_eq!(killed["terminalId"], terminal_id);
+    assert_eq!(
+        killed["success"], true,
+        "the process is gone and the close recorded: {killed}"
+    );
+    assert!(
+        killed.get("error").is_none(),
+        "a successful close carries no error: {killed}"
+    );
+    wait_for(
+        || registry.probe(&terminal_id).is_none(),
+        "the terminal to be reaped by the kill",
+    );
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The failure arm: the SAME kill shape on a broken store answers
+/// `terminal.killed{success:false, error}` (never the uncorrelated legacy
+/// INTERNAL_ERROR frame) and leaves the terminal running.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_kill_whose_durable_close_fails_answers_the_correlated_failure_frame() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-correlated-fail");
+    let (url, registry, _server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-kill-correlated-fail-create",
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+
+    set_permissions_recursive(&dir, 0o555, 0o555);
+    let kill = serde_json::json!({
+        "type": "terminal.kill",
+        "terminalId": terminal_id,
+        "requestId": "req-kill-correlated-fail",
+    });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    // The FIRST of terminal.killed / error (the correlated kill must answer
+    // the killed frame, never the legacy uncorrelated error frame).
+    let killed = loop {
+        let frame = next_any_frame(&mut ws).await;
+        if frame["type"] == "terminal.killed" || frame["type"] == "error" {
+            break frame;
+        }
+    };
+    assert_eq!(
+        killed["type"], "terminal.killed",
+        "the correlated kill answers the killed frame, never the legacy error frame: {killed}"
+    );
+    assert_eq!(killed["requestId"], "req-kill-correlated-fail");
+    assert_eq!(killed["success"], false);
+    assert!(
+        killed["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the failure carries its reason: {killed}"
+    );
+    assert!(
+        registry.probe(&terminal_id).is_some(),
+        "a failed durable close must leave the terminal running"
+    );
+
+    set_permissions_recursive(&dir, 0o755, 0o644);
+    registry.kill(&terminal_id);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The message-carried `createRequestId` keys the envelope when the registry
+/// cannot (the stale-pane arm): the close record the recovery verdict joins
+/// on carries it even though the registry never held the terminal.
+#[tokio::test]
+async fn a_registry_less_kill_uses_the_message_carried_create_request_id_for_the_envelope() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-stale-cr");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let stale_terminal_id = "77ab8c904f9472397321a3d02cfdead1";
+    let kill = serde_json::json!({
+        "type": "terminal.kill",
+        "terminalId": stale_terminal_id,
+        "requestId": "req-kill-stale-cr",
+        "createRequestId": "cr-from-the-closing-pane",
+    });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let killed = next_frame_of_type(&mut ws, "terminal.killed").await;
+    assert_eq!(
+        killed["success"], true,
+        "a missing registry entry is NOT a close failure (the terminal is already gone): {killed}"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(record) = server_ledger.pane_close_for_terminal(stale_terminal_id) {
+            assert_eq!(
+                record.create_request_id.as_deref(),
+                Some("cr-from-the-closing-pane"),
+                "the envelope keys the stale pane's createRequestId (the verdict join key): {record:?}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the close envelope for a registry-less kill landed"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await;
+    }
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// F6, the terminal half through the REAL failure surface: only the ROW
 /// retire write can fail (its bindings dir read-only; the tombstone's tree
 /// stays writable). The compensated close must NOT leave the just-written

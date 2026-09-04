@@ -5524,27 +5524,36 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     // captured sessionRef (the delta-r6 shape) missed the
     // resolver-racing/pre-resolution window this pane close covers.
     //
-    // Delta-r6-r3 (focused-episode-6 round 2, Finding at the registry-absent
-    // arm): the envelope is written UNCONDITIONALLY — FIRST — even when the
-    // registry no longer holds the id. A reaper that just removed the row
-    // (the terminal exited as the user closed the pane) or a stale pane
-    // after a server restart made the pre-r3 arms return `INVALID_TERMINAL_ID`
-    // without recording anything: the stale snapshot then received NO closed
-    // verdict and could be offered/rebuilt. The pane close is real
-    // regardless of registry presence; the record keys by the terminal id
-    // the close knows (plus the registry's createRequestId stamp when the
-    // row stands).
+    // Delta-r6-r3 (focused-episode-6 round 2, Findings 5+7): the envelope is
+    // written UNCONDITIONALLY — FIRST — even when the registry no longer
+    // holds the id. A reaper that just removed the row (the terminal exited
+    // as the user closed the pane) or a stale pane after a server restart
+    // made the pre-r3 arms return `INVALID_TERMINAL_ID` without recording
+    // anything: the stale snapshot then received NO closed verdict and could
+    // be offered/rebuilt. The pane close is real regardless of registry
+    // presence; the record keys by the terminal id the close knows, with the
+    // createRequestId taken from the registry when its row stands, else from
+    // the kill message itself (the pane carries it and the registry probe can
+    // no longer answer).
     //
     // Failure propagation (delta-r6, envelope-atomic delta-r6-r3): a FAILED
     // durable close FAILS the kill — the process is left running, the
-    // identity stands, the client gets an error frame instead of a silent
+    // identity stands, the client is answered a failure instead of a silent
     // success, and `close_pane`'s rollback guarantees no retired row or
-    // standing tombstone mis-reads the still-live terminal as closed.
-    // A MISSING registry entry is not a close failure (the terminal is
-    // already gone) — but the envelope write failing IS. (DETACH stays
-    // non-retiring, unchanged.)
+    // standing tombstone mis-reads the still-live terminal as closed. A
+    // MISSING registry entry is not a close failure (the terminal is already
+    // gone) — but the envelope write failing IS.
+    //
+    // The correlated answer (Finding 7): a kill carrying `requestId` gets ONE
+    // `terminal.killed{requestId, terminalId, success, error?}` reply — the
+    // close flows await it before dropping the pane; the legacy error frames
+    // (`INTERNAL_ERROR` / `INVALID_TERMINAL_ID`) remain for requestId-less
+    // kills (older clients). (DETACH stays non-retiring, unchanged.)
     let sref = state.identity.session_ref_for(&kill.terminal_id);
-    let create_request_id = state.registry.probe_create_request_id(&kill.terminal_id);
+    let create_request_id = state
+        .registry
+        .probe_create_request_id(&kill.terminal_id)
+        .or_else(|| kill.create_request_id.clone());
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let tid = kill.terminal_id.clone();
     let now = now_ms();
@@ -5568,10 +5577,20 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         false
     });
     if !recorded {
+        const CLOSE_FAILURE_COPY: &str =
+            "the terminal close could not be recorded durably; the terminal was left running";
+        if let Some(request_id) = &kill.request_id {
+            let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                request_id: request_id.clone(),
+                terminal_id: kill.terminal_id,
+                success: false,
+                error: Some(CLOSE_FAILURE_COPY.to_string()),
+            });
+            return send(ws_tx, &msg).await;
+        }
         let msg = ServerMessage::Error(ErrorMsg {
             code: ErrorCode::InternalError,
-            message: "the terminal close could not be recorded durably; the terminal was left running"
-                .to_string(),
+            message: CLOSE_FAILURE_COPY.to_string(),
             timestamp: crate::now_iso(),
             actual_session_ref: None,
             expected_session_ref: None,
@@ -5583,11 +5602,20 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         });
         return send(ws_tx, &msg).await;
     }
-    // The durable close stands; kill + broadcast. A reaper that beat this
-    // kill to the registry row makes `kill_and_broadcast` false — the answer
-    // for that race keeps the pre-existing shape (the invalid-id error); the
-    // close already recorded is exactly the right end state for a terminal
-    // that is gone either way.
+    // The durable close stands; the correlated answer reports success
+    // regardless of whether a reaper beat the process kill (a missing
+    // registry row means the terminal is already gone — not a close
+    // failure). The requestId-less arms keep their legacy shapes.
+    if let Some(request_id) = &kill.request_id {
+        kill_and_broadcast(state, &kill.terminal_id);
+        let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+            request_id: request_id.clone(),
+            terminal_id: kill.terminal_id,
+            success: true,
+            error: None,
+        });
+        return send(ws_tx, &msg).await;
+    }
     if kill_and_broadcast(state, &kill.terminal_id) {
         return true;
     }

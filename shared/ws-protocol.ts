@@ -546,6 +546,28 @@ export const TerminalResizeSchema = z.object({
 export const TerminalKillSchema = z.object({
   type: z.literal('terminal.kill'),
   terminalId: z.string().min(1),
+  /**
+   * Close-result correlation (delta-r6-r3 / focused-episode-6 round 2): when
+   * present, the server answers the kill with a `terminal.killed` frame
+   * carrying THIS id (`success:false` means the durable close failed and the
+   * terminal was left untouched; `success:true` covers the already-gone
+   * terminal too — missing registry entry is not a close failure). When
+   * absent, the legacy error-frame answers stand as-is. Additive optional:
+   * newer clients against older servers simply never get the frame (their
+   * wait falls back to `terminal.exit` / INVALID_TERMINAL_ID), older clients
+   * never send it — WS_PROTOCOL_VERSION deliberately not bumped.
+   */
+  requestId: z.string().min(1).optional(),
+  /**
+   * The closing pane's createRequestId — the durable close envelope's
+   * createRequestId key when the registry probe can no longer answer (the
+   * reaper beat the kill, or a post-restart stale pane: the registry row is
+   * gone but the stale snapshot must still receive its closed verdict). The
+   * registry stamp wins when present (server-side truth); this field only
+   * fills the registry-less gap. Additive optional, tolerated by older
+   * servers (accept-and-strip inbound).
+   */
+  createRequestId: z.string().min(1).optional(),
 })
 
 export const CodexActivityListSchema = z.object({
@@ -1000,6 +1022,26 @@ export type TerminalDetachedMessage = {
   terminalId: string
 }
 
+/**
+ * The correlated `terminal.kill` answer (delta-r6-r3 / focused-episode-6
+ * round 2 Findings 6+7): sent ONLY when the kill carried `requestId`
+ * (older clients keep the legacy error-frame answers), once the kill's
+ * durable close envelope is resolved one way or the other.
+ * `success: true` = the pane close is durably recorded AND the terminal is
+ * gone (an already-absent registry entry — reaper race / stale pane — counts
+ * as gone, the close envelope was still written). `success: false` = the
+ * durable close failed, the terminal was left untouched, and `error`
+ * explains it; the closing client must NOT drop the pane. server→client
+ * only, additive — WS_PROTOCOL_VERSION stays.
+ */
+export type TerminalKilledMessage = {
+  type: 'terminal.killed'
+  requestId: string
+  terminalId: string
+  success: boolean
+  error?: string
+}
+
 export type TerminalExitMessage = {
   type: 'terminal.exit'
   terminalId: string
@@ -1368,6 +1410,7 @@ export type ServerMessage =
   | TerminalModesSyncMessage
   | TerminalStreamChangedMessage
   | TerminalDetachedMessage
+  | TerminalKilledMessage
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalReplacedMessage

@@ -123,6 +123,10 @@ pub enum ServerMessage {
     TerminalInputBlocked(TerminalInputBlocked),
     #[serde(rename = "terminal.inventory")]
     TerminalInventory(TerminalInventory),
+    // Additive (delta-r6-r3, focused-episode-6 round 2): the correlated
+    // `terminal.kill` answer — see [`TerminalKilled`].
+    #[serde(rename = "terminal.killed")]
+    TerminalKilled(TerminalKilled),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
     #[serde(rename = "terminal.modes.sync")]
@@ -153,7 +157,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 61] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -201,6 +205,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
     "terminal.idle",
     "terminal.input.blocked",
     "terminal.inventory",
+    "terminal.killed",
     "terminal.meta.updated",
     "terminal.modes.sync",
     "terminal.output",
@@ -368,6 +373,22 @@ pub enum ScrollInputPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalIdOnly {
     pub terminal_id: String,
+}
+
+/// The correlated `terminal.kill` answer (delta-r6-r3 / focused-episode-6
+/// round 2): sent only when the kill carried `requestId`. `success: false`
+/// (with `error`) = the durable close failed and the terminal was left
+/// untouched — the closing client must not drop the pane; `success: true`
+/// covers the already-gone terminal too (the close envelope was still
+/// written — a missing registry entry is not a close failure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalKilled {
+    pub request_id: String,
+    pub terminal_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Payloads carrying only `{ name }` (extension.server.starting / stopped).

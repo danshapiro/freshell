@@ -42,13 +42,45 @@ const clipboardMocks = vi.hoisted(() => ({
   copyText: vi.fn().mockResolvedValue(undefined),
 }))
 
-const wsMocks = vi.hoisted(() => ({
-  send: vi.fn(),
-  connect: vi.fn().mockResolvedValue(undefined),
-  onMessage: vi.fn().mockReturnValue(() => {}),
-  onReconnect: vi.fn().mockReturnValue(() => {}),
-  setHelloExtensionProvider: vi.fn(),
-}))
+const wsMocks = vi.hoisted(() => {
+  const handlers = new Set<(msg: unknown) => void>()
+  return {
+    send: vi.fn(),
+    connect: vi.fn().mockResolvedValue(undefined),
+    handlers,
+    onMessage: vi.fn((handler: (msg: unknown) => void) => {
+      handlers.add(handler)
+      return () => {
+        handlers.delete(handler)
+      }
+    }),
+    onReconnect: vi.fn().mockReturnValue(() => {}),
+    setHelloExtensionProvider: vi.fn(),
+  }
+})
+
+/** Answer every in-flight kill the provider sent with a successful durable close. */
+function ackPendingKills() {
+  for (const [msg] of wsMocks.send.mock.calls) {
+    const m = msg as { type?: string; requestId?: string; terminalId?: string; sessionId?: string; sessionType?: string; provider?: string }
+    if (m?.type === 'terminal.kill' && m.requestId && m.terminalId) {
+      for (const handler of [...wsMocks.handlers]) {
+        handler({ type: 'terminal.killed', requestId: m.requestId, terminalId: m.terminalId, success: true })
+      }
+    }
+    if (m?.type === 'freshAgent.kill' && m.sessionId) {
+      for (const handler of [...wsMocks.handlers]) {
+        handler({
+          type: 'freshAgent.killed',
+          sessionId: m.sessionId,
+          sessionType: m.sessionType,
+          provider: m.provider,
+          success: true,
+        })
+      }
+    }
+  }
+}
 
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn().mockResolvedValue([]),
@@ -1005,10 +1037,16 @@ describe('ContextMenuProvider', () => {
       )
     })
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-1' })
+      expect(wsMocks.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'terminal.kill', terminalId: 'term-1' }),
+      )
     })
+    // The replacement conversation starts only once the old one's durable
+    // close is acknowledged (focused-episode-6 round 2 close-and-replace).
+    ackPendingKills()
 
-    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
       type: 'leaf',
       content: {
         kind: 'fresh-agent',
@@ -1021,6 +1059,7 @@ describe('ContextMenuProvider', () => {
         },
         initialCwd: '/test/project',
       },
+    })
     })
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
       [`claude:${VALID_SESSION_ID}`]: {
@@ -1091,18 +1130,23 @@ describe('ContextMenuProvider', () => {
         provider: 'claude',
       })
     })
+    // As above: the replacement starts only once the old fresh-agent
+    // session's durable close is acknowledged.
+    ackPendingKills()
 
-    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
-      type: 'leaf',
-      content: {
-        kind: 'terminal',
-        mode: 'claude',
-        sessionRef: {
-          provider: 'claude',
-          sessionId: VALID_SESSION_ID,
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          },
+          initialCwd: '/test/project',
         },
-        initialCwd: '/test/project',
-      },
+      })
     })
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
       [`claude:${VALID_SESSION_ID}`]: {
@@ -1250,18 +1294,21 @@ describe('ContextMenuProvider', () => {
         cwd: '/repo/session-state',
       })
     })
+    ackPendingKills()
 
-    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
-      type: 'leaf',
-      content: {
-        kind: 'terminal',
-        mode: 'opencode',
-        sessionRef: {
-          provider: 'opencode',
-          sessionId: OPENCODE_SESSION_ID,
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'opencode',
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: OPENCODE_SESSION_ID,
+          },
+          initialCwd: '/repo/session-state',
         },
-        initialCwd: '/repo/session-state',
-      },
+      })
     })
   })
 

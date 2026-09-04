@@ -14,11 +14,12 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
+import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
-import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
+import { clearPendingCreateFailure, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
@@ -1230,37 +1231,57 @@ export function FreshAgentView({
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
-    if (current.sessionId) {
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      sendFreshAgentMessage({
-        type: 'freshAgent.kill',
-        sessionId: current.sessionId,
-        sessionType: current.sessionType,
-        provider: current.provider,
-        ...(cwd ? { cwd } : {}),
-      })
-    }
-    commitSnapshot(null)
-    setLoadError(null)
-    setQueuedMessages([])
-    setLocalEcho(null)
-    alwaysAllowToolsRef.current.clear()
-    pendingAutoTitleBySessionIdRef.current.clear()
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: {
-        ...current,
-        createRequestId: nanoid(),
-        sessionId: undefined,
-        sessionRef: undefined,
-        resumeSessionId: undefined,
-        restoreError: undefined,
-        createError: undefined,
-        status: 'creating',
-        pendingLocalEcho: undefined,
-      },
-    }))
+    // Focused-episode-6 round 2 (Finding 6): a session-bearing conversation
+    // replacement AWAITS the old session's durable close before swapping the
+    // pane — a close the server cannot record is not a close, and dropping
+    // the conversation anyway would leave a live server session open on no
+    // tab. On failure the current conversation stays (the killed fold's
+    // session-error banner — or the await's timeout write — explains it).
+    void (async () => {
+      if (current.sessionId) {
+        const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+        const ack = await sendFreshAgentKillAndAwait(
+          {
+            sessionId: current.sessionId,
+            sessionType: current.sessionType,
+            provider: current.provider,
+            ...(cwd ? { cwd } : {}),
+          },
+          { send: (m) => sendFreshAgentMessage(m as Record<string, unknown>) },
+        )
+        if (!ack.ok) {
+          dispatch(sessionError({
+            sessionId: current.sessionId,
+            sessionType: current.sessionType,
+            provider: current.provider,
+            code: 'KILL_FAILED',
+            message: ack.timedOut ? KILL_ACK_TIMEOUT_MESSAGE : KILL_FAILED_MESSAGE,
+          }))
+          return
+        }
+      }
+      commitSnapshot(null)
+      setLoadError(null)
+      setQueuedMessages([])
+      setLocalEcho(null)
+      alwaysAllowToolsRef.current.clear()
+      pendingAutoTitleBySessionIdRef.current.clear()
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...current,
+          createRequestId: nanoid(),
+          sessionId: undefined,
+          sessionRef: undefined,
+          resumeSessionId: undefined,
+          restoreError: undefined,
+          createError: undefined,
+          status: 'creating',
+          pendingLocalEcho: undefined,
+        },
+      }))
+    })()
   }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
 
   const sendFork = useCallback((atTurnId?: string) => {

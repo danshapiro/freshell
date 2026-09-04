@@ -43,7 +43,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 60,
+    "count": 61,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -92,6 +92,7 @@
       "terminal.idle",
       "terminal.input.blocked",
       "terminal.inventory",
+      "terminal.killed",
       "terminal.meta.updated",
       "terminal.modes.sync",
       "terminal.output",

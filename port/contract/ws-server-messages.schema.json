@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 60,
+  "messageCount": 61,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3817,6 +3817,35 @@
         "bootId",
         "terminalMeta",
         "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.killed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.killed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "success",
+        "terminalId",
         "type"
       ],
       "type": "object"

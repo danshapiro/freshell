@@ -22,7 +22,10 @@ function terminalContent(p: {
     ...(p.mode ? { mode: p.mode } : {}),
     ...(p.shell ? { shell: p.shell } : {}),
     ...(p.cwd ? { initialCwd: p.cwd } : {}),
-    // D7: live sessions are left untouched - recreate the pane WITHOUT resume
+    // Defense in depth: live panes never reach this builder (the
+    // `isRestorablePane` exclusion is authoritative for ALL kinds since
+    // delta-r6-r3) — but the resume ref strip stays: a live session is
+    // never resumed onto a second terminal by ANY path.
     ...(p.sessionRef && !p.live ? { sessionRef: p.sessionRef } : {}),
   } as PaneContent
 }
@@ -40,12 +43,14 @@ function terminalContent(p: {
  *   is null). Restoring it would recreate a session the user deliberately
  *   closed (the pre-fix shape — "closed panes come back fresh" — offered
  *   exactly the never-open sessions this campaign exists to exclude).
- * - `kind === 'fresh-agent' && live`: the pane's session is STILL RUNNING on
- *   the server (D7). A fresh-agent restore resumes `content.sessionRef` via
- *   `freshAgent.create`, so rebuilding this pane would resume the live
- *   session — exclude it instead. (A live TERMINAL pane keeps the D7 regime:
- *   the pane is recreated fresh WITHOUT the resume ref — `terminalContent`
- *   strips it — which is authority-correct already, so it stays restorable.)
+ * - `live` — ANY kind (delta-r6-r3, focused-episode-6 round 2 Finding F1):
+ *   the pane's session/terminal is STILL RUNNING on the server. Restoring
+ *   would recreate a duplicate on top of the running one (a fresh-agent
+ *   restore resumes `content.sessionRef`; a terminal restore spawns a NEW
+ *   terminal — either way an extra session the user's tabs never opened).
+ *   The live one stays where it already lives (a server-side background
+ *   session, reattachable from the sidebar) and the offer's live note
+ *   explains the exclusion.
  *
  * Plain un-correlated panes (no snapshot claim, no correlation verdict —
  * `ledgerState === 'unknown'`, null ref) are untouched: they still rebuild
@@ -53,7 +58,7 @@ function terminalContent(p: {
  */
 export function isRestorablePane(p: RecoveryPane): boolean {
   if (p.ledgerState === 'closed') return false
-  if (p.kind === 'fresh-agent' && p.live) return false
+  if (p.live) return false
   return true
 }
 

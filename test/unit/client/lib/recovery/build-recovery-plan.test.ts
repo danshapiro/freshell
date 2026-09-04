@@ -150,9 +150,8 @@ describe('buildRecoveryPlan', () => {
   // F2, the live arm: the top-level `live` verdict marks a fresh-agent pane
   // whose session is still running on the server (D7) — restoring it would
   // RESUME the live session. Non-restorable: excluded from the plan and the
-  // count, exactly like a closed verdict. (Live TERMINAL panes keep the D7
-  // behavior — recreated fresh without the resume ref — pinned by the
-  // dedicated test below.)
+  // count, exactly like a closed verdict. (Delta-r6-r3: live TERMINAL panes
+  // are excluded identically — the dedicated test below pins both.)
   it('a LIVE fresh-agent pane is EXCLUDED from the plan and the count (never resumed mid-flight)', () => {
     const inventory = inv([
       pane(),
@@ -185,11 +184,34 @@ describe('buildRecoveryPlan', () => {
     expect(root.children[1].type).toBe('split')
   })
 
-  it('live panes are recreated WITHOUT resume: sessionRef stripped, cwd/mode kept (D7)', () => {
-    const [tab] = buildRecoveryPlan(inv([pane({ sessionRef: { provider: 'claude', sessionId: 'S2' }, ledgerState: 'bound', mode: 'claude', live: true })]))
-    const content = (tab.layout as { content: Record<string, unknown> }).content
-    expect(content.sessionRef).toBeUndefined()
-    expect(content).toMatchObject({ kind: 'terminal', mode: 'claude', initialCwd: '/w' })
+  it('a live TERMINAL pane is EXCLUDED from the plan and the count (never recreated on top of the still-running session)', () => {
+    // Delta-r6-r3 (focused-episode-6 round 2, Finding F1): the live
+    // exclusion covers EVERY kind — the pre-fix build recreated a live
+    // terminal pane fresh (a second terminal for a session the server
+    // already runs).
+    const inventory = inv([
+      pane(),
+      pane({
+        paneId: 'p2',
+        mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: 'S2' },
+        ledgerState: 'bound',
+        live: true,
+      }),
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    const contents = leavesOf(tab.layout).map((l) => l.content)
+    expect(contents).toHaveLength(1)
+    expect(countRecoverablePanes(inventory)).toBe(1)
+
+    // An all-live inventory yields NO plan at all (the offerability gate
+    // downstream renders nothing, focused-ep4-r2 Finding 4) — the still-
+    // running terminal stays a background session, never a recreated one.
+    const allLive = inv([
+      pane({ sessionRef: { provider: 'claude', sessionId: 'S3' }, ledgerState: 'bound', mode: 'claude', live: true }),
+    ])
+    expect(buildRecoveryPlan(allLive)).toHaveLength(0)
+    expect(countRecoverablePanes(allLive)).toBe(0)
   })
 
   it('non-terminal kinds pass payload through', () => {
