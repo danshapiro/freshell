@@ -13,7 +13,6 @@ function terminalContent(p: {
   shell: string | null
   cwd: string | null
   sessionRef: { provider: string; sessionId: string } | null
-  live: boolean
 }): PaneContent {
   return {
     kind: 'terminal',
@@ -22,44 +21,52 @@ function terminalContent(p: {
     ...(p.mode ? { mode: p.mode } : {}),
     ...(p.shell ? { shell: p.shell } : {}),
     ...(p.cwd ? { initialCwd: p.cwd } : {}),
-    // Defense in depth: live panes never reach this builder (the
-    // `isRestorablePane` exclusion is authoritative for ALL kinds since
-    // delta-r6-r3) — but the resume ref strip stays: a live session is
-    // never resumed onto a second terminal by ANY path.
-    ...(p.sessionRef && !p.live ? { sessionRef: p.sessionRef } : {}),
+    // Focused-episode-6 round 5 (Finding F1): the resume ref is NEVER
+    // stripped for liveness. A live terminal pane restores by REATTACH —
+    // when its snapshot payload carries the still-running terminal handle
+    // (`liveTerminal.terminalId`), the plan arms a one-shot
+    // createRequestId→terminalId target (see `buildRecoveryPlan`) that
+    // TerminalView consults BEFORE any create; when it does not (defensive
+    // shape: a live verdict for an identified pane whose snapshot lost the
+    // handle), the resume create meets the server's D7 live-owner refusal
+    // (RESTORE_UNAVAILABLE + liveTerminalId) and folds back onto the SAME
+    // terminal (`applyReattachToLiveTerminal`). Either way: reattach, never
+    // a second process.
+    ...(p.sessionRef ? { sessionRef: p.sessionRef } : {}),
   } as PaneContent
 }
 
 /**
- * Delta-r6 (F1+F2) — THE restorability predicate, shared by the plan, the
- * advertised count, the offer panel's listing, and the panel's live note so
- * all four always agree (the same regime delta-r4 Finding 2 established for
- * `placeLedgerEntries`). The server's correlation work stamps each snapshot
- * pane with a verdict at the TOP level (the snapshot payload is left
- * untouched); two verdicts make a pane NOT restorable:
+ * Delta-r6 (F1+F2), amended by focused-episode-6 round 5 (Finding F1) — THE
+ * restorability predicate, shared by the plan, the advertised count, the
+ * offer panel's listing, and the panel's live note so all four always agree
+ * (the same regime delta-r4 Finding 2 established for `placeLedgerEntries`).
+ * The server's correlation work stamps each snapshot pane with a verdict at
+ * the TOP level (the snapshot payload is left untouched); ONE verdict makes
+ * a pane NOT restorable:
  *
  * - `ledgerState === 'closed'`: the pane's session was CLOSED between the
  *   last registry push and the browser-state loss (the effective sessionRef
  *   is null). Restoring it would recreate a session the user deliberately
  *   closed (the pre-fix shape — "closed panes come back fresh" — offered
  *   exactly the never-open sessions this campaign exists to exclude).
- * - `live` — ANY kind (delta-r6-r3, focused-episode-6 round 2 Finding F1):
- *   the pane's session/terminal is STILL RUNNING on the server. Restoring
- *   would recreate a duplicate on top of the running one (a fresh-agent
- *   restore resumes `content.sessionRef`; a terminal restore spawns a NEW
- *   terminal — either way an extra session the user's tabs never opened).
- *   The live one stays where it already lives (a server-side background
- *   session, reattachable from the sidebar) and the offer's live note
- *   explains the exclusion.
+ *
+ * A `live` pane, by contrast, IS restorable (round-5 course correction over
+ * the delta-r6-r3 exclusion): it is a genuinely-open session still running
+ * server-side after the browser loss, so the restore puts it back IN ITS TAB
+ * — terminal panes by reattach (the plan arms the snapshot's still-running
+ * terminal handle; `liveTerminalReattach`), fresh-agent panes by ADOPTION
+ * (the content keeps the top-level effective ref, and the manager's
+ * live-session adopt answers the create without spawning). Live panes are
+ * therefore counted, listed, and planned like any other restorable pane; the
+ * offer's live note explains the reattach.
  *
  * Plain un-correlated panes (no snapshot claim, no correlation verdict —
  * `ledgerState === 'unknown'`, null ref) are untouched: they still rebuild
  * fresh with their cwd/mode and no resume ref.
  */
 export function isRestorablePane(p: RecoveryPane): boolean {
-  if (p.ledgerState === 'closed') return false
-  if (p.live) return false
-  return true
+  return p.ledgerState !== 'closed'
 }
 
 function paneContent(p: RecoveryPane): PaneContent {
@@ -78,10 +85,12 @@ function paneContent(p: RecoveryPane): PaneContent {
     // D4-corrected verdict at the TOP level — the payload's own sessionRef is
     // a pre-verdict copy. The top-level sessionRef WINS: a superseded pane
     // resumes the corrected successor, never the payload's old ref (and a
-    // null top-level ref never resurrects a payload ref — the closed/live
-    // verdicts that produce one are excluded by `isRestorablePane` before
+    // null top-level ref never resurrects a payload ref — the only verdict
+    // that produces one is `closed`, excluded by `isRestorablePane` before
     // this point, and this spread no longer carries the payload's copy
-    // regardless, as defense in depth).
+    // regardless, as defense in depth). A LIVE fresh-agent pane rides the
+    // same branch: the top-level ref is the live session's identity, so the
+    // restored pane's create adopts it server-side (never a respawn).
     const { restoreError: _restoreError, sessionRef: _snapshotSessionRef, ...payload } = p.payload
     return {
       ...payload,
@@ -110,6 +119,41 @@ export interface RecoveryTabPlan {
   sourceTabKey?: string
   layout: PaneNode
   paneTitles: Record<string, string>
+  /**
+   * Focused-episode-6 round 5 (Finding F1): the plan's LIVE terminal panes
+   * reattach to their still-running server terminals — one-shot
+   * paneId→terminalId targets, armed into `terminal-restore` on accept
+   * (RecoveryOfferPanel) and consumed by TerminalView's lifecycle BEFORE it
+   * would dispatch a terminal.create. Keyed by the leaf's PANE ID (not
+   * createRequestId): restoreLayout normalization re-mints terminal
+   * createRequestIds but preserves pane node ids, so this key identity holds
+   * from plan to mount. A pane with no entry creates exactly as before
+   * (dead panes resume/fresh per the existing rules).
+   */
+  liveTerminalReattach?: Array<{ paneId: string; terminalId: string }>
+}
+
+/**
+ * Focused-episode-6 round 5 (Finding F1): the reattach target of a LIVE
+ * terminal pane, from its snapshot's still-running terminal handle
+ * (`payload.liveTerminal.terminalId`). The inventory's `live` verdict is the
+ * server's own assertion that this id is Running NOW (durable-ref liveness
+ * primary; terminal-id membership the fallback for otherwise-unidentified
+ * shells), and the client restores onto the SAME server it fetched the
+ * inventory from — so a present handle means "reattach, never respawn". A
+ * live pane whose snapshot lacks the handle gets NO target: its kept
+ * sessionRef routes it to the resume/D7-refusal→reattach fallback instead.
+ */
+function liveReattachTarget(
+  p: RecoveryPane,
+  content: PaneContent,
+  paneId: string,
+): { paneId: string; terminalId: string } | undefined {
+  if (p.kind !== 'terminal' || !p.live || content.kind !== 'terminal') return undefined
+  const handle = p.payload.liveTerminal as { terminalId?: unknown } | undefined
+  const terminalId =
+    typeof handle?.terminalId === 'string' && handle.terminalId ? handle.terminalId : undefined
+  return terminalId ? { paneId, terminalId } : undefined
 }
 
 // Delta-r4 Finding 2: the advertised count lives below `placeLedgerEntries`
@@ -190,7 +234,7 @@ function freshAgentEntryContent(e: LedgerOnlyEntry): PaneContent {
 
 function ledgerEntryContent(e: LedgerOnlyEntry): PaneContent {
   if (e.paneKind === 'fresh-agent') return freshAgentEntryContent(e)
-  return terminalContent({ mode: e.mode, shell: null, cwd: e.cwd, sessionRef: { provider: e.provider, sessionId: e.sessionId }, live: false })
+  return terminalContent({ mode: e.mode, shell: null, cwd: e.cwd, sessionRef: { provider: e.provider, sessionId: e.sessionId } })
 }
 
 export interface LedgerPlacement {
@@ -268,23 +312,35 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
   // straggler rather than reviving the trailing-tab fallback.
   return (inv.device?.tabs ?? [])
     .filter((t) => t.panes.length > 0)
-    // Delta-r6 F1/F2: excluded-verdict panes (closed; live fresh-agent) are
-    // dropped HERE, at leaf-build time — so a tab whose every snapshot pane
-    // is excluded (and that no ledger row joins) produces NO plan rather than
-    // an empty pane chain, and count/listing/plan exclude the same set.
-    .map((t) => ({
-      tab: t,
-      leaves: [
-        ...t.panes.filter(isRestorablePane).map((p) => leaf(paneContent(p))),
-        ...(placement.joinedByTabKey.get(t.tabKey) ?? []).map((e) => leaf(ledgerEntryContent(e))),
-      ],
-    }))
+    // Delta-r6 F1/F2: closed-verdict panes are dropped HERE, at leaf-build
+    // time — so a tab whose every snapshot pane is excluded (and that no
+    // ledger row joins) produces NO plan rather than an empty pane chain, and
+    // count/listing/plan exclude the same set. Live panes are NOT dropped
+    // (round-5 Finding F1): they land in the original tab like every other
+    // restorable pane, and each live TERMINAL leaf records its reattach
+    // target for the accept-time arm.
+    .map((t) => {
+      const leaves: PaneNode[] = []
+      const liveTerminalReattach: Array<{ paneId: string; terminalId: string }> = []
+      for (const p of t.panes.filter(isRestorablePane)) {
+        const content = paneContent(p)
+        const node = leaf(content)
+        const target = liveReattachTarget(p, content, node.id)
+        if (target) liveTerminalReattach.push(target)
+        leaves.push(node)
+      }
+      for (const e of placement.joinedByTabKey.get(t.tabKey) ?? []) {
+        leaves.push(leaf(ledgerEntryContent(e)))
+      }
+      return { tab: t, leaves, liveTerminalReattach }
+    })
     .filter(({ leaves }) => leaves.length > 0)
-    .map(({ tab: t, leaves }) => ({
+    .map(({ tab: t, leaves, liveTerminalReattach }) => ({
       tabId: nanoid(),
       title: t.tabName || 'Recovered',
       sourceTabKey: t.tabKey,
       layout: chain(leaves),
       paneTitles: {},
+      ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
     }))
 }

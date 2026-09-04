@@ -52,6 +52,8 @@ const restoreMocks = vi.hoisted(() => ({
   clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
+  armRecoveredLiveTerminalTarget: vi.fn(),
+  consumeRecoveredLiveTerminalTarget: vi.fn((): string | undefined => undefined),
 }))
 
 const runtimeMocks = vi.hoisted(() => ({
@@ -90,6 +92,8 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: restoreMocks.clearTerminalRestoreRequestId,
   consumeTerminalFreshRecoveryRequest: restoreMocks.consumeTerminalFreshRecoveryRequest,
   addTerminalFreshRecoveryRequestId: restoreMocks.addTerminalFreshRecoveryRequestId,
+  armRecoveredLiveTerminalTarget: restoreMocks.armRecoveredLiveTerminalTarget,
+  consumeRecoveredLiveTerminalTarget: restoreMocks.consumeRecoveredLiveTerminalTarget,
 }))
 
 vi.mock('lucide-react', () => ({
@@ -375,6 +379,9 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    restoreMocks.armRecoveredLiveTerminalTarget.mockReset()
+    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReset()
+    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue(undefined)
     resetEnsureExtensionsRegistryCacheForTests()
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
@@ -3402,6 +3409,114 @@ describe('TerminalView lifecycle updates', () => {
       expect(
         terminalWriteStrings(term).filter((entry) => entry.includes('Reconnected to the still-running session.')),
       ).toHaveLength(1)
+    })
+  })
+
+  // Focused-episode-6 round 5 (Finding F1): the restore offer's LIVE terminal
+  // panes reattach to the still-running server terminal — the plan arms a
+  // one-shot createRequestId→terminalId target, and the lifecycle consults it
+  // BEFORE it would dispatch terminal.create (a live pane is never recreated
+  // as a second process; the same fold the D7-refusal revival uses,
+  // `applyReattachToLiveTerminal`, points the pane at its original terminal).
+  describe('recovered live-terminal reattach (restore-offer arming, round 5 F1)', () => {
+    function setupRecoveredLivePane() {
+      const tabId = 'tab-recovered-live'
+      const paneId = 'pane-recovered-live'
+
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-recovered-live',
+        status: 'creating',
+        mode: 'shell',
+        shell: 'system',
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'shell',
+              status: 'creating',
+              title: 'Shell',
+              titleSetByUser: false,
+              createRequestId: 'req-recovered-live',
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: createSettingsState(),
+          connection: { status: 'connected', error: null },
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>
+      )
+
+      return { store, tabId, paneId }
+    }
+
+    it('reattaches to the armed live terminal and NEVER dispatches a create', async () => {
+      restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue('t-still-running')
+
+      const { store, tabId } = setupRecoveredLivePane()
+
+      // The reattach fold lands instead of any create: the pane gains the
+      // still-running terminal handle with status running, createRequestId
+      // preserved (council rule 2).
+      const reattached = getLeafTerminalContent(store, tabId)
+      expect(reattached.terminalId).toBe('t-still-running')
+      expect(reattached.status).toBe('running')
+      expect(reattached.createRequestId).toBe('req-recovered-live')
+      expect(
+        wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.create'),
+        'a recovered live pane must never dispatch terminal.create (that would spawn a duplicate)',
+      ).toHaveLength(0)
+
+      // The epoch bump re-fires the lifecycle effect into the attach path.
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls
+            .map(([msg]) => msg)
+            .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 't-still-running'),
+        ).toHaveLength(1)
+      })
+
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Reconnected to the still-running session.')
+
+      // One-shot arming: exactly one consult — the fold's epoch bump re-fires
+      // the effect, but by then the pane owns a terminal handle and the
+      // create branch (and its consult) never runs again.
+      expect(restoreMocks.consumeRecoveredLiveTerminalTarget).toHaveBeenCalledTimes(1)
+    })
+
+    it('a pane with no armed target sends its create exactly as before (the fallback is untouched)', async () => {
+      const { store, tabId, paneId } = setupRecoveredLivePane()
+
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create'),
+        ).toHaveLength(1)
+      })
+      // The consult ran (before the create) and found nothing armed.
+      expect(restoreMocks.consumeRecoveredLiveTerminalTarget).toHaveBeenCalledWith(tabId, paneId)
+      expect(getLeafTerminalContent(store, tabId).terminalId).toBeUndefined()
     })
   })
 

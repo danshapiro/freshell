@@ -21,7 +21,7 @@ vi.mock('@/store/tabRegistrySync', async (importOriginal) => ({
 import { getRecoveryInventory } from '@/lib/api'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { getPendingOffer, setPendingOffer, isDismissed, recordDismissal } from '@/lib/recovery/dismissal'
-import { consumeTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { consumeTerminalRestoreRequestId, consumeRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import type { PaneNode } from '@/store/paneTypes'
 import tabsReducer from '@/store/tabsSlice'
@@ -258,15 +258,17 @@ describe('RecoveryOfferPanel', () => {
     expect(ul!.contains(screen.getByTestId('recovery-accept'))).toBe(false)
   })
 
-  // Delta-r6-r3 (focused-episode-6 round 2, Finding F1): live panes of EVERY
-  // kind are excluded from the count, the listing, and the accepted plan —
-  // recreating one would spawn a duplicate on top of the still-running
-  // server session. The live note now explains the EXCLUSION.
-  it('excludes live panes from the count, the listing, and the accepted plan — explaining them with the live note', async () => {
+  // Focused-episode-6 round 5, Finding F1 (the course correction over
+  // delta-r6-r3's live EXCLUSION): a live pane is a genuinely-open session
+  // still running server-side — it is INCLUDED in the count, the listing, and
+  // the accepted plan, and restores by REATTACH to its still-running terminal
+  // (never a second process). The live note explains the reattach.
+  it('includes live panes in the count, the listing, and the accepted plan — restored by reattach, explained by the live note', async () => {
     const basePane = INVENTORY.device!.tabs[0].panes[0]
     const liveTerminal = {
       ...basePane,
       paneId: 'p-live-term',
+      payload: { liveTerminal: { terminalId: 't-live-owner', serverInstanceId: 'srv-1' } },
       sessionRef: { provider: 'claude', sessionId: 'S-LIVE' },
       live: true,
     }
@@ -280,40 +282,73 @@ describe('RecoveryOfferPanel', () => {
     vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
     const store = makeTestStore()
     render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
-    expect(await screen.findByText(/restore 1 pane/i)).toBeInTheDocument()
+    expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
+    expect(screen.getAllByRole('listitem')).toHaveLength(2)
     expect(await screen.findByTestId('recovery-live-note')).toBeVisible()
     expect(screen.getByTestId('recovery-live-note')).toHaveTextContent(
-      /still running on the server — they are not restored/,
+      /still running on the server — restoring reattaches to them/,
     )
 
     await userEvent.click(screen.getByTestId('recovery-accept'))
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
 
     const leaves = findRecoveredTerminalLeaves(store, 'work')
-    expect(leaves).toHaveLength(1)
-    const content = leaves[0].content
-    if (content.kind !== 'terminal') throw new Error('unreachable')
+    expect(leaves).toHaveLength(2)
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'work')!
+    const bySessionId = new Map(
+      leaves.map((l) => {
+        if (l.content.kind !== 'terminal') throw new Error('unreachable')
+        return [l.content.sessionRef?.sessionId, l] as const
+      }),
+    )
+    const deadLeaf = bySessionId.get('S2')
+    expect(deadLeaf, 'the dead pane restored by resume, armed for restore').toBeTruthy()
+    expect(consumeTerminalRestoreRequestId(deadLeaf!.content.createRequestId)).toBe(true)
+    const liveLeaf = bySessionId.get('S-LIVE')
     expect(
-      content.sessionRef?.sessionId,
-      'the accepted plan restored ONLY the restorable pane (the live one was never rebuilt)',
-    ).toBe('S2')
-    expect(consumeTerminalRestoreRequestId(content.createRequestId)).toBe(true)
+      liveLeaf,
+      'the live pane was rebuilt (reattach) and kept its effective sessionRef',
+    ).toBeTruthy()
+    // …and the plan armed its one-shot reattach target (the terminal the
+    // inventory found still running — consulted before any create), keyed by
+    // the pane id that survives restoreLayout normalization.
+    expect(consumeRecoveredLiveTerminalTarget(tab.id, liveLeaf!.id)).toBe('t-live-owner')
   })
 
-  it('an all-live inventory renders no offer and clears the pending flag', async () => {
+  it('an all-live inventory renders the offer — live panes restore by reattach', async () => {
+    // Focused-episode-6 round 5, Finding F1: an all-still-running tab IS
+    // genuinely open state — the offer now includes it (delta-r6-r3's
+    // no-offer-at-all shape was the finding's documented harm).
     const basePane = INVENTORY.device!.tabs[0].panes[0]
     const liveInventory: RecoveryInventory = {
       ...INVENTORY,
       device: {
         ...INVENTORY.device!,
-        tabs: [{ tabKey: 'k', tabName: 'work', panes: [{ ...basePane, live: true }] }],
+        tabs: [{
+          tabKey: 'k',
+          tabName: 'work',
+          panes: [{
+            ...basePane,
+            payload: { liveTerminal: { terminalId: 't-live-only', serverInstanceId: 'srv-1' } },
+            live: true,
+          }],
+        }],
       },
     }
     vi.mocked(getRecoveryInventory).mockResolvedValue(liveInventory)
-    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
-    await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    await waitFor(() => expect(getPendingOffer()).toBeNull())
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByText(/restore 1 pane/i)).toBeInTheDocument()
+    expect(screen.getByTestId('recovery-live-note')).toBeVisible()
+    expect(getPendingOffer()).toEqual({ contentId: 'cid-1', bootAt: 0 })
+
+    await userEvent.click(screen.getByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'work')!
+    const leaves = findRecoveredTerminalLeaves(store, 'work')
+    expect(leaves).toHaveLength(1)
+    expect(consumeRecoveredLiveTerminalTarget(tab.id, leaves[0].id)).toBe('t-live-only')
   })
 
   // Delta-r6 F1 (closed verdicts are NOT restorable): a snapshot pane the
@@ -379,14 +414,18 @@ describe('RecoveryOfferPanel', () => {
     await waitFor(() => expect(getPendingOffer()).toBeNull())
   })
 
-  // Delta-r6 F2 + delta-r6-r3: live fresh-agent panes are NOT restorable — a
-  // fresh-agent pane whose session is still running on the server (the
-  // top-level `live` verdict) is excluded from the count, the listing, and
-  // the accepted plan — restoring it would RESUME the live session despite
-  // D7. The live note now explains EXCLUDED panes of any kind (delta-r6-r3),
-  // so it renders here.
-  it('a live fresh-agent pane is excluded from the count, the listing, and the accepted plan (and the live note explains the exclusion)', async () => {
+  // Focused-episode-6 round 5, Finding F1: a live fresh-agent pane is
+  // restorable — the plan routes it to the ADOPT path, so accepting reuses
+  // the existing live session, never a respawn. The pane is included in the
+  // count, the listing, and the accepted plan; the rebuilt content carries
+  // the top-level effective sessionRef (FreshAgentView's create effect
+  // dispatches freshAgent.create{sessionRef}, which the manager adopts).
+  it('a live fresh-agent pane is included in the count, the listing, and the accepted plan (restored by adoption, never a respawn)', async () => {
     const basePane = INVENTORY.device!.tabs[0].panes[0]
+    // A canonical claude session id: normalizePaneContent's fresh-agent gate
+    // rejects non-UUID claude refs wholesale (the same gate every genuine
+    // freshclaude restore passes — ids here must be UUID-shaped).
+    const liveClaudeId = '123e4567-e89b-42d3-a456-426614174000'
     const liveFreshAgent = {
       ...basePane,
       paneId: 'p-live-fa',
@@ -394,9 +433,9 @@ describe('RecoveryOfferPanel', () => {
       payload: {
         sessionType: 'freshclaude',
         provider: 'claude',
-        sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+        sessionRef: { provider: 'claude', sessionId: liveClaudeId },
       },
-      sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+      sessionRef: { provider: 'claude', sessionId: liveClaudeId },
       live: true,
     }
     const inventory: RecoveryInventory = {
@@ -409,7 +448,8 @@ describe('RecoveryOfferPanel', () => {
     vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
     const store = makeTestStore()
     render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
-    expect(await screen.findByText(/restore 1 pane/i)).toBeInTheDocument()
+    expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
+    expect(screen.getAllByRole('listitem')).toHaveLength(2)
     expect(await screen.findByTestId('recovery-live-note')).toBeVisible()
 
     await userEvent.click(screen.getByTestId('recovery-accept'))
@@ -417,8 +457,12 @@ describe('RecoveryOfferPanel', () => {
     const tab = store.getState().tabs.tabs.find((t) => t.title === 'work')
     expect(tab).toBeTruthy()
     const leaves = collectAllLeaves(store.getState().panes.layouts[tab!.id])
-    expect(leaves).toHaveLength(1)
-    expect(leaves[0].content.kind).toBe('terminal')
+    expect(leaves).toHaveLength(2)
+    const agent = leaves.find((l) => l.content.kind === 'fresh-agent')
+    expect(agent?.content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionRef: { provider: 'claude', sessionId: liveClaudeId },
+    })
   })
 
   it('a joinable ledgerOnly row lists under its tab (device-pane format) and joins it on accept (D8 placement)', async () => {

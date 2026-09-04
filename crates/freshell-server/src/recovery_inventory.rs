@@ -40,6 +40,30 @@ pub struct CloseEvidence {
     pub pane_closes: Vec<PaneCloseRecord>,
 }
 
+/// Focused-episode-6 round 5 (Finding F2): the D7 liveness evidence the
+/// verdict join consumes, in two halves:
+///
+/// * `session_keys` (PRIMARY): `(provider = mode, sessionId)` for every
+///   currently-Running terminal row plus every identity-registry live entry
+///   whose owning terminal probes Running (the wave-B widened join). A pane
+///   whose effective durable ref lands here verdicts `live` — as it always
+///   has.
+/// * `terminal_ids` (FALLBACK for unidentified shells): the Running
+///   registry rows' terminal ids. A plain-shell pane has NO session identity
+///   (no rows, no claims — the effective ref is null and the first half can
+///   never fire for it), so pre-F2 it always read `live: false` and the
+///   client dropped the saved terminal identity and spawned a DUPLICATE
+///   beside the still-running PTY. Such a pane now claims liveness via its
+///   snapshot's `payload.liveTerminal.terminalId` membership here. Only
+///   `terminal` panes consult this half (the liveTerminal handle is a
+///   terminal-pane shape), and a close-COVERED pane never reads live (the
+///   close envelope lands before the kill's teardown, so a mid-teardown
+///   terminal can still be Running beside a durably closed pane).
+pub struct LiveEvidence {
+    pub session_keys: HashSet<(String, String)>,
+    pub terminal_ids: HashSet<String>,
+}
+
 #[cfg(test)]
 impl CloseEvidence {
     /// The empty verdict join input (no closes recorded anywhere) — the test
@@ -375,7 +399,7 @@ fn apply_kill_tombstone_dominance(
 pub fn build_inventory(
     device_unions: Vec<DeviceUnion>,
     bindings: Vec<BindingRow>,
-    live_session_keys: HashSet<(String, String)>,
+    live: LiveEvidence,
     evidence: &DeviceEvidence,
     closes: &CloseEvidence,
 ) -> Value {
@@ -383,7 +407,7 @@ pub fn build_inventory(
         .iter()
         .map(|r| (ref_key(&row_provider(r), &row_session_id(r)), r))
         .collect();
-    let is_live = |p: &str, s: &str| live_session_keys.contains(&(p.to_string(), s.to_string()));
+    let is_live = |p: &str, s: &str| live.session_keys.contains(&(p.to_string(), s.to_string()));
     // Delta-r6-r2 (Finding 1): the close-evidence joins. A pane is COVERED by
     // a pane close record through either advisory key its snapshot payload
     // carries (`createRequestId` / `liveTerminal.terminalId` — the same keys
@@ -832,7 +856,17 @@ pub fn build_inventory(
                                 )
                             })
                             .unwrap_or_else(|| "-".into());
-                        let live = eff_ref
+                        // Finding F2 (focused-episode-6 round 5): durable-ref
+                        // liveness stays PRIMARY; the terminal-id arm is the
+                        // FALLBACK for panes with no session identity at all
+                        // (a plain shell: no rows, no claims — its snapshot's
+                        // `liveTerminal.terminalId` membership in the server's
+                        // live-terminal set is its liveness claim). A closed
+                        // verdict never reads live: the close envelope lands
+                        // before the kill's teardown, so a mid-teardown
+                        // terminal can still be Running beside a durably
+                        // closed pane.
+                        let ref_live = eff_ref
                             .as_ref()
                             .map(|r| {
                                 is_live(
@@ -841,20 +875,39 @@ pub fn build_inventory(
                                 )
                             })
                             .unwrap_or(false);
+                        let terminal_id_live = ledger_state != "closed"
+                            && pane["kind"].as_str() == Some("terminal")
+                            && payload
+                                .get("liveTerminal")
+                                .and_then(|handle| handle.get("terminalId"))
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .is_some_and(|id| live.terminal_ids.contains(id));
+                        let pane_live = ref_live || terminal_id_live;
                         if let Some(er) = &eff_ref {
                             referenced.insert(ref_key(
                                 er["provider"].as_str().unwrap_or(""),
                                 er["sessionId"].as_str().unwrap_or(""),
                             ));
                         }
-                        // TIMESTAMP-FREE substance line: capturedAt/updatedAt deliberately absent (D3)
+                        // TIMESTAMP-FREE substance line: capturedAt/updatedAt
+                        // deliberately absent (D3). Focused-episode-6 round 5
+                        // (Finding F3, Minor): the `live` flag is digest
+                        // substance NOW that liveness materially changes the
+                        // offer (live panes are included and restore by
+                        // reattach/adopt — the F1 regime): a live→dead
+                        // transition produces a materially different offer for
+                        // the SAME panes, so the dismissal identity must
+                        // re-key on it (a stale dismissal must never suppress
+                        // panes that have since become resumable).
                         substance.push(format!(
-                            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
                             device_id,
                             rec["tabKey"].as_str().unwrap_or(""),
                             pane["paneId"].as_str().unwrap_or(""),
                             pane["kind"].as_str().unwrap_or(""),
-                            eff_str
+                            eff_str,
+                            pane_live
                         ));
                         json!({
                             "paneId": pane["paneId"], "kind": pane["kind"],
@@ -864,7 +917,7 @@ pub fn build_inventory(
                             "payload": payload.clone(),
                             "sessionRef": eff_ref.unwrap_or(Value::Null),
                             "ledgerState": ledger_state,
-                            "live": live,
+                            "live": pane_live,
                         })
                     })
                     .collect();
@@ -1262,7 +1315,13 @@ async fn inventory_handler(
             }
         }
     };
-    let live = live_session_keys(&state.registry, &state.identity);
+    let live = LiveEvidence {
+        session_keys: live_session_keys(&state.registry, &state.identity),
+        // Focused-episode-6 round 5 (Finding F2): the shell half of the D7
+        // join — a plain shell carries no session identity, so its liveness
+        // claim is its snapshot terminal's membership in the Running set.
+        terminal_ids: live_terminal_ids(&state.registry),
+    };
     // Focused-ep5-r2 Finding 1 (round-4 amended, focused-ep5-r3 Finding 4):
     // a still-Bound row dominated by a kill tombstone (the split-write crash
     // remnant) reads as Retired at inventory-build time — never offered.
@@ -1331,6 +1390,21 @@ fn live_session_keys(
         }
     }
     keys
+}
+
+/// The shell half of the D7 liveness join (focused-episode-6 round 5, Finding
+/// F2): the terminal ids of every Running registry row — the same registry
+/// read `live_session_keys` filters, projected onto the id alone. An
+/// unidentified pane (a plain shell: no rows, no claims — the durable-ref
+/// half can never fire for it) claims liveness by its snapshot's
+/// `liveTerminal.terminalId` membership here.
+fn live_terminal_ids(registry: &freshell_terminal::TerminalRegistry) -> HashSet<String> {
+    registry
+        .directory()
+        .into_iter()
+        .filter(|row| row.status == freshell_protocol::TerminalRunStatus::Running)
+        .map(|row| row.terminal_id)
+        .collect()
 }
 
 /// Test-only seam: simulate a concurrent `persist_generation` retention

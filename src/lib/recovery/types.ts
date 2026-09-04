@@ -20,7 +20,15 @@ export interface RecoveryPane {
   /** Effective (ledger-corrected) session ref — the D4 authority chain is applied server-side. */
   sessionRef: RecoverySessionRef | null
   ledgerState: RecoveryLedgerState
-  /** True when a Running terminal currently owns the effective session (D7). */
+  /**
+   * True when the pane's session/terminal is STILL RUNNING server-side:
+   * either a Running terminal owns the effective session (D7, primary), or —
+   * for panes with no session identity at all (plain shells) — the
+   * snapshot's `liveTerminal.terminalId` is in the server's live-terminal
+   * set (focused-episode-6 round 5, Finding F2). Live panes ARE restorable:
+   * they restore by reattach (terminal) / adoption (fresh-agent) — round-5
+   * Finding F1.
+   */
   live: boolean
 }
 

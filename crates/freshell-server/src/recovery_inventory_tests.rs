@@ -9,15 +9,38 @@ use freshell_ws::pane_ledger::{
 use serde_json::json;
 use std::collections::HashSet;
 
-fn no_live() -> HashSet<(String, String)> {
-    HashSet::new()
+fn no_live() -> LiveEvidence {
+    LiveEvidence {
+        session_keys: HashSet::new(),
+        terminal_ids: HashSet::new(),
+    }
 }
 
-fn live(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
-    pairs
-        .iter()
-        .map(|(p, s)| (p.to_string(), s.to_string()))
-        .collect()
+fn live(pairs: &[(&str, &str)]) -> LiveEvidence {
+    LiveEvidence {
+        session_keys: pairs
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect(),
+        terminal_ids: HashSet::new(),
+    }
+}
+
+/// Focused-episode-6 round 5 (Finding F2): the shell half of the liveness
+/// evidence — live TERMINAL ids only (a plain shell has no session identity
+/// to claim through).
+fn live_terminals(ids: &[&str]) -> LiveEvidence {
+    LiveEvidence {
+        session_keys: HashSet::new(),
+        terminal_ids: ids.iter().map(|id| id.to_string()).collect(),
+    }
+}
+
+/// Focused-episode-6 round 5 (Finding F2): add terminal-id evidence to an
+/// existing set (the precedence pin combines both arms over the same pane).
+fn with_terminals(mut ev: LiveEvidence, ids: &[&str]) -> LiveEvidence {
+    ev.terminal_ids.extend(ids.iter().map(|id| id.to_string()));
+    ev
 }
 
 fn union_doc(device: &str, captured_at: u64, panes: serde_json::Value) -> serde_json::Value {
@@ -236,6 +259,160 @@ fn live_session_keys_ignores_retired_and_dead_identity_entries() {
     let keys = live_session_keys(&registry, &identity);
     assert!(!keys.contains(&("codex".to_string(), "sess-gone".to_string())));
     assert!(!keys.contains(&("claude".to_string(), "sess-retired".to_string())));
+}
+
+/// Focused-episode-6 round 5 (Finding F2) — the route's shell half of the
+/// liveness join: the live-TERMINAL set is the Running registry rows'
+/// terminal ids (the same registry read `live_session_keys` filters).
+#[test]
+fn live_terminal_ids_collect_the_running_registry_rows() {
+    let registry = freshell_terminal::TerminalRegistry::new();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "t-live".into(),
+        stream_id: "s1".into(),
+        mode: "shell".into(),
+        resume_session_id: None, // a plain shell owns no session identity
+        create_request_id: None,
+        created_at: None,
+    });
+    let ids = live_terminal_ids(&registry);
+    assert!(
+        ids.contains("t-live"),
+        "a Running shell row's terminal id is live evidence"
+    );
+    assert!(
+        !ids.contains("t-absent"),
+        "an id the registry does not hold is never live"
+    );
+}
+
+/// Finding F2 (Major) — shell liveness: a plain-shell terminal pane has NO
+/// session identity (no rows, no claims — the effective ref is null and the
+/// durable-ref liveness arm can never fire), so pre-fix it always reported
+/// `live: false`; the client then dropped the saved terminal identity and
+/// spawned a DUPLICATE beside the still-running PTY. Such a pane now claims
+/// liveness via its snapshot's `payload.liveTerminal.terminalId` membership
+/// in the server's live-terminal set. Durable-ref liveness stays primary;
+/// terminal-id membership is the fallback for unidentified shells.
+#[test]
+fn a_live_shell_pane_verdicts_live_via_its_live_terminal_id() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "shell", "shell": "system",
+                                  "createRequestId": "req-shell",
+                                  "liveTerminal": { "terminalId": "t-shell", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    // No rows anywhere (shells never write ledger rows) and no durable claims
+    // — only the terminal-id evidence.
+    let out = build_inventory(vec![d], vec![], live_terminals(&["t-shell"]), &no_evidence(), &no_closes());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["live"], true,
+        "a shell whose snapshot terminal is STILL RUNNING server-side verdicts live: {pane}"
+    );
+    assert_eq!(
+        pane["ledgerState"], "unknown",
+        "no identity exists to bind — the ref-less fallback stands: {pane}"
+    );
+    assert!(pane["sessionRef"].is_null());
+}
+
+/// F2 control: the same pane with its terminal NOT in the live set stays
+/// dead (the pre-existing fallback is untouched — such a shell restores
+/// fresh, exactly as before).
+#[test]
+fn a_shell_pane_whose_terminal_is_not_live_stays_dead() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "shell", "shell": "system",
+                                  "createRequestId": "req-shell",
+                                  "liveTerminal": { "terminalId": "t-shell", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["live"], false, "no live-terminal membership, no liveness: {pane}");
+    assert_eq!(pane["ledgerState"], "unknown", "{pane}");
+}
+
+/// F2's closed gate: a pane covered by a close record can never read live —
+/// the close envelope lands BEFORE the kill's teardown, so a terminal can be
+/// mid-close and still Running while the pane is already durably closed. The
+/// closed verdict wins and the pane is excluded regardless of the
+/// still-Running id.
+#[test]
+fn a_close_covered_pane_stays_non_live_even_while_its_terminal_still_runs() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "shell", "shell": "system",
+                                  "createRequestId": "req-mid-close",
+                                  "liveTerminal": { "terminalId": "t-mid-close", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let closes = closes_with("t-mid-close", Some("req-mid-close"), &[], &[]);
+    let out = build_inventory(vec![d], vec![], live_terminals(&["t-mid-close"]), &no_evidence(), &closes);
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["ledgerState"], "closed", "the close evidence owns the verdict: {pane}");
+    assert_eq!(
+        pane["live"], false,
+        "a mid-teardown terminal is Running but the pane was CLOSED — never live: {pane}"
+    );
+}
+
+/// F2's durable-ref precedence: an IDENTIFIED live terminal pane (a bound
+/// session claim that resolves and is live) still verdicts live through the
+/// primary arm — and the terminal-id fallback extending the SAME pane's
+/// liveness changes nothing (one boolean, never double-counted).
+#[test]
+fn the_durable_ref_arm_stays_primary_and_the_terminal_id_fallback_agrees() {
+    let d = || DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "claude",
+                                  "sessionRef": { "provider": "claude", "sessionId": "S-primary" },
+                                  "createRequestId": "req-id",
+                                  "liveTerminal": { "terminalId": "t-id", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let bindings = || vec![binding_row("claude", "S-primary", bound())];
+    // Primary arm only: the terminal id is NOT in the live set.
+    let out = build_inventory(
+        vec![d()],
+        bindings(),
+        live(&[("claude", "S-primary")]),
+        &no_evidence(),
+        &no_closes(),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["live"], true, "the durable-ref arm alone verdicts live: {pane}");
+    assert_eq!(pane["ledgerState"], "bound", "{pane}");
+    // Both arms: identical verdict and liveness.
+    let out = build_inventory(
+        vec![d()],
+        bindings(),
+        with_terminals(live(&[("claude", "S-primary")]), &["t-id"]),
+        &no_evidence(),
+        &no_closes(),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(pane["live"], true, "{pane}");
+    assert_eq!(pane["ledgerState"], "bound", "{pane}");
 }
 
 #[test]
@@ -554,6 +731,60 @@ fn content_id_ignores_timestamp_churn() {
     assert_eq!(
         a["contentId"], b["contentId"],
         "bumping only capturedAt/updatedAt must not change contentId"
+    );
+}
+
+/// Focused-episode-6 round 5, Finding F3 (Minor): the verdict's `live` flag
+/// is now materially significant — live panes are INCLUDED in the offer and
+/// restore by reattach/adopt (the round-5 F1 regime), so a live→dead
+/// transition produces a materially different recoverable offer for the SAME
+/// panes. The dismissal identity must RE-KEY on that transition: otherwise a
+/// dismissal captured against the live-state offer still suppresses the same
+/// panes once they have since become resumable. The digest deliberately folds
+/// the pane's live flag into its substance. The pinned shape: identical union
+/// and bindings, the SOLE difference being the claimed session's liveness.
+#[test]
+fn content_id_rekeys_on_a_live_to_dead_transition() {
+    let d = || DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "claude",
+                                  "sessionRef": { "provider": "claude", "sessionId": "S-flip" } } }]),
+        ),
+    };
+    let bindings = || vec![binding_row("claude", "S-flip", bound())];
+    let live_build = build_inventory(
+        vec![d()],
+        bindings(),
+        live(&[("claude", "S-flip")]),
+        &no_evidence(),
+        &no_closes(),
+    );
+    let dead_build = build_inventory(
+        vec![d()],
+        bindings(),
+        no_live(),
+        &no_evidence(),
+        &no_closes(),
+    );
+    // Anti-vacuity: the SAME claimed identity is live in the first build and
+    // dead in the second, with the same effective ref (the row stays
+    // referenced in both — nothing moves to ledgerOnly).
+    assert_eq!(live_build["device"]["tabs"][0]["panes"][0]["live"], true);
+    assert_eq!(dead_build["device"]["tabs"][0]["panes"][0]["live"], false);
+    assert_eq!(
+        live_build["device"]["tabs"][0]["panes"][0]["sessionRef"],
+        dead_build["device"]["tabs"][0]["panes"][0]["sessionRef"],
+    );
+    assert!(live_build["ledgerOnly"].as_array().unwrap().is_empty());
+    assert!(dead_build["ledgerOnly"].as_array().unwrap().is_empty());
+    // …and the dismissal identity observes the difference.
+    assert_ne!(
+        live_build["contentId"], dead_build["contentId"],
+        "a live→dead transition must re-key the dismissal identity (F3)"
     );
 }
 

@@ -147,12 +147,15 @@ describe('buildRecoveryPlan', () => {
     })
   })
 
-  // F2, the live arm: the top-level `live` verdict marks a fresh-agent pane
-  // whose session is still running on the server (D7) — restoring it would
-  // RESUME the live session. Non-restorable: excluded from the plan and the
-  // count, exactly like a closed verdict. (Delta-r6-r3: live TERMINAL panes
-  // are excluded identically — the dedicated test below pins both.)
-  it('a LIVE fresh-agent pane is EXCLUDED from the plan and the count (never resumed mid-flight)', () => {
+  // Focused-episode-6 round 5, Finding F1 (the course correction over
+  // delta-r6-r3): a LIVE pane is restorable — its session still runs
+  // server-side, so the plan puts it back IN ITS TAB by reattach/adopt,
+  // never by a second spawn and never by omission. A live fresh-agent pane
+  // is built exactly like a bound one: the top-level effective ref rides the
+  // content and FreshAgentView's create effect dispatches
+  // freshAgent.create{sessionRef}, which the provider manager ADOPTS
+  // (adopt_live_create — the existing live session, never a respawn).
+  it('a LIVE fresh-agent pane is INCLUDED and routes to the adopt path (the top-level sessionRef, never a respawn)', () => {
     const inventory = inv([
       pane(),
       pane({
@@ -171,9 +174,17 @@ describe('buildRecoveryPlan', () => {
     ])
     const [tab] = buildRecoveryPlan(inventory)
     const contents = leavesOf(tab.layout).map((l) => l.content)
-    expect(contents).toHaveLength(1)
-    expect(contents.every((c) => c.kind !== 'fresh-agent')).toBe(true)
-    expect(countRecoverablePanes(inventory)).toBe(1)
+    expect(contents).toHaveLength(2)
+    const agent = contents.find((c) => c.kind === 'fresh-agent')
+    expect(agent).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'LIVE' },
+    })
+    expect(countRecoverablePanes(inventory)).toBe(2)
+    // A fresh-agent pane never joins the TERMINAL reattach arm.
+    expect(tab.liveTerminalReattach ?? []).toHaveLength(0)
   })
 
   it('three panes -> right-leaning binary split chain', () => {
@@ -184,11 +195,12 @@ describe('buildRecoveryPlan', () => {
     expect(root.children[1].type).toBe('split')
   })
 
-  it('a live TERMINAL pane is EXCLUDED from the plan and the count (never recreated on top of the still-running session)', () => {
-    // Delta-r6-r3 (focused-episode-6 round 2, Finding F1): the live
-    // exclusion covers EVERY kind — the pre-fix build recreated a live
-    // terminal pane fresh (a second terminal for a session the server
-    // already runs).
+  it('a live TERMINAL pane is INCLUDED: keeps its sessionRef and arms a createRequestId-keyed reattach to its still-running terminal', () => {
+    // Focused-episode-6 round 5, Finding F1: a live terminal pane is put back
+    // IN ITS TAB by reattach — the plan records the snapshot's still-running
+    // terminal handle (`payload.liveTerminal.terminalId`) as a one-shot
+    // paneId→terminalId target; TerminalView consults it BEFORE any create
+    // and folds the pane onto the running PTY (never a respawn).
     const inventory = inv([
       pane(),
       pane({
@@ -197,21 +209,84 @@ describe('buildRecoveryPlan', () => {
         sessionRef: { provider: 'claude', sessionId: 'S2' },
         ledgerState: 'bound',
         live: true,
+        payload: { liveTerminal: { terminalId: 'term-live-1', serverInstanceId: 'srv-1' } },
       }),
     ])
     const [tab] = buildRecoveryPlan(inventory)
-    const contents = leavesOf(tab.layout).map((l) => l.content)
-    expect(contents).toHaveLength(1)
-    expect(countRecoverablePanes(inventory)).toBe(1)
-
-    // An all-live inventory yields NO plan at all (the offerability gate
-    // downstream renders nothing, focused-ep4-r2 Finding 4) — the still-
-    // running terminal stays a background session, never a recreated one.
-    const allLive = inv([
-      pane({ sessionRef: { provider: 'claude', sessionId: 'S3' }, ledgerState: 'bound', mode: 'claude', live: true }),
+    const leaves = leavesOf(tab.layout)
+    expect(leaves).toHaveLength(2)
+    const liveLeaf = leaves.find((l) => l.content.mode === 'claude')
+    expect(liveLeaf.content).toMatchObject({
+      kind: 'terminal',
+      mode: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'S2' },
+    })
+    expect(countRecoverablePanes(inventory)).toBe(2)
+    expect(tab.liveTerminalReattach).toEqual([
+      { paneId: liveLeaf.id, terminalId: 'term-live-1' },
     ])
-    expect(buildRecoveryPlan(allLive)).toHaveLength(0)
-    expect(countRecoverablePanes(allLive)).toBe(0)
+
+    // An all-live inventory now produces a REAL plan and count (the round-3
+    // no-plan-at-all shape was the finding's documented harm: a genuinely-
+    // open all-still-running tab got no recovery offer at all). The
+    // offerability gate downstream keys off the count.
+    const allLive = inv([
+      pane({
+        sessionRef: { provider: 'claude', sessionId: 'S3' },
+        ledgerState: 'bound', mode: 'claude', live: true,
+        payload: { liveTerminal: { terminalId: 'term-live-2', serverInstanceId: 'srv-1' } },
+      }),
+    ])
+    expect(buildRecoveryPlan(allLive)).toHaveLength(1)
+    expect(countRecoverablePanes(allLive)).toBe(1)
+  })
+
+  it('a live terminal pane whose snapshot lost the handle falls back to resume/refusal→reattach (sessionRef kept, no reattach arm)', () => {
+    // Defensive shape: `live` verdict for an identified pane whose snapshot
+    // never stamped `payload.liveTerminal`. The plan keeps the effective ref;
+    // the restored pane's resume create meets the server's D7 live-owner
+    // refusal (RESTORE_UNAVAILABLE + liveTerminalId) and folds back onto the
+    // SAME still-running terminal — reattach either way, never a respawn.
+    const inventory = inv([
+      pane({
+        sessionRef: { provider: 'claude', sessionId: 'S4' },
+        ledgerState: 'bound', mode: 'claude', live: true,
+      }),
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    expect(tab.liveTerminalReattach ?? []).toHaveLength(0)
+    const content = (tab.layout as { content: Record<string, unknown> }).content
+    expect(content.sessionRef).toEqual({ provider: 'claude', sessionId: 'S4' })
+  })
+
+  it('a mixed tab lands live AND dead members in the ORIGINAL tab: the live one reattach-armed, the dead one restored by resume', () => {
+    const inventory = inv([
+      pane({
+        paneId: 'p-live', mode: 'shell', sessionRef: null, ledgerState: 'unknown', live: true,
+        payload: { liveTerminal: { terminalId: 'term-sh-1', serverInstanceId: 'srv-1' } },
+      }),
+      pane({
+        paneId: 'p-dead', mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: 'S-dead' },
+        ledgerState: 'bound', live: false,
+      }),
+    ])
+    const plans = buildRecoveryPlan(inventory)
+    expect(plans).toHaveLength(1) // BOTH land in the one original tab
+    const leaves = leavesOf(plans[0].layout)
+    expect(leaves).toHaveLength(2)
+    // The live shell: no session identity, reattach-armed on its pane id.
+    const shell = leaves.find((l) => l.content.mode === 'shell')!
+    expect(shell.content.sessionRef).toBeUndefined()
+    expect(plans[0].liveTerminalReattach).toEqual([
+      { paneId: shell.id, terminalId: 'term-sh-1' },
+    ])
+    // The dead claude pane: restored by resume ref, never reattach-armed.
+    const claude = leaves.find((l) => l.content.mode === 'claude')!
+    expect(claude.content).toMatchObject({ sessionRef: { provider: 'claude', sessionId: 'S-dead' } })
+    expect(
+      (plans[0].liveTerminalReattach ?? []).every((t) => t.paneId !== claude.id),
+    ).toBe(true)
   })
 
   it('non-terminal kinds pass payload through', () => {

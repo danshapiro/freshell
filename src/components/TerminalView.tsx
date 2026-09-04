@@ -71,6 +71,7 @@ import {
   addTerminalFreshRecoveryRequestId,
   addTerminalRestoreRequestId,
   clearTerminalRestoreRequestId,
+  consumeRecoveredLiveTerminalTarget,
   consumeTerminalFreshRecoveryRequest,
   consumeTerminalRestoreRequestId,
   type TerminalFreshRecoveryIntent,
@@ -5357,6 +5358,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             }
             return
           }
+        }
+        // Focused-episode-6 round 5 (Finding F1): the restore offer's LIVE
+        // terminal panes reattach to the still-running server terminal — the
+        // plan armed a one-shot paneId→terminalId target for exactly this
+        // pane (RecoveryOfferPanel's accept + build-recovery-plan). The
+        // consult runs here — AFTER the pre-verdict wait (a server reconcile
+        // verdict always wins), BEFORE any create — so a live pane is put
+        // back on its original PTY and never recreated as a second process.
+        // The fold is the same `applyReattachToLiveTerminal` the D7-refusal
+        // revival uses; the epoch bump re-fires this effect into the attach
+        // branch. A died-before-attach target heals through the ordinary
+        // INVALID_TERMINAL_ID reconnect (dead-live-handle recovery or a
+        // resume create).
+        const reattachTarget = consumeRecoveredLiveTerminalTarget(tabId, paneIdRef.current)
+        if (reattachTarget) {
+          dispatch(applyReattachToLiveTerminal({
+            tabId,
+            paneId: paneIdRef.current,
+            terminalId: reattachTarget,
+          }))
+          writeLocalXtermNotice(term, `\r\nReconnected to the still-running session.\r\n`)
+          return
         }
         deferredAttachStateRef.current = {
           mode: 'none',

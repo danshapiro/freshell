@@ -12,14 +12,15 @@
  * Scenario 2 (decline path): a fresh context declines — the panel closes and
  * no recovered tabs are added.
  *
- * Scenario 3 (no-restart browser loss, live exclusion): the browser is lost
- * WITHOUT a server restart, so D's claude PTY stays Running (registry-owned)
- * and its pane verdicts LIVE. Live panes are excluded from restore for EVERY
- * kind (delta-r6-r3): the offer lists only D's UNIDENTIFIED shell pane under
- * the not-restored live note, accepting recreates the shell — and NEVER a
- * second claude on top of the still-running session (argv-log proof: no
- * fresh spawn past the watermark, never `--resume <sessionIdD>`). The live
- * session stays available as a background session.
+ * Scenario 3 (no-restart browser loss, live REATTACH): the browser is lost
+ * WITHOUT a server restart, so D's shell PTY and claude PTY both stay
+ * Running (registry-owned) and both panes verdict LIVE. Live panes are
+ * restorable (focused-episode-6 round 5, F1): the offer lists and counts
+ * BOTH under the reattach live note, and accepting puts the panes back IN
+ * THEIR TAB by reattaching to the still-running terminals — the recovered
+ * panes own D's ORIGINAL terminal ids, and NEVER spawn a second process on
+ * top of the still-running ones (argv-log proof: no fresh claude spawn past
+ * the watermark, never `--resume <sessionIdD>`).
  *
  * Scenario 4 (phone containment, R1/R3): a populating context records a
  * 40-shell-tab layout and is lost WITHOUT a server restart; a fresh
@@ -592,7 +593,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await waitForRecoverable(info)
   })
 
-  test('scenario 3: no-restart browser loss — live sessions are NEVER recreated on top of the still-running ones (delta-r6-r3 live exclusion)', async ({ browser, e2eServerKind }) => {
+  test('scenario 3: no-restart browser loss — live panes restore by REATTACH to the still-running terminals (focused-episode-6 round 5)', async ({ browser, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     test.setTimeout(240_000)
 
@@ -630,23 +631,51 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     }).toPass({ timeout: 15_000 })
     await waitForSnapshotContaining([sessionIdD])
 
-    // The argv-log watermark for the never-recreate assertions below.
+    // Capture D's still-running terminal ids — the REATTACH proof below: the
+    // recovered panes must own THESE ids (the live PTYs), never recreated
+    // ones. Both panes sit in D's one tab (shell first, claude split second).
+    const dPanes = await pageD.evaluate(() => {
+      const harness = (window as any).__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const out: Array<{ mode: string | null; terminalId?: string }> = []
+      for (const tab of state?.tabs?.tabs ?? []) {
+        const walk = (node: any): void => {
+          if (!node) return
+          if (node.type === 'leaf') {
+            if (node.content?.kind === 'terminal') {
+              out.push({ mode: node.content?.mode ?? null, terminalId: node.content?.terminalId })
+            }
+            return
+          }
+          for (const child of node.children ?? []) walk(child)
+        }
+        walk(state?.panes?.layouts?.[tab.id])
+      }
+      return out
+    })
+    const shellTerminalIdD = dPanes.find((p) => p.mode === 'shell')?.terminalId
+    const claudeTerminalIdD = dPanes.find((p) => p.mode === 'claude')?.terminalId
+    expect(shellTerminalIdD, "D's shell pane owns a live terminal id").toBeTruthy()
+    expect(claudeTerminalIdD, "D's claude pane owns a live terminal id").toBeTruthy()
+
+    // The argv-log watermark for the never-respawn assertions below.
     const argvCountAtD = (await readArgvLog(argLog)).length
 
     // ---- Lose the browser WITHOUT restarting the server: BOTH D's shell
     // PTY and D's claude CLI keep running (registry-owned, not
-    // connection-owned), so every recoverable candidate verdicts LIVE. ----
+    // connection-owned), so BOTH panes verdict LIVE. ----
     await ctxD.close()
-    // Guard (R2a): the server's inventory still sees the recoverable
-    // substance (the exclusion lives in the plan layer — the poller is the
-    // transition guard, not an assertion).
+    // Guard (R2a): the server's inventory must see the recoverable substance
+    // before E boots (the poller is the transition guard, not an assertion).
     await waitForRecoverable(info)
 
-    // ---- Context E (fresh storage): the offer lists ONLY the unidentified
-    // shell pane — the claude pane verdicts LIVE (its session still runs),
-    // and live panes are excluded for EVERY kind (focused-episode-6 round 2
-    // Finding F1: the pre-repair build recreated the live terminal pane as a
-    // SECOND claude spawn on top of the still-running session). ----
+    // ---- Context E (fresh storage): the offer lists AND counts BOTH panes —
+    // live panes are restorable (focused-episode-6 round 5, Finding F1): the
+    // shell claims liveness through its snapshot's liveTerminal.terminalId
+    // (Finding F2 — before it, an unidentified shell ALWAYS read live:false
+    // and restored as a duplicate), the claude pane through its durable
+    // session ref. Accepting reattaches both IN THEIR TAB — never a second
+    // spawn on top of the still-running sessions. ----
     const ctxE: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
     const pageE = await ctxE.newPage()
     traceInventoryFailures(pageE, 'contextE')
@@ -655,26 +684,59 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     const panelE = pageE.getByTestId('recovery-offer-panel')
     await expect(panelE).toBeVisible({ timeout: 15_000 })
     await expect(
-      pageE.getByRole('heading', { name: /restore 1 pane from server memory/i }),
+      pageE.getByRole('heading', { name: /restore 2 panes from server memory/i }),
     ).toBeVisible()
+    await expect(panelE.getByRole('listitem')).toHaveCount(2)
     await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
-    await expect(pageE.getByTestId('recovery-live-note')).toHaveText(/not restored/)
+    await expect(pageE.getByTestId('recovery-live-note')).toHaveText(/reattach/)
 
     await pageE.getByTestId('recovery-accept').click()
     await expect(panelE).toHaveCount(0)
 
-    // The accept DID run: the unidentified shell pane is recreated.
+    // The accept ran: the tab is restored with both panes visible.
     await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
-    // And the live claude pane was NOT recreated on top of the still-running
-    // session — no fresh claude spawn past the watermark, and never
-    // `--resume <sessionIdD>`. The positive window: the recreated shell is
-    // already visible above, so any wrongly-recreated claude spawn would be
-    // in flight now.
+    // PRIMARY reattach proof: the recovered panes own D's ORIGINAL terminal
+    // ids — the still-running PTYs themselves (the reviewer's "the old PTY
+    // survives" observation, now asserted as the reattach acceptance).
+    await expect(async () => {
+      const ePanes = await pageE.evaluate(() => {
+        const harness = (window as any).__FRESHELL_TEST_HARNESS__
+        const state = harness?.getState()
+        const ids: string[] = []
+        for (const tab of state?.tabs?.tabs ?? []) {
+          const walk = (node: any): void => {
+            if (!node) return
+            if (node.type === 'leaf') {
+              if (node.content?.kind === 'terminal' && node.content?.terminalId) {
+                ids.push(node.content.terminalId)
+              }
+              return
+            }
+            for (const child of node.children ?? []) walk(child)
+          }
+          walk(state?.panes?.layouts?.[tab.id])
+        }
+        return ids
+      })
+      expect(
+        ePanes,
+        "the recovered shell pane reattached to D's still-running shell PTY",
+      ).toContain(shellTerminalIdD!)
+      expect(
+        ePanes,
+        "the recovered claude pane reattached to D's still-running claude PTY",
+      ).toContain(claudeTerminalIdD!)
+    }).toPass({ timeout: 30_000 })
+
+    // ANTI-RESPAWN: the still-running sessions were NEVER recreated — no fresh
+    // claude spawn past the watermark and no resume onto a second process. The
+    // positive window: the reattached panes already rendered above, so any
+    // wrong spawn would be in flight now.
     const entriesAfterAccept = (await readArgvLog(argLog)).slice(argvCountAtD)
     expect(
       entriesAfterAccept,
-      'the live claude pane was never recreated (a second claude spawn past the watermark)',
+      'the live panes reattached — nothing spawned past the watermark',
     ).toHaveLength(0)
     expect(
       entriesAfterAccept.some((e) => hasClaudeResumePair(e.argv, sessionIdD)),

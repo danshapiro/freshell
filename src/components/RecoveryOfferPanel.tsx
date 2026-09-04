@@ -16,7 +16,7 @@ import type { RecoveryInventory } from '@/lib/recovery/types'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { addTab } from '@/store/tabsSlice'
 import { restoreLayout } from '@/store/panesSlice'
-import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
 import type { PaneNode } from '@/store/paneTypes'
 import { OVERLAY_Z } from '@/components/ui/overlay'
 import { Button } from '@/components/ui/button'
@@ -52,8 +52,11 @@ function walkArmingRestores(node: PaneNode | undefined): void {
 
 /**
  * Arms terminal restore for every terminal leaf carrying a sessionRef in the
- * given tabs' post-normalization layouts. Live panes never arm: Task 4's plan
- * builder strips their sessionRef (D7), so the walk skips them naturally.
+ * given tabs' post-normalization layouts. Live panes arm too (round-5 F1: the
+ * plan keeps their effective ref) — a live leaf ALSO carries a one-shot
+ * reattach arm that TerminalView consults first, so this restore arm only
+ * ever fires when the live handle died before attach (the resumed-honestly
+ * fallback the D7 live-owner refusal then converts to a reattach).
  */
 export function armRecoveredTerminalRestores(state: Pick<RootState, 'panes'>, tabIds: string[]): void {
   for (const tabId of tabIds) {
@@ -160,6 +163,14 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     for (const plan of plans) {
       dispatch(addTab({ id: plan.tabId, title: plan.title }))
       dispatch(restoreLayout({ tabId: plan.tabId, layout: plan.layout, paneTitles: plan.paneTitles }))
+      // Focused-episode-6 round 5 (Finding F1): live terminal panes reattach
+      // to their still-running terminals — arm the plan's one-shot
+      // paneId→terminalId targets (pane node ids survive restoreLayout
+      // normalization, so the store leaf's own TerminalView mount consults
+      // this exact key before any create).
+      for (const target of plan.liveTerminalReattach ?? []) {
+        armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
+      }
     }
     armRecoveredTerminalRestores(store.getState(), plans.map((p) => p.tabId))
     setInventory(null)
@@ -175,12 +186,12 @@ export function RecoveryOfferPanel(): JSX.Element | null {
 
   const paneCount = countRecoverablePanes(inventory)
   const device = inventory.device
-  // Delta-r6-r3 (focused-episode-6 round 2, Finding F1): the live note now
-  // explains EXCLUDED panes — every live pane (any kind) is skipped by the
-  // restore (its session still runs server-side; recreating it would spawn a
-  // duplicate). The note's condition and copy describe that exclusion
-  // honestly: no live pane is ever listed or counted, so the note no longer
-  // shares the restorability predicate on purpose.
+  // Focused-episode-6 round 5 (Finding F1): the live note now explains the
+  // REATTACH — every live pane (any kind) IS counted, listed, and restored
+  // (it reattaches/adopts the still-running server session; no new process
+  // spawns). The note's condition stays predicate-independent on purpose:
+  // live panes pass the restorability predicate, so the note cannot key off
+  // it without vacuity.
   const anyLive =
     device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false
   // D8 placement: the listing must match the plan's physical destination, so
@@ -246,8 +257,9 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1 overflow-y-auto flex-1 min-h-0">
           {restorableTabs.flatMap((tab) => [
             // Delta-r6 F1/F2: the listing consumes the SAME restorability
-            // predicate as the count and the plan — a closed-verdict pane (or
-            // a live fresh-agent pane, resumed-never) is never listed.
+            // predicate as the count and the plan — a closed-verdict pane is
+            // never listed (live panes ARE listed: they restore by reattach,
+            // round-5 F1).
             ...tab.panes.filter(isRestorablePane).map((pane) => (
               <li key={`${tab.tabKey}:${pane.paneId}`}>
                 {tab.tabName}: {pane.mode ?? pane.kind}
@@ -264,8 +276,8 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         </ul>
         {anyLive && (
           <p data-testid="recovery-live-note" className="mt-3 text-xs text-muted-foreground">
-            Some sessions are still running on the server — they are not restored; they stay open
-            as background sessions you can reattach from the sidebar.
+            Some sessions are still running on the server — restoring reattaches to them in place
+            (no new process is started).
           </p>
         )}
         <div className="mt-4 flex justify-end gap-2">
