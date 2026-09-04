@@ -2406,6 +2406,9 @@ impl PaneLedger {
     ///   durable. The delete failing while the covering record stands ⇒
     ///   [`CloseEnvelopeError::Persisted`]: the caller's error reports
     ///   persisted-close, and the index is fed to match the disk truth.
+    // The arity allowance mirrors `tabs_persist::persist_generation`'s: the
+    // record's optional pane linkage travels as two slots.
+    #[allow(clippy::too_many_arguments)]
     fn close_envelope_locked(
         &self,
         root: &Path,

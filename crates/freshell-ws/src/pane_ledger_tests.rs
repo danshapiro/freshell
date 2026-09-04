@@ -5462,7 +5462,7 @@ fn a_close_identities_envelope_is_one_journal_record() {
 /// riding beside a kill that reports failure — is what
 /// `a_close_envelope_whose_rollback_delete_fails_reports_persisted_close`
 /// now pins honestly (the caller hears persisted-close and ends the session).
-
+///
 /// F2 (ordering): the pending marker is deleted only AFTER the pane close
 /// RECORD persists. For a pre-resolution close (no rows, no captured
 /// identity) the marker is the only pre-existing evidence tying the pane to

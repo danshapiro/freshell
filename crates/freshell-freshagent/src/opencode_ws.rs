@@ -1200,10 +1200,10 @@ impl FreshOpencodeState {
                 // placeholder-keyed close IS the fresh-agent lane's close
                 // record (delta-r6-r2), so a kill with nothing else to close
                 // still writes it.
-                if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX) {
-                    if !marker_ids.iter().any(|m| m == id) {
-                        marker_ids.push(id.to_string());
-                    }
+                if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                    && !marker_ids.iter().any(|m| m == id)
+                {
+                    marker_ids.push(id.to_string());
                 }
                 if !retire_ids.iter().any(|r| r == id) {
                     retire_ids.push(id.to_string());
