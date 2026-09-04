@@ -270,6 +270,21 @@ impl PaneIdentitySink for LedgerIdentitySink {
         })
     }
 
+    /// The tombstone lifecycle transition (focused-ep5-r1 Finding 2): a
+    /// genuine claim (explicit resume/attach) clears the kill tombstone so
+    /// the claim's own binding write is never suppressed. Same
+    /// awaited-spawn_blocking discipline as `retire_closed`; a missing
+    /// tombstone is the ledger's own `Ok` idempotence.
+    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_kill_tombstone(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
     /// kata 1wxv: await the rollback-record row write BEFORE the provider
     /// mutation runs (durable-BEFORE-mutation; a pre-write failure refuses
     /// the rollback with `LEDGER_WRITE_REFUSAL_COPY`).
@@ -995,6 +1010,93 @@ mod tests {
         sink.delete_pending("never-recorded")
             .await
             .expect("missing marker deletes to Ok");
+    }
+
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2) over the REAL ledger,
+    /// through the sink seam the providers use: the kill's `retire_closed`
+    /// records the durable tombstone; a late in-flight `record_binding` (the
+    /// aborted-consumer orphan shape) is SUPPRESSED by it (no row appears —
+    /// and this holds under REAL CONCURRENCY: the kill and the write run on
+    /// parallel spawn_blocking tasks here, never a synchronous install); and
+    /// the genuine-claim `clear_kill_tombstone` reopens the identity so its
+    /// binding lands Bound again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_tombstone_fences_late_bindings_and_the_genuine_claim_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: session_id.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+
+        // Sequential sanity: kill first (no row yet — the finding's shape),
+        // the late write suppressed.
+        sink.retire_closed("claude", "durable-fence")
+            .await
+            .expect("retire ok");
+        sink.record_binding(upsert("durable-fence"))
+            .await
+            .expect("write ok");
+        assert!(
+            ledger.load_binding("claude", "durable-fence").is_none(),
+            "the tombstoned identity never gains a Bound row from a late write"
+        );
+
+        // The genuine claim reopens: clear, then the write lands Bound.
+        sink.clear_kill_tombstone("claude", "durable-fence")
+            .await
+            .expect("clear ok");
+        sink.record_binding(upsert("durable-fence"))
+            .await
+            .expect("claim write ok");
+        let row = ledger
+            .load_binding("claude", "durable-fence")
+            .expect("the claim's row exists");
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+
+        // REAL CONCURRENCY: the write and the kill launched together through
+        // the sink's own spawn_blocking hop — repeated, both start orders —
+        // must converge to not-Bound every time (the ledger's under-lock
+        // consult makes ordering the only variable, and both orders are safe).
+        for i in 0..32 {
+            let session_id = format!("durable-race-{i}");
+            // A second sink over the same ledger (the orphan's write path is
+            // the same choke point the kill consults).
+            let write_sink = LedgerIdentitySink::new(ledger.clone());
+            let kill_sink = LedgerIdentitySink::new(ledger.clone());
+            let (w, k) = if i % 2 == 0 {
+                tokio::join!(
+                    write_sink.record_binding(upsert(&session_id)),
+                    kill_sink.retire_closed("claude", &session_id)
+                )
+            } else {
+                tokio::join!(
+                    kill_sink.retire_closed("claude", &session_id),
+                    write_sink.record_binding(upsert(&session_id))
+                )
+            };
+            w.expect("write ok");
+            k.expect("retire ok");
+            let state = ledger
+                .load_binding("claude", &session_id)
+                .map(|r| r.state);
+            assert!(
+                state != Some(freshell_ws::pane_ledger::RowState::Bound),
+                "iteration {i}: a killed identity converged to not-Bound, got {state:?}"
+            );
+        }
     }
 
     /// Task 3 semantics change (`was_recorded` rekeying): a lineage-only

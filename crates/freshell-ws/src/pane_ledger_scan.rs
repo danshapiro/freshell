@@ -43,6 +43,8 @@ pub struct BootScanReport {
     pub supersession_repairs: Vec<(SessionLocator, SessionLocator)>,
     pub gc_tombstoned: Vec<SessionLocator>,
     pub tombstones_deleted: Vec<SessionLocator>,
+    /// Focused-ep5-r1 Finding 2: expired kill tombstones swept this pass.
+    pub kill_tombstones_swept: Vec<SessionLocator>,
 }
 
 impl PaneLedger {
@@ -185,6 +187,7 @@ impl PaneLedger {
         let gc_report = self.gc_locked(&root, &mut index, now_ms, transcript_absent);
         report.gc_tombstoned = gc_report.gc_tombstoned;
         report.tombstones_deleted = gc_report.tombstones_deleted;
+        report.kill_tombstones_swept = gc_report.kill_tombstones_swept;
         report
     }
 
@@ -219,12 +222,17 @@ impl PaneLedger {
             return BootScanReport::default();
         };
         let mut report = BootScanReport::default();
-        let (marker_ids, row_keys) = {
+        let (marker_ids, row_keys, tombstone_keys) = {
             let index = self.guard();
             (
                 index.pending.keys().cloned().collect::<Vec<String>>(),
                 index
                     .bindings
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<(String, String)>>(),
+                index
+                    .kill_tombstones
                     .keys()
                     .cloned()
                     .collect::<Vec<(String, String)>>(),
@@ -252,6 +260,10 @@ impl PaneLedger {
                 &mut report,
             );
         }
+        for key in tombstone_keys {
+            let mut index = self.guard();
+            self.gc_kill_tombstone_locked(&root, &mut index, &key, now_ms, &mut report);
+        }
         report
     }
 
@@ -278,7 +290,67 @@ impl PaneLedger {
         for key in row_keys {
             self.gc_row_locked(root, index, &key, now_ms, transcript_absent, &mut report);
         }
+        let tombstone_keys: Vec<(String, String)> = index.kill_tombstones.keys().cloned().collect();
+        for key in tombstone_keys {
+            self.gc_kill_tombstone_locked(root, index, &key, now_ms, &mut report);
+        }
         report
+    }
+
+    /// Expiry sweep for ONE kill tombstone, under the caller's guard
+    /// (focused-ep5-r1 Finding 2): the TTL bounds the tombstone's protective
+    /// lifetime — its live purpose is the in-flight orphan window around
+    /// the kill (milli-seconds scale), never day-old history; and a stale
+    /// tombstone must not suppress a legitimate bind forever. Re-reads the
+    /// index: one cleared/rewritten between the snapshot and this guard
+    /// acquisition is re-evaluated against its CURRENT state (a re-kill at a
+    /// newer `killed_at_ms` is FRESH and skipped).
+    fn gc_kill_tombstone_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        key: &(String, String),
+        now_ms: i64,
+        report: &mut BootScanReport,
+    ) {
+        let Some(killed_at) = index.kill_tombstones.get(key).copied() else {
+            return; // cleared since the snapshot — no longer qualifies
+        };
+        if kill_tombstone_is_fresh(killed_at, now_ms) {
+            return;
+        }
+        let sref = SessionLocator {
+            provider: key.0.clone(),
+            session_id: key.1.clone(),
+        };
+        match std::fs::remove_file(Self::kill_tombstone_path(root, &key.0, &key.1)) {
+            Ok(()) => {
+                index.kill_tombstones.remove(key);
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %sref.provider,
+                    session_id = %sref.session_id,
+                    killed_at_ms = killed_at,
+                    "pane_ledger_kill_tombstone_swept: protective TTL elapsed"
+                );
+                report.kill_tombstones_swept.push(sref);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                index.kill_tombstones.remove(key);
+                report.kill_tombstones_swept.push(sref);
+            }
+            Err(err) => {
+                // Fail loud, never silent: the tombstone stays; the next GC
+                // pass retries naturally.
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %sref.provider,
+                    session_id = %sref.session_id,
+                    error = %err,
+                    "pane_ledger_kill_tombstone_sweep_failed: file left behind; will retry next pass"
+                );
+            }
+        }
     }
 
     /// Aged-marker sweep for ONE marker, under the caller's guard (A8/V7):
@@ -450,7 +522,17 @@ impl PaneLedger {
                 }
             }
         }
+        // Focused-ep5-r1 Finding 2: the kill-tombstone subtree participates
+        // in per-row quarantine (typed rows, version-gated like bindings).
+        if let Ok(providers) = std::fs::read_dir(Self::kill_tombstone_dir(root)) {
+            for provider in providers.flatten() {
+                if let Ok(files) = std::fs::read_dir(provider.path()) {
+                    candidates.extend(files.flatten().map(|f| f.path()));
+                }
+            }
+        }
         let rollback_root = Self::rollback_dir(root);
+        let kill_tombstone_root = Self::kill_tombstone_dir(root);
         for path in candidates {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.contains(".tmp-") {
@@ -483,8 +565,11 @@ impl PaneLedger {
                             .parent()
                             .map(|p| p.ends_with("pending"))
                             .unwrap_or(false);
+                        let is_kill_tombstone = path.starts_with(&kill_tombstone_root);
                         let typed_ok = if is_pending {
                             serde_json::from_value::<PendingMarker>(value).is_ok()
+                        } else if is_kill_tombstone {
+                            serde_json::from_value::<KillTombstone>(value).is_ok()
                         } else {
                             serde_json::from_value::<BindingRow>(value).is_ok()
                         };

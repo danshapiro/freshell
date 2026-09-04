@@ -21,6 +21,16 @@
 //!   `freshell_freshagent::rollback_record` owns the schema (the version gate
 //!   lives in that crate's sink layer). Layout:
 //!   `rollback/<enc(provider)>/<enc(sessionId)>.json`.
+//! * **Kill tombstones** (focused-ep5-r1 Finding 2, retire-on-kill round 2) —
+//!   the durable record that an explicit close (`retire_closed`) happened for
+//!   a `(provider, sessionId)` identity, consulted ONLY by
+//!   [`PaneLedger::record_fresh_agent_binding`] (a fresh one suppresses the
+//!   late in-flight write that would otherwise resurrect a Bound row the kill
+//!   just retired; an expired one is swept). TTL'd
+//!   ([`KILL_TOMBSTONE_TTL_MS`]); cleared by
+//!   [`PaneLedger::clear_kill_tombstone`] on a genuine claim (explicit
+//!   resume/attach). Layout:
+//!   `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
 //!
 //! Deliberately NOT stored: scrollback (own store, P2.19), transcripts
 //! (provider-owned), layout (client-owned). NOT keyed on `createRequestId`
@@ -76,6 +86,65 @@ pub const TOMBSTONE_GC_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 /// re-minted). Fresh-by-race evidence matters at the boots near the crash;
 /// a month-old marker is stale noise.
 pub const PENDING_MARKER_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): how long a kill
+/// tombstone keeps fencing the fresh-agent binder. The tombstone exists to
+/// defeat the spawn_blocking orphan window (a binding write launched before
+/// the kill whose blocking closure lands after it — milli- to seconds-scale),
+/// the post-kill in-flight create/resume lane (seconds), and the immediate
+/// post-restart write burst after a crash (minutes, worst case). HOURS of
+/// retention cover every one of those with orders of magnitude of margin
+/// while still bounding the store (the boot + periodic GC sweep them; a
+/// write consult also lazily sweeps an expired one it encounters). The TTL
+/// is deliberately NOT days-scale: a tombstone suppresses
+/// `record_fresh_agent_binding` for its identity, so it must not outlive the
+/// genuine-claim lanes that clear it (explicit resume/attach) by more than a
+/// kill→resume horizon a human actually spans.
+pub const KILL_TOMBSTONE_TTL_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// A kill tombstone (focused-ep5-r1 Finding 2, restore-open-sessions-only):
+/// the durable record that an explicit `retire_closed` (the retire-on-kill
+/// trigger) happened for this `(provider, session_id)` identity.
+/// [`PaneLedger::record_fresh_agent_binding`] consults it under the SAME
+/// index guard as the write it gates, so a binding write that was already in
+/// flight when the kill landed (an aborted consumer's orphaned
+/// `spawn_blocking` closure — task abort can never cancel it) is suppressed
+/// by CONSULTING STATE, never by task-abort ordering: whichever way the
+/// lock serializes, a fresh tombstone seen by the write means the identity
+/// stays dead. TTL'd (see [`KILL_TOMBSTONE_TTL_MS`]); cleared by
+/// [`PaneLedger::clear_kill_tombstone`] when a NEW pane/session genuinely
+/// claims the identity (an explicit resume/attach). Layout:
+/// `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
+///
+/// Deliberately a separate subtree from binding rows (NOT a row state): the
+/// tombstone must fence identities whose row does NOT EXIST YET (the kill
+/// beat the in-flight adoption write), which a row-state marker can never
+/// express. Nothing else reads this subtree — the recovery inventory scans
+/// binding rows only, and the terminal-lineage binder (`record_binding` /
+/// `resolve_pending`) deliberately does not consult it (a terminal kill's
+/// own resume lanes must rebind freely; see the audit table in
+/// usual-sdd/retire-on-kill-r2-fix-report.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillTombstone {
+    pub ledger_version: u32,
+    pub provider: String,
+    pub session_id: String,
+    /// When the explicit close happened (the `retire_closed` call's
+    /// `now_ms`). The TTL clock (freshness compare in
+    /// [`PaneLedger::record_fresh_agent_binding`] and the GC sweep) keys on
+    /// this; a backward wall-clock step counts tombstones as FRESH (the
+    /// fail-closed direction — subtraction-based compare, never expiry-sum
+    /// overflow).
+    pub killed_at_ms: i64,
+}
+
+/// Focused-ep5-r1 Finding 2: tombstone freshness — subtraction-based so a
+/// backward clock step reads as FRESH (fail-closed: the suppression holds,
+/// never the resurrection).
+fn kill_tombstone_is_fresh(killed_at_ms: i64, now_ms: i64) -> bool {
+    now_ms - killed_at_ms < KILL_TOMBSTONE_TTL_MS
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -455,6 +524,12 @@ struct LedgerIndex {
     pending: std::collections::HashMap<String, PendingMarker>,
     /// (provider, session_id) -> rollback payload (kata 1wxv), OPAQUE JSON.
     rollback: std::collections::HashMap<(String, String), serde_json::Value>,
+    /// (provider, session_id) -> killed_at_ms (focused-ep5-r1 Finding 2),
+    /// the write-through image of the `kill-tombstones/` subtree. Consulted
+    /// ONLY by [`PaneLedger::record_fresh_agent_binding`] (plus the GC sweep
+    /// and test/diagnostic reads) — never a liveness signal (a tombstoned
+    /// session is DEAD; this map says "its write is poison", nothing more).
+    kill_tombstones: std::collections::HashMap<(String, String), i64>,
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -580,6 +655,18 @@ impl PaneLedger {
         root.join("rollback")
     }
 
+    /// Kill tombstones (focused-ep5-r1 Finding 2) — see [`KillTombstone`].
+    /// `kill-tombstones/<enc(provider)>/<enc(sessionId)>.json`.
+    fn kill_tombstone_dir(root: &Path) -> PathBuf {
+        root.join("kill-tombstones")
+    }
+
+    fn kill_tombstone_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
+        Self::kill_tombstone_dir(root)
+            .join(encode_segment(provider))
+            .join(format!("{}.json", encode_segment(session_id)))
+    }
+
     fn rollback_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
         Self::rollback_dir(root)
             .join(encode_segment(provider))
@@ -651,6 +738,32 @@ impl PaneLedger {
                         index
                             .rollback
                             .insert((provider_name.clone(), session_id), value);
+                    }
+                }
+            }
+        }
+        // Kill-tombstone subtree (focused-ep5-r1 Finding 2): typed payload,
+        // keyed like the bindings subtree; expired entries are loaded anyway
+        // and swept by the boot/GC pass or the write consult (mirroring the
+        // marker discipline — `load_index` keeps only clean current-version
+        // parses; aging is the sweep's job, never the loader's).
+        if let Ok(providers) = std::fs::read_dir(Self::kill_tombstone_dir(root)) {
+            for provider in providers.flatten() {
+                let Ok(files) = std::fs::read_dir(provider.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue; // *.tmp-* / *.quarantined-* residue
+                    }
+                    if let Ok(tombstone) = load_row::<KillTombstone>(&path) {
+                        if tombstone.ledger_version == LEDGER_VERSION {
+                            index.kill_tombstones.insert(
+                                (tombstone.provider.clone(), tombstone.session_id.clone()),
+                                tombstone.killed_at_ms,
+                            );
+                        }
                     }
                 }
             }
@@ -893,6 +1006,17 @@ impl PaneLedger {
     /// When `w.supersedes` names a different old session id, the old row is
     /// retired and linked AFTER the new bound row persists (G3 order pinned,
     /// V8/A14) — a missing old row is a silent no-op.
+    ///
+    /// Focused-ep5-r1 Finding 2: this is also the kill-tombstone CHECK — the
+    /// ONE choke point every fresh-agent binding write flows through
+    /// (`LedgerIdentitySink::record_binding`). An identity a fresh kill
+    /// tombstone covers is suppressed (never Bound; a stale Bound remnant is
+    /// force-retired Closed), so an explicit close can never be undone by a
+    /// write that was in flight when the kill landed. Deliberately NOT
+    /// consulted by the terminal-lineage lanes (`record_binding`,
+    /// `resolve_pending`): those own the mode-pane resume paths, which must
+    /// rebind after a terminal kill (natural authority split — see the round
+    /// 2 report's writer audit).
     pub fn record_fresh_agent_binding(
         &self,
         w: &FreshAgentBindingWrite<'_>,
@@ -903,6 +1027,65 @@ impl PaneLedger {
         let mut index = self.guard();
 
         let key = (w.provider.to_string(), w.session_id.to_string());
+        // Focused-ep5-r1 Finding 2 — the kill-tombstone consult (state, not
+        // scheduling): under the SAME guard the write below runs on. A FRESH
+        // tombstone for this identity means an explicit close beat this
+        // write (the in-flight orphan shape — an aborted consumer's
+        // spawn_blocking closure outliving every retire pass, or a
+        // detached-lane write racing the kill); the write is SUPPRESSED
+        // wholesale (no Bound row is created, and the supersession retire/
+        // link below is skipped with it — a dead write must not retire a
+        // live parent). A stale Bound remnant (a crash slipped between the
+        // kill's tombstone write and its row retire) is force-retired
+        // Closed, self-healing it. An EXPIRED tombstone is swept lazily
+        // (index + file) and the write proceeds — the TTL bounds the
+        // protection; a genuine late bind (claims also clear explicitly via
+        // [`Self::clear_kill_tombstone`]) is never wedged by stale kills.
+        if let Some(killed_at) = index.kill_tombstones.get(&key).copied() {
+            if kill_tombstone_is_fresh(killed_at, w.now_ms) {
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    killed_at_ms = killed_at,
+                    "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
+                     for an explicitly-closed identity writes nothing (never Bound)"
+                );
+                if let Some(mut remnant) = index.bindings.get(&key).cloned() {
+                    if remnant.state == RowState::Bound {
+                        remnant.state = RowState::Retired;
+                        remnant.retired_reason = Some(RetiredReason::Closed);
+                        remnant.updated_at = w.now_ms;
+                        tracing::info!(
+                            target: "freshell_ws::pane_ledger",
+                            provider = %w.provider,
+                            session_id = %w.session_id,
+                            "pane_ledger_tombstoned_remnant_retired: force-retiring the \
+                             crash-window Bound remnant alongside the suppressed write"
+                        );
+                        self.write_binding(root, &mut index, &remnant)?;
+                    }
+                }
+                return Ok(());
+            }
+            index.kill_tombstones.remove(&key);
+            if let Err(err) =
+                std::fs::remove_file(Self::kill_tombstone_path(root, w.provider, w.session_id))
+            {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    // Fail loud, never silent: the sweep retires at the next
+                    // GC pass regardless (the file is inert once the index
+                    // entry is gone).
+                    tracing::warn!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %w.provider,
+                        session_id = %w.session_id,
+                        error = %err,
+                        "pane_ledger_expired_tombstone_sweep_failed: file left behind; GC retries"
+                    );
+                }
+            }
+        }
         let existing = index.bindings.get(&key);
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
         // Advisory field: keep the existing row's value when the new write
@@ -1071,8 +1254,87 @@ impl PaneLedger {
         Ok(())
     }
 
+    /// The kill-tombstone record (focused-ep5-r1 Finding 2): file FIRST,
+    /// then the write-through index — the `write_binding` discipline. Under
+    /// the caller's index guard. Idempotent refresh (a re-kill re-stamps
+    /// `killed_at_ms`).
+    fn record_kill_tombstone_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        provider: &str,
+        session_id: &str,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        let tombstone = KillTombstone {
+            ledger_version: LEDGER_VERSION,
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            killed_at_ms: now_ms,
+        };
+        write_row_atomic(&Self::kill_tombstone_path(root, provider, session_id), &tombstone)?;
+        index
+            .kill_tombstones
+            .insert((provider.to_string(), session_id.to_string()), now_ms);
+        Ok(())
+    }
+
+    /// The recorded kill-tombstone time for this identity, TTL-agnostic (the
+    /// binder consult applies the TTL; the GC sweep owns expiry deletion).
+    /// Diagnostic/test surface: nothing in production reads tombstones
+    /// except the binder consult and the sweep. Memory-only (V1.md read
+    /// policy); a disabled ledger answers `None`.
+    pub fn kill_tombstone_at(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.root.as_ref()?;
+        self.guard()
+            .kill_tombstones
+            .get(&(provider.to_string(), session_id.to_string()))
+            .copied()
+    }
+
+    /// The tombstone lifecycle transition (focused-ep5-r1 Finding 2): a NEW
+    /// pane/session GENUINELY CLAIMING the identity (an explicit
+    /// resume/attach) clears the tombstone, so that claim's own binding
+    /// write lands Bound again. Idempotent (a never-killed identity clears
+    /// to `Ok`), so claim lanes call it unconditionally. File removal first,
+    /// then the write-through index — the `delete_pending` discipline.
+    pub fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let result = match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id))
+        {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        if result.is_ok() {
+            index
+                .kill_tombstones
+                .remove(&(provider.to_string(), session_id.to_string()));
+        }
+        result
+    }
+
     /// Best-effort retire on observed clean close (trigger e). Missing or
     /// already-retired rows are Ok — this path is never load-bearing.
+    ///
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): an explicit close
+    /// is an intentional session END, so this call ALSO records the durable
+    /// kill tombstone for the identity BEFORE retiring the row (when one
+    /// exists), inside the same guard. The tombstone — not task-abort
+    /// ordering — is what fences a binding write already in flight at kill
+    /// time (an aborted consumer's orphaned spawn_blocking closure survives
+    /// its task and can land after every retire pass over a row that does
+    /// not exist yet): [`PaneLedger::record_fresh_agent_binding`] consults
+    /// the tombstone under this same index guard, so the write suppresses
+    /// itself (or force-retires a stale Bound remnant) instead of restoring
+    /// Bound. The tombstone write is attempted even when the row retire is a
+    /// no-op (kill-before-row is exactly the finding's shape). Both writes
+    /// are attempted on partial failure; the tombstone's error wins the
+    /// return (it is the load-bearing half now — a missed row retire was
+    /// already this function's accepted outcome).
     pub fn retire_closed(
         &self,
         provider: &str,
@@ -1083,20 +1345,23 @@ impl PaneLedger {
             return Ok(());
         };
         let mut index = self.guard();
+        let tombstone_result =
+            self.record_kill_tombstone_locked(root, &mut index, provider, session_id, now_ms);
         let Some(mut row) = index
             .bindings
             .get(&(provider.to_string(), session_id.to_string()))
             .cloned()
         else {
-            return Ok(());
+            return tombstone_result;
         };
         if row.state != RowState::Bound {
-            return Ok(());
+            return tombstone_result;
         }
         row.state = RowState::Retired;
         row.retired_reason = Some(RetiredReason::Closed);
         row.updated_at = now_ms;
-        self.write_binding(root, &mut index, &row)
+        let retire_result = self.write_binding(root, &mut index, &row);
+        tombstone_result.and(retire_result)
     }
 
     /// Retire a Bound row as SessionMissing (session file not found on disk).

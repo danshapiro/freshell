@@ -3466,3 +3466,321 @@ fn rollback_row_rekey_move_drops_the_old_durably() {
         .expect("no-op delete");
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── Focused-ep5-r1 Finding 2 — kill tombstones (retire-on-kill round 2) ─────
+//
+// The race these pin: a fresh-agent kill runs `retire_closed` while a
+// consumer's binding write is ALREADY in flight (an aborted task's orphaned
+// spawn_blocking closure — abort can never cancel it). The pre-repair code
+// retired by row: the row did not exist yet, the retire was a no-op, and the
+// orphan then wrote a fresh Bound row — the exact recovery ghost. The repair
+// records a DURABLE kill tombstone at retire time; the binder consults it
+// under the same index guard as the write (state, never task scheduling), so
+// EVERY completion order converges to not-Bound.
+
+/// The kill's tombstone is DURABLE: `retire_closed` records it even when no
+/// row exists yet (the kill beat the in-flight adoption write), a fresh
+/// ledger over the same root loads it, and the binder refuses the late
+/// write: a tombstoned identity never gains a Bound row from it.
+#[test]
+fn kill_tombstone_suppresses_a_late_binding_write_and_survives_reload() {
+    let root = temp_root("kill-tombstone-suppress");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The kill: no binding row yet (the consumer's adoption write is still in
+    // flight) — retire_closed is a row no-op but must still record the
+    // tombstone.
+    ledger
+        .retire_closed("claude", "durable-kt", 10_000)
+        .unwrap();
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "durable-kt"),
+        Some(10_000),
+        "the kill must record a durable tombstone even with no row to retire"
+    );
+    // The orphaned write lands AFTER: suppressed — no row appears.
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-kt", 10_005))
+        .unwrap();
+    assert!(
+        ledger.load_binding("claude", "durable-kt").is_none(),
+        "a kill-tombstoned identity must never gain a Bound row from a late write"
+    );
+    // A FRESH ledger over the same root (the post-restart shape) still
+    // suppresses — the tombstone is durable, not in-memory.
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger2.kill_tombstone_at("claude", "durable-kt"),
+        Some(10_000),
+        "the tombstone is durable: a fresh load over the same root sees it"
+    );
+    ledger2
+        .record_fresh_agent_binding(&fa_write("claude", "durable-kt", 10_500))
+        .unwrap();
+    assert!(
+        ledger2.load_binding("claude", "durable-kt").is_none(),
+        "the suppression survives the reload too"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Ordering independence the whole repair rests on: write-then-kill lands
+/// exactly like kill-then-write — the row ends Retired, never Bound, and a
+/// SECOND late write (a stale refresh) cannot re-Bound it either.
+#[test]
+fn kill_after_the_write_still_retires_and_a_following_write_stays_suppressed() {
+    let root = temp_root("kill-tombstone-order");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-o", 9_000))
+        .unwrap();
+    assert_eq!(
+        ledger.load_binding("claude", "durable-o").unwrap().state,
+        RowState::Bound
+    );
+    ledger.retire_closed("claude", "durable-o", 10_000).unwrap();
+    let row = ledger.load_binding("claude", "durable-o").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    // A later write for the tombstoned identity: suppressed — the Retired row
+    // is untouched in state (never re-Bound).
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-o", 10_100))
+        .unwrap();
+    let row = ledger.load_binding("claude", "durable-o").unwrap();
+    assert_eq!(
+        row.state,
+        RowState::Retired,
+        "a kill-tombstoned row stays Retired under late writes"
+    );
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The crash-window shape the defensive arm closes: the tombstone file is
+/// durably down but the row's retire never landed (server death slipped
+/// between the two durable writes). A fresh boot loads a Bound row PLUS its
+/// tombstone; the FIRST later write attempt for the identity must not
+/// launder it back to life — the write is suppressed AND the stale Bound row
+/// is force-retired Closed (self-heals the crash remnant).
+#[test]
+fn a_bound_row_with_a_tombstone_is_force_retired_by_the_next_write_attempt() {
+    let root = temp_root("kill-tombstone-crash");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-c", 9_000))
+        .unwrap();
+    // Hand-craft the crash remnant: tombstone down, retire never landed.
+    let tombstone = KillTombstone {
+        ledger_version: LEDGER_VERSION,
+        provider: "claude".to_string(),
+        session_id: "durable-c".to_string(),
+        killed_at_ms: 10_000,
+    };
+    write_row_atomic(
+        &PaneLedger::kill_tombstone_path(&root, "claude", "durable-c"),
+        &tombstone,
+    )
+    .unwrap();
+    // A fresh boot loads BOTH.
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger2.kill_tombstone_at("claude", "durable-c"),
+        Some(10_000)
+    );
+    assert_eq!(
+        ledger2.load_binding("claude", "durable-c").unwrap().state,
+        RowState::Bound,
+        "fixture: the crash left the row Bound"
+    );
+    // The late write is suppressed, and the stale Bound row is force-retired.
+    ledger2
+        .record_fresh_agent_binding(&fa_write("claude", "durable-c", 11_000))
+        .unwrap();
+    let row = ledger2.load_binding("claude", "durable-c").unwrap();
+    assert_eq!(
+        row.state,
+        RowState::Retired,
+        "a Bound row with a fresh tombstone is force-retired by the suppressed write"
+    );
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    // And the force-retire is durable (a fresh reload agrees).
+    let ledger3 = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        ledger3.load_binding("claude", "durable-c").unwrap().state,
+        RowState::Retired
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// TTL: an EXPIRED tombstone stops suppressing (the TTL bounds the tombstone's
+/// protective lifetime) and the write it would have blocked sweeps it lazily —
+/// stale protection can never wedge a later legitimate bind.
+#[test]
+fn an_expired_kill_tombstone_no_longer_suppresses_and_is_swept() {
+    let root = temp_root("kill-tombstone-ttl");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .retire_closed("claude", "durable-ttl", 10_000)
+        .unwrap();
+    let later = 10_000 + KILL_TOMBSTONE_TTL_MS + 1;
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-ttl", later))
+        .unwrap();
+    let row = ledger.load_binding("claude", "durable-ttl").unwrap();
+    assert_eq!(
+        row.state,
+        RowState::Bound,
+        "an expired tombstone never blocks a genuine late bind"
+    );
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "durable-ttl"),
+        None,
+        "the expired tombstone was swept by the consult"
+    );
+    assert!(
+        !PaneLedger::kill_tombstone_path(&root, "claude", "durable-ttl").exists(),
+        "the expired tombstone's FILE is gone too"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The lifecycle transition (Finding 2's clear-on-genuine-claim): an explicit
+/// resume/attach of a killed session clears the tombstone, so the claim's own
+/// binding write lands Bound again. The clear is idempotent (never-killed
+/// identities clear to Ok) — claim lanes call it unconditionally.
+#[test]
+fn clear_kill_tombstone_reopens_the_identity_for_a_genuine_claim() {
+    let root = temp_root("kill-tombstone-clear");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .retire_closed("claude", "durable-r", 10_000)
+        .unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-r", 10_100))
+        .unwrap();
+    assert!(
+        ledger.load_binding("claude", "durable-r").is_none(),
+        "pre-clear: the tombstone suppresses"
+    );
+    // The genuine claim clears the tombstone...
+    ledger.clear_kill_tombstone("claude", "durable-r").unwrap();
+    assert_eq!(ledger.kill_tombstone_at("claude", "durable-r"), None);
+    assert!(
+        !PaneLedger::kill_tombstone_path(&root, "claude", "durable-r").exists(),
+        "the clear deletes the durable tombstone file"
+    );
+    // ...and its binding write lands Bound.
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-r", 10_200))
+        .unwrap();
+    assert_eq!(
+        ledger.load_binding("claude", "durable-r").unwrap().state,
+        RowState::Bound,
+        "post-clear: the genuine claim binds Bound"
+    );
+    // Idempotent: re-clears (and clears of never-tombstoned ids) are Ok.
+    ledger.clear_kill_tombstone("claude", "durable-r").unwrap();
+    ledger.clear_kill_tombstone("claude", "never-tombstoned").unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The periodic GC pass bounds the tombstone store: expired tombstones are
+/// swept (file + index, loudly reported), fresh ones are left alone.
+#[test]
+fn gc_sweeps_expired_kill_tombstones_and_keeps_fresh_ones() {
+    let root = temp_root("kill-tombstone-gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger.retire_closed("claude", "durable-old", 10_000).unwrap();
+    let now = 10_000 + KILL_TOMBSTONE_TTL_MS + 60_000;
+    ledger.retire_closed("codex", "thread-fresh", now - 1_000).unwrap();
+    let report = ledger.gc(now, &|_, _| false, None);
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "durable-old"),
+        None,
+        "the expired tombstone is swept"
+    );
+    assert!(
+        !PaneLedger::kill_tombstone_path(&root, "claude", "durable-old").exists(),
+        "the expired tombstone's file is gone"
+    );
+    assert!(
+        report
+            .kill_tombstones_swept
+            .iter()
+            .any(|l| l.provider == "claude" && l.session_id == "durable-old"),
+        "the sweep is loudly reported: {:?}",
+        report.kill_tombstones_swept
+    );
+    assert_eq!(
+        ledger.kill_tombstone_at("codex", "thread-fresh"),
+        Some(now - 1_000),
+        "a fresh tombstone is never swept"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Disabled-ledger honesty: every tombstone lane is a no-op mirror of the
+/// ledger's existing disabled behavior (never an error).
+#[test]
+fn kill_tombstones_on_a_disabled_ledger_are_no_ops() {
+    let ledger = PaneLedger::disabled();
+    ledger.retire_closed("claude", "s", 1_000).unwrap();
+    assert_eq!(ledger.kill_tombstone_at("claude", "s"), None);
+    ledger.clear_kill_tombstone("claude", "s").unwrap();
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "s", 1_001))
+        .unwrap();
+}
+
+/// REAL-CONCURRENCY pin (no synchronous-install shortcut): the record and the
+/// retire run on parallel threads against the ONE ledger through the same
+/// production entry points an orphaned spawn_blocking closure and the kill
+/// handler use. Whatever the interleaving, the identity must converge to
+/// not-Bound — the consult-under-lock + durable-tombstone design makes the
+/// outcome a function of lock order, never of task scheduling.
+#[test]
+fn record_vs_retire_closed_converges_to_never_bound_under_concurrent_interleavings() {
+    for i in 0..64u32 {
+        let root = temp_root("kill-tombstone-rr");
+        let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
+        let killed_at = 1_000_000 + i64::from(i) * 4_000;
+        let record_at = killed_at + 1;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let l1 = std::sync::Arc::clone(&ledger);
+        let b1 = std::sync::Arc::clone(&barrier);
+        let rec = std::thread::spawn(move || {
+            if i % 2 == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            b1.wait();
+            l1.record_fresh_agent_binding(&fa_write("claude", "durable-x", record_at))
+                .unwrap();
+        });
+        let l2 = std::sync::Arc::clone(&ledger);
+        let b2 = std::sync::Arc::clone(&barrier);
+        let ret = std::thread::spawn(move || {
+            if i % 2 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            b2.wait();
+            l2.retire_closed("claude", "durable-x", killed_at).unwrap();
+        });
+        rec.join().expect("record thread");
+        ret.join().expect("retire thread");
+        let state = ledger.load_binding("claude", "durable-x").map(|r| r.state);
+        assert!(
+            state != Some(RowState::Bound),
+            "iteration {i}: a killed identity must converge to not-Bound, got {state:?}"
+        );
+        assert_eq!(
+            ledger.kill_tombstone_at("claude", "durable-x"),
+            Some(killed_at),
+            "iteration {i}: the kill's tombstone always landed"
+        );
+        // Reset for the next interleaving: the claim lane's clear + the
+        // spawn-failure lane's delete (the only two row/tombstone exits).
+        ledger.clear_kill_tombstone("claude", "durable-x").unwrap();
+        ledger.delete_binding("claude", "durable-x").unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

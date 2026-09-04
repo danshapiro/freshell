@@ -414,6 +414,25 @@ impl FreshCodexState {
         self.identity_sink.get().cloned()
     }
 
+    /// Retire-on-kill round 2 (focused-ep5-r1 Finding 2), the tombstone
+    /// lifecycle's CLEAR transition: an explicit resume/attach of a durable
+    /// thread is a NEW pane GENUINELY CLAIMING that identity, so the kill
+    /// tombstone the close recorded is cleared BEFORE the claim's own binding
+    /// write can be mistaken for the killed session's orphaned write and
+    /// suppressed. Unconditional by design — idempotent on a never-killed
+    /// identity — warn-logged on failure, never a resume blocker. Deliberately
+    /// NOT called by the crash-recovery / fork / adopt-live lanes: none of
+    /// them claims an identity a user just closed (and the crash lanes'
+    /// writes must stay fenced when a kill raced the respawn).
+    async fn clear_kill_tombstone_for(&self, durable_id: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        if let Err(e) = sink.clear_kill_tombstone(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.codex.kill_tombstone_clear_failed");
+        }
+    }
+
     /// P1.13: write one fresh-agent binding row (FULL settings snapshot) through the
     /// identity sink. AWAITED at every identity site (the wave-A durable-before-answer
     /// policy) BEFORE that site's reply/broadcast goes out; a failed write is surfaced
@@ -925,6 +944,14 @@ impl FreshCodexState {
         }
         let thread_id = resume_session_id;
         self.clear_dead_thread(&thread_id).await;
+
+        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this explicit
+        // create-with-resume GENUINELY CLAIMS the thread — clear the kill
+        // tombstone the close recorded BEFORE finish_create's durable binding
+        // write, so the claim is never suppressed as a stale orphan of the
+        // killed session. Idempotent (a never-killed thread clears to Ok) and
+        // warn-only on failure — never a resume blocker.
+        self.clear_kill_tombstone_for(&thread_id).await;
 
         // Kata 1wxv Task 2 (r3): the durable rollout meta is the ONE source of
         // truth for the resumed thread's history mode (thread/resume takes no
@@ -3847,6 +3874,13 @@ impl FreshCodexState {
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
 
+        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this
+        // attach-resume GENUINELY CLAIMS the thread — clear the kill
+        // tombstone the close recorded BEFORE the refresh write below (and
+        // before any later write for this rebuilt session), so the claim is
+        // never suppressed as a stale orphan of the killed session.
+        self.clear_kill_tombstone_for(thread_id).await;
+
         // Registration tail (shared with `handle_fork`). P1.13 (Task 5, R3): the ledger
         // record's settings snapshot -- blank only when no record was recoverable
         // (never-recorded historical sessions resume on defaults, exactly as before
@@ -6289,6 +6323,102 @@ pub(crate) mod tests {
             retires.contains(&("codex".to_string(), "evicted-thread".to_string())),
             "the kill must retire (codex, evicted-thread): {retires:?}"
         );
+    }
+
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2), the tombstone
+    /// lifecycle's exit on the codex lane: a kill folds the durable kill
+    /// tombstone (the evicted-id arm — the session map is process memory),
+    /// and an EXPLICIT late resume-create of the same thread GENUINELY CLAIMS
+    /// it — clearing the tombstone BEFORE finish_create's binding write, so
+    /// the claim's write lands and is never suppressed as a stale orphan.
+    #[tokio::test]
+    async fn resume_create_after_a_kill_clears_the_tombstone_and_rebinds() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx, fake) = state_with_sink();
+        let thread_id = "thread-claim-resume";
+
+        // The close, naming the durable thread id (the codex wire shape —
+        // the map never held a session here, the evicted arm covers it).
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread_id.to_string())),
+            "the kill folded the thread's kill tombstone"
+        );
+
+        // The explicit late resume (real create-with-resume through the fake
+        // app server — the fixture answers thread/resume with the requested id).
+        configure_fake_codex_cmd("{}");
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-claim-resume".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: Some(thread_id.to_string()),
+                session_ref: None,
+                model: Some("gpt-5.3-codex".to_string()),
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the resume itself answers created (never a failure): {created}"
+        );
+        assert_eq!(created["sessionId"], json!(thread_id));
+
+        assert!(
+            fake.tombstone_clears
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread_id.to_string())),
+            "the genuine claim clears the tombstone BEFORE its own write"
+        );
+        assert!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.provider == "codex" && b.session_id == thread_id),
+            "the claim's binding write landed (never tombstone-suppressed)"
+        );
+        assert!(
+            !fake
+                .suppressed
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread_id.to_string())),
+            "the claim's own write is never suppressed"
+        );
+        st.shutdown().await;
     }
 
     // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────

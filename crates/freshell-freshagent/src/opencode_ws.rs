@@ -471,6 +471,24 @@ impl FreshOpencodeState {
         }
     }
 
+    /// Retire-on-kill round 2 (focused-ep5-r1 Finding 2), the tombstone
+    /// lifecycle's CLEAR transition: an explicit resume/attach of a durable
+    /// `ses_*` id is a NEW pane GENUINELY CLAIMING that identity, so the kill
+    /// tombstone the close recorded is cleared BEFORE the claim's own binding
+    /// writes can be mistaken for the killed session's orphaned write and
+    /// suppressed. Unconditional by design — idempotent on a never-killed
+    /// identity — warn-logged on failure, never a resume blocker. The
+    /// first-send materialization lane never clears: its `ses_*` id is
+    /// freshly minted server-side (never tombstoned).
+    async fn clear_kill_tombstone_for(&self, durable_id: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        if let Err(e) = sink.clear_kill_tombstone(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.kill_tombstone_clear_failed");
+        }
+    }
+
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
     /// `ws-handler.ts:3388-3405`'s generic catch -- always `retryable: true`,
     /// `ws-handler.ts:3403`).
@@ -2701,6 +2719,15 @@ impl FreshOpencodeState {
             lease_guard.fail();
         }
 
+        // Retire-on-kill round 2 (focused-ep5-r1 Finding 2): this resume/attach
+        // GENUINELY CLAIMS the durable session — clear the kill tombstone the
+        // close recorded BEFORE any binding write of this rebuilt session (the
+        // refresh below AND every later per-send refresh), so the claim is
+        // never suppressed as the killed session's stale orphan. Idempotent
+        // (a never-killed id clears to Ok), warn-only on failure — never a
+        // resume blocker.
+        self.clear_kill_tombstone_for(session_id).await;
+
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
         // (durable-before-answer). The SETTINGS payload rides only when a record was
         // actually recovered (never launder a defaults row for a never-recorded
@@ -4572,6 +4599,80 @@ mod tests {
             s.cwd.as_deref(),
             Some("/real/project"),
             "cwd from the record, not the attach message"
+        );
+    }
+
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2), the tombstone
+    /// lifecycle's exit on the opencode lane: a kill folds the durable kill
+    /// tombstone (the evicted arm — the session map is process memory, the
+    /// row is durable), and an EXPLICIT late attach-resume of the same
+    /// `ses_*` id GENUINELY CLAIMS it — clearing the tombstone BEFORE the
+    /// resume's own refresh write, so the claim's write lands and is never
+    /// suppressed as a stale orphan.
+    #[tokio::test]
+    async fn resume_after_a_kill_clears_the_tombstone_and_rebinds() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // The close, naming the durable id (the evicted arm of handle_kill —
+        // the map never held this session; the row is durable).
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the kill folded the durable kill tombstone"
+        );
+
+        // The explicit late attach-resume (the REAL handle_attach →
+        // resume_durable_session lane the fixture drives).
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        assert!(
+            fake.tombstone_clears
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the genuine claim clears the tombstone BEFORE its own write"
+        );
+        let writes = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+            .count();
+        assert_eq!(
+            writes, 2,
+            "the seed PLUS the resume's refresh write — the claim's write landed"
+        );
+        assert!(
+            !fake
+                .suppressed
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim's own write is never suppressed"
         );
     }
 

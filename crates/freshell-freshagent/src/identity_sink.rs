@@ -274,6 +274,14 @@ pub trait PaneIdentitySink: Send + Sync {
     /// non-rollback lane (failures surface as `Err` for the caller to
     /// warn-log, never a kill blocker). Same discipline as the WS
     /// `terminal.kill` path's `retire_closed` ("P1.8 trigger (e)").
+    ///
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2): ledger-side this
+    /// ALSO records the durable KILL TOMBSTONE for the identity (same
+    /// awaited batch), which the ledger's `record_fresh_agent_binding`
+    /// consults before writing — so a binding write already in flight when
+    /// the kill landed (an aborted consumer's orphaned spawn_blocking
+    /// closure) suppresses itself instead of restoring Bound after the
+    /// retire. See [`Self::clear_kill_tombstone`] for the lifecycle exit.
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite;
     /// The PENDING companion of [`Self::retire_closed`]: a kill observed
     /// before identity resolution also deletes the pending marker, so a
@@ -281,6 +289,16 @@ pub trait PaneIdentitySink: Send + Sync {
     /// for a pane that provably no longer exists. Idempotent (a missing
     /// marker == `Ok`).
     fn delete_pending(&self, placeholder_id: &str) -> SinkWrite;
+    /// The tombstone lifecycle transition (focused-ep5-r1 Finding 2): a NEW
+    /// pane/session GENUINELY CLAIMING the identity — an explicit
+    /// resume/attach of a killed session — clears the kill tombstone the
+    /// close recorded, so the claim's own binding write is never mistaken
+    /// for the killed session's orphaned write and suppressed. Claims call
+    /// it BEFORE their binding write (unconditionally — it is idempotent, a
+    /// never-killed identity clears to `Ok`), awaited like every
+    /// non-rollback lane (failures surface as `Err` for the caller to
+    /// warn-log, never a resume blocker).
+    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
@@ -313,6 +331,21 @@ pub(crate) struct FakeIdentitySink {
     /// call, in order — kill-handler tests assert the (provider, sessionId)
     /// batch a kill retires.
     pub retires: std::sync::Mutex<Vec<(String, String)>>,
+    /// Focused-ep5-r1 Finding 2: the fake mirror of the ledger's kill
+    /// tombstones. `retire_closed` folds the tombstone in (exactly like the
+    /// real `PaneLedger::retire_closed`), and `record_binding`'s apply
+    /// consults it: a tombstoned identity's binding write is SUPPRESSED
+    /// (recorded in `suppressed`, never appended to `bindings` — the fake's
+    /// observable twin of "writes nothing"). TTL is NOT modeled (tests never
+    /// advance a clock — every tombstone counts fresh).
+    pub kill_tombstones: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// Every `clear_kill_tombstone` call (the genuine-claim lanes' lifecycle
+    /// transition), in order, whether or not a tombstone existed.
+    pub tombstone_clears: std::sync::Mutex<Vec<(String, String)>>,
+    /// Binding writes SUPPRESSED by a kill tombstone (the round-2 fence) —
+    /// recorded here (never in `bindings`) so tests assert the suppression
+    /// positively instead of inferring it from absence.
+    pub suppressed: std::sync::Mutex<Vec<(String, String)>>,
     /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
     /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
     /// through [`RollbackRecord::from_stored_payload`] exactly like the real
@@ -322,6 +355,39 @@ pub(crate) struct FakeIdentitySink {
         std::sync::Mutex<std::collections::HashMap<(String, String), serde_json::Value>>,
     /// When true, write futures resolve to Err — for failure-surfacing tests.
     pub fail_writes: std::sync::atomic::AtomicBool,
+    /// Focused-ep5-r1 Finding 2 test hook — see [`Self::arm_orphan_binding_gate`].
+    orphan_gate: std::sync::Mutex<Option<OrphanBindingGate>>,
+    /// Weak self-handle so the orphan gate's detached apply task can reach
+    /// the fake after the caller's await was cancelled (set by
+    /// [`Self::arm_orphan_binding_gate`]).
+    self_weak: std::sync::Mutex<std::sync::Weak<FakeIdentitySink>>,
+}
+
+/// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
+#[cfg(test)]
+struct OrphanBindingGate {
+    /// The (provider, session_id) key this gate intercepts.
+    key: (String, String),
+    /// Signaled when `record_binding` was INVOKED for the key (the
+    /// production "spawn_blocking launched" moment).
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the detached apply runs only after this resolves.
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// Signaled when the detached apply RAN (post-release), so the test's
+    /// assertions are deterministic (no sleep-and-hope).
+    applied_tx: std::sync::mpsc::Sender<()>,
+}
+
+/// Focused-ep5-r1 Finding 2 test hook: the handles
+/// [`FakeIdentitySink::arm_orphan_binding_gate`] hands the test. `entered`
+/// fires at invocation (production's spawn-launch point); `release` lets the
+/// in-flight write land; `applied` fires when the detached apply actually
+/// ran.
+#[cfg(test)]
+pub(crate) struct OrphanGateHandles {
+    pub entered: std::sync::mpsc::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+    pub applied: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
@@ -397,6 +463,136 @@ impl FakeIdentitySink {
             Box::pin(std::future::ready(Ok(())))
         }
     }
+    /// Focused-ep5-r1 Finding 2: arm the ORPHAN gate for one identity key.
+    /// The next `record_binding` for exactly that key models the production
+    /// spawn_blocking orphan FAITHFULLY: the mutation decision is NOT made at
+    /// invocation or await time — it is DETACHED and made when the test
+    /// releases the gate, even if the caller's await was cancelled (an
+    /// aborted consumer), exactly like a `spawn_blocking` closure that
+    /// outlives its awaiting task. The tombstone consult therefore happens at
+    /// apply time, which is what lets a test stage "the binding write was in
+    /// flight when the kill landed" WITHOUT a synchronous-install shortcut.
+    pub(crate) fn arm_orphan_binding_gate(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> OrphanGateHandles {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        *self.self_weak.lock().unwrap() = std::sync::Arc::downgrade(self);
+        *self.orphan_gate.lock().unwrap() = Some(OrphanBindingGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+            applied_tx,
+        });
+        OrphanGateHandles {
+            entered: entered_rx,
+            release: release_tx,
+            applied: applied_rx,
+        }
+    }
+    /// The shared binding-write apply (the normal path AND the orphan gate's
+    /// detached task): mutations only — the caller owns the SinkWrite knob.
+    /// The kill-tombstone consult lives HERE so both paths fence identically.
+    #[cfg(test)]
+    fn apply_binding(&self, upsert: FreshAgentBindingUpsert) {
+        // Focused-ep5-r1 Finding 2 mirror: a tombstoned identity writes
+        // NOTHING (the ledger's `record_fresh_agent_binding` suppression).
+        let key0 = (upsert.provider.clone(), upsert.session_id.clone());
+        if self.kill_tombstones.lock().unwrap().contains(&key0) {
+            self.suppressed.lock().unwrap().push(key0);
+            return;
+        }
+        // ...delegated to the existing mutation body below
+        self.apply_binding_mutations(upsert);
+    }
+    /// The mutation body of `record_binding`, minus the tombstone consult.
+    #[cfg(test)]
+    fn apply_binding_mutations(&self, upsert: FreshAgentBindingUpsert) {
+        let key = (upsert.provider.clone(), upsert.session_id.clone());
+        // Task 3 keying (mirrors `PaneLedger::fresh_agent_settings_recorded`
+        // and the ledger sink's `load_settings` blank guard): settings are
+        // a FULL snapshot (replace), so a blank snapshot REPLACES any prior
+        // one — the key leaves `settings`/`recorded` again. A lineage-only
+        // write therefore still lands on the `bindings` log but never
+        // counts as a settings-bearing record.
+        let settings_bearing = upsert.settings != FreshAgentSettings::default();
+        if settings_bearing {
+            self.recorded.lock().unwrap().insert(key.clone());
+            self.settings
+                .lock()
+                .unwrap()
+                .insert(key, upsert.settings.clone());
+        } else {
+            self.recorded.lock().unwrap().remove(&key);
+            self.settings.lock().unwrap().remove(&key);
+        }
+        // Focused-ep1-r4 Finding 2 + delta-r2 Finding 2 + focused-ep4-r3
+        // Findings 1+2: track the row's CURRENT provenance stamps with the
+        // ledger's merge policy — the attribution fact moves ATOMICALLY:
+        // `Replace` applies stamps AND time together, and only from a
+        // FULL client+device+tab triple whose assertion time is >= the
+        // tracked one (the ledger's `advances_attribution` + monotonicity
+        // guard, mirrored); `Inherit` asserts nothing (every stamp
+        // survives); `Clear` (explicitly headless lineage) erases them.
+        match &upsert.provenance {
+            ProvenanceUpdate::Inherit => {}
+            ProvenanceUpdate::Replace(stamps) => {
+                let mut provenance = self.provenance.lock().unwrap();
+                // (`key` may have been moved by the settings insert above.)
+                let entry = provenance
+                    .entry((upsert.provider.clone(), upsert.session_id.clone()))
+                    .or_default();
+                // The ledger's rule (focused-ep4-r3): a weaker (partial/
+                // hollow) `Replace` touches NOTHING — no piecemeal field
+                // merge — and an OLDER full-triple assertion never drags
+                // the stamps+time back. A fresh entry (`0`) is always
+                // superseded, matching the ledger's absent-prior-time
+                // arm; the focused-ep4-r2 rule (the assertion time rides
+                // the value, never a write's own clock) is unchanged.
+                let complete = stamps.client_instance_id.is_some()
+                    && stamps.device_id.is_some()
+                    && stamps.tab_key.is_some();
+                if complete && stamps.asserted_at >= entry.asserted_at {
+                    entry.client_instance_id = stamps.client_instance_id.clone();
+                    entry.device_id = stamps.device_id.clone();
+                    entry.tab_key = stamps.tab_key.clone();
+                    entry.asserted_at = stamps.asserted_at;
+                }
+            }
+            ProvenanceUpdate::Clear => {
+                // An erased row answers `load_provenance` with absence
+                // (the default-map entry is never a meaningful answer).
+                self.provenance
+                    .lock()
+                    .unwrap()
+                    .remove(&(upsert.provider.clone(), upsert.session_id.clone()));
+            }
+        }
+        // kata 1wxv Task 4 (claude rollback adoption): the rollback-row re-key
+        // old→new rides the SAME awaited batch as the binding write — mirrors
+        // `freshell-server`'s LedgerIdentitySink (scoped to the claude fork
+        // adoption; codex's crash-respawn supersession must NOT move a marker
+        // bucket to a memory-less thread).
+        if upsert.provider == "claude" {
+            if let Some(old_id) = upsert.supersedes.as_deref() {
+                if old_id != upsert.session_id {
+                    let mut rollbacks = self.rollbacks.lock().unwrap();
+                    if let Some(record) =
+                        rollbacks.remove(&(upsert.provider.clone(), old_id.to_string()))
+                    {
+                        rollbacks.insert(
+                            (upsert.provider.clone(), upsert.session_id.clone()),
+                            record,
+                        );
+                    }
+                }
+            }
+        }
+        self.bindings.lock().unwrap().push(upsert);
+    }
 }
 
 #[cfg(test)]
@@ -413,87 +609,38 @@ impl PaneIdentitySink for FakeIdentitySink {
     }
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
         if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-            let key = (upsert.provider.clone(), upsert.session_id.clone());
-            // Task 3 keying (mirrors `PaneLedger::fresh_agent_settings_recorded`
-            // and the ledger sink's `load_settings` blank guard): settings are
-            // a FULL snapshot (replace), so a blank snapshot REPLACES any prior
-            // one — the key leaves `settings`/`recorded` again. A lineage-only
-            // write therefore still lands on the `bindings` log but never
-            // counts as a settings-bearing record.
-            let settings_bearing = upsert.settings != FreshAgentSettings::default();
-            if settings_bearing {
-                self.recorded.lock().unwrap().insert(key.clone());
-                self.settings
-                    .lock()
-                    .unwrap()
-                    .insert(key, upsert.settings.clone());
-            } else {
-                self.recorded.lock().unwrap().remove(&key);
-                self.settings.lock().unwrap().remove(&key);
-            }
-            // Focused-ep1-r4 Finding 2 + delta-r2 Finding 2 + focused-ep4-r3
-            // Findings 1+2: track the row's CURRENT provenance stamps with the
-            // ledger's merge policy — the attribution fact moves ATOMICALLY:
-            // `Replace` applies stamps AND time together, and only from a
-            // FULL client+device+tab triple whose assertion time is >= the
-            // tracked one (the ledger's `advances_attribution` + monotonicity
-            // guard, mirrored); `Inherit` asserts nothing (every stamp
-            // survives); `Clear` (explicitly headless lineage) erases them.
-            match &upsert.provenance {
-                ProvenanceUpdate::Inherit => {}
-                ProvenanceUpdate::Replace(stamps) => {
-                    let mut provenance = self.provenance.lock().unwrap();
-                    // (`key` may have been moved by the settings insert above.)
-                    let entry = provenance
-                        .entry((upsert.provider.clone(), upsert.session_id.clone()))
-                        .or_default();
-                    // The ledger's rule (focused-ep4-r3): a weaker (partial/
-                    // hollow) `Replace` touches NOTHING — no piecemeal field
-                    // merge — and an OLDER full-triple assertion never drags
-                    // the stamps+time back. A fresh entry (`0`) is always
-                    // superseded, matching the ledger's absent-prior-time
-                    // arm; the focused-ep4-r2 rule (the assertion time rides
-                    // the value, never a write's own clock) is unchanged.
-                    let complete = stamps.client_instance_id.is_some()
-                        && stamps.device_id.is_some()
-                        && stamps.tab_key.is_some();
-                    if complete && stamps.asserted_at >= entry.asserted_at {
-                        entry.client_instance_id = stamps.client_instance_id.clone();
-                        entry.device_id = stamps.device_id.clone();
-                        entry.tab_key = stamps.tab_key.clone();
-                        entry.asserted_at = stamps.asserted_at;
+            // Focused-ep5-r1 Finding 2 orphan-gate arm: an armed gate for this
+            // EXACT key DETACHES the apply — it runs when the test releases
+            // the gate (tombstone consult at apply time), exactly like the
+            // production spawn_blocking closure that survives its awaiting
+            // task's abort. The returned future resolves immediately: the
+            // write landing is decoupled from any await.
+            let gate_arm = {
+                let gate = self.orphan_gate.lock().unwrap();
+                gate.as_ref().and_then(|g| {
+                    if g.key == (upsert.provider.clone(), upsert.session_id.clone()) {
+                        let release_rx = g.release_rx.lock().unwrap().take();
+                        release_rx.map(|rx| (g.entered_tx.clone(), rx, g.applied_tx.clone()))
+                    } else {
+                        None
                     }
-                }
-                ProvenanceUpdate::Clear => {
-                    // An erased row answers `load_provenance` with absence
-                    // (the default-map entry is never a meaningful answer).
-                    self.provenance
-                        .lock()
-                        .unwrap()
-                        .remove(&(upsert.provider.clone(), upsert.session_id.clone()));
-                }
-            }
-            // kata 1wxv Task 4 (claude rollback adoption): the rollback-row re-key
-            // old→new rides the SAME awaited batch as the binding write — mirrors
-            // `freshell-server`'s LedgerIdentitySink (scoped to the claude fork
-            // adoption; codex's crash-respawn supersession must NOT move a marker
-            // bucket to a memory-less thread).
-            if upsert.provider == "claude" {
-                if let Some(old_id) = upsert.supersedes.as_deref() {
-                    if old_id != upsert.session_id {
-                        let mut rollbacks = self.rollbacks.lock().unwrap();
-                        if let Some(record) =
-                            rollbacks.remove(&(upsert.provider.clone(), old_id.to_string()))
-                        {
-                            rollbacks.insert(
-                                (upsert.provider.clone(), upsert.session_id.clone()),
-                                record,
-                            );
-                        }
+                })
+            };
+            if let Some((entered_tx, release_rx, applied_tx)) = gate_arm {
+                // One-shot: disarm so later writes for the key apply inline.
+                *self.orphan_gate.lock().unwrap() = None;
+                let _ = entered_tx.send(());
+                let me = self.self_weak.lock().unwrap().clone();
+                tokio::spawn(async move {
+                    let _ = release_rx.await;
+                    if let Some(me) = me.upgrade() {
+                        me.apply_binding(upsert);
                     }
-                }
+                    let _ = applied_tx.send(());
+                });
+                return Box::pin(std::future::ready(Ok(())));
             }
-            self.bindings.lock().unwrap().push(upsert);
+            self.apply_binding(upsert);
         }
         self.write_result()
     }
@@ -575,6 +722,25 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .lock()
                 .unwrap()
                 .push((provider.into(), session_id.into()));
+            // Focused-ep5-r1 Finding 2 mirror: retire_closed folds the kill
+            // tombstone in (the real `PaneLedger::retire_closed` discipline).
+            self.kill_tombstones
+                .lock()
+                .unwrap()
+                .insert((provider.into(), session_id.into()));
+        }
+        self.write_result()
+    }
+    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.tombstone_clears
+                .lock()
+                .unwrap()
+                .push((provider.into(), session_id.into()));
+            self.kill_tombstones
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
         }
         self.write_result()
     }
@@ -1021,6 +1187,122 @@ mod tests {
         .await
         .expect("conn-less refresh ok");
         assert_eq!(fake.load_provenance("opencode", "ses_clr"), None);
+    }
+
+    /// Focused-ep5-r1 Finding 2 (fake mirror): `retire_closed` folds the kill
+    /// tombstone in, `record_binding`'s apply consults it (the tombstoned
+    /// identity's write is SUPPRESSED — never appended to `bindings`), and
+    /// `clear_kill_tombstone` is the genuine-claim lifecycle exit (the next
+    /// write lands again).
+    #[tokio::test]
+    async fn fake_sink_mirrors_the_kill_tombstone_fence_and_the_claim_clear() {
+        let fake = Arc::new(FakeIdentitySink::default());
+        let upsert = || FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "durable-m".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings::default(),
+        };
+        fake.retire_closed("claude", "durable-m")
+            .await
+            .expect("retire ok");
+        fake.record_binding(upsert()).await.expect("write ok");
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "a tombstoned identity's binding write is suppressed"
+        );
+        assert_eq!(
+            fake.suppressed.lock().unwrap().as_slice(),
+            &[("claude".to_string(), "durable-m".to_string())],
+            "the suppression is positively observable"
+        );
+
+        fake.clear_kill_tombstone("claude", "durable-m")
+            .await
+            .expect("clear ok");
+        assert_eq!(
+            fake.tombstone_clears.lock().unwrap().as_slice(),
+            &[("claude".to_string(), "durable-m".to_string())]
+        );
+        fake.record_binding(upsert()).await.expect("write ok");
+        assert_eq!(
+            fake.bindings.lock().unwrap().len(),
+            1,
+            "post-clear the genuine claim's write lands"
+        );
+    }
+
+    /// Focused-ep5-r1 Finding 2 (fake's faithful orphan model): the armed
+    /// orphan gate DETACHES the binding write's apply from the caller's await
+    /// — the mutation decision happens at gate-release, so a kill folded
+    /// in-between suppresses an already-invoked write, and without the kill
+    /// the same release lets it land (the gate discriminates).
+    /// (multi_thread: the orphan gate's detached apply task must progress
+    /// while the test thread blocks on the `applied` rendezvous — a
+    /// current_thread runtime would starve it.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fake_orphan_gate_applies_at_release_against_the_tombstone_state() {
+        let upsert = || FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "durable-g".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings::default(),
+        };
+        // Arm + invoke + KILL + release: suppressed.
+        let fake = Arc::new(FakeIdentitySink::default());
+        let gate = fake.arm_orphan_binding_gate("claude", "durable-g");
+        fake.record_binding(upsert()).await.expect("invoke ok");
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the gate observed the invocation");
+        assert!(fake.bindings.lock().unwrap().is_empty());
+        // The caller's await is dropped here — modelling the aborted consumer.
+        fake.retire_closed("claude", "durable-g")
+            .await
+            .expect("kill tombstone");
+        gate.release.send(()).expect("release");
+        gate.applied
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the detached apply ran");
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "a write in flight at kill time must never land"
+        );
+        assert_eq!(
+            fake.suppressed.lock().unwrap().as_slice(),
+            &[("claude".to_string(), "durable-g".to_string())]
+        );
+
+        // Arm + invoke + NO kill + release (a FRESH, never-killed key): lands
+        // — the gate proves the write would have applied but for the tombstone.
+        let gate = fake.arm_orphan_binding_gate("claude", "durable-h");
+        fake.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "durable-h".into(),
+            ..upsert()
+        })
+        .await
+        .expect("invoke ok");
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the gate observed the invocation");
+        gate.release.send(()).expect("release");
+        gate.applied
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the detached apply ran");
+        assert_eq!(
+            fake.bindings.lock().unwrap().len(),
+            1,
+            "without the tombstone the released write applies"
+        );
     }
 
     /// A stored row whose version mismatches the schema reads as None — never
