@@ -759,6 +759,68 @@ async fn a_kill_before_identity_resolution_records_a_pane_close_the_late_resolut
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Delta-r6-r3 (focused-episode-6 round 2, Finding at `terminal.rs:5512`): a
+/// kill for a terminal id the registry no longer holds — the reaper beat the
+/// kill (a terminal exited just before the pane's close landed), or a stale
+/// pane after a server restart — must STILL write the durable close envelope
+/// keyed by what the close knows (the terminal id the pane carries), even
+/// though the answer is the pre-existing `INVALID_TERMINAL_ID` frame: the
+/// pane close is REAL regardless of registry presence — skipping the write
+/// lets a stale snapshot be offered and rebuilt. (The message-carried
+/// `createRequestId` keys the same envelope even stronger; that field is the
+/// round-2 client batch.)
+#[tokio::test]
+async fn a_kill_for_a_terminal_the_registry_lost_still_records_the_pane_close() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("kill-stale-pane");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // The registry never held this id (the post-restart stale-pane shape) —
+    // the kill answers `INVALID_TERMINAL_ID` as always...
+    let stale_terminal_id = "334ab8c904f9472397321a3d02cf52b5";
+    let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": stale_terminal_id });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(
+        err["code"], "INVALID_TERMINAL_ID",
+        "the missing-registry answer is unchanged (the terminal IS gone): {err}"
+    );
+
+    // ...but the PANE close was discharged durably FIRST (or a verdict join
+    // downstream could rebuild the stale snapshot).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while server_ledger
+        .pane_close_for_terminal(stale_terminal_id)
+        .is_none()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the durable close envelope must be written even when the registry \
+             entry is absent — the stale pane's snapshot must verdict closed"
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await;
+    }
+    let record = server_ledger
+        .pane_close_for_terminal(stale_terminal_id)
+        .expect("close record");
+    assert_eq!(record.terminal_id, stale_terminal_id);
+    assert!(
+        record.kills.is_empty(),
+        "no identities were discoverable (registry-less close): {record:?}"
+    );
+    // Idempotent on a repeat kill (the user's second close of a reaped
+    // terminal re-stamps, never duplicates evidence).
+    assert!(
+        registry.probe(stale_terminal_id).is_none(),
+        "fixture: the registry never held the id"
+    );
+
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// F6, the terminal half through the REAL failure surface: only the ROW
 /// retire write can fail (its bindings dir read-only; the tombstone's tree
 /// stays writable). The compensated close must NOT leave the just-written

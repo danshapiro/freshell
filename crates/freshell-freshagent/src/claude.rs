@@ -1153,35 +1153,23 @@ impl FreshClaudeState {
         // closure, which NO task abort can cancel) suppresses itself instead
         // of restoring Bound after the retire.
         //
-        // Delta-r6 close-durability: the retire runs in TWO passes. PASS 1
-        // (immediately below) records the close for the identity the kill
-        // NAMES before ANY live-state change — before the alias-resolution
-        // await, the map removal, the consumer abort, and every collection
-        // lock — so a restart or task cancellation after this point can never
-        // strand an "already-closing" live session with nothing durable: the
-        // named id's tombstone + row retire stand, and from this instant the
-        // tombstone also fences every later-landing write for the named id.
-        // (For a kill naming the durable id — the common case once the pane
-        // learned it — pass 1 IS the row's own retirement; for a
-        // bare-placeholder kill it is the placeholder's fence, and the
-        // alias-resolved row completes in pass 2.)
+        // Delta-r6-r3 (focused-episode-6 round 2, Finding 4) — ONE close
+        // envelope, then teardown. The close's identity set is computed
+        // FIRST (the Task-10b alias resolution + the pre-destruction
+        // collection below — no await ever interleaves per-identity DURABLE
+        // writes while live state is being destroyed), then the WHOLE set
+        // closes as a single failure-atomic ledger envelope
+        // (`retire_closed_batch` → `PaneLedger::close_identities`):
+        // tombstones + row retires under ONE guard hold, rolling the
+        // envelope's OWN writes back on any failure. The delta-r6/r6-r2
+        // two-pass shape could close the wire/alias identities first and — a
+        // later authoritative-session close failing — report `success:false`
+        // with the live session preserved and standing tombstones still on
+        // disk: a tombstone with no matching row reads as CLOSED in the
+        // recovery inventory, suppressing a genuinely open session. A FAILED
+        // envelope here aborts the kill the same way but leaves NOTHING
+        // durable; a retried kill re-attempts idempotently.
         //
-        // A FAILED pass-1 write fails the kill: the answer reports
-        // success:false and NO live state was touched (warn-and-continue
-        // would leave the row Bound — recoverable — while the client
-        // believes the pane is closed). The session stays live and Bound:
-        // self-consistent, and a retried kill re-attempts idempotently.
-        if !self.retire_closed_rows(std::slice::from_ref(&session_id)).await {
-            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                provider: PROVIDER.to_string(),
-                session_id,
-                session_type: session_type.to_string(),
-                success: false,
-            }));
-            return;
-        }
-        let mut retire_ids = vec![session_id.clone()];
-
         // Task 10b: durable ids resolve through `cli_index` (alias, don't move) --
         // a kill addressed by the durable id must tear down the live aliased session.
         // Unresolvable ids keep today's idempotent success path.
@@ -1189,16 +1177,6 @@ impl FreshClaudeState {
             .resolve_session_key(&session_id)
             .await
             .unwrap_or_else(|| session_id.clone());
-        // Delta-r6-r2 (focused-episode-6 round 1, Finding 3): the FULL retire
-        // set is collected and closed BEFORE any live-state destruction (the
-        // map removal, the consumer abort). The delta-r6 order removed and
-        // aborted FIRST and retired the alias-resolved rows only afterward —
-        // a restart, task cancellation, or pass-2 write failure in that
-        // window left the durable Claude row Bound while the live session
-        // was already destroyed, and the placeholder tombstone from pass 1
-        // does not fence or retire the differently keyed durable row (the
-        // recovery offer's never-actually-open shape, exactly).
-        //
         // The pre-destruction collection is safe against the round-1 mint
         // guard by SPLITTING: the consumer is the only minter, and an
         // adoption's `cli_index` insert PRECEDES its ledger write — so a mint
@@ -1207,24 +1185,13 @@ impl FreshClaudeState {
         // and caught by the post-abort COMPLETION DIFF (farther down): it
         // re-collects, retires any newly visible id, and the folded tombstone
         // fences that id's late-landing ledger write.
+        let mut retire_ids = vec![session_id.clone()];
         self.collect_kill_retire_ids(&session_id, &map_key, &mut retire_ids)
             .await;
-        // The completion half of the durable close (pass 1 covered the wire
-        // id). Delta-r6-r2 (Finding 3): a FAILURE here ABORTS the kill —
-        // `success:false`, and NOTHING live was touched (no removal, no
-        // abort): the session stays live and Bound, self-consistent, and a
-        // retried kill re-attempts idempotently. The delta-r6 ordering
-        // destroyed first and reported after.
-        let pass2_ok = self
-            .retire_closed_rows(
-                &retire_ids
-                    .iter()
-                    .filter(|id| **id != session_id)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-            .await;
-        if !pass2_ok {
+        // THE durable close — ONE envelope over the whole set, BEFORE any
+        // live-state destruction (the map removal, the consumer abort). On
+        // failure the kill aborts with NOTHING touched and NOTHING durable.
+        if !self.retire_closed_rows(&retire_ids).await {
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),
                 session_id,
@@ -1399,31 +1366,35 @@ impl FreshClaudeState {
         }
     }
 
-    /// The kill-side lane of `retire_closed` (delta-review round 5): retire
-    /// every id in `ids` through the identity sink, AWAITED before the
+    /// The kill-side durable close (delta-review round 5; delta-r6-r3 —
+    /// focused-episode-6 round 2 — ONE envelope): every id in `ids` closes
+    /// through the sink as a SINGLE failure-atomic envelope (`retire_closed_batch`
+    /// — tombstones + row retires under the ledger's ONE guard, rolling its
+    /// own writes back on any failure), AWAITED before the
     /// `freshAgent.killed` broadcast (durable-before-answer, like the
-    /// create-path binding write). Each call ALSO folds the durable kill
-    /// tombstone in (focused-ep5-r1 Finding 2 — the ledger-side
+    /// create-path binding write). Each envelope ALSO folds the durable kill
+    /// tombstones in (focused-ep5-r1 Finding 2 — the ledger-side
     /// `retire_closed`), so the passes `handle_kill` runs cannot be undone by
     /// a binding write that was already in flight.
     ///
-    /// Delta-r6 failure propagation: returns `false` when ANY retire failed
-    /// (warn-logged per id). The caller treats the first-pass failure as a
-    /// kill ABORT (no live state touched, `success:false`) and a completion
-    /// failure as an unacknowledged answer (the teardown it precedes has
-    /// already mutated live state, so the kill must not claim success).
+    /// Delta-r6 failure propagation: returns `false` when the envelope
+    /// failed (nothing durable survives it). The caller treats the main
+    /// envelope's failure as a kill ABORT (no live state touched,
+    /// `success:false`) and a completion-diff failure as an unacknowledged
+    /// answer (the teardown it precedes has already mutated live state, so
+    /// the kill must not claim success).
     async fn retire_closed_rows(&self, ids: &[String]) -> bool {
         let Some(sink) = self.identity_sink() else {
             return true;
         };
-        let mut all_recorded = true;
-        for id in ids {
-            if let Err(e) = sink.retire_closed(PROVIDER, id).await {
-                tracing::warn!(error = %e, session = %id, "freshagent.claude.retire_on_kill_failed");
-                all_recorded = false;
-            }
+        if ids.is_empty() {
+            return true;
         }
-        all_recorded
+        if let Err(e) = sink.retire_closed_batch(PROVIDER, ids, &[]).await {
+            tracing::warn!(error = %e, sessions = ?ids, "freshagent.claude.retire_on_kill_failed");
+            return false;
+        }
+        true
     }
 
     /// Retire-on-kill round 3 (focused-ep5-r2 Findings 2+3): the kill's
@@ -6916,11 +6887,14 @@ rl.on('line', (line) => {
         let created = await_claude_created(&mut rx, "req-close-before-removal").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
 
-        // The removal's gate: the test holds the sessions map guard, so the
-        // kill's removal parks on it. Everything BEFORE the removal — notably
-        // the durable close, which must NOT depend on that lock — still runs.
-        let sessions_guard = st.sessions.lock().await;
-
+        // Delta-r6-r3 staging: park the kill AT the close envelope itself —
+        // its mutations have landed (the durable close IS on record) and only
+        // its answer stalls — while nothing live may have been touched yet.
+        // (The pre-envelope staging held the `sessions` map guard to park the
+        // removal; the envelope lane legitimately consults that map while
+        // collecting the close set, so the gate moved to where the property
+        // lives.)
+        let stall = fake.arm_retire_stall("claude", &placeholder);
         let st2 = st.clone();
         let ph = placeholder.clone();
         let mut kill = tokio::spawn(async move {
@@ -6933,36 +6907,19 @@ rl.on('line', (line) => {
             .await;
         });
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let close_recorded_first = loop {
-            let retired = fake
-                .retires
-                .lock()
-                .unwrap()
-                .contains(&("claude".to_string(), placeholder.clone()));
-            if retired {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
-            tokio::task::yield_now().await;
-        };
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect(
+                "the durable close must be recorded BEFORE the map removal — the kill \
+                 parked without recording anything (a restart there leaves the row Bound \
+                 behind an already-closing pane)",
+            );
         assert!(
-            close_recorded_first,
-            "the durable close must be recorded BEFORE the map removal — the kill \
-             parked on the sessions lock without recording anything (a restart there \
-             leaves the row Bound behind an already-closing pane)"
+            st.sessions.lock().await.contains_key(&placeholder),
+            "no live-state mutation yet: the session is still mapped while the close envelope's answer parks"
         );
-        assert!(
-            sessions_guard.contains_key(&placeholder),
-            "no live-state mutation yet: the session is still mapped while the removal parks"
-        );
-        assert!(
-            !kill.is_finished(),
-            "fixture: the kill is parked at the map removal"
-        );
-        drop(sessions_guard);
+        stall.release.send(()).expect("release the stall");
         tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
             .await
             .expect("the kill completes once the hold releases")
@@ -7104,12 +7061,17 @@ rl.on('line', (line) => {
         );
     }
 
-    /// Delta-r6-r2 (Finding 3), the failure half: the wire-id close landing
-    /// and the alias-resolved close FAILING must ABORT the kill before any
-    /// live state is touched — the session stays mapped, its consumer stays
-    /// running, and the answer reports `success:false`. The delta-r6 order
-    /// torn down first and merely REPORTED failure: a live-bound/destroyed
-    /// mismatch the client could never observe honestly.
+    /// Delta-r6-r3 (focused-episode-6 round 2, Finding 4): the claude kill's
+    /// close is ONE failure-atomic envelope over the whole identity set (the
+    /// wire placeholder AND every alias-resolved durable id). A failed
+    /// envelope ABORTS the kill before any live state is touched — the
+    /// session stays mapped, its consumer stays running, the answer reports
+    /// `success:false` — and leaves NO durable close evidence behind: the
+    /// wire id's fence does NOT survive the failed envelope either. The
+    /// pre-envelope lane wrote the wire-id close first and left it standing
+    /// across a later failure — a standing tombstone with no row reads as
+    /// closed in the recovery inventory and would suppress a genuinely open
+    /// session.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_kill_whose_alias_resolved_close_fails_aborts_before_any_live_state_destruction() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -7137,9 +7099,8 @@ rl.on('line', (line) => {
             assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        // First retire (the wire id's close) succeeds; every retire after —
-        // the alias-resolved durable's — fails.
-        fake.fail_retires_after(1);
+        // The whole close envelope fails (disk-full/permission shape).
+        fake.fail_retires_after(0);
         while rx.try_recv().is_ok() {} // drain pre-kill frames
 
         st.handle_kill(FreshAgentKill {
@@ -7154,18 +7115,22 @@ rl.on('line', (line) => {
             let sessions = st.sessions.lock().await;
             let session = sessions
                 .get(&placeholder)
-                .expect("a failed alias-resolved close leaves the session MAPPED");
+                .expect("a failed close envelope leaves the session MAPPED");
             assert!(
                 !session.consumer.is_finished(),
-                "a failed alias-resolved close leaves the consumer RUNNING"
+                "a failed close envelope leaves the consumer RUNNING"
             );
         }
         assert!(
-            fake.retires
-                .lock()
-                .unwrap()
-                .contains(&("claude".to_string(), placeholder.clone())),
-            "the wire-id close landed (it precedes the alias-resolved failure)"
+            fake.retires.lock().unwrap().is_empty(),
+            "round 2 Finding 4: NO identity's close may survive a failed envelope \
+             (the wire-id fence included — a standing tombstone with no row reads \
+             as closed in the recovery inventory): {:?}",
+            fake.retires.lock().unwrap()
+        );
+        assert!(
+            fake.kill_tombstones.lock().unwrap().is_empty(),
+            "no durable close fence survives the failed envelope"
         );
         let mut killed_frame = None;
         while let Ok(raw) = rx.try_recv() {
@@ -7179,6 +7144,67 @@ rl.on('line', (line) => {
             killed_frame["success"], false,
             "the kill reports failure: {killed_frame}"
         );
+    }
+
+    /// Delta-r6-r3 (focused-episode-6 round 2, Finding 4): the close is ONE
+    /// envelope call over the WHOLE identity set — never the delta-r6-r2
+    /// multi-pass shape (per-identity writes interleaved with live-state
+    /// destruction, a later pass's failure leaving the earlier closes
+    /// durable over a still-live session). The completion-diff envelope is
+    /// the only legal second call, and only when a mint landed mid-close.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_closes_the_whole_identity_set_in_one_envelope_call() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(dedup_create_msg("req-one-envelope"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-one-envelope").await;
+        let placeholder = created["sessionId"].as_str().unwrap().to_string();
+        let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let present = st
+                .cli_index
+                .lock()
+                .await
+                .get(durable)
+                .is_some_and(|mapped| mapped == &placeholder);
+            if present {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: placeholder.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the close is ONE envelope call (no multi-pass partials): {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "claude");
+        assert!(
+            ids.contains(&placeholder),
+            "the envelope covers the wire placeholder: {ids:?}"
+        );
+        assert!(
+            ids.contains(&durable.to_string()),
+            "the envelope covers the alias-resolved durable id: {ids:?}"
+        );
+        assert!(pendings.is_empty(), "claude kills carry no marker ids");
     }
 
     /// Delta-r6-r2 (Finding 3), the mint-gap half: with the durable close

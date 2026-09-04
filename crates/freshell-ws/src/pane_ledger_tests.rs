@@ -5135,3 +5135,285 @@ fn a_corrupt_pane_close_record_quarantines_loudly() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ── Delta-r6-r3 (focused-episode-6 round 2): fail-fast phases + ONE close envelope ──
+
+/// F3 (fail-fast per phase): a close whose KILL-TOMBSTONE write failed must
+/// NOT attempt the row retire — the pre-fix dual-attempt could durably flip
+/// a Bound row to Retired(Closed) while the kill reports failure and leaves
+/// the live session intact, so the inventory would exclude a genuinely
+/// open session.
+#[cfg(unix)]
+#[test]
+fn a_close_whose_tombstone_write_fails_never_attempts_the_row_retire() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("failfast-tombstone");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-ff", "term-ff", 1_000))
+        .unwrap();
+    // Make ONLY the tombstone provider dir read-only: its atomic temp file
+    // cannot be created there; the bindings dir stays writable.
+    let kt_dir = PaneLedger::kill_tombstone_dir(&root).join(encode_segment("codex"));
+    std::fs::create_dir_all(&kt_dir).unwrap();
+    std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = ledger
+        .retire_closed("codex", "sess-ff", 2_000)
+        .expect_err("the tombstone write fails against a read-only tombstone dir");
+    assert_eq!(err.phase(), ClosePhase::KillTombstone);
+    std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let row = ledger.load_binding("codex", "sess-ff").unwrap();
+    assert_eq!(
+        row.state,
+        RowState::Bound,
+        "fail-fast: a failed tombstone write must leave the row UN-attempted (Bound), \
+         never durably flipped behind a kill that reports failure"
+    );
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        disk.load_binding("codex", "sess-ff").unwrap().state,
+        RowState::Bound,
+        "the disk truth agrees"
+    );
+    assert_eq!(ledger.kill_tombstone_at("codex", "sess-ff"), None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F2 (ordering): the pending marker is deleted only AFTER the pane close
+/// RECORD persists. For a pre-resolution close (no rows, no captured
+/// identity) the marker is the only pre-existing evidence tying the pane to
+/// the attempted creation; deleting it before the record write means a
+/// record-write failure (or interruption) leaves NEITHER artifact, and a
+/// stale snapshot receives no closed verdict.
+#[cfg(unix)]
+#[test]
+fn a_close_pane_writes_the_close_record_before_the_pending_marker_is_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("record-before-marker");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("term-rbm", "codex", None, ProvenanceStamps::default(), 1_000)
+        .unwrap();
+    assert!(ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-rbm"));
+    // The close-records dir is read-only: the record write fails. Nothing
+    // else may have been consumed by then — above all NOT the marker.
+    let closes_dir = PaneLedger::pane_close_dir(&root);
+    std::fs::create_dir_all(&closes_dir).unwrap();
+    std::fs::set_permissions(&closes_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-rbm".to_string(),
+            create_request_id: Some("cr-rbm".to_string()),
+            resolved: vec![],
+            now_ms: 2_000,
+        })
+        .expect_err("a read-only close-records dir fails the close");
+    assert!(!err.to_string().is_empty());
+    assert!(
+        ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == "term-rbm"),
+        "the pending marker must OUTLIVE a failed close-record write — it is the \
+         only pre-existing evidence for a pre-resolution close"
+    );
+    assert!(
+        ledger.list_pane_closes().is_empty(),
+        "no close record landed"
+    );
+    // Heal and retry: the close completes idempotently — record written,
+    // marker deleted.
+    std::fs::set_permissions(&closes_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-rbm".to_string(),
+            create_request_id: Some("cr-rbm".to_string()),
+            resolved: vec![],
+            now_ms: 3_000,
+        })
+        .expect("the retried close completes");
+    assert!(
+        !ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == "term-rbm"),
+        "a complete close deletes the marker"
+    );
+    let record = ledger.pane_close_for_terminal("term-rbm").expect("record");
+    assert_eq!(record.create_request_id.as_deref(), Some("cr-rbm"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// F4-class, pane lane (ONE close envelope, rolled back on ANY failure):
+/// two Bound rows close in one `close_pane`; the SECOND identity's row
+/// retire cannot land (read-only bindings dir). The envelope reports `Err`
+/// and ROLLS BACK its own writes: the first identity's row is Bound again
+/// and every tombstone this envelope created is gone — a failed kill must
+/// never leave retired rows / standing fences over a still-live session
+/// (recovery would read them as closed and suppress the session).
+#[cfg(unix)]
+#[test]
+fn a_close_pane_whose_late_identity_close_fails_rolls_back_the_whole_envelope() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("envelope-rollback");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "sess-first", "term-env-a", 1_000))
+        .unwrap();
+    ledger
+        .record_binding(&write("opencode", "sess-second", "term-env-b", 1_000))
+        .unwrap();
+    std::fs::create_dir_all(
+        PaneLedger::bindings_dir(&root).join(encode_segment("opencode")),
+    )
+    .unwrap();
+    // The second identity's retire cannot land (read-only provider bindings
+    // dir); everything else is writable.
+    let opencode_rows = PaneLedger::bindings_dir(&root).join(encode_segment("opencode"));
+    std::fs::set_permissions(&opencode_rows, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-env".to_string(),
+            create_request_id: Some("cr-env".to_string()),
+            resolved: vec![
+                SessionLocator { provider: "codex".into(), session_id: "sess-first".into() },
+                SessionLocator { provider: "opencode".into(), session_id: "sess-second".into() },
+            ],
+            now_ms: 2_000,
+        })
+        .expect_err("the second identity's close fails the envelope");
+    std::fs::set_permissions(&opencode_rows, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!err.to_string().is_empty());
+    for id in ["sess-first", "sess-second"] {
+        let provider = if id == "sess-first" { "codex" } else { "opencode" };
+        let row = ledger.load_binding(provider, id).unwrap();
+        assert_eq!(
+            row.state,
+            RowState::Bound,
+            "rollback: the envelope's own retire of {id} is undone (the kill reports failure)"
+        );
+        assert_eq!(
+            ledger.kill_tombstone_at(provider, id),
+            None,
+            "rollback: no tombstone this envelope created survives"
+        );
+    }
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(disk.load_binding("codex", "sess-first").unwrap().state, RowState::Bound);
+    assert_eq!(disk.kill_tombstone_at("codex", "sess-first"), None);
+    assert!(disk.list_pane_closes().is_empty(), "no close record landed");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The batched identity close (`close_identities`), success: every listed id
+/// gets its tombstone + row Retired(Closed) in one guarded op, the pending
+/// markers delete LAST, and the whole batch is durable across a restart.
+#[test]
+fn a_close_identities_batch_closes_every_identity_and_deletes_markers_last() {
+    let root = temp_root("close-batch");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-a", "term-a", 1_000))
+        .unwrap();
+    ledger
+        .record_binding(&write("claude", "sess-b", "term-b", 1_000))
+        .unwrap();
+    ledger
+        .record_pending("ph-a", "claude", None, ProvenanceStamps::default(), 1_000)
+        .unwrap();
+    ledger
+        .close_identities(
+            "claude",
+            &[
+                "sess-a".to_string(),
+                "sess-b".to_string(),
+                "sess-unknown".to_string(), // unknown ids are idempotent
+                "sess-a".to_string(),       // duplicates dedupe
+            ],
+            &["ph-a".to_string()],
+            2_000,
+        )
+        .unwrap();
+    for id in ["sess-a", "sess-b", "sess-unknown"] {
+        assert_eq!(ledger.kill_tombstone_at("claude", id), Some(2_000));
+    }
+    for id in ["sess-a", "sess-b"] {
+        let row = ledger.load_binding("claude", id).unwrap();
+        assert_eq!(row.state, RowState::Retired);
+        assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+    }
+    assert!(
+        !ledger.list_pending_raw().iter().any(|m| m.terminal_id == "ph-a"),
+        "the marker deleted"
+    );
+    let disk = PaneLedger::new(Some(root.clone()));
+    for id in ["sess-a", "sess-b"] {
+        assert_eq!(
+            disk.load_binding("claude", id).unwrap().state,
+            RowState::Retired,
+            "durable across restart: {id}"
+        );
+        assert_eq!(disk.kill_tombstone_at("claude", id), Some(2_000));
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `close_identities`, failure: one identity's row retire cannot land — the
+/// batch `Err`s and rolls back EVERY write of its own: the earlier
+/// identity's created tombstone is removed (no residue over a live session),
+/// and pending markers are never touched (they only delete on a complete
+/// close). A batch with an empty identity list deletes nothing.
+#[test]
+fn a_close_identities_batch_whose_identity_close_fails_rolls_back_every_prior_write() {
+    let root = temp_root("close-batch-rollback");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // `sess-tombonly` has no row (tombstone-only close); `sess-pend` has the
+    // Bound row whose retire is armed to fail BOTH attempts.
+    ledger
+        .record_pending("ph-batch", "claude", None, ProvenanceStamps::default(), 1_000)
+        .unwrap();
+    ledger
+        .record_binding(&write("claude", "sess-pend", "term-pend", 1_000))
+        .unwrap();
+    ledger.fail_next_binding_writes(2);
+    let err = ledger
+        .close_identities(
+            "claude",
+            &["sess-tombonly".to_string(), "sess-pend".to_string()],
+            &["ph-batch".to_string()],
+            2_000,
+        )
+        .expect_err("the armed retire failure fails the batch");
+    assert!(!err.to_string().is_empty());
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "sess-tombonly"),
+        None,
+        "rollback: the earlier identity's tombstone (created by THIS batch) is removed"
+    );
+    assert_eq!(ledger.kill_tombstone_at("claude", "sess-pend"), None);
+    assert_eq!(
+        ledger.load_binding("claude", "sess-pend").unwrap().state,
+        RowState::Bound,
+        "the failed identity's row was never retired"
+    );
+    assert!(
+        ledger.list_pending_raw().iter().any(|m| m.terminal_id == "ph-batch"),
+        "markers delete only on a COMPLETE close"
+    );
+    // Retry succeeds idempotently (the knob is spent).
+    ledger
+        .close_identities(
+            "claude",
+            &["sess-tombonly".to_string(), "sess-pend".to_string()],
+            &["ph-batch".to_string()],
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(ledger.kill_tombstone_at("claude", "sess-pend"), Some(3_000));
+    assert_eq!(
+        ledger.load_binding("claude", "sess-pend").unwrap().state,
+        RowState::Retired
+    );
+    assert!(ledger.list_pending_raw().iter().all(|m| m.terminal_id != "ph-batch"));
+    std::fs::remove_dir_all(&root).ok();
+}

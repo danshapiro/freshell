@@ -1210,36 +1210,36 @@ impl FreshOpencodeState {
             (session_arc, retire_ids, marker_ids)
         };
 
-        // Phase 2 — THE durable close. An explicit kill is an intentional
-        // session END: retire the session's DURABLE row(s) `Closed` (the
-        // ledger row is keyed on the materialized `ses_*` id) so the recovery
-        // inventory (Bound-only pre-filter) can never re-offer a pane the
-        // user just closed inside the 7s creation-race grace window; and
-        // delete the pending marker so a late materialization resolution can
-        // never carry evidence for a pane that provably no longer exists.
-        // This is phase 2 of 5: it precedes the session-lock wait (phase 3),
-        // so no park-prone await stands between the kill and its durable
-        // record.
+        // Phase 2 — THE durable close: ONE failure-atomic envelope over the
+        // whole identity set plus the pending markers
+        // (`retire_closed_batch` → `PaneLedger::close_identities`,
+        // delta-r6-r3, focused-episode-6 round 2 Finding 5). An explicit
+        // kill is an intentional session END: it retires the session's
+        // DURABLE row(s) `Closed` (the ledger row is keyed on the
+        // materialized `ses_*` id) so the recovery inventory (Bound-only
+        // pre-filter) can never re-offer a pane the user just closed inside
+        // the 7s creation-race grace window; and deletes the pending marker
+        // (LAST — once the closes are durable) so a late materialization
+        // resolution can never carry evidence for a pane that provably no
+        // longer exists. The per-identity loop it replaces wrote several
+        // retires + marker deletes BEFORE checking any failure: an early
+        // success stayed durable over the still-live session a later failure
+        // left behind — recovery would classify that session closed. This is
+        // phase 2 of 5: it precedes the session-lock wait (phase 3), so no
+        // park-prone await stands between the kill and its durable record,
+        // and no durable write survives a failure the kill reports.
         if let Some(sink) = self.identity_sink() {
-            let mut close_failed = false;
-            for id in &retire_ids {
-                if let Err(e) = sink.retire_closed(PROVIDER, id).await {
-                    tracing::warn!(error = %e, session = %id, "freshagent.opencode.retire_on_kill_failed");
-                    close_failed = true;
-                }
-            }
-            for placeholder in &marker_ids {
-                if let Err(e) = sink.delete_pending(placeholder).await {
-                    tracing::warn!(error = %e, placeholder = %placeholder, "freshagent.opencode.pending_delete_failed_on_kill");
-                    close_failed = true;
-                }
-            }
-            if close_failed {
-                // Failure propagation (delta-r6): the durable close did not
-                // land, so the kill must NOT acknowledge success and must
-                // leave ALL live state untouched — the session stays live and
-                // Bound (self-consistent: nothing has been closed), and a
-                // retried kill re-attempts idempotently.
+            if let Err(e) = sink
+                .retire_closed_batch(PROVIDER, &retire_ids, &marker_ids)
+                .await
+            {
+                tracing::warn!(error = %e, sessions = ?retire_ids, "freshagent.opencode.retire_on_kill_failed");
+                // Failure propagation (delta-r6, envelope-atomic delta-r6-r3):
+                // the durable close did not land — NOTHING of it survived —
+                // so the kill must NOT acknowledge success and must leave ALL
+                // live state untouched: the session stays live and Bound
+                // (self-consistent: nothing has been closed), and a retried
+                // kill re-attempts idempotently.
                 self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                     provider: PROVIDER.to_string(),
                     session_id: msg.session_id,
@@ -4223,6 +4223,56 @@ mod tests {
     /// is derived WITHOUT the session lock (from the map's placeholder/durable
     /// mirror), so a first send that materializes WHILE the kill sits between
     /// its map read and its session-lock phase adds the durable key behind
+    /// Delta-r6-r3 (focused-episode-6 round 2, Finding 5): the pre-lock
+    /// durable close is ONE envelope call over the WHOLE identity set +
+    /// pending markers — never the delta-r6-r2 loop (per-identity retires
+    /// and per-placeholder marker deletes before any failure check, whose
+    /// earlier successful writes stayed durable over the still-live session
+    /// a later failure left behind). The completion retire in the
+    /// session-lock phase is separate (single id, post-dating any mid-kill
+    /// materialization) — the envelope covers the map-derived set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_closes_the_whole_identity_set_in_one_envelope_call() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-one-envelope"), None).await;
+        let placeholder = "freshopencode-req-kill-one-envelope";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the pre-lock close is ONE envelope call (no per-identity write loop): {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "opencode");
+        assert!(ids.contains(&"ses_1".to_string()), "the envelope covers the durable id: {ids:?}");
+        assert!(
+            pendings.contains(&placeholder.to_string()),
+            "the envelope's marker deletes cover the placeholder: {pendings:?}"
+        );
+    }
+
     /// that read. The session-lock phase — whose acquisition provably
     /// post-dates any such materialization completing — completes the close:
     /// the then-visible materialized id retires too.
@@ -4411,10 +4461,12 @@ mod tests {
         };
         let killed_flag = session_arc.lock().await.killed.clone();
 
-        // EVERY retire fails — the pre-lock phase has no durable ids to
-        // retire (the session is unmaterialized at the scan), so the failure
-        // lands on the late retire inside the session-lock phase.
-        fake.fail_retires_after(0);
+        // The pre-lock close SUCCEEDS (its envelope covers no durable ids —
+        // the session is unmaterialized at the scan — plus the pending
+        // marker), and every close AFTER it fails: the failure lands on the
+        // late retire inside the session-lock phase. (Delta-r6-r3 staged this
+        // per CALL: the pre-lock envelope is ONE batch call.)
+        fake.fail_retires_after(1);
 
         let mut session_guard = session_arc.lock().await;
         let st2 = st.clone();

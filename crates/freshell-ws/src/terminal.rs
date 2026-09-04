@@ -5509,9 +5509,6 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
             live_terminal_id: None,
         })
     };
-    if !state.registry.exists(&kill.terminal_id) {
-        return send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await;
-    }
     // P1.8 trigger (e): explicit user close — THE durable close
     // (focused-episode-6 round 1, delta-r6-r2 Findings 1+2+6): ONE
     // `PaneLedger::close_pane` call, under the ledger's own serialization,
@@ -5527,12 +5524,25 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     // captured sessionRef (the delta-r6 shape) missed the
     // resolver-racing/pre-resolution window this pane close covers.
     //
-    // Failure propagation (delta-r6, now compensated — delta-r6-r2 Finding
-    // 6): a FAILED durable close FAILS the kill — the process is left
-    // running, the identity stands, and the client gets an error frame
-    // instead of a silent success; `close_pane`'s per-identity compensated
-    // retire guarantees a partial failure left no dominant tombstone over
-    // the still-live row. (DETACH stays non-retiring, unchanged.)
+    // Delta-r6-r3 (focused-episode-6 round 2, Finding at the registry-absent
+    // arm): the envelope is written UNCONDITIONALLY — FIRST — even when the
+    // registry no longer holds the id. A reaper that just removed the row
+    // (the terminal exited as the user closed the pane) or a stale pane
+    // after a server restart made the pre-r3 arms return `INVALID_TERMINAL_ID`
+    // without recording anything: the stale snapshot then received NO closed
+    // verdict and could be offered/rebuilt. The pane close is real
+    // regardless of registry presence; the record keys by the terminal id
+    // the close knows (plus the registry's createRequestId stamp when the
+    // row stands).
+    //
+    // Failure propagation (delta-r6, envelope-atomic delta-r6-r3): a FAILED
+    // durable close FAILS the kill — the process is left running, the
+    // identity stands, the client gets an error frame instead of a silent
+    // success, and `close_pane`'s rollback guarantees no retired row or
+    // standing tombstone mis-reads the still-live terminal as closed.
+    // A MISSING registry entry is not a close failure (the terminal is
+    // already gone) — but the envelope write failing IS. (DETACH stays
+    // non-retiring, unchanged.)
     let sref = state.identity.session_ref_for(&kill.terminal_id);
     let create_request_id = state.registry.probe_create_request_id(&kill.terminal_id);
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
@@ -5575,9 +5585,9 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     }
     // The durable close stands; kill + broadcast. A reaper that beat this
     // kill to the registry row makes `kill_and_broadcast` false — the answer
-    // for that race is the pre-fix one (the invalid-id error); the close
-    // already recorded is exactly the right end state for a terminal that is
-    // gone either way.
+    // for that race keeps the pre-existing shape (the invalid-id error); the
+    // close already recorded is exactly the right end state for a terminal
+    // that is gone either way.
     if kill_and_broadcast(state, &kill.terminal_id) {
         return true;
     }

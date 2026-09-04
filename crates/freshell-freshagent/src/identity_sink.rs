@@ -321,6 +321,24 @@ pub trait PaneIdentitySink: Send + Sync {
     /// closure) suppresses itself instead of restoring Bound after the
     /// retire. See [`Self::clear_kill_tombstone`] for the lifecycle exit.
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkWrite;
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5) — the kill
+    /// lanes' ONE durable close envelope: EVERY identity the kill covers (the
+    /// wire id, a bare placeholder, every alias-resolved durable id) closes
+    /// in ONE guarded ledger mutation (kill tombstones first, row retires
+    /// after), and pending markers delete LAST. The envelope is
+    /// failure-atomic across the set: `Err` means NOTHING this call wrote is
+    /// left durable (the ledger rolled its own writes back), so a failed
+    /// kill never leaves a retired row or standing fence over the still-live
+    /// session — recovery can never misread it as closed. Awaited like every
+    /// non-rollback lane; callers treat `Err` as a KILL FAILURE (report
+    /// `success:false`, touch no live state — a retried kill re-attempts
+    /// idempotently).
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkWrite;
     /// The PENDING companion of [`Self::retire_closed`]: a kill observed
     /// before identity resolution also deletes the pending marker, so a
     /// marker-driven resolution that lands later can never carry evidence
@@ -458,6 +476,12 @@ pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
 #[cfg(test)]
 pub(crate) type AliasRecordMap = std::collections::HashMap<(String, String), Vec<(String, i64)>>;
 
+/// The delta-r6-r3 batch-close trace shape: (provider, session_ids,
+/// pending_ids) per envelope call. Factored for the type-complexity lint
+/// (the `AliasRecordMap` precedent).
+#[cfg(test)]
+pub(crate) type RetireBatchLog = Vec<(String, Vec<String>, Vec<String>)>;
+
 /// In-memory sink for tests, crate-wide. Mutations happen synchronously
 /// before the (already-completed) future is returned, so tests can assert
 /// immediately after `.await`.
@@ -486,6 +510,12 @@ pub(crate) struct FakeIdentitySink {
     /// call, in order — kill-handler tests assert the (provider, sessionId)
     /// batch a kill retires.
     pub retires: std::sync::Mutex<Vec<(String, String)>>,
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5): every
+    /// `retire_closed_batch` envelope call, in order —
+    /// `(provider, session_ids, pending_ids)`. Kill-lane tests assert the
+    /// close is ONE envelope over the whole identity set (never multi-pass
+    /// partials over a session whose later close could fail).
+    pub retire_batches: std::sync::Mutex<RetireBatchLog>,
     /// Focused-ep5-r1 Finding 2 (round-4 amended): the fake mirror of the
     /// ledger's kill tombstones, stamped by `kill_clock` — a deterministic
     /// monotone counter standing in for the real ledger's wall-clock
@@ -1255,6 +1285,99 @@ impl PaneIdentitySink for FakeIdentitySink {
             });
         }
         self.write_result()
+    }
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkWrite {
+        // Delta-r6-r3 (focused-episode-6 round 2) fake mirror of the ledger's
+        // `close_identities` envelope: failure-atomic across the set — a
+        // failed call applies NOTHING (the rollback is exact, so applying
+        // then rolling reads identically to never applying), and a
+        // successful call folds ALL of [tombstone + row flip] per id in one
+        // pass, then deletes the pending markers. The sequenced budget
+        // (`fail_retires_after`) consumes ONE unit per batch call: the kill
+        // lanes' phased closes (their main envelope, then a completion-diff
+        // envelope) sequence the same way under either accounting.
+        let budget_fail = {
+            let mut budget = self.fail_retires_after.lock().unwrap();
+            match *budget {
+                Some(0) => true,
+                Some(n) => {
+                    *budget = Some(n - 1);
+                    false
+                }
+                None => false,
+            }
+        };
+        if budget_fail || self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(std::future::ready(Err(std::io::Error::other(
+                "fake write failure",
+            ))));
+        }
+        self.retire_batches.lock().unwrap().push((
+            provider.into(),
+            session_ids.to_vec(),
+            pending_ids.to_vec(),
+        ));
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for id in session_ids {
+            if !seen.insert(id.as_str()) {
+                continue; // the real envelope dedupes
+            }
+            self.retires
+                .lock()
+                .unwrap()
+                .push((provider.into(), id.clone()));
+            let stamp = {
+                let mut clock = self.kill_clock.lock().unwrap();
+                *clock += 1;
+                *clock
+            };
+            self.kill_tombstones
+                .lock()
+                .unwrap()
+                .insert((provider.into(), id.clone()), stamp);
+            let mut states = self.states.lock().unwrap();
+            if states.get(&(provider.into(), id.clone())) == Some(&FakeRowState::Bound) {
+                states.insert((provider.into(), id.clone()), FakeRowState::Closed);
+            }
+        }
+        // The pending-marker deletes ride the same envelope (last, post-close).
+        {
+            let mut pendings = self.pendings.lock().unwrap();
+            for p in pending_ids {
+                pendings.retain(|(id, _, _)| id != p);
+            }
+        }
+        // Retire-stall arm (same contract as the single close: the envelope's
+        // mutations are ON RECORD, only its ANSWER parks) — an armed gate
+        // whose key is covered by this batch engages once.
+        let stall_arm = {
+            let gate = self.retire_stall.lock().unwrap();
+            gate.as_ref().and_then(|g| {
+                if session_ids
+                    .iter()
+                    .any(|id| g.key == (provider.to_string(), id.clone()))
+                {
+                    let release_rx = g.release_rx.lock().unwrap().take();
+                    release_rx.map(|rx| (g.entered_tx.clone(), rx))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((entered_tx, release_rx)) = stall_arm {
+            *self.retire_stall.lock().unwrap() = None;
+            let _ = entered_tx.send(());
+            return Box::pin(async move {
+                let _ = release_rx.await;
+                Ok(())
+            });
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
     fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
         if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {

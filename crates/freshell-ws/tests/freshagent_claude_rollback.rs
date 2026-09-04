@@ -356,6 +356,28 @@ impl PaneIdentitySink for TestLedgerSink {
             .map_err(std::io::Error::other)?
         })
     }
+
+    /// Delta-r6-r3: the real-ledger delegation mirrors
+    /// `freshell-server/src/identity_sink.rs`'s `retire_closed_batch`
+    /// (the ledger envelope is the atomicity point; one spawn_blocking hop).
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = provider.to_string();
+        let ids = session_ids.to_vec();
+        let pendings = pending_ids.to_vec();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.close_identities(&p, &ids, &pendings, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
     fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
         let ledger = self.ledger.clone();
         let p = placeholder_id.to_string();

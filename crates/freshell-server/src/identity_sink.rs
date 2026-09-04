@@ -266,6 +266,30 @@ impl PaneIdentitySink for LedgerIdentitySink {
         })
     }
 
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5): the batched
+    /// close every fresh-agent kill lane uses — the whole identity set (plus
+    /// the pending markers, last) closes through the ledger's ONE guarded
+    /// envelope, failure-atomic across the set (see the trait doc; the
+    /// envelope's rollback lives in the ledger). Same awaited-spawn_blocking
+    /// discipline as `retire_closed`.
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = provider.to_string();
+        let ids = session_ids.to_vec();
+        let pendings = pending_ids.to_vec();
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.close_identities(&p, &ids, &pendings, now))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
     /// The PENDING companion of [`Self::retire_closed`]: delete the pending
     /// marker. Same awaited-write discipline; a missing marker is `Ok` (the
     /// ledger's own idempotence).
@@ -1122,6 +1146,113 @@ mod tests {
         sink.delete_pending("never-recorded")
             .await
             .expect("missing marker deletes to Ok");
+    }
+
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5): the kill lanes'
+    /// ONE close envelope rides `retire_closed_batch` — SUCCESS: every id
+    /// ends tombstoned + Retired(Closed) and the pending markers delete, all
+    /// durable across a restart; FAILURE anywhere rolls the envelope's own
+    /// writes back (no partial closes survive to suppress a still-live
+    /// session) and the markers stand.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_closed_batch_closes_the_whole_envelope_or_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        use freshell_freshagent::PaneIdentitySink;
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let bind = |id: &str, cr: &str| FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: id.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some(cr.into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+        sink.record_binding(bind("ses_x", "cr-x")).await.expect("seed x");
+        sink.record_binding(bind("ses_y", "cr-y")).await.expect("seed y");
+        sink.record_pending("ph-batch-sink", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
+
+        // SUCCESS: the whole envelope closes in one call.
+        sink.retire_closed_batch(
+            "opencode",
+            &["ses_x".to_string(), "ses_y".to_string()],
+            &["ph-batch-sink".to_string()],
+        )
+        .await
+        .expect("the batch close succeeds");
+        for id in ["ses_x", "ses_y"] {
+            let row = ledger.load_binding("opencode", id).expect("row");
+            assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Retired);
+            assert_eq!(
+                row.retired_reason,
+                Some(freshell_ws::pane_ledger::RetiredReason::Closed)
+            );
+            assert!(ledger.kill_tombstone_at("opencode", id).is_some());
+        }
+        assert!(
+            ledger.pending_for_terminal("ph-batch-sink").is_none(),
+            "the marker deleted with the close"
+        );
+        let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            disk.load_binding("opencode", "ses_x").expect("row").state,
+            freshell_ws::pane_ledger::RowState::Retired,
+            "durable across restart"
+        );
+        assert!(disk.kill_tombstone_at("opencode", "ses_y").is_some());
+
+        // FAILURE: re-seed two Bound rows, then break the ledger's
+        // kill-tombstone subtree for the provider — the batch must Err and
+        // leave NOTHING durable of its own.
+        sink.record_binding(bind("ses_p", "cr-p")).await.expect("seed p");
+        sink.record_binding(bind("ses_q", "cr-q")).await.expect("seed q");
+        sink.record_pending("ph-batch-sink-2", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
+        let kt_dir = tmp
+            .path()
+            .join("kill-tombstones")
+            .join("opencode");
+        std::fs::create_dir_all(&kt_dir).unwrap();
+        std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = sink
+            .retire_closed_batch(
+                "opencode",
+                &["ses_p".to_string(), "ses_q".to_string()],
+                &["ph-batch-sink-2".to_string()],
+            )
+            .await
+            .expect_err("the broken tombstone subtree fails the batch");
+        assert!(!err.to_string().is_empty());
+        std::fs::set_permissions(&kt_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for id in ["ses_p", "ses_q"] {
+            let row = ledger.load_binding("opencode", id).expect("row");
+            assert_eq!(
+                row.state,
+                freshell_ws::pane_ledger::RowState::Bound,
+                "rollback: {id}'s row is untouched by the failed envelope"
+            );
+            assert_eq!(
+                ledger.kill_tombstone_at("opencode", id),
+                None,
+                "rollback: no tombstone residue for {id}"
+            );
+        }
+        assert!(
+            ledger.pending_for_terminal("ph-batch-sink-2").is_some(),
+            "markers delete only on a COMPLETE close"
+        );
     }
 
     /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): `row_is_bound`
