@@ -593,6 +593,37 @@ pub fn build_inventory(
                         let (ledger_state, eff_ref) = if covered {
                             ("closed", None)
                         } else {
+                        // Delta-r6-r4e (the kill-window e2e's actual payload
+                        // shape): claude panes snapshotted pre-association
+                        // carry NO `sessionRef` — the placeholder rides the
+                        // payload's `sessionKeys` (`provider:sessionId`, the
+                        // cross-device rings stamp) instead. The ref-less
+                        // arms below are terminal-kind-gated, so without this
+                        // consult such a pane verdicts `unknown` even when
+                        // its identity's kill fence STANDS — re-offering a
+                        // pane the user just closed. A standing fence over
+                        // ANY well-formed sessionKeys entry IS the durable
+                        // close for the pane: the identity was killed and
+                        // never redeemed (a genuine reopen clears the fence
+                        // through the claim commit). Same verdict shape as
+                        // the sessionRef arm's fenced-Unknown case.
+                        if payload
+                            .get("sessionKeys")
+                            .and_then(Value::as_array)
+                            .is_some_and(|keys| {
+                                keys.iter().filter_map(Value::as_str).any(|k| {
+                                    k.split_once(':')
+                                        .filter(|(p, s)| !p.is_empty() && !s.is_empty())
+                                        .is_some_and(|(p, s)| {
+                                            closes
+                                                .standing_kill_tombstones
+                                                .contains(&(p.to_string(), s.to_string()))
+                                        })
+                                })
+                            })
+                        {
+                            ("closed", None)
+                        } else {
                         match &snap_ref {
                             None => {
                                 // Focused-ep3 bind-by-correlation: the pane was
@@ -735,6 +766,7 @@ pub fn build_inventory(
                                     }
                                 }
                             }
+                        }
                         }
                         };
                         let eff_str = eff_ref

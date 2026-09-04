@@ -4071,6 +4071,92 @@ fn a_claim_whose_identity_has_a_standing_tombstone_and_no_row_verdicts_closed() 
     assert!(pane["sessionRef"].is_null());
 }
 
+/// Delta-r6-r4e (the kill-window e2e's actual payload shape): a claude
+/// pane snapshotted pre-association carries NO `sessionRef` at all — the
+/// placeholder lives in the payload's `sessionKeys` (the cross-device rings
+/// stamp: `provider:sessionId`). The ref-less arms (the terminal-gated
+/// correlations) leave such a pane `unknown`; with its kill's standing
+/// fence, that re-offers a pane the user just closed. The closed verdict
+/// must reach the pane through the sessionKeys claim shape too.
+#[test]
+fn a_ref_less_fresh_agent_pane_claiming_a_fenced_identity_via_session_keys_verdicts_closed() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "fresh-agent",
+                     "payload": { "provider": "claude", "sessionType": "freshclaude",
+                                  "createRequestId": "req-fa-sk",
+                                  "sessionKeys": ["claude:ph-sk-1"] } }]),
+        ),
+    };
+    let closes = closes_with("t-unrelated", None, &[], &[("claude", "ph-sk-1")]);
+    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &closes);
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["ledgerState"], "closed",
+        "a standing kill fence over the pane's sessionKeys claim IS the durable close: {pane}"
+    );
+    assert!(pane["sessionRef"].is_null());
+}
+
+/// Same claim shape WITHOUT the fence: the pane stays `unknown` (the
+/// pre-existing fallback) — a sessionKeys claim alone never suppresses a
+/// restore.
+#[test]
+fn a_ref_less_fresh_agent_pane_claiming_an_unfenced_identity_via_session_keys_stays_unknown() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "fresh-agent",
+                     "payload": { "provider": "claude", "sessionType": "freshclaude",
+                                  "createRequestId": "req-fa-sk-open",
+                                  "sessionKeys": ["claude:ph-sk-open"] } }]),
+        ),
+    };
+    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes());
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["ledgerState"], "unknown",
+        "no fence => the ref-less unknown fallback stands: {pane}"
+    );
+}
+
+/// Multi-key payloads: ANY fenced key closes the pane (a pane whose slice
+/// lists the killed placeholder beside a live durable id still verdicts
+/// closed), and an unfenced key list never fabricates a close.
+#[test]
+fn session_keys_fence_consult_reads_every_key_and_ignores_malformed_entries() {
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([
+                { "paneId": "p1", "kind": "fresh-agent",
+                  "payload": { "provider": "claude", "sessionType": "freshclaude",
+                               "createRequestId": "req-fa-sk-m",
+                               "sessionKeys": ["claude:ph-sk-live", "claude:ph-sk-killed"] } },
+                { "paneId": "p2", "kind": "fresh-agent",
+                  "payload": { "provider": "claude", "sessionType": "freshclaude",
+                               "createRequestId": "req-fa-sk-md",
+                               "sessionKeys": ["", "claude:", ":orphan", 42, null] } }
+            ]),
+        ),
+    };
+    let closes = closes_with("t-unrelated", None, &[], &[("claude", "ph-sk-killed")]);
+    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &closes);
+    let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(panes[0]["ledgerState"], "closed", "any fenced key closes: {panes:?}");
+    assert_eq!(
+        panes[1]["ledgerState"], "unknown",
+        "empty/malformed/non-string keys name no identity and never close anything: {panes:?}"
+    );
+}
+
 /// Control: the pre-existing fallback is untouched — a claim with no row and
 /// NO close evidence stays `unknown` (restored fresh with its original
 /// claim), and a covered pane whose identity GENUINELY lives elsewhere still

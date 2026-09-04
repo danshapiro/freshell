@@ -976,12 +976,20 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     }
 
     // 9. Offer assertion: the shell tab survived in the evidence, so the
-    //    offer is REQUIRED; the panel's ledgerOnly lines render
-    //    "{tabName}: {mode} — {cwd}", and the marker cwd must appear on NO
+    //    offer is REQUIRED; the panel lines render "{tabName}: {mode} — {cwd}",
+    //    and the killed pane's freshclaude line (marker cwd) must appear on NO
     //    line.
     const { ctx: ctxB, page: pageB, harness: harnessB } = await openFreshContextWithOffer(browser, 'kill-window-exclusion')
     const panel = pageB.getByTestId('recovery-offer-panel')
-    await expect(panel.locator('ul li', { hasText: 'kill-window-freshclaude-' })).toHaveCount(0)
+    // The killed pane's line would render "{tabName}: freshclaude — {cwd}"
+    // with the marker cwd. Do NOT match the bare marker string: the surviving
+    // shell pane's line carries the tab NAME from the last pushed generation,
+    // which legitimately derives from the killed pane's cwd while that pane
+    // was active (the anti-vacuity shell offer MUST render). Only the
+    // freshclaude-mode line with the marker CWD names the killed pane.
+    await expect(
+      panel.locator('ul li', { hasText: /: freshclaude — \S*kill-window-freshclaude-/ }),
+    ).toHaveCount(0)
 
     // 10. Accept: the surviving shell restores (anti-vacuity), and NO leaf
     //     anywhere carries the killed session — the pane the user closed
