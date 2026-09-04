@@ -498,9 +498,9 @@ impl FreshOpencodeState {
     /// registered session, the round-3 keep behavior). On commit the
     /// fence-clear AND the row revive are ONE ledger transition (Finding 3:
     /// no split-write intermediate). Returns true iff the claim committed;
-    /// an `Err` (io failure deciding or writing) is ambiguous about which
-    /// side won — warn-loud and proceed as committed (the round-3 failure
-    /// policy, never a resume blocker).
+    /// an `Err` (io failure deciding or writing) provably left the durable
+    /// close untouched (round 5, focused-ep5-r4 Finding 5): warn-loud and
+    /// report false — the caller tears the session down, kill wins.
     async fn commit_session_claim(&self, durable_id: &str, expect_killed_at_ms: Option<i64>) -> bool {
         let Some(sink) = self.identity_sink() else {
             return true;
@@ -516,8 +516,16 @@ impl FreshOpencodeState {
                 false
             }
             Err(e) => {
-                tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.claim_commit_failed");
-                true
+                // Round 5 (focused-ep5-r4 Finding 5): the ledger's commit is
+                // crash-atomic, so an `Err` means the durable close was left
+                // UNTOUCHED (fence stands, row Closed). Registering anyway
+                // would run a live session over the Closed row — treat the
+                // error like a refusal (kill wins): the caller tears the
+                // just-rebuilt session down.
+                tracing::warn!(error = %e, session = %durable_id,
+                    "freshagent.opencode.claim_commit_failed: the durable close left the claim \
+                     undecidable; the lane tears down and leaves the close standing");
+                false
             }
         }
     }
@@ -1136,49 +1144,38 @@ impl FreshOpencodeState {
     /// child is reused by every session and torn down only by
     /// [`crate::FreshAgentState::shutdown`] at server shutdown.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        // Retire-on-kill round 5 (focused-ep5-r4 Finding 4) — the batch's
+        // design rule: the durable close is recorded BEFORE any
+        // teardown/settlement await (a crash inside the turn settlement or
+        // bridge teardown must never lose the close). The kill therefore runs
+        // in this order: (1) capture the session + mark it killed (cheap,
+        // no settlement awaits), (2) the durable close — row retire + pending
+        // marker deletion, ONE first write phase, (3) only then the map
+        // removal and every settlement await. Order (2) before (3) also makes
+        // this kill visible to a claim's ledger-conditional commit before the
+        // session leaves the map (kill always wins vs an in-flight claim).
         let session_arc = {
-            let mut guard = self.sessions.lock().await;
+            let guard = self.sessions.lock().await;
             let found = guard.get(&msg.session_id).cloned();
             if let Some(session_arc) = &found {
-                let (placeholder, real) = {
-                    let s = session_arc.lock().await;
-                    // Retire-on-kill (delta-review round 5): mark the session
-                    // killed INSIDE this session-lock phase, BEFORE removing the
-                    // map keys — a send that took this Arc just before the
-                    // removal parks on this very lock and must observe the flag
-                    // (never materialize + re-bind a row for the pane that is
-                    // going away).
-                    s.killed.store(true, Ordering::SeqCst);
-                    (s.placeholder_id.clone(), s.real_session_id.clone())
-                };
-                guard.remove(&placeholder);
-                if let Some(real) = real {
-                    guard.remove(&real);
-                }
+                let s = session_arc.lock().await;
+                // Retire-on-kill (delta-review round 5): mark the session
+                // killed INSIDE this session-lock phase, BEFORE removing the
+                // map keys — a send that took this Arc just before the
+                // removal parks on this very lock and must observe the flag
+                // (never materialize + re-bind a row for the pane that is
+                // going away).
+                s.killed.store(true, Ordering::SeqCst);
             }
             found
         };
 
         let mut real_session_id = None;
         let mut placeholder_id = None;
-        if let Some(session_arc) = session_arc {
-            let mut s = session_arc.lock().await;
+        if let Some(session_arc) = &session_arc {
+            let s = session_arc.lock().await;
             real_session_id = s.real_session_id.clone();
             placeholder_id = Some(s.placeholder_id.clone());
-            if let Some(task) = s.turn_task.take() {
-                // ep4-r6 F2: join + await the compact's pre-drive-redo settle
-                // before the kill answers — the compensation must have landed.
-                task.abort_and_settle().await;
-            }
-            // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
-            // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
-            if let Some(bridge) = s.serve_bridge.take() {
-                bridge.abort();
-            }
-            // Task 13: a killed session must reopen its durable id's lease binding.
-            if let Some(real) = s.real_session_id.as_deref() {
-                self.leases.clear_binding(PROVIDER, real);
-            }
         }
 
         // Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
@@ -1217,6 +1214,37 @@ impl FreshOpencodeState {
                 if let Err(e) = sink.delete_pending(&msg.session_id).await {
                     tracing::warn!(error = %e, placeholder = %msg.session_id, "freshagent.opencode.pending_delete_failed_on_kill");
                 }
+            }
+        }
+
+        // The durable close is recorded; everything from here is best-effort
+        // continuation (round 5: settlement failure never loses the close).
+        if let Some(session_arc) = session_arc {
+            // Remove the map keys now that the close is durable (map lock →
+            // session lock, the phase-1 order — no awaits past these takes).
+            let (turn_task, bridge, real) = {
+                let mut guard = self.sessions.lock().await;
+                let mut s = session_arc.lock().await;
+                let real = s.real_session_id.clone();
+                guard.remove(&s.placeholder_id);
+                if let Some(real) = real.as_deref() {
+                    guard.remove(real);
+                }
+                (s.turn_task.take(), s.serve_bridge.take(), real)
+            };
+            if let Some(task) = turn_task {
+                // ep4-r6 F2: join + await the compact's pre-drive-redo settle
+                // before the kill answers — the compensation must have landed.
+                task.abort_and_settle().await;
+            }
+            // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
+            // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
+            if let Some(bridge) = bridge {
+                bridge.abort();
+            }
+            // Task 13: a killed session must reopen its durable id's lease binding.
+            if let Some(real) = real.as_deref() {
+                self.leases.clear_binding(PROVIDER, real);
             }
         }
 
@@ -3825,6 +3853,158 @@ mod tests {
         assert!(
             retires.contains(&("opencode".to_string(), "ses_evicted".to_string())),
             "the kill must retire (opencode, ses_evicted): {retires:?}"
+        );
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 4), the opencode lane:
+    /// the durable close (row retire + pending-marker deletion, the first
+    /// write phase) must be recorded BEFORE any teardown/settlement await —
+    /// the kill handler runs in a detached task and the client removes the
+    /// pane without a durable acknowledgement, so a server crash inside the
+    /// turn settlement would otherwise lose the close (Bound row survives,
+    /// re-offerable by the next recovery). THE HOOKED TEARDOWN STALL: the
+    /// session carries a compact drive whose settle channel the test holds
+    /// (ep4-r6's settle knob) — `abort_and_settle` parks on it for seconds —
+    /// the close must already be observable while the settlement never
+    /// lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_records_the_close_before_the_turn_settlement() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-settle"), None).await;
+        let placeholder = "freshopencode-req-kill-settle";
+        assert!(
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "precondition: the create recorded the pending marker"
+        );
+
+        // The stalled settlement: a Compact-kind drive task whose settle
+        // channel the test holds — `abort_and_settle` joins the (aborted)
+        // drive instantly, then parks on the settle wait up to 5s.
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            session_arc.lock().await.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: Some(settled_rx),
+            });
+        }
+
+        let st2 = st.clone();
+        let kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: AgentProvider::Opencode,
+                session_id: placeholder.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // The settle never lands while held, so the ONLY way the close can be
+        // observable within this budget is if it was recorded FIRST. (The
+        // settle wait is 5s; 1.5s here is comfortably inside the stall.)
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        loop {
+            let marker_gone = !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder);
+            if marker_gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the durable close (row retire + pending-marker delete) must be recorded \
+                 BEFORE the turn-settlement await — a crash inside it lost the close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !kill.is_finished(),
+            "fixture: the settlement is still stalled (the close preceded it, not followed it)"
+        );
+        // Release the settle; the kill completes.
+        let _ = settled_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(15), kill)
+            .await
+            .expect("the kill completes after the settle lands")
+            .expect("kill task completed");
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 5), the opencode lane:
+    /// the claim commit's `Err` (an io failure deciding or writing the
+    /// durable transition) left the close untouched (fence stands, row
+    /// Closed) — the resume must FAIL instead of registering a live session
+    /// over the Closed row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_commit_error_stops_the_resume_and_leaves_the_close_standing() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // The close the user MEANT (before this attach): row Closed + fence.
+        state
+            .handle_kill(FreshAgentKill {
+                provider: AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            fake.kill_tombstone_at_ms("opencode", DURABLE_ID).is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // The commit's io failure knob (Finding 5's shape).
+        fake.set_fail_writes(true);
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("OPENCODE_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "a commit error must FAIL the resume, never register a live session over a Closed row"
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(DURABLE_ID),
+            "nothing registers when the commit could not run"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the close stands: the row stays Retired"
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("opencode", DURABLE_ID).is_some(),
+            "the close stands: the fence was never cleared"
         );
     }
 

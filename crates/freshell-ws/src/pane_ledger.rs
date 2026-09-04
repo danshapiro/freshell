@@ -1702,6 +1702,21 @@ impl PaneLedger {
         result
     }
 
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the identity's RAW
+    /// row-state answer — true iff a row exists and is currently Bound. The
+    /// claude alias-tombstone retention consults it: a placeholder→durable
+    /// mapping may only be discarded (TTL expiry / capacity eviction) once
+    /// the row it resolves to is Retired-or-GC'd — while the row is Bound,
+    /// the pane's close still needs the mapping to reach this row. Note this
+    /// deliberately answers the RAW state: a Bound row dominated by a kill
+    /// tombstone (the unconverged crash remnant) still answers true, and
+    /// retaining that alias is harmless (its kills retire the row anyway).
+    /// Memory-only (V1.md read policy), like [`Self::load_binding`].
+    pub fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.load_binding(provider, session_id)
+            .is_some_and(|row| row.state == RowState::Bound)
+    }
+
     /// Raw single-row read from the index (no chain following — that is
     /// `lookup_by_session`, Task 2). Memory-only (V1.md read policy).
     pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow> {

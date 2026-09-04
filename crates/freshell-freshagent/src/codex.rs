@@ -435,10 +435,10 @@ impl FreshCodexState {
     /// and the row the kill retired stays Retired. A reviving claim must
     /// never undo a newer close. On commit the fence-clear AND the row
     /// revive are ONE ledger transition (Finding 3: no split-write
-    /// intermediate). Returns true iff the claim committed; an `Err` (io
-    /// failure deciding or writing) is ambiguous about which side won —
-    /// warn-loud and proceed as committed (the round-3 failure policy,
-    /// never a resume blocker).
+    /// intermediate). Returns true iff the claim committed. An `Err` (io
+    /// failure deciding or writing) provably left the durable close
+    /// untouched (round 5, focused-ep5-r4 Finding 5): warn-loud and report
+    /// false — the caller tears the session down, kill wins.
     async fn commit_session_claim(&self, durable_id: &str, expect_killed_at_ms: Option<i64>) -> bool {
         let Some(sink) = self.identity_sink() else {
             return true;
@@ -454,9 +454,41 @@ impl FreshCodexState {
                 false
             }
             Err(e) => {
-                tracing::warn!(error = %e, session = %durable_id, "freshagent.codex.claim_commit_failed");
-                true
+                // Round 5 (focused-ep5-r4 Finding 5): the ledger's commit is
+                // crash-atomic, so an `Err` here means the durable close was
+                // left UNTOUCHED (the fence stands, the row stays Closed —
+                // only a cleanup-phase failure can land past the transition,
+                // and that one reports `Committed`). Registering anyway would
+                // build a live session over a durably-closed row. Treat the
+                // error like a refusal: the caller tears the session down and
+                // the close stands (kill wins).
+                tracing::warn!(error = %e, session = %durable_id,
+                    "freshagent.codex.claim_commit_failed: the durable close left the claim \
+                     undecidable; the lane tears down and leaves the close standing");
+                false
             }
+        }
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1): the claim's
+    /// POST-REGISTRATION dead-state re-check. The commit's durable decision
+    /// and the kill's retire write serialize on the ledger guard, but a kill
+    /// QUEUED behind a successful commit (its decision pre-dated the kill)
+    /// lands while this lane is between commit and registration — nothing
+    /// else observes that ordering. Re-validate against the claim-start
+    /// snapshot once the session is registered (kill-visible): an advanced
+    /// dead state at this point means the row was retired after our commit,
+    /// so the registered session is a late orphan of the pane the user
+    /// closed — the caller tears it down and leaves the row Retired. Same
+    /// predicate as the ledger's `commit_claim` refusal.
+    fn claim_dead_state_advanced(&self, durable_id: &str, claim_dead_state: Option<i64>) -> bool {
+        let current = self
+            .identity_sink()
+            .and_then(|sink| sink.kill_tombstone_at_ms(PROVIDER, durable_id));
+        match (current, claim_dead_state) {
+            (Some(cur), Some(exp)) => cur > exp,
+            (Some(_), None) => true,
+            (None, _) => false,
         }
     }
 
@@ -1012,7 +1044,9 @@ impl FreshCodexState {
         // established): clear the durable kill fence BEFORE finish_create's
         // binding write, AND return a kill-closed row to Bound.
         // warn-only on failure — never a resume blocker. finish_create's
-        // lease-revoke arm rolls the commit back (`commit_rollback_id`).
+        // lease-revoke arm rolls the commit back (`claim`), and
+        // `finish_create`'s post-registration re-check (round 5, Finding 1)
+        // tears down a late orphan a kill queued behind the commit produced.
         //
         // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
         // the claim-start dead-state snapshot. A kill that landed while this
@@ -1065,8 +1099,10 @@ impl FreshCodexState {
             history_mode,
             provenance,
             // This lane committed the claim above: its lease-revoke arm in
-            // `finish_create` must roll the commit back.
-            Some(thread_id.as_str()),
+            // `finish_create` must roll the commit back, and the
+            // post-registration re-check (round 5, Finding 1) compares
+            // against the claim-start snapshot.
+            Some((thread_id.as_str(), claim_dead_state)),
         )
         .await;
     }
@@ -1098,13 +1134,16 @@ impl FreshCodexState {
         // D8: the creating connection's provenance for the binding write below
         // (`None` on conn-less lanes; the ledger merge keeps prior stamps).
         provenance: Option<crate::BindProvenance>,
-        // Retire-on-kill round 3 (Finding 5): `Some(<the resumed durable id>)`
-        // when the caller already COMMITTED the claim (create-with-resume);
-        // the lease-revoke arm below then rolls the commit back before
-        // answering failed, so a torn-down claim never leaves the identity
-        // unfenced / Bound. `None` on the plain create lane (nothing was
-        // committed — nothing to roll back).
-        commit_rollback_id: Option<&str>,
+        // Retire-on-kill round 3 (Finding 5): `Some((<the resumed durable
+        // id>, <the claim-start dead-state snapshot>))` when the caller
+        // committed (round 5: COMMITS, before this tail) a claim
+        // (create-with-resume); the lease-revoke arm below then rolls the
+        // commit back before answering failed, so a torn-down claim never
+        // leaves the identity unfenced / Bound, and the post-registration
+        // dead-state re-check (round 5, Finding 1) compares the fence
+        // against the snapshot. `None` on the plain create lane (nothing was
+        // committed — nothing to roll back or re-check).
+        claim: Option<(&str, Option<i64>)>,
     ) {
         // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
         // initialized client's hello — all fields absent) behaves like `None`
@@ -1211,6 +1250,40 @@ impl FreshCodexState {
             },
         );
 
+        // Round 5 (focused-ep5-r4 Finding 1), the create-resume lane's
+        // post-registration dead-state re-check (the attach lane's twin is in
+        // `ensure_session_resumable`): a kill QUEUED behind this claim's
+        // commit lands between the commit and the insert above — the
+        // registered session is a late orphan of the pane the user closed
+        // (the kill's retire already left the row Retired). Tear it down and
+        // answer failed; kill always wins.
+        if let Some((claim_id, claim_dead_state)) = claim {
+            if self.claim_dead_state_advanced(claim_id, claim_dead_state) {
+                tracing::info!(target: "freshell_freshagent::codex",
+                    durable = %claim_id,
+                    "freshagent.codex.claim_late_orphan_torn_down: a close landed between the \
+                     claim's commit and its registration; the registered orphan is torn down"
+                );
+                if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                    session.consumer.abort();
+                    session.client.close().await;
+                    if let Some(kill_tx) = session.kill_tx {
+                        let _ = kill_tx.send(());
+                    }
+                    let _ = session.watcher.await;
+                }
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    &format!("codex thread {thread_id} closed while the resume was in flight; torn down"),
+                );
+                return;
+            }
+        }
+
         // Task 12: bind the durable thread id to this live session + release the lease
         // in ONE lock scope. A revoked lease means we must NOT keep the session -- tear
         // down our own tree and answer failed.
@@ -1228,8 +1301,8 @@ impl FreshCodexState {
                 // that gets torn down here dies again — restore the close's
                 // durable record (fence re-raised, the revived row
                 // re-retired) before answering failed.
-                if let Some(claim) = commit_rollback_id {
-                    self.rollback_session_claim(claim).await;
+                if let Some((claim_id, _)) = claim {
+                    self.rollback_session_claim(claim_id).await;
                 }
                 g.fail(); // own tree torn down -- reopen the key
                 self.fail_create(
@@ -2602,6 +2675,36 @@ impl FreshCodexState {
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
         let session_id = msg.session_id.clone();
 
+        // Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+        // explicit kill is an intentional session END — retire the thread's
+        // pane-ledger row `Closed`, so the recovery inventory (Bound-only at
+        // its `row_is_bound` pre-filter) can never re-offer a session the user
+        // just closed inside the 7s creation-race grace window. Runs for an
+        // UNKNOWN/Evicted id too: the session map is process memory while the
+        // row is durable, so a (consumer-exit-evicted) session the map no
+        // longer knows still has its row retired here.
+        //
+        // ROUND 5 ORDERING (focused-ep5-r4 Findings 1+3 — the batch's two
+        // design rules):
+        //
+        // 1. The durable close (kill tombstone + row retire, one ledger
+        //    write) is recorded BEFORE any teardown/settlement await
+        //    (Finding 3): the dispatcher runs this handler detached and the
+        //    client removes the pane without a durable acknowledgement, so a
+        //    server crash inside the client-close/exit-watcher awaits would
+        //    otherwise lose the close and leave the row Bound — re-offerable.
+        // 2. The retire strictly precedes the session-map removal (Finding
+        //    1's kill-half): a kill whose retire lands while a claim sits
+        //    between its commit and its registration still finds (and tears
+        //    down) the claim's session once the claim registers — kill always
+        //    wins vs an in-flight claim. (The claim half is the
+        //    post-registration dead-state re-check, `claim_dead_state_advanced`.)
+        self.retire_closed_row(&session_id).await;
+
+        // Task 12: an explicitly-killed session must reopen its durable id (the watcher
+        // also clears it; idempotent -- this covers watcher-less test sessions too).
+        self.leases.clear_binding(PROVIDER, &session_id);
+
         let removed = self.sessions.lock().await.remove(&session_id);
         if let Some(session) = removed {
             session.consumer.abort();
@@ -2613,19 +2716,6 @@ impl FreshCodexState {
             // for it so the sidecar is actually gone before we broadcast success.
             let _ = session.watcher.await;
         }
-        // Task 12: an explicitly-killed session must reopen its durable id (the watcher
-        // also clears it; idempotent -- this covers watcher-less test sessions too).
-        self.leases.clear_binding(PROVIDER, &session_id);
-
-        // Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
-        // explicit kill is an intentional session END — retire the thread's
-        // pane-ledger row `Closed`, so the recovery inventory (Bound-only at
-        // its `row_is_bound` pre-filter) can never re-offer a session the user
-        // just closed inside the 7s creation-race grace window. Runs for an
-        // UNKNOWN/Evicted id too: the session map is process memory while the
-        // row is durable, so a (consumer-exit-evicted) session the map no
-        // longer knows still has its row retired here.
-        self.retire_closed_row(&session_id).await;
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
@@ -4038,6 +4128,40 @@ impl FreshCodexState {
                 row_provenance,
             )
             .await;
+
+        // Round 5 (focused-ep5-r4 Finding 1): the claim start's commit and
+        // the kill's retire serialize on the ledger guard, but a kill QUEUED
+        // behind a successful commit (the commit's decision pre-dated it)
+        // lands while this lane is between the commit and this registration.
+        // Now that the session is registered (kill-visible), re-validate the
+        // dead state against the claim-start snapshot: an advanced fence
+        // means the row was retired after our commit — the registered
+        // session is a late orphan of the pane the user closed, so tear it
+        // down (the kill's own retire already left the row Retired; the
+        // kill's post-retire map removal also finds this session when the
+        // ordering runs the other way — the two halves close every
+        // interleaving; kill always wins).
+        if self.claim_dead_state_advanced(thread_id, claim_dead_state) {
+            tracing::info!(target: "freshell_freshagent::codex",
+                durable = %thread_id,
+                "freshagent.codex.claim_late_orphan_torn_down: a close landed between the \
+                 claim's commit and its registration; the registered orphan is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(thread_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            return Err(ResumeSessionError::Transient(
+                "codex thread closed while the resume was in flight; torn down".to_string(),
+            ));
+        }
 
         // Task 13: bind the durable thread id to this live session + release the lease.
         if let Some(mut g) = lease_guard.take() {
@@ -6457,6 +6581,365 @@ pub(crate) mod tests {
             retires.contains(&("codex".to_string(), "evicted-thread".to_string())),
             "the kill must retire (codex, evicted-thread): {retires:?}"
         );
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 3), the codex lane:
+    /// the durable close (kill tombstone + row retire, one ledger write) must
+    /// be recorded BEFORE any teardown/settlement await — a server crash mid-
+    /// teardown must never lose the close (the row would stay Bound and the
+    /// next recovery could offer a pane the user closed). THE HOOKED
+    /// TEARDOWN STALL: a session whose exit-watcher never completes parks the
+    /// kill's teardown phase forever; the retire must already be durable
+    /// while the settle never lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_records_the_durable_close_before_the_teardown_settles() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, _rx, fake) = state_with_sink();
+
+        // A session whose watcher never resolves (the stalled teardown) and
+        // whose kill_tx is absent — the teardown block parks on the watcher
+        // join forever.
+        let consumer = tokio::spawn(async {});
+        let watcher = tokio::spawn(std::future::pending::<()>());
+        let exited = Arc::new(AtomicBool::new(false));
+        st.sessions.lock().await.insert(
+            "thread-stall".to_string(),
+            CodexSession {
+                client,
+                model: "gpt-5.3-codex-spark".to_string(),
+                effort: None,
+                cwd: None,
+                sandbox: None,
+                permission_mode: None,
+                active_turn: Arc::new(StdMutex::new(None)),
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
+                consumer,
+                kill_tx: None,
+                watcher,
+                exited,
+                provenance: None,
+            },
+        );
+
+        let st2 = st.clone();
+        let kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-stall".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // The teardown never settles, so the ONLY way the durable close can
+        // be observable is if it was recorded FIRST. Bounded poll (the
+        // kill-window tests' 25ms discipline).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let retired = fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), "thread-stall".to_string()));
+            if retired {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the durable close (kill tombstone + row retire) must be recorded BEFORE \
+                 the teardown/settlement awaits — a crash inside them lost the close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !kill.is_finished(),
+            "fixture: the teardown is still stalled (the close preceded it, not followed it)"
+        );
+        kill.abort();
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1), the codex
+    /// ATTACH-resume lane: a kill QUEUED behind the claim's commit (the
+    /// commit's dead-state decision pre-dates the kill — the report's
+    /// exact interleaving) lands while the lane is between its completed
+    /// commit and its session registration. Kill must still win: the lane's
+    /// post-registration dead-state re-check observes the advanced fence,
+    /// the late session is torn down before it is ever answerable, and the
+    /// row the kill retired stays Retired. (The fake sink's post-commit
+    /// stall is the deterministic model: the commit APPLIES — fence cleared,
+    /// row revived — then the lane parks pre-registration while the kill
+    /// lands.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_thread()
+     {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx, fake) = state_with_sink();
+        let thread = "historical-thread-killed-post-commit";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/tmp".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+
+        // The close the user MEANT (before this attach): row Closed + fence.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let claim_start_snapshot = fake.kill_tombstone_at_ms("codex", thread);
+        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+
+        // Stall the claim AFTER its commit lands, BEFORE the registration.
+        let stall = fake.arm_post_commit_stall("codex", thread);
+        let st2 = st.clone();
+        let attach = tokio::spawn(async move {
+            st2.handle_attach(attach_msg(thread)).await;
+        });
+        stall
+            .applied
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim's commit landed (the lane is parked pre-registration)");
+        assert_eq!(
+            fake.kill_tombstone_at_ms("codex", thread),
+            None,
+            "fixture: the commit cleared the fence — its decision pre-dates the kill below"
+        );
+
+        // THE INTERLEAVING (Finding 1): the user's close lands between the
+        // completed commit and the registration.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let post_kill = fake.kill_tombstone_at_ms("codex", thread);
+        assert!(
+            post_kill.is_some() && post_kill > claim_start_snapshot,
+            "fixture: the post-commit close re-raised the fence past the claim's snapshot"
+        );
+        stall.release.send(()).expect("release the stalled claim");
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), attach)
+            .await
+            .expect("attach resolves")
+            .expect("attach task completed");
+
+        // The lane must answer the attach with the resume failure (never a
+        // silently-adopted orphan), must register NOTHING, and must leave the
+        // row the kill retired Retired with its fence standing.
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("CODEX_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "the kill-queued-behind-the-commit attach answers the resume failure"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "the late orphan session was torn down, never kept"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the row the kill retired stays Retired — the commit must not outlive the kill"
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "the post-commit kill's fence stands"
+        );
+        st.shutdown().await;
+    }
+
+    /// The CREATE-resume lane twin of the Finding-1 pin above: the
+    /// post-commit kill lands while `finish_create` is between the claim's
+    /// commit ( handle_create_resume ) and its sessions-map insert — the
+    /// re-check tears the registered session down and the create answers
+    /// failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create()
+     {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx, fake) = state_with_sink();
+        let thread = "thread-killed-post-commit-create";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/tmp".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "fixture: the fence is durable"
+        );
+
+        let stall = fake.arm_post_commit_stall("codex", thread);
+        let st2 = st.clone();
+        let create = tokio::spawn(async move {
+            st2.handle_create(
+                FreshAgentCreate {
+                    request_id: "req-post-commit-kill".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: Some(thread.to_string()),
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex".to_string()),
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
+            .await;
+        });
+        stall
+            .applied
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim's commit landed (the lane is parked pre-registration)");
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        stall.release.send(()).expect("release the stalled claim");
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), create)
+            .await
+            .expect("the create resolves")
+            .expect("create task completed");
+
+        let mut saw_create_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("freshAgent.create.failed") {
+                saw_create_failed = true;
+            }
+        }
+        assert!(
+            saw_create_failed,
+            "the kill-queued-behind-the-commit create answers failed (never a live orphan)"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "the late orphan session was torn down, never kept"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the row the kill retired stays Retired"
+        );
+        st.shutdown().await;
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 5), the codex
+    /// ATTACH-resume lane: the claim commit's `Err` (an io failure deciding
+    /// or writing the durable transition) leaves the close UNTOUCHED (the
+    /// fence stands, the row stays Closed — the ledger's commit is crash-
+    /// atomic that way). Continuing would register a live session against a
+    /// durably-closed row (omitted from the next recovery), so the lane must
+    /// fail instead: no registration, no revive, the session torn down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_commit_error_stops_the_attach_resume_and_leaves_the_close_standing() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx, fake) = state_with_sink();
+        let thread = "historical-thread-commit-error";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/tmp".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // The commit's io failure knob: every durable write from here errs —
+        // commit_claim's Err is the Finding-5 shape.
+        fake.set_fail_writes(true);
+        st.handle_attach(attach_msg(thread)).await;
+
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("CODEX_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "a commit error must FAIL the resume, never register a live session over a Closed row"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "nothing registers when the commit could not run"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the close stands: the row stays Retired"
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "the close stands: the fence was never cleared"
+        );
+        st.shutdown().await;
     }
 
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2), the tombstone

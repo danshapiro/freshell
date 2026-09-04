@@ -3478,6 +3478,38 @@ fn rollback_row_rekey_move_drops_the_old_durably() {
 // under the same index guard as the write (state, never task scheduling), so
 // EVERY completion order converges to not-Bound.
 
+/// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): `row_is_bound` — the
+/// claude alias-tombstone retention probe's raw row-state answer. A
+/// fresh-agent Bound row answers true; a retired row and a never-written id
+/// answer false (freeing their alias records to age out); a disabled ledger
+/// answers false (no row provable).
+#[test]
+fn row_is_bound_answers_the_raw_row_state() {
+    let root = temp_root("row-is-bound");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&fa_write("claude", "durable-rb", 1_000))
+        .unwrap();
+    assert!(
+        ledger.row_is_bound("claude", "durable-rb"),
+        "a Bound fresh-agent row answers true"
+    );
+    ledger.retire_closed("claude", "durable-rb", 2_000).unwrap();
+    assert!(
+        !ledger.row_is_bound("claude", "durable-rb"),
+        "a retired row answers false (its alias records may age out)"
+    );
+    assert!(
+        !ledger.row_is_bound("claude", "never-written"),
+        "a missing row answers false"
+    );
+    assert!(
+        !PaneLedger::disabled().row_is_bound("claude", "durable-rb"),
+        "a disabled ledger proves nothing"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The kill's tombstone is DURABLE: `retire_closed` records it even when no
 /// row exists yet (the kill beat the in-flight adoption write), a fresh
 /// ledger over the same root loads it, and the binder refuses the late

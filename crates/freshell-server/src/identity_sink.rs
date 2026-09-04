@@ -293,6 +293,13 @@ impl PaneIdentitySink for LedgerIdentitySink {
         self.ledger.kill_tombstone_at(provider, session_id)
     }
 
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
+    /// retention probe — the row's raw Bound state, read inline against the
+    /// write-through index like [`Self::kill_tombstone_at_ms`].
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.ledger.row_is_bound(provider, session_id)
+    }
+
     /// The claim commit (focused-ep5-r3 Findings 1+3): ONE conditional
     /// durable transition — clear + revive atomically, refused wholesale
     /// (no side effects) when the identity's dead-state advanced past the
@@ -1048,6 +1055,45 @@ mod tests {
         sink.delete_pending("never-recorded")
             .await
             .expect("missing marker deletes to Ok");
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): `row_is_bound`
+    /// through the real ledger — the claude alias-tombstone retention probe.
+    /// Bound rows answer true; retired/unknown ids false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_is_bound_answers_the_ledgers_raw_row_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger);
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "ses-rb".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        assert!(
+            sink.row_is_bound("claude", "ses-rb"),
+            "a Bound row answers true"
+        );
+        sink.retire_closed("claude", "ses-rb")
+            .await
+            .expect("retire");
+        assert!(
+            !sink.row_is_bound("claude", "ses-rb"),
+            "a retired row answers false"
+        );
+        assert!(!sink.row_is_bound("claude", "never-written"));
     }
 
     /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2) over the REAL ledger,

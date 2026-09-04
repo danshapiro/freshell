@@ -336,6 +336,18 @@ pub trait PaneIdentitySink: Send + Sync {
     /// CURRENT stamp against this snapshot: any advance means a close landed
     /// mid-claim.
     fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64>;
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the raw row-state
+    /// read the claude ALIAS-tombstone retention consults — true iff the
+    /// identity's binding row exists and is currently Bound. Alias records
+    /// (placeholder→durable) must live as long as the row they can resolve
+    /// to: a close issued days after a pane's exit-eviction still needs the
+    /// mapping to find the durable row, so TTL/cap eviction may only discard
+    /// a record whose target row is already Retired-or-GC'd (unrecoverable —
+    /// the mapping can no longer miss a live close). Memory-fast + sync like
+    /// [`Self::kill_tombstone_at_ms`]. This is the RAW state (a tombstone-
+    /// dominated-but-unconverged Bound row still answers true — retaining
+    /// that alias is harmless: its kills retire the row anyway).
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool;
     /// Focused-ep5-r3 Findings 1+3 (retire-on-kill round 4) — the claim
     /// lifecycle's COMMIT, superseding round 3's separate
     /// `clear_kill_tombstone` + `revive_closed` pair. ONE conditional durable
@@ -352,10 +364,16 @@ pub trait PaneIdentitySink: Send + Sync {
     ///   orphan of the pane the user already closed, and the caller tears
     ///   it down. The reviving claim must never undo a newer close.
     ///
-    /// Awaited like every non-rollback lane. An `Err` (io failure deciding
-    /// or writing) is ambiguous about which side won: callers warn-log and
-    /// keep the session (the round-3 failure policy), because the commit is
-    /// deliberately idempotent and the next genuine claim converges it.
+    /// Awaited like every non-rollback lane. Round 5 (focused-ep5-r4
+    /// Finding 5) supersedes the round-3 `Err` policy ("ambiguous — proceed
+    /// as committed"): the ledger's commit is constructed so an `Err` leaves
+    /// the close UNTOUCHED (the fence stands, a Closed row stays Closed —
+    /// only the cleanup-phase tombstone delete can fail past the durable
+    /// transition, and that failure is reported `Committed`, never `Err`).
+    /// Continuing past an `Err` therefore registers a live session against a
+    /// durably-closed row — exactly the live/Closed orphan this state
+    /// machine exists to prevent. Callers treat `Err` like a refusal: tear
+    /// the would-be session down and leave the row Closed (kill wins).
     fn commit_claim(
         &self,
         provider: &str,
@@ -443,6 +461,9 @@ pub(crate) struct FakeIdentitySink {
         std::sync::Mutex<std::collections::HashMap<(String, String), serde_json::Value>>,
     /// When true, write futures resolve to Err — for failure-surfacing tests.
     pub fail_writes: std::sync::atomic::AtomicBool,
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook — see
+    /// [`Self::arm_post_commit_stall`].
+    post_commit_stall: std::sync::Mutex<Option<PostCommitStallGate>>,
     /// Focused-ep5-r1 Finding 2 test hook — see [`Self::arm_orphan_binding_gate`].
     orphan_gate: std::sync::Mutex<Option<OrphanBindingGate>>,
     /// Weak self-handle so the orphan gate's detached apply task can reach
@@ -520,6 +541,35 @@ pub(crate) struct ClaimGateHandles {
     pub entered: std::sync::mpsc::Receiver<()>,
     pub release: tokio::sync::oneshot::Sender<()>,
     pub decided: std::sync::mpsc::Receiver<()>,
+}
+
+/// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook: the armed
+/// post-commit stall gate's state. The commit DECIDES+APPLIES inline (the
+/// durable transition has LANDED — fence cleared, row revived) but the
+/// returned future stalls behind the test's release — the deterministic
+/// model of Finding 1's shape: a kill QUEUED behind the commit (the
+/// commit's decision pre-dates it) whose retire lands while the claimant is
+/// between its completed commit and its session registration.
+#[cfg(test)]
+struct PostCommitStallGate {
+    /// The (provider, session_id) key this gate intercepts.
+    key: (String, String),
+    /// Signaled when the commit APPLIED (the durable transition landed) and
+    /// the lane is now parked pre-registration.
+    applied_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the stalled future resolves only after this.
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook: the handles
+/// [`FakeIdentitySink::arm_post_commit_stall`] hands the test. `applied`
+/// fires when the commit LANDED and the lane parked pre-registration;
+/// `release` lets the stalled lane proceed (to its registration and, on the
+/// fixed lanes, its post-registration dead-state re-check).
+#[cfg(test)]
+pub(crate) struct PostCommitStallHandles {
+    pub applied: std::sync::mpsc::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
 }
 
 #[cfg(test)]
@@ -660,6 +710,35 @@ impl FakeIdentitySink {
             entered: entered_rx,
             release: release_tx,
             decided: decided_rx,
+        }
+    }
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1) test hook: arm the
+    /// post-commit stall for one identity key. The next `commit_claim` for
+    /// exactly that key DECIDES+APPLIES inline (the durable transition lands
+    /// — tombstone cleared, kill-closed row revived, exactly like the real
+    /// [`PaneLedger::commit_claim`]'s committed arm) and then parks the lane
+    /// behind the test's release BEFORE resolving — so the test can land a
+    /// REAL `handle_kill` (whose retire re-stamps the fence and re-retires
+    /// the row) in the window between the completed commit and the claim
+    /// lane's session registration, the finding's "kill queued while the
+    /// commit owns the ledger lock" interleaving. One-shot: later commits
+    /// proceed inline.
+    pub(crate) fn arm_post_commit_stall(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> PostCommitStallHandles {
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.self_weak.lock().unwrap() = std::sync::Arc::downgrade(self);
+        *self.post_commit_stall.lock().unwrap() = Some(PostCommitStallGate {
+            key: (provider.into(), session_id.into()),
+            applied_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        PostCommitStallHandles {
+            applied: applied_rx,
+            release: release_tx,
         }
     }
     /// The shared claim-commit decide+apply (the direct path AND the claim
@@ -970,6 +1049,15 @@ impl PaneIdentitySink for FakeIdentitySink {
             .get(&(provider.into(), session_id.into()))
             .copied()
     }
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        // Retire-on-kill round 5 (F2): the fake's row-state mirror answers —
+        // a Bound row retains the aliases that can resolve to it.
+        self.states
+            .lock()
+            .unwrap()
+            .get(&(provider.into(), session_id.into()))
+            == Some(&FakeRowState::Bound)
+    }
     fn commit_claim(
         &self,
         provider: &str,
@@ -1018,6 +1106,32 @@ impl PaneIdentitySink for FakeIdentitySink {
                 outcome_rx
                     .await
                     .map_err(std::io::Error::other)
+            });
+        }
+        // Retire-on-kill round 5 (focused-ep5-r4 Finding 1) stall arm: the
+        // decide+apply runs INLINE (the durable transition has landed), then
+        // the future parks behind the test's release — the claimant sits
+        // between its completed commit and its registration while the test
+        // lands the kill that the commit's decision pre-dated.
+        let stall_arm = {
+            let gate = self.post_commit_stall.lock().unwrap();
+            gate.as_ref().and_then(|g| {
+                if g.key == (provider.to_string(), session_id.to_string()) {
+                    let release_rx = g.release_rx.lock().unwrap().take();
+                    release_rx.map(|rx| (g.applied_tx.clone(), rx))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((applied_tx, release_rx)) = stall_arm {
+            // One-shot: disarm so later commits proceed inline.
+            *self.post_commit_stall.lock().unwrap() = None;
+            let outcome = self.apply_claim_commit(provider, session_id, expect_killed_at_ms);
+            let _ = applied_tx.send(());
+            return Box::pin(async move {
+                let _ = release_rx.await;
+                Ok(outcome)
             });
         }
         let outcome = self.apply_claim_commit(provider, session_id, expect_killed_at_ms);

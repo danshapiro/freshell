@@ -383,6 +383,12 @@ impl PaneIdentitySink for TestLedgerSink {
         self.ledger.kill_tombstone_at(provider, session_id)
     }
 
+    // Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
+    // retention probe — memory-only inline pass-through like the snapshot read.
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.ledger.row_is_bound(provider, session_id)
+    }
+
     // Focused-ep5-r3 Findings 1+3: the conditional single-transition claim
     // commit — a faithful pass-through to the real ledger op.
     fn commit_claim(
