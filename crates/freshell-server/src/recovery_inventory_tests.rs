@@ -3188,6 +3188,101 @@ async fn route_never_offers_ledger_only_rows_without_parent_evidence() {
     assert_eq!(body["ledgerOnly"].as_array().unwrap().len(), 0);
 }
 
+/// Focused-episode-6 round 3, Finding 2 — the headline pin: close evidence
+/// + its snapshot BOTH retained across the TTL edge → the verdict stays
+/// `closed` (never re-offered). The chain: a real retained generation
+/// references the closed pane's `createRequestId`; the REAL
+/// `retained_snapshot_references` scan feeds the ledger's periodic GC at
+/// +6h; the record (and its fences) survive; the route still verdicts the
+/// pane closed.
+#[tokio::test]
+async fn a_close_record_and_its_snapshot_both_survive_the_ttl_edge_and_the_verdict_stays_closed() {
+    // An OLD retained snapshot whose terminal pane carries the closed pane's
+    // createRequestId (snapshots prune by COUNT, never by age — this
+    // generation can sit retained indefinitely).
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "oldclient",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal",
+               "payload":{"mode":"codex",
+                          "createRequestId":"cr-closed",
+                          "sessionRef":{"provider":"codex","sessionId":"sess-closed"},
+                          "liveTerminal":{"terminalId":"term-closed","serverInstanceId":"srv-1"}}}]}
+        ]),
+    );
+    // The pane was closed pre-loss: the close record + row retire persist.
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    let seeder = freshell_ws::pane_ledger::PaneLedger::new(Some(broot.clone()));
+    seeder
+        .close_pane(&freshell_ws::pane_ledger::PaneCloseWrite {
+            terminal_id: "term-closed".to_string(),
+            create_request_id: Some("cr-closed".to_string()),
+            resolved: vec![freshell_protocol::SessionLocator {
+                provider: "codex".into(),
+                session_id: "sess-closed".into(),
+            }],
+            now_ms: 1_000_100,
+        })
+        .expect("the close persists");
+    drop(seeder);
+
+    // The periodic GC runs at +TTL with the REAL scan of the retained store:
+    // the close evidence MUST survive (reference-time retention).
+    let refs =
+        freshell_ws::tabs_persist::retained_snapshot_references(tmp.path()).expect("scan io");
+    let sweeper = freshell_ws::pane_ledger::PaneLedger::new(Some(broot.clone()));
+    let aged = 1_000_100 + freshell_ws::pane_ledger::KILL_TOMBSTONE_TTL_MS + 60_000;
+    let report = sweeper.gc(aged, &|_, _| false, None, Some(&refs));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "referenced close evidence never prunes across the TTL edge: {:?}",
+        report.pane_closes_swept
+    );
+    assert!(
+        sweeper.kill_tombstone_at("codex", "sess-closed").is_some(),
+        "the fence survives with its record"
+    );
+    drop(sweeper);
+
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let panes = body["device"]["tabs"][0]["panes"].as_array().unwrap();
+    assert_eq!(
+        panes[0]["ledgerState"], "closed",
+        "the verdict stays closed across the TTL edge: {body}"
+    );
+    assert!(panes[0]["sessionRef"].is_null());
+
+    // Counterfactual hinge: the SAME gc over a store that references nothing
+    // prunes the record (the TTL still bounds unreferenced evidence).
+    let mut refs = freshell_ws::tabs_persist::RetainedSnapshotReferences::default();
+    refs.claims.clear();
+    let sweeper = freshell_ws::pane_ledger::PaneLedger::new(Some(
+        home.path().join("pane-ledger"),
+    ));
+    let report = sweeper.gc(aged, &|_, _| false, None, Some(&refs));
+    assert!(
+        report
+            .pane_closes_swept
+            .contains(&"pane:term-closed".to_string()),
+        "unreferenced + fully aged prunes: {:?}",
+        report.pane_closes_swept
+    );
+}
+
 /// Focused-episode-6 round 3, Finding 1 — the end-to-end pin: a fresh-agent
 /// (opencode) pane killed BEFORE its first send holds no row, only the
 /// placeholder-keyed close evidence the kill's envelope writes; a retained

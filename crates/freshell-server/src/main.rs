@@ -147,6 +147,29 @@ impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
     }
 }
 
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the close-evidence
+/// retention gate input — every pane identity the retained snapshot
+/// generations reference, scanned from the SAME `tabs-snapshots` store the
+/// recovery route reads. A scan ERROR maps to `None` = "references unknown"
+/// = the gate keeps EVERYTHING this pass (over-pruning the only closed
+/// verdict for a pane a retained snapshot still claims is never acceptable).
+fn snapshot_close_evidence_references(
+    home: &Option<PathBuf>,
+) -> Option<freshell_ws::tabs_persist::RetainedSnapshotReferences> {
+    let root = home.as_ref()?.join(".freshell").join("tabs-snapshots");
+    match freshell_ws::tabs_persist::retained_snapshot_references(&root) {
+        Ok(refs) => Some(refs),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "pane_ledger_snapshot_reference_scan_failed: close-evidence retention keeps \
+                 everything this pass (references unknown)"
+            );
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
@@ -1117,11 +1140,19 @@ async fn main() -> ExitCode {
         // root was derived from. No home => the ledger is disabled and the
         // closure is never consulted; answering false (defer) is still safe.
         let scan_home = home.clone();
-        let report = pane_ledger.boot_scan(now, &move |provider, session_id| {
-            scan_home
-                .as_deref()
-                .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
-        });
+        // Delta-r6-r4 Finding 2: close evidence outlives its TTL exactly as
+        // long as a retained snapshot can reference it (no absolute-age
+        // re-offer gap).
+        let snapshot_refs = snapshot_close_evidence_references(&home);
+        let report = pane_ledger.boot_scan(
+            now,
+            &move |provider, session_id| {
+                scan_home
+                    .as_deref()
+                    .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
+            },
+            snapshot_refs.as_ref(),
+        );
         if !report.quarantined.is_empty() {
             tracing::error!(
                 count = report.quarantined.len(),
@@ -1206,6 +1237,9 @@ async fn main() -> ExitCode {
                         .collect();
                     // Same Option handling as the boot-scan closure above:
                     // no home => defer (false) — never the destructive branch.
+                    // Delta-r6-r4 Finding 2: the close-evidence reference gate
+                    // rides the same snapshot store scan (fresh every pass).
+                    let snapshot_refs = snapshot_close_evidence_references(&home);
                     ledger.gc(
                         now,
                         &|provider, session_id| {
@@ -1214,6 +1248,7 @@ async fn main() -> ExitCode {
                             })
                         },
                         Some(&live),
+                        snapshot_refs.as_ref(),
                     );
                 })
                 .await;

@@ -1464,3 +1464,70 @@ fn persist_lock_recovers_from_poison() {
     );
     assert_eq!(outcome, PersistOutcome::Persisted);
 }
+
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the collector behind
+/// the close-evidence retention gate — every pane identity ANY retained
+/// generation references, in all three shapes (createRequestId,
+/// liveTerminal.terminalId, sessionRef claims), across devices and clients.
+#[test]
+fn retained_snapshot_references_collect_every_pane_identity_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut term = open_record("dev-a:tab-1", "tab", 1_000);
+    term["panes"] = json!([
+        { "paneId": "p1", "kind": "terminal",
+          "payload": { "mode": "codex", "createRequestId": "cr-1",
+                       "sessionRef": { "provider": "codex", "sessionId": "S-1" },
+                       "liveTerminal": { "terminalId": "term-9", "serverInstanceId": "srv-1" } } },
+        { "paneId": "p2", "kind": "fresh-agent",
+          "payload": { "provider": "opencode", "sessionType": "freshopencode",
+                       "sessionRef": { "provider": "opencode", "sessionId": "freshopencode-cr-7" } } },
+        // Never referenced anywhere below: control rows.
+        { "paneId": "p3", "kind": "terminal", "payload": { "mode": "shell" } }
+    ]);
+    put(dir.path(), "dev-a", "client-a", 1, 1_000, vec![term]);
+    let mut other = open_record("dev-b:tab-2", "tab2", 2_000);
+    other["panes"] = json!([
+        { "paneId": "p9", "kind": "terminal",
+          "payload": { "mode": "claude", "createRequestId": "cr-other",
+                       "liveTerminal": { "terminalId": "term-other", "serverInstanceId": "srv-2" } } }
+    ]);
+    put(dir.path(), "dev-b", "client-b", 1, 2_000, vec![other]);
+
+    let refs = retained_snapshot_references(dir.path()).expect("scan io");
+    assert!(refs.create_request_ids.contains("cr-1"));
+    assert!(refs.create_request_ids.contains("cr-other"));
+    assert!(refs.terminal_ids.contains("term-9"));
+    assert!(refs.terminal_ids.contains("term-other"));
+    assert!(refs.claims.contains(&("codex".to_string(), "S-1".to_string())));
+    assert!(
+        refs.claims
+            .contains(&("opencode".to_string(), "freshopencode-cr-7".to_string())),
+        "the placeholder claim is a reference: {refs:?}"
+    );
+    // No junk: empty/absent fields contribute nothing.
+    assert!(!refs.create_request_ids.contains(""));
+    assert_eq!(refs.terminal_ids.len(), 2);
+
+    // A missing root is absence; an EMPTY store references nothing (the
+    // sweep's "everything prunable" arm — distinct from the error arm the
+    // caller treats as unknown).
+    let empty = tempfile::tempdir().unwrap();
+    let refs = retained_snapshot_references(empty.path()).expect("missing root io");
+    assert!(refs.create_request_ids.is_empty() && refs.terminal_ids.is_empty() && refs.claims.is_empty());
+
+    // Fail-loud like the store's other readers: a corrupt generation file is
+    // an ERROR (the caller maps it to "unknown ⇒ keep everything"), never a
+    // silently-incomplete reference set a sweep could over-prune from.
+    let corrupt_dir_path = dir.path().join(encode_device_id("dev-a").unwrap());
+    let junk = std::fs::read_dir(&corrupt_dir_path)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .expect("a generation file");
+    std::fs::write(&junk, b"{ not json").unwrap();
+    assert!(
+        retained_snapshot_references(dir.path()).is_err(),
+        "a corrupt generation fails the scan loudly"
+    );
+}

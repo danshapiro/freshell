@@ -1067,7 +1067,12 @@ async fn a_kill_whose_row_projection_fails_still_ends_the_terminal_and_converges
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let report = sweeper.gc(now, &|_, _| false, None);
+    let report = sweeper.gc(
+        now,
+        &|_, _| false,
+        None,
+        Some(&freshell_ws::tabs_persist::RetainedSnapshotReferences::default()),
+    );
     assert!(
         report
             .kill_tombstone_enforced_retires

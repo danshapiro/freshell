@@ -21,6 +21,82 @@ pub const MAX_SNAPSHOT_DEVICES: usize = 64;
 /// A generation whose pretty-JSON exceeds this is skipped (never written).
 pub const MAX_SNAPSHOT_BYTES: usize = 1_048_576;
 
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): every pane identity
+/// ANY retained snapshot generation can reference — the pane-ledger's
+/// close-evidence retention gate. Close evidence (the journal records, and
+/// the close fences they carry) verdicts a pane `closed` while retained
+/// snapshots can still claim the pane; the pre-fix 6h TTL could delete the
+/// only closed verdict while a stale open-pane generation survived
+/// (snapshots prune by COUNT caps, never by age), letting recovery re-offer
+/// a pane the user had closed. Reference-time rule: evidence prunes only
+/// once NO retained generation can reference it — matching how the ledger's
+/// alias tombstones outlive their TTL via row reachability.
+#[derive(Debug, Default, Clone)]
+pub struct RetainedSnapshotReferences {
+    /// Every retained generation's pane-payload `createRequestId`.
+    pub create_request_ids: std::collections::HashSet<String>,
+    /// Every retained generation's pane-payload `liveTerminal.terminalId`.
+    pub terminal_ids: std::collections::HashSet<String>,
+    /// Every retained generation's pane-payload `sessionRef`
+    /// `(provider, sessionId)` claim.
+    pub claims: std::collections::HashSet<(String, String)>,
+}
+
+/// Scan every retained generation file across every device (the conservative
+/// superset of whatever the recovery selection would compose — any retained
+/// generation the selection COULD pick is included). Fail-loud exactly like
+/// the store's other readers: an unreadable dir or a corrupt generation is
+/// an ERROR — the pane-ledger caller maps `Err` to "references unknown", the
+/// keep-everything arm: over-pruning close evidence from an incomplete scan
+/// is never acceptable. A missing root is absence (empty, not error).
+pub fn retained_snapshot_references(
+    dir: &Path,
+) -> std::io::Result<RetainedSnapshotReferences> {
+    with_persist_lock(|| {
+        let mut refs = RetainedSnapshotReferences::default();
+        for device in list_snapshot_devices_locked(dir)? {
+            for (_, _, doc) in all_generations_parsed(dir, &device)? {
+                let Some(records) = doc["records"].as_array() else {
+                    continue;
+                };
+                for record in records {
+                    let Some(panes) = record["panes"].as_array() else {
+                        continue;
+                    };
+                    for pane in panes {
+                        let payload = &pane["payload"];
+                        if let Some(crid) = payload
+                            .get("createRequestId")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            refs.create_request_ids.insert(crid.to_string());
+                        }
+                        if let Some(tid) = payload
+                            .get("liveTerminal")
+                            .and_then(|v| v.get("terminalId"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            refs.terminal_ids.insert(tid.to_string());
+                        }
+                        if let Some(sref) = payload.get("sessionRef") {
+                            let provider = sref.get("provider").and_then(Value::as_str);
+                            let session = sref.get("sessionId").and_then(Value::as_str);
+                            if let (Some(p), Some(s)) = (provider, session) {
+                                if !p.is_empty() && !s.is_empty() {
+                                    refs.claims.insert((p.to_string(), s.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(refs)
+    })
+}
+
 /// INJECTIVE, containment-safe folder/name segment for a device OR client id.
 /// Keeps ONLY `[A-Za-z0-9]`; escapes every other byte as `_<2-lower-hex>`
 /// (so `-` -> `_2d`, `_` -> `_5f`, `/` -> `_2f`, `.` -> `_2e`). The output can

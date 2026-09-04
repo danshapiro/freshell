@@ -77,6 +77,7 @@ impl PaneLedger {
         &self,
         now_ms: i64,
         transcript_absent: &dyn Fn(&str, &str) -> bool,
+        snapshot_refs: Option<&crate::tabs_persist::RetainedSnapshotReferences>,
     ) -> BootScanReport {
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
@@ -205,7 +206,7 @@ impl PaneLedger {
         }
 
         // 4. GC pass (also runs periodically via `gc`).
-        let gc_report = self.gc_locked(&root, &mut index, now_ms, transcript_absent);
+        let gc_report = self.gc_locked(&root, &mut index, now_ms, transcript_absent, snapshot_refs);
         report.gc_tombstoned = gc_report.gc_tombstoned;
         report.tombstones_deleted = gc_report.tombstones_deleted;
         report.kill_tombstones_swept = gc_report.kill_tombstones_swept;
@@ -236,11 +237,17 @@ impl PaneLedger {
     /// `Some(registry terminal ids)` (a terminal is live iff it appears in
     /// the registry); `None` disables the orphan rule entirely (the boot
     /// path — see `gc_locked`).
+    /// `snapshot_refs` (delta-r6-r4 Finding 2): the pane identities ANY
+    /// retained snapshot generation references — the close-evidence
+    /// retention gate ([`PaneLedger::gc_pane_close_locked`]). `None` means
+    /// UNKNOWN (the reference scan failed): close evidence is never pruned
+    /// on doubt.
     pub fn gc(
         &self,
         now_ms: i64,
         transcript_absent: &dyn Fn(&str, &str) -> bool,
         live_terminal_ids: Option<&HashSet<String>>,
+        snapshot_refs: Option<&crate::tabs_persist::RetainedSnapshotReferences>,
     ) -> BootScanReport {
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
@@ -302,9 +309,9 @@ impl PaneLedger {
             let mut index = self.guard();
             self.gc_alias_tombstone_locked(&root, &mut index, &key, now_ms, &mut report);
         }
-        for terminal_id in pane_close_ids {
+        for key in pane_close_ids {
             let mut index = self.guard();
-            self.gc_pane_close_locked(&root, &mut index, &terminal_id, now_ms, &mut report);
+            self.gc_pane_close_locked(&root, &mut index, &key, now_ms, snapshot_refs, &mut report);
         }
         report
     }
@@ -318,6 +325,7 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         now_ms: i64,
         transcript_absent: &dyn Fn(&str, &str) -> bool,
+        snapshot_refs: Option<&crate::tabs_persist::RetainedSnapshotReferences>,
     ) -> BootScanReport {
         let mut report = BootScanReport::default();
         let marker_ids: Vec<String> = index.pending.keys().cloned().collect();
@@ -341,8 +349,8 @@ impl PaneLedger {
             self.gc_alias_tombstone_locked(root, index, &key, now_ms, &mut report);
         }
         let pane_close_ids: Vec<String> = index.close_envelopes.keys().cloned().collect();
-        for terminal_id in pane_close_ids {
-            self.gc_pane_close_locked(root, index, &terminal_id, now_ms, &mut report);
+        for key in pane_close_ids {
+            self.gc_pane_close_locked(root, index, &key, now_ms, snapshot_refs, &mut report);
         }
         report
     }
@@ -372,6 +380,7 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         key: &str,
         now_ms: i64,
+        snapshot_refs: Option<&crate::tabs_persist::RetainedSnapshotReferences>,
         report: &mut BootScanReport,
     ) {
         let Some(record) = index.close_envelopes.get(key).cloned() else {
@@ -385,6 +394,37 @@ impl PaneLedger {
             .unwrap_or(record.closed_at)
             .max(record.closed_at);
         if now_ms - newest < KILL_TOMBSTONE_TTL_MS {
+            return;
+        }
+        // Delta-r6-r4 (focused-episode-6 round 3, Finding 2) — REFERENCE-TIME
+        // retention (the alias-tombstones' "lifetime is the referenced row's"
+        // discipline, carried to close evidence): a record is prunable only
+        // once NO retained snapshot generation can reference its pane
+        // identity — by `terminalId`, by `createRequestId`, or by a
+        // `sessionRef` claim matching one of its kills. Retained generations
+        // prune by COUNT caps, never by age, so the pre-fix raw-TTL sweep
+        // could delete the only closed verdict while the stale open-pane
+        // snapshot still claims it — the exact re-offer the campaign exists
+        // to kill. `None` is the UNKNOWN arm (the reference scan failed):
+        // never prune on doubt.
+        let referenced = match snapshot_refs {
+            None => true,
+            Some(refs) => {
+                record
+                    .terminal_id
+                    .as_deref()
+                    .is_some_and(|t| refs.terminal_ids.contains(t))
+                    || record
+                        .create_request_id
+                        .as_deref()
+                        .is_some_and(|c| refs.create_request_ids.contains(c))
+                    || record.kills.iter().any(|k| {
+                        refs.claims
+                            .contains(&(k.provider.clone(), k.session_id.clone()))
+                    })
+            }
+        };
+        if referenced {
             return;
         }
         // Dominance has no TTL (focused-ep5-r3 Finding 4, carried to the
