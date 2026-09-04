@@ -21,7 +21,7 @@ vi.mock('@/lib/ws-client', () => ({
 import {
   EXIT_FALLBACK_GRACE_MS,
   KILL_ACK_TIMEOUT_MS,
-  reassertAllOpenTerminalPanes,
+  reassertAllOpenPanes,
   sendFreshAgentKillAndAwait,
   sendPaneClosedAndAwait,
   sendPaneOpened,
@@ -397,16 +397,16 @@ describe('kill-ack', () => {
     })
   })
 
-  describe('reassertAllOpenTerminalPanes (F2 — the per-ready sweep)', () => {
+  describe('reassertAllOpenPanes (F2/r4 — the per-ready sweep re-asserts EVERY displayed pane)', () => {
     const leaf = (paneId: string, content: Record<string, unknown>) => ({
       type: 'leaf' as const,
       id: paneId,
       content,
     })
 
-    it('asserts every DISPLAYED terminal pane (per tab, keyed by createRequestId) and skips the rest', () => {
+    it('asserts every DISPLAYED terminal AND fresh-agent pane (per tab, keyed by createRequestId) and skips the rest', () => {
       const send = vi.fn()
-      reassertAllOpenTerminalPanes(
+      reassertAllOpenPanes(
         {
           'tab-1': {
             type: 'split',
@@ -415,11 +415,20 @@ describe('kill-ack', () => {
             sizes: [50, 50],
             children: [
               leaf('p1', { kind: 'terminal', createRequestId: 'cr-a', terminalId: 'term-a', mode: 'shell', status: 'running' }),
-              leaf('p2', { kind: 'terminal', createRequestId: 'cr-b', mode: 'claude', status: 'creating' }), // in-flight create: CRID-only
+              {
+                type: 'split',
+                id: 's2',
+                direction: 'vertical',
+                sizes: [50, 50],
+                children: [
+                  leaf('p2', { kind: 'terminal', createRequestId: 'cr-b', mode: 'claude', status: 'creating' }), // in-flight create: CRID-only
+                  leaf('p5', { kind: 'fresh-agent', createRequestId: 'cr-fa', sessionType: 'freshclaude', provider: 'claude', sessionId: 'sess-fa', status: 'idle' }),
+                ],
+              },
             ],
           },
           'tab-2': leaf('p3', { kind: 'terminal', createRequestId: 'cr-c', terminalId: 'term-c', mode: 'shell', status: 'running' }),
-          'tab-3': leaf('p4', { kind: 'browser', url: 'https://example.com' }), // non-terminal: never
+          'tab-3': leaf('p4', { kind: 'browser', url: 'https://example.com' }), // non-session: never
           'tab-4': undefined, // dead entry: never
         } as never,
         { send },
@@ -427,13 +436,14 @@ describe('kill-ack', () => {
       expect(send.mock.calls.map(([m]) => m)).toEqual([
         { type: 'pane.opened', createRequestId: 'cr-a', tabId: 'tab-1' },
         { type: 'pane.opened', createRequestId: 'cr-b', tabId: 'tab-1' },
+        { type: 'pane.opened', createRequestId: 'cr-fa', tabId: 'tab-1' },
         { type: 'pane.opened', createRequestId: 'cr-c', tabId: 'tab-2' },
       ])
     })
 
-    it('sends nothing when no terminal pane is displayed (cheap every-ready call)', () => {
+    it('sends nothing when no session pane is displayed (cheap every-ready call)', () => {
       const send = vi.fn()
-      reassertAllOpenTerminalPanes({}, { send })
+      reassertAllOpenPanes({}, { send })
       expect(send).not.toHaveBeenCalled()
     })
   })

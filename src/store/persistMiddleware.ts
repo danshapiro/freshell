@@ -603,6 +603,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             deadSessionAdjudication: _dsa,
             reconcileWarming: _rw,
             reconcilePendingPanes: _rpp,
+            closingTabs: _ct,
             ...persistablePanes
           } = state.panes
           persistablePanesSection = {

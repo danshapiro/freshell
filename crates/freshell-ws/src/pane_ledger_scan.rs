@@ -411,6 +411,19 @@ impl PaneLedger {
         // open-pane snapshot still claims it — the exact re-offer the
         // campaign exists to kill. `None` is the UNKNOWN arm (the reference
         // scan failed): never prune on doubt.
+        //
+        // Focused-episode-7 round 4 (Finding F1): the reference check
+        // consults the record's WHOLE carried linkage, not only its top-level
+        // fields. A batch close (`pane-detach-batch:<tabId>`) stores every
+        // pane identity in `panes` and leaves the top-level `terminal_id` /
+        // `create_request_id` None — pre-fix this check was blind to them, so
+        // a snapshot-only batch close (no binding row: a plain shell or
+        // pre-association pane) pruned past the TTL while a retained
+        // generation still referenced its pane, and recovery re-offered the
+        // deliberately closed pane. The ROW-side keep below already consults
+        // the full carried linkage ([`detach_linkages`]); this arm now does
+        // too. Kill-record behavior is untouched: a kill envelope's snapshot
+        // linkage is its top-level fields (its `panes` stays empty).
         let referenced = match snapshot_refs {
             None => true,
             Some(refs) => {
@@ -422,6 +435,16 @@ impl PaneLedger {
                         .create_request_id
                         .as_deref()
                         .is_some_and(|c| refs.create_request_ids.contains(c))
+                    || record.panes.iter().any(|linkage| {
+                        (!linkage.create_request_id.is_empty()
+                            && refs
+                                .create_request_ids
+                                .contains(linkage.create_request_id.as_str()))
+                            || linkage
+                                .terminal_id
+                                .as_deref()
+                                .is_some_and(|t| refs.terminal_ids.contains(t))
+                    })
                     || record.kills.iter().any(|k| {
                         refs.claims
                             .contains(&(k.provider.clone(), k.session_id.clone()))

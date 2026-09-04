@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -19,7 +19,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
-import { collectPaneEntries } from '@/lib/pane-utils'
+import { collectSessionPaneIdentities } from '@/lib/pane-utils'
 import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
@@ -461,7 +461,7 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
  * Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the acknowledged
  * close gate. EVERY user- or system-initiated pane removal routes through one
  * of the three gated thunks below (`closePaneWithCleanup`, `closeTab`,
- * `replacePaneWithCleanup`), and each terminal-pane identity's durable close
+ * `replacePaneWithCleanup`), and each session-pane identity's durable close
  * evidence must be CONFIRMED before the layout loses the pane — the kill
  * lane's close-ack rule applied to the non-retiring pane-close family. An
  * unacknowledged send after `next(action)` (the r7-r2 shape) could be lost by
@@ -499,20 +499,20 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
  */
 type PaneCloseIdentity = { paneId: string; createRequestId: string; terminalId?: string }
 
-/** Terminal-pane identities (crid-bearing) in a layout subtree — the gate's unit. */
+/**
+ * Session-pane identities (crid-bearing) in a layout subtree — the gate's
+ * unit. Focused-episode-7 round 4 (Finding F2): FRESH-AGENT panes are
+ * collected exactly like terminal panes — they carry the same mandatory
+ * createRequestId `pane.closed` / `panes.closed` key by, so a whole-tab or
+ * replace-pane removal journals their per-REMOVAL close evidence too (the
+ * pane-header kill lane is an ADDITIONAL close path whose retiring kill
+ * envelope coexists; it never covered the removal of the pane itself).
+ * Fresh-agent identities are always CRID-only: no terminal id ever exists.
+ * The walk itself is the shared one (`collectSessionPaneIdentities`).
+ */
 function collectPaneCloseIdentities(layout: PaneNode | undefined): PaneCloseIdentity[] {
   if (!layout) return []
-  const identities: PaneCloseIdentity[] = []
-  for (const { paneId, content } of collectPaneEntries(layout)) {
-    if (content.kind !== 'terminal') continue
-    if (!content.createRequestId) continue // the pathological legacy shape sends nothing
-    identities.push({
-      paneId,
-      createRequestId: content.createRequestId,
-      ...(content.terminalId ? { terminalId: content.terminalId } : {}),
-    })
-  }
-  return identities
+  return collectSessionPaneIdentities(layout)
 }
 
 /**
@@ -608,7 +608,7 @@ export const closePaneWithCleanup = createAsyncThunk(
 export const closeTab = createAsyncThunk(
   'tabs/closeTab',
   async (tabId: string, { dispatch, getState }) => {
-    // F2: the whole-tab close is all-or-nothing — EVERY terminal-pane
+    // F2: the whole-tab close is all-or-nothing — EVERY session-pane
     // identity's close evidence must confirm before ANY state moves (the
     // closed-tab snapshot, the reopen stack, the tab list, the layout). One
     // failed close keeps the whole tab standing, exactly the TabBar
@@ -624,76 +624,101 @@ export const closeTab = createAsyncThunk(
     // gated pane wears the error (there is no per-pane answer to partition
     // by — the batch resolved as one op), and the kept set re-asserts open
     // (F2 — see the reassert helper).
-    const identities = collectPaneCloseIdentities((getState() as RootState).panes.layouts[tabId])
-    if (identities.length > 0) {
-      const ack = await sendPanesClosedAndAwait(tabId, identities, { timeoutMs: KILL_ACK_TIMEOUT_MS })
-      if (!ack.ok) {
-        log.warn('tab close evidence was not confirmed; the tab stays', {
-          tabId,
-          gatedPanes: identities.map((i) => i.paneId),
+    //
+    // Focused-episode-7 round 4 (Finding F3) — the close FREEZES the pane
+    // identity set: the batch names exactly the panes the tab held when the
+    // user acted, the panes slice refuses every pane-gaining / re-keying
+    // mutation on the closing tab while the batch is in flight
+    // (`panes.closingTabs` — the mid-wait split hazard), and the post-ack
+    // removal applies exactly that frozen set (pre-fix the removal read the
+    // CURRENT layout post-ack, so a pane minted into the still-visible tab
+    // during the bounded wait was removed with no close evidence ever
+    // journaled for it — and recovery could later re-offer it). A second
+    // close of an already-closing tab is a no-op; the in-flight close
+    // completes it.
+    const stateAtClose = getState() as RootState
+    if (stateAtClose.panes.closingTabs?.[tabId]) return
+    const frozenLayout = stateAtClose.panes.layouts[tabId]
+    const frozenTab = stateAtClose.tabs.tabs.find((item) => item.id === tabId)
+    const frozenPaneTitles = stateAtClose.panes.paneTitles[tabId]
+    const frozenPaneTitleSetByUser = stateAtClose.panes.paneTitleSetByUser?.[tabId]
+    const identities = collectPaneCloseIdentities(frozenLayout)
+    dispatch(markTabClosing({ tabId }))
+    try {
+      if (identities.length > 0) {
+        const ack = await sendPanesClosedAndAwait(tabId, identities, { timeoutMs: KILL_ACK_TIMEOUT_MS })
+        if (!ack.ok) {
+          log.warn('tab close evidence was not confirmed; the tab stays', {
+            tabId,
+            gatedPanes: identities.map((i) => i.paneId),
+          })
+          const timedOut = ack.timedOut === true
+          surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut })))
+          reassertKeptPanesOpen(tabId, identities)
+          return
+        }
+        // Confirmed: mark every identity so the detach middleware's belt
+        // skips the redundant duplicate sends (the one-shot mark/consume
+        // pattern).
+        for (const identity of identities) {
+          markPaneCloseEvidenceConfirmed(identity.createRequestId)
+        }
+      }
+      const tabRegistryState = (stateAtClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
+      const serverInstanceId = stateAtClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+      if (frozenTab && frozenLayout && tabRegistryState) {
+        const paneCount = countPaneLeaves(frozenLayout)
+        const openDurationMs = Math.max(0, Date.now() - (frozenTab.createdAt || Date.now()))
+        const keep = shouldKeepClosedTab({
+          openDurationMs,
+          paneCount,
+          titleSetByUser: !!frozenTab.titleSetByUser,
         })
-        const timedOut = ack.timedOut === true
-        surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut })))
-        reassertKeptPanesOpen(tabId, identities)
-        return
+        if (keep) {
+          dispatch(recordClosedTabSnapshot(buildClosedTabRegistryRecord({
+            tab: frozenTab,
+            layout: frozenLayout,
+            serverInstanceId,
+            paneTitles: frozenPaneTitles,
+            extensions: stateAtClose.extensions?.entries,
+            deviceId: tabRegistryState.deviceId,
+            deviceLabel: tabRegistryState.deviceLabel,
+            revision: 0,
+            updatedAt: Date.now(),
+          })))
+        }
       }
-      // Confirmed: mark every identity so the detach middleware's belt skips
-      // the redundant duplicate sends (the one-shot mark/consume pattern).
-      for (const identity of identities) {
-        markPaneCloseEvidenceConfirmed(identity.createRequestId)
+
+      // Push to the reopen stack so Alt+H can restore this tab
+      if (frozenTab && frozenLayout) {
+        dispatch(pushReopenEntry({
+          tab: { ...frozenTab },
+          layout: frozenLayout,
+          paneTitles: frozenPaneTitles || {},
+          paneTitleSetByUser: frozenPaneTitleSetByUser || {},
+          closedAt: Date.now(),
+        }))
       }
-    }
-    const stateBeforeClose = getState() as RootState
-    const tab = stateBeforeClose.tabs.tabs.find((item) => item.id === tabId)
-    const layout = stateBeforeClose.panes.layouts[tabId]
-    const tabRegistryState = (stateBeforeClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
-    const serverInstanceId = stateBeforeClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
-    if (tab && layout && tabRegistryState) {
-      const paneCount = countPaneLeaves(layout)
-      const openDurationMs = Math.max(0, Date.now() - (tab.createdAt || Date.now()))
-      const keep = shouldKeepClosedTab({
-        openDurationMs,
-        paneCount,
-        titleSetByUser: !!tab.titleSetByUser,
-      })
-      if (keep) {
-        dispatch(recordClosedTabSnapshot(buildClosedTabRegistryRecord({
-          tab,
-          layout,
-          serverInstanceId,
-          paneTitles: stateBeforeClose.panes.paneTitles[tabId],
-          extensions: stateBeforeClose.extensions?.entries,
-          deviceId: tabRegistryState.deviceId,
-          deviceLabel: tabRegistryState.deviceLabel,
-          revision: 0,
-          updatedAt: Date.now(),
-        })))
+
+      // The frozen set is authoritative (F3): remove the tab and the layout
+      // and clean up exactly the panes the acknowledged batch covered — with
+      // the freeze above, the current layout equals it by construction.
+      const paneIds = collectPaneIds(frozenLayout)
+
+      dispatch(removeTab(tabId))
+      dispatch(removeLayout({ tabId }))
+
+      // Clean up attention and drafts for the tab and all its panes
+      dispatch(clearTabAttention({ tabId }))
+      for (const paneId of paneIds) {
+        dispatch(clearPaneAttention({ paneId }))
+        clearDraft(paneId)
       }
-    }
-
-    // Push to the reopen stack so Alt+H can restore this tab
-    if (tab && layout) {
-      dispatch(pushReopenEntry({
-        tab: { ...tab },
-        layout,
-        paneTitles: stateBeforeClose.panes.paneTitles[tabId] || {},
-        paneTitleSetByUser: stateBeforeClose.panes.paneTitleSetByUser?.[tabId] || {},
-        closedAt: Date.now(),
-      }))
-    }
-
-    // Collect all pane IDs before removing the layout
-    const currentLayout = (getState() as RootState).panes.layouts[tabId]
-    const paneIds = collectPaneIds(currentLayout)
-
-    dispatch(removeTab(tabId))
-    dispatch(removeLayout({ tabId }))
-
-    // Clean up attention and drafts for the tab and all its panes
-    dispatch(clearTabAttention({ tabId }))
-    for (const paneId of paneIds) {
-      dispatch(clearPaneAttention({ paneId }))
-      clearDraft(paneId)
+    } finally {
+      // removeLayout already cleared the flag on the success path; this
+      // covers the failure return and any throw — a stuck flag would freeze
+      // the kept tab forever.
+      dispatch(clearTabClosing({ tabId }))
     }
   }
 )

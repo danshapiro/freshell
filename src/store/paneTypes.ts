@@ -407,6 +407,22 @@ export interface PanesState {
   /** Ephemeral: paneKey -> wall-clock ms when a reconcile request naming this pane went out.
    *  While present (and young), the pane's mount drive defers its create until the verdict folds. */
   reconcilePendingPanes?: Record<string, number>
+  /**
+   * Tabs whose close is IN FLIGHT (focused-episode-7 round 4, Finding F3) —
+   * set by the `closeTab` thunk before it awaits the close batch's
+   * acknowledgement, cleared on either resolution. While a tab is closing,
+   * its pane identity set is FROZEN: the reducers that gain or re-key a pane
+   * (`splitPane`/`addPane`/`replacePane`/`initLayout`/`restoreLayout`/
+   * `resetLayout`/`restartFreshAgentCreate`, an identity-changing
+   * `updatePaneContent` fold) refuse — otherwise a pane minted into the
+   * still-visible tab during the bounded ack wait would be removed with the
+   * tab while the acknowledged batch never carried its close evidence, and
+   * recovery could later re-offer it. `removeLayout` clears the flag
+   * alongside the layout (the tab is gone). Ephemeral: never persisted
+   * (stripped in persistMiddleware beside the other volatile maps), never
+   * hydrated.
+   */
+  closingTabs?: Record<string, true>
 }
 
 /**

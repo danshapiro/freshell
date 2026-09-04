@@ -19,7 +19,7 @@ import {
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
-import { reassertAllOpenTerminalPanes } from '@/lib/kill-ack'
+import { reassertAllOpenPanes } from '@/lib/kill-ack'
 import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -1124,14 +1124,15 @@ export default function App() {
             } else {
               ws.clearReconcileCreateHold()
             }
-            // Focused-episode-7 round 3 (Finding F2) — the per-ready open
-            // re-assertion sweep: assert every terminal pane the client is
-            // DISPLAYING, so the server consumes any standing close record
-            // that contradicts the displayed layout (the healed shape is a
-            // committed close whose ack was lost mid-socket-death — incl.
-            // across a page reload, which drops the send queue). One
-            // idempotent fire-and-forget message per displayed pane.
-            reassertAllOpenTerminalPanes(appStore.getState().panes.layouts)
+            // Focused-episode-7 round 3 (Finding F2; round-4 widened to
+            // fresh-agent panes) — the per-ready open re-assertion sweep:
+            // assert every session pane the client is DISPLAYING, so the
+            // server consumes any standing close record that contradicts the
+            // displayed layout (the healed shape is a committed close whose
+            // ack was lost mid-socket-death — incl. across a page reload,
+            // which drops the send queue). One idempotent fire-and-forget
+            // message per displayed pane.
+            reassertAllOpenPanes(appStore.getState().panes.layouts)
           }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline

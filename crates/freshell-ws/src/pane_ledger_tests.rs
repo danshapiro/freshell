@@ -6346,6 +6346,71 @@ fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Focused-episode-7 round 4 (Finding F1) — the batch envelope's
+/// SNAPSHOT-side retention: the record's carried per-pane identities (its
+/// `panes` list — a batch record's top-level crid/terminal ids are None) must
+/// reach the retained-snapshot reference check exactly as the top-level
+/// fields do for the single-pane shape. Pre-fix the check consulted only the
+/// top-level fields, so a snapshot-only batch close (NO binding row — a
+/// plain shell or pre-association pane never stamped one) pruned past the
+/// six-hour TTL while a retained generation still referenced its pane — the
+/// recovery offer then resurrected a pane the user deliberately closed. The
+/// ROW-side half (a surviving row retains the envelope) is pinned by the
+/// batch test above; this pins the snapshot-only + no-row case past the TTL
+/// edge.
+#[test]
+fn a_snapshot_referenced_batch_close_never_prunes_past_the_ttl() {
+    let root = temp_root("batch-close-snapshot-retained");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // NO binding rows — the finding's exact shape (plain shell /
+    // pre-association panes never stamp one).
+    ledger
+        .close_panes_detached(
+            "tab-snap",
+            &[
+                PaneCloseLinkage {
+                    create_request_id: "req-s1".to_string(),
+                    terminal_id: Some("term-s1".to_string()),
+                },
+                PaneCloseLinkage {
+                    create_request_id: "req-s2".to_string(),
+                    terminal_id: None,
+                },
+            ],
+            2_000,
+        )
+        .expect("the batch close persists");
+    let batch_key = PaneLedger::pane_detach_batch_envelope_key("tab-snap");
+    let aged = 2_000 + KILL_TOMBSTONE_TTL_MS + 60_000;
+
+    // A retained generation naming a carried createRequestId retains it.
+    let mut refs = crate::tabs_persist::RetainedSnapshotReferences::default();
+    refs.create_request_ids.insert("req-s2".to_string());
+    let report = ledger.gc(aged, &never_absent, None, Some(&refs));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "a snapshot-referenced batch close outlives the TTL (crid arm): {report:?}"
+    );
+
+    // So does one naming a carried TERMINAL id.
+    let mut refs = crate::tabs_persist::RetainedSnapshotReferences::default();
+    refs.terminal_ids.insert("term-s1".to_string());
+    let report = ledger.gc(aged, &never_absent, None, Some(&refs));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "a snapshot-referenced batch close outlives the TTL (terminal-id arm): {report:?}"
+    );
+
+    // Control: referenced by NO retained generation and covered by NO row,
+    // the aged envelope prunes (the pre-existing row-backed test's tail).
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report.pane_closes_swept.contains(&batch_key),
+        "unreferenced and row-less, the aged batch close prunes: {report:?}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The durable open re-assertion (F2): a committed close whose ack was lost
 /// leaves the record standing under a still-open pane. `pane.opened` consumes
 /// the pane's linkage from every DETACH-family record — deleting a record

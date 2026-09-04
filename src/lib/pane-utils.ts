@@ -106,6 +106,45 @@ export function collectPaneEntries(node: PaneNode): PaneEntry[] {
   ]
 }
 
+/**
+ * One close-evidence-bearing pane identity (focused-episode-7 round 4,
+ * Finding F2): the pane id plus the createRequestId the `pane.closed` /
+ * `panes.closed` / `pane.opened` lanes key by, and the terminalId when the
+ * pane has one (terminal panes only — fresh-agent identities are CRID-only).
+ */
+export interface SessionPaneIdentity {
+  paneId: string
+  createRequestId: string
+  terminalId?: string
+}
+
+/**
+ * Every session-pane identity in a subtree — terminal AND fresh-agent panes.
+ * Both kinds carry the mandatory createRequestId the close/open lanes key by,
+ * so the close gate, the middleware belt, and the per-ready open sweep all
+ * consume this ONE walker (three hand-rolled kind checks would drift again —
+ * the round-4 terminal-only exclusions were exactly that drift). The
+ * pathological legacy CRID-less shape is skipped (never a malformed record
+ * key), and non-session panes (browser/editor/picker/host-stats/extension)
+ * carry no identity the close lanes know.
+ */
+export function collectSessionPaneIdentities(node: PaneNode): SessionPaneIdentity[] {
+  const identities: SessionPaneIdentity[] = []
+  for (const { paneId, content } of collectPaneEntries(node)) {
+    if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') continue
+    const createRequestId = typeof content.createRequestId === 'string' && content.createRequestId
+      ? content.createRequestId
+      : undefined
+    if (!createRequestId) continue
+    identities.push({
+      paneId,
+      createRequestId,
+      ...(content.kind === 'terminal' && content.terminalId ? { terminalId: content.terminalId } : {}),
+    })
+  }
+  return identities
+}
+
 export function findPaneContent(node: PaneNode, paneId: string): PaneContent | null {
   if (node.type === 'leaf') {
     return node.id === paneId ? node.content : null

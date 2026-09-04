@@ -1336,6 +1336,67 @@ fn a_detach_close_covers_its_snapshot_pane_by_create_request_id_but_never_a_reat
     );
 }
 
+/// Focused-episode-7 round 4 (Finding F2) — the fresh-agent coverage half of
+/// the mixed tab close: once the gated collectors carry fresh-agent
+/// identities, the batch envelope's flattened linkage covers a snapshot
+/// fresh-agent pane through the SAME createRequestId arm (the consult is
+/// kind-agnostic — `payload.createRequestId`), so a deliberately closed
+/// fresh-agent pane verdicts closed and is never restored, and the mixed
+/// batch's terminal pane verdicts closed beside it, while an uncovered
+/// fresh-agent sibling is never tainted. The ROW half is the ledger's
+/// origin-keyed join (delta-r7-round-3): a fresh-agent row's
+/// origin/advisory createRequestId is exactly the batch-carried key.
+#[test]
+fn a_detach_close_covers_a_fresh_agent_snapshot_pane() {
+    let union = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([
+                { "paneId": "p-fa", "kind": "fresh-agent",
+                  "payload": { "provider": "opencode", "sessionType": "freshopencode",
+                               "sessionRef": { "provider": "opencode", "sessionId": "S-fa-closed" },
+                               "createRequestId": "req-fa-closed" } },
+                { "paneId": "p-t", "kind": "terminal",
+                  "payload": { "mode": "shell",
+                               "createRequestId": "req-t-closed",
+                               "liveTerminal": { "terminalId": "term-t", "serverInstanceId": "srv-x" } } },
+                { "paneId": "p-open", "kind": "fresh-agent",
+                  "payload": { "provider": "opencode", "sessionType": "freshopencode",
+                               "sessionRef": { "provider": "opencode", "sessionId": "S-fa-open" },
+                               "createRequestId": "req-fa-open" } },
+            ]),
+        ),
+    };
+    let out = build_inventory(
+        vec![union],
+        vec![],
+        no_live(),
+        &no_evidence(),
+        // Exactly the flatten the whole-tab batch envelope produces
+        // (`list_pane_detach_closes`): the fresh-agent linkage is CRID-only.
+        &closes_with_detach(&[("req-fa-closed", None), ("req-t-closed", Some("term-t"))]),
+    );
+    let panes = &out["device"]["tabs"][0]["panes"];
+    assert_eq!(
+        panes[0]["ledgerState"], "closed",
+        "the closed fresh-agent pane verdicts closed (never restored): {panes}"
+    );
+    assert_eq!(
+        panes[0]["live"], false,
+        "a close-covered fresh-agent pane never reads live: {panes}"
+    );
+    assert_eq!(
+        panes[1]["ledgerState"], "closed",
+        "the mixed batch's terminal pane verdicts closed beside it: {panes}"
+    );
+    assert_ne!(
+        panes[2]["ledgerState"], "closed",
+        "the uncovered fresh-agent sibling is never tainted: {panes}"
+    );
+}
+
 #[test]
 fn content_id_is_stable_and_input_sensitive() {
     // D8 repair: the rows must actually be OFFERED (attributed + within grace

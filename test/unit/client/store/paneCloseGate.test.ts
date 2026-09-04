@@ -24,7 +24,7 @@ import tabsReducer, {
   closePaneWithCleanup,
   replacePaneWithCleanup,
 } from '@/store/tabsSlice'
-import panesReducer, { initLayout, splitPane, setPaneCloseError } from '@/store/panesSlice'
+import panesReducer, { initLayout, splitPane, setPaneCloseError, addPane, replacePane, updatePaneContent, hydratePanes } from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { KILL_ACK_TIMEOUT_MS } from '@/lib/kill-ack'
@@ -80,6 +80,17 @@ function terminalContent(crid: string, terminalId?: string): PaneContent {
     ...(terminalId ? { terminalId } : {}),
     status: 'running',
     mode: 'shell',
+  } as PaneContent
+}
+
+function freshAgentContent(crid: string): PaneContent {
+  return {
+    kind: 'fresh-agent',
+    createRequestId: crid,
+    provider: 'claude',
+    sessionType: 'freshclaude',
+    sessionId: `sess-${crid}`,
+    status: 'idle',
   } as PaneContent
 }
 
@@ -288,6 +299,83 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
   })
 })
 
+describe('focused-episode-7 round 4 (F2) — fresh-agent panes are gated exactly like terminal panes', () => {
+  function createMixedStore() {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', 'term-a') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'vertical',
+      newContent: freshAgentContent('req-fa'),
+      newPaneId: 'pane-fa',
+    }))
+    mockSend.mockClear()
+    return store
+  }
+
+  it('closePaneWithCleanup on a fresh-agent pane sends the CRID-only pane.closed and awaits the ack', async () => {
+    const store = createMixedStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    // Gated: nothing moves before the ack; the message names the pane
+    // identity the fresh-agent pane always carries (no terminalId — the
+    // in-flight-create shape is the only shape this pane kind knows).
+    expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-fa' })
+    expect(paneContents(store, 'tab-1')).toHaveLength(2)
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('a failed fresh-agent pane close keeps the pane and re-asserts it open', async () => {
+    const store = createMixedStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    emit({ type: 'pane.closed.result', createRequestId: 'req-fa', success: false })
+    await close
+    expect(paneContents(store, 'tab-1')).toHaveLength(2)
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-fa', tabId: 'tab-1' }),
+    ])
+  })
+
+  it('replacePaneWithCleanup gates a fresh-agent pane too (the per-REMOVAL evidence, not per-kill)', async () => {
+    const store = createMixedStore()
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    expect(mockSend).toHaveBeenCalledWith({ type: 'pane.closed', createRequestId: 'req-fa' })
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-fa')?.content.kind).toBe('fresh-agent')
+    ackAllPaneCloses()
+    await replace
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-fa')?.content.kind).toBe('picker')
+  })
+
+  it('a mixed whole-tab close carries BOTH identities in the ONE batch and re-asserts BOTH on failure', async () => {
+    const store = createMixedStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    const batches = sentCallsOf('panes.closed')
+    expect(batches).toHaveLength(1)
+    expect(batches[0].panes).toEqual([
+      { createRequestId: 'req-a', terminalId: 'term-a' },
+      { createRequestId: 'req-fa' },
+    ])
+    // A failed batch keeps the tab and re-asserts EVERY kept pane open —
+    // the fresh-agent pane included (its standing close record must be
+    // consumable by its own open re-assertion, per-REMOVAL).
+    ackPanesClosedBatches({ success: false })
+    await close
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-a', tabId: 'tab-1' }),
+      expect.objectContaining({ createRequestId: 'req-fa', tabId: 'tab-1' }),
+    ])
+    // And the healthy path: an acked mixed batch removes the whole tab.
+    const second = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await second
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
+  })
+})
+
 describe('closeTab — the all-or-nothing close gate (F2) + ONE envelope per tab close (F1)', () => {
   it('success: ONE acknowledged batch envelope covers the whole pane set → the whole tab is gone', async () => {
     const store = createTwoPaneStore()
@@ -374,6 +462,171 @@ describe('closeTab — the all-or-nothing close gate (F2) + ONE envelope per tab
     await store.dispatch(closeTab('tab-1'))
     expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
     expect(mockSend).not.toHaveBeenCalled()
+  })
+})
+
+describe('focused-episode-7 round 4 (F3) — a pending tab close freezes the pane identity set', () => {
+  it.each([
+    {
+      name: 'splitPane',
+      mutate: (store: ReturnType<typeof createStore>) => store.dispatch(splitPane({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        direction: 'horizontal',
+        newContent: terminalContent('req-late'),
+        newPaneId: 'pane-late',
+      })),
+      expectRefused: (store: ReturnType<typeof createStore>) =>
+        expect(paneContents(store, 'tab-1').some((p) => (p.content as { createRequestId?: string }).createRequestId === 'req-late')).toBe(false),
+    },
+    {
+      name: 'addPane',
+      mutate: (store: ReturnType<typeof createStore>) => store.dispatch(addPane({
+        tabId: 'tab-1',
+        newContent: terminalContent('req-late'),
+      })),
+      expectRefused: (store: ReturnType<typeof createStore>) =>
+        expect(paneContents(store, 'tab-1').some((p) => (p.content as { createRequestId?: string }).createRequestId === 'req-late')).toBe(false),
+    },
+    {
+      name: 'replacePane (a re-key to a picker the user could then mint content into)',
+      mutate: (store: ReturnType<typeof createStore>) => store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'pane-2' })),
+      expectRefused: (store: ReturnType<typeof createStore>) =>
+        expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('terminal'),
+    },
+    {
+      name: 'updatePaneContent minting a new identity (the picker-select path)',
+      mutate: (store: ReturnType<typeof createStore>) => store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-2',
+        // No createRequestId in the input: normalize mints a NEW pane identity
+        // — exactly the gain/re-key the frozen set outlaws mid-close.
+        content: { kind: 'terminal', mode: 'shell' } as PaneContent,
+      })),
+      expectRefused: (store: ReturnType<typeof createStore>) =>
+        expect((paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string } | undefined)?.createRequestId).toBe('req-b'),
+    },
+  ])('a mid-wait $name is refused; the post-ack removal applies exactly the frozen set', async ({ mutate, expectRefused }) => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    // Sanity: the batch named exactly the frozen pair.
+    expect(sentCallsOf('panes.closed')[0]?.panes).toEqual([
+      { createRequestId: 'req-a', terminalId: 'term-a' },
+      { createRequestId: 'req-b', terminalId: 'term-b' },
+    ])
+
+    // THE FINDING'S SCENARIO: the still-visible tab gains/re-keys a pane
+    // while the close's acknowledgement is in flight — REFUSED, so the pane
+    // can never be removed with no close evidence journaled for it.
+    mutate(store)
+    expectRefused(store)
+
+    ackPanesClosedBatches()
+    await close
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+    // And no second batch ever went out carrying the refused identity.
+    expect(sentCallsOf('panes.closed')).toHaveLength(1)
+  })
+
+  it('an identity-PRESERVING updatePaneContent fold still lands mid-wait (terminal.created must not be lost)', async () => {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', 'term-a') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'vertical',
+      newContent: terminalContent('req-b'), // the in-flight create: CRID-only
+      newPaneId: 'pane-2',
+    }))
+    mockSend.mockClear()
+    const close = store.dispatch(closeTab('tab-1'))
+    expect(sentCallsOf('panes.closed')[0]?.panes).toEqual([
+      { createRequestId: 'req-a', terminalId: 'term-a' },
+      { createRequestId: 'req-b' },
+    ])
+    // terminal.created folds the SAME identity — allowed even on a closing tab.
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-2',
+      content: terminalContent('req-b', 'term-b-late'),
+    }))
+    expect((paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { terminalId?: string }).terminalId)
+      .toBe('term-b-late')
+    ackPanesClosedBatches()
+    await close
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+  })
+
+  it('a failed close lifts the block — the kept tab mutates normally again', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: terminalContent('req-during'),
+      newPaneId: 'pane-during',
+    }))
+    expect(paneContents(store, 'tab-1')).toHaveLength(2) // refused mid-wait
+    ackPanesClosedBatches({ success: false })
+    await close
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: terminalContent('req-after'),
+      newPaneId: 'pane-after',
+    }))
+    expect(paneContents(store, 'tab-1')).toHaveLength(3) // allowed again after resolution
+  })
+
+  it('a second closeTab dispatch while the close is in flight sends no second batch — the in-flight close completes it', async () => {
+    const store = createTwoPaneStore()
+    const first = store.dispatch(closeTab('tab-1'))
+    const second = store.dispatch(closeTab('tab-1'))
+    expect(sentCallsOf('panes.closed')).toHaveLength(1)
+    ackPanesClosedBatches()
+    await Promise.all([first, second])
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
+  })
+
+  it('a hydratePanes fold mid-wait never re-seeds the closing tab (the remote shape cannot grow the frozen set)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    const local = store.getState().panes
+    // A remote hydration claims the tab holds THREE panes (a newer generation
+    // on another device). The closing tab keeps its frozen local layout.
+    store.dispatch(hydratePanes({
+      ...local,
+      layouts: {
+        'tab-1': {
+          type: 'split',
+          id: 'rs1',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            { type: 'leaf', id: 'pane-1', content: terminalContent('req-a', 'term-a') },
+            {
+              type: 'split',
+              id: 'rs2',
+              direction: 'vertical',
+              sizes: [50, 50],
+              children: [
+                { type: 'leaf', id: 'pane-2', content: terminalContent('req-b', 'term-b') },
+                { type: 'leaf', id: 'pane-remote', content: terminalContent('req-remote', 'term-remote') },
+              ],
+            },
+          ],
+        },
+      },
+    }))
+    expect(paneContents(store, 'tab-1').some((p) => (p.content as { createRequestId?: string }).createRequestId === 'req-remote')).toBe(false)
+    ackPanesClosedBatches()
+    await close
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
   })
 })
 

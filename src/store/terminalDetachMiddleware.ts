@@ -1,6 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
-import { collectAllTerminalIds, collectPaneEntries } from '@/lib/pane-utils'
+import { collectAllTerminalIds, collectSessionPaneIdentities } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
 import { consumePaneCloseEvidenceMark } from '@/lib/pane-close-evidence-marks'
 import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles, closePane, removeLayout, replacePane } from './panesSlice'
@@ -47,10 +47,15 @@ const skipDetachActionTypes = new Set<string>([
  *   discarded for a picker — the user-visible REMOVAL of that pane identity
  *   (F1: it previously sent a plain detach and journaled nothing).
  *
- * For EVERY removed terminal-pane identity the middleware sends ONE
- * `pane.closed` message keyed by the pane's `createRequestId` — present from
- * creation, never absent — and carrying the pane's terminalId when it has
- * one. This is deliberately decoupled from the detach loop below (F2):
+ * For EVERY removed SESSION-pane identity (terminal AND fresh-agent —
+ * focused-episode-7 round 4, Finding F2: the gate's collectors now cover
+ * fresh-agent panes, and this belt is the floor for the same identity class)
+ * the middleware sends ONE `pane.closed` message keyed by the pane's
+ * `createRequestId` — present from creation, never absent — and carrying the
+ * pane's terminalId when it has one (never for fresh-agent panes). The
+ * pane-header fresh-agent KILL lane is an ADDITIONAL close path whose
+ * retiring kill envelope coexists — pane-close evidence is per-REMOVAL, not
+ * per-kill. This is deliberately decoupled from the detach loop below (F2):
  * close evidence is about the PANE (terminalId-less in-flight creates count;
  * panes sharing one terminal each count; a multi-pane removal journals every
  * pane's CRID), while the detach is about the TERMINAL (identity-driven,
@@ -72,22 +77,25 @@ const skipDetachActionTypes = new Set<string>([
  */
 const paneCloseActionTypes = new Set<string>([closePane.type, removeLayout.type, replacePane.type])
 
-/** The terminal-pane identities (createRequestId) of every layout, keyed `tabId:paneId`. */
-function collectTerminalPaneIdentities(
+/**
+ * The session-pane identities (createRequestId) of every layout, keyed
+ * `tabId:paneId` — terminal AND fresh-agent panes (focused-episode-7 round 4,
+ * Finding F2): both kinds carry the mandatory createRequestId the close lanes
+ * key by, so every REMOVED session-pane identity journals its evidence, never
+ * terminal-only. Fresh-agent identities are CRID-only (no terminal id ever
+ * exists for them). The per-tree walk is the shared
+ * `collectSessionPaneIdentities` (lib/pane-utils).
+ */
+function collectLayoutSessionPaneIdentities(
   layouts: PanesStateSlice['panes']['layouts'],
 ): Map<string, { createRequestId: string; terminalId?: string }> {
   const identities = new Map<string, { createRequestId: string; terminalId?: string }>()
   for (const [tabId, root] of Object.entries(layouts)) {
     if (!root) continue
-    for (const { paneId, content } of collectPaneEntries(root)) {
-      if (content.kind !== 'terminal') continue
-      const createRequestId = typeof content.createRequestId === 'string' && content.createRequestId
-        ? content.createRequestId
-        : undefined
-      if (!createRequestId) continue
-      identities.set(`${tabId}:${paneId}`, {
-        createRequestId,
-        ...(content.terminalId ? { terminalId: content.terminalId } : {}),
+    for (const identity of collectSessionPaneIdentities(root)) {
+      identities.set(`${tabId}:${identity.paneId}`, {
+        createRequestId: identity.createRequestId,
+        ...(identity.terminalId ? { terminalId: identity.terminalId } : {}),
       })
     }
   }
@@ -99,9 +107,9 @@ function collectRemovedPaneIdentities(
   before: PanesStateSlice['panes']['layouts'],
   after: PanesStateSlice['panes']['layouts'],
 ): Array<{ createRequestId: string; terminalId?: string }> {
-  const afterIdentities = collectTerminalPaneIdentities(after)
+  const afterIdentities = collectLayoutSessionPaneIdentities(after)
   const removed: Array<{ createRequestId: string; terminalId?: string }> = []
-  for (const [key, identity] of collectTerminalPaneIdentities(before)) {
+  for (const [key, identity] of collectLayoutSessionPaneIdentities(before)) {
     if (afterIdentities.get(key)?.createRequestId === identity.createRequestId) continue
     removed.push(identity)
   }

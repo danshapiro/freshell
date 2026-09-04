@@ -392,6 +392,7 @@ function loadInitialPanesState(): PanesState {
     deadSessionAdjudication: [],
     reconcileWarming: null,
     reconcilePendingPanes: {},
+    closingTabs: {},
   }
 
   try {
@@ -412,6 +413,9 @@ function loadInitialPanesState(): PanesState {
       deadSessionAdjudication: [],
       reconcileWarming: null,
       reconcilePendingPanes: {},
+      // The close guard is strictly in-flight state: a reload has no pending
+      // close (the thunk's await died with the page).
+      closingTabs: {},
     }
     state = cleanOrphanedLayouts(state)
     return state
@@ -1109,6 +1113,49 @@ function findFirstLeafId(node: PaneNode): string {
   return findFirstLeafId(node.children[0])
 }
 
+/**
+ * Focused-episode-7 round 4 (Finding F3) — the pending-close freeze. While a
+ * tab's close is in flight (the `closeTab` thunk is awaiting the close
+ * batch's acknowledgement), the tab's pane identity set is FROZEN: it must
+ * match exactly the pane set the acknowledged batch covered. The reducers
+ * that would GAIN or RE-KEY a pane on the closing tab (splitPane / addPane /
+ * replacePane / initLayout / restoreLayout / resetLayout /
+ * restartFreshAgentCreate, and any identity-CHANGING updatePaneContent fold)
+ * refuse (logged, no state change) — pre-fix, the removal applied to the
+ * CURRENT layout post-ack, so a pane split into the still-visible tab during
+ * the bounded wait was removed with the tab while its close evidence was
+ * never journaled, and recovery could later re-offer it. Identity-PRESERVING
+ * folds (the `terminal.created` terminalId fold, reconcile verdicts, title
+ * updates) are never refused: they must keep landing so a close that fails
+ * leaves an uninjured tab.
+ */
+function isTabClosePending(state: PanesState, tabId: string): boolean {
+  return state.closingTabs?.[tabId] === true
+}
+
+/** Shared refusal for the gaining/re-keying reducers. Returns true when refused. */
+function refuseMutationWhileClosing(state: PanesState, tabId: string, op: string): boolean {
+  if (!isTabClosePending(state, tabId)) return false
+  log.warn('refusing a pane mutation while the tab close is in flight', { op, tabId })
+  return true
+}
+
+/**
+ * The pane identity a content carries, when it carries one: the
+ * createRequestId of the session panes (terminal/fresh-agent — the close
+ * lanes' key). Non-session panes (browser/editor/picker/host-stats/extension)
+ * carry none.
+ */
+function contentPaneIdentityKey(content: PaneContent | undefined): string | undefined {
+  if (!content) return undefined
+  if (content.kind === 'terminal' || content.kind === 'fresh-agent') {
+    return typeof content.createRequestId === 'string' && content.createRequestId
+      ? content.createRequestId
+      : undefined
+  }
+  return undefined
+}
+
 export const panesSlice = createSlice({
   name: 'panes',
   initialState,
@@ -1118,6 +1165,7 @@ export const panesSlice = createSlice({
       action: PayloadAction<{ tabId: string; content: PaneContentInput; paneId?: string }>
     ) => {
       const { tabId, content, paneId: providedPaneId } = action.payload
+      if (refuseMutationWhileClosing(state, tabId, 'initLayout')) return
       // Don't overwrite existing layout
       if (state.layouts[tabId]) return
 
@@ -1139,6 +1187,7 @@ export const panesSlice = createSlice({
       action: PayloadAction<{ tabId: string; layout: PaneNode; paneTitles: Record<string, string>; paneTitleSetByUser?: Record<string, boolean> }>
     ) => {
       const { tabId, layout, paneTitles, paneTitleSetByUser } = action.payload
+      if (refuseMutationWhileClosing(state, tabId, 'restoreLayout')) return
       if (state.layouts[tabId]) return
 
       const normalizedLayout = normalizeRestoredTree(layout)
@@ -1157,6 +1206,7 @@ export const panesSlice = createSlice({
       action: PayloadAction<{ tabId: string; content: PaneContentInput }>
     ) => {
       const { tabId, content } = action.payload
+      if (refuseMutationWhileClosing(state, tabId, 'resetLayout')) return
       const paneId = nanoid()
       const normalized = normalizePaneContent(content)
       state.layouts[tabId] = {
@@ -1183,6 +1233,7 @@ export const panesSlice = createSlice({
       const { tabId, paneId, direction, newContent, newPaneId: providedPaneId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      if (refuseMutationWhileClosing(state, tabId, 'splitPane')) return
 
       const newPaneId = providedPaneId ?? nanoid()
       const normalizedContent = normalizePaneContent(newContent)
@@ -1237,6 +1288,7 @@ export const panesSlice = createSlice({
       const { tabId, newContent } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      if (refuseMutationWhileClosing(state, tabId, 'addPane')) return
 
       const activePaneId = state.activePane[tabId]
 
@@ -1516,6 +1568,7 @@ export const panesSlice = createSlice({
       const { tabId, paneId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      if (refuseMutationWhileClosing(state, tabId, 'replacePane')) return
 
       const pickerContent: PaneContent = { kind: 'picker' }
       let found = false
@@ -1559,6 +1612,19 @@ export const panesSlice = createSlice({
       const { tabId, paneId, content } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      if (isTabClosePending(state, tabId)) {
+        // The pending-close freeze (F3): only IDENTITY-CHANGING folds refuse
+        // (the picker-select path mints a fresh createRequestId; a wholesale
+        // content swap re-keys). Identity-preserving folds — the
+        // terminal.created terminalId fold, status/metadata writes — still
+        // land.
+        const target = findLeaf(root, paneId)
+        const next = target ? normalizePaneContent(content, target.content) : undefined
+        if (contentPaneIdentityKey(next) !== contentPaneIdentityKey(target?.content)) {
+          log.warn('refusing an identity-changing pane content fold while the tab close is in flight', { tabId, paneId })
+          return
+        }
+      }
       let normalizedContentForTitle: PaneContent | null = null
       let previousContentForTitle: PaneContent | null = null
 
@@ -1691,6 +1757,9 @@ export const panesSlice = createSlice({
       const { tabId, paneId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      // The retry mints a fresh createRequestId — a re-key the pending-close
+      // freeze (F3) outlaws while the tab close is in flight.
+      if (refuseMutationWhileClosing(state, tabId, 'restartFreshAgentCreate')) return
 
       function restartContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
@@ -1791,6 +1860,22 @@ export const panesSlice = createSlice({
       clearPaneRefreshRequest(state, tabId, paneId)
     },
 
+    /**
+     * Focused-episode-7 round 4 (Finding F3) — mark/un-mark a tab's close as
+     * IN FLIGHT. The `closeTab` thunk marks before it awaits the batch
+     * acknowledgement and clears on either resolution; while marked, the
+     * gaining/re-keying reducers above refuse (`refuseMutationWhileClosing`)
+     * so the post-ack removal applies exactly the pane set the acknowledged
+     * batch covered.
+     */
+    markTabClosing: (state, action: PayloadAction<{ tabId: string }>) => {
+      if (!state.closingTabs) state.closingTabs = {}
+      state.closingTabs[action.payload.tabId] = true
+    },
+    clearTabClosing: (state, action: PayloadAction<{ tabId: string }>) => {
+      if (state.closingTabs) delete state.closingTabs[action.payload.tabId]
+    },
+
     removeLayout: (
       state,
       action: PayloadAction<{ tabId: string }>
@@ -1799,6 +1884,10 @@ export const panesSlice = createSlice({
       delete state.layouts[tabId]
       delete state.activePane[tabId]
       delete state.paneTitles[tabId]
+      // The tab is gone — any in-flight close guard for it is spent.
+      if (state.closingTabs) {
+        delete state.closingTabs[tabId]
+      }
       if (state.zoomedPane) {
         delete state.zoomedPane[tabId]
       }
@@ -1824,6 +1913,14 @@ export const panesSlice = createSlice({
       const incomingLayoutTabIds = new Set<string>()
       for (const [tabId, incomingNode] of Object.entries(incoming.layouts || {})) {
         const localNode = state.layouts[tabId]
+        if (localNode && isTabClosePending(state, tabId)) {
+          // The pending-close freeze (F3): a closing tab keeps its FROZEN
+          // local layout — the acknowledged batch covered exactly that pane
+          // set; a remote fold must never re-seed panes the batch did not
+          // cover (the tab is removed wholesale post-ack).
+          mergedLayouts[tabId] = localNode
+          continue
+        }
         const incomingHasShape = hasPaneTreeShape(incomingNode)
         const mergedNode = localNode
           ? mergeTerminalState(incomingNode as PaneNode, localNode, meta)
@@ -2454,6 +2551,8 @@ export const {
   requestTabRefresh,
   consumePaneRefreshRequest,
   removeLayout,
+  markTabClosing,
+  clearTabClosing,
   hydratePanes,
   updatePaneTitle,
   updatePaneTitleByTerminalId,

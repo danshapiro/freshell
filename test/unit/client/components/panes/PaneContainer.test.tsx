@@ -109,6 +109,23 @@ function ackFreshAgentKillsMocked() {
   }
 }
 
+/** Answer every in-flight panes.closed batch with success (focused-episode-7
+ * round 4, F2: a fresh-agent pane's removal flows the SAME close gate — the
+ * last-pane cascade's closeTab sends the batch envelope, and the gate awaits
+ * its correlated answer). */
+function ackPanesClosedBatchesMocked() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; requestId?: string }
+    if (m?.type === 'panes.closed' && m.requestId) {
+      emitWsMessage({
+        type: 'panes.closed.result',
+        requestId: m.requestId,
+        success: true,
+      })
+    }
+  }
+}
+
 // Mock the ws-client module
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -1251,6 +1268,19 @@ describe('PaneContainer', () => {
       ).toBe('pane-fresh-agent-ack')
 
       ackFreshAgentKillsMocked()
+      // Focused-episode-7 round 4 (F2): the kill's retiring envelope and the
+      // pane-gate's per-REMOVAL close coexist — the last-pane cascade's
+      // closeTab sends the batch envelope covering the fresh-agent identity
+      // and awaits ITS correlated answer before the layout moves.
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: 'panes.closed',
+            panes: [{ createRequestId: 'req-fresh-ack-close' }],
+          }),
+        )
+      })
+      ackPanesClosedBatchesMocked()
       await waitFor(() => {
         expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
       })

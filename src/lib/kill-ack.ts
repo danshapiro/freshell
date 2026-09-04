@@ -2,7 +2,7 @@ import { nanoid } from 'nanoid'
 import { createLogger } from './client-logger'
 import { markTerminalReleased } from './terminal-release-marks'
 import { getWsClient } from './ws-client'
-import { collectPaneEntries } from './pane-utils'
+import { collectSessionPaneIdentities } from './pane-utils'
 import type { PaneNode } from '@/store/paneTypes'
 
 /**
@@ -263,7 +263,7 @@ export function sendPaneOpened(
 /**
  * The per-ready OPEN re-assertion sweep (focused-episode-7 round 3, Finding
  * F2): on every ws `ready` (first connect AND every reconnect), assert every
- * terminal pane the client is displaying — ONE message per pane, keyed by
+ * session pane the client is displaying — ONE message per pane, keyed by
  * its createRequestId, exactly the close gate's identity criterion. The
  * server consumes any standing detach-family close record for a displayed
  * pane and re-asserts its row attribution: server state re-agrees with the
@@ -272,21 +272,25 @@ export function sendPaneOpened(
  * never reused, so a re-opened pane asserts only its own new key. Idempotent
  * and fsync-free server-side when nothing stands and attribution is
  * unchanged, so every-viewport reconnect stays cheap.
+ *
+ * Focused-episode-7 round 4 (Finding F2): the sweep re-asserts EVERY
+ * displayed session-bearing pane, not terminal-only — fresh-agent panes
+ * carry the same mandatory createRequestId the pane.opened re-assertion is
+ * keyed by, and their standing close record is recoverable exactly like a
+ * terminal pane's (a displayed fresh-agent pane with a durable close record
+ * would otherwise stay suppressed from recovery forever). Non-session panes
+ * (browser/editor/picker/host-stats/extension) carry no pane identity the
+ * close lanes know; they are never asserted.
  */
-export function reassertAllOpenTerminalPanes(
+export function reassertAllOpenPanes(
   layouts: Record<string, PaneNode | undefined>,
   opts?: { send?: (msg: unknown) => void },
 ): void {
   let count = 0
   for (const [tabId, root] of Object.entries(layouts)) {
     if (!root) continue
-    for (const { content } of collectPaneEntries(root)) {
-      if (content.kind !== 'terminal') continue
-      const createRequestId = typeof content.createRequestId === 'string' && content.createRequestId
-        ? content.createRequestId
-        : undefined
-      if (!createRequestId) continue
-      sendPaneOpened({ createRequestId, tabId }, opts)
+    for (const identity of collectSessionPaneIdentities(root)) {
+      sendPaneOpened({ createRequestId: identity.createRequestId, tabId }, opts)
       count++
     }
   }

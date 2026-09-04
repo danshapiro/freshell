@@ -374,6 +374,32 @@ describe('terminalDetachMiddleware — durable pane-close evidence (delta-r7-r2 
     expect(paneClosedMessages()).toEqual([])
   })
 
+  it('focused-episode-7 round 4 (F2): the belt covers FRESH-AGENT pane removals too — per-REMOVAL, CRID-only (their kill envelope coexists; pane-close evidence is the removal)', () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('term-a', 'req-1') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshclaude' as const,
+        provider: 'claude' as const,
+        sessionId: 'sess-fa',
+        createRequestId: 'req-fa',
+        status: 'idle' as const,
+      },
+      newPaneId: 'pane-fa',
+    }))
+    mockSend.mockClear()
+    store.dispatch(removeLayout({ tabId: 'tab-1' }))
+    expect(detachedIds()).toEqual(['term-a'])
+    expect(paneClosedMessages().sort((a, b) => (a.createRequestId ?? '').localeCompare(b.createRequestId ?? ''))).toEqual([
+      { type: 'pane.closed', createRequestId: 'req-1', terminalId: 'term-a' },
+      { type: 'pane.closed', createRequestId: 'req-fa' },
+    ])
+  })
+
   it('NON-close removals NEVER journal pane-close evidence (updatePaneContent re-point, reconcile-fold family)', () => {
     const store = createStore()
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('term-old', 'req-live') }))
