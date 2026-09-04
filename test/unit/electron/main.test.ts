@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
-import { initMainProcess, type ElectronApp, type MainProcessDeps } from '../../../electron/main.js'
+import { initMainProcess, acquireInstanceLock, type ElectronApp, type MainProcessDeps } from '../../../electron/main.js'
 
 function createMockApp(): ElectronApp & EventEmitter {
   const emitter = new EventEmitter() as ElectronApp & EventEmitter
@@ -40,11 +40,47 @@ describe('initMainProcess', () => {
     expect(deps.createMainWindow).toHaveBeenCalled()
   })
 
-  it('quits when single instance lock fails', async () => {
-    ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+  describe('acquireInstanceLock', () => {
+    it('returns true without quitting when the lock is acquired', () => {
+      const app = createMockApp()
+      expect(acquireInstanceLock(app)).toBe(true)
+      expect(app.quit).not.toHaveBeenCalled()
+    })
+
+    it('quits and returns false when another instance holds the lock', () => {
+      const app = createMockApp()
+      ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+      expect(acquireInstanceLock(app)).toBe(false)
+      expect(app.quit).toHaveBeenCalled()
+    })
+
+    it('invokes onDenied BEFORE quitting (so entry.ts can lift the wizard-phase will-quit veto)', () => {
+      const app = createMockApp()
+      ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+      const onDenied = vi.fn()
+      expect(acquireInstanceLock(app, onDenied)).toBe(false)
+      expect(onDenied.mock.invocationCallOrder[0])
+        .toBeLessThan((app.quit as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+    })
+  })
+
+  it('shows a hidden main window before focusing it on second-instance', async () => {
     await initMainProcess(deps)
-    expect(app.quit).toHaveBeenCalled()
-    expect(deps.createMainWindow).not.toHaveBeenCalled()
+
+    app.emit('second-instance')
+
+    expect(mockWindow.show).toHaveBeenCalled()
+    expect(mockWindow.focus).toHaveBeenCalled()
+    expect(mockWindow.show.mock.invocationCallOrder[0])
+      .toBeLessThan(mockWindow.focus.mock.invocationCallOrder[0])
+  })
+
+  it('does not double-register second-instance when an early canonical handler exists', async () => {
+    // entry.ts installs its own canonical handler in main() before any window
+    // creation; initMainProcess must defer to it.
+    app.on('second-instance', () => {})
+    await initMainProcess(deps)
+    expect(app.listenerCount('second-instance')).toBe(1)
   })
 
   it('close-to-tray hides window instead of quitting', async () => {

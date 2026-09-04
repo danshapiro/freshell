@@ -35,6 +35,20 @@ export interface ServerSpawner {
   pid(): number | undefined
 }
 
+/** Environment for a spawned server: inherits ours, pinned to the spawn port
+ * and to THIS process's Freshell config dir (profile-aware). */
+export function buildSpawnEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  port: number,
+  configDir: string,
+): Record<string, string> {
+  return {
+    ...(baseEnv as Record<string, string>),
+    PORT: String(port),
+    FRESHELL_CONFIG_DIR: configDir,
+  }
+}
+
 export function createServerSpawner(): ServerSpawner {
   let childProcess: ChildProcess | null = null
   let running = false
@@ -92,10 +106,7 @@ export function createServerSpawner(): ServerSpawner {
 
       let cmd: string
       let args: string[]
-      const env: Record<string, string> = {
-        ...process.env as Record<string, string>,
-        PORT: String(port),
-      }
+      const env = buildSpawnEnv(process.env, port, configDir)
 
       if (spawnMode.mode === 'production') {
         cmd = spawnMode.nodeBinary

@@ -5,6 +5,7 @@
 export interface ElectronApp {
   whenReady(): Promise<void>
   on(event: string, callback: (...args: any[]) => void): void
+  listenerCount(event: string): number
   quit(): void
   requestSingleInstanceLock(): boolean
 }
@@ -17,16 +18,29 @@ export interface MainProcessDeps {
   platform: NodeJS.Platform
 }
 
+/**
+ * Acquire the single-instance lock for this process's userData dir. When
+ * entry.ts has namespaced userData per profile, each profile holds its own
+ * lock. Call BEFORE any boot side effects (provisioning, server spawn).
+ * Returns true when the lock is held; on failure the app quits and this
+ * returns false. `onDenied` (optional) runs immediately BEFORE app.quit() —
+ * entry.ts uses it to lift the wizard-phase `will-quit` veto for the denied
+ * duplicate, which never enters the wizard.
+ */
+export function acquireInstanceLock(app: ElectronApp, onDenied?: () => void): boolean {
+  const gotLock = app.requestSingleInstanceLock()
+  if (!gotLock) {
+    onDenied?.()
+    app.quit()
+    return false
+  }
+  return true
+}
+
 export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
   const { app, minimizeToTray } = deps
 
-  // Single-instance lock
-  const gotLock = app.requestSingleInstanceLock()
-  if (!gotLock) {
-    app.quit()
-    return
-  }
-
+  // The caller must hold the instance lock already (see acquireInstanceLock);
   let mainWindow: any = null
   let isQuitting = false
 
@@ -59,15 +73,19 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
     }
   })
 
-  // Second instance: focus existing window
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized?.()) {
-        mainWindow.restore?.()
+  // Second instance: surface and focus the existing window. Skipped if entry
+  // already installed a canonical early handler.
+  if (app.listenerCount('second-instance') === 0) {
+    app.on('second-instance', () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized?.()) {
+          mainWindow.restore?.()
+        }
+        mainWindow.show?.()
+        mainWindow.focus?.()
       }
-      mainWindow.focus?.()
-    }
-  })
+    })
+  }
 
   // Note: window-all-closed is handled by entry.ts with a lifecycle-aware
   // guard (wizardPhase). This prevents the app from quitting during the

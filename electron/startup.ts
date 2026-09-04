@@ -201,7 +201,7 @@ async function loadMainWindow(
   window.on('resize', saveState)
   window.on('move', saveState)
 
-  ctx.hotkeyManager.register(ctx.desktopConfig.globalHotkey, () => {
+  const hotkeyRegistered = ctx.hotkeyManager.register(ctx.desktopConfig.globalHotkey, () => {
     if (window.isVisible() && window.isFocused()) {
       window.hide()
     } else {
@@ -209,6 +209,13 @@ async function loadMainWindow(
       window.focus()
     }
   })
+  if (!hotkeyRegistered) {
+    ctx.mainProcessLogger?.log({
+      severity: 'warn',
+      event: 'global_hotkey_registration_failed',
+      accelerator: ctx.desktopConfig.globalHotkey,
+    })
+  }
 
   try {
     ctx.createTray()

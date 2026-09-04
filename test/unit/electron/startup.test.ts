@@ -776,6 +776,27 @@ describe('runStartup', () => {
   })
 
   describe('hotkey quake-style toggle', () => {
+    it('logs a warning when the global hotkey registration fails', async () => {
+      const ctx = createDefaultContext()
+      // createDefaultContext() does not provide mainProcessLogger — attach one and
+      // keep a direct mock reference (the optional-chain in production code means
+      // "no logger" is legal, so the test must supply one explicitly).
+      const mainProcessLogger = { log: vi.fn() }
+      ;(ctx as { mainProcessLogger?: { log: ReturnType<typeof vi.fn> } }).mainProcessLogger = mainProcessLogger
+      ;(ctx.hotkeyManager.register as ReturnType<typeof vi.fn>).mockReturnValue(false)
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      expect(mainProcessLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          severity: 'warn',
+          event: 'global_hotkey_registration_failed',
+          accelerator: ctx.desktopConfig.globalHotkey,
+        }),
+      )
+    })
+
     it('shows and focuses window when hidden', async () => {
       const mockWindow = createMockWindow()
       const ctx = createDefaultContext({
