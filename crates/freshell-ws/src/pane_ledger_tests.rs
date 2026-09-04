@@ -5746,6 +5746,182 @@ fn a_close_envelope_failure_over_a_prior_record_that_covers_the_whole_set_report
 }
 
 
+// ── Delta-round-7 (round-7 Finding F2): the non-retiring DETACH pane close ──
+
+/// The terminal pane's deliberate X-close is a DETACH (the session keeps
+/// running server-side — the sidebar-reattach feature) AND, since round 7, a
+/// durable pane-close act: one close-envelope journal record keyed by the
+/// pane's `createRequestId` (`pane-detach:<crid>` — the kill lane keys
+/// `pane:<terminalId>`, so the two lanes never merge). It answers "was this
+/// PANE closed", never "is the session dead": kills are EMPTY (no fence is
+/// fed) and no row is touched — the row stays Bound for sidebar reattach.
+/// Because its terminal stays live, the record must NOT surface in the
+/// kill-lane pane read model (`list_pane_closes`): its terminalId arm would
+/// otherwise cover a later pane REATTACHED to the same (still-running)
+/// terminal. The recovery inventory reads it through
+/// `list_pane_detach_closes` only (crid + terminal arms on ledger ROWS and
+/// the crid arm on snapshot PANES), and `resolve_pending`/`close_pane` are
+/// untouched (a late identity resolution legitimately lands Bound — the
+/// session lives on).
+#[test]
+fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() {
+    let root = temp_root("detach-close");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The closed pane's Bound row (the sidebar-reattach evidence).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "sess-det",
+            terminal_id: "term-det",
+            mode: "claude",
+            cwd: Some("/tmp/proj"),
+            create_request_id: Some("req-det"),
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 1_000,
+        })
+        .unwrap();
+
+    ledger
+        .close_pane_detached("req-det", Some("term-det"), 2_000)
+        .expect("the detach close persists");
+
+    // NOTHING is fenced and NO row is touched: no tombstone, the row is
+    // byte-identical Bound (even `updated_at` — no write happened at all).
+    assert!(
+        ledger.all_kill_tombstone_keys().is_empty(),
+        "a detach close feeds no kill fence"
+    );
+    let row = ledger.load_binding("claude", "sess-det").expect("row");
+    assert_eq!(row.state, RowState::Bound, "the row stays Bound (sidebar reattach)");
+    assert_eq!(row.retired_reason, None);
+    assert_eq!(row.updated_at, 1_000, "the detach close never rewrites the row");
+    assert_eq!(row.create_request_id.as_deref(), Some("req-det"));
+    assert_eq!(row.live_terminal_id.as_deref(), Some("term-det"));
+
+    // The recovery read model sees EXACTLY the detach linkage — and the
+    // kill-lane surfaces do NOT (the terminal stays live; a reattached pane
+    // must never read covered through the terminal id).
+    assert_eq!(
+        ledger.list_pane_detach_closes(),
+        vec![PaneDetachClose {
+            create_request_id: "req-det".to_string(),
+            terminal_id: Some("term-det".to_string()),
+        }]
+    );
+    assert!(
+        ledger.list_pane_closes().is_empty(),
+        "the kill-lane pane read model never surfaces a (still-live) detach close"
+    );
+    assert!(
+        ledger.pane_close_for_terminal("term-det").is_none(),
+        "resolve_pending's kill consult never sees a detach close"
+    );
+
+    // Idempotent: a repeated detach close keeps ONE record (re-stamped).
+    ledger
+        .close_pane_detached("req-det", Some("term-det"), 3_000)
+        .expect("idempotent repeat");
+    assert_eq!(ledger.list_pane_detach_closes().len(), 1);
+    assert!(ledger.all_kill_tombstone_keys().is_empty());
+
+    // Durable across a restart reload (the SIGKILL premise).
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(
+        disk.list_pane_detach_closes(),
+        vec![PaneDetachClose {
+            create_request_id: "req-det".to_string(),
+            terminal_id: Some("term-det".to_string()),
+        }],
+        "the detach close reloads from the journal"
+    );
+    assert!(disk.list_pane_closes().is_empty());
+
+    // A LATER kill of the same terminal is an ordinary close_pane: an
+    // independent record at its own key, the fence lands, the row retires —
+    // the two record families coexist without interference.
+    ledger
+        .close_pane(&PaneCloseWrite {
+            terminal_id: "term-det".to_string(),
+            create_request_id: Some("req-det".to_string()),
+            resolved: vec![SessionLocator {
+                provider: "claude".into(),
+                session_id: "sess-det".into(),
+            }],
+            now_ms: 4_000,
+        })
+        .expect("the later kill lands");
+    assert_eq!(
+        ledger.kill_tombstone_at("claude", "sess-det"),
+        Some(4_000)
+    );
+    assert_eq!(
+        ledger.load_binding("claude", "sess-det").unwrap().state,
+        RowState::Retired,
+        "the kill retires what the detach deliberately left Bound"
+    );
+    assert_eq!(
+        ledger.list_pane_detach_closes().len(),
+        1,
+        "the detach record stands beside the kill record"
+    );
+    assert_eq!(ledger.list_pane_closes().len(), 1, "the kill record surfaces alone");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Round-7 F2 retention: the detach record's natural reference arm (a
+/// retained snapshot carrying the crid/terminal id) does not cover the
+/// finding's own shape — the pane was created AND closed inside the push
+/// cadence, so no retained generation ever references it. The record's life
+/// is therefore REFERENCE-TIME over the LEDGER too: it must outlive any
+/// binding row still carrying its createRequestId (a Bound row it excludes
+/// from the recovery offer), exactly the dominance-keep principle ("a close's
+/// evidence plus an unconverged row outlive the 6h TTL"). Once the row is
+/// gone (retired and pruned by its own rules), a fully-aged record prunes.
+#[test]
+fn a_fully_aged_detach_close_survives_while_a_row_carries_its_create_request_id() {
+    let root = temp_root("detach-retention");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "sess-kept",
+            terminal_id: "term-kept",
+            mode: "claude",
+            cwd: Some("/tmp/proj"),
+            create_request_id: Some("req-kept"),
+            provenance: ProvenancePolicy::Inherit,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    ledger
+        .close_pane_detached("req-kept", Some("term-kept"), 1_500)
+        .unwrap();
+    let aged = 1_500 + KILL_TOMBSTONE_TTL_MS + 60_000;
+    // No retained snapshot references it (the within-cadence create+close):
+    // the BOUND row carrying the crid is the keep.
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report.pane_closes_swept.is_empty(),
+        "a row-covered detach close never prunes: {report:?}"
+    );
+    assert_eq!(ledger.list_pane_detach_closes().len(), 1);
+    let disk = PaneLedger::new(Some(root.clone()));
+    assert_eq!(disk.list_pane_detach_closes().len(), 1);
+
+    // Delete the row (the ledger's own lifecycle) and the next pass prunes
+    // the orphaned record.
+    ledger.delete_binding("claude", "sess-kept").unwrap();
+    let report = ledger.gc(aged, &never_absent, None, Some(&no_snapshot_refs()));
+    assert!(
+        report
+            .pane_closes_swept
+            .contains(&"pane-detach:req-kept".to_string()),
+        "with no row and no snapshot referencing it, the aged record prunes: {report:?}"
+    );
+    assert!(ledger.list_pane_detach_closes().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // ── Delta-r6-r4 (focused-episode-6 round 3, Finding 2): reference-time close-evidence retention ──
 
 /// The finding: the 6h TTL deleted the only closed verdict while stale

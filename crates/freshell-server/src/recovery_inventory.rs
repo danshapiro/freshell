@@ -4,7 +4,7 @@
 //! snapshot store, the ledger, and the terminal registry, and consumes
 //! `select_foreign_recent_generation_ids` when composing each device's union.
 
-use freshell_ws::pane_ledger::{BindingRow, PaneCloseRecord, RetiredReason, RowState};
+use freshell_ws::pane_ledger::{BindingRow, PaneCloseRecord, PaneDetachClose, RetiredReason, RowState};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -38,6 +38,22 @@ pub struct DeviceUnion {
 pub struct CloseEvidence {
     pub standing_kill_tombstones: HashSet<(String, String)>,
     pub pane_closes: Vec<PaneCloseRecord>,
+    /// Delta-round-7 (Finding F2) — the NON-RETIRING detach closes (the
+    /// terminal pane X-close family, keyed by the pane's createRequestId):
+    /// "this PANE was closed" evidence that never fences or retires the
+    /// session. Coverage rules, by construction ([`PaneDetachClose`]):
+    ///
+    /// * snapshot PANES: the createRequestId arm ONLY — their terminal stays
+    ///   RUNNING, so a terminalId arm would cover a later pane reattached to
+    ///   it (the P2 false positive the kill lane can never produce: a killed
+    ///   terminal is dead).
+    /// * ledger ROWS: the createRequestId arm (the row the pane's create
+    ///   stamped) OR the terminalId arm (the row whose live terminal IS the
+    ///   closed pane's — relevant when a conn-less identity resolution wrote
+    ///   the row without the advisory createRequestId). A covered row is
+    ///   NEVER offered, whether live or dead; it stays Bound for sidebar
+    ///   reattach.
+    pub pane_detach_closes: Vec<PaneDetachClose>,
 }
 
 /// Focused-episode-6 round 5 (Finding F2): the D7 liveness evidence the
@@ -72,6 +88,7 @@ impl CloseEvidence {
         Self {
             standing_kill_tombstones: HashSet::new(),
             pane_closes: Vec::new(),
+            pane_detach_closes: Vec::new(),
         }
     }
 }
@@ -422,13 +439,44 @@ pub fn build_inventory(
             close_by_crid.entry(crid).or_insert(record);
         }
     }
+    // Delta-round-7 (Finding F2) — the DETACH close joins. The createRequestId
+    // arm MERGES with the kill records' (`covered_crids`): a close record of
+    // EITHER family keys "this exact pane was closed". The terminalId arm is
+    // deliberately SPLIT:
+    //
+    // * snapshot PANES consult the KILL set's terminal arm alone — a detached
+    //   terminal stays RUNNING and a later pane legimately reattaches to it
+    //   (fresh createRequestId): joining panes on a detach record's terminal
+    //   id would cover that reattached pane (the P2 false positive the kill
+    //   lane can never produce — killed terminals are dead).
+    // * ledger ROWS additionally consult the DETACH terminal arm: a row whose
+    //   live terminal IS the closed pane's terminal is that pane's row
+    //   (terminal ids are never re-minted) — the arm that covers rows written
+    //   without the advisory createRequestId (the conn-less resolution lane).
+    let detach_terminal_ids: HashSet<&str> = closes
+        .pane_detach_closes
+        .iter()
+        .filter_map(|d| d.terminal_id.as_deref())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let covered_crids: HashSet<&str> = close_by_crid
+        .keys()
+        .copied()
+        .chain(
+            closes
+                .pane_detach_closes
+                .iter()
+                .map(|d| d.create_request_id.as_str())
+                .filter(|id| !id.is_empty()),
+        )
+        .collect();
     let pane_covered_by_close = |pane: &Value| -> bool {
         let payload = &pane["payload"];
         let crid_hit = payload
             .get("createRequestId")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .is_some_and(|id| close_by_crid.contains_key(id));
+            .is_some_and(|id| covered_crids.contains(id));
         if crid_hit {
             return true;
         }
@@ -438,6 +486,29 @@ pub fn build_inventory(
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .is_some_and(|id| close_by_terminal.contains_key(id))
+    };
+    // Delta-round-7 (Finding F2): the ROW-side close coverage. A close record
+    // (either family) that names the row's creation key proves the pane the
+    // row belongs to was closed, so the row is never offered — while the row
+    // itself stays Bound (the detach record is deliberately non-retiring) for
+    // sidebar reattach. A genuine re-open lapses the coverage by
+    // construction: resume creates re-stamp the row's createRequestId/
+    // liveTerminalId wholesale (and a re-opened session's pane re-references
+    // the row through the snapshot unions), so the offer returns exactly
+    // when the session is genuinely open again.
+    let row_close_covered = |r: &BindingRow| -> bool {
+        let crid_hit = r
+            .create_request_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .is_some_and(|id| covered_crids.contains(id));
+        if crid_hit {
+            return true;
+        }
+        r.live_terminal_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .is_some_and(|id| detach_terminal_ids.contains(id))
     };
     // Bind-by-correlation advisory secondary indices (focused-ep3), Bound
     // rows only. A codex/opencode CLI pane snapshotted INSIDE its
@@ -1006,13 +1077,36 @@ pub fn build_inventory(
 
     let mut d8_dropped = 0usize;
     let mut ambiguous_suppressed = 0usize;
+    let mut close_covered = 0usize;
     let ledger_only: Vec<Value> = bindings
         .iter()
         .filter(|r| row_is_bound(r))
         // vs effective refs across ALL unions (A4), not just the primary device
         .filter(|r| !referenced.contains(&ref_key(&row_provider(r), &row_session_id(r))))
-        // live rows are excluded: sessions still running are never offered for resume (D7)
-        .filter(|r| !is_live(&row_provider(r), &row_session_id(r)))
+        // Delta-round-7 (Finding F2): a close-covered row is NEVER offered —
+        // the pane it belongs to was deliberately closed (the terminal
+        // DETACH lane journals the pane-close record now, answering "was
+        // this PANE closed" within the grace window that cannot tell
+        // created-then-closed from created-then-crashed). The row itself
+        // stays Bound for sidebar reattach.
+        .filter(|r| {
+            let covered = row_close_covered(r);
+            if covered {
+                close_covered += 1;
+            }
+            !covered
+        })
+        // Delta-round-7 (Finding F1): LIVE rows are INCLUDED (reversing the
+        // round-3 categorical exclusion, the finding's harm): an unreferenced
+        // still-running session whose pane never reached a surviving snapshot
+        // is genuinely open — liveness + attribution + placement are the
+        // evidence. The row answers the SAME attribution/grace/placement
+        // judgment as a dead row below; the `live` stamp (+ the row's
+        // still-running terminal id) routes the client to reattach/adopt —
+        // NEVER a respawn. Dead rows keep the pre-existing resume treatment;
+        // dead/unattributed/unverifiable rows stay excluded by the same
+        // gates that always owned them.
+        //
         // Focused-ep3-r2 Finding 1 (offer-eligibility only): rows tainted by
         // an ambiguous correlation are never offered. Rows that do not
         // correlate at all are untouched — they fall through to the normal
@@ -1038,8 +1132,18 @@ pub fn build_inventory(
             keep
         })
         .map(|r| {
+            let row_live = is_live(&row_provider(r), &row_session_id(r));
             let mut entry = json!({"provider": row_provider(r), "sessionId": row_session_id(r),
-                   "mode": row_mode(r), "cwd": row_cwd(r)});
+                   "mode": row_mode(r), "cwd": row_cwd(r), "live": row_live});
+            // The REATTACH arm (F1): a LIVE row forwards its still-running
+            // terminal id — the client's one-shot paneId→terminalId reattach
+            // target (never a respawn). Dead rows forward no handle: they
+            // restore by resume.
+            if row_live {
+                if let Some(live_terminal_id) = &r.live_terminal_id {
+                    entry["liveTerminalId"] = json!(live_terminal_id);
+                }
+            }
             // D8: forward the stamped tabKey for the client-side original-tab join.
             if let Some(tab_key) = &r.tab_key {
                 entry["tabKey"] = json!(tab_key);
@@ -1077,14 +1181,21 @@ pub fn build_inventory(
         ambiguous_correlations = ambiguous,
         retired_correlated,
         ambiguous_suppressed,
+        close_covered,
         "D8 offer judgment");
 
-    // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3)
+    // contentId: sha256 over the sorted TIMESTAMP-FREE substance (A5/A6, D3).
+    // Delta-round-7 (Finding F1): the row's `live` flag folds into the
+    // substance for the same reason the pane verdict's does (focused-episode-6
+    // round 5, Finding F3) — a live→dead transition is a materially different
+    // offer (reattach vs resume), so the dismissal identity must RE-KEY on it
+    // rather than suppress the now-dead row under the live offer's id.
     substance.extend(ledger_only.iter().map(|e| {
         format!(
-            "{}:{}",
+            "{}:{}\u{1}{}",
             e["provider"].as_str().unwrap_or(""),
-            e["sessionId"].as_str().unwrap_or("")
+            e["sessionId"].as_str().unwrap_or(""),
+            e["live"].as_bool().unwrap_or(false)
         )
     }));
     substance.sort();
@@ -1331,9 +1442,12 @@ async fn inventory_handler(
     let dominant_tombstones = state.ledger.dominant_kill_tombstone_keys();
     // Delta-r6-r2 (Finding 1): the verdict join's close evidence — memory-
     // fast reads against the write-through index, same as the dominance set.
+    // Delta-round-7 (Finding F2): the non-retiring detach closes join too
+    // (their own read model — never the kill lane's `list_pane_closes`).
     let closes = CloseEvidence {
         standing_kill_tombstones: state.ledger.all_kill_tombstone_keys(),
         pane_closes: state.ledger.list_pane_closes(),
+        pane_detach_closes: state.ledger.list_pane_detach_closes(),
     };
     Json(build_inventory(
         unions,

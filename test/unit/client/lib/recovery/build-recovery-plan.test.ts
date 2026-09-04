@@ -498,6 +498,79 @@ describe('buildRecoveryPlan', () => {
     })
   })
 
+  // Delta-round-7 (Finding F1): a LIVE ledger row (the unsnapshotted-live
+  // inclusion — the row's pane never reached a surviving snapshot) restores by
+  // REATTACH, never a respawn: the content keeps the resume ref (the
+  // died-before-attach fallback), and the plan arms the one-shot
+  // paneId→terminalId reattach target from the forwarded handle — exactly the
+  // snapshot-pane live path's arm shape.
+  it('a LIVE terminal ledger row joins as a terminal with its sessionRef AND arms the reattach to its still-running terminal', () => {
+    const inventory = inv([pane()], [
+      { provider: 'claude', sessionId: 'S-live-row', mode: 'claude', cwd: '/j', tabKey: 'k', live: true, liveTerminalId: 't-row-live' },
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    const leaves = leavesOf(tab.layout)
+    expect(leaves).toHaveLength(2)
+    const rowLeaf = leaves.find((l) => l.content.initialCwd === '/j')!
+    expect(rowLeaf.content).toMatchObject({
+      kind: 'terminal',
+      mode: 'claude',
+      sessionRef: { provider: 'claude', sessionId: 'S-live-row' },
+    })
+    expect(tab.liveTerminalReattach).toEqual([{ paneId: rowLeaf.id, terminalId: 't-row-live' }])
+    expect(countRecoverablePanes(inventory)).toBe(2)
+  })
+
+  it('a live terminal ledger row WITHOUT a forwarded handle falls back to resume/refusal→reattach (sessionRef kept, no reattach arm)', () => {
+    // Defensive shape parity with the snapshot-side pin ('a live terminal pane
+    // whose snapshot lost the handle…'): the ref rides the create and the
+    // server's D7 live-owner refusal folds the pane back onto the SAME live
+    // terminal — reattach either way, never a respawn.
+    const inventory = inv([pane()], [
+      { provider: 'claude', sessionId: 'S-live-nohandle', mode: 'claude', cwd: '/j', tabKey: 'k', live: true },
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    expect(tab.liveTerminalReattach ?? []).toHaveLength(0)
+    const leaves = leavesOf(tab.layout)
+    const rowLeaf = leaves.find((l) => l.content.initialCwd === '/j')!
+    expect(rowLeaf.content.sessionRef).toEqual({ provider: 'claude', sessionId: 'S-live-nohandle' })
+  })
+
+  it('a LIVE fresh-agent ledger row keeps its sessionRef and joins NO reattach arm (the adopt path)', () => {
+    const inventory = inv([pane()], [
+      {
+        provider: 'claude', sessionId: 'S-live-agent', mode: 'freshclaude', cwd: '/j', tabKey: 'k',
+        paneKind: 'fresh-agent', live: true, liveTerminalId: undefined,
+      },
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    expect(tab.liveTerminalReattach ?? []).toHaveLength(0)
+    const leaves = leavesOf(tab.layout)
+    const rowLeaf = leaves.find((l) => l.content.kind === 'fresh-agent')!
+    // The adopt route: the content carries the live session's ref, and the
+    // manager's live-session adopt answers the create without spawning.
+    expect(rowLeaf.content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      sessionRef: { provider: 'claude', sessionId: 'S-live-agent' },
+    })
+  })
+
+  it('a DEAD ledger row is unchanged by the live routing (no stamp => resume, no arm)', () => {
+    const inventory = inv([pane()], [
+      { provider: 'codex', sessionId: 'C-dead', mode: 'codex', cwd: '/x', tabKey: 'k', live: false },
+    ])
+    const [tab] = buildRecoveryPlan(inventory)
+    expect(tab.liveTerminalReattach ?? []).toHaveLength(0)
+    const leaves = leavesOf(tab.layout)
+    const rowLeaf = leaves.find((l) => l.content.initialCwd === '/x')!
+    expect(rowLeaf.content).toMatchObject({
+      kind: 'terminal',
+      mode: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'C-dead' },
+    })
+  })
+
   it('a plain CLI ledgerOnly row still builds terminal content (finding-2 regime is fresh-agent-only)', () => {
     const plans = buildRecoveryPlan(inv([pane()], [
       { provider: 'codex', sessionId: 'C9', mode: 'codex', cwd: '/x', tabKey: 'k' },

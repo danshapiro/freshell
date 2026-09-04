@@ -56,6 +56,28 @@
  * recreates it. Pinned RED pre-repair: the kill left the row Bound, and
  * inside the grace window the parent-relative judgment kept it.
  *
+ * Scenario 6 (delta-round-7, F1 — the early-loss variant of scenario 3): the
+ * browser is lost WITHOUT a server restart AND before any snapshot containing
+ * the live claude pane survives (deterministic post-loss evidence shaping).
+ * No union pane can then reference the pane's binding row, so the row reaches
+ * the offer ONLY through the ledgerOnly pipeline — which pre-fix categorically
+ * excluded live rows (recovery_inventory.rs's !is_live filter), losing a
+ * genuinely-open session. Post-fix the live, attributed, placement-valid,
+ * not-close-covered row is offered (probe pin: `live:true` + the still-running
+ * terminal id), and accepting REATTACHES it to its ORIGINAL terminal (argv-log
+ * anti-respawn proof), never spawns a second process.
+ *
+ * Scenario 7 (delta-round-7, F2 — the terminal-detach kill-window twin): a
+ * claude CLI pane is created and closed PROMPTLY via the PLAIN pane-X inside
+ * the grace window. The close DETACHES (the session survives — FEATURE), the
+ * ledger row stays Bound, and the durable pane-close record keyed by the
+ * pane's createRequestId lands BEFORE/ALONGSIDE the detach; after browser
+ * loss + server SIGKILL (the terminal dies; the row reads non-live) the
+ * close-covered row is never offered or restored. Pre-fix nothing durable
+ * recorded the pane close (terminalDetachMiddleware only detached), so the
+ * still-Bound row was admitted and the offer recreated a pane the user had
+ * explicitly closed.
+ *
  * Fixture shapes (fake CLI, config seeding, shell-picker choreography) are
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
  * per-spec-ownership convention. The freshclaude helpers
@@ -212,6 +234,79 @@ function findFreshAgentLeaf(node: any): any {
     }
   }
   return null
+}
+
+/** Every leaf of a pane layout tree (flat list; the scenarios' inline walkers). */
+function leavesOfLayout(node: any): any[] {
+  if (!node) return []
+  if (node.type === 'leaf') return [node]
+  return (node.children ?? []).flatMap(leavesOfLayout)
+}
+
+/**
+ * Delta-round-7 evidence shaping (scenarios 6+7, donor: the kill-window
+ * scenario's step-7 idiom generalized to a NEEDLE SET): delete every retained
+ * snapshot generation referencing ANY needle (the lost pane's session id,
+ * createRequestId, terminalId, AND paneId — any one of them would otherwise
+ * let a retained generation reference the pane's row, so the row would reach
+ * the offer through the union path instead of the ledgerOnly pipeline under
+ * test; none may survive). Then require (a) at least one surviving generation
+ * containing EVERY keep needle (the anti-vacuity premise — the lost pane's
+ * TAB must survive in the evidence, bearing the sibling shell push), and
+ * (b) every surviving client's newest generation within the judgment's grace
+ * window of the row's attribution time, or the time-drop clause alone would
+ * answer the exclusion and every ledgerOnly assertion is vacuous.
+ */
+async function shapeEvidenceExcluding(opts: {
+  snapshotsRoot: string
+  needles: string[]
+  keepNeedles: string[]
+  latestAllowedMs: number
+  premiseLabel: string
+}): Promise<void> {
+  const { snapshotsRoot, needles, keepNeedles, latestAllowedMs, premiseLabel } = opts
+  const newestByClient = new Map<string, { revision: number; capturedAt: number }>()
+  let keptKeepsakeGeneration = false
+  for (const deviceDirName of await fs.readdir(snapshotsRoot).catch(() => [] as string[])) {
+    const deviceDir = path.join(snapshotsRoot, deviceDirName)
+    for (const name of (await fs.readdir(deviceDir)).filter((n) => n.endsWith('.json'))) {
+      const filePath = path.join(deviceDir, name)
+      const raw = await fs.readFile(filePath, 'utf8')
+      if (needles.some((n) => raw.includes(n))) {
+        await fs.rm(filePath)
+        continue
+      }
+      if (keepNeedles.every((n) => raw.includes(n))) keptKeepsakeGeneration = true
+      let doc: any = null
+      try {
+        doc = JSON.parse(raw)
+      } catch {
+        continue
+      }
+      const client = doc?.clientInstanceId
+      if (typeof client !== 'string' || !client) continue
+      const revision = Number(doc?.snapshotRevision ?? 0)
+      const capturedAt = Number(doc?.capturedAt ?? 0)
+      const cur = newestByClient.get(client)
+      if (!cur || revision > cur.revision || (revision === cur.revision && capturedAt > cur.capturedAt)) {
+        newestByClient.set(client, { revision, capturedAt })
+      }
+    }
+  }
+  expect(
+    keptKeepsakeGeneration,
+    `evidence shaping must leave a keepsake generation behind (${premiseLabel}: the surviving tab's push)`,
+  ).toBe(true)
+  expect(newestByClient.size, 'the lost context pushed at least one retained generation').toBeGreaterThan(0)
+  for (const [client, newest] of newestByClient) {
+    expect(
+      newest.capturedAt,
+      `client ${client}'s newest retained generation must sit INSIDE the grace window ` +
+        `(${premiseLabel}: capturedAt=${newest.capturedAt}, latest allowed=${latestAllowedMs}, ` +
+        'grace=7000ms) — otherwise the time-drop clause alone answers the judgment ' +
+        'and this scenario is vacuous',
+    ).toBeLessThanOrEqual(latestAllowedMs)
+  }
 }
 
 /**
@@ -850,6 +945,434 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await expect(panel).toHaveCount(0)
 
     await ctxPhone.close()
+  })
+
+  /**
+   * Delta-round-7 Finding F1 (the scenario-3 early-loss variant): a live,
+   * meaningfully-attributed, placement-valid, not-close-covered ledger row
+   * whose pane never landed in ANY surviving snapshot is OFFERED as a reattach
+   * candidate (pre-fix the ledgerOnly pipeline categorically excluded live
+   * rows, so the genuinely-open session was lost from recovery). The row is
+   * deliberately NOT waited into a snapshot: the browser is lost right after
+   * the binding row lands, and post-loss shaping deletes every retained
+   * generation referencing the pane (session id / createRequestId /
+   * terminalId / paneId), so ONLY the ledgerOnly pipeline can carry it. The
+   * offer lists it under the live (reattach) note, and accepting reattaches
+   * to the ORIGINAL still-running terminal — never a second spawn.
+   *
+   * Placement: after scenario 4 — it wipes the evidence base (safe at this
+   * serial boundary: no client is connected) and never restarts the server,
+   * so later scenarios' own wipe discipline is unaffected.
+   */
+  test('scenario 6: early loss before any snapshot survives — the LIVE unsnapshotted ledger row is offered and reattached, never respawned (delta-round-7 F1)', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+
+    // 1. Re-base the evidence base (the kill-window/stale-row idiom: safe
+    //    while no client is connected).
+    const snapshotsRoot = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    await fs.rm(snapshotsRoot, { recursive: true, force: true })
+
+    // 2. Context L boots against the wiped store — NO offer (nothing is
+    //    recoverable) — then gains a shell pane and a claude CLI pane in one
+    //    tab. Plain connect, NOT openFreshContextWithOffer (which REQUIRES a
+    //    panel).
+    const ctxL: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageL = await ctxL.newPage()
+    traceInventoryFailures(pageL, 'early-loss-L')
+    const harnessL = await connect(pageL, info)
+    await selectShellIfPickerShowing(pageL)
+    await expect(pageL.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    const tabLId = (await harnessL.getActiveTabId())!
+
+    const argvCountBeforeCreate = (await readArgvLog(argLog)).length
+    await openCliPane(pageL, /^Claude CLI$/i)
+    let sessionIdL = ''
+    await expect(async () => {
+      const sid = sessionIdsOf((await readArgvLog(argLog)).slice(argvCountBeforeCreate))[0]
+      expect(sid, 'context L fake claude received a pre-allocated --session-id').toBeTruthy()
+      sessionIdL = sid!
+    }).toPass({ timeout: 30_000 })
+
+    // 3. The binding row is durable BEFORE the loss, WITH its attribution
+    //    (the judgment's row_time = lastAttributedAt — the creation receipt).
+    const rowPathL = path.join(
+      capturedHome, '.freshell', 'pane-ledger', 'bindings', 'claude', `${sessionIdL}.json`,
+    )
+    let attributedAt = 0
+    await expect(async () => {
+      const raw = await fs.readFile(rowPathL, 'utf8').catch(() => '')
+      expect(raw, "L's claude binding row must land on disk").not.toBe('')
+      const row = JSON.parse(raw) as { lastAttributedAt?: unknown; state?: unknown }
+      expect(row.state).toBe('bound')
+      expect(typeof row.lastAttributedAt, 'row JSON lastAttributedAt (the judgment row_time)').toBe('number')
+      attributedAt = row.lastAttributedAt as number
+    }).toPass({ timeout: 15_000 })
+
+    // 4. Capture L's pane identities — the reattach proofs (the ORIGINAL
+    //    terminal ids) and the shaping needles (so NO retained generation can
+    //    reference this pane or its row). POLLED: the terminal handle folds
+    //    into the pane content when terminal.created lands.
+    let claudeLeafL: any
+    let shellTerminalIdL: string | undefined
+    let claudeTerminalIdL: string | undefined
+    let claudeCrIdL: string | undefined
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessL.getPaneLayout(tabLId))
+      claudeLeafL = leaves.find((l) => l.content?.kind === 'terminal' && l.content?.mode === 'claude')
+      const shellLeafL = leaves.find((l) => l.content?.kind === 'terminal' && (l.content?.mode ?? 'shell') === 'shell')
+      shellTerminalIdL = shellLeafL?.content?.terminalId
+      claudeTerminalIdL = claudeLeafL?.content?.terminalId
+      claudeCrIdL = claudeLeafL?.content?.createRequestId
+      expect(claudeTerminalIdL, "L's claude pane owns a live terminal id").toBeTruthy()
+      expect(shellTerminalIdL, "L's shell pane owns a live terminal id").toBeTruthy()
+      expect(claudeCrIdL, "L's claude pane owns its createRequestId").toBeTruthy()
+    }).toPass({ timeout: 15_000 })
+
+    // The argv-log watermark for the anti-respawn assertions below.
+    const argvCountAtL = (await readArgvLog(argLog)).length
+
+    // 5. THE EARLY LOSS: the browser dies WITHOUT any snapshot containing the
+    //    new pane surviving (we deliberately never wait for one — the F1
+    //    shape). The server (and both PTYs) keep running.
+    await ctxL.close()
+    await waitForRecoverable(info)
+
+    // 6. Deterministic shaping: remove every retained generation referencing
+    //    the pane (within-cadence loss made exact); the surviving keepsake
+    //    generation holds the TAB (placement) with only the shell pane.
+    await shapeEvidenceExcluding({
+      snapshotsRoot,
+      needles: [sessionIdL, claudeCrIdL as string, claudeTerminalIdL as string, claudeLeafL.id as string],
+      keepNeedles: [tabLId],
+      latestAllowedMs: attributedAt + 7_000,
+      premiseLabel: `lastAttributedAt=${attributedAt}`,
+    })
+
+    // 7. Probe the inventory BEFORE any page is opened (the standalone-probe
+    //    idiom). THE F1 PIN: the row must now be OFFERED — `live:true` with
+    //    the still-running terminal id for the client-side reattach arm —
+    //    while NO union pane references it (it arrives ONLY via ledgerOnly).
+    const probe = await request.newContext({
+      baseURL: info.baseUrl,
+      extraHTTPHeaders: { 'x-auth-token': info.token },
+    })
+    try {
+      const res = await probe.get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
+      expect(res.ok(), `inventory probe must succeed (status ${res.status()})`).toBe(true)
+      const body = (await res.json()) as {
+        recoverable?: unknown
+        device?: unknown
+        ledgerOnly?: Array<{ sessionId?: unknown; live?: unknown; liveTerminalId?: unknown; tabKey?: unknown }>
+      }
+      expect(body.recoverable).toBe(true)
+      const deviceJson = JSON.stringify(body.device ?? null)
+      expect(deviceJson.includes(sessionIdL), 'no union pane may reference the lost pane (session id)').toBe(false)
+      expect(
+        deviceJson.includes(claudeCrIdL as string),
+        'no union pane may reference the lost pane (createRequestId)',
+      ).toBe(false)
+      expect(Array.isArray(body.ledgerOnly), 'probe response must carry a ledgerOnly array').toBe(true)
+      const entry = (body.ledgerOnly ?? []).find((e) => e.sessionId === sessionIdL)
+      expect(
+        entry,
+        `the LIVE unsnapshotted row ${sessionIdL} must be offered as a reattach candidate ` +
+          `(got ledgerOnly=${JSON.stringify(body.ledgerOnly)})`,
+      ).toBeTruthy()
+      expect(entry!.live, 'the entry carries the live verdict (reattach routing)').toBe(true)
+      expect(
+        entry!.liveTerminalId,
+        "the entry forwards the row's still-running terminal id for the reattach arm",
+      ).toBe(claudeTerminalIdL)
+      expect(String(entry!.tabKey), 'the entry joins the ORIGINAL tab').toContain(tabLId)
+    } finally {
+      await probe.dispose()
+    }
+
+    // 8. Context E (fresh storage = new machine): the offer lists AND counts
+    //    BOTH panes (the snapshotted live shell + the ledgerOnly live claude
+    //    row), the live note explains the reattach, and accepting puts both
+    //    back IN THEIR TAB on their ORIGINAL terminals — never a respawn.
+    const ctxE: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageE = await ctxE.newPage()
+    traceInventoryFailures(pageE, 'early-loss-E')
+    await connect(pageE, info)
+
+    const panelE = pageE.getByTestId('recovery-offer-panel')
+    await expect(panelE).toBeVisible({ timeout: 15_000 })
+    await expect(
+      pageE.getByRole('heading', { name: /restore 2 panes from server memory/i }),
+    ).toBeVisible()
+    await expect(panelE.getByRole('listitem')).toHaveCount(2)
+    await expect(pageE.getByTestId('recovery-live-note')).toBeVisible()
+    await expect(pageE.getByTestId('recovery-live-note')).toHaveText(/reattach/)
+
+    await pageE.getByTestId('recovery-accept').click()
+    await expect(panelE).toHaveCount(0)
+    await expect(pageE.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+    await expect(async () => {
+      const ePanes = await pageE.evaluate(() => {
+        const harness = (window as any).__FRESHELL_TEST_HARNESS__
+        const state = harness?.getState()
+        const ids: string[] = []
+        for (const tab of state?.tabs?.tabs ?? []) {
+          const walk = (node: any): void => {
+            if (!node) return
+            if (node.type === 'leaf') {
+              if (node.content?.kind === 'terminal' && node.content?.terminalId) {
+                ids.push(node.content.terminalId)
+              }
+              return
+            }
+            for (const child of node.children ?? []) walk(child)
+          }
+          walk(state?.panes?.layouts?.[tab.id])
+        }
+        return ids
+      })
+      expect(ePanes, "the recovered shell pane reattached to L's still-running shell PTY").toContain(shellTerminalIdL!)
+      expect(
+        ePanes,
+        "the ledgerOnly claude pane reattached to L's still-running claude PTY (the F1 arm)",
+      ).toContain(claudeTerminalIdL!)
+    }).toPass({ timeout: 30_000 })
+
+    // ANTI-RESPAWN: nothing spawned past the watermark and the live session
+    // was never resumed onto a recreated pane.
+    const entriesAfterAccept = (await readArgvLog(argLog)).slice(argvCountAtL)
+    expect(entriesAfterAccept, 'the live panes reattached — nothing spawned past the watermark').toHaveLength(0)
+    expect(
+      entriesAfterAccept.some((e) => hasClaudeResumePair(e.argv, sessionIdL)),
+      'the live session is never resumed onto a recreated pane',
+    ).toBe(false)
+
+    await ctxE.close()
+  })
+
+  /**
+   * Delta-round-7 Finding F2 (the terminal-detach twin of the kill-window
+   * scenario): a claude CLI terminal pane created and closed PROMPTLY via the
+   * PLAIN pane-X (inside the grace window) DETACHES — the session survives,
+   * the row must stay Bound (the sidebar-reattach FEATURE) — and the durable
+   * pane-close record keyed by the pane's createRequestId lands
+   * BEFORE/ALONGSIDE the detach without fencing/retiring anything (kills
+   * empty). After the compound loss (browser dies, server SIGKILL makes the
+   * row non-live) and evidence shaping, the close-covered row is NEVER
+   * offered and NEVER restored. Pre-fix nothing durable recorded the pane
+   * close, so the judgment admitted the row and the offer recreated a pane
+   * the user had explicitly removed — the finding's verbatim failure shape.
+   *
+   * Placement: alongside the kill-window scenario — it wipes the evidence
+   * base (safe at this serial boundary) and restarts the server exactly once.
+   */
+  test('scenario 7: close inside the grace window via terminal DETACH — a just-closed CLI pane is never offered or restored (delta-round-7 F2)', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+
+    // 1. Re-base the evidence base.
+    const snapshotsRoot = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+    await fs.rm(snapshotsRoot, { recursive: true, force: true })
+
+    // 2. Context A: boot shell pane, then SPLIT a claude CLI pane beside it
+    //    (the shell sibling keeps the tab alive, so closePane — not closeTab
+    //    — fires, and no closed-tab record is written).
+    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const pageA = await ctxA.newPage()
+    const harnessA = await connect(pageA, info)
+    await selectShellIfPickerShowing(pageA)
+    await expect(pageA.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    const tabAId = (await harnessA.getActiveTabId())!
+
+    // The marker cwd is the offer-list discriminator (the panel renders
+    // ledgerOnly lines as "{tabName}: {mode} — {cwd}"): create the CLI pane
+    // with a unique real marker dir as its starting directory.
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'detach-close-cli-'))
+    const argvCountBeforeCreate = (await readArgvLog(argLog)).length
+    const picker = await openPanePicker(pageA)
+    await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
+    const directoryInput = pageA.getByRole('combobox', { name: /Starting directory/i })
+    await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+    await directoryInput.fill(markerDir)
+    await directoryInput.press('Enter')
+
+    // 3. Durable id + binding row on disk WITH attribution (mirrors the
+    //    kill-window scenario's read of the judgment's row_time).
+    let closedSessionId = ''
+    await expect(async () => {
+      const sid = sessionIdsOf((await readArgvLog(argLog)).slice(argvCountBeforeCreate))[0]
+      expect(sid, 'context A fake claude received a pre-allocated --session-id').toBeTruthy()
+      closedSessionId = sid!
+    }).toPass({ timeout: 30_000 })
+    const rowPath = path.join(
+      capturedHome, '.freshell', 'pane-ledger', 'bindings', 'claude', `${closedSessionId}.json`,
+    )
+    let attributedAt = 0
+    await expect(async () => {
+      const raw = await fs.readFile(rowPath, 'utf8').catch(() => '')
+      expect(raw, 'the claude binding row must land on disk').not.toBe('')
+      const row = JSON.parse(raw) as { lastAttributedAt?: unknown; state?: unknown }
+      expect(row.state).toBe('bound')
+      expect(typeof row.lastAttributedAt, 'row JSON lastAttributedAt (the judgment row_time)').toBe('number')
+      attributedAt = row.lastAttributedAt as number
+    }).toPass({ timeout: 15_000 })
+
+    // 4. The pane's identities (the shaping needles + the close-record join
+    //    keys), fetched BEFORE the close. POLLED: the terminal handle folds
+    //    into the pane content when terminal.created lands.
+    let claudeLeafA: any
+    let claudeTerminalIdA: string | undefined
+    let claudeCrIdA = ''
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessA.getPaneLayout(tabAId))
+      claudeLeafA = leaves.find((l) => l.content?.kind === 'terminal' && l.content?.mode === 'claude')
+      claudeTerminalIdA = claudeLeafA?.content?.terminalId
+      claudeCrIdA = claudeLeafA?.content?.createRequestId ?? ''
+      expect(claudeTerminalIdA, "A's claude pane owns a live terminal id").toBeTruthy()
+      expect(claudeCrIdA, "A's claude pane owns its createRequestId").toBeTruthy()
+    }).toPass({ timeout: 15_000 })
+
+    // 5. Close VIA THE PLAIN pane-X immediately — inside the grace window —
+    //    never shift+close and never the BackgroundSessions Stop button (the
+    //    terminal.kill shape is the OTHER close family; this is the DETACH
+    //    lane: the session survives by design).
+    await pageA
+      .locator(`[data-pane-id="${claudeLeafA.id}"][data-context='pane'] button[title='Close pane']`)
+      .click()
+
+    // 6. Premise 1 (NON-RETIRING): the row stays Bound — the detach answers
+    //    "was this PANE closed", never "is the session dead" (the sidebar
+    //    reattach feature is untouched).
+    const readRowState = async () => {
+      const raw = await fs.readFile(rowPath, 'utf8').catch(() => '')
+      if (!raw) return ''
+      return String((JSON.parse(raw) as { state?: unknown }).state ?? '')
+    }
+    await expect(async () => {
+      expect(await readRowState()).toBe('bound')
+    }).toPass({ timeout: 5_000 })
+
+    // 7. Premise 2 (THE DURABLE CLOSE RECORD): a close-envelope record keyed
+    //    by the pane's createRequestId (the record family the kill envelope
+    //    writes) lands, carrying the pane linkage with NO identity fences
+    //    (kills empty — nothing is fenced or retired).
+    await expect(async () => {
+      const dir = path.join(capturedHome, '.freshell', 'pane-ledger', 'close-envelopes')
+      const files = await fs.readdir(dir).catch(() => [] as string[])
+      let found: any = null
+      for (const name of files.filter((f) => f.endsWith('.json'))) {
+        const body = await fs.readFile(path.join(dir, name), 'utf8').catch(() => '')
+        try {
+          found = JSON.parse(body)
+        } catch {
+          continue
+        }
+        if (found?.createRequestId === claudeCrIdA) break
+        found = null
+      }
+      expect(
+        found,
+        'a durable pane-close record keyed by the closed pane\'s createRequestId must land ' +
+          `(looked in ${dir} for createRequestId=${claudeCrIdA})`,
+      ).toBeTruthy()
+      expect(found.terminalId, 'the record carries the pane (terminal) linkage').toBe(claudeTerminalIdA)
+      expect(found.kills ?? [], 'the detach close fences NOTHING (non-retiring)').toHaveLength(0)
+    }).toPass({ timeout: 15_000 })
+
+    // 8. The COMPOUND loss: the browser dies FIRST (about:blank — a surviving
+    //    page would reconnect and re-push), then the server is SIGKILLed and
+    //    revived. The detached claude PTY dies with the server: the row now
+    //    reads non-live — exactly the finding's admission shape.
+    await pageA.goto('about:blank')
+    info = await server.restartAbrupt()
+
+    // 9. Post-kill evidence shaping + the IN-WINDOW premise read (the
+    //    kill-window idiom): delete every retained generation referencing the
+    //    closed pane, require a keepsake session-free generation (the tab's
+    //    surviving push), and hold every surviving client's newest inside the
+    //    grace window — otherwise the time-drop clause alone answers the
+    //    exclusion and this scenario is vacuous. The row's file must STILL
+    //    record Bound across the restart (the record, not a retirement,
+    //    carries the close) — the anti-vacuity precondition of the probe
+    //    below.
+    await shapeEvidenceExcluding({
+      snapshotsRoot,
+      needles: [closedSessionId, claudeCrIdA, claudeTerminalIdA as string, claudeLeafA.id as string],
+      keepNeedles: [tabAId],
+      latestAllowedMs: attributedAt + 7_000,
+      premiseLabel: `lastAttributedAt=${attributedAt}`,
+    })
+    expect(
+      await readRowState(),
+      'across the restart the row stays Bound — the close coverage (not a retirement) owns the exclusion',
+    ).toBe('bound')
+
+    // 10. Inventory assertion via a STANDALONE probe BEFORE any page is
+    //     opened: the close-covered row is absent from ledgerOnly (bucket-
+    //     shape anti-vacuity check included).
+    const probe = await request.newContext({
+      baseURL: info.baseUrl,
+      extraHTTPHeaders: { 'x-auth-token': info.token },
+    })
+    try {
+      const res = await probe.get('/api/recovery/inventory?clientInstanceId=freshell-test-probe&bootAgoMs=0')
+      expect(res.ok(), `inventory probe must succeed (status ${res.status()})`).toBe(true)
+      const body = (await res.json()) as { ledgerOnly?: Array<{ sessionId?: unknown }> }
+      expect(Array.isArray(body.ledgerOnly), 'probe response must carry a ledgerOnly array').toBe(true)
+      expect(
+        (body.ledgerOnly ?? []).every((e) => e.sessionId !== closedSessionId),
+        `the detach-close-covered row ${closedSessionId} must NOT be in the inventory's ` +
+          `ledgerOnly bucket (got ${JSON.stringify(body.ledgerOnly)})`,
+      ).toBe(true)
+    } finally {
+      await probe.dispose()
+    }
+
+    // 11. Offer assertion: the shell tab survived in the evidence, so the
+    //     offer is REQUIRED; the closed pane's line would render
+    //     "{tabName}: claude — {markerDir}" and must appear on NO line.
+    const { ctx: ctxB, page: pageB, harness: harnessB } = await openFreshContextWithOffer(browser, 'detach-window-exclusion')
+    const panel = pageB.getByTestId('recovery-offer-panel')
+    await expect(panel.getByRole('listitem').first()).toBeVisible({ timeout: 15_000 })
+    await expect(
+      panel.locator('ul li', { hasText: /: claude — \S*detach-close-cli-/ }),
+    ).toHaveCount(0)
+
+    // 12. Accept: the surviving shell restores (anti-vacuity), and NO leaf
+    //     anywhere carries the closed session — the pane the user closed
+    //     stays closed. The shell respawn is expected (it verdicts dead after
+    //     the SIGKILL); the claude session must never reappear in ANY form.
+    const argvCountAtAccept = (await readArgvLog(argLog)).length
+    await pageB.getByTestId('recovery-accept').click()
+    await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    await expect(async () => {
+      const layout = await harnessB.getPaneLayout(await harnessB.getActiveTabId())
+      const leaves = leavesOfLayout(layout)
+      const hit = leaves.some(
+        (leaf) =>
+          leaf?.content?.sessionRef?.sessionId === closedSessionId
+          || leaf?.content?.resumeSessionId === closedSessionId
+          || leaf?.content?.sessionId === closedSessionId,
+      )
+      expect(hit, `no restored pane may carry the detach-closed session ${closedSessionId}`).toBe(false)
+      const shellCount = leaves.filter(
+        (leaf) => leaf?.content?.kind === 'terminal' && (leaf?.content?.mode ?? 'shell') === 'shell',
+      ).length
+      expect(shellCount, 'accept must restore the surviving shell (anti-vacuity)').toBeGreaterThan(0)
+    }).toPass({ timeout: 30_000 })
+    expect(
+      (await readArgvLog(argLog)).slice(argvCountAtAccept).some((e) => hasClaudeResumePair(e.argv, closedSessionId)),
+      'the closed session is never resumed onto a recreated pane',
+    ).toBe(false)
+    expect(
+      (await readArgvLog(argLog))
+        .slice(argvCountAtAccept)
+        .some((e) => e.argv.includes(closedSessionId)),
+      'the closed session never respawns at all (no argv names it)',
+    ).toBe(false)
+
+    await ctxB.close()
+    await fs.rm(markerDir, { recursive: true, force: true })
   })
 
   /**

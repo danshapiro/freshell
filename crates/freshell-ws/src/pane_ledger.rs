@@ -265,12 +265,17 @@ pub struct PaneCloseKill {
 ///
 /// Keys: `pane:<terminalId>` for the terminal lane (`close_pane` — the close
 /// keyed by the PANE, with its `terminalId`/`createRequestId` linkage the
-/// recovery verdict join's pane-cover arm consumes) and
+/// recovery verdict join's pane-cover arm consumes),
 /// `<provider>:<addressedSessionId>` for the fresh-agent lanes
 /// (`close_identities` — the kill's wire id, the identity the close knew
 /// first; a later kill naming a different alias journals a second record and
-/// the fences merge in the index). The mixed flat subtree cannot collide:
-/// every key carries a `:` (encoded), terminal ids are 32-hex.
+/// the fences merge in the index), and `pane-detach:<createRequestId>` for
+/// the NON-RETIRING detach close (delta-round-7 Finding F2,
+/// `close_pane_detached` — "this PANE was closed" evidence with empty
+/// `kills`: the session survives by design, so nothing is fenced or retired,
+/// and the kill lanes' merges/consults at `pane:` must never see it). The
+/// mixed flat subtree cannot collide: every key carries a `:` (encoded),
+/// terminal ids are 32-hex.
 ///
 /// What it carries:
 /// * `terminal_id` / `create_request_id` — the pane linkage when the close
@@ -361,6 +366,24 @@ pub struct PaneCloseRecord {
     /// late resolution). Same-key repeats refresh the stamp.
     #[serde(default)]
     pub kills: Vec<PaneCloseKill>,
+}
+
+/// Delta-round-7 (Finding F2) — the recovery verdict join's read model for
+/// the NON-RETIRING detach close family: records keyed
+/// `pane-detach:<createRequestId>` ([`PaneLedger::close_pane_detached`]). A
+/// terminal pane's deliberate X-close DETACHES — the session keeps running
+/// (the sidebar-reattach feature) — but THE PANE closed durably. Unlike the
+/// kill lane's records, these carry empty `kills` (nothing is fenced) and
+/// never surface in `list_pane_closes`: their terminal stays RUNNING, so a
+/// terminalId-arm join would cover a later pane reattached to it. The
+/// inventory joins them by `create_request_id` (snapshot panes — the "this
+/// exact pane was closed" key — and ledger rows — the row the pane's create
+/// stamped) and by `terminal_id` (ledger rows only: the row's live terminal
+/// IS the closed pane's; terminal ids are never re-minted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneDetachClose {
+    pub create_request_id: String,
+    pub terminal_id: Option<String>,
 }
 
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) — the close envelope's
@@ -1202,6 +1225,28 @@ impl PaneLedger {
     /// The fresh-agent lane's envelope key (see [`Self::pane_envelope_key`]).
     fn agent_envelope_key(provider: &str, addressed_session_id: &str) -> String {
         format!("{provider}:{addressed_session_id}")
+    }
+
+    /// Delta-round-7 (Finding F2) — the NON-RETIRING detach close's key:
+    /// `pane-detach:<createRequestId>`. Keyed by the pane's creation key, NOT
+    /// its terminal id: the detached terminal stays RUNNING and can be
+    /// reattached by a NEW pane (new createRequestId), and the kill lane's
+    /// merges/consults at `pane:<terminalId>` ([`Self::pane_envelope_key`])
+    /// must never see it (`resolve_pending`'s consult would retire a live
+    /// session's row over a pane close that retired nothing). The prefix
+    /// cannot collide with the existing key shapes (`pane:<32-hex terminal
+    /// id>`, `<provider>:<sessionId>`).
+    fn pane_detach_envelope_key(create_request_id: &str) -> String {
+        format!("pane-detach:{create_request_id}")
+    }
+
+    /// The detach-close key family (the read models' lane discriminator —
+    /// [`Self::list_pane_closes`] EXCLUDES these keys from the kill-lane pane
+    /// view; [`Self::list_pane_detach_closes`] projects exactly them).
+    const PANE_DETACH_ENVELOPE_PREFIX: &'static str = "pane-detach:";
+
+    fn is_detach_close_key(key: &str) -> bool {
+        key.starts_with(Self::PANE_DETACH_ENVELOPE_PREFIX)
     }
 
     fn rollback_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
@@ -2973,9 +3018,62 @@ impl PaneLedger {
         Ok(())
     }
 
+    /// Delta-round-7 (Finding F2) — the terminal pane DETACH close: the
+    /// pane's deliberate X-close records ONE durable close-envelope journal
+    /// record keyed by the pane's `createRequestId`, BEFORE/ALONGSIDE the
+    /// (non-retiring) detach. THE record answers "was this PANE closed",
+    /// never "is the session dead":
+    ///
+    /// * `kills` is EMPTY BY CONSTRUCTION — no kill fence is fed (a fence
+    ///   would suppress future binding writes and drive the kill-tombstone
+    ///   verdicts/dominance: a still-live detached session must never read
+    ///   closed), and `close_envelope_locked`'s row-flip projection over an
+    ///   empty identity set flips NOTHING — the row stays Bound for sidebar
+    ///   reattach.
+    /// * The key is `pane-detach:<createRequestId>`, disjoint from the kill
+    ///   lane's `pane:<terminalId>` — a LATER genuine kill of the same
+    ///   terminal journals its own record (fences + retire) beside this one,
+    ///   and `resolve_pending`'s `pane:`-keyed consult never sees this
+    ///   record (a late identity resolution legitimately lands Bound — the
+    ///   session lives on).
+    ///
+    /// The same ONE-journal-record durability protocol applies (atomic file
+    /// write; `Clean`/`Persisted` split; the detach lane surfaces a failure
+    /// loudly and never blocks the detach itself). Retention: the sweep's
+    /// reference-time rule, extended by this round to ledger rows — the
+    /// record outlives any binding row still carrying its createRequestId
+    /// (the created-and-closed-inside-the-push-cadence shape has NO retained
+    /// snapshot referencing it, so the row keep is what stands between the
+    /// record and the ghost re-offer).
+    pub fn close_pane_detached(
+        &self,
+        create_request_id: &str,
+        terminal_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), CloseEnvelopeError> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        self.close_envelope_locked(
+            &root,
+            &mut index,
+            &Self::pane_detach_envelope_key(create_request_id),
+            &[], // kills EMPTY: the pane-close record fences/retires nothing
+            terminal_id,
+            Some(create_request_id),
+            now_ms,
+        )
+    }
+
     /// Every standing pane-keyed close record (the recovery inventory's
     /// verdict join input), derived from the journal records — the
     /// fresh-agent envelopes carry no pane linkage and never surface here.
+    /// Delta-round-7 (Finding F2): DETACH records never surface here either
+    /// — their terminals stay RUNNING, so this read model's terminalId join
+    /// arm would cover a later pane reattached to the same terminal. The
+    /// inventory's detach coverage reads [`Self::list_pane_detach_closes`]
+    /// instead.
     /// Memory-only (V1.md read policy); a disabled ledger answers empty.
     pub fn list_pane_closes(&self) -> Vec<PaneCloseRecord> {
         if self.root.is_none() {
@@ -2983,8 +3081,9 @@ impl PaneLedger {
         }
         self.guard()
             .close_envelopes
-            .values()
-            .filter_map(|record| {
+            .iter()
+            .filter(|(key, _)| !Self::is_detach_close_key(key))
+            .filter_map(|(_, record)| {
                 record
                     .terminal_id
                     .clone()
@@ -2994,6 +3093,32 @@ impl PaneLedger {
                         create_request_id: record.create_request_id.clone(),
                         closed_at: record.closed_at,
                         kills: record.kills.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Delta-round-7 (Finding F2) — the recovery inventory's DETACH-close
+    /// read model: every standing non-retiring detach close's pane linkage
+    /// (the createRequestId the record is keyed by, plus the terminal id the
+    /// detach knew — the row-side terminal arm: a row whose live terminal IS
+    /// the closed pane's terminal is that pane's row; terminal ids are never
+    /// re-minted). Memory-only; a disabled ledger answers empty.
+    pub fn list_pane_detach_closes(&self) -> Vec<PaneDetachClose> {
+        if self.root.is_none() {
+            return Vec::new();
+        }
+        self.guard()
+            .close_envelopes
+            .iter()
+            .filter(|(key, _)| Self::is_detach_close_key(key))
+            .filter_map(|(_, record)| {
+                record
+                    .create_request_id
+                    .clone()
+                    .map(|create_request_id| PaneDetachClose {
+                        create_request_id,
+                        terminal_id: record.terminal_id.clone(),
                     })
             })
             .collect()

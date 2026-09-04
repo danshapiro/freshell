@@ -2,7 +2,7 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
 import { collectAllTerminalIds } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
-import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles } from './panesSlice'
+import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles, closePane, removeLayout } from './panesSlice'
 import type { PaneNode } from './paneTypes'
 
 type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> } }
@@ -35,6 +35,44 @@ const skipDetachActionTypes = new Set<string>([
 ])
 
 /**
+ * Delta-round-7 (Finding F2): the actions that mean "the user CLOSED pane(s)"
+ * — the plain pane-X (`closePane`, via closePaneWithCleanup) and a whole-tab
+ * close (`removeLayout`, via the closeTab thunk). When one of these removes
+ * the last layout reference to a terminal, the detach carries the closing
+ * pane's `createRequestId`, and the server journals a durable, NON-retiring
+ * pane-close record keyed by it BEFORE/ALONGSIDE the detach (the session
+ * survives — sidebar reattach; the record answers "was this PANE closed",
+ * never "is the session dead"). No other detach shape carries the key:
+ * reconcile folds, server-driven handle swaps, resume-create respawns (e.g.
+ * resetPaneForReconcileCreate — which PRESERVES the pane's createRequestId
+ * for the SAME still-open pane), and the dead-terminal cleanup reducers all
+ * detach WITHOUT it, so a live handle swap can never mislabel the pane's
+ * createRequestId as closed. MAINTENANCE WARNING (same discipline as the
+ * skip-list above): register new genuine pane/tab-close actions here, and
+ * NEVER register an action that merely swaps a live handle.
+ */
+const paneCloseActionTypes = new Set<string>([closePane.type, removeLayout.type])
+
+/** The createRequestId of the (pre-action) pane that owned `terminalId`, if any. */
+function createRequestIdOfTerminal(layouts: PanesStateSlice['panes']['layouts'], terminalId: string): string | undefined {
+  for (const root of Object.values(layouts)) {
+    const stack: PaneNode[] = []
+    if (root && typeof root === 'object') stack.push(root)
+    while (stack.length) {
+      const node = stack.pop()!
+      if (node.type === 'leaf') {
+        if (node.content.kind === 'terminal' && node.content.terminalId === terminalId) {
+          return node.content.createRequestId || undefined
+        }
+      } else {
+        stack.push(...node.children)
+      }
+    }
+  }
+  return undefined
+}
+
+/**
  * Detach reconciler: whenever an action makes a terminalId disappear from
  * ALL pane layouts, the client no longer references that terminal and must
  * release its server-side attach subscription — otherwise the server sees
@@ -56,6 +94,8 @@ export const terminalDetachMiddleware: Middleware = (store) => (next) => (action
   if (typeof actionType === 'string' && skipDetachActionTypes.has(actionType)) {
     return result
   }
+  // F2: only a genuine pane/tab close keys the durable pane-close record.
+  const isPaneClose = typeof actionType === 'string' && paneCloseActionTypes.has(actionType)
 
   const before = collectAllTerminalIds(beforeLayouts)
   if (before.size === 0) return result
@@ -64,7 +104,14 @@ export const terminalDetachMiddleware: Middleware = (store) => (next) => (action
   for (const terminalId of before) {
     if (after.has(terminalId)) continue
     if (consumeTerminalReleaseMark(terminalId)) continue
-    getWsClient().send({ type: 'terminal.detach', terminalId })
+    const createRequestId = isPaneClose
+      ? createRequestIdOfTerminal(beforeLayouts, terminalId)
+      : undefined
+    getWsClient().send({
+      type: 'terminal.detach',
+      terminalId,
+      ...(createRequestId ? { createRequestId } : {}),
+    })
   }
   return result
 }

@@ -681,9 +681,13 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
+      // Delta-round-7 (Finding F2): the plain tab close is a pane close, so
+      // the detach carries the closing pane's createRequestId — the server
+      // journals the durable NON-retiring pane-close record keyed by it.
       expect(mockSend).toHaveBeenCalledWith({
         type: 'terminal.detach',
         terminalId: 'term-123',
+        createRequestId: 'req-pane-1',
       })
     })
 
@@ -770,9 +774,13 @@ describe('TabBar', () => {
       fireEvent.click(closeButton)
 
       const detachMessages = mockSend.mock.calls
-        .map(([msg]) => msg as { type?: string; terminalId?: string })
+        .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
-      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-123' }])
+      // The single pane-close detach carries the closed pane's createRequestId
+      // (delta-round-7 F2) — exactly ONE message either way.
+      expect(detachMessages).toEqual([
+        { type: 'terminal.detach', terminalId: 'term-123', createRequestId: 'req-pane-1' },
+      ])
     })
 
     it('shift close leaves the tab standing when the terminal close is not durably acknowledged', async () => {
@@ -894,14 +902,18 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
+      // Delta-round-7 (Finding F2): each pane-close detach carries ITS OWN
+      // pane's createRequestId (the durable non-retiring close record's key).
       expect(mockSend).toHaveBeenCalledTimes(2)
       expect(mockSend).toHaveBeenNthCalledWith(1, {
         type: 'terminal.detach',
         terminalId: 'term-a',
+        createRequestId: 'req-pane-1',
       })
       expect(mockSend).toHaveBeenNthCalledWith(2, {
         type: 'terminal.detach',
         terminalId: 'term-b',
+        createRequestId: 'req-pane-2',
       })
     })
 

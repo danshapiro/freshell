@@ -519,6 +519,12 @@ export const TerminalAttachSchema = z.object({
 export const TerminalDetachSchema = z.object({
   type: z.literal('terminal.detach'),
   terminalId: z.string().min(1),
+  /** The closing pane's createRequestId (delta-round-7, Finding F2): present
+   * ONLY on a pane-close detach — the server journals a durable NON-retiring
+   * pane-close record keyed by it (the session survives: nothing is fenced or
+   * retired). Absent on every other detach shape (legacy clients, reconcile/
+   * cleanup folds): additive optional, no record is written. */
+  createRequestId: z.string().min(1).optional(),
 })
 
 export const TerminalAutoResumeCancelSchema = z.object({

@@ -62,7 +62,7 @@ use freshell_platform::{
 use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
     Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
-    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
+    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly,
     TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
     LEGACY_RESUME_IDENTITY_REFUSAL,
 };
@@ -1034,7 +1034,7 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalDetach(detach) => {
-            handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
+            handle_detach(&detach, ws_tx, state, conn_id).await
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
         ClientMessage::TerminalAutoResumeCancel(cancel) => {
@@ -5420,15 +5420,76 @@ fn handle_resize(resize: TerminalResize, state: &WsState) {
 
 /// `terminal.detach` — drop THIS connection's subscription (the terminal keeps
 /// running as a background session); reply `terminal.detached`.
+///
+/// Delta-round-7 (Finding F2): a PANE-close detach carries the pane's
+/// `createRequestId` and journals ONE durable, NON-retiring pane-close record
+/// keyed by it BEFORE the detach is processed (BEFORE/ALONGSIDE the detach,
+/// mirroring the kill lane's durable-close-before-teardown order). The record
+/// fences and retires NOTHING (the session survives by design — sidebar
+/// reattach); without it, a created-then-closed-within-the-grace-window pane
+/// was indistinguishable from created-then-crashed, and the recovery offer
+/// could later recreate a pane the user explicitly removed. The write runs on
+/// the blocking pool (the kill lane's fsync idiom); unlike the kill lane a
+/// write failure does NOT fail the detach (the session state is already
+/// consistent — nothing ends) — it surfaces through the ledger's standard
+/// loud degradation seam instead. A CRID-less detach (legacy clients, the
+/// reconcile/server-swap folds, cleanup of server-dead handles) writes
+/// nothing, exactly as before.
 async fn handle_detach(
-    terminal_id: &str,
+    detach: &TerminalDetach,
     ws_tx: &mut WsSink,
     state: &WsState,
     conn_id: u64,
 ) -> bool {
-    state.registry.detach(terminal_id, conn_id);
+    if let Some(create_request_id) = detach.create_request_id.as_deref() {
+        if !create_request_id.is_empty() {
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let crid = create_request_id.to_string();
+            let tid = detach.terminal_id.clone();
+            let now = now_ms();
+            let result = spawn_blocking_in_span(move || {
+                ledger.close_pane_detached(&crid, Some(&tid), now)
+            })
+            .await
+            .unwrap_or_else(|join_err| {
+                Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+                    std::io::Error::other(format!("detach close task join failed: {join_err}")),
+                ))
+            });
+            match result {
+                Ok(()) => {}
+                Err(err) if err.is_persisted() => {
+                    // The record IS durable despite the reported error — the
+                    // close evidence stands, so nothing is degraded; loud,
+                    // structured, never silent.
+                    tracing::error!(
+                        target: "freshell_ws::terminal",
+                        terminal_id = %detach.terminal_id,
+                        error = %err,
+                        "pane_detach_close_persisted_despite_error: the non-retiring \
+                         pane-close record is durable; the write layer reported an error"
+                    );
+                }
+                Err(err) => {
+                    // Clean: NOTHING is durable — genuine durability
+                    // degradation. Never fail the detach itself (nothing ends
+                    // server-side): surface through the ledger's standard
+                    // loud seam (structured ERROR + invariant counter + the
+                    // live broadcast) instead.
+                    crate::pane_ledger::surface_write_failure(
+                        state,
+                        &detach.terminal_id,
+                        Err(std::io::Error::other(format!(
+                            "pane-detach close record write failed: {err}"
+                        ))),
+                    );
+                }
+            }
+        }
+    }
+    state.registry.detach(&detach.terminal_id, conn_id);
     let detached = ServerMessage::TerminalDetached(TerminalIdOnly {
-        terminal_id: terminal_id.to_string(),
+        terminal_id: detach.terminal_id.clone(),
     });
     send(ws_tx, &detached).await
 }

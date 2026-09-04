@@ -192,8 +192,6 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   // spawns). The note's condition stays predicate-independent on purpose:
   // live panes pass the restorability predicate, so the note cannot key off
   // it without vacuity.
-  const anyLive =
-    device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false
   // D8 placement: the listing must match the plan's physical destination, so
   // both consume the same partition — a kept ledger row whose stamped tabKey
   // names a restorable tab renders under THAT tab in the same line format as
@@ -203,6 +201,13 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   // Finding 2) — count, list, and plan can never disagree.
   const restorableTabs = (device?.tabs ?? []).filter((tab) => tab.panes.length > 0)
   const placement = placeLedgerEntries(inventory)
+  // Delta-round-7 (Finding F1): the note also covers live LEDGER rows — an
+  // unsnapshotted live row offered as a reattach candidate is exactly a
+  // session "still running on the server". Only JOINED entries count (the
+  // note must describe what the offer actually restores, like the count).
+  const anyLive =
+    (device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false) ||
+    [...placement.joinedByTabKey.values()].some((entries) => entries.some((e) => e.live === true))
 
   return createPortal(
     <div

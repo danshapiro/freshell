@@ -821,6 +821,123 @@ async fn a_kill_for_a_terminal_the_registry_lost_still_records_the_pane_close() 
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Delta-round-7 (Finding F2) — the terminal pane's deliberate X-close,
+/// end to end: the close DETACHES (the session keeps running — the
+/// sidebar-reattach feature) AND the detach carrying the pane's
+/// `createRequestId` journals ONE durable, NON-retiring pane-close record
+/// keyed by that creation key (the close-envelope family), BEFORE the detach
+/// is processed. Nothing is fenced and NO row flips: the closed pane's
+/// identity row stays Bound, the terminal stays Running, and
+/// `terminal.detached` answers as always. A CRID-less (legacy / reconcile /
+/// cleanup) detach writes NOTHING, exactly as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detach_carrying_the_panes_create_request_id_journals_a_non_retiring_pane_close() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("detach-close-record");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // An identified terminal: claude's pre-spawn binding row is Bound with
+    // the pane's createRequestId stamped (the close-coverage join key).
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-detach-close-1",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let row_path_row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("binding row written at create");
+    assert_eq!(row_path_row.create_request_id.as_deref(), Some("req-detach-close-1"));
+
+    // THE PANE CLOSE: detach carrying the pane's createRequestId.
+    let detach = serde_json::json!({
+        "type": "terminal.detach",
+        "terminalId": terminal_id,
+        "createRequestId": "req-detach-close-1",
+    });
+    ws.send(WsMessage::Text(detach.to_string())).await.unwrap();
+    // The record is journaled BEFORE the detach is processed (the kill lane's
+    // durable-close-before-teardown order), so once `terminal.detached`
+    // arrives the close is already durable.
+    let detached = next_frame_of_type(&mut ws, "terminal.detached").await;
+    assert_eq!(detached["terminalId"], terminal_id);
+
+    let closes = server_ledger.list_pane_detach_closes();
+    assert_eq!(
+        closes.len(),
+        1,
+        "exactly one non-retiring pane-close record: {closes:?}"
+    );
+    assert_eq!(closes[0].create_request_id, "req-detach-close-1");
+    assert_eq!(closes[0].terminal_id.as_deref(), Some(terminal_id.as_str()));
+
+    // NOTHING retired, NOTHING fenced: the row stays Bound, no tombstone is
+    // fed, and the kill-lane pane read model stays empty (its terminalId arm
+    // must never cover a later pane reattached to this STILL-RUNNING
+    // terminal).
+    let row = server_ledger.load_binding("claude", &session_id).expect("row");
+    assert_eq!(row.state, RowState::Bound, "the detach close never retires the row");
+    assert_eq!(row.retired_reason, None);
+    assert!(
+        server_ledger.all_kill_tombstone_keys().is_empty(),
+        "the detach close feeds no kill fence"
+    );
+    assert!(
+        server_ledger.list_pane_closes().is_empty(),
+        "the kill-lane read model never surfaces a detach close"
+    );
+    // The session keeps RUNNING (detached only): the FEATURE half of the
+    // finding.
+    assert!(
+        registry.probe(&terminal_id).is_some(),
+        "the terminal survived the pane close (detach is non-retiring)"
+    );
+
+    // Durable across a restart: a fresh ledger over the same dir reads the
+    // record back from the journal.
+    let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
+    assert_eq!(disk.list_pane_detach_closes().len(), 1);
+    assert_eq!(disk.list_pane_detach_closes()[0].create_request_id, "req-detach-close-1");
+
+    // A CRID-less detach writes NOTHING (legacy/reconcile/cleanup shapes):
+    // second terminal, plain detach — no new record appears.
+    let create2 = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-detach-plain-2",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create2.to_string())).await.unwrap();
+    let created2 = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id_2 = created2["terminalId"].as_str().unwrap().to_string();
+    let detach2 = serde_json::json!({
+        "type": "terminal.detach",
+        "terminalId": terminal_id_2,
+    });
+    ws.send(WsMessage::Text(detach2.to_string())).await.unwrap();
+    let detached2 = next_frame_of_type(&mut ws, "terminal.detached").await;
+    assert_eq!(detached2["terminalId"], terminal_id_2);
+    assert_eq!(
+        server_ledger.list_pane_detach_closes().len(),
+        1,
+        "a CRID-less detach journals no pane-close record"
+    );
+
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Delta-r6-r3 (focused-episode-6 round 2, Finding 7's server half): a kill
 /// carrying `requestId` answers ONCE with a correlated `terminal.killed`
 /// frame — `success:true` after the durable close envelope landed and the

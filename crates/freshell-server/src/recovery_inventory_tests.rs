@@ -3,8 +3,9 @@
 use super::*;
 use freshell_protocol::SessionLocator;
 use freshell_ws::pane_ledger::{
-    BindingRow, BindingWrite, FreshAgentBindingWrite, PaneCloseKill, PaneCloseRecord, PaneLedger,
-    ProvenancePolicy, ProvenanceStamps, RetiredReason, RowState, LEDGER_VERSION,
+    BindingRow, BindingWrite, FreshAgentBindingWrite, PaneCloseKill, PaneCloseRecord,
+    PaneDetachClose, PaneLedger, ProvenancePolicy, ProvenanceStamps, RetiredReason, RowState,
+    LEDGER_VERSION,
 };
 use serde_json::json;
 use std::collections::HashSet;
@@ -190,6 +191,24 @@ fn closes_with(
                 })
                 .collect(),
         }],
+        pane_detach_closes: Vec::new(),
+    }
+}
+
+/// Delta-round-7 (Finding F2) fixture: the NON-RETIRING detach closes (no
+/// kill-lane records, no standing fences) — `(createRequestId, terminalId)`
+/// pairs exactly as `list_pane_detach_closes` projects them.
+fn closes_with_detach(detaches: &[(&str, Option<&str>)]) -> CloseEvidence {
+    CloseEvidence {
+        standing_kill_tombstones: HashSet::new(),
+        pane_closes: Vec::new(),
+        pane_detach_closes: detaches
+            .iter()
+            .map(|(crid, tid)| PaneDetachClose {
+                create_request_id: crid.to_string(),
+                terminal_id: tid.map(str::to_string),
+            })
+            .collect(),
     }
 }
 
@@ -590,24 +609,39 @@ fn bound_row_referenced_by_non_primary_device_is_not_ledger_only() {
 }
 
 #[test]
-fn live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only() {
-    // D7: pane resolves (via ledger chain) to S2, which a Running terminal owns;
-    // a second live bound row C9 is referenced by no pane.
+fn live_effective_ref_marks_pane_live_and_live_rows_become_reattach_candidates() {
+    // D7 pane half (unchanged): the pane's claim resolves (via the ledger
+    // chain) to S2, which a Running terminal owns => the pane verdicts live
+    // and the effective ref is still reported.
+    //
+    // Delta-round-7 Finding F1 (RETARGETED row half — this test previously
+    // pinned the round-3 live EXCLUSION, the finding's harm): the
+    // unreferenced Bound row C9 is LIVE, meaningfully attributed
+    // (client+device+tab stamps with a present `last_attributed_at`), inside
+    // its parent's grace window (1_000 + 7_000 >= 5_000), placement-valid
+    // (the union's record carries its stamped tabKey "dev1:t9"), and not
+    // close-covered => it is OFFERED as a REATTACH candidate: `live:true`
+    // (the client's reattach/adopt routing) plus the row's still-running
+    // terminal id and its stamped tabKey. Dead rows keep the EXISTING
+    // judgment's treatment unchanged: the same row with no live evidence is
+    // offered too (the D8 resume cohort — that was never the pinned
+    // exclusion; the categorical !is_live drop was).
     let d = DeviceUnion {
         device_id: "dev1".into(),
-        union_doc: union_doc(
+        union_doc: union_doc_with_tab_key(
             "dev1",
             1000,
+            "dev1:t9",
             json!([{ "paneId": "p1", "kind": "terminal",
                      "payload": { "mode": "claude", "sessionRef": { "provider": "claude", "sessionId": "S1" } } }]),
         ),
     };
+    let mut c9 = with_attribution(binding_row("codex", "C9", bound()), "c9", "dev1", "t9");
+    c9.live_terminal_id = Some("term-c9-live".into());
     let bindings = vec![
         binding_row("claude", "S1", retired_superseded_by("claude", "S2")),
         binding_row("claude", "S2", bound()),
-        // C9 is attributed with in-grace parent evidence, so the D8 judgment
-        // alone would offer it — the D7 live rule remains the deciding filter.
-        with_attribution(binding_row("codex", "C9", bound()), "c9", "dev1", "t9"),
+        c9,
     ];
     let out = build_inventory(
         vec![d],
@@ -617,10 +651,350 @@ fn live_effective_ref_marks_pane_live_and_live_rows_never_ledger_only() {
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["live"], true);
     assert_eq!(pane["sessionRef"]["sessionId"], "S2"); // ref still reported; the CLIENT strips it (Task 4, D7)
+    let only = out["ledgerOnly"].as_array().unwrap();
+    // S2 is REFERENCED by the snapshot pane (never ledgerOnly); the live C9
+    // row is the one offered member.
+    let entry = only
+        .iter()
+        .find(|e| e["sessionId"] == "C9")
+        .unwrap_or_else(|| panic!("the live attributed placement-valid row is offERED as a reattach candidate: {out}"));
+    assert_eq!(only.len(), 1, "S2 stays referenced; C9 alone joins: {out}");
+    assert_eq!(entry["live"], true, "the live verdict rides the offer entry: {entry}");
     assert_eq!(
-        out["ledgerOnly"].as_array().unwrap().len(),
-        0,
-        "live bound rows are excluded from ledgerOnly"
+        entry["liveTerminalId"], "term-c9-live",
+        "the row's still-running terminal id arms the client reattach: {entry}"
+    );
+    assert_eq!(entry["tabKey"], "dev1:t9", "the original-tab join key: {entry}");
+    assert!(entry.get("paneKind").is_none(), "a terminal row carries no paneKind: {entry}");
+
+    // The dead twin: same row, no live evidence — the pre-existing D8 resume
+    // cohort. Still offered (never the pinned exclusion), stamped live:false
+    // and with NO reattach terminal handle (its terminal is gone).
+    let d2 = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1000,
+            "dev1:t9",
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "claude", "sessionRef": { "provider": "claude", "sessionId": "S1" } } }]),
+        ),
+    };
+    let mut c9_dead = with_attribution(binding_row("codex", "C9", bound()), "c9", "dev1", "t9");
+    c9_dead.live_terminal_id = Some("term-c9-live".into());
+    let out_dead = build_inventory(
+        vec![d2],
+        vec![
+            binding_row("claude", "S1", retired_superseded_by("claude", "S2")),
+            binding_row("claude", "S2", bound()),
+            c9_dead,
+        ],
+        no_live(),
+        &evidence(&[("dev1", &[("c9", 5_000)])]), &no_closes());
+    let only_dead = out_dead["ledgerOnly"].as_array().unwrap();
+    let entry_dead = only_dead
+        .iter()
+        .find(|e| e["sessionId"] == "C9")
+        .expect("the dead twin stays offered (the D8 resume cohort)");
+    assert_eq!(entry_dead["live"], false, "no live evidence, no live stamp: {entry_dead}");
+    assert!(
+        entry_dead.get("liveTerminalId").is_none() || entry_dead["liveTerminalId"].is_null(),
+        "a dead row forwards no reattach handle (it restores by resume): {entry_dead}"
+    );
+}
+
+/// Delta-round-7 Finding F1, the gate-parity pins: including live rows never
+/// WEAKENS the judgment — a live row answers the SAME attribution, grace, and
+/// placement gates as a dead one. Each arm isolates one failing gate with
+/// the liveness evidence present (pre-fix every arm passed vacuously: the
+/// categorical live drop masked them all).
+#[test]
+fn live_rows_answer_the_same_attribution_grace_and_placement_gates_as_dead_rows() {
+    let open_union = |tab_key: &str| DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1_000_000,
+            tab_key,
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let ev = evidence(&[("dev1", &[("c1", 1_000_000)])]);
+    let live_ev = live(&[("claude", "S-live")]);
+
+    // (a) OUT OF GRACE: the parent's evidence already observed the row's
+    // absence (992_999 + 7_000 < 1_000_000) — excluded, live stamp or not.
+    let out = build_inventory(
+        vec![open_union("dev1:t1")],
+        vec![with_attribution(
+            binding_row_at("claude", "S-live", bound(), 992_999),
+            "c1",
+            "dev1",
+            "t1",
+        )],
+        live_ev,
+        &ev, &no_closes());
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "a live row past its parent's grace stays excluded: {out}"
+    );
+
+    // (b) PLACEMENT MISS: the stamped tabKey names no open paned tab in the
+    // union — unplaceable, excluded.
+    let out = build_inventory(
+        vec![open_union("dev1:t-other")],
+        vec![with_attribution(
+            binding_row_at("claude", "S-live", bound(), 995_000),
+            "c1",
+            "dev1",
+            "t1",
+        )],
+        live(&[("claude", "S-live")]),
+        &ev, &no_closes());
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "a live row whose stamped tab is not in the union stays excluded: {out}"
+    );
+
+    // (c) UNATTRIBUTED: no client/device stamps at all — never offered.
+    let out = build_inventory(
+        vec![open_union("dev1:t1")],
+        vec![binding_row_at("claude", "S-live", bound(), 995_000)],
+        live(&[("claude", "S-live")]),
+        &ev, &no_closes());
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "a live but unattributed row stays excluded: {out}"
+    );
+
+    // (d) CONTROL: every gate passes — the live row IS offered (anti-vacuity:
+    // the three exclusions above are decided by their gates, not by the offer
+    // pipeline being broken).
+    let out = build_inventory(
+        vec![open_union("dev1:t1")],
+        vec![with_attribution(
+            binding_row_at("claude", "S-live", bound(), 995_000),
+            "c1",
+            "dev1",
+            "t1",
+        )],
+        live(&[("claude", "S-live")]),
+        &ev, &no_closes());
+    let only = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(only.len(), 1, "all gates pass => the live row is offered: {out}");
+    assert_eq!(only[0]["live"], true, "{out}");
+}
+
+/// Delta-round-7 (Finding F2) — the ROW-side detach coverage: a Bound,
+/// unreferenced, attributed, in-grace, placement-valid row whose PANE was
+/// X-closed (the non-retiring detach wrote its createRequestId-keyed close
+/// record) is NEVER offered — LIVE or DEAD (the finding's exact admission:
+/// created-then-closed-within-7s read indistinguishable from
+/// created-then-crashed). The row itself stays Bound (the record never
+/// flips it — sidebar reattach keeps working). The uncovered sibling row
+/// stays offered either way (anti-vacuity: the fixture discriminates).
+#[test]
+fn a_detach_close_covered_row_is_never_offered_live_or_dead() {
+    let make = |live_keys: &[(&str, &str)]| {
+        let d = DeviceUnion {
+            device_id: "dev1".into(),
+            union_doc: union_doc_with_tab_key(
+                "dev1",
+                1_000_000,
+                "dev1:t1",
+                json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+            ),
+        };
+        let covered = with_attribution(
+            with_correlation_ids(
+                binding_row_at("claude", "S-closed", bound(), 995_000),
+                Some("req-closed"),
+                Some("term-closed"),
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        );
+        let sibling = with_attribution(
+            with_correlation_ids(
+                binding_row_at("claude", "S-open", bound(), 995_000),
+                Some("req-open"),
+                Some("term-open"),
+            ),
+            "c1",
+            "dev1",
+            "t1",
+        );
+        build_inventory(
+            vec![d],
+            vec![covered, sibling],
+            live(live_keys),
+            &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+            &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+        )
+    };
+    for (label, keys) in [
+        ("DEAD (post-restart)", &[][..]),
+        ("LIVE (still Running)", &[("claude", "S-closed"), ("claude", "S-open")][..]),
+    ] {
+        let out = make(keys);
+        let only = out["ledgerOnly"].as_array().unwrap();
+        assert!(
+            only.iter().all(|e| e["sessionId"] != "S-closed"),
+            "the detach-close-covered row is never offered ({label}): {out}"
+        );
+        assert!(
+            only.iter().any(|e| e["sessionId"] == "S-open"),
+            "the uncovered sibling stays offered ({label} anti-vacuity): {out}"
+        );
+    }
+
+    // The TERMINAL arm alone also covers the row (the conn-less resolution
+    // lane writes rows without the advisory createRequestId): a row with NO
+    // crid whose live terminal IS the closed pane's terminal is that pane's
+    // row — covered. (A live-terminal-id match against a KILL record never
+    // reaches here: kill-covered rows are retired or dominance-rewritten
+    // before this pipeline.)
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1_000_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let crid_less = with_attribution(
+        with_correlation_ids(
+            binding_row_at("claude", "S-resolved-late", bound(), 995_000),
+            None,
+            Some("term-closed"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![crid_less],
+        live(&[("claude", "S-resolved-late")]),
+        &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+        &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+    );
+    assert!(
+        out["ledgerOnly"].as_array().unwrap().is_empty(),
+        "the crid-less row on the closed pane's terminal is covered via the terminal arm: {out}"
+    );
+
+    // REBOUND LAPSE: the same identity re-created by a NEW pane mints a new
+    // createRequestId wholesale — neither arm keys the old close anymore, so
+    // a genuinely re-opened session is offerable again.
+    let d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1_000_000,
+            "dev1:t1",
+            json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell"} }]),
+        ),
+    };
+    let rebound = with_attribution(
+        with_correlation_ids(
+            binding_row_at("claude", "S-rebound", bound(), 995_000),
+            Some("req-new-pane"),
+            Some("term-new-pane"),
+        ),
+        "c1",
+        "dev1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![d],
+        vec![rebound],
+        live(&[("claude", "S-rebound")]),
+        &evidence(&[("dev1", &[("c1", 1_000_000)])]),
+        &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+    );
+    let only = out["ledgerOnly"].as_array().unwrap();
+    assert_eq!(
+        only.len(),
+        1,
+        "a rebound row (fresh pane keys) is never ghosted by the old pane's close: {out}"
+    );
+}
+
+/// Delta-round-7 (Finding F2) — the PANE-side detach coverage via the
+/// createRequestId arm ONLY: a snapshot pane whose createRequestId a detach
+/// record keys verdicts CLOSED even though its session is still live (the
+/// pane itself was closed; coverage beats liveness) — but a LATER pane
+/// reattached to the SAME still-running terminal (fresh createRequestId) is
+/// NOT covered: the detach record's terminal id never joins snapshot panes
+/// (the P2 false-positive guard — the kill lane's terminal arm is untouched:
+/// killed terminals are dead, so it never collides).
+#[test]
+fn a_detach_close_covers_its_snapshot_pane_by_create_request_id_but_never_a_reattached_pane() {
+    // The CLOSED pane, snapshotted pre-close with its identity resolved and
+    // its terminal still Running: coverage wins over the live verdict.
+    let closed_pane = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "claude",
+                                  "sessionRef": { "provider": "claude", "sessionId": "S-closed" },
+                                  "createRequestId": "req-closed",
+                                  "liveTerminal": { "terminalId": "term-closed", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let out = build_inventory(
+        vec![closed_pane],
+        vec![with_correlation_ids(
+            binding_row("claude", "S-closed", bound()),
+            Some("req-closed"),
+            Some("term-closed"),
+        )],
+        live(&[("claude", "S-closed")]),
+        &no_evidence(),
+        &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["ledgerState"], "closed",
+        "the closed pane's own snapshot verdicts closed (never restored): {pane}"
+    );
+    assert_eq!(pane["live"], false, "a close-covered pane never reads live: {pane}");
+
+    // The REATTACHED pane: a NEW pane on the SAME still-running terminal
+    // (sidebar reattach mints a fresh createRequestId) is NOT covered by the
+    // old pane's detach record — it verdicts live through the terminal-id
+    // fallback and restores by reattach.
+    let reattached_pane = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc(
+            "dev1",
+            1000,
+            json!([{ "paneId": "p2", "kind": "terminal",
+                     "payload": { "mode": "shell", "shell": "system",
+                                  "createRequestId": "req-reattached",
+                                  "liveTerminal": { "terminalId": "term-closed", "serverInstanceId": "srv-x" } } }]),
+        ),
+    };
+    let out = build_inventory(
+        vec![reattached_pane],
+        vec![],
+        with_terminals(no_live(), &["term-closed"]),
+        &no_evidence(),
+        &closes_with_detach(&[("req-closed", Some("term-closed"))]),
+    );
+    let pane = &out["device"]["tabs"][0]["panes"][0];
+    assert_eq!(
+        pane["live"], true,
+        "the reattached pane lives (terminal-id fallback), never covered by the old pane's close: {pane}"
+    );
+    assert_ne!(
+        pane["ledgerState"], "closed",
+        "a detach record's terminal id never covers a different pane: {pane}"
     );
 }
 
@@ -3638,6 +4012,160 @@ async fn route_serves_attributed_ledger_only_row_within_parent_grace() {
     assert_eq!(entry["tabKey"], "dev1:t9");
 }
 
+/// Delta-round-7 (Finding F1), route level: a Bound, unreferenced, attributed,
+/// in-grace, placement-valid row whose session is LIVE in the registry is
+/// offered as a reattach candidate — `live:true` with the row's still-running
+/// terminal id — NOT categorically excluded. The dead control row (no live
+/// terminal owns its session) is offered too with `live:false` and no reattach
+/// handle (the pre-existing resume cohort, untouched).
+#[tokio::test]
+async fn route_offers_a_live_attributed_row_as_a_reattach_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    let seed = |session_id: &str, live_terminal: Option<&str>| {
+        let mut row = json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
+            "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
+            "state": "bound",
+            "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+            "lastAttributedAt": 995_000
+        });
+        if let Some(t) = live_terminal {
+            row["liveTerminalId"] = json!(t);
+        }
+        std::fs::write(
+            broot.join("bindings").join("claude").join(format!("{session_id}.json")),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+    };
+    seed("S9-live", Some("t-live-9"));
+    seed("S9-dead", Some("t-dead-9"));
+    // The live evidence: a Running registry row owning S9-live's session.
+    let registry = freshell_terminal::TerminalRegistry::new();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "t-live-9".into(),
+        stream_id: "s9".into(),
+        mode: "claude".into(),
+        resume_session_id: Some("S9-live".into()),
+        create_request_id: None,
+        created_at: None,
+    });
+    let state = RecoveryInventoryState {
+        auth_token: "tok".into(),
+        snapshots_dir: Some(tmp.path().to_path_buf()),
+        ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(Some(broot))),
+        registry,
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+    };
+    let router = router(state);
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let only = body["ledgerOnly"].as_array().unwrap();
+    let live_entry = only.iter().find(|e| e["sessionId"] == "S9-live").unwrap_or_else(|| {
+        panic!("the LIVE attributed placement-valid row is offered (never categorically excluded): {body}")
+    });
+    assert_eq!(live_entry["live"], true, "the live verdict rides the entry: {live_entry}");
+    assert_eq!(
+        live_entry["liveTerminalId"], "t-live-9",
+        "the still-running terminal id arms the client reattach: {live_entry}"
+    );
+    let dead_entry = only
+        .iter()
+        .find(|e| e["sessionId"] == "S9-dead")
+        .expect("the dead control row stays offered (the resume cohort)");
+    assert_eq!(dead_entry["live"], false);
+    assert!(
+        dead_entry.get("liveTerminalId").is_none() || dead_entry["liveTerminalId"].is_null(),
+        "a dead row forwards no reattach handle: {dead_entry}"
+    );
+}
+
+/// Delta-round-7 (Finding F2), route level — the finding's verbatim failure
+/// shape: a Bound row whose pane was X-closed (the non-retiring terminal
+/// DETACH journaled its createRequestId-keyed close record) is NEVER offered,
+/// even though the row stays Bound (sidebar reattach) and every
+/// attribution/grace/placement gate passes. The uncovered sibling row stays
+/// offered (anti-vacuity). Seeding mirrors the reference-time route test: the
+/// close is written through a REAL PaneLedger and reloaded by the route's.
+#[tokio::test]
+async fn route_never_offers_a_detach_close_covered_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "c1",
+        1_000_000,
+        1,
+        json!([
+            {"tabKey":"dev1:t9","tabId":"t9","tabName":"work","status":"open","revision":1,"updatedAt":1_000_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    let seed = |session_id: &str, crid: &str| {
+        std::fs::write(
+            broot.join("bindings").join("claude").join(format!("{session_id}.json")),
+            serde_json::to_vec(&json!({
+                "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
+                "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
+                "state": "bound", "createRequestId": crid, "liveTerminalId": format!("term-{crid}"),
+                "clientInstanceId": "c1", "deviceId": "dev1", "tabKey": "dev1:t9",
+                "lastAttributedAt": 995_000
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    seed("S-detached-closed", "req-closed");
+    seed("S-detached-open", "req-open");
+    // THE DURABLE PANE CLOSE (non-retiring): the detach record exists via the
+    // same write path the detach handler drives; the row stays Bound.
+    let seeder = PaneLedger::new(Some(broot.clone()));
+    seeder
+        .close_pane_detached("req-closed", Some("term-req-closed"), 996_000)
+        .expect("the detach close persists");
+    drop(seeder);
+
+    let router = router(test_state(Some(tmp.path().to_path_buf()), Some(broot)));
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let only = body["ledgerOnly"].as_array().unwrap();
+    assert!(
+        only.iter().all(|e| e["sessionId"] != "S-detached-closed"),
+        "a detach-close-covered row is never offered (the created-then-closed ghost): {body}"
+    );
+    assert!(
+        only.iter().any(|e| e["sessionId"] == "S-detached-open"),
+        "the uncovered sibling stays offered (the fixture discriminates): {body}"
+    );
+}
+
 /// Focused-ep5-r2 Finding 1 (retire-on-kill round 3), the route-level pin the
 /// finding demands: `retire_closed`'s two durable writes (kill tombstone,
 /// then row retire) can split across a crash or a failed second write. The
@@ -4226,9 +4754,14 @@ fn a_ref_less_pane_covered_by_terminal_id_verdicts_closed() {
     assert_eq!(pane["ledgerState"], "closed");
 }
 
-/// A covered pane claims NOTHING: its (would-be) correlated row is neither
-/// bound to it nor tainted by it — the row proceeds to the ordinary
-/// ledgerOnly judgment as if the closed pane did not exist.
+/// A covered pane claims NOTHING (its would-be candidates neither bind to it
+/// nor taint into the ambiguity census). Delta-round-7 (Finding F2) RETARGETED
+/// the row half (the old pin offered the covered pane's own row): a row the
+/// close coverage keys — by EITHER pane linkage (its createRequestId or, for
+/// detach records only, its live terminal id) — IS that closed pane's row and
+/// is never offered; the ordinary judgment it falls to now includes the
+/// row-close-coverage gate. The uncovered control row proves the judgment
+/// itself still discriminates.
 #[test]
 fn a_close_covered_pane_never_claims_its_correlated_row() {
     let d = DeviceUnion {
@@ -4246,18 +4779,26 @@ fn a_close_covered_pane_never_claims_its_correlated_row() {
         ),
     };
     // The row the pane WOULD correlate to (advisory crid match): Bound,
-    // attributed, within grace — offerable iff the closed pane never claims
-    // it. Its stamped tab is the union's tab, so the placement clause admits
-    // it.
-    let mut row = binding_row("codex", "sess-resumed", bound());
+    // attributed, within grace — but it is the CLOSED pane's own row (the
+    // kill record names the same createRequestId), so the row-close-coverage
+    // gate excludes it.
+    let mut row = binding_row("codex", "sess-closed-pane", bound());
     row.create_request_id = Some("req-cov".into());
     row.live_terminal_id = Some("t-cov".into());
     row = with_attribution(row, "c1", "dev1", "k1");
     row.last_attributed_at = Some(900);
+    // The control: an UNRELATED row on its own pane — never claimed, never
+    // tainted, offered (the judgment discriminates; the covered pane's census
+    // skip does not starve it either).
+    let mut control = binding_row("codex", "sess-elsewhere", bound());
+    control.create_request_id = Some("req-elsewhere".into());
+    control.live_terminal_id = Some("t-elsewhere".into());
+    control = with_attribution(control, "c1", "dev1", "k1");
+    control.last_attributed_at = Some(900);
     let closes = closes_with("t-cov", Some("req-cov"), &[], &[]);
     let out = build_inventory(
         vec![d],
-        vec![row],
+        vec![row, control],
         no_live(),
         &evidence(&[("dev1", &[("c1", 1_000)])]),
         &closes,
@@ -4269,9 +4810,13 @@ fn a_close_covered_pane_never_claims_its_correlated_row() {
     );
     let ledger_only = out["ledgerOnly"].as_array().unwrap();
     assert!(
-        ledger_only.iter().any(|e| e["sessionId"] == "sess-resumed"),
-        "the row was never claimed by the closed pane: it reaches the ordinary offer \
-         judgment (attributed + in grace + placeable): {ledger_only:?}"
+        ledger_only.iter().all(|e| e["sessionId"] != "sess-closed-pane"),
+        "the closed pane's own row is close-covered — never offered (F2): {ledger_only:?}"
+    );
+    assert!(
+        ledger_only.iter().any(|e| e["sessionId"] == "sess-elsewhere"),
+        "the unrelated control row reaches the ordinary offer judgment \
+         (attributed + in grace + placeable + uncovered): {ledger_only:?}"
     );
 }
 

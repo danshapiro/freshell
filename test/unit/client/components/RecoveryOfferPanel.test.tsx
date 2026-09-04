@@ -351,6 +351,55 @@ describe('RecoveryOfferPanel', () => {
     expect(consumeRecoveredLiveTerminalTarget(tab.id, leaves[0].id)).toBe('t-live-only')
   })
 
+  // Delta-round-7 (Finding F1): a LIVE ledger-only row (the unsnapshotted
+  // live inclusion — the row's pane never survived in a snapshot) is counted,
+  // listed under its ORIGINAL tab, and explained by the live note; accepting
+  // arms the one-shot reattach to its still-running terminal (never a
+  // respawn).
+  it('a live ledger-only row is counted, listed, reattach-armed on accept, and explained by the live note', async () => {
+    const inventory: RecoveryInventory = {
+      ...INVENTORY,
+      ledgerOnly: [
+        {
+          provider: 'claude',
+          sessionId: 'S-row-live',
+          mode: 'claude',
+          cwd: '/row-cwd',
+          tabKey: 'k',
+          live: true,
+          liveTerminalId: 't-row-live',
+        },
+      ],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    expect(await screen.findByText(/restore 2 panes/i)).toBeInTheDocument()
+    const items = screen.getAllByRole('listitem')
+    expect(items).toHaveLength(2)
+    expect(
+      items.some((li) => li.textContent === 'work: claude — /row-cwd'),
+      `the ledger row lists under its original tab in the standard line shape (got: ${items.map((li) => li.textContent).join(' | ')})`,
+    ).toBe(true)
+    expect(await screen.findByTestId('recovery-live-note')).toBeVisible()
+    expect(screen.getByTestId('recovery-live-note')).toHaveTextContent(
+      /still running on the server — restoring reattaches to them/,
+    )
+
+    await userEvent.click(screen.getByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'work')!
+    const leaves = collectTerminalLeaves(store.getState().panes.layouts[tab.id])
+    expect(leaves).toHaveLength(2)
+    const rowLeaf = leaves.find((l) =>
+      l.content.kind === 'terminal' && l.content.sessionRef?.sessionId === 'S-row-live',
+    )
+    expect(rowLeaf, 'the live ledger row restored as a terminal leaf keeping its resume ref').toBeTruthy()
+    // …armed for the reattach (consulted BEFORE any create) keyed by the pane
+    // id that survives restoreLayout normalization.
+    expect(consumeRecoveredLiveTerminalTarget(tab.id, rowLeaf!.id)).toBe('t-row-live')
+  })
+
   // Delta-r6 F1 (closed verdicts are NOT restorable): a snapshot pane the
   // server marked `ledgerState: "closed"` (its session was closed between the
   // last registry push and the browser-state loss) must be excluded from the

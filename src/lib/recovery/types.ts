@@ -52,12 +52,30 @@ export interface RecoveryOtherDevice {
   paneCount: number
 }
 
-/** Ledger-bound session with no snapshot pane referencing it (live rows are excluded server-side, D7). */
+/** Ledger-bound session with no snapshot pane referencing it. Delta-round-7
+ * (Finding F1): LIVE rows are now OFFERED as reattach candidates (the round-3
+ * categorical live exclusion was the finding's harm); `live` routes the plan
+ * to reattach/adopt, never a respawn. */
 export interface LedgerOnlyEntry {
   provider: string
   sessionId: string
   mode: string
   cwd: string | null
+  /**
+   * Delta-round-7 (Finding F1): true when the session is STILL RUNNING
+   * server-side. Fresh-agent rows restore by ADOPTION (the content keeps the
+   * sessionRef; the manager's live-session adopt answers the create without
+   * spawning). Terminal rows restore by REATTACH when `liveTerminalId` is
+   * present (the one-shot paneId→terminalId arm — see build-recovery-plan's
+   * `liveTerminalReattach`), else by the resume/D7-refusal→reattach fallback.
+   * Absent/false ⇒ the dead row's pre-existing resume treatment, unchanged.
+   */
+  live?: boolean
+  /**
+   * The row's still-running terminal id, forwarded only when `live` (F1) —
+   * the client-side reattach target for the recovered pane.
+   */
+  liveTerminalId?: string
   /**
    * D8 provenance stamp: `<deviceId>:<tabId>` of the tab the pane was open in
    * (present only for rows bound by a connection-scoped lane). The recovery

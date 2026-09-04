@@ -330,7 +330,23 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
         leaves.push(node)
       }
       for (const e of placement.joinedByTabKey.get(t.tabKey) ?? []) {
-        leaves.push(leaf(ledgerEntryContent(e)))
+        const node = leaf(ledgerEntryContent(e))
+        // Delta-round-7 (Finding F1): a LIVE terminal ledger row restores by
+        // REATTACH to its still-running terminal — the same one-shot
+        // paneId→terminalId arm the snapshot-pane live path uses
+        // (`liveReattachTarget`), consulted by TerminalView BEFORE any create
+        // (never a respawn). A live row with no forwarded handle (defensive)
+        // keeps its sessionRef and falls to the resume/D7-refusal→reattach
+        // path; fresh-agent rows never join this arm (their ADOPT rides the
+        // sessionRef create, exactly like a live fresh-agent snapshot pane).
+        const reattachTerminalId =
+          e.live === true && e.paneKind !== 'fresh-agent' && typeof e.liveTerminalId === 'string' && e.liveTerminalId
+            ? e.liveTerminalId
+            : undefined
+        if (reattachTerminalId) {
+          liveTerminalReattach.push({ paneId: node.id, terminalId: reattachTerminalId })
+        }
+        leaves.push(node)
       }
       return { tab: t, leaves, liveTerminalReattach }
     })

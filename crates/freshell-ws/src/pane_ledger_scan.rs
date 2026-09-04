@@ -435,6 +435,27 @@ impl PaneLedger {
         if referenced {
             return;
         }
+        // Delta-round-7 (Finding F2) — the LEDGER side of reference-time
+        // retention: the DETACH close family (`pane-detach:<crid>`,
+        // non-retiring, empty kills) exists to cover the row the closed pane
+        // created, and the finding's own shape gives it NO snapshot reference
+        // (the pane was created AND closed inside the push cadence, so no
+        // retained generation ever carries it) and no fences (empty kills —
+        // the record is not what makes anything read closed; the row join
+        // is). So the record lives while a binding row still carries its
+        // createRequestId — the same dominance-keep principle ("a close's
+        // evidence plus an unconverged row outlive the TTL") the fence side
+        // already applies below. Once the row leaves the ledger (its own GC
+        // lifecycle), this keep lapses and the aged record prunes.
+        let row_covered = record.create_request_id.as_deref().is_some_and(|c| {
+            index
+                .bindings
+                .values()
+                .any(|r| r.create_request_id.as_deref() == Some(c))
+        });
+        if row_covered {
+            return;
+        }
         // Dominance has no TTL (focused-ep5-r3 Finding 4, carried to the
         // journal record): a fence this record feeds that still DOMINATES a
         // Bound row is unconverged close evidence — the record stays until

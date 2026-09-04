@@ -31,6 +31,13 @@ describe('production store', () => {
     }))
     mockSend.mockClear()
     store.dispatch(removeLayout({ tabId: 'detach-reg-tab' }))
-    expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'detach-reg-term' })
+    // removeLayout is the closeTab thunk's layout removal — a pane close —
+    // so the detach carries the closing pane's createRequestId (delta-round-7
+    // F2: the durable non-retiring pane-close record's key).
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'terminal.detach',
+      terminalId: 'detach-reg-term',
+      createRequestId: 'detach-reg-req',
+    })
   })
 })

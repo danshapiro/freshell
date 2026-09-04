@@ -327,6 +327,15 @@ pub struct TerminalAttach {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalDetach {
     pub terminal_id: String,
+    /// The closing pane's createRequestId (delta-round-7, Finding F2): when a
+    /// PANE-close detach carries it, the server journals a durable
+    /// NON-retiring pane-close record keyed by the createRequestId
+    /// BEFORE/ALONGSIDE the detach (the session survives — nothing is fenced
+    /// or retired). Absent on every other detach shape (legacy clients,
+    /// server-driven handle swaps, reconcile folds): additive optional, no
+    /// record is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

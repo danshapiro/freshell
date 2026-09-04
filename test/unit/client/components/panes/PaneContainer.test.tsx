@@ -3,7 +3,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { resetPaneForReconcileCreate } from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
@@ -450,7 +450,7 @@ describe('PaneContainer', () => {
   })
 
   describe('terminal cleanup on pane close', () => {
-    it('sends terminal.detach message when closing a pane with terminalId', () => {
+    it('sends terminal.detach message when closing a pane with terminalId — carrying the pane\'s createRequestId (delta-round-7 F2)', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
       const terminalId = 'term-123'
@@ -464,12 +464,12 @@ describe('PaneContainer', () => {
           {
             type: 'leaf',
             id: pane1Id,
-            content: createTerminalContent({ terminalId }),
+            content: createTerminalContent({ terminalId, createRequestId: 'req-pane-1' }),
           },
           {
             type: 'leaf',
             id: pane2Id,
-            content: createTerminalContent({ terminalId: 'term-456' }),
+            content: createTerminalContent({ terminalId: 'term-456', createRequestId: 'req-pane-2' }),
           },
         ],
       }
@@ -488,10 +488,13 @@ describe('PaneContainer', () => {
       const closeButtons = screen.getAllByTitle('Close pane')
       fireEvent.click(closeButtons[0])
 
-      // Should have sent terminal.detach with the correct terminalId
+      // Should have sent terminal.detach with the correct terminalId — AND
+      // the closing pane's createRequestId (the durable, NON-retiring
+      // pane-close record's key: the session survives the detach by design).
       expect(mockSend).toHaveBeenCalledWith({
         type: 'terminal.detach',
         terminalId: terminalId,
+        createRequestId: 'req-pane-1',
       })
     })
 
@@ -509,12 +512,12 @@ describe('PaneContainer', () => {
           {
             type: 'leaf',
             id: pane1Id,
-            content: createTerminalContent({ terminalId }),
+            content: createTerminalContent({ terminalId, createRequestId: 'req-pane-1' }),
           },
           {
             type: 'leaf',
             id: pane2Id,
-            content: createTerminalContent({ terminalId: 'term-456' }),
+            content: createTerminalContent({ terminalId: 'term-456', createRequestId: 'req-pane-2' }),
           },
         ],
       }
@@ -537,6 +540,88 @@ describe('PaneContainer', () => {
         .map(([msg]) => msg as { type?: string; terminalId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
       expect(detachMessages).toHaveLength(1)
+    })
+
+    // Delta-round-7 (Finding F2) — the strongest false-positive guard: a
+    // NON-close layout reduction that drops a terminal handle (here: the
+    // reconcile resume/fresh create reset, which PRESERVES the still-open
+    // pane's createRequestId while swapping out its dead handle) must send a
+    // PLAIN detach. Carrying the preserved createRequestId would mark the
+    // still-open pane's durable record as closed and wrongly ghost it from
+    // future recovery offers.
+    it('a reconcile create reset (NOT a pane close) detaches WITHOUT any createRequestId', () => {
+      const pane1Id = 'pane-1'
+      const rootNode: PaneNode = {
+        type: 'leaf',
+        id: pane1Id,
+        content: createTerminalContent({
+          terminalId: 'term-stale',
+          createRequestId: 'req-preserved',
+          sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+          mode: 'claude',
+        }),
+      }
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': pane1Id },
+      })
+
+      store.dispatch(
+        resetPaneForReconcileCreate({
+          tabId: 'tab-1',
+          paneId: pane1Id,
+          intent: 'respawn',
+          sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+        }),
+      )
+
+      const detachMessages = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-stale' }])
+      // The pane is STILL open with its createRequestId preserved.
+      const layout = (store.getState() as { panes: PanesState }).panes.layouts['tab-1']
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content.createRequestId : undefined).toBe('req-preserved')
+    })
+
+    // The fallback arm: a closed pane that somehow carries NO createRequestId
+    // detaches as plainly as any legacy client — never a malformed record key.
+    it('closing a pane without a createRequestId sends a plain createRequestId-less detach', () => {
+      const pane1Id = 'pane-1'
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: pane1Id,
+            content: createTerminalContent({ terminalId: 'term-no-crid' }),
+          },
+          {
+            type: 'leaf',
+            id: 'pane-2',
+            content: createTerminalContent({ terminalId: 'term-456', createRequestId: 'req-pane-2' }),
+          },
+        ],
+      }
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': pane1Id },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+      const closeButtons = screen.getAllByTitle('Close pane')
+      fireEvent.click(closeButtons[0])
+
+      const detachMessages = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-no-crid' }])
     })
 
     it('does not send terminal.detach when closing a pane without terminalId', () => {
