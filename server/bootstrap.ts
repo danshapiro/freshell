@@ -1,15 +1,19 @@
 /**
  * Bootstrap module for first-run auto-configuration.
  *
- * This module runs synchronously on import, BEFORE dotenv/config loads,
- * to ensure that a valid .env file exists with AUTH_TOKEN and other defaults.
+ * This module runs synchronously on import, BEFORE the `.env` load in
+ * `./env-load.ts`, to ensure that a valid `.env` file exists (at the
+ * config-dir anchor, with migration from the legacy cwd location) with
+ * AUTH_TOKEN and other defaults. Entry points import this module first and
+ * `./env-load.js` second (`server/index.ts`).
  *
- * Usage: import './bootstrap.js' as the first import in server/index.ts
+ * Note: ensureEnvFile's `readConfigHost()` reads config.json directly —
+ * deliberately not dotenv-dependent — so the anchor questions and the .env
+ * load stay correctly ordered.
  */
 
 import { execFile, execSync } from 'child_process'
 import crypto from 'crypto'
-import dotenv from 'dotenv'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -388,26 +392,55 @@ export function resolveProjectRoot(): string {
   return process.cwd()
 }
 
+interface EnvMigrationDeps {
+  existsSync: (p: string) => boolean
+  mkdirSync: (p: string, opts: { recursive: true }) => unknown
+  copyFileSync: (src: string, dest: string) => void
+  log: (msg: string) => void
+  error: (msg: string) => void
+}
+
+/**
+ * Copy a legacy working-directory `.env` into the anchored config-dir when the
+ * anchor has no `.env` yet. Never moves, never overwrites. Returns true when
+ * a copy happened.
+ *
+ * Why this exists: before the server honored FRESHELL_CONFIG_DIR, a
+ * WorkingDirectory-less daemon unit (systemd user units default cwd=$HOME;
+ * launchd agents default cwd=/) kept its AUTH_TOKEN at `<cwd>/.env`. Re-
+ * anchoring blindly would mint a fresh token in the new location and strand
+ * every saved URL. There is no risk to same-path boots (`envPath ===
+ * cwdEnvPath`) or to fresh installs (nothing to copy).
+ */
+export function migrateLegacyEnvFile(
+  envPath: string,
+  cwdEnvPath: string,
+  deps: EnvMigrationDeps = {
+    existsSync: fs.existsSync,
+    mkdirSync: (p, o) => fs.mkdirSync(p, o),
+    copyFileSync: fs.copyFileSync,
+    log: (msg) => console.log(msg),
+    error: (msg) => console.error(msg),
+  },
+): boolean {
+  if (envPath === cwdEnvPath) return false
+  if (deps.existsSync(envPath)) return false
+  if (!deps.existsSync(cwdEnvPath)) return false
+  try {
+    deps.mkdirSync(path.dirname(envPath), { recursive: true })
+    deps.copyFileSync(cwdEnvPath, envPath)
+    deps.log(`[bootstrap] Migrated existing .env into the Freshell config dir (${envPath})`)
+    return true
+  } catch (err) {
+    deps.error(`[bootstrap] Failed to migrate ${cwdEnvPath} to ${envPath}: ${err instanceof Error ? err.message : String(err)}`)
+    return false
+  }
+}
+
 // --- Auto-run on import ---
 const projectRoot = resolveProjectRoot()
 const envPath = path.join(projectRoot, '.env')
-
-// Credential-migration guard: before the server honored FRESHELL_CONFIG_DIR,
-// a WorkingDirectory-less service unit (systemd user units default cwd=$HOME;
-// launchd agents default cwd=/) kept its token at `<cwd>/.env`. Switching the
-// anchor to the config dir would mint a NEW AUTH_TOKEN and strand every saved
-// URL, so copy (never move) the legacy file into the anchored location when
-// the target is missing.
-const cwdEnvPath = path.join(process.cwd(), '.env')
-if (envPath !== cwdEnvPath && !fs.existsSync(envPath) && fs.existsSync(cwdEnvPath)) {
-  try {
-    fs.mkdirSync(path.dirname(envPath), { recursive: true })
-    fs.copyFileSync(cwdEnvPath, envPath)
-    console.log(`[bootstrap] Migrated existing .env into the Freshell config dir (${envPath})`)
-  } catch (err) {
-    console.error(`[bootstrap] Failed to migrate ${cwdEnvPath} to ${envPath}: ${err instanceof Error ? err.message : String(err)}`)
-  }
-}
+migrateLegacyEnvFile(envPath, path.join(process.cwd(), '.env'))
 
 const result = ensureEnvFile(envPath)
 
@@ -420,10 +453,3 @@ if (result.action === 'created') {
 } else if (result.action === 'error') {
   console.error(`[bootstrap] Failed to ensure .env: ${result.error}`)
 }
-
-// Load .env HERE, at bootstrap module-evaluation time. `server/index.ts`
-// imports this module first, so every later module-level consumer of
-// process.env (e.g. logger constants, the PTY env scrub) sees the resolved
-// values. A `dotenv.config()` call from index.ts module *body* would run only
-// after every import was evaluated — too late for those readers.
-dotenv.config({ path: envPath })

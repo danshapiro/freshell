@@ -29,13 +29,13 @@ function candidate(url: string, token?: string): LaunchServerCandidate {
   }
 }
 
-describe('named profiles', () => {
+describe('server ownership', () => {
   it('a named app-bound profile ALWAYS starts its own server (never auto-connects to a discovered one)', () => {
     expect(chooseLaunchAction({
       desktopConfig: config({ serverMode: 'app-bound', port: 3002 }),
       candidates: [candidate('http://localhost:3001', 'tok')],
       savedRemoteReachable: false,
-      profileId: 'work',
+      ownsServer: true,
     })).toEqual({ type: 'start-local' })
   })
 
@@ -44,21 +44,32 @@ describe('named profiles', () => {
       desktopConfig: config({ serverMode: 'daemon' }),
       candidates: [candidate('http://localhost:3001', 'tok')],
       savedRemoteReachable: false,
-      profileId: 'work',
+      ownsServer: true,
     })).toEqual({ type: 'start-local' })
   })
 
-  it('the default profile keeps historical discovery behavior', () => {
+  it('a default boot inside a multi-profile install owns its server too', () => {
+    // When the registry names any profile, the Default boot behaves like any
+    // other tenant: it must NEVER auto-attach to a neighbor profile's server.
+    expect(chooseLaunchAction({
+      desktopConfig: config(),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })).toEqual({ type: 'start-local' })
+  })
+
+  it('a legacy default boot (ownsServer unset) keeps historical discovery behavior', () => {
     const c = candidate('http://localhost:3001', 'tok')
     expect(chooseLaunchAction({
       desktopConfig: config(),
       candidates: [c],
       savedRemoteReachable: false,
-      profileId: 'default',
+      ownsServer: false,
     })).toEqual({ type: 'auto-connect', candidate: c })
   })
 
-  it('an absent profileId (legacy call shape) keeps historical discovery behavior', () => {
+  it('an absent ownsServer (legacy call shape) keeps historical discovery behavior', () => {
     const c = candidate('http://localhost:3001', 'tok')
     expect(chooseLaunchAction({
       desktopConfig: config(),

@@ -1,8 +1,16 @@
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve as resolvePath } from 'node:path'
 import dotenv from 'dotenv'
 import { getFreshellConfigDir } from './freshell-home.js'
 import { isWSL } from './platform.js'
+
+/** Where this process's `.env` lives: FRESHELL_CONFIG_DIR when explicit
+ *  (daemon units, named Electron profiles), else the cwd. */
+function resolveDotenvAnchor(): string {
+  const override = process.env.FRESHELL_CONFIG_DIR?.trim()
+  if (override) return resolvePath(override)
+  return process.cwd()
+}
 
 /**
  * Read the effective network bind host from ~/.freshell/config.json.
@@ -26,9 +34,11 @@ import { isWSL } from './platform.js'
  */
 export function getNetworkHost(): string {
   // Load .env if not already loaded. Idempotent — dotenv won't overwrite
-  // vars already in process.env. This ensures config/vite/vite.config.ts (which doesn't
-  // import 'dotenv/config') can still see HOST from .env.
-  dotenv.config()
+  // vars already in process.env. Anchor to the same location/bootstrap the
+  // server uses (FRESHELL_CONFIG_DIR when explicit, else cwd), so a daemon
+  // unit's real .env is not silently swapped for a stray cwd one.
+  const envPath = join(resolveDotenvAnchor(), '.env')
+  dotenv.config({ path: envPath })
 
   // Explicit override for E2E tests and CI. Takes precedence over WSL
   // auto-detection and config file. Only valid bind addresses are accepted.

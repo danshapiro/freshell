@@ -79,8 +79,9 @@ export interface SettingsState {
   loaded: boolean
   lastSavedAt?: number
   /** Effective server config dir (~/.freshell or the named profile's dir), as
-   *  reported by bootstrap. Null until the bootstrap payload arrives. */
-  serverConfigDir: string | null
+   *  reported by bootstrap. Undefined until a bootstrap payload with configDir
+   *  arrives; kept optional so test-store helpers can omit the field. */
+  serverConfigDir?: string | null
 }
 
 const initialLocalSettings = loadInitialLocalSettings()

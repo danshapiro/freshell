@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
+import os from 'os'
 import path from 'path'
 import { runStartup, type StartupContext, type BrowserWindowLike } from '../../../electron/startup.js'
 import type { DesktopConfig } from '../../../electron/types.js'
@@ -132,6 +133,37 @@ describe('runStartup', () => {
   })
 
   describe('daemon mode', () => {
+    it('a named profile in daemon mode reads the daemon (default-profile) .env for its token', async () => {
+      const mockWindow = createMockWindow()
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'daemon',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      const readEnvToken = vi.fn().mockResolvedValue('daemon-token')
+      ctx.readEnvToken = readEnvToken
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      // The machine daemon anchors its .env at the default config dir
+      // (~/.freshell), never the named profile's dir.
+      expect(readEnvToken).toHaveBeenCalledWith(
+        path.join(os.homedir(), '.freshell', '.env'),
+      )
+      const startSpawnerCalls = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls
+      expect(startSpawnerCalls).toHaveLength(0) // daemon path never spawns
+    })
+
     it('does not start daemon if already running', async () => {
       const ctx = createDefaultContext({
         desktopConfig: {
@@ -263,7 +295,7 @@ describe('runStartup', () => {
       expect(patchDesktopConfig).not.toHaveBeenCalled()
     })
 
-    it('the default profile keeps legacy behavior when its port is busy (no auto-bump)', async () => {
+    it('the default profile in a single-profile install keeps legacy behavior when its port is busy (no auto-bump)', async () => {
       const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
       ctx.isPortAvailable = vi.fn().mockResolvedValue(false)
       const patchDesktopConfig = vi.fn()
@@ -276,6 +308,25 @@ describe('runStartup', () => {
         expect(result.serverUrl).toBe('http://localhost:3001')
       }
       expect(patchDesktopConfig).not.toHaveBeenCalled()
+    })
+
+    it('the default profile in a multi-profile install is auto-bumped off a neighbor-held port', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      // No profileId — this IS the default boot — but the registry named
+      // profiles, so entry passes ownsServer=true: Default must not adopt a
+      // neighbor's server and must not keep a taken port either.
+      ctx.ownsServer = true
+      ctx.isPortAvailable = vi.fn(async (p: number) => p !== 3001)
+      const patchDesktopConfig = vi.fn().mockResolvedValue({})
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      expect(patchDesktopConfig).toHaveBeenCalledWith({ port: 3002 })
     })
 
     it('spawns server in production mode with paths from resourcesPath', async () => {

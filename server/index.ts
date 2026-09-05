@@ -1,5 +1,6 @@
 import { createFreshAgentExtrasRouter } from './fresh-agent-extras-router.js'
-import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists and loads it (see bootstrap.ts)
+import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists and migrates legacy anchors
+import './env-load.js' // Loads .env (at the bootstrap anchor) before any other module's top-level env readers evaluate
 import express from 'express'
 import fs from 'fs'
 import http from 'http'

@@ -21,8 +21,13 @@ export interface ChooseLaunchActionOptions {
   candidates: LaunchServerCandidate[]
   savedRemoteReachable: boolean
   savedRemoteAuthenticated?: boolean
-  /** Active profile id ('default' or undefined for the legacy single-profile boot). */
-  profileId?: string
+  /**
+   * True when the booting profile owns its own server: always for named
+   * profiles, and also for the DEFAULT profile once any named profile is
+   * installed (a machine with several profiles treats Default as just another
+   * tenant — it must never attach to a neighbor's server either).
+   */
+  ownsServer?: boolean
 }
 
 export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAction {
@@ -62,14 +67,13 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'show-chooser', candidates, reason: 'saved-remote-unreachable' }
   }
 
-  // A named profile OWNS its server: never attach a discovery-surfaced
-  // instance (which could belong to a DIFFERENT profile with a different
-  // config dir and identity) via auto-connect or the chooser. Start this
-  // profile's own server (app-bound path in runStartup) or the machine
-  // daemon (daemon mode — machine-global by design, see README).
+  // A server-owning boot NEVER attaches to a discovery-surfaced instance
+  // (which could belong to a neighbor profile with a different config dir and
+  // identity) via auto-connect or the chooser; it starts its own server
+  // (app-bound path in runStartup) or the machine daemon (daemon mode —
+  // machine-global by design, see README).
   if (
-    options.profileId !== undefined &&
-    options.profileId !== 'default' &&
+    options.ownsServer &&
     (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
   ) {
     return { type: 'start-local' }

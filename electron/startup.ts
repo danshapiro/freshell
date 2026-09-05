@@ -1,4 +1,6 @@
 import path from 'path'
+import os from 'os'
+import { configDirForProfile } from './profile.js'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
 import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
@@ -56,11 +58,21 @@ export interface StartupContext {
    * skips discovery and policy and performs exactly this action.
    */
   forcedLaunch?: ForcedLaunch
-  /** Active profile id; named profiles own their app-bound server and skip
-   *  localhost discovery (see launch-policy.ts). Defaults to 'default'. */
+  /** Active profile id; named profiles own their app-bound server (see
+   *  launch-policy.ts). Defaults to 'default'. */
   profileId?: string
+  /**
+   * Canonical server-ownership gate for this boot: true for every named
+   * profile AND for the default profile once any named profile exists in the
+   * registry (multi-profile installs treat Default as one more tenant). Owned
+   * boots skip discovery-based auto-connect (never adopt a neighbor server)
+   * and auto-bump a busy port on app-bound starts. entry.ts computes this at
+   * module top. When absent, the fallback is "named profile only", for older
+   * call sites.
+   */
+  ownsServer?: boolean
   /** Port availability probe (entry.ts wires the production check). When
-   *  provided AND the active profile is named AND app-bound, a busy
+   *  provided AND this boot owns its server AND app-bound, a busy
    *  desktopConfig.port is auto-bumped to the next free port (and persisted),
    *  since two profiles sharing one port cannot both hold it. */
   isPortAvailable?: (port: number) => Promise<boolean>
@@ -272,6 +284,9 @@ async function startAppBoundServer(ctx: StartupContext, port: number): Promise<s
       port,
       envFile: path.join(ctx.configDir, '.env'),
       configDir: ctx.configDir,
+      // Same pinning contract as the production branch below — dev spawns of
+      // named profiles must not fall back to the default config dir.
+      pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== 'default',
     })
     return 'http://localhost:5173'
   }
@@ -330,7 +345,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   // A named profile's app-bound/daemon boot owns its server; discovery is
   // skipped entirely so a neighbor profile's server is never surfaced.
   const skipDiscovery =
-    ctx.profileId !== undefined && ctx.profileId !== 'default' &&
+    (ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== 'default')) &&
     (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
   const candidates = skipDiscovery ? [] : await discoverCandidates()
   const savedRemoteReachable = desktopConfig.serverMode === 'remote' && !!desktopConfig.remoteUrl
@@ -344,7 +359,8 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     candidates,
     savedRemoteReachable,
     savedRemoteAuthenticated,
-    profileId: ctx.profileId,
+    ownsServer:
+      ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== 'default'),
   })
 
   if (launchAction.type === 'show-setup') {
@@ -378,9 +394,10 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
       break
     }
     case 'app-bound': {
-      const namedProfile = ctx.profileId !== undefined && ctx.profileId !== 'default'
+      const ownsServer =
+        ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== 'default')
       let launchPort = port
-      if (namedProfile && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
+      if (ownsServer && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
         // The profile's configured port is already held (typically by another
         // profile's resident server). Bump to the next free port rather than
         // spawning a doomed server whose health check would succeed against
@@ -410,7 +427,21 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
               error: err instanceof Error ? err.message : String(err),
             })
           }
+        } else {
+          // Never silently land on the knowably-busy port: that is exactly
+          // the neighbor-server hijack this gate exists for.
+          ctx.mainProcessLogger?.log({
+            severity: 'warn',
+            event: 'profile_port_scan_exhausted',
+            profileId: ctx.profileId,
+            port,
+          })
         }
+      }
+      if (launchPort !== port) {
+        // Keep the in-memory desktopConfig in step so other consumers
+        // (e.g. the chooser's getCurrentPort) see the effective port.
+        desktopConfig.port = launchPort
       }
       serverUrl = await startAppBoundServer(ctx, launchPort)
       break
@@ -432,7 +463,15 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   if (desktopConfig.serverMode === 'remote') {
     authToken = desktopConfig.remoteToken
   } else if (ctx.readEnvToken) {
-    authToken = await ctx.readEnvToken(path.join(ctx.configDir, '.env'))
+    // Daemon mode is machine-global (one spotlight instance, one .env): a
+    // named profile booting in daemon mode must read the token from the
+    // DEFAULT config dir (~/.freshell), not its own. App-bound keeps the
+    // profile-scoped dir.
+    const envDir =
+      desktopConfig.serverMode === 'daemon'
+        ? configDirForProfile('default', os.homedir())
+        : ctx.configDir
+    authToken = await ctx.readEnvToken(path.join(envDir, '.env'))
   }
 
   return loadMainWindow(ctx, serverUrl, authToken)

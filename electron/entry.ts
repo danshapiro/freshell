@@ -114,16 +114,10 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
     },
   })
   const pickerWebContentsId = pickerWin.webContents.id
-  const onSecondInstance = () => {
-    if (!pickerWin.isDestroyed()) {
-      pickerWin.show()
-      pickerWin.focus()
-    }
-  }
-  app.on('second-instance', onSecondInstance)
+  // Duplicate flag-less launches are surfaced by the canonical handler
+  // installed in main() (covers all windows), so the picker doesn't add one.
 
   const cleanup = () => {
-    app.removeListener('second-instance', onSecondInstance)
     ipcMain.removeHandler('get-profiles')
     ipcMain.removeHandler('choose-profile')
   }
@@ -486,6 +480,10 @@ async function main(): Promise<void> {
     desktopConfig,
     forcedLaunch,
     profileId: activeProfileId,
+    // Default is just another tenant in a multi-profile install: once the
+    // registry names any named profile, even the default boot owns its own
+    // server (skips discovery auto-connect, auto-bumps a busy port).
+    ownsServer: activeProfileId !== DEFAULT_PROFILE_ID || registryAtBoot.profiles.length > 0,
     daemonManager,
     serverSpawner,
     hotkeyManager,
