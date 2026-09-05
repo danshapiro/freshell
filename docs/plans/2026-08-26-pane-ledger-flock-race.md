@@ -33,7 +33,7 @@ silently-empty/disabled ledger rather than a loud one.
 - The sibling `CodexSidecarStore::new_locked` (`crates/freshell-codex/src/sidecar_store.rs`) shares the single-shot acquisition shape; it is NOT changed in this work item (recorded as a follow-up candidate) unless review makes parity blocking.
 - Baseline remains red for the 3 pre-existing vite-config identities; the full QA gate accepts nonzero only when every parsed failure identity is in the completed baseline ledger.
 
-**Goal:** A transient flock-holder window (e.g. a fork→exec fd-inheritance microseconds window) at `PaneLedger::new_locked` acquisition time no longer degrades the ledger to DISABLED for the whole process lifetime, while a genuine second writer still produces exactly today's loud DISABLED outcome; `load_index()` I/O failures (unreadable directories or rows) surface as loud structured ERRORs instead of a silently-empty index; the deflake probe retains its errno evidence and additionally identifies the lock holder's pid from `/proc/locks` on failure.
+**Goal:** A transient flock-holder window — the fork→exec open-file-description (OFD) inheritance handoff (in-tree trigger: `git` spawns from `terminal_meta.rs:492` inside the same lib test binary under 96-way libtest parallelism; empirically bounded AT exec by O_CLOEXEC — validator PoC arms a/b1/b2, `reports/validator-poc.md` in logs_dir) — at `PaneLedger::new_locked` acquisition time no longer degrades the ledger to DISABLED for the whole process lifetime, while a genuine second writer still produces exactly today's loud DISABLED outcome; `load_index()` I/O failures (unreadable directories or rows) surface as loud structured ERRORs instead of a silently-empty index; the deflake probe retains its errno evidence and additionally identifies the lock holder's pid from `/proc/locks` on failure.
 
 **Architecture:** Keep the existing design (flock id, `<root>/lock`, DISABLED-on-contention construction, write-through index, boot-scan quarantine). Add a deliberately small, bounded, documented retry **inside** `acquire_store_lock` (only on EWOULDBLOCK; never on other errnos), so the production acquisition path tolerates transient holder windows, and a genuine persistent holder still fails after the fixed budget with the same loud ERROR. Instrument `load_index` to emit structured ERROR logs for directory and per-row I/O failures while keeping parse-error silence (boot-scan quarantines those loudly per the existing documented policy). Upgrade the probe test's panic with holder identification; add deterministic tests that a mid-retry release is absorbed and that persistent contention still degrades within a bounded time.
 
@@ -78,6 +78,9 @@ fn acquire_retries_through_a_transient_holder_release() {
     // the lock fd pre-exec). Production acquisition must ABSORB a window that
     // releases well inside the retry budget: the holder is dropped 50ms after
     // construction starts, far below the worst-case budget (~275ms).
+    // Margin math: 50ms dropper vs ~275ms budget tolerates ~225ms of
+    // scheduling overshoot (N4, proven structurally) — do NOT "tighten" the
+    // 50ms toward the budget; that would reintroduce flakiness.
     let root = temp_root("lock-retry");
     let holder = PaneLedger::new_locked(Some(root.clone()));
     let rehome = root.clone();
@@ -133,13 +136,16 @@ In `crates/freshell-ws/src/pane_ledger.rs`:
 1. Add constants near `LEDGER_VERSION` (after line 57 block):
 
 ```rust
-/// H1: a *transient* holder window (fork→exec fd-inheritance, dying-process
-/// teardown) can leave `<root>/lock` momentarily held when `new_locked`
-/// runs; single-shot `LOCK_NB` then converted a microsecond-scale window
-/// into a process-lifetime DISABLED ledger (deflake kata s52d). Acquisition
-/// retries ONLY on EWOULDBLOCK with a fixed budget: generous vs the window
-/// class (~µs–ms), small at the one-shot boot call site, and loud-unchanged
-/// for a genuine persistent second writer (same ERROR, ~275ms later).
+/// H1: a *transient* holder window — the fork→exec open-file-description
+/// inheritance handoff (a forked child transiently carries a reference to
+/// the lock's OFD; std opens O_CLOEXEC, so the window ends AT exec, proven
+/// by validator PoC arm b2 / N6) — can leave `<root>/lock` momentarily held
+/// when `new_locked` runs; single-shot `LOCK_NB` then converted a µs-scale
+/// window (no-fork release measured ~13µs, PoC arm a) into a process-
+/// lifetime DISABLED ledger (deflake kata s52d). Acquisition retries ONLY
+/// on EWOULDBLOCK with a fixed budget: generous vs the measured window
+/// class, small at the one-shot boot call site, and loud-unchanged for a
+/// genuine persistent second writer (same ERROR, ~275ms later).
 #[cfg(unix)]
 const LOCK_RETRY_MAX_ATTEMPTS: u32 = 12;
 #[cfg(unix)]
@@ -196,7 +202,7 @@ fn flock_once(root: &Path) -> std::io::Result<Option<std::fs::File>> {
 }
 ```
 
-3. Update the `new_locked` rustdoc (lines 231-236) to state the retry contract: "acquisition retries EWOULDBLOCK-only on a fixed budget (see `LOCK_RETRY_MAX_ATTEMPTS`) so a transient holder window cannot downgrade this process to a lifetime-DISABLED ledger; a persistent second writer still degrades loudly". Update the module doc's single-writer mention (lines 36-43) cross-referencing H1. The `not(unix)` variant is unchanged.
+3. Update the `new_locked` rustdoc (lines 231-236) to state the retry contract: "acquisition retries EWOULDBLOCK-only on a fixed budget (see `LOCK_RETRY_MAX_ATTEMPTS`) so a transient holder window — the fork→exec open-file-description inheritance handoff — cannot downgrade this process to a lifetime-DISABLED ledger; a persistent second writer still degrades loudly". Update the module doc's single-writer mention (lines 36-43) cross-referencing H1 and the inheritance-mediated transient class. The `not(unix)` variant is unchanged.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -206,28 +212,35 @@ Expected: PASS — the two new tests plus all existing `pane_ledger::tests::*`.
 
 - [ ] **Step 5: Refactor while green**
 
-Upgrade the probe test diagnostics (same red→green cycle within this task, now green by construction): in `new_locked_degrades_to_disabled_when_another_holder_exists`, keep every assertion and extend the failure paths with a holder report. Add the test-only helper near `temp_root`:
+Upgrade the probe test diagnostics (same red→green cycle within this task, now green by construction): in `new_locked_degrades_to_disabled_when_another_holder_exists`, keep every assertion and extend the failure paths with an ordered resight + holder report. Add the test-only helper near `temp_root`. The `/proc/locks` match is dev+inode hardened (D1/N2): the exact field-6 token format `%02x:%02x:%d` over (`libc::major(dev)`, `libc::minor(dev)`, ino) is evidence-locked by validator PoC arm c (observed verbatim token `fc:00:4213268`; both the simple `:{ino} ` shape and this hardened shape matched the self row — use the hardened shape to kill the cross-device false-positive caveat):
 
 ```rust
 /// H1 diagnostic: on a lock-acquisition failure, `/proc/locks` names the
-/// live holder pid(s) for this lock file (an in-process transient, a forked
-/// child, or a foreign process — the pid decides). Match on inode; the
-/// `major:minor:inode` column is field 6 and repetition-safe for a temp file.
+/// live holder pid(s) for this lock file (self vs foreign is the only
+/// discrimination it can make: the pid column is the LOCKING tgid, so an
+/// inheritance-window transient reports THIS test process's own pid, never
+/// the forked child's). Match the hardened dev+ino token (format
+/// `%02x:%02x:%d`, evidence-locked by validator PoC arm c).
 #[cfg(unix)]
 fn lock_holder_report(lock_path: &Path) -> String {
     use std::os::unix::fs::MetadataExt;
     let Ok(meta) = std::fs::metadata(lock_path) else {
         return "lock file itself unreadable".into();
     };
-    let ino = meta.ino();
+    let token = format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(meta.dev()),
+        libc::minor(meta.dev()),
+        meta.ino()
+    );
     match std::fs::read_to_string("/proc/locks") {
         Ok(body) => {
             let hits: Vec<&str> = body
                 .lines()
-                .filter(|l| l.contains(&format!(":{ino} ")))
+                .filter(|l| l.split_whitespace().nth(5) == Some(token.as_str()))
                 .collect();
             if hits.is_empty() {
-                format!("no /proc/locks row for inode {ino}")
+                format!("no /proc/locks row for {token}")
             } else {
                 hits.join("\n")
             }
@@ -237,23 +250,40 @@ fn lock_holder_report(lock_path: &Path) -> String {
 }
 ```
 
-Change the probe's panic message and the final assertion's message to append the report:
+Change the probe's panic path to sight the raw single-shot errno FIRST, then read `/proc/locks` (D2 — temporal adjacency distinguishes "transient window outlived the 275ms budget" (the single-shot resight now SUCCEEDS ⇒ released right after the retries gave up) from "genuinely held" (resight still EWOULDBLOCK)):
 
 ```rust
 match PaneLedger::acquire_store_lock(&root) {
     Ok(lock) => drop(lock), // release before constructing `next`
-    Err(err) => panic!(
-        "acquire_store_lock STILL failed after the bounded retry budget: errno={:?} kind={:?} \
-         (persistent EWOULDBLOCK => a REAL second holder — holder report: {} ; \
-         ENOSPC/EMFILE/EACCES => resource pressure)",
-        err.raw_os_error(),
-        err.kind(),
-        lock_holder_report(&root.join("lock")),
-    ),
+    Err(err) => {
+        // Sight the raw single-shot errno BEFORE reading /proc/locks.
+        let resight = match PaneLedger::flock_once(&root) {
+            Ok(lock) => {
+                drop(lock);
+                "single-shot resight now SUCCEEDS (window outlived the retry budget)".to_string()
+            }
+            Err(e) => format!(
+                "single-shot resight still fails: errno={:?} kind={:?} (genuinely held)",
+                e.raw_os_error(),
+                e.kind()
+            ),
+        };
+        panic!(
+            "acquire_store_lock STILL failed after the bounded retry budget: errno={:?} kind={:?}; {}; \
+             holder report (/proc/locks names the LOCKING tgid — an inheritance-window transient \
+             reports THIS test process's own pid, a foreign holder reports a foreign pid): {}",
+            err.raw_os_error(),
+            err.kind(),
+            resight,
+            lock_holder_report(&root.join("lock")),
+        )
+    }
 }
 ```
 
-Update the DEFLAKE comment block (test lines 153-162) to record the resolution: root cause class identified (transient holder window), product fix = bounded EWOULDBLOCK-only retry, probe retained with pid-level holder identity; the historical fossil references stay intact.
+Update the DEFLAKE comment block (test lines 153-162) to record the resolution: root-cause CLASS identified as the fork→exec open-file-description inheritance handoff (in-tree trigger: `git` spawns from `terminal_meta.rs:492` in the same lib test binary under parallel libtest), NOT a bare drop→acquire race (proven non-mechanism: no-fork release is ~13µs, PoC arm a); product fix = bounded EWOULDBLOCK-only retry. The comment must state explicitly (N3) that routing the probe through the now-retrying `acquire_store_lock` means the probe SELF-ABSORBS transients by design — the retry is production behavior, not test-lane masking, and persistent contention still panics with the resight + holder pid report. It must ALSO state the C2(a) caveat: `/proc/locks` names the LOCKING tgid; for the inheritance class that is THIS test process (self vs foreign is the only discrimination available; it never names the forked child), so a self-pid report confirms the transient class overshooting budget rather than contradicting the fix. The historical fossil references stay intact.
+
+Also reword the probe's final assertion message (test lines 200-207): the stale "(H2, pane_ledger.rs:299-321 swallows I/O errors)" line reference is post-refactor wrong, and post Task 2 an I/O-failure index is loud-but-unobserved HERE because this test binary installs no tracing subscriber. Reference the Task 2 event names (`pane_ledger_load_index_dir_unreadable`/`pane_ledger_load_index_row_unreadable`) instead of line numbers; do NOT add a capture to the probe test (coupling not worth it).
 
 Refactor check: no duplicate retry logic elsewhere in this crate (sidecar_store is a sibling crate and explicitly out of scope); helper is unix-gated like its callers.
 
@@ -275,7 +305,7 @@ git commit -m "fix(pane-ledger): bounded EWOULDBLOCK-only retry on store-lock ac
 ### Task 2: `load_index` I/O failures are loud (H2), never a silently-empty index
 
 **Files:**
-- Modify: `crates/freshell-ws/src/pane_ledger.rs:299-350` (`load_index`; module doc corruption-policy note at lines 26-43)
+- Modify: `crates/freshell-ws/src/pane_ledger.rs:313-350` (`load_index`; module doc corruption-policy note at lines 26-28/34-43)
 - Test: `crates/freshell-ws/src/pane_ledger_tests.rs` (two new tests appended after Task 1's tests)
 
 **Interfaces:**
@@ -486,9 +516,9 @@ git commit -m "fix(pane-ledger): loud structured ERRORs for load_index I/O failu
 
 ## Final verification (execution-stage, after Task 2)
 
-0. Hypothesis-2 disposition (recorded as load-bearing evidence in `run-state.md`): cross-process contention on the probe's lock path is eliminated by construction — the deflaked suite was TMPDIR-isolated per run and every `temp_root` embeds the test process pid (`pane-ledger-test-<label>-<pid>-<n>`), so a foreign process cannot know that path; stale fossil dirs in shared `/tmp` never hold locks after their process dies. The remaining viable mechanism class is a transient in-process fd-inheritance window, which Stage 2 validates with a standalone PoC (fork a child inside the holder window → nonblocking re-acquire deterministically returns EWOULDBLOCK until the child execs/exits; no fork ⇒ release is immediate). This plan is mechanism-agnostic by design for the transient class.
+0. Hypothesis-2 disposition (recorded as load-bearing evidence in `run-state.md`): cross-process contention on the probe's lock path is eliminated by construction — the deflaked suite was TMPDIR-isolated per run and every `temp_root` embeds the test process pid (`pane-ledger-test-<label>-<pid>-<n>`), so a foreign process cannot know that path; stale fossil dirs in shared `/tmp` never hold locks after their process dies. The remaining viable mechanism class is the transient fork→exec open-file-description inheritance handoff (window ends AT exec via O_CLOEXEC, not at child exit). Stage 2 CLOSED this empirically with the grouped validator PoC (`reports/validator-poc.md` in logs_dir, 23/23 assertions PASS, no fallbacks): arm b1/b3 (inherited OFD reference survives the holder's close → fresh acquirer gets EWOULDBLOCK errno 11/WouldBlock — C1/C8 empirical), arm a (no-fork close→fresh-open re-acquire ~13.2µs — the bare race is a non-mechanism, N1), arm b2 (exec'd `/bin/sleep` child still alive yet re-acquire SUCCEEDS; FD_CLOEXEC measured 0x01 — window bounded at exec, N6/D3), arm c (self `/proc/locks` row matched on both the simple `:{ino} ` shape and the hardened `%02x:%02x:%d` dev+ino shape — verbatim token `fc:00:4213268`, C2/D1), arm d (`read_dir` on a regular file → ENOTDIR(20)/NotADirectory; read of a directory → EISDIR(21) — C4 forging exact). This plan is mechanism-agnostic by design for the transient class.
 1. Flake-proof the probe shape: 20 consecutive runs of the deflaked suite subset under load-adjacent conditions —
-   `for i in $(seq 1 20); do cargo test -p freshell-ws --lib pane_ledger -- --test-threads=8 >/tmp/s52d-proof-$i.log 2>&1 || { echo "run $i FAILED"; break; }; done; echo "survived: $(ls /tmp/s52d-proof-*.log | wc -l)"`
+   `for i in $(seq 1 20); do cargo test -p freshell-ws --lib pane_ledger -- --test-threads=8 >/tmp/opencode/s52d-proof-$i.log 2>&1 || { echo "run $i FAILED"; break; }; done; echo "survived: $(ls /tmp/opencode/s52d-proof-*.log | wc -l)"`
    Expected: 20/20 pass (previously ~9/10 on the probe test alone under workspace load).
 2. Full crate suite: `cargo test -p freshell-ws` — PASS.
 3. Work-source oracle check: `npm run check` — completes; the only permitted failures are the 3 baseline vite-config identities (this command is included in, and never replaces, the full QA gate).
@@ -498,5 +528,5 @@ git commit -m "fix(pane-ledger): loud structured ERRORs for load_index I/O failu
 
 - The exact transient holder of the original run-10 event cannot be identified retroactively; if the probe EVER fails again, the panic now carries the holder pid(s) from `/proc/locks`.
 - Per-`DirEntry` iteration errors inside `read_dir` results remain `.flatten()`-silenced: no deterministic red test can arm them on a healthy fs; recorded, not fixed.
-- `CodexSidecarStore` (crates/freshell-codex) keeps the single-shot pattern with its own documented NA-3 CLOEXEC note; a parity retry there is a deliberately separate follow-up.
+- `CodexSidecarStore` (crates/freshell-codex) keeps the single-shot pattern with its own documented NA-3 CLOEXEC note; a parity retry there is a deliberately separate follow-up. Strategist-verified identical single-shot shape (sidecar_store.rs:115-141, CLOEXEC note at :122-127); its tests construct holder+loser sequentially with NO post-drop probe, so it exposes no flake today (N5).
 - Baseline vite-config `getNetworkHost` failures are pre-existing and untouched.
