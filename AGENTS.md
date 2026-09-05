@@ -2,6 +2,10 @@
 
 Freshell is a self-hosted, browser-accessible terminal multiplexer and session organizer. It provides multi-tab terminal management with support for terminals and coding CLI's like Claude Code and Codex. Key features include session history browsing, AI-powered summaries (via Google Gemini), and remote access over LAN/VPN with token-based authentication.
 
+## Active Repair Plan
+
+PR699 follow-up: [Rust-only integration repair plan](docs/superpowers/plans/2026-09-04-pr699-integration-repair.md).
+
 ## Development Philosophy
 - We are working on an infinite schedule with infinite tokens. This is unusual! We do not have time pressure, and can do things correctly.
 - We use Red-Green-Refactor TDD for all changes but the most trivial (e.g. doc changes). We never skip the tests, and never skip the refactor.
