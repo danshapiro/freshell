@@ -18,6 +18,7 @@ import path from 'node:path'
 import os from 'node:os'
 import WebSocket from 'ws'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 const BURST_SIZE = 16
 
@@ -61,7 +62,7 @@ class SyntheticClient {
     const client = new SyntheticClient(ws)
     client.send({
       type: 'hello',
-      protocolVersion: 8,
+      protocolVersion: WS_PROTOCOL_VERSION,
       token: info.token,
     })
     await client.waitFor((f) => f.type === 'ready')

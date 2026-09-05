@@ -4,6 +4,7 @@ import { test, expect } from '@playwright/test'
 import WebSocket from 'ws'
 import { RustServer } from '../helpers/rust-server.js'
 import type { TestServerInfo } from '../helpers/test-server.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 /**
  * RECONCILE-HANDSHAKE (PW-RUST, design §9.2) — synthetic-client proof of the
@@ -91,7 +92,7 @@ class SyntheticClient {
     const client = new SyntheticClient(ws)
     client.send({
       type: 'hello',
-      protocolVersion: 8,
+      protocolVersion: WS_PROTOCOL_VERSION,
       token: info.token,
       capabilities: { paneReconcileV1: true },
     })

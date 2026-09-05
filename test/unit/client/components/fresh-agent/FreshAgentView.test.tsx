@@ -1169,6 +1169,38 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
   })
 
+  it('stamps freshAgent.create with the pane tab identity (D8 provenance)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-tabid',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // D8 (restore-open-sessions-only): the server composes the ledger row's
+    // tabKey as `deviceId:tabId` from the hello-stamped connection identity
+    // plus this field; the D8 judgment never offers rows whose parent
+    // evidence cannot see them, so a dropped tabId would silently orphan the
+    // pane's placement on restore.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-tabid',
+      tabId: 'tab-1',
+    }))
+  })
+
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
     const store = createStore()
     store.dispatch(initLayout({
@@ -3957,6 +3989,20 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
     })
+    // The replacement conversation starts only once the durable close is
+    // acknowledged (correlated close waits, focused-episode-6 round 2).
+    const aliasHandlers = wsMock.onMessage.mock.calls.map(([h]) => h).filter(Boolean)
+    act(() => {
+      for (const handler of aliasHandlers) {
+        ;(handler as (msg: unknown) => void)({
+          type: 'freshAgent.killed',
+          sessionId: 'thread-reset-alias',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          success: true,
+        })
+      }
+    })
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'freshAgent.create',
@@ -4054,6 +4100,115 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('starts the new conversation only once the old session close is durably acknowledged', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-new-ack',
+        sessionId: 'thread-new-ack',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-new-ack' }),
+    )
+    // Ungated before: the pane stays on the OLD conversation until the close lands.
+    const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(before.content).toMatchObject({ sessionId: 'thread-new-ack', status: 'idle' })
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-new-ack',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(after.content).toMatchObject({ status: 'creating' })
+      expect((after.content as { sessionId?: string }).sessionId).toBeUndefined()
+    })
+  })
+
+  it('keeps the current conversation when the new-conversation close is not durably recorded', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-new-fail',
+        sessionId: 'thread-new-fail',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-new-fail',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+      })
+    }
+    await waitFor(() => {
+      // The KILL_FAILED banner state is folded (close flows never drop the
+      // conversation on an unrecorded close).
+      expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-new-fail']?.lastErrorCode).toBe('KILL_FAILED')
+    })
+    const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(after.content).toMatchObject({ sessionId: 'thread-new-fail', status: 'idle' })
+  })
+
   it('routes FreshOpenCode forks through the pane cwd', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -4098,6 +4253,7 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_fork_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      tabId: 'tab-1',
       cwd: '/repo/route-aware',
       input: { atTurnId: 'turn-route-fork' },
     })

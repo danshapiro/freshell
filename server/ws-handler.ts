@@ -82,6 +82,9 @@ import {
   TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
+  PaneClosedSchema,
+  PanesClosedSchema,
+  PaneOpenedSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
@@ -847,6 +850,9 @@ export class WsHandler {
       TerminalCodexCandidatePersistedSchema,
       TerminalAttachSchema,
       TerminalDetachSchema,
+      PaneClosedSchema,
+      PanesClosedSchema,
+      PaneOpenedSchema,
       TerminalInputSchema,
       TerminalResizeSchema,
       TerminalKillSchema,
@@ -3982,6 +3988,49 @@ export class WsHandler {
         // Rust-only feature: agent auto-resume lives in freshell-ws. The
         // Node server has no auto-resume hub — accept and ignore so a valid
         // client message never triggers UNKNOWN_MESSAGE.
+        return
+
+      case 'pane.closed':
+        // The durable pane-close evidence is journaled only by the Rust
+        // freshell-ws pane ledger (this server has no recovery ledger).
+        // The close is ACKNOWLEDGED on every floor — the client's close gate
+        // awaits one correlated `pane.closed.result` per pane.closed, so
+        // answer success (this server's close-durability model records
+        // exactly nothing: there is no ledger read path to protect, hence
+        // nothing that can fail). Answer, never ignore: a v10 client treats
+        // silence as an unconfirmed close.
+        this.send(ws, {
+          type: 'pane.closed.result',
+          createRequestId: m.createRequestId,
+          ...(typeof m.terminalId === 'string' && m.terminalId ? { terminalId: m.terminalId } : {}),
+          success: true,
+        })
+        return
+
+      case 'panes.closed':
+        // The whole-tab BATCH close. Same floor rule as pane.closed — the
+        // v10 client gates tab removal on the ONE correlated
+        // `panes.closed.result`, and this server journals nothing (no
+        // recovery ledger), so answer success by the batch's requestId.
+        this.send(ws, {
+          type: 'panes.closed.result',
+          requestId: m.requestId,
+          success: true,
+        })
+        return
+
+      case 'pane.opened':
+        // The durable open re-assertion is ANSWERED on every floor — the
+        // client tracks a failed consume for its next-sweep retry. Only the
+        // Rust pane ledger consumes the pane's standing close record; this
+        // server records nothing (no ledger, no recovery pipeline), so there
+        // is nothing that can fail and the answer is success. Answering keeps
+        // the client's failure bookkeeping exact.
+        this.send(ws, {
+          type: 'pane.opened.result',
+          createRequestId: m.createRequestId,
+          success: true,
+        })
         return
 
       case 'terminal.interest':

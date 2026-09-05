@@ -929,19 +929,45 @@ pub type TestWs =
 /// handshake frame (the 4th handshake message; `config_fallback` is None in
 /// this harness, so the handshake is exactly 4 frames).
 pub async fn connect_and_capture_inventory(url: &str) -> (TestWs, serde_json::Value) {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect");
-    ws.send(WsMessage::Text(
+    connect_with_hello(
+        url,
         serde_json::json!({
             "type": "hello",
             "token": AUTH_TOKEN,
             "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
-        })
-        .to_string(),
-    ))
+        }),
+    )
     .await
-    .expect("send hello");
+}
+
+/// `connect_and_capture_inventory` variant whose hello carries the D8
+/// provenance identity (`deviceId`/`clientInstanceId`) — the stamp source for
+/// connection-scoped ledger rows.
+pub async fn connect_and_capture_inventory_with_identity(
+    url: &str,
+    device_id: &str,
+    client_instance_id: &str,
+) -> (TestWs, serde_json::Value) {
+    connect_with_hello(
+        url,
+        serde_json::json!({
+            "type": "hello",
+            "token": AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "deviceId": device_id,
+            "clientInstanceId": client_instance_id,
+        }),
+    )
+    .await
+}
+
+async fn connect_with_hello(url: &str, hello: serde_json::Value) -> (TestWs, serde_json::Value) {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
 
     let mut inventory = serde_json::Value::Null;
     // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +

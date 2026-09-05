@@ -21,6 +21,7 @@ import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 import { getWsClient } from '@/lib/ws-client'
+import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { api } from '@/lib/api'
 import { isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
 import { getPaneDisplayTitle } from '@/lib/pane-title'
@@ -41,6 +42,7 @@ import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import {
   clearPendingCreate as clearFreshAgentPendingCreate,
   removeSession as removeFreshAgentSession,
+  sessionError as freshAgentSessionError,
 } from '@/store/freshAgentSlice'
 import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
 import { cancelCreate } from '@/lib/create-cancellation'
@@ -320,25 +322,46 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
         const cwd = getFreshOpenCodeRouteCwd(content, { freshAgentSessions, sessionId })
-        ws.send({
-          type: 'freshAgent.kill',
+        // Focused-episode-6 round 2 (Finding 6): AWAIT the killed answer
+        // before dropping the pane — a close the server did NOT confirm
+        // durable is not a close. `success:false` (and the bounded 5s
+        // timeout) leaves the pane standing: the server-answered failure
+        // already surfaces through the pane's ordinary session-error banner
+        // (the freshAgent.killed fold writes it); an unanswered wait
+        // surfaces there too (same banner surface, timeout copy).
+        void sendFreshAgentKillAndAwait({
           sessionId,
           sessionType: content.sessionType,
           provider: content.provider,
           ...(cwd ? { cwd } : {}),
+        }).then((ack) => {
+          if (!ack.ok) {
+            // The pane's ordinary session-error banner carries the failure
+            // (idempotent with the freshAgent.killed fold's own write — one
+            // shared copy, kill-ack.ts).
+            dispatch(freshAgentSessionError({
+              sessionId,
+              sessionType: content.sessionType,
+              provider: content.provider,
+              code: 'KILL_FAILED',
+              message: ack.timedOut ? KILL_ACK_TIMEOUT_MESSAGE : KILL_FAILED_MESSAGE,
+            }))
+            return
+          }
+          if (!content.sessionId && pendingSessionId) {
+            dispatch(removeFreshAgentSession({
+              sessionId: pendingSessionId,
+              sessionType: content.sessionType,
+              provider: content.provider,
+            }))
+            dispatch(clearFreshAgentPendingCreate({ requestId: content.createRequestId }))
+          }
+          dispatch(closePaneWithCleanup({ tabId, paneId }))
         })
-      } else {
-        cancelCreate(content.createRequestId)
-        ws.cancelCreate(content.createRequestId)
+        return
       }
-      if (!content.sessionId && pendingSessionId) {
-        dispatch(removeFreshAgentSession({
-          sessionId: pendingSessionId,
-          sessionType: content.sessionType,
-          provider: content.provider,
-        }))
-        dispatch(clearFreshAgentPendingCreate({ requestId: content.createRequestId }))
-      }
+      cancelCreate(content.createRequestId)
+      ws.cancelCreate(content.createRequestId)
     }
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.

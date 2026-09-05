@@ -81,16 +81,34 @@ const terminalRestoreMocks = vi.hoisted(() => ({
   addTerminalRestoreRequestId: vi.fn(),
   addTerminalFreshRecoveryRequestId: vi.fn(),
   setPaneReconcileActive: vi.fn(),
+  // Batch-6 arm/consume pair (restore offer live-reattach): a full-module
+  // mock must carry every export TerminalView imports, or the create path
+  // throws inside the mock and vitest reports an unhandled rejection.
+  armRecoveredLiveTerminalTarget: vi.fn(),
+  consumeRecoveredLiveTerminalTarget: vi.fn(() => undefined),
 }))
 
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: terminalRestoreMocks.addTerminalRestoreRequestId,
   addTerminalFreshRecoveryRequestId: terminalRestoreMocks.addTerminalFreshRecoveryRequestId,
   setPaneReconcileActive: terminalRestoreMocks.setPaneReconcileActive,
+  armRecoveredLiveTerminalTarget: terminalRestoreMocks.armRecoveredLiveTerminalTarget,
+  consumeRecoveredLiveTerminalTarget: terminalRestoreMocks.consumeRecoveredLiveTerminalTarget,
 }))
 
-let messageHandler: ((msg: any) => void) | null = null
+// The real WsClient fans every inbound frame out to a SET of handlers
+// (ws-client.ts: `this.messageHandlers.forEach(...)`). Model that set —
+// focused-episode-7 round 5 (F3): kill-ack's `pane.opened` re-assertion
+// registers its own bounded listener per send, so a single-slot model would
+// clobber App's handler the first time the ready sweep runs.
+let messageHandlers = new Set<(msg: any) => void>()
 let disconnectHandler: (() => void) | null = null
+
+/** Deliver one inbound server frame to every registered handler. */
+function emitServerFrame(frame: any) {
+  // App's handlers register/unregister during folds — iterate a snapshot.
+  for (const handler of [...messageHandlers]) handler(frame)
+}
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -306,7 +324,7 @@ async function bootApp() {
     </Provider>,
   )
   await waitFor(() => {
-    expect(messageHandler).toBeTypeOf('function')
+    expect(messageHandlers.size).toBeGreaterThan(0)
   })
   return store
 }
@@ -314,14 +332,14 @@ async function bootApp() {
 async function bootAppWithReady(options: { capabilities?: Record<string, unknown> } = {}) {
   const store = await bootApp()
   act(() => {
-    messageHandler?.(readyFrame(options))
+    emitServerFrame(readyFrame(options))
   })
   return { sentFrames, dispatched, store }
 }
 
 async function receiveInventory({ liveTerminalIds }: { liveTerminalIds: string[] }) {
   act(() => {
-    messageHandler?.({
+    emitServerFrame({
       type: 'terminal.inventory',
       terminals: liveTerminalIds.map((terminalId) => ({
         terminalId,
@@ -338,13 +356,13 @@ async function receiveInventory({ liveTerminalIds }: { liveTerminalIds: string[]
 
 async function receiveServerFrame(frame: Record<string, unknown>) {
   act(() => {
-    messageHandler?.(frame)
+    emitServerFrame(frame)
   })
 }
 
 async function simulateReconnectWithReady(options: { capabilities?: Record<string, unknown> } = {}) {
   act(() => {
-    messageHandler?.(readyFrame(options))
+    emitServerFrame(readyFrame(options))
   })
 }
 
@@ -395,7 +413,7 @@ describe('App pane.reconcile adoption', () => {
     seededPane = null
     seededFreshAgentPane = null
     setFreshAgentReconcileActive(false)
-    messageHandler = null
+    messageHandlers = new Set()
     disconnectHandler = null
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
@@ -405,8 +423,8 @@ describe('App pane.reconcile adoption', () => {
       return () => { disconnectHandler = null }
     })
     wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
-      messageHandler = cb
-      return () => { messageHandler = null }
+      messageHandlers.add(cb)
+      return () => { messageHandlers.delete(cb) }
     })
     wsMocks.send.mockImplementation((frame: unknown) => {
       sentFrames.push(frame)

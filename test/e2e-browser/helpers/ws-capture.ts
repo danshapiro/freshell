@@ -2,6 +2,7 @@
 // (terminal.idle / terminal.turn.complete edges), independent of the browser
 // client. Mirrors the WsCapture pattern in terminal-activity-rust.spec.ts.
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 export type WsFrame = Record<string, any>
 
@@ -18,7 +19,7 @@ export class WsCapture {
         15_000,
       )
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: WS_PROTOCOL_VERSION, token }))
       })
       this.ws.on('message', (data) => {
         let frame: WsFrame

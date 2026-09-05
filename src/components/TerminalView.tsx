@@ -16,6 +16,7 @@ import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
   applyReconcileAttach,
   applyReattachToLiveTerminal,
+  clearPaneCloseError,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
@@ -71,6 +72,7 @@ import {
   addTerminalFreshRecoveryRequestId,
   addTerminalRestoreRequestId,
   clearTerminalRestoreRequestId,
+  consumeRecoveredLiveTerminalTarget,
   consumeTerminalFreshRecoveryRequest,
   consumeTerminalRestoreRequestId,
   type TerminalFreshRecoveryIntent,
@@ -91,7 +93,7 @@ import {
   type DeferredAttachReason,
   type TerminalAttachPriority,
 } from '@/lib/terminal-attach-policy'
-import { collectAllTerminalIds, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { collectAllTerminalIds, findPaneContent, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
@@ -575,6 +577,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const isMobile = useMobile()
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const serverInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
+  // Delta-r7-r3 (F2): the close gate's failure surface lives on the STORE'S
+  // pane content (the pane prop is a mount-time snapshot — a set-on-failure
+  // close error must reach an already-mounted pane).
+  const closeError = useAppSelector((s) => {
+    const root = s.panes.layouts[tabId]
+    const content = root ? findPaneContent(root, paneId) : null
+    return content?.kind === 'terminal' ? content.closeError : undefined
+  })
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -1287,6 +1297,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     lastSessionActivityAtRef.current = 0
   }, [terminalContent?.resumeSessionId])
+
+  // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close gate's
+  // failure surface — a terminal pane whose close the server did NOT
+  // confirm durable stays open wearing `closeError`; render it NOW on the
+  // pane's own error chrome (the xterm "[Close failed]" notice — the
+  // terminal.killed{success:false} fold's convention) and clear the field
+  // from the store. One-shot per set; a re-failed close re-sets it.
+  useEffect(() => {
+    if (!isTerminal || !closeError) return
+    const term = termRef.current
+    if (!term) return
+    writeLocalXtermNotice(term, `\r\n[Close failed] ${closeError}\r\n`)
+    dispatch(clearPaneCloseError({ tabId, paneId: paneIdRef.current }))
+  }, [isTerminal, closeError, dispatch, tabId, writeLocalXtermNotice])
 
   const notifyPendingInputLoss = useCallback((reason: PendingInputLossReason) => {
     log.warn('pending_input_dropped', { tabId, paneId: paneIdRef.current, reason })
@@ -2969,6 +2993,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send(buildTerminalAttachMessage({
       content: contentRef.current,
       terminalId: tid,
+      tabId,
       intent: wireIntent,
       cols,
       rows,
@@ -2993,6 +3018,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     suppressNetworkEffects,
     ws,
     appStore,
+    tabId,
     applySeqState,
     buildCheckpointReplayInput,
     clearQuarantineRepair,
@@ -4786,6 +4812,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         // Ledger A2 / invariant 10b: also match the pane's last-known tid --
         // recovery paths clear terminalIdRef, and a backstop frame for the
         // just-dead id must stay visible.
+        if (msg.type === 'terminal.killed' && (msg.terminalId === tid || msg.terminalId === lastKnownTerminalIdRef.current)) {
+          // Focused-episode-6 round 2 (Findings 6+7): the correlated close
+          // answer. `success:false` means the durable close FAILED and this
+          // terminal still runs server-side — the close flow kept the pane
+          // for exactly this case; say so on the pane's own surface.
+          if (msg.success === false) {
+            log.warn('terminal_killed_reported_failure', {
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: msg.terminalId,
+              error: msg.error ?? null,
+            })
+            writeLocalXtermNotice(
+              term,
+              `\r\n[Close failed] ${msg.error ?? 'the terminal close could not be recorded durably; the terminal may still be running'}\r\n`,
+            )
+          }
+          return
+        }
+
         if (msg.type === 'terminal.input.blocked' && (msg.terminalId === tid || msg.terminalId === lastKnownTerminalIdRef.current)) {
           const reason = msg.reason as TerminalInputBlockedReason
           log.warn('terminal_input_blocked', {
@@ -5337,6 +5383,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             }
             return
           }
+        }
+        // Focused-episode-6 round 5 (Finding F1): the restore offer's LIVE
+        // terminal panes reattach to the still-running server terminal — the
+        // plan armed a one-shot paneId→terminalId target for exactly this
+        // pane (RecoveryOfferPanel's accept + build-recovery-plan). The
+        // consult runs here — AFTER the pre-verdict wait (a server reconcile
+        // verdict always wins), BEFORE any create — so a live pane is put
+        // back on its original PTY and never recreated as a second process.
+        // The fold is the same `applyReattachToLiveTerminal` the D7-refusal
+        // revival uses; the epoch bump re-fires this effect into the attach
+        // branch. A died-before-attach target heals through the ordinary
+        // INVALID_TERMINAL_ID reconnect (dead-live-handle recovery or a
+        // resume create).
+        const reattachTarget = consumeRecoveredLiveTerminalTarget(tabId, paneIdRef.current)
+        if (reattachTarget) {
+          dispatch(applyReattachToLiveTerminal({
+            tabId,
+            paneId: paneIdRef.current,
+            terminalId: reattachTarget,
+          }))
+          writeLocalXtermNotice(term, `\r\nReconnected to the still-running session.\r\n`)
+          return
         }
         deferredAttachStateRef.current = {
           mode: 'none',

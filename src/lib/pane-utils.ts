@@ -42,6 +42,33 @@ export function collectTerminalIds(node: PaneNode): string[] {
 }
 
 /**
+ * The terminal-close pairs for one tab's pane tree (focused-episode-6 round
+ * 2): each live terminal's `terminalId` PLUS the pane's `createRequestId` —
+ * the durable close envelope's createRequestId key on the server when the
+ * registry probe can no longer answer. First reference wins per
+ * terminalId (a terminal shared by two panes closes once).
+ */
+export function collectTerminalCloseTargets(
+  node: PaneNode,
+): Array<{ terminalId: string; createRequestId: string | null }> {
+  const seen = new Set<string>()
+  const out: Array<{ terminalId: string; createRequestId: string | null }> = []
+  const walk = (n: PaneNode): void => {
+    if (n.type === 'leaf') {
+      if (n.content.kind === 'terminal' && n.content.terminalId && !seen.has(n.content.terminalId)) {
+        seen.add(n.content.terminalId)
+        out.push({ terminalId: n.content.terminalId, createRequestId: n.content.createRequestId ?? null })
+      }
+      return
+    }
+    walk(n.children[0])
+    walk(n.children[1])
+  }
+  walk(node)
+  return out
+}
+
+/**
  * Union of every terminalId referenced by any pane in any tab layout.
  * This is the client's complete "terminals I currently reference" set —
  * the primitive the detach middleware diffs to spot dropped references.
@@ -77,6 +104,45 @@ export function collectPaneEntries(node: PaneNode): PaneEntry[] {
     ...collectPaneEntries(node.children[0]),
     ...collectPaneEntries(node.children[1]),
   ]
+}
+
+/**
+ * One close-evidence-bearing pane identity (focused-episode-7 round 4,
+ * Finding F2): the pane id plus the createRequestId the `pane.closed` /
+ * `panes.closed` / `pane.opened` lanes key by, and the terminalId when the
+ * pane has one (terminal panes only — fresh-agent identities are CRID-only).
+ */
+export interface SessionPaneIdentity {
+  paneId: string
+  createRequestId: string
+  terminalId?: string
+}
+
+/**
+ * Every session-pane identity in a subtree — terminal AND fresh-agent panes.
+ * Both kinds carry the mandatory createRequestId the close/open lanes key by,
+ * so the close gate, the middleware belt, and the per-ready open sweep all
+ * consume this ONE walker (three hand-rolled kind checks would drift again —
+ * the round-4 terminal-only exclusions were exactly that drift). The
+ * pathological legacy CRID-less shape is skipped (never a malformed record
+ * key), and non-session panes (browser/editor/picker/host-stats/extension)
+ * carry no identity the close lanes know.
+ */
+export function collectSessionPaneIdentities(node: PaneNode): SessionPaneIdentity[] {
+  const identities: SessionPaneIdentity[] = []
+  for (const { paneId, content } of collectPaneEntries(node)) {
+    if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') continue
+    const createRequestId = typeof content.createRequestId === 'string' && content.createRequestId
+      ? content.createRequestId
+      : undefined
+    if (!createRequestId) continue
+    identities.push({
+      paneId,
+      createRequestId,
+      ...(content.kind === 'terminal' && content.terminalId ? { terminalId: content.terminalId } : {}),
+    })
+  }
+  return identities
 }
 
 export function findPaneContent(node: PaneNode, paneId: string): PaneContent | null {

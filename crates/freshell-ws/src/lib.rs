@@ -4,7 +4,7 @@
 //! A faithful port of the **handshake path** of `server/ws-handler.ts`:
 //!
 //! * mount `/ws` (an axum WebSocket upgrade — tokio-tungstenite-backed);
-//! * read the first `hello`, validate `protocolVersion == 8` **first**, then the
+//! * read the first `hello`, validate `protocolVersion == 10` **first**, then the
 //!   token with a **constant-time** compare (mirrors `auth.ts#timingSafeCompare`
 //!   and the `ws-handler.ts` ordering: version check precedes auth);
 //! * on success emit, IN ORDER, exactly what the original sends on a clean
@@ -630,7 +630,7 @@ pub enum HelloOutcome {
     Accept,
     /// Not a `hello` frame, or unparseable — the original closes NOT_AUTHENTICATED.
     NotHello,
-    /// `protocolVersion != 8` — checked BEFORE the token (matches ws-handler.ts).
+    /// `protocolVersion != 10` — checked BEFORE the token (matches ws-handler.ts).
     ProtocolMismatch,
     /// Bad/missing token (constant-time compared).
     BadToken,
@@ -829,6 +829,24 @@ async fn handle_socket(
         .and_then(|c| c.get("uiScreenshotV1"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // D8 (restore-open-sessions-only): the connection's client identity rides
+    // the `hello` frame as additive optional top-level fields (older clients
+    // omit them; an absent hello identity simply leaves ledger rows
+    // unstamped). Read from the raw payload exactly like the capability bools
+    // above; `tabs.sync.push` frames refresh it inside the serve loop.
+    let conn_identity = terminal::ConnectionIdentity {
+        device_id: value
+            .get("deviceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        client_instance_id: value
+            .get("clientInstanceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
     terminal::run(
@@ -840,6 +858,7 @@ async fn handle_socket(
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         origin_kind,
+        conn_identity,
         terminal_interest_v1,
     )
     .await;
@@ -992,14 +1011,14 @@ mod tests {
         );
 
         // Right version, wrong token.
-        let v = json!({ "type": "hello", "protocolVersion": 8, "token": "nope" });
+        let v = json!({ "type": "hello", "protocolVersion": WS_PROTOCOL_VERSION, "token": "nope" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::BadToken
         );
 
         // Right version, right token.
-        let v = json!({ "type": "hello", "protocolVersion": 8, "token": "s3cr3t-token-abcdef" });
+        let v = json!({ "type": "hello", "protocolVersion": WS_PROTOCOL_VERSION, "token": "s3cr3t-token-abcdef" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::Accept

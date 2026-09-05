@@ -14,6 +14,9 @@ const wsHarness = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
   const addedRestoreIds = new Set<string>()
   const addedFreshRecoveryIds = new Map<string, string>()
+  // Mirrors src/lib/terminal-restore.ts's recovered-live-terminal target arm
+  // (focused-ep6 r5): one-shot tabId:paneId -> terminalId consult before create.
+  const recoveredLiveTerminalTargets = new Map<string, string>()
 
   return {
     send: vi.fn(),
@@ -43,10 +46,20 @@ const wsHarness = vi.hoisted(() => {
       addedRestoreIds.delete(id)
       return intent
     },
+    armRecoveredLiveTerminalTarget(tabId: string, paneId: string, terminalId: string) {
+      recoveredLiveTerminalTargets.set(`${tabId}:${paneId}`, terminalId)
+    },
+    consumeRecoveredLiveTerminalTarget(tabId: string, paneId: string) {
+      const key = `${tabId}:${paneId}`
+      const terminalId = recoveredLiveTerminalTargets.get(key)
+      if (terminalId !== undefined) recoveredLiveTerminalTargets.delete(key)
+      return terminalId
+    },
     reset() {
       messageHandlers.clear()
       addedRestoreIds.clear()
       addedFreshRecoveryIds.clear()
+      recoveredLiveTerminalTargets.clear()
     },
   }
 })
@@ -66,6 +79,10 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
   addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
   consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
+  armRecoveredLiveTerminalTarget: (tabId: string, paneId: string, terminalId: string) =>
+    wsHarness.armRecoveredLiveTerminalTarget(tabId, paneId, terminalId),
+  consumeRecoveredLiveTerminalTarget: (tabId: string, paneId: string) =>
+    wsHarness.consumeRecoveredLiveTerminalTarget(tabId, paneId),
 }))
 
 vi.mock('@/lib/terminal-themes', () => ({

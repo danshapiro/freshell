@@ -87,12 +87,19 @@ const terminalRestoreMocks = vi.hoisted(() => ({
   addTerminalRestoreRequestId: vi.fn(),
   addTerminalFreshRecoveryRequestId: vi.fn(),
   setPaneReconcileActive: vi.fn(),
+  // Batch-6 arm/consume pair (restore offer live-reattach): a full-module
+  // mock must carry every export TerminalView imports, or the create path
+  // throws inside the mock and vitest reports an unhandled rejection.
+  armRecoveredLiveTerminalTarget: vi.fn(),
+  consumeRecoveredLiveTerminalTarget: vi.fn(() => undefined),
 }))
 
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: terminalRestoreMocks.addTerminalRestoreRequestId,
   addTerminalFreshRecoveryRequestId: terminalRestoreMocks.addTerminalFreshRecoveryRequestId,
   setPaneReconcileActive: terminalRestoreMocks.setPaneReconcileActive,
+  armRecoveredLiveTerminalTarget: terminalRestoreMocks.armRecoveredLiveTerminalTarget,
+  consumeRecoveredLiveTerminalTarget: terminalRestoreMocks.consumeRecoveredLiveTerminalTarget,
 }))
 
 let messageHandler: ((msg: any) => void) | null = null

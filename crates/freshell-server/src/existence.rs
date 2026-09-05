@@ -656,6 +656,8 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -703,6 +705,8 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -1254,7 +1258,14 @@ mod tests {
         std::fs::create_dir_all(&ledger_root).expect("mkdir ledger root");
         let ledger = Arc::new(PaneLedger::new(Some(ledger_root)));
         ledger
-            .record_pending("t-pane1", "opencode", Some(&cwd), 1_000)
+            .record_pending(
+                "t-pane1",
+                "opencode",
+                Some(&cwd),
+                None,
+                freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("pending marker");
         ledger
             .resolve_pending(&BindingWrite {
@@ -1264,6 +1275,8 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 2_000,
             })
             .expect("first bind: root");
@@ -1275,6 +1288,8 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 3_000,
             })
             .expect("signal rebind: child");
@@ -1287,6 +1302,8 @@ mod tests {
                 mode: "opencode",
                 cwd: Some(&cwd),
                 create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 2_500,
             })
             .expect("control bind: root2");

@@ -60,10 +60,10 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
-    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
-    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
-    LEGACY_RESUME_IDENTITY_REFUSAL,
+    PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator,
+    SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated,
+    TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
+    TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -210,6 +210,42 @@ fn map_shell(shell: Shell) -> ShellType {
     }
 }
 
+/// D8 (restore-open-sessions-only): this connection's client identity —
+/// stamped from the `hello` frame at handshake (`lib.rs`), then refreshed by
+/// every `tabs.sync.push` (a mid-lifetime clientInstanceId rotation self-heals
+/// at the next push instead of waiting out a reconnect; and a create issued
+/// between `ready` and the first push is still stamped from the hello).
+/// Connection-scoped bind lanes stamp ledger rows from it; conn-less lanes
+/// (respawn, locator/adoption resolution, REST/headless) never see one.
+/// `pub` only because [`run`] (also `pub`) takes it — crate-internal plumbing.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionIdentity {
+    pub device_id: Option<String>,
+    pub client_instance_id: Option<String>,
+}
+
+impl ConnectionIdentity {
+    /// The provenance stamps for one create off this connection — `tabKey`
+    /// composes as `deviceId:tabId` (exactly `src/lib/tab-registry-snapshot.ts`'s
+    /// record composition) and only when both halves exist. Focused-ep4-r2
+    /// Findings 1+2: `asserted_at` is the WS message's RECEIPT time, captured
+    /// ONCE in the dispatch arm and passed unchanged — the value carries the
+    /// browser's assertion through however long the create/spawn/fork work
+    /// takes, so no later write site needs (or may invent) a fresh clock read.
+    fn bind_provenance(
+        &self,
+        tab_id: Option<&str>,
+        asserted_at: i64,
+    ) -> freshell_freshagent::BindProvenance {
+        freshell_freshagent::BindProvenance::for_create(
+            self.client_instance_id.as_deref(),
+            self.device_id.as_deref(),
+            tab_id,
+            asserted_at,
+        )
+    }
+}
+
 /// Serve one authenticated connection's `terminal.*` traffic (and fan out the
 /// shared broadcast bus) until the socket closes. `socket` has already had the
 /// connect handshake written by the caller; `bcast_rx` is this connection's
@@ -224,6 +260,7 @@ pub async fn run(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
+    conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
@@ -264,6 +301,7 @@ pub async fn run(
         pane_reconcile_fresh_agent_v1,
         conn_id,
         origin_kind,
+        conn_identity,
         terminal_interest_v1,
     )
     .instrument(span)
@@ -285,6 +323,7 @@ async fn run_loop(
     pane_reconcile_fresh_agent_v1: bool,
     conn_id: u64,
     origin_kind: &'static str,
+    mut conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
 ) {
     // One independently supervised socket writer. The read/dispatch path
@@ -449,6 +488,7 @@ async fn run_loop(
                             &interactive_create_tx,
                             &create_cancel_rx,
                             &mut host_stats_last_refresh_at,
+                            &mut conn_identity,
                         )
                         .await
                         {
@@ -693,6 +733,9 @@ async fn handle_client_text(
     create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
     // Task 9: per-connection hoststats.refresh floor stamp (see run_loop).
     host_stats_last_refresh_at: &mut Option<std::time::Instant>,
+    // D8: the connection's hello-stamped client identity (refreshed by
+    // `tabs.sync.push` below) — the provenance source for ledger stamps.
+    conn_identity: &mut ConnectionIdentity,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -706,7 +749,27 @@ async fn handle_client_text(
     // `server/ws-handler.ts:3058-3145`.
     if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
         match msg_type {
-            "tabs.sync.push" => return handle_tabs_push(&value, ws_tx, state).await,
+            "tabs.sync.push" => {
+                // D8: refresh the connection identity from each push (same
+                // non-empty-string filter `validate_tabs_push` applies), so a
+                // mid-lifetime clientInstanceId rotation self-heals at the
+                // next push instead of waiting out a reconnect.
+                if let Some(device_id) = value
+                    .get("deviceId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    conn_identity.device_id = Some(device_id.to_string());
+                }
+                if let Some(client_instance_id) = value
+                    .get("clientInstanceId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    conn_identity.client_instance_id = Some(client_instance_id.to_string());
+                }
+                return handle_tabs_push(&value, ws_tx, state).await;
+            }
             "tabs.sync.query" => return handle_tabs_query(&value, ws_tx, state).await,
             "tabs.sync.client.retire" => {
                 handle_tabs_retire(&value, state).await;
@@ -880,6 +943,12 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
+            // Focused-ep4-r2 Findings 1+2: the provenance's assertion time —
+            // captured ONCE here, at message receipt. The value rides the whole
+            // create chain (dedupe wait, gated-restore permit queue, spawn,
+            // post-spawn binding/pending-marker writes) unchanged, so slow
+            // work can never manufacture a later attribution.
+            let asserted_at = now_ms();
             // Server-wide requestId -> terminal dedupe (legacy `createdByRequestId`
             // parity): registered BEFORE the rate limiter and BEFORE the
             // paneReconcileV1 adopt/sessionRef-lease branches inside `handle_create`,
@@ -928,11 +997,23 @@ async fn handle_client_text(
                     create_cancel_rx.clone(),
                     conn_id,
                     pane_reconcile_v1,
+                    conn_identity.clone(),
+                    asserted_at,
                 );
                 true
             } else {
                 let request_id = create.request_id.clone();
-                match interactive_create_tx.try_send(interactive_creates::Job::new(create, state)) {
+                // Main's serial interactive-create queue (terminal-foreground
+                // delivery) keeps THIS lane's stamping intact: the Job carries
+                // the connection's provenance and the message-receipt
+                // assertion time, captured NOW (queue latency must never
+                // fabricate freshness in the recovery judgment).
+                match interactive_create_tx.try_send(interactive_creates::Job::new(
+                    create,
+                    state,
+                    conn_identity,
+                    asserted_at,
+                )) {
                     Ok(()) => true,
                     Err(error) => {
                         let full = matches!(&error, mpsc::error::TrySendError::Full(_));
@@ -970,6 +1051,17 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
+                // Delta-r7-round-2 (Finding F3) — the attach-carried pane
+                // identity restamps the terminal's Bound ledger row BEFORE
+                // the attach is observable (the kill lane's
+                // durable-before-observable order): a sidebar reattach mints
+                // a new client createRequestId, and without the re-stamp the
+                // row keeps the OLD pane's close-covered key (the durable
+                // pane-close evidence for the pane the user X-closed) and the
+                // recovery inventory would suppress a genuinely re-opened
+                // session lost before its first snapshot.
+                let asserted_at = now_ms();
+                maybe_restamp_on_attach(&attach, state, conn_identity, asserted_at).await;
                 match handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1) {
                     Some(err) => send(ws_tx, &err).await,
                     None => true,
@@ -977,6 +1069,11 @@ async fn handle_client_text(
             } else {
                 send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
             }
+        }
+        ClientMessage::PaneClosed(closed) => handle_pane_closed(&closed, state, ws_tx).await,
+        ClientMessage::PanesClosed(closed) => handle_panes_closed(&closed, state, ws_tx).await,
+        ClientMessage::PaneOpened(opened) => {
+            handle_pane_opened(&opened, state, conn_identity, ws_tx).await
         }
         ClientMessage::TerminalInput(input) => {
             // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
@@ -1040,7 +1137,7 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalDetach(detach) => {
-            handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
+            handle_detach(&detach, ws_tx, state, conn_id).await
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
         ClientMessage::TerminalAutoResumeCancel(cancel) => {
@@ -1054,18 +1151,30 @@ async fn handle_client_text(
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
             if state.fresh_codex.is_enabled() {
+                // D8 (restore-open-sessions-only): thread this connection's
+                // provenance (hello identity + the create's `tabId`) down the
+                // provider `handle_create` chain so the identity-sink binding
+                // write is stamped. The message alone cannot carry the device/
+                // client identity (it is per-CONNECTION, not per-pane).
+                // Focused-ep4-r2 Findings 1+2: the assertion time is captured
+                // HERE, at message receipt — the value then rides the whole
+                // detached-task create chain (sidecar spawn, SDK init,
+                // identity write) unchanged, so a pane whose create completes
+                // after the pane closed still attributes at the browser's
+                // assertion.
+                let provenance = conn_identity.bind_provenance(create.tab_id.as_deref(), now_ms());
                 match create.provider {
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
                         tokio::spawn(
-                            async move { fresh_codex.handle_create(create).await }
+                            async move { fresh_codex.handle_create(create, Some(provenance)).await }
                                 .instrument(tracing::Span::current()),
                         );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(
-                            async move { fresh_claude.handle_create(create).await }
+                            async move { fresh_claude.handle_create(create, Some(provenance)).await }
                                 .instrument(tracing::Span::current()),
                         );
                     }
@@ -1073,7 +1182,7 @@ async fn handle_client_text(
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
                         tokio::spawn(
-                            async move { fresh_opencode.handle_create(create).await }
+                            async move { fresh_opencode.handle_create(create, Some(provenance)).await }
                                 .instrument(tracing::Span::current()),
                         );
                     }
@@ -1283,20 +1392,39 @@ async fn handle_client_text(
         // remaining unsupported cells (claude permanently, amplifier unconditionally).
         // Detached task, same shape as the FreshAgentCompact arm (the fork RPC chain
         // never blocks the select loop).
+        //
+        // D8 (focused-ep1-r5 Finding 1): fork stamps from the FORKING connection —
+        // thread this connection's provenance (hello identity + the fork's `tabId`,
+        // the same composition the create arm above uses) into both providers'
+        // fork lanes, which resolve it AHEAD of the parent's parked stamps (a
+        // forceNew multi-tab fork must not inherit the other tab's attribution).
         ClientMessage::FreshAgentFork(fork) => {
+            // Focused-ep4-r2 Findings 1+2: assertion time captured at receipt,
+            // same as the create arm — the fork lane's provenance resolution
+            // (forking connection > parent's parked > parent's row) carries
+            // whichever value wins VERBATIM.
+            let provenance = conn_identity.bind_provenance(fork.tab_id.as_deref(), now_ms());
             if fork.provider == freshell_protocol::AgentProvider::Opencode {
                 let fresh_opencode = state.fresh_opencode.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
-                    async move { fresh_opencode.handle_fork(fork, conn_sink).await }
-                        .instrument(tracing::Span::current()),
+                    async move {
+                        fresh_opencode
+                            .handle_fork(fork, Some(provenance), conn_sink)
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
                 );
             } else if is_codex_provider(fork.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
-                    async move { fresh_codex.handle_fork(fork, conn_sink).await }
-                        .instrument(tracing::Span::current()),
+                    async move {
+                        fresh_codex
+                            .handle_fork(fork, Some(provenance), conn_sink)
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
                 );
             }
             true
@@ -2583,7 +2711,14 @@ pub(crate) async fn prepare_launch(
 
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
-/// sends `terminal.attach` next.
+/// sends `terminal.attach` next. `conn_identity` (D8) is the creating connection's
+/// hello-stamped client identity; the ledger bind sites below stamp it onto the
+/// row (tabKey composed with the create's `tabId`). `asserted_at` (focused-
+/// ep4-r2 Findings 1+2) is the create message's RECEIPT time, captured once by
+/// the dispatch arm — the provenance value's assertion time — so the slowest
+/// create (gated-restore queue, cold sidecar plan, slow spawn) still attributes
+/// the browser's assertion, never this function's completion time.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_create(
     create: TerminalCreate,
     prepared: Option<PreparedLaunch>,
@@ -2592,6 +2727,8 @@ pub(crate) async fn handle_create(
     conn_id: u64,
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    conn_identity: &ConnectionIdentity,
+    asserted_at: i64,
 ) -> bool {
     // P1 (graceful restore/resume S1): destructure the prepared values at
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
@@ -3475,6 +3612,14 @@ pub(crate) async fn handle_create(
     // (provider, session_id) key with the resolved cwd — a benign re-write
     // — and stays the ONLY writer for resume creates. Failure policy
     // identical to that arm: never blocks the create, surfaced LIVE.
+    // D8 (restore-open-sessions-only): the provenance this connection-scoped
+    // create stamps onto its ledger rows — the connection's hello identity plus
+    // the create's `tabId` (`tabKey` composes only when both halves exist).
+    // Focused-ep4-r2 Findings 1+2: the value carries its assertion time (the
+    // message's receipt, threaded in as `asserted_at`) — pre-spawn, post-spawn,
+    // and pending-marker writes below all record THAT time, never their own.
+    let bind_provenance = conn_identity.bind_provenance(create.tab_id.as_deref(), asserted_at);
+
     if claude_fresh_prealloc {
         if let Some(session_id) = resume_session_id.as_deref() {
             let ledger = std::sync::Arc::clone(&state.pane_ledger);
@@ -3483,6 +3628,10 @@ pub(crate) async fn handle_create(
             let write_mode = mode.clone();
             let write_cwd = spec.cwd.clone();
             let write_request_id = create.request_id.clone();
+            let write_client_instance_id = bind_provenance.client_instance_id.clone();
+            let write_device_id = bind_provenance.device_id.clone();
+            let write_tab_key = bind_provenance.tab_key.clone();
+            let write_asserted_at = bind_provenance.asserted_at;
             let now = now_ms();
             let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
@@ -3492,6 +3641,17 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Lineage (F1): the origin falls back to this write's own
+                    // createRequestId — the conn-scoped lane's create IS the origin.
+                    origin_create_request_id: None,
+                    provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                        crate::pane_ledger::ProvenanceStamps {
+                            client_instance_id: write_client_instance_id.as_deref(),
+                            device_id: write_device_id.as_deref(),
+                            tab_key: write_tab_key.as_deref(),
+                            asserted_at: write_asserted_at,
+                        },
+                    ),
                     now_ms: now,
                 })
             })
@@ -3539,8 +3699,12 @@ pub(crate) async fn handle_create(
     if let Err(err) = create_result {
         // PIN 2 (Step 4b): the spawn FAILED, so the pre-spawn claude binding
         // row (PIN2_CLAUDE_PRE_SPAWN_BINDING above) now describes a pane
-        // that never existed — left in place it would surface as a ghost
-        // `ledgerOnly` recovery offer for ~30 days. Delete it, but ONLY for
+        // that never existed — left in place it could surface as a ghost
+        // `ledgerOnly` recovery offer across the row's ~30-day lifetime.
+        // (The D8 parent-relative judgment narrows ghost offers to stamped
+        // rows inside their own parent client's grace window; this row IS
+        // connection-stamped and its bind sits inside that window, so the
+        // judgment does NOT save it.) Delete it, but ONLY for
         // a fresh preallocation (this create minted the id, so the row is
         // exclusively ours); a resume-create's row belongs to the prior
         // epoch and must stay recoverable. Same failure policy as the
@@ -3802,6 +3966,10 @@ pub(crate) async fn handle_create(
             let write_mode = mode.clone();
             let write_cwd = record.cwd.clone();
             let write_request_id = create.request_id.clone();
+            let write_client_instance_id = bind_provenance.client_instance_id.clone();
+            let write_device_id = bind_provenance.device_id.clone();
+            let write_tab_key = bind_provenance.tab_key.clone();
+            let write_asserted_at = bind_provenance.asserted_at;
             let now = now_ms();
             let result = spawn_blocking_in_span(move || {
                 ledger.record_binding(&crate::pane_ledger::BindingWrite {
@@ -3811,6 +3979,21 @@ pub(crate) async fn handle_create(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Lineage (F1): the origin falls back to this write's own
+                    // createRequestId — the conn-scoped lane's create IS the origin.
+                    origin_create_request_id: None,
+                    provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                        crate::pane_ledger::ProvenanceStamps {
+                            client_instance_id: write_client_instance_id.as_deref(),
+                            device_id: write_device_id.as_deref(),
+                            tab_key: write_tab_key.as_deref(),
+                            // Focused-ep4-r2 Findings 1+2: the POST-SPAWN write
+                            // records the receipt-captured assertion time carried
+                            // on the provenance value — never this (possibly
+                            // much later) write's own now.
+                            asserted_at: write_asserted_at,
+                        },
+                    ),
                     now_ms: now,
                 })
             })
@@ -3825,13 +4008,46 @@ pub(crate) async fn handle_create(
         // Identity-bearing pane whose identity is still in flight (fresh
         // codex/opencode/amplifier — trigger d): a durable pending marker
         // from spawn until resolution deletes it (binding-first order).
+        // Delta-r3 Finding 2: this connection-scoped create stamps the marker
+        // with the SAME provenance the binding arm above asserts — the
+        // conn-less locator/candidate resolution (ledger_resolve_identity,
+        // `Inherit`) has no existing row to inherit FROM for a fresh CLI
+        // pane, so the marker's stamps are the ONLY attribution source that
+        // survives until the provider resolves the session id.
         let ledger = std::sync::Arc::clone(&state.pane_ledger);
         let write_terminal_id = terminal_id_for_meta.clone();
         let write_mode = mode.clone();
         let write_cwd = spec.cwd.clone();
+        // Delta-r7-round-3 (focused-episode-7 round-2 Finding F1): the
+        // marker ALSO carries the ORIGIN pane's createRequestId, so the row
+        // this marker resolves into records the pane lineage even on the
+        // conn-less resolution lane (whose binding write is deliberately
+        // create_request_id-less) — the join key a CRID-only pane.closed
+        // record (an in-flight-create close) can still cover.
+        let write_request_id = create.request_id.clone();
+        let write_client_instance_id = bind_provenance.client_instance_id.clone();
+        let write_device_id = bind_provenance.device_id.clone();
+        let write_tab_key = bind_provenance.tab_key.clone();
+        // Focused-ep4-r2 Findings 1+2, as split by focused-ep4-r3 Finding 3:
+        // the provenance's `asserted_at` rides the marker's dedicated field,
+        // so a gated/late marker write still carries the receipt time (its
+        // `spawned_at` stays the write time — the retention clock).
+        let write_asserted_at = bind_provenance.asserted_at;
         let now = now_ms();
         let result = spawn_blocking_in_span(move || {
-            ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
+            ledger.record_pending(
+                &write_terminal_id,
+                &write_mode,
+                write_cwd.as_deref(),
+                Some(&write_request_id),
+                crate::pane_ledger::ProvenanceStamps {
+                    client_instance_id: write_client_instance_id.as_deref(),
+                    device_id: write_device_id.as_deref(),
+                    tab_key: write_tab_key.as_deref(),
+                    asserted_at: write_asserted_at,
+                },
+                now,
+            )
         })
         .await
         .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
@@ -4477,6 +4693,15 @@ pub async fn respawn_agent_terminal(
                     mode: &write_mode,
                     cwd: write_cwd.as_deref(),
                     create_request_id: Some(&write_request_id),
+                    // Lineage (F1): the origin falls back to this write's own
+                    // createRequestId — the conn-scoped lane's create IS the origin.
+                    origin_create_request_id: None,
+                    // Conn-less lane (D8): the auto-resume respawn has no
+                    // client connection; `Inherit` preserves the create's
+                    // provenance stamps AND the assertion time the row already
+                    // carries (focused-ep4-r2 Findings 1+2: maintenance writes
+                    // touch neither).
+                    provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                     now_ms: now,
                 })
             })
@@ -5004,6 +5229,73 @@ fn wrap_terminal_spawn_error(
     }
 }
 
+/// Delta-r7-round-2 (Finding F3) — the pane-identity restamp an attach
+/// performs FIRST, when the attach carries the attaching pane's
+/// `createRequestId`. A pane reattaching to a still-running terminal (the
+/// sidebar background-session Attach; the recovery offer's reattach arm; any
+/// viewport mount) mints a fresh client createRequestId, and the terminal's
+/// Bound ledger row must follow it: otherwise the row keeps the OLD pane's
+/// close-covered key (the durable `pane.closed` evidence for the pane the
+/// user X-closed) and the recovery inventory suppresses a genuinely
+/// re-opened session lost before its first snapshot. The ordering is the
+/// kill lane's durable-before-observable discipline: the row write lands
+/// before `registry.attach` may enqueue `terminal.attach.ready`. Gated on a
+/// LIVE registry id (a doomed INVALID_TERMINAL_ID attach never re-points a
+/// row at a dead terminal) and no-op inside the ledger when the row already
+/// belongs to this pane (every keepalive attach would otherwise fsync it).
+/// Failures never block the attach (the attach's own semantics are
+/// unaffected) — they surface through the ledger's standard loud degradation
+/// seam.
+async fn maybe_restamp_on_attach(
+    attach: &TerminalAttach,
+    state: &WsState,
+    conn_identity: &ConnectionIdentity,
+    asserted_at: i64,
+) {
+    let Some(create_request_id) = attach
+        .create_request_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    else {
+        return; // legacy/headless attach: nothing asserted
+    };
+    if !state.registry.exists(&attach.terminal_id) {
+        return; // the attach INVALID_TERMINAL_IDs — never re-point a row at a dead terminal
+    }
+    let Some(canonical) = state.identity.session_ref_for(&attach.terminal_id) else {
+        return; // unresolved identity window: no row key to restamp
+    };
+    let provenance = conn_identity.bind_provenance(attach.tab_id.as_deref(), asserted_at);
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let terminal_id = attach.terminal_id.clone();
+    let write_crid = create_request_id.to_string();
+    let now = now_ms();
+    let result = spawn_blocking_in_span(move || {
+        ledger.note_pane_reattach(&crate::pane_ledger::ReattachWrite {
+            provider: &canonical.provider,
+            session_id: &canonical.session_id,
+            terminal_id: &terminal_id,
+            create_request_id: &write_crid,
+            provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                crate::pane_ledger::ProvenanceStamps {
+                    client_instance_id: provenance.client_instance_id.as_deref(),
+                    device_id: provenance.device_id.as_deref(),
+                    tab_key: provenance.tab_key.as_deref(),
+                    asserted_at: provenance.asserted_at,
+                },
+            ),
+            now_ms: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(std::io::Error::other(format!(
+            "attach restamp task join failed: {join_err}"
+        )))
+    });
+    crate::pane_ledger::surface_write_failure(state, &attach.terminal_id, result.map(|_| ()))
+}
+
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
 /// connection to it: the registry enqueues `terminal.attach.ready`, replays the
 /// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
@@ -5338,17 +5630,322 @@ fn handle_resize(resize: TerminalResize, state: &WsState) {
 
 /// `terminal.detach` — drop THIS connection's subscription (the terminal keeps
 /// running as a background session); reply `terminal.detached`.
+///
+/// The detach is IDENTITY-DRIVEN ONLY (delta-r7-round-2, Findings F1+F2): it
+/// carries no pane identity and writes no ledger evidence. The durable
+/// pane-close record rides the dedicated [`pane.closed`](handle_pane_closed)
+/// message — close evidence is about the PANE (every removed pane identity
+/// counts, terminalId-less in-flight creates included), while detach is
+/// about the TERMINAL (last-reference subscription release).
 async fn handle_detach(
-    terminal_id: &str,
+    detach: &TerminalDetach,
     ws_tx: &mut WsSink,
     state: &WsState,
     conn_id: u64,
 ) -> bool {
-    state.registry.detach(terminal_id, conn_id);
+    state.registry.detach(&detach.terminal_id, conn_id);
     let detached = ServerMessage::TerminalDetached(TerminalIdOnly {
-        terminal_id: terminal_id.to_string(),
+        terminal_id: detach.terminal_id.clone(),
     });
     send(ws_tx, &detached).await
+}
+
+/// `pane.closed` (delta-r7-round-2, Findings F1+F2) — journal ONE durable,
+/// NON-retiring pane-close record keyed by the removed pane's
+/// `createRequestId` (BEFORE the client's detach, which arrives after on the
+/// wire — the kill lane's durable-close-before-teardown order). The record
+/// fences and retires NOTHING (the session survives by design — sidebar
+/// reattach); without it, a created-then-closed-within-the-grace-window pane
+/// was indistinguishable from created-then-crashed, and the recovery offer
+/// could later recreate a pane the user explicitly removed. The write runs
+/// on the blocking pool (the kill lane's fsync idiom); a write failure never
+/// fails anything client-visible (no live state changes — the record is the
+/// whole act), so it surfaces through the ledger's standard loud degradation
+/// seam (structured ERROR + invariant counter + the live broadcast).
+///
+/// Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the close is
+/// now ACKNOWLEDGED: `pane.closed.result{createRequestId, terminalId?,
+/// success, error?}` answers EVERY well-formed `pane.closed` once the
+/// journal write resolved one way or the other (`success:false` means
+/// NOTHING is durable; a persisted-despite-reported-error record answers
+/// `success:true` — the evidence stands). The closing client awaits this
+/// answer before dropping the pane, exactly the kill lane's correlated
+/// `terminal.killed` discipline — an unacknowledged close (disconnect,
+/// half-open socket) can no longer be dropped silently by the client after
+/// the user acted.
+async fn handle_pane_closed(closed: &PaneClosed, state: &WsState, ws_tx: &mut WsSink) -> bool {
+    if closed.create_request_id.is_empty() {
+        // Never a malformed record key — but still ANSWER (loudly): leaving
+        // this close unacknowledged would wedge the client's bounded wait.
+        return send(
+            ws_tx,
+            &ServerMessage::PaneClosedResult(PaneClosedResult {
+                create_request_id: closed.create_request_id.clone(),
+                terminal_id: closed.terminal_id.clone(),
+                success: false,
+                error: Some("createRequestId must not be empty".to_string()),
+            }),
+        )
+        .await;
+    }
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let crid = closed.create_request_id.clone();
+    let tid = closed.terminal_id.clone();
+    let now = now_ms();
+    let result =
+        spawn_blocking_in_span(move || ledger.close_pane_detached(&crid, tid.as_deref(), now))
+            .await
+            .unwrap_or_else(|join_err| {
+                Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+                    std::io::Error::other(format!(
+                        "pane.closed record task join failed: {join_err}"
+                    )),
+                ))
+            });
+    let answer = |success: bool, error: Option<String>| {
+        ServerMessage::PaneClosedResult(PaneClosedResult {
+            create_request_id: closed.create_request_id.clone(),
+            terminal_id: closed.terminal_id.clone(),
+            success,
+            error,
+        })
+    };
+    match result {
+        Ok(()) => send(ws_tx, &answer(true, None)).await,
+        Err(err) if err.is_persisted() => {
+            // The record IS durable despite the reported error — the close
+            // evidence stands, so the answer is success; loud, structured,
+            // never silent.
+            tracing::error!(
+                target: "freshell_ws::terminal",
+                create_request_id = %closed.create_request_id,
+                error = %err,
+                "pane_close_persisted_despite_error: the non-retiring pane-close \
+                 record is durable; the write layer reported an error"
+            );
+            send(ws_tx, &answer(true, None)).await
+        }
+        Err(err) => {
+            // Clean: NOTHING is durable — genuine durability degradation.
+            // Surface through the ledger's standard loud seam (structured
+            // ERROR + invariant counter + the live broadcast) AND answer the
+            // close as failed — the client keeps the pane on success:false.
+            crate::pane_ledger::surface_write_failure(
+                state,
+                closed
+                    .terminal_id
+                    .as_deref()
+                    .unwrap_or(&closed.create_request_id),
+                Err(std::io::Error::other(format!(
+                    "pane-close record write failed: {err}"
+                ))),
+            );
+            send(
+                ws_tx,
+                &answer(
+                    false,
+                    Some("the pane-close record could not be written durably".to_string()),
+                ),
+            )
+            .await
+        }
+    }
+}
+
+/// `panes.closed` (focused-episode-7 round 3, Finding F1) — the whole-tab
+/// BATCH close: the client's gated `closeTab` sends ONE message carrying the
+/// tab's full terminal-pane identity set; the server journals ONE durable,
+/// NON-retiring envelope record (`pane-detach-batch:<tabId>`,
+/// [`PaneLedger::close_panes_detached`]) covering the whole set in ONE
+/// atomic write, then answers ONE correlated
+/// `panes.closed.result{requestId, success}`. A partial per-pane durable
+/// outcome is impossible by construction — pre-fix, each `pane.closed`
+/// committed independently while the UI failure handling was all-or-nothing,
+/// so a pane-A-ack + pane-B-failure pair left pane A durably closed under a
+/// still-standing tab and recovery suppressed the visibly OPEN pane. The
+/// same failure protocol as [`handle_pane_closed`] applies: persisted-close
+/// answers success (the evidence IS durable), a Clean failure answers
+/// `success:false` AND surfaces through the ledger's loud degradation seam
+/// (the client keeps the whole tab), and a malformed batch answers
+/// `success:false` immediately so the client's bounded wait never wedges.
+async fn handle_panes_closed(
+    closed: &freshell_protocol::PanesClosed,
+    state: &WsState,
+    ws_tx: &mut WsSink,
+) -> bool {
+    let answer = |success: bool, error: Option<String>| {
+        ServerMessage::PanesClosedResult(PanesClosedResult {
+            request_id: closed.request_id.clone(),
+            success,
+            error,
+        })
+    };
+    if closed.request_id.is_empty()
+        || closed.tab_id.is_empty()
+        || closed.panes.is_empty()
+        || closed.panes.iter().any(|p| p.create_request_id.is_empty())
+    {
+        return send(
+            ws_tx,
+            &answer(
+                false,
+                Some("requestId/tabId/panes must be non-empty and every pane createRequestId must be non-empty".to_string()),
+            ),
+        )
+        .await;
+    }
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let tab_id = closed.tab_id.clone();
+    let linkages: Vec<crate::pane_ledger::PaneCloseLinkage> = closed
+        .panes
+        .iter()
+        .map(|p| crate::pane_ledger::PaneCloseLinkage {
+            create_request_id: p.create_request_id.clone(),
+            terminal_id: p.terminal_id.clone(),
+        })
+        .collect();
+    let now = now_ms();
+    let result =
+        spawn_blocking_in_span(move || ledger.close_panes_detached(&tab_id, &linkages, now))
+            .await
+            .unwrap_or_else(|join_err| {
+                Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+                    std::io::Error::other(format!(
+                        "panes.closed record task join failed: {join_err}"
+                    )),
+                ))
+            });
+    match result {
+        Ok(()) => send(ws_tx, &answer(true, None)).await,
+        Err(err) if err.is_persisted() => {
+            // The record IS durable despite the reported error — the close
+            // evidence stands, so the answer is success; loud, structured,
+            // never silent.
+            tracing::error!(
+                target: "freshell_ws::terminal",
+                request_id = %closed.request_id,
+                error = %err,
+                "panes_close_persisted_despite_error: the non-retiring batch close \
+                 record is durable; the write layer reported an error"
+            );
+            send(ws_tx, &answer(true, None)).await
+        }
+        Err(err) => {
+            crate::pane_ledger::surface_write_failure(
+                state,
+                &closed.request_id,
+                Err(std::io::Error::other(format!(
+                    "panes-close record write failed: {err}"
+                ))),
+            );
+            send(
+                ws_tx,
+                &answer(
+                    false,
+                    Some("the pane-close record could not be written durably".to_string()),
+                ),
+            )
+            .await
+        }
+    }
+}
+
+/// `pane.opened` (focused-episode-7 round 3, Finding F2; round 5 Finding F3)
+/// — the durable OPEN re-assertion: the client is still DISPLAYING this pane
+/// (its close's ack was lost or failed), so the server re-agrees with the
+/// displayed layout — [`PaneLedger::note_pane_opened`] consumes the pane's
+/// standing detach-family close record durably (a later genuine close of the
+/// same pane re-journals after it on the client's own wire order) and
+/// re-asserts the Bound row's attribution from this connection's identity +
+/// the message's tab (the full-triple advance rule).
+///
+/// Focused-episode-7 round 5 (Finding F3): the re-assertion is ANSWERED. ONE
+/// correlated `pane.opened.result{createRequestId, success, error?}` follows
+/// the journal resolution — pre-fix a failed consume was broadcast-log-only,
+/// and client state lost before another reconnect could omit a genuinely open
+/// pane from recovery. `success:false` (a Clean write failure, or the
+/// malformed empty-createRequestId shape — answered immediately, never an
+/// unacknowledged message) means NOTHING changed durably: the standing close
+/// record is untouched (the consumption's fail-loud rule), the standard loud
+/// degradation seam fires, and the client marks the pane and retries on its
+/// next sweep tick. The client's listen is bounded and never gates (the
+/// per-ready sweep re-asserts regardless), so the frame is additive with no
+/// protocol bump — a predated server degrades to the pre-answer behavior the
+/// sweep already heals.
+async fn handle_pane_opened(
+    opened: &freshell_protocol::PaneOpened,
+    state: &WsState,
+    conn_identity: &ConnectionIdentity,
+    ws_tx: &mut WsSink,
+) -> bool {
+    let answer = |success: bool, error: Option<String>| {
+        ServerMessage::PaneOpenedResult(freshell_protocol::PaneOpenedResult {
+            create_request_id: opened.create_request_id.clone(),
+            success,
+            error,
+        })
+    };
+    if opened.create_request_id.is_empty() {
+        tracing::warn!(
+            target: "freshell_ws::terminal",
+            "pane.opened rejected: createRequestId must not be empty"
+        );
+        return send(
+            ws_tx,
+            &answer(false, Some("createRequestId must be non-empty".to_string())),
+        )
+        .await;
+    }
+    let asserted_at = now_ms();
+    let provenance = conn_identity.bind_provenance(
+        Some(opened.tab_id.as_str()).filter(|t| !t.is_empty()),
+        asserted_at,
+    );
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let crid = opened.create_request_id.clone();
+    let now = now_ms();
+    let result = spawn_blocking_in_span(move || {
+        ledger.note_pane_opened(
+            &crid,
+            crate::pane_ledger::ProvenancePolicy::Replace(crate::pane_ledger::ProvenanceStamps {
+                client_instance_id: provenance.client_instance_id.as_deref(),
+                device_id: provenance.device_id.as_deref(),
+                tab_key: provenance.tab_key.as_deref(),
+                asserted_at: provenance.asserted_at,
+            }),
+            now,
+        )
+    })
+    .await
+    .unwrap_or_else(|join_err| {
+        Err(std::io::Error::other(format!(
+            "pane.opened task join failed: {join_err}"
+        )))
+    });
+    match result {
+        Ok(()) => send(ws_tx, &answer(true, None)).await,
+        Err(err) => {
+            // The loud degradation seam stands (invariant + broadcast), and
+            // the CORRELATED failure now reaches the client too — it marks
+            // the pane and retries on its next sweep tick (the standing close
+            // record is untouched either way: the never-pretend rule).
+            crate::pane_ledger::surface_write_failure(
+                state,
+                &opened.create_request_id,
+                Err(std::io::Error::other(format!(
+                    "pane-opened re-assertion write failed: {err}"
+                ))),
+            );
+            send(
+                ws_tx,
+                &answer(
+                    false,
+                    Some("the open re-assertion could not be written durably".to_string()),
+                ),
+            )
+            .await
+        }
+    }
 }
 
 /// `terminal.kill` — SIGKILL + reap the shared PTY and remove it. The registry fans
@@ -5413,44 +6010,177 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
 }
 
 async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
-    if kill_and_broadcast(state, &kill.terminal_id) {
-        // P1.8 trigger (e): explicit user close — best-effort retire of the
-        // binding (`closed`) + marker cleanup. Best-effort by spec: SIGKILL
-        // is the tested mode, so retire-on-close must never be load-bearing.
-        // `session_ref_for` is retired-INCLUSIVE, so it still answers after
-        // the retire() inside kill_and_broadcast. Awaited spawn_blocking:
-        // fsync must not pin the dispatch task (V1.md; the PTY-spawn
-        // precedent above).
-        let sref = state.identity.session_ref_for(&kill.terminal_id);
-        let ledger = std::sync::Arc::clone(&state.pane_ledger);
-        let tid = kill.terminal_id.clone();
-        let now = now_ms();
-        let _ = spawn_blocking_in_span(move || {
-            if let Some(sref) = sref {
-                if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
-                    tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
-                }
-            }
-            if let Err(err) = ledger.delete_pending(&tid) {
-                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
-            }
+    let unknown_terminal_error = |terminal_id: String| {
+        ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::InvalidTerminalId,
+            message: "Unknown terminalId".to_string(),
+            timestamp: crate::now_iso(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: None,
+            retry_after_ms: None,
+            terminal_id: Some(terminal_id),
+            terminal_exit_code: None,
+            live_terminal_id: None,
         })
-        .await;
+    };
+    // P1.8 trigger (e): explicit user close — THE durable close
+    // (focused-episode-6 round 1, delta-r6-r2 Findings 1+2+6): ONE
+    // `PaneLedger::close_pane` call, under the ledger's own serialization,
+    // BEFORE the process and the in-memory identity are destroyed. It
+    // retires every identity the pane owns — the in-memory `session_ref_for`
+    // capture AND any binding row keyed by this terminal (a resolution that
+    // beat the capture but not the ledger turn retires under the guard;
+    // one resolving LATER consults the pane close record and lands Retired,
+    // never Bound — `resolve_pending`'s consult) — deletes the pending
+    // marker, and persists the pane close record the recovery verdict joins
+    // on. Destroying first (the pre-delta-r6 shape) lost the close entirely
+    // when the blocking write was cancelled or failed; retiring only the
+    // captured sessionRef (the delta-r6 shape) missed the
+    // resolver-racing/pre-resolution window this pane close covers.
+    //
+    // Delta-r6-r3 (focused-episode-6 round 2, Findings 5+7): the envelope is
+    // written UNCONDITIONALLY — FIRST — even when the registry no longer
+    // holds the id. A reaper that just removed the row (the terminal exited
+    // as the user closed the pane) or a stale pane after a server restart
+    // made the pre-r3 arms return `INVALID_TERMINAL_ID` without recording
+    // anything: the stale snapshot then received NO closed verdict and could
+    // be offered/rebuilt. The pane close is real regardless of registry
+    // presence; the record keys by the terminal id the close knows, with the
+    // createRequestId taken from the registry when its row stands, else from
+    // the kill message itself (the pane carries it and the registry probe can
+    // no longer answer).
+    //
+    // Failure propagation (delta-r6, envelope-atomic delta-r6-r3): a FAILED
+    // durable close FAILS the kill — the process is left running, the
+    // identity stands, the client is answered a failure instead of a silent
+    // success, and `close_pane`'s rollback guarantees no retired row or
+    // standing tombstone mis-reads the still-live terminal as closed. A
+    // MISSING registry entry is not a close failure (the terminal is already
+    // gone) — but the envelope write failing IS.
+    //
+    // The correlated answer (Finding 7): a kill carrying `requestId` gets ONE
+    // `terminal.killed{requestId, terminalId, success, error?}` reply — the
+    // close flows await it before dropping the pane; the legacy error frames
+    // (`INTERNAL_ERROR` / `INVALID_TERMINAL_ID`) remain for requestId-less
+    // kills (older clients). (DETACH stays non-retiring, unchanged.)
+    let sref = state.identity.session_ref_for(&kill.terminal_id);
+    let create_request_id = state
+        .registry
+        .probe_create_request_id(&kill.terminal_id)
+        .or_else(|| kill.create_request_id.clone());
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let tid = kill.terminal_id.clone();
+    let now = now_ms();
+    // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's error
+    // is CLASSED, never flattened — `Clean` means nothing is durable (leave
+    // the terminal running, answer failure); `Persisted` means the journal
+    // record stands despite the reported error, so the kill PROCEEDS (the
+    // live terminal ends, consistent with the durable close) while the
+    // answer still reports failure visibly.
+    let close_outcome = spawn_blocking_in_span(move || {
+        ledger.close_pane(&crate::pane_ledger::PaneCloseWrite {
+            terminal_id: tid.clone(),
+            create_request_id,
+            resolved: sref.into_iter().collect(),
+            now_ms: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
+        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+            std::io::Error::other(format!("close task join failed: {err}")),
+        ))
+    });
+    let persisted_despite_error = match &close_outcome {
+        Ok(()) => false,
+        Err(err) => {
+            if err.is_persisted() {
+                tracing::error!(terminal_id = %kill.terminal_id, error = %err,
+                    "pane_ledger_close_persisted_despite_error_on_kill: the close is durable; \
+                     the terminal ends consistently and the answer reports the failure");
+                true
+            } else {
+                tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_pane_failed_on_kill");
+                false
+            }
+        }
+    };
+    if close_outcome_is_clean_failure(&close_outcome) {
+        const CLOSE_FAILURE_COPY: &str =
+            "the terminal close could not be recorded durably; the terminal was left running";
+        if let Some(request_id) = &kill.request_id {
+            let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                request_id: request_id.clone(),
+                terminal_id: kill.terminal_id,
+                success: false,
+                error: Some(CLOSE_FAILURE_COPY.to_string()),
+            });
+            return send(ws_tx, &msg).await;
+        }
+        let msg = ServerMessage::Error(ErrorMsg {
+            code: ErrorCode::InternalError,
+            message: CLOSE_FAILURE_COPY.to_string(),
+            timestamp: crate::now_iso(),
+            actual_session_ref: None,
+            expected_session_ref: None,
+            request_id: None,
+            retry_after_ms: None,
+            terminal_id: Some(kill.terminal_id),
+            terminal_exit_code: None,
+            live_terminal_id: None,
+        });
+        return send(ws_tx, &msg).await;
+    }
+    // The durable close stands (cleanly, or persisted-despite-error). The
+    // correlated answer reports success regardless of whether a reaper beat
+    // the process kill (a missing registry row means the terminal is already
+    // gone — not a close failure); the requestId-less arms keep their legacy
+    // shapes. The persisted-despite-error arm answers success:false — the
+    // kill visibly failed — but still ends the terminal (the close IS
+    // durable; keeping it live would misclassify it at recovery).
+    const PERSISTED_CLOSE_COPY: &str =
+        "the terminal close is recorded durably, but the ledger reported an error; \
+         the terminal was closed to keep state consistent";
+    if let Some(request_id) = &kill.request_id {
+        kill_and_broadcast(state, &kill.terminal_id);
+        let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+            request_id: request_id.clone(),
+            terminal_id: kill.terminal_id,
+            success: !persisted_despite_error,
+            error: persisted_despite_error.then(|| PERSISTED_CLOSE_COPY.to_string()),
+        });
+        return send(ws_tx, &msg).await;
+    }
+    if kill_and_broadcast(state, &kill.terminal_id) {
+        if persisted_despite_error {
+            let msg = ServerMessage::Error(ErrorMsg {
+                code: ErrorCode::InternalError,
+                message: PERSISTED_CLOSE_COPY.to_string(),
+                timestamp: crate::now_iso(),
+                actual_session_ref: None,
+                expected_session_ref: None,
+                request_id: None,
+                retry_after_ms: None,
+                terminal_id: Some(kill.terminal_id.clone()),
+                terminal_exit_code: None,
+                live_terminal_id: None,
+            });
+            return send(ws_tx, &msg).await;
+        }
         return true;
     }
-    let msg = ServerMessage::Error(ErrorMsg {
-        code: ErrorCode::InvalidTerminalId,
-        message: "Unknown terminalId".to_string(),
-        timestamp: crate::now_iso(),
-        actual_session_ref: None,
-        expected_session_ref: None,
-        request_id: None,
-        retry_after_ms: None,
-        terminal_id: Some(kill.terminal_id),
-        terminal_exit_code: None,
-        live_terminal_id: None,
-    });
-    send(ws_tx, &msg).await
+    send(ws_tx, &unknown_terminal_error(kill.terminal_id)).await
+}
+
+/// True iff the close envelope reported a CLEAN failure (nothing durable —
+/// the kill must leave the terminal running). `Ok` and `Persisted` both
+/// mean the close is durable.
+fn close_outcome_is_clean_failure(
+    outcome: &Result<(), crate::pane_ledger::CloseEnvelopeError>,
+) -> bool {
+    matches!(outcome, Err(err) if !err.is_persisted())
 }
 
 /// The kill core, split from the socket reply for testability: `true` = the
@@ -7300,6 +8030,7 @@ mod pane_reconcile_gate_tests {
             mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         let keep_open = handle_client_text(
             r#"{"type":"pane.reconcile.request","reconcileId":"r1","panes":[{"paneKey":"tab-1:pane-1","kind":"terminal","mode":"shell","createRequestId":"cr-1"}]}"#,
@@ -7313,6 +8044,7 @@ mod pane_reconcile_gate_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(
@@ -7336,6 +8068,7 @@ mod pane_reconcile_gate_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(pong_ok);
@@ -7364,6 +8097,7 @@ mod pane_reconcile_gate_tests {
             mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
         let filler =
             r#"{"type":"terminal.create","requestId":"filler","mode":"shell","shell":"system"}"#;
         let ok = handle_client_text(
@@ -7378,6 +8112,7 @@ mod pane_reconcile_gate_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7401,6 +8136,7 @@ mod pane_reconcile_gate_tests {
                 &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
+                &mut conn_identity,
             )
             .await;
             assert!(ok, "attempt {attempt}: a full queue must be answered");
@@ -7722,6 +8458,7 @@ mod host_stats_dispatch_tests {
             mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         // subscribe: 0->1 edge drives set_active(true) ONCE and the current
         // snapshot is sent immediately Node `sendHostStatsSnapshot` parity,
@@ -7739,6 +8476,7 @@ mod host_stats_dispatch_tests {
                 &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
+                &mut conn_identity,
             )
             .await;
             assert!(ok);
@@ -7769,6 +8507,7 @@ mod host_stats_dispatch_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7789,6 +8528,7 @@ mod host_stats_dispatch_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(pong_ok);
@@ -7815,6 +8555,7 @@ mod host_stats_dispatch_tests {
             mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         // First refresh passes the floor and invokes the collector.
         let ok = handle_client_text(
@@ -7829,6 +8570,7 @@ mod host_stats_dispatch_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7855,6 +8597,7 @@ mod host_stats_dispatch_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);
@@ -7885,6 +8628,7 @@ mod host_stats_dispatch_tests {
             mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
 
         let ok = handle_client_text(
             r#"{"type":"hoststats.refresh","requestId":"r9"}"#,
@@ -7898,6 +8642,7 @@ mod host_stats_dispatch_tests {
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
+            &mut conn_identity,
         )
         .await;
         assert!(ok);

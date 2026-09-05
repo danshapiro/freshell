@@ -825,6 +825,99 @@ describe('WebSocket edge cases', () => {
     })
   })
 
+  describe('Rust-only message acceptance', () => {
+    // Delta-r7-r2 (Findings F1+F2): `pane.closed` is the dedicated durable
+    // pane-close evidence channel; only the Rust server journals it (the Node
+    // server has no recovery ledger). Delta-r7-r3 (focused-episode-7 round 2,
+    // Finding F2): the close is ACKNOWLEDGED on every floor — the client
+    // gates pane removal on the correlated `pane.closed.result`, so the Node
+    // server accepts AND answers success (its close-durability model records
+    // nothing: no ledger, no recovery pipeline, nothing to fail) — never an
+    // INVALID_MESSAGE/UNKNOWN_MESSAGE error and never silence (a v10 client
+    // against silence would refuse every terminal close for 5s).
+    it('accepts pane.closed and answers a correlated success result (no error frame, connection stays open)', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({
+        type: 'pane.closed',
+        createRequestId: 'req-node-accept',
+        terminalId: 'term-node-accept',
+      }))
+      // A terminalId-less close (the in-flight-create shape) is equally valid.
+      ws.send(JSON.stringify({ type: 'pane.closed', createRequestId: 'req-node-accept-2' }))
+
+      // Any protocol frame proves life-after-the-message; ping/pong is the
+      // lightest. An error frame for either pane.closed would also surface
+      // inside this collection window.
+      ws.send(JSON.stringify({ type: 'ping' }))
+      const messages = await collectMessages(ws, 400)
+      expect(messages.some((m) => m.type === 'pong')).toBe(true)
+      const results = messages.filter((m) => m.type === 'pane.closed.result')
+      expect(results).toEqual([
+        {
+          type: 'pane.closed.result',
+          createRequestId: 'req-node-accept',
+          terminalId: 'term-node-accept',
+          success: true,
+        },
+        {
+          type: 'pane.closed.result',
+          createRequestId: 'req-node-accept-2',
+          success: true,
+        },
+      ])
+      expect(
+        messages.filter((m) => m.type === 'error'),
+        `pane.closed must never draw an error frame: ${JSON.stringify(messages)}`,
+      ).toEqual([])
+      expect(ws.readyState).toBe(WebSocket.OPEN)
+
+      close()
+    })
+
+    // Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+    // envelope ON EVERY FLOOR — the v10 client's close gate awaits the ONE
+    // correlated `panes.closed.result`, so the Node server accepts the batch
+    // and answers success by requestId (it journals nothing: no ledger, no
+    // recovery pipeline). Focused-episode-7 round 5 (Finding F3): the durable
+    // open re-assertion is ANSWERED on every floor — the client tracks a
+    // failed consume for its next-sweep retry, so the Node server accepts and
+    // answers success (nothing recorded, nothing that can fail).
+    it('accepts panes.closed and pane.opened with correlated success results (no error frames)', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({
+        type: 'panes.closed',
+        requestId: 'batch-node-accept',
+        tabId: 'tab-node',
+        panes: [
+          { createRequestId: 'req-node-a', terminalId: 'term-node-a' },
+          { createRequestId: 'req-node-b' },
+        ],
+      }))
+      ws.send(JSON.stringify({ type: 'pane.opened', createRequestId: 'req-node-a', tabId: 'tab-node' }))
+
+      ws.send(JSON.stringify({ type: 'ping' }))
+      const messages = await collectMessages(ws, 400)
+      expect(messages.some((m) => m.type === 'pong')).toBe(true)
+      const results = messages.filter((m) => m.type === 'panes.closed.result')
+      expect(results).toEqual([
+        { type: 'panes.closed.result', requestId: 'batch-node-accept', success: true },
+      ])
+      const openResults = messages.filter((m) => m.type === 'pane.opened.result')
+      expect(openResults).toEqual([
+        { type: 'pane.opened.result', createRequestId: 'req-node-a', success: true },
+      ])
+      expect(
+        messages.filter((m) => m.type === 'error'),
+        `the batch close and the re-assertion must never draw an error frame: ${JSON.stringify(messages)}`,
+      ).toEqual([])
+      expect(ws.readyState).toBe(WebSocket.OPEN)
+
+      close()
+    })
+  })
+
   describe('Terminal stream v2 replay and pressure handling', () => {
     it('sinceSeq replays only missing frames on terminal.attach', async () => {
       const { ws: ws1, close: close1 } = await createAuthenticatedConnection()

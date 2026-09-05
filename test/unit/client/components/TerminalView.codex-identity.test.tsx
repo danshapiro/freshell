@@ -15,6 +15,9 @@ import TerminalView from '@/components/TerminalView'
 const wsHarness = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
   const restoreRequestIds = new Set<string>()
+  // Mirrors src/lib/terminal-restore.ts's recovered-live-terminal target arm
+  // (focused-ep6 r5): one-shot tabId:paneId -> terminalId consult before create.
+  const recoveredLiveTerminalTargets = new Map<string, string>()
   const send = vi.fn()
   const connect = vi.fn().mockResolvedValue(undefined)
   const onMessage = vi.fn((handler: (msg: any) => void) => {
@@ -39,9 +42,19 @@ const wsHarness = vi.hoisted(() => {
     clearRestoreRequestId(id: string) {
       restoreRequestIds.delete(id)
     },
+    armRecoveredLiveTerminalTarget(tabId: string, paneId: string, terminalId: string) {
+      recoveredLiveTerminalTargets.set(`${tabId}:${paneId}`, terminalId)
+    },
+    consumeRecoveredLiveTerminalTarget(tabId: string, paneId: string) {
+      const key = `${tabId}:${paneId}`
+      const terminalId = recoveredLiveTerminalTargets.get(key)
+      if (terminalId !== undefined) recoveredLiveTerminalTargets.delete(key)
+      return terminalId
+    },
     reset() {
       messageHandlers.clear()
       restoreRequestIds.clear()
+      recoveredLiveTerminalTargets.clear()
       send.mockClear()
       connect.mockClear()
       onMessage.mockClear()
@@ -69,6 +82,10 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
   addTerminalFreshRecoveryRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
+  armRecoveredLiveTerminalTarget: (tabId: string, paneId: string, terminalId: string) =>
+    wsHarness.armRecoveredLiveTerminalTarget(tabId, paneId, terminalId),
+  consumeRecoveredLiveTerminalTarget: (tabId: string, paneId: string) =>
+    wsHarness.consumeRecoveredLiveTerminalTarget(tabId, paneId),
 }))
 
 vi.mock('@/lib/terminal-themes', () => ({

@@ -110,6 +110,13 @@ export type TerminalPaneContent = {
   initialCwd?: string
   /** One-shot user-visible reconcile notice (corrected identity, fresh-by-reason, duplicate ignored). Rendered then cleared by TerminalView. */
   reconcileNotice?: string
+  /** The pane-close failure surface (delta-r7-r3 / focused-episode-7 round 2
+   * Finding F2): set by the close gate when the server does NOT confirm the
+   * durable pane-close journal (success:false or the bounded wait timed out)
+   * — the pane stays open and TerminalView renders this as the xterm "[Close
+   * failed]" notice, then clears it. VOLATILE: never persisted (stripped in
+   * persistMiddleware beside reconcileNotice). */
+  closeError?: string
   /** Set by verdict folding; consumed by TerminalView when it sends terminal.create. 'respawn' = create-with-resume from sessionRef; 'fresh' = clean create. */
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter. Incremented by applyReconcileAttach / resetPaneForReconcileCreate so a fold on an already-mounted pane (same createRequestId — never re-minted) re-fires TerminalView's create-or-attach effect (Task 12 adds it to the dep array). Stripped from persistence (Task 8). */
@@ -400,6 +407,43 @@ export interface PanesState {
   /** Ephemeral: paneKey -> wall-clock ms when a reconcile request naming this pane went out.
    *  While present (and young), the pane's mount drive defers its create until the verdict folds. */
   reconcilePendingPanes?: Record<string, number>
+  /**
+   * Tabs whose close is IN FLIGHT (focused-episode-7 round 4, Finding F3) —
+   * set by the `closeTab` thunk before it awaits the close batch's
+   * acknowledgement, cleared on either resolution. While a tab is closing,
+   * its pane identity set is FROZEN: the reducers that gain or re-key a pane
+   * (`splitPane`/`addPane`/`replacePane`/`initLayout`/`restoreLayout`/
+   * `resetLayout`/`restartFreshAgentCreate`, an identity-changing
+   * `updatePaneContent` fold, a `swapPanes` exchange — delta-round-8 F1)
+   * refuse — otherwise a pane minted into the still-visible tab during the
+   * bounded ack wait would be removed with the tab while the acknowledged
+   * batch never carried its close evidence, and recovery could later
+   * re-offer it. `removeLayout` clears the flag
+   * alongside the layout (the tab is gone). Ephemeral: never persisted
+   * (stripped in persistMiddleware beside the other volatile maps), never
+   * hydrated.
+   */
+  closingTabs?: Record<string, true>
+  /**
+   * Panes whose SINGLE-pane close is IN FLIGHT (focused-episode-7 round 5,
+   * Finding F2) — set by `closePaneWithCleanup` / `replacePaneWithCleanup`
+   * before they await the pane close's acknowledgement, cleared on either
+   * resolution. Keyed `${tabId}:${paneId}` (the `reconcilePendingPanes`
+   * keying convention). Together with `closingTabs` this is the ONE shared
+   * pending-close guard (`isPaneClosePending` in panesSlice): while a close
+   * is outstanding for a pane, every identity-CHANGING reducer fold of that
+   * pane refuses, so the acknowledgement always covers exactly the identity
+   * the post-ack removal applies — never a re-keyed replacement removed
+   * evidenceless. The same marks drive the close-op serialization
+   * (delta-round-8 Finding F2, strengthened delta-round-9): ONE close op
+   * per tab at a time, ANY scope — a pane-scope start rejects while ANY of
+   * these marks (or the tab's) stands in its tab, and a tab-scope start
+   * rejects likewise, so even two different panes' closes never overlap in
+   * one tab. Ephemeral: never persisted (stripped in
+   * persistMiddleware beside the other volatile maps), never hydrated,
+   * `removeLayout` drops the tab's entries alongside the layout.
+   */
+  closingPanes?: Record<string, true>
 }
 
 /**

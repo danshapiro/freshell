@@ -97,6 +97,22 @@ pub struct FreshOpencodeState {
     /// mirrors `adapter.ts`'s `remember()` (`sessions.set(placeholderId, state);
     /// sessions.set(realSessionId, state)`), so a `freshAgent.send`/`kill` addressed by
     /// either id resolves to the SAME session record.
+    ///
+    /// LOCK ORDER (retire-on-kill round 6, focused-ep5-r5 Finding 1): the
+    /// `sessions` map guard is NEVER held across a per-session lock
+    /// acquisition — clone the session's `Arc` out under a short map section,
+    /// drop the guard, THEN await `session_arc.lock()`. The reverse direction
+    /// is the one permitted pair: `handle_send` re-acquires `sessions` while
+    /// holding the session lock (the materialization insert), so the wait-for
+    /// graph carries edges only session→map, never map→session, and no cycle
+    /// can close. (The finding's deadlock: `handle_kill`'s capture phase held
+    /// the map while awaiting the session lock, and a first send held that
+    /// session lock across its cold-start `create_session` before awaiting
+    /// the map to register the durable key — kill owns the map and waits for
+    /// the session, send owns the session and waits for the map, freezing the
+    /// close BEFORE its durable retire and wedging every other opencode map
+    /// reader. Pinned by `handle_kill_never_holds_the_sessions_map_across_
+    /// its_session_lock_wait` and its teardown/refusal-teardown twins.)
     sessions: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
@@ -313,6 +329,44 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+    /// Retire-on-kill (delta-review round 5): set by `handle_kill` inside its
+    /// session-lock phase. A send that took this session's Arc just before the
+    /// kill's map removal is Parking on this lock and would otherwise
+    /// materialize + re-bind a ledger row for the pane that is going away;
+    /// `handle_send` consults the flag BEFORE any side effect and refuses
+    /// (SESSION_NOT_FOUND — the same answer the map-removed arm gives).
+    killed: Arc<AtomicBool>,
+    /// Focused-episode-6 round 4 (Finding F6): the kill's enumeration gate —
+    /// nonzero while a kill is between its one critical-section enumeration
+    /// (under THIS session lock) and its durable-close outcome. `handle_send`
+    /// refuses (SESSION_NOT_FOUND — the same answer the killed arm gives)
+    /// instead of materializing, so the
+    /// enumerated identity set is COMPLETE by construction: no session id can
+    /// mint behind the envelope's back, and the post-envelope discovery +
+    /// second close the pre-fix code needed is gone. Guarded by the session
+    /// mutex (no lock ordering change — every read/write of it runs under
+    /// the session guard the kill/send already hold). Decremented only when
+    /// the envelope fails Clean (the kill aborts; the session is genuinely
+    /// untouched); a durable close tears the session down with the gate
+    /// still standing.
+    close_pending: usize,
+    /// D8 (restore-open-sessions-only): the LATEST connection-scoped provenance
+    /// this session was attached under. Parked by `handle_create` at create, by
+    /// the in-memory-hit arm AND by `resume_durable_session` at a
+    /// connection-scoped resume (focused-ep1-r3: the cold-resume reconstruction
+    /// parks it too, so the fork consumer's `session.provenance` read and the
+    /// per-send refresh write always assert the CURRENT attribution). Read by
+    /// every downstream binder: the materialization row (born at first SEND,
+    /// mediations after `handle_create` returned), the per-send refresh, and
+    /// the fork child's precedence source (2) (the FORKING connection's
+    /// stamps win, focused-ep1-r5 Finding 1). Conn-less cold reconstruction
+    /// (attach-resume rehydrate) seeds it from the DURABLE row's stamps
+    /// (focused-ep1-r4 Finding 2); a row that genuinely has none leaves `None`
+    /// parked — never invented — and conn-less writes let the ledger merge
+    /// keep any prior stamps. Every park/refresh gate filters hollow `Some`s
+    /// away (focused-ep1-r5 Finding 2): a partially initialized client's
+    /// hello never lands or overrides here.
+    provenance: Option<crate::BindProvenance>,
 }
 
 /// Why [`FreshOpencodeState::resume_durable_session`] could not produce a live session for
@@ -348,6 +402,9 @@ impl OpencodeSession {
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
+            killed: Arc::new(AtomicBool::new(false)),
+            close_pending: 0,
+            provenance: None,
         }
     }
 }
@@ -445,6 +502,80 @@ impl FreshOpencodeState {
         }
     }
 
+    /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
+    /// the claim lifecycle's COMMIT: an explicit resume/attach of a durable
+    /// `ses_*` id is a NEW pane GENUINELY CLAIMING that identity — invoked
+    /// only once the rebuilt session is registered (the replacement session
+    /// is established) — clearing the durable kill fence BEFORE the claim's
+    /// own binding writes can be mistaken for the killed session's orphaned
+    /// write and suppressed, AND returning a kill-closed ledger row to Bound
+    /// (Finding 4: unconditional — the V7-gated refresh write below skips a
+    /// lineage-only record for a conn-less attach, and the row once stayed
+    /// Closed while the live session ran, so the next recovery omitted a
+    /// genuinely open session). Unconditional by design — idempotent on a
+    /// never-killed identity — warn-logged on failure, never a resume
+    /// blocker. The first-send materialization lane never commits: its
+    /// `ses_*` id is freshly minted server-side (never tombstoned).
+    /// Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on the
+    /// claim-START dead-state snapshot — a kill landing mid-claim (the user
+    /// closed the pane while the resume awaited the serve manager) advances
+    /// the durable tombstone past it, and the commit is REFUSED with no
+    /// durable side effects: the caller tears the just-rebuilt session down
+    /// and the row the kill retired stays Retired. A reviving claim must
+    /// never undo a newer close — this also ends round 3's UNCONDITIONAL
+    /// commit on the lease-failure arm (a revoked lease caused by a kill now
+    /// tears the session down; a revocation with an UNCHANGED dead-state —
+    /// an expired handle-less holder, no kill — still commits and keeps the
+    /// registered session, the round-3 keep behavior). On commit the
+    /// fence-clear AND the row revive are ONE ledger transition (Finding 3:
+    /// no split-write intermediate). Returns true iff the claim committed;
+    /// an `Err` (io failure deciding or writing) provably left the durable
+    /// close untouched (round 5, focused-ep5-r4 Finding 5): warn-loud and
+    /// report false — the caller tears the session down, kill wins.
+    async fn commit_session_claim(
+        &self,
+        durable_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> bool {
+        let Some(sink) = self.identity_sink() else {
+            return true;
+        };
+        match sink
+            .commit_claim(PROVIDER, durable_id, expect_killed_at_ms)
+            .await
+        {
+            Ok(crate::identity_sink::ClaimCommit::Committed) => true,
+            Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
+                tracing::info!(target: "freshell_freshagent::opencode",
+                    durable = %durable_id,
+                    "freshagent.opencode.claim_refused_stale_dead_state: a close landed while \
+                     this resume was in flight; the claim commits nothing and the lane tears down"
+                );
+                false
+            }
+            Err(e) => {
+                // Round 5 (focused-ep5-r4 Finding 5): the ledger's commit is
+                // crash-atomic, so an `Err` means the durable close was left
+                // UNTOUCHED (fence stands, row Closed). Registering anyway
+                // would run a live session over the Closed row — treat the
+                // error like a refusal (kill wins): the caller tears the
+                // just-rebuilt session down.
+                tracing::warn!(error = %e, session = %durable_id,
+                    "freshagent.opencode.claim_commit_failed: the durable close left the claim \
+                     undecidable; the lane tears down and leaves the close standing");
+                false
+            }
+        }
+    }
+
+    /// Focused-ep5-r3 Finding 1: the claim attempt's dead-state snapshot,
+    /// read at claim START (before the serve-manager awaits) and handed to
+    /// [`Self::commit_session_claim`] at commit time.
+    fn claim_dead_state_snapshot(&self, durable_id: &str) -> Option<i64> {
+        self.identity_sink()
+            .and_then(|sink| sink.kill_tombstone_at_ms(PROVIDER, durable_id))
+    }
+
     /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
     /// `ws-handler.ts:3388-3405`'s generic catch -- always `retryable: true`,
     /// `ws-handler.ts:3403`).
@@ -479,7 +610,14 @@ impl FreshOpencodeState {
     /// Handle a `freshAgent.create` for opencode: mint a placeholder session (NO serve
     /// spawn — `adapter.ts create():419-431`) and broadcast `freshAgent.created`.
     /// `sessionId == freshopencode-<requestId>` until a `send` materializes it.
-    pub async fn handle_create(&self, msg: FreshAgentCreate) {
+    /// `provenance` (D8): the WS connection's stamped identity for this create
+    /// (`None` on conn-less lanes); carried on the session to the materialization
+    /// binding write (opencode's row is written at first send, not at create).
+    pub async fn handle_create(
+        &self,
+        msg: FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
+    ) {
         let request_id = msg.request_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
@@ -518,7 +656,7 @@ impl FreshOpencodeState {
             .or_else(|| msg.session_ref.as_ref().map(|r| r.session_id.clone()))
             .filter(|id| id.starts_with("ses_"));
         if let Some(durable_id) = resume_target {
-            self.handle_create_resume(request_id, durable_id, &msg)
+            self.handle_create_resume(request_id, durable_id, &msg, provenance)
                 .await;
             return;
         }
@@ -527,7 +665,13 @@ impl FreshOpencodeState {
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
 
-        let session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
+        let mut session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
+        // D8: park the connection provenance ON the session — the binding row
+        // is written at materialization (first send), well after this create
+        // returns. A HOLLOW `Some` (a partially initialized client's hello,
+        // focused-ep1-r5 Finding 2) parks `None` instead — never a hollow
+        // value downstream readers would treat as truth.
+        session.provenance = provenance.filter(|p| p.is_meaningful());
         self.sessions
             .lock()
             .await
@@ -587,22 +731,35 @@ impl FreshOpencodeState {
     /// genuinely gone (or an unreachable sidecar) fails the create loudly
     /// (`freshAgent.create.failed`) -- never a silently-minted fresh session,
     /// never a `lost_session_frame` (that shape is exclusive to `freshAgent.attach`).
+    /// `provenance` (D8): a resume-CREATE is still a connection-scoped create —
+    /// this pane IS open in that client's tab — so the resume's binding refresh
+    /// re-stamps the CURRENT connection's identity/tab (delta-r1 Finding 3).
     async fn handle_create_resume(
         &self,
         request_id: String,
         durable_id: String,
         msg: &FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
     ) {
+        // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
+        // HOLLOW `Some` (a partially initialized client's hello without
+        // device/client fields) behaves like `None` on every gate below: the
+        // in-memory re-park and the refresh write never let a hollow value
+        // override parked/row truth, and the cold path falls through to the
+        // durable row's seed.
+        let provenance = provenance.filter(|p| p.is_meaningful());
+
         // Already tracked locally (a live pane, or an earlier attach/create already
         // rebound it)? Reuse it -- mirrors handle_attach's local-map-first lookup.
         let existing = {
             let guard = self.sessions.lock().await;
             guard.get(&durable_id).cloned()
         };
+        let in_memory_hit = existing.is_some();
         let session_arc = match existing {
             Some(session_arc) => session_arc,
             None => match self
-                .resume_durable_session(&durable_id, msg.cwd.as_deref())
+                .resume_durable_session(&durable_id, msg.cwd.as_deref(), provenance.clone())
                 .await
             {
                 Ok(session_arc) => session_arc,
@@ -636,6 +793,16 @@ impl FreshOpencodeState {
         // being rewritten to the default.
         {
             let mut session = session_arc.lock().await;
+            // D8 (focused-ep1 Finding A, branch 1 — same-process in-memory
+            // hit): a resume reached through a CONNECTION-SCOPED create must
+            // re-park the CURRENT connection's provenance on the session —
+            // otherwise every later per-send refresh write keeps re-asserting
+            // the OLD tab's attribution into the ledger row (the merge's
+            // REPLACE rule). Conn-less resumes keep the parked stamps (the
+            // ledger keep-when-None merge's in-memory twin).
+            if in_memory_hit && provenance.is_some() {
+                session.provenance = provenance.clone();
+            }
             let raw_model = msg.model.clone().or_else(|| session.model.clone());
             let model = normalize_opencode_model(raw_model.as_deref());
             let raw_effort = msg.effort.clone().or_else(|| session.effort.clone());
@@ -645,6 +812,40 @@ impl FreshOpencodeState {
             if msg.cwd.is_some() {
                 session.cwd = msg.cwd.clone();
             }
+        }
+
+        // D8 (focused-ep1 Finding A, branch 1): the in-memory hit bypasses
+        // `resume_durable_session`, so it must perform that lane's SAME
+        // awaited refresh write itself (durable-before-answer) — the CURRENT
+        // connection's attribution lands on the row immediately, even if no
+        // send ever follows this resume. Conn-less resumes write nothing here
+        // (nothing new to assert; the row keeps its stamps).
+        if let Some(p) = provenance.filter(|_| in_memory_hit) {
+            let (model, effort, cwd) = {
+                let session = session_arc.lock().await;
+                (
+                    session.model.clone(),
+                    session.effort.clone(),
+                    session.cwd.clone(),
+                )
+            };
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model,
+                    sandbox: None,
+                    permission_mode: None,
+                    effort,
+                    cwd,
+                },
+            })
+            .await;
         }
 
         // requestId dedup cache: a duplicate create replays the DURABLE id (never a
@@ -702,6 +903,29 @@ impl FreshOpencodeState {
         };
 
         let mut session = session_arc.lock().await;
+
+        // Retire-on-kill (delta-review round 5, the resolution arm): a send that
+        // took this session's Arc just before `handle_kill`'s map removal parks
+        // on this very lock — see the killed flag the kill set inside its own
+        // session-lock phase and refuse with the SAME SESSION_NOT_FOUND the
+        // map-removed arm gives, BEFORE any side effect. Without this gate the
+        // send would materialize + re-bind a ledger row for the pane that just
+        // closed (the finding class: a created-then-closed row re-offered in
+        // the creation-race grace window).
+        if session.killed.load(Ordering::SeqCst) || session.close_pending > 0 {
+            // Focused-episode-6 round 4 (Finding F6): the `close_pending`
+            // half — a kill has enumerated this session's identity set and
+            // is writing its ONE durable close; no materialization may land
+            // behind that envelope's back (a refused send retries cleanly if
+            // the close fails Clean and the gate drops).
+            drop(session);
+            self.send_error(
+                &request_id,
+                "SESSION_NOT_FOUND",
+                "opencode session not found",
+            );
+            return;
+        }
 
         // D2-F1 (delta-review round 2): a send arriving while a COMPACT is in flight
         // is REFUSED — the nested `freshAgent.error{INTERNAL_ERROR}` — BEFORE any side
@@ -820,9 +1044,8 @@ impl FreshOpencodeState {
                 .await
                 .insert(durable_id.clone(), session_arc.clone());
 
-            // P1.13: binding row at materialization (AWAITED BEFORE the materialized
-            // broadcast -- durable-before-answer), resolving the create's pending
-            // marker. Opencode has no sandbox/permission concepts -- always `None`.
+            // D8: stamps parked on the session at create reach the
+            // materialization row here (Some asserts, None inherits).
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
@@ -839,6 +1062,7 @@ impl FreshOpencodeState {
                     .map(str::to_string),
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
+                provenance: session.provenance.clone().into(),
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -871,6 +1095,9 @@ impl FreshOpencodeState {
         // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
         // durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
+            // D8: same session-carried stamps (a per-send refresh re-asserts
+            // them via `Replace`; a conn-less refresh lane carries `None` →
+            // `Inherit` and the ledger merge preserves them).
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: acked_session_id.clone(),
@@ -878,6 +1105,7 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
+                provenance: session.provenance.clone().into(),
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
                     sandbox: None,
@@ -990,36 +1218,234 @@ impl FreshOpencodeState {
     /// child is reused by every session and torn down only by
     /// [`crate::FreshAgentState::shutdown`] at server shutdown.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        // Retire-on-kill close-durability rule (delta-r6): the durable close
+        // — every row retire plus every pending-marker delete — is recorded
+        // BEFORE any live-state mutation (map removal, the killed flag) and
+        // BEFORE any await that can park (the per-session lock, whose wait
+        // can span a first send's cold-start materialization). A restart or
+        // task cancellation anywhere in that wait must never strand a
+        // just-closed pane as recoverable. And a FAILED durable write fails
+        // the kill: the answer reports `success:false` and NOTHING was
+        // touched (never warn-and-continue into a Bound row for a pane the
+        // user closed).
+        //
+        // Round 6 lock order (focused-ep5-r5 Finding 1) is preserved
+        // throughout: the `sessions` map is only ever held for short
+        // SYNCHRONOUS sections (lookup/scan/removal), never across a
+        // per-session lock acquisition — the wait-for graph carries only
+        // session→map edges.
+        //
+        // Phase 1 — discovery completes BEFORE the envelope and BEFORE
+        // teardown (focused-episode-6 round 4, Finding F6). The session
+        // lock is the serialization point: a materialization holds it
+        // through its map insert + binding-row write, so acquiring it here
+        // parks behind any in-flight materialization and then sees its
+        // complete result. Under that ONE acquisition the kill BOTH
+        // enumerates the COMPLETE identity set (placeholder, the wire id,
+        // the durable id(s) resolvable from the map mirror and the
+        // session's `real_session_id`, plus the pending markers) AND arms
+        // the mint gate (`close_pending`) — so the set written to the ONE
+        // envelope below is complete by construction and no second close
+        // can ever exist. A send taking the lock past this point reads the
+        // gate and refuses; the gate releases ONLY if the envelope fails
+        // Clean (the kill aborts, the session untouched).
         let session_arc = {
-            let mut guard = self.sessions.lock().await;
-            let found = guard.get(&msg.session_id).cloned();
-            if let Some(session_arc) = &found {
-                let (placeholder, real) = {
-                    let s = session_arc.lock().await;
-                    (s.placeholder_id.clone(), s.real_session_id.clone())
+            let guard = self.sessions.lock().await;
+            guard.get(&msg.session_id).cloned()
+        };
+        let mut retire_ids: Vec<String> = Vec::new();
+        let mut marker_ids: Vec<String> = Vec::new();
+        {
+            // Focused-episode-6 round 3, Finding 1: EVERY key this kill
+            // answers to — durable `ses_*` ids AND placeholders — is
+            // close evidence (the durable record the recovery verdict
+            // join consults); a placeholder additionally names its
+            // pending marker for deletion. The pre-first-send shape
+            // (placeholders only) used to skip the identity set entirely
+            // (`retire_ids` empty ⇒ marker delete only), leaving a
+            // retained snapshot claiming the placeholder with no standing
+            // close fence — verdict `unknown`, re-offerable. The
+            // placeholder-keyed close IS the fresh-agent lane's close
+            // record (delta-r6-r2), so a kill with nothing else to close
+            // still writes it.
+            let consider =
+                |retire_ids: &mut Vec<String>, marker_ids: &mut Vec<String>, id: &str| {
+                    if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                        && !marker_ids.iter().any(|m| m == id)
+                    {
+                        marker_ids.push(id.to_string());
+                    }
+                    if !retire_ids.iter().any(|r| r == id) {
+                        retire_ids.push(id.to_string());
+                    }
                 };
-                guard.remove(&placeholder);
-                if let Some(real) = real {
-                    guard.remove(&real);
+            if let Some(session_arc) = &session_arc {
+                let mut s = session_arc.lock().await;
+                {
+                    let guard = self.sessions.lock().await;
+                    for (key, candidate) in guard.iter() {
+                        if Arc::ptr_eq(candidate, session_arc) {
+                            consider(&mut retire_ids, &mut marker_ids, key);
+                        }
+                    }
+                }
+                if let Some(real_id) = s.real_session_id.clone() {
+                    consider(&mut retire_ids, &mut marker_ids, &real_id);
+                }
+                consider(&mut retire_ids, &mut marker_ids, &msg.session_id);
+                s.close_pending += 1;
+            } else {
+                // A kill naming an id the map never held still retires that
+                // DURABLE id by name (an evicted session's row is durable)
+                // and still clears a marker under that placeholder name.
+                consider(&mut retire_ids, &mut marker_ids, &msg.session_id);
+            }
+        }
+
+        // Phase 2 — THE durable close: ONE failure-atomic envelope over the
+        // COMPLETE identity set plus the pending markers
+        // (`retire_closed_batch` → `PaneLedger::close_identities`,
+        // delta-r6-r3, focused-episode-6 round 2 Finding 5). An explicit
+        // kill is an intentional session END: it retires the session's
+        // DURABLE row(s) `Closed` (the ledger row is keyed on the
+        // materialized `ses_*` id) so the recovery inventory (Bound-only
+        // pre-filter) can never re-offer a pane the user just closed inside
+        // the 7s creation-race grace window; and deletes the pending marker
+        // (LAST — once the closes are durable) so a late materialization
+        // resolution can never carry evidence for a pane that provably no
+        // longer exists. The per-identity loop it replaced wrote several
+        // retires + marker deletes BEFORE checking any failure: an early
+        // success stayed durable over the still-live session a later failure
+        // left behind — recovery would classify that session closed. The
+        // delta-r6-r2 post-envelope completion retire (whose Clean failure
+        // could not roll back the phase-2 placeholder close, focused-
+        // episode-6 round 4 Finding F6) is gone: phase 1's session-lock
+        // enumeration + mint gate made post-envelope discovery impossible,
+        // and this envelope's Clean failure also rolls nothing back BY
+        // CONSTRUCTION — nothing stands yet. The answer is classed (delta-
+        // r6-r4, round 3 Finding 3): `Failed` (Clean): nothing durable —
+        // the kill releases the enumeration gate and leaves ALL live state
+        // untouched: the session stays live and Bound (self-consistent:
+        // nothing has been closed), and a retried kill re-attempts
+        // idempotently. `Persisted`: the close IS durable despite the
+        // reported error — the kill PROCEEDS (the session ends, consistent
+        // with the durable close) while the answer still reports
+        // `success:false` (the kill visibly fails).
+        let mut close_reported_failure = false;
+        let mut close_invariant_broken = false;
+        if let Some(sink) = self.identity_sink() {
+            match sink
+                .retire_closed_batch(PROVIDER, &retire_ids, &marker_ids)
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    let persisted = e.is_persisted();
+                    if persisted {
+                        tracing::error!(error = %e, sessions = ?retire_ids,
+                            "freshagent.opencode.retire_on_kill_persisted_despite_error: the close \
+                             is durable; the kill ends the session and answers failure");
+                        close_reported_failure = true;
+                    } else {
+                        tracing::warn!(error = %e, sessions = ?retire_ids, "freshagent.opencode.retire_on_kill_failed");
+                        // Failure propagation: the durable close did not
+                        // land — NOTHING of it survived — so the kill must
+                        // NOT acknowledge success and must leave ALL live
+                        // state untouched. Release the enumeration gate
+                        // first: the session is resumable exactly as if the
+                        // kill never ran (F6: no placeholder close stands to
+                        // roll back — the one envelope landed nothing).
+                        if let Some(session_arc) = &session_arc {
+                            let mut s = session_arc.lock().await;
+                            s.close_pending = s.close_pending.saturating_sub(1);
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                        }));
+                        return;
+                    }
                 }
             }
-            found
-        };
+        }
 
-        if let Some(session_arc) = session_arc {
-            let mut s = session_arc.lock().await;
-            if let Some(task) = s.turn_task.take() {
+        // Phase 3 — ONE per-session lock take: the killed flag, then the
+        // teardown-field extraction. Retire-on-kill (delta-review round 5):
+        // mark the session killed BEFORE removing the map keys — a send
+        // that took this Arc just before the removal parks on this very
+        // lock and must observe the flag (never materialize + re-bind a row
+        // for the pane that is going away). The enumeration completeness is
+        // not re-PROVEN here: phase 1's gate made it structural (a send
+        // between the gate and this flag is refused by the gate; the flag
+        // and the gate observe under the same lock). A defect there would
+        // still be caught loud (the invariant probe below) and the kill
+        // would answer failure — never masquerade a broken gate as success.
+        if let Some(session_arc) = &session_arc {
+            let (turn_task, bridge, real, strays) = {
+                let mut s = session_arc.lock().await;
+                let strays: Vec<String> = s
+                    .real_session_id
+                    .clone()
+                    .filter(|real_id| !retire_ids.iter().any(|id| id == real_id))
+                    .into_iter()
+                    .collect();
+                s.killed.store(true, Ordering::SeqCst);
+                (
+                    s.turn_task.take(),
+                    s.serve_bridge.take(),
+                    s.real_session_id.clone(),
+                    strays,
+                )
+            };
+            // DEFENSIVE invariant probe (F6, must never fire): an identity
+            // discovered here slipped the phase-1 gate. Retire it under the
+            // teardown and make the kill visibly FAIL — the externally
+            // visible state is then: the session ended, the identity's close
+            // is whatever the probe's retire managed, and NO answer pretends
+            // consistency.
+            if !strays.is_empty() {
+                close_invariant_broken = true;
+                tracing::error!(target: "freshell_freshagent::opencode",
+                    strays = ?strays,
+                    session = %msg.session_id,
+                    "freshagent.opencode.kill_post_envelope_discovery_invariant_broken: a real \
+                     session id surfaced after the gated one-envelope enumeration; retiring it \
+                     under the teardown and answering failure"
+                );
+                if let Some(sink) = self.identity_sink() {
+                    for stray in &strays {
+                        if let Err(e) = sink.retire_closed(PROVIDER, stray).await {
+                            tracing::error!(error = %e, session = %stray,
+                                "freshagent.opencode.invariant_probe_retire_failed");
+                        }
+                    }
+                }
+            }
+
+            // Phase 4 — the map removal, its own short synchronous section
+            // (every key aliasing this Arc goes; the killed flag has gated
+            // sends since phase 3, so no new key can appear for it).
+            {
+                let mut guard = self.sessions.lock().await;
+                guard.retain(|_, candidate| !Arc::ptr_eq(candidate, session_arc));
+            }
+
+            // Phase 5 — the settlement awaits, strictly after the durable
+            // close (round 5: teardown failure never loses the close).
+            if let Some(task) = turn_task {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
                 // before the kill answers — the compensation must have landed.
                 task.abort_and_settle().await;
             }
             // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
             // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
-            if let Some(bridge) = s.serve_bridge.take() {
+            if let Some(bridge) = bridge {
                 bridge.abort();
             }
             // Task 13: a killed session must reopen its durable id's lease binding.
-            if let Some(real) = s.real_session_id.as_deref() {
+            if let Some(real) = real.as_deref() {
                 self.leases.clear_binding(PROVIDER, real);
             }
         }
@@ -1035,12 +1461,18 @@ impl FreshOpencodeState {
 
         // `adapter.ts kill()` is unconditional (`return true` even for an
         // already-removed/unknown session) — idempotent, matching the codex/claude
-        // `freshAgent.killed{success:true}` pattern.
+        // `freshAgent.killed{success:true}` pattern. Every durable-close
+        // CLEAN failure aborts BEFORE any live state is touched (the ONE
+        // envelope in phase 2 — the enumeration gate released with it; F6
+        // retired the post-envelope completion retire entirely); a
+        // PERSISTED-despite-error close ends the session (consistent with
+        // the durable close) while the kill visibly fails (delta-r6-r4,
+        // round 3 Finding 3).
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
-            success: true,
+            success: !close_reported_failure && !close_invariant_broken,
         }));
     }
 
@@ -1445,7 +1877,23 @@ impl FreshOpencodeState {
     /// | placeholder never materialized | nested `freshAgent.error{INVALID_SESSION_ID}` with the legacy parity text (adapter.ts:403) |
     /// | a fork for this parent is already in flight (duplicate click, D2-F2) | nested `freshAgent.error{INTERNAL_ERROR}`, NO other action — no second fork POST, no child minted (a second child could never correlate after the first fork re-keys the pane) |
     /// | serve failure (400/500/…) | nested `freshAgent.error{INTERNAL_ERROR}` carrying the serve error text, BEFORE any state change |
-    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+    /// `provenance` (D8, focused-ep1-r5 Finding 1) is the FORKING connection's
+    /// stamped identity (the WS dispatch composes it from the hello identity
+    /// + the fork's `tabId`, exactly like the create lanes).
+    ///
+    /// Fork is always connection-initiated (a user clicks Fork in a specific
+    /// browser tab), so the child row's attribution resolves by precedence:
+    /// first the forking connection's provenance — a HOLLOW `Some` (a
+    /// partially initialized client's hello, Finding 2) behaves like `None`
+    /// and never overrides real stamps — then the parent's PARKED provenance,
+    /// then the parent's DURABLE ROW stamps via
+    /// [`crate::identity_sink::PaneIdentitySink::load_provenance`].
+    pub async fn handle_fork(
+        &self,
+        msg: FreshAgentFork,
+        provenance: Option<crate::BindProvenance>,
+        reply_sink: FrameSink,
+    ) {
         // D2-F2 single-flight: acquire BEFORE any lookup/POST; the RAII guard
         // releases on every terminal leg (success AND every failure), so a refreshed
         // Fork click once this op settles is never stranded.
@@ -1482,7 +1930,7 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, model, effort) = {
+        let (real_id, route, model, effort, parent_provenance) = {
             let session = session_arc.lock().await;
             let Some(real_id) = session.real_session_id.clone() else {
                 // Legacy throws FreshAgentLostSessionError BEFORE calling the serve
@@ -1507,8 +1955,30 @@ impl FreshOpencodeState {
                 session.cwd.clone(),
                 session.model.clone(),
                 session.effort.clone(),
+                // Fork precedence source (2) (focused-ep1-r3/r5): the
+                // parent's PARKED provenance.
+                session.provenance.clone(),
             )
         };
+
+        // D8 (focused-ep1-r5 Findings 1+2): fork provenance by precedence —
+        // (1) the FORKING connection's provenance (fork is always
+        // connection-initiated; parked provenance is SHARED across the
+        // globally-shared session, so a fork from tab B must not stamp the
+        // child with tab A's most-recent park). A HOLLOW connection `Some`
+        // (a partially initialized client's hello) behaves like `None` —
+        // it never overrides real stamps. (2) the parent's parked value.
+        // (3) the parent's DURABLE row stamps — the last source that can
+        // know, and the child's NEW ledger key is where a `None` resolution
+        // (merged keep-when-None against an empty row) could never be
+        // rescued.
+        let fork_provenance = provenance
+            .filter(|p| p.is_meaningful())
+            .or(parent_provenance)
+            .or_else(|| {
+                self.identity_sink()
+                    .and_then(|s| s.load_provenance(PROVIDER, &real_id))
+            });
 
         // The selected-turn knob (REVIEWED, fresh-eyes F4/F5): the probed opencode
         // 1.18.18 `POST /session/:id/fork` body schema is `{messageID?: ^msg…}` with
@@ -1574,6 +2044,7 @@ impl FreshOpencodeState {
             model.clone(),
             effort.clone(),
         );
+        child_session.provenance = fork_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
         child_session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
@@ -1596,6 +2067,10 @@ impl FreshOpencodeState {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
+            // connection > parent's parked > parent's row); `Inherit` only
+            // when no source knows the attribution — never invented.
+            provenance: fork_provenance.into(),
             settings: crate::identity_sink::FreshAgentSettings {
                 model,
                 sandbox: None,
@@ -2246,8 +2721,10 @@ impl FreshOpencodeState {
         };
         let session_arc = match session_arc {
             Some(session_arc) => session_arc,
+            // Conn-less lane (D8): attach carries no tab identity — keep-when-None
+            // merge preserves the create's provenance stamps.
             None => match self
-                .resume_durable_session(&msg.session_id, msg.cwd.as_deref())
+                .resume_durable_session(&msg.session_id, msg.cwd.as_deref(), None)
                 .await
             {
                 Ok(session_arc) => session_arc,
@@ -2330,11 +2807,34 @@ impl FreshOpencodeState {
     /// page reload after a server restart -- can rehydrate instead of being declared lost.
     /// There is no separate placeholder id here: attach only ever resumes an ALREADY
     /// durable `ses_*` id, so the placeholder and real id are the same value.
+    /// `provenance` (D8): the CURRENT connection's provenance when this resume flows
+    /// from a connection-scoped create ([`Self::handle_create_resume`]; delta-r1
+    /// Finding 3) — parked on the reconstructed session (focused-ep1-r3) AND re-stamped
+    /// by the binding refresh below, so a resume-into-a-new-tab never keeps the OLD
+    /// tab's attribution. `None` from conn-less lanes (`handle_attach`): the session
+    /// then parks the DURABLE row's stamps instead (focused-ep1-r4 Finding 2 — the
+    /// row is the authoritative record of where this session last lived; the fork
+    /// child's NEW ledger key is where a `None` park could never be rescued), and
+    /// the conn-less refresh below writes `None` stamps so the ledger's
+    /// keep-when-None merge preserves whatever the row had.
     async fn resume_durable_session(
         &self,
         session_id: &str,
         cwd: Option<&str>,
+        provenance: Option<crate::BindProvenance>,
     ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
+        // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
+        // HOLLOW `Some` (a partially initialized client's hello) behaves like
+        // `None` on every decision below: the park falls through to the
+        // durable row's stamp seed, and the refresh gate never fires on
+        // hollow alone.
+        let provenance = provenance.filter(|p| p.is_meaningful());
+        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
+        // SNAPSHOT — taken at claim start, before the serve-manager awaits
+        // (`get_session` and friends) — so a kill landing while this resume
+        // is in flight advances the durable tombstone past it and the commit
+        // below REFUSES instead of undoing the newer close.
+        let claim_dead_state = self.claim_dead_state_snapshot(session_id);
         let manager = self.fresh_agent.ensure_manager().await;
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
@@ -2464,6 +2964,24 @@ impl FreshOpencodeState {
             rec.effort.clone(),
         );
         session.real_session_id = Some(session_id.to_string());
+        // D8 (focused-ep1-r3 + focused-ep1-r4 Finding 2 — the COMPLETE parking
+        // invariant): a session (re)attached to a client connection must hold
+        // that connection's LATEST provenance; a session reconstructed by a
+        // CONN-LESS cold resume (`handle_attach` carries no tab identity)
+        // holds the DURABLE row's stamps instead — the authoritative record of
+        // where this session last lived. Park BEFORE insertion so every
+        // downstream reader of `session.provenance` (the per-send refresh
+        // write, the fork consumer's child-row inheritance — a NEW ledger key
+        // where keep-when-None could never rescue a `None` park) asserts a
+        // known attribution. The connection's provenance still wins when
+        // present (the current-tab truth for a live move). A row that
+        // genuinely carries no stamps seeds nothing: `None` stays parked —
+        // never invented — and the conn-less refresh below preserves whatever
+        // the row had.
+        session.provenance = provenance.clone().or_else(|| {
+            sink.as_ref()
+                .and_then(|s| s.load_provenance(PROVIDER, session_id))
+        });
         session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
             session_id.to_string(),
@@ -2484,10 +3002,94 @@ impl FreshOpencodeState {
             lease_guard.fail();
         }
 
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding
+        // 4): this resume/attach GENUINELY CLAIMS the durable session — the
+        // claim COMMITS here (the rebuilt session is registered, the lease
+        // resolution is final): clear the durable kill fence BEFORE any
+        // binding write of this rebuilt session (the refresh below AND every
+        // later per-send refresh), so the claim is never suppressed as the
+        // killed session's stale orphan, AND return a kill-closed row to
+        // Bound now — the refresh write below is V7-gated on a recovered
+        // settings snapshot / connection provenance, so a lineage-only row
+        // attached conn-less would otherwise stay Closed while the session
+        // runs live (the finding).
+        //
+        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
+        // the claim-start dead-state snapshot — including on the
+        // lease-revoked arm above (the round-3 lane committed UNCONDITIONALLY
+        // there, the finding's exact headline). A kill that landed while this
+        // resume was in flight advanced the tombstone; a revoked lease CAUSED
+        // by that kill therefore refuses the commit now with NO side effects,
+        // and the just-registered session is torn back down (map entry
+        // dropped, bridge aborted, lease failed open) — a revoked lease whose
+        // dead-state is UNCHANGED (an expired handle-less holder, no kill)
+        // still commits and keeps the registered session (the round-3 keep).
+        if !self
+            .commit_session_claim(session_id, claim_dead_state)
+            .await
+        {
+            // Round 6 lock order (focused-ep5-r5 Finding 1): the map removal
+            // is its OWN synchronous critical section, completed before the
+            // session-lock teardown begins. (The pre-fix `if let Some(removed)
+            // = self.sessions.lock().await.remove(...)` kept the scrutinee
+            // guard alive through the whole body on edition 2021 — the map
+            // stayed locked across `removed.lock().await` and the settle
+            // await, wedging every other opencode map reader for the
+            // duration of an arbitrarily slow settle.)
+            let removed = {
+                let mut guard = self.sessions.lock().await;
+                guard.remove(session_id)
+            };
+            if let Some(removed) = removed {
+                let mut s = removed.lock().await;
+                s.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = s.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
+                if let Some(bridge) = s.serve_bridge.take() {
+                    bridge.abort();
+                }
+            }
+            lease_guard.fail();
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} closed while the resume was in flight; torn down"
+                )),
+            ));
+        }
+
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
-        // (durable-before-answer), and ONLY when a record was actually recovered: never
-        // launder a defaults row for a never-recorded session (V7).
-        if recovered.is_some() {
+        // (durable-before-answer). The SETTINGS payload rides only when a record was
+        // actually recovered (never launder a defaults row for a never-recorded
+        // session, V7); the D8 provenance re-stamp rides whenever the resume is
+        // connection-scoped — INCLUDING the settings-None (lineage-only row) case,
+        // which must still assert the CURRENT connection's identity/tab
+        // (focused-ep1 Finding A, branch 2). A conn-less resume of a
+        // never-recorded session still writes nothing (V7's no-laundering rule,
+        // unchanged).
+        if recovered.is_some() || provenance.is_some() {
+            // D8 provenance (delta-r1 Finding 3): a connection-scoped
+            // create-resume re-stamps the row with the CURRENT connection's
+            // identity/tab (a resume-into-a-new-tab must not keep the OLD tab's
+            // attribution). When no connection identity is available the write
+            // is `Inherit` (never invent) and the ledger merge preserves the
+            // create's stamps.
+            let provenance: crate::identity_sink::ProvenanceUpdate = provenance.into();
+            // Settings merge stays as-is: recovered values when a snapshot
+            // exists; otherwise a blank payload (a replace-no-op — a
+            // lineage-only row has no settings to clobber, and a never-recorded
+            // session gains provenance WITHOUT a laundered defaults snapshot).
+            let settings = if recovered.is_some() {
+                crate::identity_sink::FreshAgentSettings {
+                    model: rec.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: rec.effort.clone(),
+                    cwd,
+                }
+            } else {
+                crate::identity_sink::FreshAgentSettings::default()
+            };
             self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: session_id.to_string(),
@@ -2495,13 +3097,8 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: rec.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: rec.effort.clone(),
-                    cwd,
-                },
+                provenance,
+                settings,
             })
             .await;
         }
@@ -3033,6 +3630,21 @@ mod tests {
                     async move { Ok(ServeHttpResponse::new(404, b"not found".to_vec())) },
                 );
             }
+            // Like the real serve, `POST /session/:id/fork` mints a FRESH child
+            // `ses_N` (sharing the create counter) and remembers it, so a fork
+            // of a genuinely-known parent yields a distinct, itself-resolvable id.
+            if matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && req.url.contains("/fork")
+            {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let child = format!("ses_{n}");
+                self.created.lock().unwrap().insert(child.clone());
+                let body = serde_json::to_vec(
+                    &json!({ "id": child, "title": "forked session", "time": { "updated": 6 }, "directory": "/serve/dir" }),
+                )
+                .unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&json!([
                     { "info": { "id": "m1", "role": "user" }, "parts": [{ "type": "text", "text": "hello" }] },
@@ -3133,7 +3745,9 @@ mod tests {
         let state = FreshOpencodeState::new(fresh_agent);
 
         let started = std::time::Instant::now();
-        let out = state.resume_durable_session("ses_wedged_1", None).await;
+        let out = state
+            .resume_durable_session("ses_wedged_1", None, None)
+            .await;
         std::env::remove_var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS");
         assert!(
             matches!(out, Err(ResumeOpencodeError::Manager(_))),
@@ -3172,6 +3786,7 @@ mod tests {
             resume_session_id: None,
             sandbox: None,
             session_ref: None,
+            tab_id: None,
         }
     }
 
@@ -3198,7 +3813,7 @@ mod tests {
             (FreshOpencodeState::new(fresh_agent), rx)
         };
 
-        st.handle_create(create_msg("req-1")).await;
+        st.handle_create(create_msg("req-1"), None).await;
 
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.created");
@@ -3220,7 +3835,7 @@ mod tests {
         let (st, killed) = state().await;
         let _ = &killed;
 
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
         let placeholder = "freshopencode-req-dedup-seq";
         st.handle_send(send_msg(placeholder, "hi")).await;
 
@@ -3240,7 +3855,7 @@ mod tests {
 
         // A duplicate create for the SAME requestId, as the frozen client resends on
         // every reconnect while the pane is still `status==creating` on its side.
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
 
         let sessions = st.sessions.lock().await;
         assert_eq!(
@@ -3272,8 +3887,8 @@ mod tests {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_create(create_msg("req-dedup-race")),
-            st2.handle_create(create_msg("req-dedup-race")),
+            st1.handle_create(create_msg("req-dedup-race"), None),
+            st2.handle_create(create_msg("req-dedup-race"), None),
         );
 
         assert_eq!(
@@ -3289,8 +3904,8 @@ mod tests {
     async fn handle_create_distinct_request_ids_create_distinct_sessions() {
         let (st, _killed) = state().await;
 
-        st.handle_create(create_msg("req-dedup-a")).await;
-        st.handle_create(create_msg("req-dedup-b")).await;
+        st.handle_create(create_msg("req-dedup-a"), None).await;
+        st.handle_create(create_msg("req-dedup-b"), None).await;
 
         assert_eq!(
             st.sessions.lock().await.len(),
@@ -3317,7 +3932,7 @@ mod tests {
         let (st, _killed) = state().await;
         let placeholder = "freshopencode-req-dedup-kill";
 
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
         st.handle_send(send_msg(placeholder, "hi")).await;
         assert!(
             st.sessions
@@ -3340,7 +3955,7 @@ mod tests {
         })
         .await;
 
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
 
         let sessions = st.sessions.lock().await;
         assert_eq!(
@@ -3360,6 +3975,1279 @@ mod tests {
             None,
             "the dedup cache must have been evicted by the kill, so this create is a \
              genuinely fresh (unmaterialized) session, not a replay of the killed one"
+        );
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END. Killing a MATERIALIZED
+    /// session must (a) retire its durable row `Closed` through the identity
+    /// sink — so the recovery inventory (Bound-only pre-filter) can never
+    /// re-offer a pane the user just closed inside the 7s creation-race grace
+    /// window — and (b) clear the pending marker, so a late resolution can
+    /// never carry evidence for a pane that provably no longer exists.
+    #[tokio::test]
+    async fn handle_kill_retires_the_materialized_row_and_clears_the_pending_marker() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-retire"), None).await;
+        let placeholder = "freshopencode-req-kill-retire";
+        assert!(
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "precondition: create recorded the pending marker"
+        );
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("sanity: the session materialized before the kill")
+        };
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("opencode".to_string(), real_id.clone())),
+            "the kill must retire (opencode, {real_id}) — the durable-keyed row: {retires:?}"
+        );
+        assert!(
+            !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "the kill must delete the pending marker for {placeholder}"
+        );
+    }
+
+    /// The PENDING arm of the same contract: a kill arriving before the first
+    /// send materialized the session deletes the pending marker (so the marker
+    /// can never resolve into a Bound row after the pane is gone), and a kill
+    /// naming an id the session map never held — a durable id whose sidecar
+    /// was already evicted — still retires the row that id names.
+    #[tokio::test]
+    async fn handle_kill_before_materialization_clears_the_marker_and_evicted_ids_still_retire() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-pending"), None).await;
+        let placeholder = "freshopencode-req-kill-pending";
+        assert!(
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "precondition: create recorded the pending marker"
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "the pre-materialization kill must delete the pending marker"
+        );
+        // Focused-episode-6 round 3, Finding 1: the marker delete alone is
+        // NOT the close — a kill whose retire set is empty leaves NO durable
+        // close evidence for the placeholder, so a retained snapshot claiming
+        // it verdicts `unknown` and can re-offer the pane the user closed.
+        // The envelope's IDENTITY set must carry the placeholder itself (the
+        // placeholder-keyed close record the verdict join consults).
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the pre-lock close is ONE envelope call: {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "opencode");
+        assert!(
+            ids.contains(&placeholder.to_string()),
+            "a no-retire-ids kill must STILL close the placeholder durably \
+             (the verdict join's closed evidence): {ids:?}"
+        );
+        assert!(
+            pendings.contains(&placeholder.to_string()),
+            "the envelope's marker deletes still cover the placeholder: {pendings:?}"
+        );
+
+        // The evicted-session arm: a durable id no longer in the session map
+        // still retires the row it names (idempotent when no row exists).
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_evicted".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("opencode".to_string(), "ses_evicted".to_string())),
+            "the kill must retire (opencode, ses_evicted): {retires:?}"
+        );
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 4), the opencode lane:
+    /// the durable close (row retire + pending-marker deletion, the first
+    /// write phase) must be recorded BEFORE any teardown/settlement await —
+    /// the kill handler runs in a detached task and the client removes the
+    /// pane without a durable acknowledgement, so a server crash inside the
+    /// turn settlement would otherwise lose the close (Bound row survives,
+    /// re-offerable by the next recovery). THE HOOKED TEARDOWN STALL: the
+    /// session carries a compact drive whose settle channel the test holds
+    /// (ep4-r6's settle knob) — `abort_and_settle` parks on it for seconds —
+    /// the close must already be observable while the settlement never
+    /// lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_records_the_close_before_the_turn_settlement() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-settle"), None).await;
+        let placeholder = "freshopencode-req-kill-settle";
+        assert!(
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
+            "precondition: the create recorded the pending marker"
+        );
+
+        // The stalled settlement: a Compact-kind drive task whose settle
+        // channel the test holds — `abort_and_settle` joins the (aborted)
+        // drive instantly, then parks on the settle wait up to 5s.
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            session_arc.lock().await.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: Some(settled_rx),
+            });
+        }
+
+        let st2 = st.clone();
+        let kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: AgentProvider::Opencode,
+                session_id: placeholder.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // The settle never lands while held, so the ONLY way the close can be
+        // observable within this budget is if it was recorded FIRST. (The
+        // settle wait is 5s; 1.5s here is comfortably inside the stall.)
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        loop {
+            let marker_gone = !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder);
+            if marker_gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the durable close (row retire + pending-marker delete) must be recorded \
+                 BEFORE the turn-settlement await — a crash inside it lost the close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !kill.is_finished(),
+            "fixture: the settlement is still stalled (the close preceded it, not followed it)"
+        );
+        // Release the settle; the kill completes.
+        let _ = settled_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(15), kill)
+            .await
+            .expect("the kill completes after the settle lands")
+            .expect("kill task completed");
+    }
+
+    /// Delta-r6 close-durability finding, re-staged for the round-4 (F6)
+    /// topology: the enumeration's session-lock wait (the FIRST acquisition)
+    /// must carry NOTHING — no durable close ever waits behind a park, and
+    /// no live state is touched before it resolves. A restart or task
+    /// cancellation during that wait loses nothing (no close evidence, no
+    /// torn state), and once the hold releases the ONE envelope covers the
+    /// complete set and the lane runs to completion. This retargets the
+    /// pre-F6 pin "the close precedes the session-lock wait": the finding
+    /// that ordering caused was discovery AFTER the envelope — enumeration
+    /// now parks first, carrying nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kills_enumeration_park_carries_nothing_durable_then_the_one_envelope_lands() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-before-lock"), None)
+            .await;
+        let placeholder = "freshopencode-req-kill-before-lock";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+
+        // The gate: the test holds the per-session lock (the cold-start
+        // materialization hold) — the kill's ENUMERATION parks on it.
+        let killed_flag = session_arc.lock().await.killed.clone();
+        let session_guard = session_arc.lock().await;
+
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // While the kill parks, NOTHING is durable and nothing is torn: no
+        // retires, no pending-marker deletes, the killed flag unset. (A
+        // cancel here is a no-op.)
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+            assert!(
+                !kill.is_finished(),
+                "fixture: the kill is still parked on the held session lock"
+            );
+        }
+        assert!(
+            fake.retires.lock().unwrap().is_empty(),
+            "the enumeration park records nothing: {:?}",
+            fake.retires.lock().unwrap()
+        );
+        assert!(
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == placeholder),
+            "the pending marker stands (nothing deleted) while the kill parks"
+        );
+        assert!(
+            !killed_flag.load(Ordering::SeqCst),
+            "the killed flag is unset while the kill parks"
+        );
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the hold releases")
+            .expect("kill task completed");
+        assert!(st.sessions.lock().await.is_empty(), "both map keys removed");
+        let retires = fake.retires.lock().unwrap().clone();
+        for id in [placeholder, "ses_1"] {
+            assert!(
+                retires.contains(&("opencode".to_string(), id.to_string())),
+                "the envelope covers {id}: {retires:?}"
+            );
+        }
+    }
+
+    /// Delta-r6 close-durability (failures propagate): a kill whose durable
+    /// close could NOT be recorded must FAIL — the `freshAgent.killed` answer
+    /// reports `success:false` and NO live state was touched (the session
+    /// map, the killed flag, the pending marker, the in-flight turn all
+    /// stand). Warn-and-continue would leave the row Bound and eligible for
+    /// the recovery pipeline while the client believes the pane is closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_whose_durable_close_fails_reports_failure_and_touches_no_live_state() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-fail"), None).await;
+        let placeholder = "freshopencode-req-kill-fail";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+        // Drain the frames emitted so far (created/accepted/snapshots) so the
+        // only frames in the channel are the kill's answer.
+        while rx.try_recv().is_ok() {}
+
+        // The ledger fails every write (disk-full/permission shape).
+        fake.set_fail_writes(true);
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // NO live state was mutated: both map keys stand, the killed flag was
+        // never set, the surviving pending marker was never deleted (the
+        // delete failed), and the session is untouched.
+        {
+            let sessions = st.sessions.lock().await;
+            assert!(
+                sessions.contains_key(placeholder) && sessions.contains_key("ses_1"),
+                "a failed durable close must leave the session map untouched"
+            );
+        }
+        assert!(
+            !session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "a failed durable close must never mark the session killed"
+        );
+        assert!(
+            !fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), "ses_1".to_string())),
+            "sanity: the failed retire recorded nothing"
+        );
+        assert!(
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == placeholder),
+            "the pending marker survives (its delete failed)"
+        );
+
+        // The answer reports failure (never a success acknowledgement).
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "a kill whose durable close failed must report success:false: {killed_frame}"
+        );
+    }
+
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the opencode
+    /// lane's PERSISTED class on the pre-lock envelope: the whole identity
+    /// set's journal record IS durable although its write reports failure.
+    /// The kill must END the session (map removal, killed flag, teardown —
+    /// never a live session beside durable close evidence) while the answer
+    /// reports `success:false`.
+    #[tokio::test]
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly(
+    ) {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-pers"), None).await;
+        let placeholder = "freshopencode-req-kill-pers";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+        while rx.try_recv().is_ok() {}
+
+        fake.fail_retires_as_persisted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        {
+            let sessions = st.sessions.lock().await;
+            assert!(
+                !sessions.contains_key(placeholder) && !sessions.contains_key("ses_1"),
+                "the close IS durable: the session ends (never a live session beside close evidence)"
+            );
+        }
+        assert!(
+            session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "the session was torn down"
+        );
+        let retires = fake.retires.lock().unwrap().clone();
+        for id in [placeholder, "ses_1"] {
+            assert!(
+                retires.contains(&("opencode".to_string(), id.to_string())),
+                "the close's facts are on record for {id}: {retires:?}"
+            );
+        }
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill fails VISIBLY even though the close is durable: {killed_frame}"
+        );
+    }
+
+    /// Delta-r6 close-durability (the completion pass): the kill's retire set
+    /// is derived WITHOUT the session lock (from the map's placeholder/durable
+    /// mirror), so a first send that materializes WHILE the kill sits between
+    /// its map read and its session-lock phase adds the durable key behind
+    /// Delta-r6-r3 (focused-episode-6 round 2, Finding 5): the pre-lock
+    /// durable close is ONE envelope call over the WHOLE identity set +
+    /// pending markers — never the delta-r6-r2 loop (per-identity retires
+    /// and per-placeholder marker deletes before any failure check, whose
+    /// earlier successful writes stayed durable over the still-live session
+    /// a later failure left behind). The completion retire in the
+    /// session-lock phase is separate (single id, post-dating any mid-kill
+    /// materialization) — the envelope covers the map-derived set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_closes_the_whole_identity_set_in_one_envelope_call() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-one-envelope"), None)
+            .await;
+        let placeholder = "freshopencode-req-kill-one-envelope";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the pre-lock close is ONE envelope call (no per-identity write loop): {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "opencode");
+        assert!(
+            ids.contains(&"ses_1".to_string()),
+            "the envelope covers the durable id: {ids:?}"
+        );
+        // Focused-episode-6 round 3, Finding 1: the placeholder is close
+        // evidence too, not only a marker — it belongs in the IDENTITY set of
+        // every kill's envelope (a placeholder-claiming retained snapshot
+        // verdicts closed only while a standing close fence exists).
+        assert!(
+            ids.contains(&placeholder.to_string()),
+            "the envelope covers the placeholder itself (durable close evidence): {ids:?}"
+        );
+        assert!(
+            pendings.contains(&placeholder.to_string()),
+            "the envelope's marker deletes cover the placeholder: {pendings:?}"
+        );
+    }
+
+    /// Focused-episode-6 round 4 (Finding F6): a materialization that
+    /// completes while the kill is PARKED on the session lock (the send's
+    /// materialization critical section holds that same lock, so the kill's
+    /// enumeration provably post-dates it) joins the ONE envelope — never a
+    /// second close call, never a discovered-after-the-envelope identity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_materialization_completing_behind_the_kills_park_joins_the_one_envelope() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-mid-mat"), None).await;
+        let placeholder = "freshopencode-req-kill-mid-mat";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "fixture: the session has NOT materialized"
+        );
+
+        // Hold the session lock: the kill cannot even ENUMERATE until it
+        // drops — it parks before its envelope (nothing durable yet).
+        let mut session_guard = session_arc.lock().await;
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        // Let the kill run to its park point (deterministic: it cannot pass
+        // the held guard), then the materialization completes behind it.
+        tokio::task::yield_now().await;
+        session_guard.real_session_id = Some("ses_late".to_string());
+        // The mint observed by the enumeration... the gate the kill then
+        // arms is what the send half must refuse behind.
+        assert_eq!(session_guard.close_pending, 0, "pre-enumeration fixture");
+        drop(session_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the hold releases")
+            .expect("kill task completed");
+        let batches = fake.retire_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            1,
+            "ONE envelope — never a second, discovered-later close call (F6): {batches:?}"
+        );
+        let (provider, ids, pendings) = &batches[0];
+        assert_eq!(provider, "opencode");
+        assert!(
+            ids.contains(&placeholder.to_string()) && ids.contains(&"ses_late".to_string()),
+            "the envelope covers the placeholder AND the mid-kill materialized id: {ids:?}"
+        );
+        assert!(pendings.contains(&placeholder.to_string()));
+        assert_eq!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, id)| id == "ses_late")
+                .count(),
+            1,
+            "ses_late retires exactly once (the envelope's fold, not a second call): {:?}",
+            fake.retires.lock().unwrap()
+        );
+    }
+
+    /// Focused-episode-6 round 4 (Finding F6), the ORDER half: the ONE
+    /// envelope — covering the mid-park materialized id — is durable BEFORE
+    /// the killed flag is set (which is what makes the kill
+    /// cancellation-safe: a task cancel or a failed close BEFORE that flag
+    /// can never strand a Bound row behind a destroyed session). The
+    /// envelope's answer parks on the retire stall with its mutation landed
+    /// — and the flag must still read false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_one_envelope_is_durable_before_the_killed_flag_is_set() {
+        let (st, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-late-order"), None)
+            .await;
+        let placeholder = "freshopencode-req-kill-late-order";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        let killed_flag = session_arc.lock().await.killed.clone();
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "fixture: the session has NOT materialized"
+        );
+
+        let stall = fake.arm_retire_stall("opencode", "ses_late");
+        let mut session_guard = session_arc.lock().await;
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // The kill parks on the held session lock; the mid-park
+        // materialization lands behind it, then the hold releases.
+        tokio::task::yield_now().await;
+        session_guard.real_session_id = Some("ses_late".to_string());
+        drop(session_guard);
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the one envelope's mutations landed (its answer is parked)");
+        assert!(
+            !killed_flag.load(Ordering::SeqCst),
+            "the killed flag must NOT be set before the whole identity set's close is durable"
+        );
+        stall.release.send(()).expect("release the stall");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+        assert!(
+            killed_flag.load(Ordering::SeqCst),
+            "post-close the flag stands"
+        );
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), "ses_late".to_string())),
+            "the mid-park id retired in the one envelope"
+        );
+    }
+
+    /// Focused-episode-6 round 4 (Finding F6), the FAILURE half: the close
+    /// covering the COMPLETE identity set (placeholder AND the mid-park
+    /// materialized id) fails Clean — the kill ABORTS: NOTHING durable
+    /// stands (no placeholder fence to roll back — the one-envelope
+    /// construct makes the first/second-close split impossible by
+    /// construction; the finding's "placeholder close survives the failed
+    /// late close" shape cannot form), the enumeration gate releases, the
+    /// killed flag is never set, the map stands, no teardown runs, and the
+    /// answer reports `success:false`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_close_over_the_complete_set_leaves_nothing_durable_and_releases_the_gate() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-late-fails"), None)
+            .await;
+        let placeholder = "freshopencode-req-kill-late-fails";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        let killed_flag = session_arc.lock().await.killed.clone();
+
+        // Identity-conditional failure (F6's honest staging under the
+        // one-envelope discipline): the close covering the materialized id
+        // fails Clean — the whole envelope fails, nothing of it lands.
+        fake.fail_retires_for("opencode", "ses_late");
+
+        let mut session_guard = session_arc.lock().await;
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        tokio::task::yield_now().await;
+        session_guard.real_session_id = Some("ses_late".to_string());
+        drop(session_guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+
+        assert!(
+            !killed_flag.load(Ordering::SeqCst),
+            "a failed envelope aborts BEFORE the kill point of no return: the flag is never set"
+        );
+        assert_eq!(
+            session_arc.lock().await.close_pending,
+            0,
+            "the enumeration gate released with the abort"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key(placeholder),
+            "the map stands — nothing was torn down"
+        );
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            !retires
+                .iter()
+                .any(|(_, id)| id == "ses_late" || id == placeholder),
+            "NOTHING of the close is durable — no placeholder fence stands to mis-close \
+             the preserved live session (F6's exact regression): {retires:?}"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill reports failure: {killed_frame}"
+        );
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 5), the opencode lane:
+    /// the claim commit's `Err` (an io failure deciding or writing the
+    /// durable transition) left the close untouched (fence stands, row
+    /// Closed) — the resume must FAIL instead of registering a live session
+    /// over the Closed row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_commit_error_stops_the_resume_and_leaves_the_close_standing() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // The close the user MEANT (before this attach): row Closed + fence.
+        state
+            .handle_kill(FreshAgentKill {
+                provider: AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            fake.kill_tombstone_at_ms("opencode", DURABLE_ID).is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // The commit's io failure knob (Finding 5's shape).
+        fake.set_fail_writes(true);
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("OPENCODE_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "a commit error must FAIL the resume, never register a live session over a Closed row"
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(DURABLE_ID),
+            "nothing registers when the commit could not run"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the close stands: the row stays Retired"
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("opencode", DURABLE_ID).is_some(),
+            "the close stands: the fence was never cleared"
+        );
+    }
+
+    /// The resurrection gate (the same repair's resolution arm): a send that
+    /// holds the session's Arc across the kill — the real client sequence is
+    /// "send in flight, pane closed" — must NOT materialize + re-bind a row for
+    /// the pane that is going away. The kill marks the session killed inside
+    /// its session-lock phase; the send's own critical section sees the flag and
+    /// is refused (SESSION_NOT_FOUND, the same answer the map-removed arm gives)
+    /// BEFORE any side effect.
+    #[tokio::test]
+    async fn a_send_against_a_killed_session_is_refused_and_writes_no_binding_row() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-killed-gate"), None).await;
+        let placeholder = "freshopencode-req-killed-gate";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        // Drive the kill's state reach directly (same-crate white-box seam):
+        // what the send must obey is the killed flag the kill sets inside its
+        // session-lock phase.
+        session_arc
+            .lock()
+            .await
+            .killed
+            .store(true, Ordering::SeqCst);
+
+        st.handle_send(send_msg(placeholder, "hi")).await;
+
+        // SESSION_NOT_FOUND through the error channel…
+        let frame: serde_json::Value = loop {
+            let frame: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.expect("a frame")).unwrap();
+            if frame["type"] == "error" || frame["type"] == "freshAgent.send.accepted" {
+                break frame;
+            }
+        };
+        assert_eq!(
+            frame["type"], "error",
+            "a send against a killed session is refused, never accepted: {frame}"
+        );
+        // `send_error` maps to ErrorCode::InternalError with the textual code in
+        // the message (the opencode slice's refusal convention, same as the
+        // map-removed arm).
+        assert_eq!(frame["code"], "INTERNAL_ERROR");
+        assert!(
+            frame["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND")),
+            "the refusal answers SESSION_NOT_FOUND: {frame}"
+        );
+        // …and the identity is never re-bound: no materialization, no row.
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "the refused send must not materialize the killed session"
+        );
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "the refused send must not record a binding row: {:?}",
+            fake.bindings.lock().unwrap()
+        );
+    }
+
+    /// Focused-episode-6 round 4 (Finding F6): a send that lands between the
+    /// kill's gated enumeration and its durable close is REFUSED — never a
+    /// materialization behind the one envelope's back. Driven through the
+    /// real lane: the kill's close answer is parked (mutations landed, gate
+    /// armed); the send must answer SESSION_NOT_FOUND and record nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_is_refused_while_the_kills_close_gate_is_armed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-gate-send"), None).await;
+        let placeholder = "freshopencode-req-gate-send";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+
+        // Park the kill inside its one durable close: the gate is armed.
+        let stall = fake.arm_retire_stall("opencode", placeholder);
+        let st2 = st.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: placeholder.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the durable close is in flight (the gate is armed)");
+
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let frame: serde_json::Value = loop {
+            let frame: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.expect("a frame")).unwrap();
+            if frame["type"] == "error" || frame["type"] == "freshAgent.send.accepted" {
+                break frame;
+            }
+        };
+        assert_eq!(
+            frame["type"], "error",
+            "a send under the armed close gate is refused, never accepted: {frame}"
+        );
+        assert!(
+            frame["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("SESSION_NOT_FOUND")),
+            "the refusal answers SESSION_NOT_FOUND (the map-removed arm's shape): {frame}"
+        );
+        assert!(
+            session_arc.lock().await.real_session_id.is_none(),
+            "the refused send must not materialize behind the envelope"
+        );
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "the refused send must not record a binding row: {:?}",
+            fake.bindings.lock().unwrap()
+        );
+
+        stall.release.send(()).expect("release the stall");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+    }
+
+    /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1): the ONE lock rule —
+    /// `sessions` is NEVER held across a per-session lock acquisition (clone
+    /// the Arc out, drop the map guard, THEN await the session lock). The
+    /// finding's deadlock: `handle_kill`'s capture phase held the map guard
+    /// while awaiting the session lock, and a first send holds that session
+    /// lock across its cold-start `create_session` before re-acquiring the
+    /// map to register the materialized key — kill owns the map and waits
+    /// for the session, send owns the session and waits for the map. This
+    /// test holds the session lock directly (the exact gate the first send's
+    /// materialization hold applies, per the struct's lock-order rule) while
+    /// a kill runs: the map must stay acquirable THROUGHOUT the kill's
+    /// session-lock wait, and the kill must still complete (killed flag set,
+    /// map keys removed, `freshAgent.killed` broadcast) once the in-flight
+    /// hold releases.
+    #[tokio::test]
+    async fn handle_kill_never_holds_the_sessions_map_across_its_session_lock_wait() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-lock-order"), None).await;
+        let placeholder = "freshopencode-req-lock-order";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+
+        // The gate: the test holds the per-session lock, exactly the hold a
+        // first send's materialization critical section applies (its
+        // `create_session` cold start awaits while the lock is held).
+        let session_guard = session_arc.lock().await;
+
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // After one scheduler pass the kill has run to its session-lock
+        // park; every observation while it parks there must find the map
+        // FREE (the pre-fix shape held the map across this wait — the
+        // finding's deadlock half). A bounded yield loop, never a wall-clock
+        // sleep: the interleave gate is the session lock itself.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            assert!(
+                st.sessions.try_lock().is_ok(),
+                "the sessions map must stay acquirable while the kill waits on the session lock"
+            );
+            assert!(
+                !kill.is_finished(),
+                "fixture: the kill is still parked on the session lock"
+            );
+        }
+
+        // Release the in-flight hold: the kill completes its full lane.
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the in-flight hold releases")
+            .expect("kill task completed");
+        assert!(
+            session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "the kill's session-lock phase ran (the killed flag is set)"
+        );
+        assert!(
+            st.sessions.lock().await.get(placeholder).is_none(),
+            "the map key is removed"
+        );
+        let mut saw_killed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("\"freshAgent.killed\"") {
+                saw_killed = true;
+            }
+        }
+        assert!(saw_killed, "the kill answers freshAgent.killed");
+    }
+
+    /// Finding 1, the kill's TEARDOWN half, re-staged for the round-4 (F6)
+    /// topology (the gated one-envelope close precedes the flag phase): the
+    /// pre-fix `let mut guard = sessions.lock(); let mut s =
+    /// session_arc.lock();` block held the map guard across the session-lock
+    /// take. The rule is unchanged — the map guard is NEVER held across a
+    /// session-lock acquisition; every map touch is its own synchronous
+    /// section. Staged deterministically: the fake sink's retire stall parks
+    /// the kill inside its (already-applied) durable close, the test takes
+    /// the session lock, and the release lets the kill run to its flag +
+    /// field-extraction phase — where its re-acquisition must park on a
+    /// FREELY ACQUIRABLE map. The map removal lands after that phase
+    /// completes, as its own short section.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_teardown_never_holds_the_sessions_map_across_its_session_lock_wait() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-lock-order-teardown"), None)
+            .await;
+        let placeholder = "freshopencode-req-lock-order-teardown";
+        // Materialize (a first send through the fake serve), so the kill's
+        // retire batch has the durable id (`ses_1`) to close.
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id"
+        );
+
+        let stall = fake.arm_retire_stall("opencode", "ses_1");
+        let st2 = st.clone();
+        let ph = placeholder.to_string();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: ph,
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the kill parked inside its durable close");
+        assert!(
+            fake.kill_tombstone_at_ms("opencode", "ses_1").is_some(),
+            "the close is already recorded (the stall only parks the answer)"
+        );
+
+        // NOW the test holds the session lock when the kill's session-lock
+        // phase needs it; the release moves the kill to that wait. The
+        // discriminating observation while it parks there: the map stays
+        // FREELY ACQUIRABLE (the kill never holds the map guard across this
+        // wait) — the finding's shape (a map guard held across the
+        // session-lock wait) fails `try_lock` on every pass. The map removal
+        // lands only after the session-lock phase completes, in its own
+        // short section. A bounded yield loop, never a wall-clock sleep (the
+        // sibling pin's convention): the interleave gate is the session lock
+        // itself.
+        let session_guard = session_arc.lock().await;
+        stall.release.send(()).expect("release the stalled close");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+            assert!(
+                st.sessions.try_lock().is_ok(),
+                "the sessions map must stay acquirable while the kill waits on the \
+                 session lock — a map guard held ACROSS the wait is the finding's \
+                 deadlock half"
+            );
+            assert!(
+                !kill.is_finished(),
+                "fixture: the kill is parked at its session-lock phase"
+            );
+        }
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes once the hold releases")
+            .expect("kill task completed");
+        assert!(st.sessions.lock().await.is_empty(), "both map keys removed");
+        let mut saw_killed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("\"freshAgent.killed\"") {
+                saw_killed = true;
+            }
+        }
+        assert!(saw_killed, "the kill answers freshAgent.killed");
+    }
+
+    /// Finding 1, the resume-refusal teardown (`resume_durable_session`'s
+    /// refused-commit arm): the pre-fix `if let Some(removed) =
+    /// self.sessions.lock().await.remove(session_id)` kept the map guard
+    /// alive through the whole `if let` body (edition 2021 scrutinee
+    /// temporaries) — the map stayed locked across `removed.lock().await`
+    /// AND the settle await. Same rule, same probe: the refusal's teardown
+    /// must acquire the session lock only after the map guard is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_refusal_teardown_never_holds_the_sessions_map_across_its_session_lock_wait() {
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // Park the resume AT its commit gate, then advance the fence
+        // mid-resume WITHOUT touching the map (a kill that landed before the
+        // registration — the refusal arm runs with the session still
+        // registered, so its real teardown body is what the probe covers).
+        let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
+        let st2 = state.clone();
+        let mut attach =
+            tokio::spawn(async move { st2.handle_attach(attach_msg(DURABLE_ID)).await });
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the resume reached its commit");
+        let session_arc = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(DURABLE_ID)
+                .expect("the resume registers before its commit")
+                .clone()
+        };
+        let session_guard = session_arc.lock().await;
+        fake.retire_closed("opencode", DURABLE_ID)
+            .await
+            .expect("the mid-resume close records");
+        gate.release.send(()).expect("release the commit decision");
+
+        // Same discriminating probe while the refusal teardown parks on the
+        // session lock: the DURABLE_ID key must ALREADY be removed from a
+        // FREELY ACQUIRABLE map (the removal is its own synchronous critical
+        // section). A guard held across the session-lock take (the finding's
+        // `if let` scrutinee shape) fails both halves at once. Deadline-
+        // bounded observation, lock-gated interleaving (the test convention).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let removed_while_parked = loop {
+            if let Ok(map) = state.sessions.try_lock() {
+                if !map.contains_key(DURABLE_ID) {
+                    break true;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            removed_while_parked,
+            "the refusal teardown's map removal must run before its session-lock wait — \
+             the key was still present (or the map stayed locked) while the lane parked"
+        );
+        assert!(
+            !attach.is_finished(),
+            "fixture: the refusal teardown is parked on the session lock"
+        );
+        drop(session_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut attach)
+            .await
+            .expect("the attach completes once the hold releases")
+            .expect("attach task completed");
+
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("OPENCODE_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "the refused resume fails loudly (never registers over a Closed row)"
+        );
+        assert!(
+            state.sessions.lock().await.get(DURABLE_ID).is_none(),
+            "the refusal teardown removed the just-registered session"
+        );
+        assert!(
+            fake.claim_refusals
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the refusal is positively logged"
         );
     }
 
@@ -3390,7 +5278,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-t3")).await;
+        st.handle_create(create_msg("req-t3"), None).await;
         let placeholder = "freshopencode-req-t3";
 
         // BEFORE the fix, this call falls straight through to
@@ -3486,7 +5374,7 @@ mod tests {
     #[tokio::test]
     async fn second_send_reuses_the_same_durable_session_id() {
         let (st, _killed) = state().await;
-        st.handle_create(create_msg("req-cont")).await;
+        st.handle_create(create_msg("req-cont"), None).await;
         let placeholder = "freshopencode-req-cont";
 
         st.handle_send(send_msg(placeholder, "first turn")).await;
@@ -3684,7 +5572,7 @@ mod tests {
         // never reports idle and would hang `run_turn` until the real 600s turn timeout.
         let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
 
-        st.handle_create(create_msg("req-attach")).await;
+        st.handle_create(create_msg("req-attach"), None).await;
         let placeholder = "freshopencode-req-attach";
         st.handle_send(send_msg(placeholder, "hello")).await;
         let real_id = {
@@ -3748,7 +5636,7 @@ mod tests {
     async fn attach_placeholder_addressed_session_emits_materialized_first() {
         let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
 
-        st.handle_create(create_msg("req-attach-ph")).await;
+        st.handle_create(create_msg("req-attach-ph"), None).await;
         let placeholder = "freshopencode-req-attach-ph";
         st.handle_send(send_msg(placeholder, "hello")).await;
         let real_id = {
@@ -3847,7 +5735,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-mat")).await;
+        st.handle_create(create_msg("req-mat"), None).await;
         let _ = rx.try_recv().unwrap(); // drain freshAgent.created
 
         let placeholder = "freshopencode-req-mat";
@@ -3874,7 +5762,7 @@ mod tests {
     #[tokio::test]
     async fn kill_removes_session_but_does_not_terminate_the_shared_serve_child() {
         let (st, killed) = state().await;
-        st.handle_create(create_msg("req-kill")).await;
+        st.handle_create(create_msg("req-kill"), None).await;
         let placeholder = "freshopencode-req-kill";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -4013,7 +5901,7 @@ mod tests {
         create.cwd = Some("/w".to_string());
         create.model = Some("big-model".to_string());
         create.effort = Some("high".to_string());
-        state.handle_create(create).await;
+        state.handle_create(create, None).await;
         state
             .handle_send(send_msg("freshopencode-r1", "hello"))
             .await;
@@ -4066,7 +5954,7 @@ mod tests {
         create.cwd = Some("/w".to_string());
         create.model = Some("big-model".to_string());
         create.effort = Some("high".to_string());
-        state.handle_create(create).await;
+        state.handle_create(create, None).await;
         let placeholder = "freshopencode-r2";
         state.handle_send(send_msg(placeholder, "first")).await;
 
@@ -4089,6 +5977,51 @@ mod tests {
             .unwrap();
         assert_eq!(b.settings.model.as_deref(), Some("small-model"));
         assert_eq!(b.settings.effort.as_deref(), Some("low"));
+    }
+
+    /// D8 lane-reach (restore-open-sessions-only, review round 3): opencode's
+    /// binding write happens at MATERIALIZATION (first send), not create — the
+    /// create-time connection provenance must survive on the session and reach
+    /// the sink write. Optional ledger fields would otherwise let this lane
+    /// keep writing `None` silently (and the recovery judgment would then
+    /// drop genuinely-open freshopencode sessions).
+    #[tokio::test]
+    async fn materialization_binding_carries_the_creates_connection_provenance() {
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("r1");
+        create.cwd = Some("/w".to_string());
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-oc"),
+                    Some("device-oc"),
+                    Some("tab-oc"),
+                    7_777,
+                )),
+            )
+            .await;
+        state
+            .handle_send(send_msg("freshopencode-r1", "hello"))
+            .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id.starts_with("ses_"))
+            .expect("binding at materialization");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-oc")
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-oc"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-oc:tab-oc")
+        );
     }
 
     // ── P1.13 Task 8: settings-from-ledger resume (attach + create-with-resume) ──
@@ -4173,6 +6106,89 @@ mod tests {
         );
     }
 
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2), the tombstone
+    /// lifecycle's exit on the opencode lane: a kill folds the durable kill
+    /// tombstone (the evicted arm — the session map is process memory, the
+    /// row is durable), and an EXPLICIT late attach-resume of the same
+    /// `ses_*` id GENUINELY CLAIMS it — clearing the tombstone BEFORE the
+    /// resume's own refresh write, so the claim's write lands and is never
+    /// suppressed as a stale orphan.
+    #[tokio::test]
+    async fn resume_after_a_kill_clears_the_tombstone_and_rebinds() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // The close, naming the durable id (the evicted arm of handle_kill —
+        // the map never held this session; the row is durable).
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the kill folded the durable kill tombstone"
+        );
+
+        // The explicit late attach-resume (the REAL handle_attach →
+        // resume_durable_session lane the fixture drives).
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        assert!(
+            fake.claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the genuine claim COMMITS (round 4: fence-clear + revive in one conditional \
+             transition) BEFORE its own write"
+        );
+        assert!(
+            !fake
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the durable fence is gone post-commit"
+        );
+        let writes = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+            .count();
+        assert_eq!(
+            writes, 2,
+            "the seed PLUS the resume's refresh write — the claim's write landed"
+        );
+        assert!(
+            !fake
+                .suppressed
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim's own write is never suppressed"
+        );
+    }
+
     /// Task 3: a lineage-only ledger row (binding exists with create_request_id
     /// lineage but an all-blank settings snapshot — exactly what the now-
     /// unconditional materialization writes produce for a default create) must
@@ -4191,6 +6207,7 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -4221,6 +6238,234 @@ mod tests {
         assert!(
             !saw_settings_reset,
             "a lineage-only row must never arm SETTINGS_RESET on resume"
+        );
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), the headline shape
+    /// (`opencode_ws.rs` resume lane): a kill-closed, LINEAGE-ONLY row plus a
+    /// CONN-LESS attach — `load_settings` answers None and no connection
+    /// provenance exists, so the conditional refresh write is skipped and the
+    /// row once stayed Closed forever. A successful attach must record the
+    /// row live-again regardless: Bound again, fence cleared, and STILL no
+    /// laundered settings write (V7 untouched — revive is not a settings
+    /// concern).
+    #[tokio::test]
+    async fn attach_of_a_killed_lineage_only_session_revives_the_row_without_a_settings_write() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The lineage-only seed (blank settings — same construction the Task 3
+        // keying test uses).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-lineage-killed".into()),
+            resolves_pending: Some("freshopencode-cr-lineage-killed".into()),
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage seed write");
+        state.set_identity_sink(fake.clone());
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "fixture: lineage-only — the refresh gate's skip case"
+        );
+
+        // The close: row Closed + fence (the evicted-becomes-live arm is the
+        // durable serve session the local map never tracked — retired by name).
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "fixture: the kill closed the row"
+        );
+
+        // The conn-less attach: the resume rebuilds the live session; the
+        // row must follow it back to Bound.
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "a successful attach must return the kill-closed row to Bound"
+        );
+        assert!(
+            !fake
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim cleared the fence (inside its one-transition commit)"
+        );
+        assert!(
+            fake.claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the claim's revive fired even though the conditional refresh write was skipped"
+        );
+        // The V7 gate held: the ONLY bindings entry for the session is the
+        // lineage seed — no laundered defaults row was written by the resume.
+        assert_eq!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+                .count(),
+            1,
+            "no laundered settings write for the lineage-only attach"
+        );
+    }
+
+    /// Focused-ep5-r3 Finding 1 (retire-on-kill round 4), the opencode lane
+    /// — including the finding's called-out sub-shape, round 3's
+    /// UNCONDITIONAL commit even when the lease failed or the kill had
+    /// already removed the newly-registered session: with the user's close
+    /// recorded mid-resume, the commit must REFUSE — the row stays Retired,
+    /// the newer fence stands, the just-registered session is torn back down
+    /// (its kill did that), and no binding write lands. (The fake sink's
+    /// claim gate holds the commit's decide point — the deterministic twin
+    /// of the ledger guard contended mid-claim.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_mid_resume_is_never_undone_by_the_claim_commit() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // The close the user will MEAN: row Closed + fence, before the resume.
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        let claim_start_snapshot = fake.kill_tombstone_at_ms("opencode", DURABLE_ID);
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // Gate the claim's commit, then start the resume.
+        let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
+        let st2 = state.clone();
+        let attach = tokio::spawn(async move {
+            st2.handle_attach(attach_msg(DURABLE_ID)).await;
+        });
+
+        // The resume reached its commit point (the rebuilt session IS
+        // registered at this point on the opencode lane).
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim reached its commit");
+        assert!(
+            state.sessions.lock().await.contains_key(DURABLE_ID),
+            "fixture: the rebuilt session registered before the commit"
+        );
+
+        // THE INTERLEAVING: the user closes the pane now — the kill removes
+        // the newly-registered session AND advances the dead-state before
+        // the commit decides.
+        state
+            .handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Opencode,
+                session_id: DURABLE_ID.to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        assert_ne!(
+            fake.kill_tombstone_at_ms("opencode", DURABLE_ID),
+            claim_start_snapshot,
+            "fixture: the mid-claim close advanced the durable dead-state"
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(DURABLE_ID),
+            "the kill removed the session mid-claim"
+        );
+        gate.release.send(()).expect("release the claim decision");
+        gate.decided
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the commit decided");
+        tokio::time::timeout(std::time::Duration::from_secs(15), attach)
+            .await
+            .expect("the attach resolves")
+            .expect("attach task completed");
+
+        // No commit side effect ran: the row stays Retired and the newer
+        // fence stands — and the refresh writes never fired.
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("opencode".to_string(), DURABLE_ID.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the claim must never revive the row the newer close retired"
+        );
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the newer kill's fence stands — never cleared by the stale claim"
+        );
+        assert!(
+            fake.claim_refusals
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "the refusal is positively logged"
+        );
+        assert!(
+            !fake
+                .claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), DURABLE_ID.to_string())),
+            "no commit side effect ran"
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(DURABLE_ID),
+            "the orphan session stays torn down"
+        );
+        let writes = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.provider == "opencode" && b.session_id == DURABLE_ID)
+            .count();
+        assert_eq!(
+            writes, 1,
+            "no refresh binding write landed for the identity the close outranked (the seed alone)"
         );
     }
 
@@ -4332,7 +6577,7 @@ mod tests {
             provider: "opencode".to_string(),
             session_id: DURABLE_ID.to_string(),
         });
-        state.handle_create(create).await;
+        state.handle_create(create, None).await;
 
         let sessions = state.sessions.lock().await;
         assert!(
@@ -4376,6 +6621,937 @@ mod tests {
         );
     }
 
+    /// Delta-r1 Finding 3: a durable-session resume driven by a CONNECTION-SCOPED
+    /// create (`freshAgent.create{sessionRef}` — e.g. a recovery-restored pane in
+    /// a NEW tab) must stamp the resume's binding write with the CURRENT
+    /// connection's identity/tab, exactly like the normal create lane. Passing
+    /// `None`s here would let the keep-when-None merge keep the OLD tab's
+    /// attribution (wrong placement data on the next recovery offer), and a
+    /// first-time resume would stay unattributed (never offered at all).
+    #[tokio::test]
+    async fn create_resume_binding_carries_the_current_connections_provenance() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The resume refresh write is gated on a recoverable settings record.
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-resume-prov");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-new"),
+                    Some("device-new"),
+                    Some("tab-new"),
+                    7_777,
+                )),
+            )
+            .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == DURABLE_ID)
+            .expect("the resume refresh binding write (the seed's stamps are all None)");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new"),
+            "stale/None: the resume must stamp the CURRENT connection"
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
+    }
+
+    /// Focused-ep1 Finding A (branch 1 — same-process in-memory hit): a
+    /// connection-scoped resume-create (`freshAgent.create{sessionRef}`) for a
+    /// session ALREADY live in this process's local map must re-stamp the
+    /// CURRENT connection's identity/tab — on the parked in-memory provenance
+    /// AND on the ledger row. Otherwise every later per-send refresh write
+    /// keeps re-asserting the OLD tab's attribution (the ledger merge's
+    /// REPLACE rule then cements the stale tab into the recovery-offer
+    /// placement data).
+    #[tokio::test]
+    async fn create_resume_hitting_the_in_memory_map_restamps_the_current_connections_provenance() {
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Live, materialized session parked with the OLD connection's stamps
+        // (create + first send drive the materialization binding write).
+        state
+            .handle_create(
+                create_msg("r1"),
+                Some(crate::BindProvenance::for_create(
+                    Some("client-old"),
+                    Some("device-old"),
+                    Some("tab-old"),
+                    7_777,
+                )),
+            )
+            .await;
+        state
+            .handle_send(send_msg("freshopencode-r1", "hello"))
+            .await;
+        let durable_id = "ses_1"; // FakeHttp's first POST /session mint
+        assert!(
+            state.sessions.lock().await.contains_key(durable_id),
+            "the materialized session is live in the local map"
+        );
+        let bindings_before = fake.bindings.lock().unwrap().len();
+        assert!(
+            bindings_before > 0,
+            "materialization already wrote binding rows (stamped OLD)"
+        );
+
+        // The resume-create arrives via a DIFFERENT connection (e.g. a
+        // recovery-accept into a new tab): the same-process in-memory hit arm.
+        let mut create = create_msg("req-resume-in-mem");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: durable_id.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-new"),
+                    Some("device-new"),
+                    Some("tab-new"),
+                    7_777,
+                )),
+            )
+            .await;
+
+        // The parked in-memory provenance now carries the CURRENT connection…
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get(durable_id).expect("live session").lock().await;
+            let p = s.provenance.clone().expect("parked provenance present");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-new"));
+            assert_eq!(p.device_id.as_deref(), Some("device-new"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        // …and the resume itself re-asserted the row with the CURRENT stamps
+        // (durable-before-the-created-answer; no send needed)…
+        {
+            let bindings = fake.bindings.lock().unwrap();
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == durable_id)
+                .expect("the in-memory resume's refresh write");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id.as_deref(),
+                Some("client-new"),
+                "the in-memory resume must NOT keep re-asserting the OLD connection"
+            );
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
+        }
+
+        // …and a SUBSEQUENT per-send refresh write asserts the CURRENT
+        // attribution — never the stale tab.
+        state.handle_send(send_msg(durable_id, "again")).await;
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == durable_id)
+            .expect("the post-resume send's refresh write");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new")
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
+    }
+
+    /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
+    /// connection-scoped create-resume whose ledger row is LINEAGE-ONLY
+    /// (default settings — `load_settings` answers `None`) must STILL re-stamp
+    /// the row's provenance to the CURRENT connection: the provenance refresh,
+    /// not the settings write, is the point of the resume refresh.
+    #[tokio::test]
+    async fn create_resume_with_a_lineage_only_row_still_restamps_the_current_connections_provenance(
+    ) {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A lineage-only row (the "default settings" shape): binding lineage
+        // exists, but no settings snapshot is recoverable (`load_settings`
+        // answers None). Same fixture as
+        // `lineage_only_binding_does_not_arm_settings_reset_on_resume`.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-lineage".into()),
+            resolves_pending: Some("freshopencode-cr-lineage".into()),
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-old".into()),
+                device_id: Some("device-old".into()),
+                tab_key: Some("device-old:tab-old".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage binding write ok");
+        assert!(
+            fake.load_settings("opencode", DURABLE_ID).is_none(),
+            "fixture sanity: the settings-None case (lineage-only row)"
+        );
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-resume-lineage-prov");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-new"),
+                    Some("device-new"),
+                    Some("tab-new"),
+                    7_777,
+                )),
+            )
+            .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == DURABLE_ID)
+            .expect("the settings-None resume's provenance refresh write");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new"),
+            "the provenance refresh must not be gated on settings presence"
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
+        // Settings merge stays as-is: no recoverable snapshot ⇒ the write
+        // carries a blank (replace-no-op) settings payload — never invented
+        // defaults, and the row stays lineage-only.
+        assert_eq!(
+            b.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "the settings payload is untouched by the provenance refresh"
+        );
+    }
+
+    /// The paired never-invert arm (delta-r1 Finding 3): a resume with NO
+    /// connection identity available (the conn-less attach lane) keeps `None`
+    /// stamps on its refresh write, so the ledger's keep-when-None merge
+    /// preserves whatever the original create stamped.
+    #[tokio::test]
+    async fn attach_resume_binding_keeps_none_stamps_for_ledger_inheritance() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == DURABLE_ID)
+            .expect("the attach-resume refresh binding write");
+        assert_eq!(b.asserted_stamps().client_instance_id, None);
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
+    }
+
+    /// Focused-ep1-r3 (the parking invariant): a COLD durable resume driven by a
+    /// connection-scoped create (`freshAgent.create{sessionRef}` with the local
+    /// map empty — the post-restart recovery-accept shape) must PARK the resume
+    /// connection's provenance on the reconstructed session before insertion.
+    /// Every downstream writer (the per-send refresh, the fork consumer's
+    /// `session.provenance` read) asserts the CURRENT attribution from the
+    /// parked value — parking nothing leaves the session permanently orphaned
+    /// from the connection that provably has it open.
+    #[tokio::test]
+    async fn cold_resume_parks_the_resume_connections_provenance_on_the_session() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+
+        let mut create = create_msg("req-cold-park");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-cold"),
+                    Some("device-cold"),
+                    Some("tab-cold"),
+                    7_777,
+                )),
+            )
+            .await;
+
+        let sessions = state.sessions.lock().await;
+        let s = sessions
+            .get(DURABLE_ID)
+            .expect("the cold resume registered the session")
+            .lock()
+            .await;
+        let p = s
+            .provenance
+            .clone()
+            .expect("the cold-resume construction parks the resume connection's provenance");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-cold"));
+        assert_eq!(p.device_id.as_deref(), Some("device-cold"));
+        assert_eq!(p.tab_key.as_deref(), Some("device-cold:tab-cold"));
+    }
+
+    /// Focused-ep1-r3, the confirmed finding's D8 consumer chain: cold-resume a
+    /// durable session over a stamped connection, then FORK it. The child
+    /// binding row must carry the RESUME connection's identity/tab (the fork
+    /// inherits the parent's parked provenance) — a `None`-stamped child row is
+    /// unattributed and `recovery_inventory`'s parent-relative keep drops the
+    /// genuinely-open fork child from the recovery offer.
+    #[tokio::test]
+    async fn cold_resume_then_fork_child_row_carries_the_resume_connections_provenance() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-cold-chain");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-chain"),
+                    Some("device-chain"),
+                    Some("tab-chain"),
+                    7_777,
+                )),
+            )
+            .await;
+
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(
+                fork_msg(DURABLE_ID, "fork-req-cold-chain", None),
+                None,
+                sink,
+            )
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+        assert_ne!(child_id, DURABLE_ID, "the fork mints a fresh child id");
+
+        // The child SESSION parks the same stamps (a fork-of-fork stays
+        // attributed — the chain is connection > session > child rows).
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the fork child parks the parent's provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-chain"));
+            assert_eq!(p.device_id.as_deref(), Some("device-chain"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-chain:tab-chain"));
+        }
+
+        // …and the child's ledger ROW asserts the same attribution (never the
+        // unattributed row the D8 judgment drops).
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-chain"),
+            "the child row must carry the RESUME connection's identity, not None"
+        );
+        assert_eq!(
+            b.asserted_stamps().device_id.as_deref(),
+            Some("device-chain")
+        );
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-chain:tab-chain")
+        );
+    }
+
+    /// The paired never-invent pin (session-level twin of
+    /// [`attach_resume_binding_keeps_none_stamps_for_ledger_inheritance`]): the
+    /// conn-less cold resume (the attach lane carries no tab identity) parks
+    /// NOTHING on the reconstructed session, so later conn-less refresh lanes
+    /// keep the ledger's prior stamps instead of asserting an invention.
+    #[tokio::test]
+    async fn attach_resume_parks_no_provenance_on_the_reconstructed_session() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let sessions = state.sessions.lock().await;
+        let s = sessions
+            .get(DURABLE_ID)
+            .expect("the attach-resume registered the session")
+            .lock()
+            .await;
+        assert_eq!(
+            s.provenance, None,
+            "a conn-less resume invents no provenance (None stays parked)"
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 2 (the parking invariant's durable half): the
+    /// CONN-LESS cold attach (`freshAgent.attach` — no tab identity on the
+    /// wire) of a session the local map has never heard of must seed the
+    /// parked provenance from the DURABLE row's stamps — the authoritative
+    /// record of where this session last lived. A fork of the attached
+    /// session (before any snapshot) then produces an ATTRIBUTED child row on
+    /// its NEW ledger key, where keep-when-None cannot rescue a `None` park.
+    #[tokio::test]
+    async fn attach_resume_seeds_the_durable_rows_provenance_and_fork_inherits_it() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The durable row from the pre-restart connection: settings + stamps.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        // The reconstructed session parks the ROW's stamps…
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the attach-resume registered the session")
+                .lock()
+                .await;
+            let p = s.provenance.clone().expect(
+                "the conn-less cold attach seeds the parked provenance from the durable row",
+            );
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+
+        // …so a fork of the attached session (the D8 consumer the finding
+        // names: the fork child has a NEW ledger key where keep-when-None
+        // cannot rescue a None park) writes an attributed child row.
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(fork_msg(DURABLE_ID, "fork-req-row-seed", None), None, sink)
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the fork child parks the row-seeded provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-row"),
+            "the child row inherits the row-seeded provenance, not a fork-time None"
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-row"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
+    }
+
+    /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
+    /// attach of a session whose durable row is GENUINELY UNATTRIBUTED (all
+    /// stamps None) parks NOTHING — never invented — and the conn-less refresh
+    /// write keeps its None stamps so the ledger merge preserves exactly what
+    /// the row had (nothing).
+    #[tokio::test]
+    async fn attach_resume_with_a_genuinely_unattributed_row_parks_none() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A settings-bearing row with NO stamps (an explicit upsert, not the
+        // seed helper, so the row unambiguously has them unset).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the attach-resume registered the session")
+                .lock()
+                .await;
+            assert_eq!(
+                s.provenance, None,
+                "a genuinely unattributed row seeds nothing — never invented"
+            );
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == DURABLE_ID)
+            .expect("the attach-resume refresh write (settings recovered)");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id,
+            None,
+            "never write invented stamps"
+        );
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
+    }
+
+    /// Focused-ep1-r5 Finding 1 (Major — fork stamps from the FORKING
+    /// connection): parked provenance is shared across the globally-shared
+    /// session, so under forceNew multi-tab a fork from tab B must stamp the
+    /// child with TAB B's identity — never the parent's parked (tab A's
+    /// most-recent) attribution. A fork is always connection-initiated, so
+    /// the forking connection's provenance wins over the parked value and
+    /// the durable row alike.
+    #[tokio::test]
+    async fn fork_stamps_the_child_from_the_forking_connection_over_the_stale_park() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Tab A's connection cold-resumes the session (parks + rows A).
+        let mut create = create_msg("req-stale-park-a");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                create,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-a"),
+                    Some("device-a"),
+                    Some("tab-a"),
+                    7_777,
+                )),
+            )
+            .await;
+
+        // The fork is issued over TAB B's connection.
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(
+                fork_msg(DURABLE_ID, "fork-req-b", None),
+                Some(crate::BindProvenance::for_create(
+                    Some("client-b"),
+                    Some("device-b"),
+                    Some("tab-b"),
+                    7_777,
+                )),
+                sink,
+            )
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+
+        // The child SESSION parks the forking connection's stamps…
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the child parks the FORKING connection's provenance, not the stale park");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-b"));
+            assert_eq!(p.device_id.as_deref(), Some("device-b"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-b:tab-b"));
+        }
+
+        // …and the child ROW asserts the same.
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-b"),
+            "the fork child row stamps the FORKING connection, not the parent's stale park"
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-b"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-b:tab-b")
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
+    /// one: a fork whose connection provenance is HOLLOW (a partially
+    /// initialized client's hello — all fields absent) behaves like None, and
+    /// with a parent that parks nothing the child stamps fall back to the
+    /// parent's DURABLE ROW (the last source that knows the attribution).
+    #[tokio::test]
+    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty(
+    ) {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The parent's durable row knows the attribution (lineage-only
+        // payload: no settings ride the seed).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("row stamp write ok");
+        state.set_identity_sink(fake.clone());
+        // …but the local session parks NOTHING (a conn-less construction the
+        // row seeding never reached).
+        insert_fork_parent(&state, DURABLE_ID, Some("/serve/dir"), None, None).await;
+
+        let (sink, captured) = capturing_sink();
+        state
+            .handle_fork(
+                fork_msg(DURABLE_ID, "fork-req-hollow", None),
+                // HOLLOW: the forking connection's hello carried no
+                // device/client fields — must NOT blank out the row's stamps.
+                Some(crate::BindProvenance::default()),
+                sink,
+            )
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let child_id = match frames.as_slice() {
+            [ServerMessage::FreshAgentForked(FreshAgentForked { session_id, .. })] => {
+                session_id.clone()
+            }
+            other => panic!("exactly one forked reply on the requesting sink: {other:?}"),
+        };
+
+        {
+            let sessions = state.sessions.lock().await;
+            let c = sessions
+                .get(&child_id)
+                .expect("the fork child is registered")
+                .lock()
+                .await;
+            let p = c
+                .provenance
+                .clone()
+                .expect("the child parks the durable row's stamps (hollow connection, empty park)");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == child_id)
+            .expect("a binding row for the forked child");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-row"),
+            "the child row falls back to the parent's durable row stamps, not a hollow None"
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-row"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the cold-resume park, `resume_durable_session`):
+    /// a connection-scoped resume-create carrying a HOLLOW provenance behaves
+    /// like None — the row seed (not the hollow value) is what gets parked,
+    /// and the refresh gate does not fire on hollow alone (parked/row truth
+    /// is never replaced with nothing).
+    #[tokio::test]
+    async fn hollow_cold_resume_falls_back_to_the_row_seed_and_writes_nothing() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A stamped LINEAGE-ONLY row (blank settings): the only gate driver
+        // here would be the provenance — exactly Finding 2's shape.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: DURABLE_ID.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-row".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("seed binding write ok");
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("req-hollow-cold");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(create, Some(crate::BindProvenance::default()))
+            .await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the cold resume registered the session")
+                .lock()
+                .await;
+            let p = s
+                .provenance
+                .clone()
+                .expect("a hollow resume parks the ROW seed, not the hollow value");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|b| b.session_id == DURABLE_ID)
+                .count(),
+            1,
+            "a hollow provenance does not fire the refresh gate (only the seed row exists)"
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the named `opencode_ws.rs:677` gate): an
+    /// in-memory resume-create hit carrying a HOLLOW provenance keeps the
+    /// parked Some EXACTLY and writes nothing — hollow behaves like None.
+    #[tokio::test]
+    async fn hollow_in_memory_resume_keeps_the_parked_stamps_and_writes_nothing() {
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // First create: tab A's connection cold-resumes (parks + rows A).
+        let mut first = create_msg("req-mem-a");
+        first.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(
+                first,
+                Some(crate::BindProvenance::for_create(
+                    Some("client-mem"),
+                    Some("device-mem"),
+                    Some("tab-mem"),
+                    7_777,
+                )),
+            )
+            .await;
+        let rows_before = fake
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.session_id == DURABLE_ID)
+            .count();
+
+        // The partially-initialized client's resume hits the in-memory map:
+        // hollow Some.
+        let mut second = create_msg("req-mem-hollow");
+        second.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: DURABLE_ID.to_string(),
+        });
+        state
+            .handle_create(second, Some(crate::BindProvenance::default()))
+            .await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions
+                .get(DURABLE_ID)
+                .expect("the session stays")
+                .lock()
+                .await;
+            let p = s
+                .provenance
+                .clone()
+                .expect("a hollow in-memory resume must NOT regress the parked Some");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-mem"));
+            assert_eq!(p.device_id.as_deref(), Some("device-mem"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-mem:tab-mem"));
+        }
+        let bindings = fake.bindings.lock().unwrap();
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|b| b.session_id == DURABLE_ID)
+                .count(),
+            rows_before,
+            "a hollow in-memory resume writes nothing (like the conn-less resume)"
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the create-lane park): a create carrying a
+    /// HOLLOW connection provenance parks NOTHING on the placeholder — never
+    /// a hollow Some that downstream readers would treat as truth.
+    #[tokio::test]
+    async fn hollow_create_provenance_parks_nothing() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let st = fork_state(http).await;
+        st.handle_create(
+            create_msg("req-hollow-park"),
+            Some(crate::BindProvenance::default()),
+        )
+        .await;
+
+        let sessions = st.sessions.lock().await;
+        let s = sessions
+            .get("freshopencode-req-hollow-park")
+            .expect("the placeholder session")
+            .lock()
+            .await;
+        assert_eq!(
+            s.provenance, None,
+            "a hollow hello parks None — never a hollow Some"
+        );
+    }
+
     // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────
 
     /// Build a [`FreshOpencodeState`] on top of [`state_with_status_poll`], returning it
@@ -4411,7 +7587,7 @@ mod tests {
     async fn clean_turn_emits_busy_then_idle_then_one_monotonic_turn_complete() {
         let (st, mut rx) = state_with_status_poll_and_receiver(1).await;
 
-        st.handle_create(create_msg("req-clean")).await;
+        st.handle_create(create_msg("req-clean"), None).await;
         let placeholder = "freshopencode-req-clean";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -4483,7 +7659,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-int")).await;
+        st.handle_create(create_msg("req-int"), None).await;
         let placeholder = "freshopencode-req-int";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -4555,7 +7731,7 @@ mod tests {
         fresh_agent.set_manager_for_test(manager.clone()).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
-        st.handle_create(create_msg("req-err")).await;
+        st.handle_create(create_msg("req-err"), None).await;
         let placeholder = "freshopencode-req-err";
         st.handle_send(send_msg(placeholder, "hello")).await;
 
@@ -5884,7 +9060,7 @@ mod tests {
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
 
-        st.handle_create(create_msg("req-noop")).await;
+        st.handle_create(create_msg("req-noop"), None).await;
         let placeholder = "freshopencode-req-noop";
         // Drain the freshAgent.created frame.
         assert!(rx.try_recv().is_ok());
@@ -6321,6 +9497,7 @@ mod tests {
             input: at_turn_id.map(|id| json!({ "atTurnId": id })),
             request_id: Some(request_id.to_string()),
             cwd: None,
+            tab_id: None,
         }
     }
 
@@ -6470,7 +9647,7 @@ mod tests {
         .await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-1", None), None, sink)
             .await;
 
         // The exact `freshAgent.forked` reply — every field, request_id echoed
@@ -6550,7 +9727,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-2", None), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-2", None), None, sink)
             .await;
 
         assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
@@ -6567,11 +9744,11 @@ mod tests {
     async fn fork_on_an_unmaterialized_placeholder_replies_invalid_session_id_and_posts_nothing() {
         let http = Arc::new(ForkFakeHttp::child_ok());
         let st = fork_state(http.clone()).await;
-        st.handle_create(create_msg("req-fork")).await;
+        st.handle_create(create_msg("req-fork"), None).await;
         let placeholder = "freshopencode-req-fork";
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(placeholder, "fork-req-3", None), sink)
+        st.handle_fork(fork_msg(placeholder, "fork-req-3", None), None, sink)
             .await;
 
         let frames = captured.lock().expect("captured mutex").clone();
@@ -6600,7 +9777,7 @@ mod tests {
         let st = fork_state(http.clone()).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_ghost", "fork-req-4", None), sink)
+        st.handle_fork(fork_msg("ses_ghost", "fork-req-4", None), None, sink)
             .await;
 
         let frames = captured.lock().expect("captured mutex").clone();
@@ -6624,7 +9801,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-5", None), sink)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-5", None), None, sink)
             .await;
 
         let frames = captured.lock().expect("captured mutex").clone();
@@ -6673,7 +9850,7 @@ mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("ses_parent", "fork-req-dup-1", None), sink1)
+                st.handle_fork(fork_msg("ses_parent", "fork-req-dup-1", None), None, sink1)
                     .await;
             })
         };
@@ -6692,7 +9869,7 @@ mod tests {
         let (sink2, captured2) = capturing_sink();
         tokio::time::timeout(
             Duration::from_secs(2),
-            st.handle_fork(fork_msg("ses_parent", "fork-req-dup-2", None), sink2),
+            st.handle_fork(fork_msg("ses_parent", "fork-req-dup-2", None), None, sink2),
         )
         .await
         .expect("the duplicate fork is refused inline, never upstream-blocking");
@@ -6732,7 +9909,7 @@ mod tests {
         );
 
         let (sink3, captured3) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-dup-3", None), sink3)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-dup-3", None), None, sink3)
             .await;
         let frames3 = captured3.lock().expect("captured mutex").clone();
         assert!(
@@ -6759,7 +9936,7 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink1, captured1) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-f1", None), sink1)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f1", None), None, sink1)
             .await;
         let frames1 = captured1.lock().expect("captured mutex").clone();
         let v1 = serde_json::to_value(&frames1[0]).unwrap();
@@ -6773,7 +9950,7 @@ mod tests {
 
         // The retry reaches the wire — the failure path released the guard.
         let (sink2, captured2) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-f2", None), sink2)
+        st.handle_fork(fork_msg("ses_parent", "fork-req-f2", None), None, sink2)
             .await;
         let frames2 = captured2.lock().expect("captured mutex").clone();
         let v2 = serde_json::to_value(&frames2[0]).unwrap();
@@ -6808,7 +9985,7 @@ mod tests {
             insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
 
             let (sink, captured) = capturing_sink();
-            st.handle_fork(fork_msg("ses_parent", "fork-req-8", None), sink)
+            st.handle_fork(fork_msg("ses_parent", "fork-req-8", None), None, sink)
                 .await;
 
             let frames = captured.lock().expect("captured mutex").clone();
@@ -6847,8 +10024,12 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-6", Some("msg_abc")), sink)
-            .await;
+        st.handle_fork(
+            fork_msg("ses_parent", "fork-req-6", Some("msg_abc")),
+            None,
+            sink,
+        )
+        .await;
 
         assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
         let forks = http.fork_requests();
@@ -6872,6 +10053,7 @@ mod tests {
         let (sink, captured) = capturing_sink();
         st.handle_fork(
             fork_msg("ses_parent", "fork-req-7", Some("not-a-msg")),
+            None,
             sink,
         )
         .await;
