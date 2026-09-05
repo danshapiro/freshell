@@ -322,7 +322,10 @@ fn persistent_contention_still_degrades_disabled_within_a_bounded_budget() {
     let _holder = PaneLedger::new_locked(Some(root.clone()));
     let started = std::time::Instant::now();
     let loser = PaneLedger::new_locked(Some(root.clone()));
-    assert!(!loser.is_enabled(), "a persistent holder must still degrade");
+    assert!(
+        !loser.is_enabled(),
+        "a persistent holder must still degrade"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(3),
         "degradation is bounded by the fixed retry budget, never a spin"
@@ -1303,7 +1306,7 @@ fn load_index_dir_io_errors_are_loud_not_silently_empty() {
         2,
         "one ERROR per unreadable top-level dir (bindings + pending); got: {events:?}"
     );
-    assert!(hits.iter().all(|h| h.fields.get("path").is_some()));
+    assert!(hits.iter().all(|h| h.fields.contains_key("path")));
     drop(events);
     assert!(
         !ledger.ever_bound("claude", "anything"),
