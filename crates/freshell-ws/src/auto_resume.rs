@@ -346,14 +346,6 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
         // (one respawn in flight, ever).
         'events: while let Some(ev) = rx.recv().await {
             let mut sref = driver.resumable_session_ref(&ev.terminal_id);
-            // True iff the identity was absent at the first query but
-            // present after the grace — i.e. an upsert REVIVED the retired
-            // entry (upsert un-retires, identity.rs:123) while the pane was
-            // dead. Such identities must be re-retired before the decision
-            // match or the dead terminal stays in live-only lookups
-            // (identity.list()/find_by_session filter retired) no matter
-            // whether the outcome is Resume or a settle.
-            let mut identity_revived = false;
             // Identity grace (kata kmbs): `no_resumable_identity` used to be
             // a one-shot, never-reconsidered settle — a permanently dead pane
             // when identity legitimately landed seconds later (locator
@@ -383,22 +375,25 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     // arm's post-sleep take_cancel) — never consumed
                     // silently by the settle tail's hygiene cleanup.
                     if driver.take_cancel(&ev.terminal_id) {
-                        // A cancel and an identity revival can land in the
-                        // SAME grace sleep: upsert has already un-retired
-                        // (identity.rs:123) by the time we observe either of
-                        // them, so this tail must re-query and restore the
-                        // crash invariant before continuing — the dead
-                        // terminal must not stay in live-only lookups.
-                        if driver.resumable_session_ref(&ev.terminal_id).is_some() {
-                            driver.retire_identity(&ev.terminal_id);
-                        }
+                        // iteration-tail invariant: every exit path from an
+                        // event ends by retiring the dead terminal's identity;
+                        // retire is idempotent and tombstone-free
+                        // (identity.rs), so unconditional calls are safe —
+                        // revival can land before query#1, during any
+                        // grace/backoff sleep, or between the final recheck
+                        // and the tail. (Residual: an upsert racing in AFTER
+                        // the final retire of the iteration is outside any
+                        // in-hub fix — no writer today upserts a terminal id
+                        // whose pane is already dead AND settled (locators /
+                        // signal-rebinds target live panes); this residual is
+                        // accepted.)
+                        driver.retire_identity(&ev.terminal_id);
                         driver.emit_settled(&ev.terminal_id, SETTLE_REASON_CANCELLED, None);
                         driver.log_settled(&ev.terminal_id, "user_cancelled");
                         continue 'events;
                     }
                     sref = driver.resumable_session_ref(&ev.terminal_id);
                     if sref.is_some() {
-                        identity_revived = true;
                         tracing::info!(
                             terminal_id = %ev.terminal_id,
                             "terminal.auto_resume.identity_grace_resolved"
@@ -406,9 +401,6 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         break;
                     }
                 }
-            }
-            if identity_revived {
-                driver.retire_identity(&ev.terminal_id);
             }
             // Prune the cycle record to the rolling window BEFORE deciding
             // (znhn item 2): recent_cycles feeds the breaker threshold.
@@ -477,6 +469,8 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                             }
                         }
                     }
+                    // Iteration-tail invariant (see the grace-cancel tail).
+                    driver.retire_identity(&ev.terminal_id);
                     // Fresh-eyes fix: a cancel whose terminal settles without
                     // ever reaching the Resume arm's take_cancel check would
                     // otherwise leak in auto_resume_cancels forever — the
@@ -489,6 +483,12 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     let (provider, session_id, cwd) = sref.expect("checked by decide");
                     let key = ev.create_request_id.clone().expect("checked by decide");
                     attempts.entry(key.clone()).or_default().attempts = attempt;
+                    // Re-retire BEFORE the recovering frame: a revival that
+                    // landed before query#1 or during the grace must not
+                    // leave the dead identity live between the decision and
+                    // the respawn (iteration-tail invariant, grace-cancel
+                    // tail).
+                    driver.retire_identity(&ev.terminal_id);
                     driver.emit_recovering(
                         &ev.terminal_id,
                         &ev.mode,
@@ -507,6 +507,8 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         // client-side (recordAutoResumeSettled).
                         driver.emit_settled(&ev.terminal_id, SETTLE_REASON_CANCELLED, None);
                         driver.log_settled(&ev.terminal_id, "user_cancelled");
+                        // Iteration-tail invariant (see the grace-cancel tail).
+                        driver.retire_identity(&ev.terminal_id);
                         continue;
                     }
                     if let Some(reason) =
@@ -518,6 +520,8 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         // landed after the take_cancel check above must not
                         // leak — every settle tail cleans it up.
                         let _ = driver.take_cancel(&ev.terminal_id);
+                        // Iteration-tail invariant (see the grace-cancel tail).
+                        driver.retire_identity(&ev.terminal_id);
                         continue;
                     }
                     if !driver.claim_session(&provider, &session_id, &key).await {
@@ -525,6 +529,8 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
                         // Cancel-set hygiene (see the guard tail above).
                         let _ = driver.take_cancel(&ev.terminal_id);
+                        // Iteration-tail invariant (see the grace-cancel tail).
+                        driver.retire_identity(&ev.terminal_id);
                         continue;
                     }
                     let spec = RespawnSpec {
@@ -577,6 +583,10 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     // every tail of the respawn match (replaced /
                     // lease_completion_lost / respawn_failed).
                     let _ = driver.take_cancel(&ev.terminal_id);
+                    // Arm-end retire (iteration-tail invariant, grace-cancel
+                    // tail): covers a revival landing during the backoff
+                    // sleep — after the pre-emit retire already ran.
+                    driver.retire_identity(&ev.terminal_id);
                 }
             }
         }
@@ -657,11 +667,13 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     /// Consume a pending user cancel for this terminal id (znhn item 2).
     fn take_cancel(&self, terminal_id: &str) -> bool;
     fn log_settled(&self, terminal_id: &str, reason: &str);
-    /// Restore the crash invariant after a grace-revived identity: the exit
-    /// hook retires before the CrashEvent is sent, but a grace-resolved identity
-    /// landed via upsert AFTER the hook — and upsert un-retires (identity.rs:123)
-    /// — so the hub re-retires before the decision match. Called only when the
-    /// grace path observed the revival; idempotent regardless.
+    /// Restore the crash invariant — the dead terminal's identity stays
+    /// retired — at every iteration tail. The exit hook retires before the
+    /// CrashEvent is sent, but an identity landed via upsert AFTER the hook
+    /// un-retires it (identity.rs:123). Called UNCONDITIONALLY at the end of
+    /// every event path (the iteration-tail invariant in `run_hub_body`):
+    /// idempotent and tombstone-free, so paths that saw no revival retire a
+    /// no-op.
     fn retire_identity(&self, terminal_id: &str);
 }
 
@@ -1314,8 +1326,8 @@ mod tests {
         /// (terminal_id, reason, resume_cycles) — settle FRAMES broadcast
         /// (znhn item 3), distinct from the `settled` log records.
         settled_frames: Vec<(String, String, Option<u32>)>,
-        /// Terminal ids re-retired by the hub after a grace-observed
-        /// identity revival (kata kmbs) — the restored crash invariant.
+        /// Terminal ids retired by the hub's unconditional iteration-tail
+        /// retires (delta fix 1) — the restored crash invariant.
         retired: Vec<String>,
     }
 
@@ -1417,7 +1429,7 @@ mod tests {
         fn settled_frames(&self) -> Vec<(String, String, Option<u32>)> {
             self.lock().settled_frames.clone()
         }
-        /// Terminal ids re-retired by the hub after a grace revival (kmbs).
+        /// Terminal ids retired by the hub's iteration-tail retires.
         fn retired(&self) -> Vec<String> {
             self.lock().retired.clone()
         }
@@ -1575,6 +1587,41 @@ mod tests {
         assert_eq!(
             fake.replaced_calls(),
             vec![("t1".into(), "t-new".into(), 1u32)]
+        );
+        // Delta-fix-1: identity was Some from the very first query (a revival
+        // landing BEFORE query#1 is hub-level indistinguishable from healthy)
+        // — the unconditional pre-emit tail retire must still restore the
+        // crash invariant.
+        assert!(fake.retired().contains(&"t1".to_string()));
+    }
+
+    /// Delta-fix-1: a revival landing DURING the resume backoff (after the
+    /// pre-emit retire already ran) is re-retired by the unconditional retire
+    /// at the resume arm's END — the mid-sleep revival family the
+    /// `identity_revived` flag never observed.
+    #[tokio::test(start_paused = true)]
+    async fn mid_backoff_identity_revival_is_re_retired_at_the_arm_end() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy(); // identity Some from the start
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 5_000))
+            .unwrap();
+        drain().await;
+        assert_eq!(fake.recovering_calls(), vec![("t1".into(), 1u32, 2u32)]);
+        // Second "revival" upsert lands while the hub is parked in the
+        // backoff sleep.
+        fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 1);
+        assert_eq!(
+            fake.replaced_calls(),
+            vec![("t1".into(), "t-new".into(), 1u32)]
+        );
+        assert!(
+            fake.retired().contains(&"t1".to_string()),
+            "the arm-end retire covers the mid-sleep revival"
         );
     }
 
@@ -1931,6 +1978,11 @@ mod tests {
             ]
         );
         assert!(fake.respawn_calls().is_empty());
+        // Delta-fix-1: the exhaustion tail retires unconditionally — a
+        // revival slipping in between the final recheck and the tail (or a
+        // cancel/settle tail that never set the old flag) cannot leak the
+        // dead terminal into live-only lookups.
+        assert!(fake.retired().contains(&"t2".to_string()));
     }
 
     /// Grace eligibility gate — clean exit, shell mode, AND missing
