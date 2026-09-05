@@ -22,6 +22,16 @@ pub(crate) const AUTO_RESUME_MODES: [&str; 4] = ["claude", "codex", "opencode", 
 /// per user ruling 2026-07-27. After the last entry: exhausted and LOUD.
 pub(crate) const AUTO_RESUME_DEFAULT_DELAYS_MS: [u64; 2] = [2_000, 10_000];
 
+/// Grace before settling `no_resumable_identity` (kata kmbs): identity can
+/// legitimately land SECONDS after the crash decision — codex/opencode
+/// locator adoption windows are 2s (`codex_locator.rs` /
+/// `opencode_locator.rs`), and a claude instant-crash races the create-path
+/// identity upsert. Total 5s sits inside the repo's own unresolved-identity
+/// alarm budget (`IDENTITY_RESOLUTION_GRACE_MS = 10_000`, invariants.rs).
+/// Empty via env = grace disabled (escape hatch). Bounded and LOUD:
+/// exhaustion still settles `no_resumable_identity`.
+pub(crate) const AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS: [u64; 2] = [2_500, 2_500];
+
 /// A crashed generation that lived at least this long proves the previous
 /// resume was healthy — the attempt counter resets (mirrors
 /// `DEFAULT_RESPAWN_LIVENESS_WINDOW_MS` in freshell-terminal).
@@ -70,6 +80,10 @@ pub(crate) fn auto_resume_healthy_lifetime_ms() -> i64 {
 #[derive(Debug, Clone)]
 pub(crate) struct HubConfig {
     pub delays: Vec<u64>,
+    /// Bounded identity-grace re-check schedule (kata kmbs), stepped through
+    /// by the hub loop before a `no_resumable_identity` settle. Empty =
+    /// grace disabled (env escape hatch).
+    pub identity_grace_delays: Vec<u64>,
     pub healthy_lifetime_ms: i64,
     pub max_cycles: u32,
     pub cycle_window_ms: i64,
@@ -79,9 +93,20 @@ impl HubConfig {
     pub(crate) fn from_env() -> Self {
         Self {
             delays: auto_resume_delays(),
+            identity_grace_delays: auto_resume_identity_grace_delays(),
             healthy_lifetime_ms: auto_resume_healthy_lifetime_ms(),
             max_cycles: auto_resume_max_cycles(),
             cycle_window_ms: auto_resume_cycle_window_ms(),
+        }
+    }
+
+    /// Test/harness constructor: explicit backoff AND identity-grace
+    /// schedules, everything else from env defaults.
+    pub(crate) fn with_schedules(delays: Vec<u64>, identity_grace_delays: Vec<u64>) -> Self {
+        Self {
+            delays,
+            identity_grace_delays,
+            ..HubConfig::from_env()
         }
     }
 }
@@ -213,6 +238,23 @@ pub(crate) fn auto_resume_delays() -> Vec<u64> {
     }
 }
 
+/// `FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS="2500,2500"` (kata kmbs) —
+/// bounded identity-grace schedule. Zero/invalid values fall back LOUDLY to
+/// the default; an explicit empty string disables the grace (escape hatch).
+pub(crate) fn auto_resume_identity_grace_delays() -> Vec<u64> {
+    match std::env::var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS") {
+        Ok(raw) if raw.trim().is_empty() => Vec::new(),
+        Ok(raw) => parse_delays_env(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                raw,
+                "FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS is set but unparseable — falling back to default grace delays"
+            );
+            AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec()
+        }),
+        Err(_) => AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec(),
+    }
+}
+
 /// The auto-resume orchestrator: consumes [`CrashEvent`]s, applies
 /// [`decide`], and drives the retry pipeline (recovering frame → backoff →
 /// post-sleep guards → lease claim → respawn → lease completion → replaced
@@ -302,8 +344,72 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
         // 10s worst-case. Acceptable at v1 — crashes are rare, the budget is
         // tiny, and full serialization is the strongest anti-storm property
         // (one respawn in flight, ever).
-        while let Some(ev) = rx.recv().await {
-            let sref = driver.resumable_session_ref(&ev.terminal_id);
+        'events: while let Some(ev) = rx.recv().await {
+            let mut sref = driver.resumable_session_ref(&ev.terminal_id);
+            // True iff the identity was absent at the first query but
+            // present after the grace — i.e. an upsert REVIVED the retired
+            // entry (upsert un-retires, identity.rs:123) while the pane was
+            // dead. Such identities must be re-retired before the decision
+            // match or the dead terminal stays in live-only lookups
+            // (identity.list()/find_by_session filter retired) no matter
+            // whether the outcome is Resume or a settle.
+            let mut identity_revived = false;
+            // Identity grace (kata kmbs): `no_resumable_identity` used to be
+            // a one-shot, never-reconsidered settle — a permanently dead pane
+            // when identity legitimately landed seconds later (locator
+            // adoption windows, load-race upsert lag). Re-check here, at the
+            // single decision choke point, through a BOUNDED schedule before
+            // deciding: identity arriving in grace converts the settle into
+            // the normal Resume path with zero special-casing below. Skipped
+            // unless no_resumable_identity is the reason `decide` WOULD
+            // settle on — same predicate order: clean_exit / not_agent_mode /
+            // no_create_request_id settle immediately, grace-free.
+            if sref.is_none()
+                && ev.exit_code != 0
+                && AUTO_RESUME_MODES.contains(&ev.mode.as_str())
+                && ev.create_request_id.is_some()
+                && cfg.identity_grace_delays.iter().any(|s| *s > 0)
+            {
+                tracing::info!(
+                    terminal_id = %ev.terminal_id,
+                    "terminal.auto_resume.identity_grace_entered"
+                );
+                for step in &cfg.identity_grace_delays {
+                    if *step == 0 {
+                        continue;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(*step)).await;
+                    // Cancel during grace stays LOUD (mirrors the Resume
+                    // arm's post-sleep take_cancel) — never consumed
+                    // silently by the settle tail's hygiene cleanup.
+                    if driver.take_cancel(&ev.terminal_id) {
+                        // A cancel and an identity revival can land in the
+                        // SAME grace sleep: upsert has already un-retired
+                        // (identity.rs:123) by the time we observe either of
+                        // them, so this tail must re-query and restore the
+                        // crash invariant before continuing — the dead
+                        // terminal must not stay in live-only lookups.
+                        if driver.resumable_session_ref(&ev.terminal_id).is_some() {
+                            driver.retire_identity(&ev.terminal_id);
+                        }
+                        driver.emit_settled(&ev.terminal_id, SETTLE_REASON_CANCELLED, None);
+                        driver.log_settled(&ev.terminal_id, "user_cancelled");
+                        continue 'events;
+                    }
+                    sref = driver.resumable_session_ref(&ev.terminal_id);
+                    if sref.is_some() {
+                        identity_revived = true;
+                        tracing::info!(
+                            terminal_id = %ev.terminal_id,
+                            "terminal.auto_resume.identity_grace_resolved"
+                        );
+                        break;
+                    }
+                }
+            }
+            if identity_revived {
+                driver.retire_identity(&ev.terminal_id);
+            }
             // Prune the cycle record to the rolling window BEFORE deciding
             // (znhn item 2): recent_cycles feeds the breaker threshold.
             let now = crate::terminal::now_ms();
@@ -551,6 +657,12 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     /// Consume a pending user cancel for this terminal id (znhn item 2).
     fn take_cancel(&self, terminal_id: &str) -> bool;
     fn log_settled(&self, terminal_id: &str, reason: &str);
+    /// Restore the crash invariant after a grace-revived identity: the exit
+    /// hook retires before the CrashEvent is sent, but a grace-resolved identity
+    /// landed via upsert AFTER the hook — and upsert un-retires (identity.rs:123)
+    /// — so the hub re-retires before the decision match. Called only when the
+    /// grace path observed the revival; idempotent regardless.
+    fn retire_identity(&self, terminal_id: &str);
 }
 
 /// Everything a respawn needs, resolved by the hub before the driver call.
@@ -827,6 +939,11 @@ impl AutoResumeDriver for WsAutoResumeDriver {
     fn log_settled(&self, terminal_id: &str, reason: &str) {
         tracing::info!(terminal_id, reason, "terminal.auto_resume.settled");
     }
+
+    fn retire_identity(&self, terminal_id: &str) {
+        // Idempotent (identity.rs:205); the bool is irrelevant here.
+        let _ = self.state.identity.retire(terminal_id);
+    }
 }
 
 /// Build + broadcast the settle frame (`terminal.status status:exited`).
@@ -902,6 +1019,22 @@ pub fn spawn_auto_resume_hub_with_delays(
     )
 }
 
+/// [`spawn_auto_resume_hub`] with explicit backoff AND identity-grace
+/// schedules. The harness injects tiny values: it is in-process, so env
+/// writes would leak across parallel tests in one binary.
+pub fn spawn_auto_resume_hub_with_schedules(
+    state: crate::WsState,
+    rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
+    delays: Vec<u64>,
+    identity_grace_delays: Vec<u64>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_hub_with_driver(
+        WsAutoResumeDriver { state },
+        rx,
+        HubConfig::with_schedules(delays, identity_grace_delays),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +1057,7 @@ mod tests {
     fn test_cfg(delays: Vec<u64>) -> HubConfig {
         HubConfig {
             delays,
+            identity_grace_delays: AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec(),
             healthy_lifetime_ms: AUTO_RESUME_HEALTHY_LIFETIME_MS,
             max_cycles: AUTO_RESUME_DEFAULT_MAX_CYCLES,
             cycle_window_ms: AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS,
@@ -1117,6 +1251,42 @@ mod tests {
         assert_eq!(parse_delays_env("0"), None); // zero-delay loops are forbidden
     }
 
+    #[test]
+    fn identity_grace_env_defaults_and_escape_hatch() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var_os("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS");
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", v),
+                    None => std::env::remove_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS"),
+                }
+            }
+        }
+        let _r = Restore(prior);
+
+        std::env::remove_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS");
+        assert_eq!(
+            auto_resume_identity_grace_delays(),
+            AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec()
+        );
+        std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", "");
+        assert!(
+            auto_resume_identity_grace_delays().is_empty(),
+            "explicit empty value disables the grace (escape hatch)"
+        );
+        std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", "100,,0");
+        assert_eq!(
+            auto_resume_identity_grace_delays(),
+            AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec(),
+            "unparseable output falls back loudly to the default"
+        );
+        std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", "100,200");
+        assert_eq!(auto_resume_identity_grace_delays(), vec![100, 200]);
+    }
+
     // ---- Task 5: hub orchestration (fake driver, paused tokio time) ----
 
     use std::sync::{Arc, Mutex};
@@ -1163,6 +1333,9 @@ mod tests {
         /// (terminal_id, reason, resume_cycles) — settle FRAMES broadcast
         /// (znhn item 3), distinct from the `settled` log records.
         settled_frames: Vec<(String, String, Option<u32>)>,
+        /// Terminal ids re-retired by the hub after a grace-observed
+        /// identity revival (kata kmbs) — the restored crash invariant.
+        retired: Vec<String>,
     }
 
     /// Records every orchestrator effect; each knob is mutable mid-test so
@@ -1194,6 +1367,7 @@ mod tests {
                     fails: Vec::new(),
                     settled: Vec::new(),
                     settled_frames: Vec::new(),
+                    retired: Vec::new(),
                 })),
             }
         }
@@ -1261,6 +1435,10 @@ mod tests {
         /// (terminal_id, reason, resume_cycles) settle FRAMES (znhn item 3).
         fn settled_frames(&self) -> Vec<(String, String, Option<u32>)> {
             self.lock().settled_frames.clone()
+        }
+        /// Terminal ids re-retired by the hub after a grace revival (kmbs).
+        fn retired(&self) -> Vec<String> {
+            self.lock().retired.clone()
         }
     }
 
@@ -1386,6 +1564,9 @@ mod tests {
             self.lock()
                 .settled
                 .push((terminal_id.to_string(), reason.to_string()));
+        }
+        fn retire_identity(&self, terminal_id: &str) {
+            self.lock().retired.push(terminal_id.to_string());
         }
     }
 
@@ -1639,7 +1820,11 @@ mod tests {
         // exit_code=0 / mode="shell" — zero respawn calls, zero recovering frames.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+        let _hub = spawn_hub_with_driver(
+            fake.clone(),
+            rx,
+            HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]),
+        );
 
         fake.set_cap_exhausted(true);
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
@@ -1651,6 +1836,29 @@ mod tests {
         tx.send(crash("t2", 1, "claude", Some("cr-2"), 1_000))
             .unwrap();
         drain().await;
+        // Identity grace (kata kmbs): t2's no_resumable_identity settle is no
+        // longer one-shot — identity stays absent through the WHOLE two-step
+        // grace before the settle lands. (t1's cap-exhausted settle frame is
+        // already in the list; the intermediate assertions are t2-scoped.)
+        assert!(
+            !fake.settled_frames().iter().any(|(t, _, _)| t == "t2"),
+            "the grace must run before t2 settles: {:?}",
+            fake.settled_frames()
+        );
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert!(
+            !fake.settled_frames().iter().any(|(t, _, _)| t == "t2"),
+            "t2's second grace step is still pending: {:?}",
+            fake.settled_frames()
+        );
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert!(
+            fake.settled_frames()
+                .contains(&("t2".to_string(), "no_resumable_identity".to_string(), None)),
+            "grace exhausted: t2 settles no_resumable_identity"
+        );
 
         fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
         tx.send(crash("t3", 0, "claude", Some("cr-3"), 1_000))
@@ -1672,6 +1880,174 @@ mod tests {
             ],
             "shell-mode settles must NOT emit a settle frame"
         );
+    }
+
+    /// Kata kmbs (primary RED pin): identity landing mid-grace converts the
+    /// previously one-shot `no_resumable_identity` settle into a normal
+    /// resume. Per-step `advance` + `drain`: paused-clock `advance` wakes
+    /// only timers ALREADY scheduled, so each grace step gets its own
+    /// advance.
+    #[tokio::test(start_paused = true)]
+    async fn identity_arriving_during_grace_converts_no_identity_settle_into_resume() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_session(None); // identity absent at crash-decision time
+        let cfg = HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 5_000))
+            .unwrap();
+        drain().await;
+        assert!(fake.settled_frames().is_empty(), "no settle during grace");
+        assert!(fake.recovering_calls().is_empty(), "no recover before identity");
+
+        // Grace step 1 elapses with no identity: re-check sees None, loop holds.
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert!(fake.settled_frames().is_empty());
+        assert!(fake.recovering_calls().is_empty());
+
+        // Identity lands before grace step 2 completes.
+        fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert_eq!(fake.recovering_calls(), vec![("t1".into(), 1u32, 2u32)]);
+        assert!(fake.respawn_calls().is_empty(), "resume backoff still respected");
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(
+            fake.replaced_calls(),
+            vec![("t1".into(), "t-new".into(), 1u32)]
+        );
+        assert!(fake.settled_frames().is_empty(), "no exited settle at all");
+        // The crash invariant — dead terminal's identity retired — is restored:
+        assert!(fake.retired().contains(&"t1".to_string()));
+    }
+
+    /// Kata kmbs: grace exhaustion still settles loudly — the SAME
+    /// `no_resumable_identity` frame as pre-grace behavior, bounded-late.
+    #[tokio::test(start_paused = true)]
+    async fn no_identity_after_grace_exhaustion_settles_exited_loudly() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_session(None); // stays None for the whole grace
+        let cfg = HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        tx.send(crash("t2", 1, "claude", Some("cr-2"), 1_000))
+            .unwrap();
+        drain().await;
+        assert!(fake.settled_frames().is_empty(), "grace must run first");
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert!(fake.settled_frames().is_empty(), "second grace step pending");
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert_eq!(
+            fake.settled_frames(),
+            vec![
+                ("t2".to_string(), "no_resumable_identity".to_string(), None)
+            ]
+        );
+        assert!(fake.respawn_calls().is_empty());
+    }
+
+    /// Grace eligibility gate — clean exit, shell mode, AND missing
+    /// create_request_id all settle IMMEDIATELY (no grace sleeps).
+    #[tokio::test(start_paused = true)]
+    async fn non_identity_settles_skip_the_grace_entirely() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let cfg = HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        tx.send(crash("t3", 0, "claude", Some("cr-3"), 1_000))
+            .unwrap(); // clean_exit
+        tx.send(crash("t4", 1, "shell", Some("cr-4"), 1_000))
+            .unwrap(); // not_agent_mode (silent)
+        tx.send(crash("t5", 1, "claude", None, 1_000)).unwrap(); // no_create_request_id
+        drain().await; // NO time advance — ineligible settles must already have happened
+        assert_eq!(
+            fake.settled_frames(),
+            vec![
+                ("t3".to_string(), "clean_exit".to_string(), None),
+                ("t5".to_string(), "no_create_request_id".to_string(), None),
+            ],
+            "shell settles silently; both non-identity settles are grace-free"
+        );
+    }
+
+    /// Kata kmbs: cancel during grace settles loudly at a grace-step
+    /// boundary (ordering under paused time: the crash event must be drained
+    /// into the hub BEFORE the cancel is seeded, so the hub is parked inside
+    /// its first grace sleep).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_grace_settles_cancelled_and_skips_further_rechecks() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_session(None);
+        let cfg = HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        tx.send(crash("t6", 1, "claude", Some("cr-6"), 1_000))
+            .unwrap();
+        drain().await; // hub is now parked in grace sleep #1
+        // Cancel AND identity revival land in the same grace sleep (the race
+        // round-3 flagged): both must be handled — cancelled settle AND
+        // re-retire, never a live leftover.
+        fake.set_cancelled("t6");
+        fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert_eq!(
+            fake.settled_frames(),
+            vec![(
+                "t6".to_string(),
+                super::SETTLE_REASON_CANCELLED.to_string(),
+                None
+            )]
+        );
+        assert!(
+            fake.retired().contains(&"t6".to_string()),
+            "identity revived during the cancelled sleep must be re-retired"
+        );
+        // Neither a further identity nor further steps resurrect anything:
+        tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
+        drain().await;
+        assert!(fake.recovering_calls().is_empty());
+        assert!(fake.respawn_calls().is_empty());
+    }
+
+    /// Review-round-2 pin: a grace-revived identity is re-retired even when
+    /// the decision is a SETTLE (cap exhausted at decision time).
+    #[tokio::test(start_paused = true)]
+    async fn grace_revived_identity_is_re_retired_even_on_settle_outcomes() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_cap_exhausted(true); // settle, not resume, after revival
+        fake.set_session(None);
+        let cfg = HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        tx.send(crash("t7", 1, "claude", Some("cr-7"), 5_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
+        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        drain().await;
+        assert!(fake.respawn_calls().is_empty(), "cap was exhausted");
+        assert_eq!(
+            fake.settled_frames(),
+            vec![(
+                "t7".to_string(),
+                "respawn_cap_exhausted".to_string(),
+                None
+            )]
+        );
+        // The revived identity did NOT leak into live-only registry lookups:
+        assert!(fake.retired().contains(&"t7".to_string()));
     }
 
     #[tokio::test(start_paused = true)]
