@@ -6661,12 +6661,9 @@ mod tests {
 
         let (status, body) = get(router, "/api/panes/pane-legacy-agent/capture", true).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("pane kind \"fresh-agent\""),
-            "expected the fresh-agent pane-kind validation message, got: {body}"
+        assert_eq!(
+            body["message"],
+            json!("pane kind \"fresh-agent\" does not support capture-pane; use screenshot-pane")
         );
     }
 
