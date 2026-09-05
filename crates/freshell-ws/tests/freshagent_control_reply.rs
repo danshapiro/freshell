@@ -58,10 +58,9 @@ fn assert_capability_refusal(
     assert_eq!(frame["event"]["message"], serde_json::json!(message));
 }
 
-/// Refusal-matrix cell: approvals belong to the claude provider only — a
-/// codex-provider approval.respond is refused with the parity capability text.
+/// Codex approvals reach the runtime, which diagnoses an unknown session.
 #[tokio::test]
-async fn codex_approval_respond_is_refused_with_the_parity_capability_message() {
+async fn codex_approval_respond_dispatches_to_the_runtime() {
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
@@ -73,20 +72,16 @@ async fn codex_approval_respond_is_refused_with_the_parity_capability_message() 
             "provider": "codex",
             "sessionId": "ses-approve-1",
             "sessionType": "freshcodex",
-            "decision": { "approved": true, "scope": "once" },
+            "decision": { "behavior": "allow" },
             "requestId": "perm-1",
         }),
     )
     .await;
 
     let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_capability_refusal(
-        &frame,
-        "ses-approve-1",
-        "codex",
-        "freshcodex",
-        "Approvals are not supported for freshcodex",
-    );
+    assert_eq!(frame["provider"], "codex");
+    assert_eq!(frame["sessionId"], "ses-approve-1");
+    assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
 }
 
 /// Refusal-matrix cell (whole-branch review M-3): approvals belong to the claude
@@ -120,11 +115,9 @@ async fn opencode_approval_respond_is_refused_with_the_parity_capability_message
     );
 }
 
-/// Refusal-matrix cell (whole-branch review M-3): questions belong to the claude
-/// provider only — a codex-provider question.respond is refused with the parity
-/// capability text.
+/// Codex questions reach the runtime, which diagnoses an unknown session.
 #[tokio::test]
-async fn codex_question_respond_is_refused_with_the_parity_capability_message() {
+async fn codex_question_respond_dispatches_to_the_runtime() {
     let (url, _registry) = spawn_server().await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
@@ -142,13 +135,9 @@ async fn codex_question_respond_is_refused_with_the_parity_capability_message() 
     .await;
 
     let frame = next_frame_of_type(&mut ws, "freshAgent.event").await;
-    assert_capability_refusal(
-        &frame,
-        "ses-cx-question-1",
-        "codex",
-        "freshcodex",
-        "Questions are not supported for freshcodex",
-    );
+    assert_eq!(frame["provider"], "codex");
+    assert_eq!(frame["sessionId"], "ses-cx-question-1");
+    assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
 }
 
 /// Refusal-matrix cell (whole-branch review M-3): questions belong to the claude

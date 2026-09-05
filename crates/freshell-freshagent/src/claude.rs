@@ -213,6 +213,7 @@ struct RollbackAdoption {
 
 /// One live freshclaude session: the Node sidecar it drives + its stdout consumer.
 struct ClaudeSession {
+    configuration: ClaudeConfiguration,
     /// stdin of the Node sidecar (write `create`/`send`/`shutdown` requests).
     stdin: ChildStdin,
     /// The owned Node sidecar child (SIGKILL backstop; `kill_on_drop`).
@@ -339,6 +340,15 @@ struct QuiesceVerdict {
     cancelled_queue: u64,
     in_flight_turn: bool,
     handed_compact_likely: bool,
+}
+
+#[derive(Default)]
+struct ClaudeConfiguration {
+    settings: crate::identity_sink::FreshAgentSettings,
+    pending: Option<(String, tokio::sync::oneshot::Sender<Result<(), String>>)>,
+    commands: Option<Vec<Value>>,
+    needs_configure: bool,
+    runtime_cwd: Option<String>,
 }
 
 impl ClaudeSession {
@@ -649,7 +659,7 @@ impl FreshClaudeState {
             created.clone(),
             session_type.to_string(),
             created.clone(),
-            Some(settings),
+            Some(settings.clone()),
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
@@ -673,6 +683,10 @@ impl FreshClaudeState {
         self.sessions.lock().await.insert(
             created.clone(),
             ClaudeSession {
+                configuration: ClaudeConfiguration {
+                    settings,
+                    ..ClaudeConfiguration::default()
+                },
                 stdin,
                 child,
                 ownership_id: ownership_id.clone(),
@@ -954,6 +968,15 @@ impl FreshClaudeState {
         // resolved before the teardown window serializes identically to one that
         // parked through it.
         let _turn = turn_lock.lock().await;
+        if let Some(settings) = msg.settings.as_ref() {
+            if let Err(err) = self
+                .configure_for_send(&map_key, settings, session_type)
+                .await
+            {
+                self.send_error(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
+                return;
+            }
+        }
         // Task 4 review (C1b): the destroy target comes from POST-lock session
         // state — a rollback holding this lock may have RE-KEYED the durable id
         // (the rollback-row MOVE old→new) while we parked. Keying the destroy by
@@ -1014,8 +1037,11 @@ impl FreshClaudeState {
         };
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
-        let send_req =
+        let mut send_req =
             json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
+        if let Some(images) = msg.images {
+            send_req["images"] = json!(images);
+        }
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
             // The write never went out — undo EXACTLY our own arm (ep2-r2:
@@ -1038,6 +1064,103 @@ impl FreshClaudeState {
                 submitted_turn_id: None,
             },
         ));
+    }
+
+    /// The caller owns the session turn lock. Apply changed settings before any
+    /// send bookkeeping or text delivery, preserving an unsent prompt on failure.
+    async fn configure_for_send(
+        &self,
+        map_key: &str,
+        requested: &freshell_protocol::FreshAgentSendSettings,
+        session_type: &str,
+    ) -> Result<(), String> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (response, next) = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(map_key)
+                .ok_or("Claude session is no longer available.")?;
+            let mut next = session.configuration.settings.clone();
+            if let Some(value) = &requested.model {
+                if next.model.as_ref() != Some(value) && requested.effort.is_none() {
+                    next.effort = None;
+                }
+                next.model = Some(value.clone());
+            }
+            if let Some(value) = &requested.effort {
+                next.effort = Some(value.clone());
+            }
+            if let Some(value) = &requested.permission_mode {
+                next.permission_mode = Some(value.clone());
+            }
+            if let Some(value) = &requested.cwd {
+                if next.cwd.is_some() || session.configuration.runtime_cwd.as_ref() != Some(value) {
+                    next.cwd = Some(value.clone());
+                }
+            }
+            if next == session.configuration.settings && !session.configuration.needs_configure {
+                return Ok(());
+            }
+            if session.in_turn.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(
+                    "Wait for the current turn to finish before changing agent settings.".into(),
+                );
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            session.configuration.pending = Some((request_id.clone(), tx));
+            let frame = json!({
+                "type": "configure", "sessionId": session.sidecar_session_id,
+                "requestId": request_id, "settings": {
+                    "model": next.model, "effort": next.effort,
+                    "permissionMode": next.permission_mode, "cwd": next.cwd,
+                },
+            });
+            if let Err(err) = write_line(&mut session.stdin, &frame).await {
+                session.configuration.pending = None;
+                return Err(err);
+            }
+            (rx, next)
+        };
+        let applied = match tokio::time::timeout(SIDECAR_CREATE_BUDGET, response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                Err("Claude stopped while applying settings. Your message was not sent.".into())
+            }
+            Err(_) => Err(
+                "Claude did not finish applying settings. Your message was not sent; try again."
+                    .into(),
+            ),
+        };
+        let (durable, effective) = {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(map_key)
+                .ok_or("Claude session is no longer available.")?;
+            session.configuration.pending = None;
+            session.configuration.needs_configure = applied.is_err();
+            if applied.is_ok() {
+                session.configuration.settings = next;
+            }
+            // A setter can succeed before a later setter rejects. The receipt
+            // reconciles that partial success; persist the actual runtime state
+            // even though the user's prompt must remain unsent.
+            (
+                session.cli_session_id.clone(),
+                session.configuration.settings.clone(),
+            )
+        };
+        if let Some(durable) = durable {
+            self.adopt_session_init(
+                &durable,
+                map_key,
+                session_type,
+                Some(&effective),
+                None,
+                self.identity_sink(),
+            )
+            .await;
+        }
+        applied
     }
 
     // ── freshAgent.approval.respond / question.respond / compact (WS, Task 2) ─────────
@@ -1338,6 +1461,42 @@ impl FreshClaudeState {
             .map(|q| json!({ "requestId": q.request_id, "questions": q.questions }))
             .collect();
         (approvals, questions)
+    }
+
+    pub(crate) async fn apply_snapshot_metadata(&self, any_id: &str, snapshot: &mut Value) {
+        let Some(key) = self.resolve_session_key(any_id).await else {
+            return;
+        };
+        let sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(&key) else {
+            return;
+        };
+        let status = session.current_status();
+        snapshot["status"] = json!(if status == "idle"
+            && session.in_turn.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            "running".to_string()
+        } else {
+            status
+        });
+        snapshot["extensions"]["claude"]["statusFromLiveState"] = json!(true);
+        let settings = &session.configuration.settings;
+        let mut fields = Map::new();
+        for (key, value) in [
+            ("model", &settings.model),
+            ("effort", &settings.effort),
+            ("permissionMode", &settings.permission_mode),
+        ] {
+            if let Some(value) = value {
+                fields.insert(key.into(), json!(value));
+            }
+        }
+        if !fields.is_empty() {
+            snapshot["settings"] = Value::Object(fields);
+        }
+        if let Some(commands) = &session.configuration.commands {
+            snapshot["commands"] = json!(commands);
+        }
     }
 
     /// Kata 1wxv Task 5: the DURABLE rollback record for the snapshot route.
@@ -2308,6 +2467,10 @@ impl FreshClaudeState {
         self.sessions.lock().await.insert(
             map_key.clone(),
             ClaudeSession {
+                configuration: ClaudeConfiguration {
+                    settings: recovered.clone().unwrap_or_default(),
+                    ..ClaudeConfiguration::default()
+                },
                 stdin,
                 child,
                 ownership_id,
@@ -2734,7 +2897,7 @@ impl FreshClaudeState {
             msg.session_id.clone(),
             session_type.clone(),
             sidecar_session_id.clone(),
-            recovered,
+            recovered.clone(),
             Arc::clone(&broadcast_id),
             Arc::clone(&pending),
             Arc::clone(&last_status),
@@ -2746,6 +2909,10 @@ impl FreshClaudeState {
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
             ClaudeSession {
+                configuration: ClaudeConfiguration {
+                    settings: recovered.unwrap_or_default(),
+                    ..ClaudeConfiguration::default()
+                },
                 stdin,
                 child,
                 ownership_id,
@@ -3025,6 +3192,54 @@ impl FreshClaudeState {
                 // its own recheck). Ordering is instead restored at the
                 // SOURCE by rollback's quiesce probe (see handle_rollback).
                 match value.get("type").and_then(Value::as_str) {
+                    Some("sdk.session.changed") if value["reason"] == "session-commands" => {
+                        if let Some(commands) = value["commands"].as_array() {
+                            if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                                session.configuration.commands = Some(commands.clone());
+                            }
+                        }
+                    }
+                    Some("sdk.configured") => {
+                        if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                            if session
+                                .configuration
+                                .pending
+                                .as_ref()
+                                .is_some_and(|(id, _)| {
+                                    value["requestId"].as_str() == Some(id.as_str())
+                                })
+                            {
+                                if let Some((_, tx)) = session.configuration.pending.take() {
+                                    if let Some(settings) = value["settings"].as_object() {
+                                        let current = &mut session.configuration.settings;
+                                        current.model = settings
+                                            .get("model")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        current.effort = settings
+                                            .get("effort")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        current.permission_mode = settings
+                                            .get("permissionMode")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned);
+                                        if let Some(cwd) =
+                                            settings.get("cwd").and_then(Value::as_str)
+                                        {
+                                            current.cwd = Some(cwd.to_string());
+                                        }
+                                    }
+                                    let result = if value["ok"].as_bool() == Some(true) {
+                                        Ok(())
+                                    } else {
+                                        Err(value["message"].as_str().unwrap_or("Claude could not apply these settings. Your message was not sent.").to_string())
+                                    };
+                                    let _ = tx.send(result);
+                                }
+                            }
+                        }
+                    }
                     Some("sdk.result") => {
                         fold_terminal_edge(&in_turn, &turn_tracker);
                         // A result's trailing idle is its pair punctuation the
@@ -3153,7 +3368,7 @@ impl FreshClaudeState {
                             }
                         }
                     }
-                    Some("sdk.error") => {
+                    Some("sdk.error") if value["turnFailure"].as_bool() != Some(true) => {
                         // The queued ops provably never arrive as
                         // their own turns — clear the QUEUE outright (the running
                         // op and `in_turn` stay fail-closed for its own terminal
@@ -3217,12 +3432,23 @@ impl FreshClaudeState {
                 // entry may not exist yet during create).
                 if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
                     if let Some(cli_id) = value.get("cliSessionId").and_then(Value::as_str) {
+                        let current_settings = {
+                            let mut guard = sessions.lock().await;
+                            guard
+                                .get_mut(&session_id)
+                                .map(|session| {
+                                    session.configuration.runtime_cwd =
+                                        value["cwd"].as_str().map(str::to_string);
+                                    session.configuration.settings.clone()
+                                })
+                                .or_else(|| settings.clone())
+                        };
                         state
                             .adopt_session_init(
                                 cli_id,
                                 &session_id,
                                 &session_type,
-                                settings.as_ref(),
+                                current_settings.as_ref(),
                                 None,
                                 identity_sink.clone(),
                             )
@@ -4321,6 +4547,7 @@ pub(crate) mod tests {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
                 ownership_id: format!("test-{session_id}"),
@@ -5131,6 +5358,7 @@ const liveSessions = new Set(
 // the cancelledQueue the real sidecar reports), mirroring the real
 // cancellation authority at the pre-handoff residence.
 const compactQueue = []
+const configuredSettings = new Map()
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
 rl.on('line', (line) => {
   const trimmed = line.trim()
@@ -5152,6 +5380,7 @@ rl.on('line', (line) => {
       counter += 1
       const sessionId = `fake-claude-session-${process.pid}-${counter}`
       liveSessions.add(sessionId)
+      configuredSettings.set(sessionId, { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd: msg.cwd })
       process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
       // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
       // id when present (resume continuity), else a fixed fake uuid.
@@ -5165,6 +5394,14 @@ rl.on('line', (line) => {
     }
     if (deferCreateMs > 0) setTimeout(answer, deferCreateMs)
     else answer()
+  } else if (msg.type === 'configure') {
+    if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
+    console.log(JSON.stringify({ type: 'sdk.session.changed', sessionId: msg.sessionId, reason: 'session-commands', commands: [{ name: 'review', description: 'Review changes' }] }))
+    const settings = configuredSettings.get(msg.sessionId) ?? {}
+    const ok = msg.settings?.model !== 'unavailable' && msg.settings?.effort !== 'invalid'
+    if (msg.settings?.model !== 'unavailable') settings.model = msg.settings.model
+    if (ok) Object.assign(settings, msg.settings)
+    console.log(JSON.stringify({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok, settings, message: 'Model or effort is unavailable' }))
   } else if (msg.type === 'send') {
     // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
     // the consumer-exit eviction path (ledger A9).
@@ -5433,6 +5670,174 @@ rl.on('line', (line) => {
             request_id: None,
             settings: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_applies_changed_settings_before_text_and_persists_them() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+        let mut create = dedup_create_msg("settings-send");
+        create.model = Some("opus".into());
+        create.effort = Some("high".into());
+        state.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "settings-send").await;
+        let session_id = created["sessionId"].as_str().unwrap();
+        let mut send = send_msg(session_id, "Review this image");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
+            permission_mode: Some("plan".into()),
+            sandbox: None,
+        });
+        send.images = Some(vec![freshell_protocol::FreshAgentImage {
+            data: "YWJj".into(),
+            media_type: "image/png".into(),
+        }]);
+        state.handle_send(send).await;
+        let frames = env.respond_log_frames(1).await;
+        assert_eq!(
+            frames[0]["type"], "configure",
+            "settings must apply before sending text"
+        );
+        let frames = env.respond_log_frames(2).await;
+        assert_eq!(frames[1]["text"], "Review this image");
+        assert_eq!(frames[1]["images"][0]["data"], "YWJj");
+        let mut snapshot = json!({});
+        state
+            .apply_snapshot_metadata(session_id, &mut snapshot)
+            .await;
+        assert_eq!(
+            snapshot["settings"],
+            json!({ "model": "sonnet", "effort": "max", "permissionMode": "plan" })
+        );
+        assert_eq!(
+            snapshot["commands"],
+            json!([{ "name": "review", "description": "Review changes" }])
+        );
+        assert_eq!(
+            snapshot["status"], "running",
+            "accepted input is busy before the first provider output"
+        );
+        assert_eq!(
+            snapshot["extensions"]["claude"]["statusFromLiveState"],
+            true
+        );
+        let bindings = fake.bindings.lock().unwrap();
+        let settings = &bindings.last().unwrap().settings;
+        assert_eq!(settings.model.as_deref(), Some("sonnet"));
+        assert_eq!(settings.effort.as_deref(), Some("max"));
+        assert_eq!(settings.permission_mode.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_effort_records_the_model_that_already_took_effect() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+        let mut create = dedup_create_msg("partial-settings");
+        create.model = Some("opus".into());
+        create.effort = Some("high".into());
+        state.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "partial-settings").await;
+        let session_id = created["sessionId"].as_str().unwrap();
+        let mut send = send_msg(session_id, "Keep this unsent");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            model: Some("sonnet".into()),
+            effort: Some("invalid".into()),
+            cwd: None,
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(send).await;
+        assert!(await_top_level_error(&mut rx)
+            .await
+            .contains("CLAUDE_SETTINGS_FAILED"));
+        assert_eq!(
+            env.respond_log_frames(1).await.len(),
+            1,
+            "failed configuration must not send the prompt"
+        );
+        let mut snapshot = json!({"status": "idle"});
+        state
+            .apply_snapshot_metadata(session_id, &mut snapshot)
+            .await;
+        assert_eq!(snapshot["settings"]["model"], "sonnet");
+        assert_eq!(snapshot["settings"]["effort"], "high");
+        assert_eq!(snapshot["status"], "idle");
+        let bindings = fake.bindings.lock().unwrap();
+        assert_eq!(
+            bindings.last().unwrap().settings.model.as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            bindings.last().unwrap().settings.effort.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_rejects_failed_settings_without_losing_text_or_changing_saved_settings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+        let mut create = dedup_create_msg("settings-fail");
+        create.model = Some("opus".into());
+        state.handle_create(create).await;
+        let created = await_claude_created(&mut rx, "settings-fail").await;
+        let session_id = created["sessionId"].as_str().unwrap();
+        let mut send = send_msg(session_id, "Do not lose this prompt");
+        send.request_id = Some("retained-prompt".into());
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("unavailable".into()),
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(send).await;
+        let frames = env.respond_log_frames(1).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "configure");
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_ne!(frame["type"], "freshAgent.send.accepted");
+                if frame["type"] == "error" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(error["requestId"], "retained-prompt");
+        assert!(error["message"].as_str().unwrap().contains("unavailable"));
+        assert_eq!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .settings
+                .model
+                .as_deref(),
+            Some("opus")
+        );
+        assert!(!state
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .unwrap()
+            .in_turn
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
@@ -5774,6 +6179,7 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             session_id.to_string(),
             ClaudeSession {
+                configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
                 ownership_id: format!("test-{session_id}"),
@@ -7015,6 +7421,7 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             map_key.to_string(),
             ClaudeSession {
+                configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
                 ownership_id: format!("test-{map_key}"),
@@ -7062,6 +7469,7 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             map_key.to_string(),
             ClaudeSession {
+                configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
                 ownership_id: format!("test-{map_key}"),
@@ -7152,6 +7560,7 @@ rl.on('line', (line) => {
         st.sessions.lock().await.insert(
             map_key.to_string(),
             ClaudeSession {
+                configuration: ClaudeConfiguration::default(),
                 stdin,
                 child,
                 ownership_id: format!("test-live-{map_key}"),

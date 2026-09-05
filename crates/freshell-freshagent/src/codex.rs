@@ -80,6 +80,9 @@ use crate::summary::{
 };
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
+mod controls;
+mod metadata;
+
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
@@ -184,6 +187,7 @@ pub struct FreshCodexState {
     /// proceeds and destroys redo ("send waits, rollback wins, then destroys") —
     /// no circular wait, no deadlock.
     rollback_in_flight: crate::InFlightRegistry,
+    controls: controls::ControlRegistry,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -364,6 +368,7 @@ impl FreshCodexState {
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            controls: Default::default(),
         }
     }
 
@@ -585,8 +590,12 @@ impl FreshCodexState {
         let model = normalize_freshcodex_model(raw_model.as_deref());
         let raw_effort = msg.effort.clone().or(rec.effort);
         let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
-        let sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
-        let permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
+        let mut sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
+        let mut permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
+        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
+            self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", error);
+            return;
+        }
 
         // Validate the effort maps to the codex wire vocabulary (adapter create calls
         // toCodexReasoningEffort purely to reject unsupported efforts before spawning).
@@ -1200,30 +1209,11 @@ impl FreshCodexState {
         // Look up the session; extract the client + settings under the lock (Child isn't Clone).
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard.get(&session_id).map(|s| {
-                (
-                    s.client.clone(),
-                    s.model.clone(),
-                    s.effort.clone(),
-                    s.cwd.clone().or_else(|| cwd.clone()),
-                    s.sandbox.clone(),
-                    s.permission_mode.clone(),
-                    s.active_turn.clone(),
-                    s.turn_lock.clone(),
-                )
-            })
+            guard
+                .get(&session_id)
+                .map(|s| (s.client.clone(), s.active_turn.clone(), s.turn_lock.clone()))
         };
-        let Some((
-            client,
-            model,
-            effort,
-            turn_cwd,
-            sandbox,
-            permission_mode,
-            active_turn,
-            turn_lock,
-        )) = looked_up
-        else {
+        let Some((client, active_turn, turn_lock)) = looked_up else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
@@ -1238,6 +1228,44 @@ impl FreshCodexState {
         // this lock, the send simply waits, then proceeds and destroys redo
         // ("send waits, rollback wins, then destroys").
         let _turn = turn_lock.lock().await;
+
+        // Read defaults after acquiring the turn lock: a queued send inherits the
+        // last accepted settings, while this message's explicit choices win.
+        let stored = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id).map(|s| {
+                (
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.cwd.clone(),
+                    s.sandbox.clone(),
+                    s.permission_mode.clone(),
+                )
+            })
+        };
+        let Some((stored_model, stored_effort, stored_cwd, stored_sandbox, stored_permission)) =
+            stored
+        else {
+            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+            return;
+        };
+        let settings = msg.settings.as_ref();
+        let model = settings
+            .and_then(|s| s.model.clone())
+            .unwrap_or(stored_model);
+        let effort = settings.and_then(|s| s.effort.clone()).or(stored_effort);
+        let turn_cwd = settings.and_then(|s| s.cwd.clone()).or(stored_cwd).or(cwd);
+        let mut sandbox = settings
+            .and_then(|s| s.sandbox)
+            .map(sandbox_wire_value)
+            .or(stored_sandbox);
+        let mut permission_mode = settings
+            .and_then(|s| s.permission_mode.clone())
+            .or(stored_permission);
+        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
+            self.send_error(&request_id, "INVALID_PERMISSION_MODE", error);
+            return;
+        }
 
         // Decision 5 (codex/opencode/claude share this helper): any new
         // submission permanently destroys redo. AWAITED before the turn goes
@@ -1266,10 +1294,9 @@ impl FreshCodexState {
 
         let params = StartTurnParams {
             thread_id: session_id.clone(),
-            // toCodexUserInput(text): [{ type:'text', text, text_elements:[] }] (adapter.ts:164).
-            input: vec![json!({ "type": "text", "text": msg.text, "text_elements": [] })],
+            input: codex_user_input(&msg.text, msg.images.as_deref()),
             cwd: turn_cwd.clone(),
-            model: Some(model),
+            model: Some(model.clone()),
             // DEV-0003: none/minimal/low/medium/high forwarded VERBATIM; max/xhigh → xhigh.
             effort: wire_effort,
             sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
@@ -1288,6 +1315,27 @@ impl FreshCodexState {
                 return;
             }
         };
+
+        // Only persist choices once the provider has accepted them. Failed sends
+        // keep the previous working settings for resume and retry.
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            session.model = model.clone();
+            session.effort = effort.clone();
+            session.cwd = turn_cwd.clone();
+            session.sandbox = sandbox.clone();
+            session.permission_mode = permission_mode.clone();
+        }
+        self.record_codex_binding(
+            &session_id,
+            None,
+            &model,
+            sandbox.as_deref(),
+            permission_mode.as_deref(),
+            effort.as_deref(),
+            turn_cwd.as_deref(),
+            None,
+        )
+        .await;
 
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
@@ -2294,6 +2342,8 @@ impl FreshCodexState {
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
         let session_id = msg.session_id.clone();
 
+        self.clear_controls(&session_id).await;
+
         let removed = self.sessions.lock().await.remove(&session_id);
         if let Some(session) = removed {
             session.consumer.abort();
@@ -3205,12 +3255,20 @@ impl FreshCodexState {
         gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
+        let state = self.clone();
         tokio::spawn(async move {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
+            state.clear_controls(&thread_id).await;
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
+                if state
+                    .consume_control_notification(&thread_id, &notification)
+                    .await
+                {
+                    continue;
+                }
                 let events = reduce_notification(
                     &mut subscription,
                     notification,
@@ -3230,6 +3288,7 @@ impl FreshCodexState {
                     }
                 }
             }
+            state.clear_controls(&thread_id).await;
         })
     }
 
@@ -3277,14 +3336,29 @@ impl FreshCodexState {
         let rollback = self
             .identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, thread_id));
-        build_codex_snapshot_json(
+        let mut snapshot = build_codex_snapshot_json(
             thread_id,
             &raw,
             active_turn_present,
             history_mode,
             rollback.as_ref(),
         )
-        .map_err(CodexSnapshotError::Protocol)
+        .map_err(CodexSnapshotError::Protocol)?;
+        self.overlay_controls(thread_id, &mut snapshot).await;
+        if let Some(session) = self.sessions.lock().await.get(thread_id) {
+            let mut settings = Map::new();
+            if !session.model.is_empty() {
+                settings.insert("model".into(), json!(session.model));
+            }
+            if let Some(effort) = &session.effort {
+                settings.insert("effort".into(), json!(effort));
+            }
+            if let Some(permission) = &session.permission_mode {
+                settings.insert("permissionMode".into(), json!(permission));
+            }
+            snapshot["settings"] = Value::Object(settings);
+        }
+        Ok(snapshot)
     }
 
     /// Resolve the live client + active-turn bit for `thread_id`, via
@@ -4322,6 +4396,7 @@ fn build_codex_snapshot_json(
         })
         .collect();
 
+    let (diffs, child_threads) = metadata::transcript_metadata(&turns);
     let undo_capable = history_mode == Some(HistoryMode::Paginated);
     let mut snapshot = json!({
         "sessionType": SESSION_TYPE,
@@ -4337,8 +4412,8 @@ fn build_codex_snapshot_json(
             "questions": false,
             "fork": !is_running,
             "worktrees": false,
-            "diffs": false,
-            "childThreads": false,
+            "diffs": !diffs.is_empty(),
+            "childThreads": !child_threads.is_empty(),
             // Kata 1wxv Task 5: SESSION-SCOPED stamps (correction item 1, r3) —
             // undo iff the thread's durable history mode is paginated; codex
             // redo is permanently unavailable (revert is destructive; there is
@@ -4357,8 +4432,8 @@ fn build_codex_snapshot_json(
         "pendingApprovals": [],
         "pendingQuestions": [],
         "worktrees": [],
-        "diffs": [],
-        "childThreads": [],
+        "diffs": diffs,
+        "childThreads": child_threads,
         "turns": turns,
         "extensions": { "codex": {} },
     });
@@ -4723,7 +4798,9 @@ fn reduce_notification(
                 .into_iter()
                 .collect()
         }
-        CodexNotification::FsChanged { .. } | CodexNotification::Other { .. } => Vec::new(),
+        CodexNotification::FsChanged { .. }
+        | CodexNotification::Other { .. }
+        | CodexNotification::ServerRequest { .. } => Vec::new(),
     }
 }
 
@@ -5040,6 +5117,33 @@ fn sandbox_wire_value(sandbox: freshell_protocol::Sandbox) -> String {
         freshell_protocol::Sandbox::DangerFullAccess => "danger-full-access",
     }
     .to_string()
+}
+
+fn normalize_codex_permission(
+    permission: &mut Option<String>,
+    sandbox: &mut Option<String>,
+) -> Result<(), &'static str> {
+    // Older settings offered Read-only in the approval menu. Preserve that
+    // intent using the actual sandbox field instead of sending an invalid policy.
+    if permission.as_deref() == Some("read-only") {
+        *permission = Some("on-request".into());
+        *sandbox = Some("read-only".into());
+    }
+    match permission.as_deref() {
+        None | Some("untrusted" | "on-failure" | "on-request" | "never") => Ok(()),
+        _ => Err("Choose a supported Codex approval policy: untrusted, on-failure, on-request, or never."),
+    }
+}
+
+fn codex_user_input(
+    text: &str,
+    images: Option<&[freshell_protocol::FreshAgentImage]>,
+) -> Vec<Value> {
+    let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
+    for image in images.unwrap_or_default() {
+        input.push(json!({ "type": "image", "url": format!("data:{};base64,{}", image.media_type, image.data) }));
+    }
+    input
 }
 
 /// `toCodexSandboxPolicy(sandbox)` (adapter.ts:136-149): the turn/start `sandboxPolicy` object.
@@ -5561,7 +5665,7 @@ pub(crate) mod tests {
 
     // ── freshAgent.interrupt / freshAgent.kill / onExit self-heal (PR-1) ───────
 
-    fn state_with_bus() -> (FreshCodexState, tokio::sync::broadcast::Receiver<String>) {
+    pub(super) fn state_with_bus() -> (FreshCodexState, tokio::sync::broadcast::Receiver<String>) {
         let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshCodexState::new(
             Arc::new("tok".to_string()),
@@ -5636,7 +5740,7 @@ pub(crate) mod tests {
 
     /// A harmless real child that stays alive until reaped (the interrupt/kill tests' fake
     /// "owned sidecar" -- no real `codex` binary needed).
-    fn spawn_sleeper() -> tokio::process::Child {
+    pub(super) fn spawn_sleeper() -> tokio::process::Child {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("30");
         cmd.kill_on_drop(true);
@@ -5649,7 +5753,7 @@ pub(crate) mod tests {
     /// [`freshell_codex::ChannelPeer`] actually flows through [`reduce_notification`]
     /// and clears `active_turn` -- exercising the exact production path `get_snapshot`
     /// (REST) relies on for `capabilities.send`.
-    async fn insert_fake_session_with_real_consumer(
+    pub(super) async fn insert_fake_session_with_real_consumer(
         state: &FreshCodexState,
         thread_id: &str,
         client: Arc<CodexAppServerClient>,
@@ -5785,6 +5889,93 @@ pub(crate) mod tests {
             "composer must be sendable once the real notification stream has cleared the active turn"
         );
         assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn send_applies_updated_model_effort_permissions_and_images() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (st, _) = state_with_bus();
+        st.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-parity-send",
+        )
+        .await;
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(serde_json::from_value(json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"thread-1", "text":"Look at this",
+                "images":[{"data":"aGVsbG8=", "mediaType":"image/png"}],
+                "settings":{"model":"gpt-5.5", "effort":"low", "permissionMode":"never", "sandbox":"read-only", "cwd":"/tmp"}
+            })).unwrap()).await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({"turn":{"id":"turn-new"}}));
+        task.await.unwrap();
+        let saved = st
+            .identity_sink()
+            .unwrap()
+            .load_settings("codex", "thread-1")
+            .expect("accepted settings survive resume");
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(saved.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(saved.effort.as_deref(), Some("low"));
+        assert_eq!(saved.permission_mode.as_deref(), Some("never"));
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["effort"], "low");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["cwd"], "/tmp");
+        assert_eq!(
+            params["input"][1],
+            json!({"type":"image","url":"data:image/png;base64,aGVsbG8="})
+        );
+    }
+
+    #[test]
+    fn codex_snapshot_exposes_actual_changed_files_and_child_threads() {
+        let raw = json!({"thread":{"id":"parent", "turns":[{"id":"turn-1", "items":[
+            {"id":"edit-1","type":"fileChange","status":"completed","changes":[{"path":"src/app.ts","kind":{"type":"update"},"diff":"-old\n+new"}]},
+            {"id":"child-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"parent","receiverThreadIds":["child"],"agentsStates":{}},
+            {"id":"edit-2","type":"fileChange","status":"completed","changes":[{"path":"src/app.ts","kind":{"type":"update"},"diff":"-new\n+final"}]},
+            {"id":"child-2","type":"collabAgentToolCall","tool":"wait","status":"completed","senderThreadId":"parent","receiverThreadIds":["child"],"agentsStates":{}}
+        ]}]}});
+        let snapshot = build_codex_snapshot_json("parent", &raw, false, None, None).unwrap();
+        assert_eq!(snapshot["capabilities"]["diffs"], true);
+        assert_eq!(
+            snapshot["diffs"],
+            json!([{"id":"src/app.ts","path":"src/app.ts","status":"completed"}])
+        );
+        assert_eq!(snapshot["capabilities"]["childThreads"], true);
+        assert_eq!(
+            snapshot["childThreads"],
+            json!([{"id":"child","threadId":"child","origin":"spawnAgent"}])
+        );
+    }
+
+    #[test]
+    fn legacy_read_only_permission_preserves_read_only_intent() {
+        let mut permission = Some("read-only".into());
+        let mut sandbox = Some("danger-full-access".into());
+        normalize_codex_permission(&mut permission, &mut sandbox).unwrap();
+        assert_eq!(permission.as_deref(), Some("on-request"));
+        assert_eq!(sandbox.as_deref(), Some("read-only"));
+        let mut permission = Some("not-a-policy".into());
+        assert!(normalize_codex_permission(&mut permission, &mut sandbox).is_err());
     }
 
     #[tokio::test]

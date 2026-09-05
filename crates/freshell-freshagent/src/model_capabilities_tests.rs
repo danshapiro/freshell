@@ -112,6 +112,37 @@ fn expected_model_json(m: &ModelCapability) -> Value {
     serde_json::to_value(m).unwrap()
 }
 
+#[tokio::test]
+async fn claude_catalog_probes_live_models_and_shares_cache_with_kilroy() {
+    let opencode = Arc::new(RecordingProbe::new());
+    let claude = Arc::new(RecordingProbe::new());
+    let mut model = cap("sonnet", "Claude Sonnet", None);
+    model.provider = "claude";
+    claude.push_ok(vec![model]).await;
+    let (registry, _) = registry_with(opencode.clone());
+    let registry = registry.with_claude_probe(claude.clone());
+    let (status, first) = registry.get(SessionType::FreshClaude, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["models"][0]["id"], "sonnet");
+    let (_, cached) = registry.get(SessionType::Kilroy, None).await;
+    assert_eq!(cached["status"], "cached");
+    assert_eq!(cached["sessionType"], "kilroy");
+    assert_eq!(claude.call_count().await, 1);
+    assert_eq!(opencode.call_count().await, 0);
+    claude
+        .push_err(CapabilityError {
+            code: "CAPABILITY_PROBE_FAILED".into(),
+            message: "login required".into(),
+            retryable: true,
+        })
+        .await;
+    let (status, failed) = registry.refresh(SessionType::FreshClaude, None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(failed["status"], "unavailable");
+    let (_, cached) = registry.get(SessionType::FreshClaude, None).await;
+    assert_eq!(cached["models"][0]["id"], "sonnet");
+}
+
 // ── registry semantics (model-capability-registry.test.ts ports) ──────────────
 
 /// Port of "caches OpenCode capabilities by cwd without probing Claude or live
@@ -260,11 +291,9 @@ async fn blank_cwd_maps_to_default_cache_key() {
     assert_eq!(probe.calls().await, vec![None]);
 }
 
-/// Port of "serves non-Claude fresh-agent catalogs without reusing the Claude
-/// probe cache" + the static-codec arm (`:187-221`), AND the documented claude
-/// static deviation (module doc).
+/// Codex keeps its built-in catalog without starting a Claude or OpenCode probe.
 #[tokio::test]
-async fn non_opencode_session_types_serve_static_catalogs() {
+async fn codex_serves_static_catalog() {
     let probe = Arc::new(RecordingProbe::new());
     let (registry, _now) = registry_with(probe.clone());
 
@@ -307,35 +336,24 @@ async fn non_opencode_session_types_serve_static_catalogs() {
         })
     );
 
-    for (st, wire) in [
-        (SessionType::Kilroy, "kilroy"),
-        (SessionType::FreshClaude, "freshclaude"),
-    ] {
-        let (status, body) = registry.get(st, None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            json!({
-                "ok": true,
-                "sessionType": wire,
-                "runtimeProvider": "claude",
-                "status": "fresh",
-                "fetchedAt": 1_000,
-                "models": [
-                    {
-                        "id": "opus[1m]",
-                        "displayName": "Claude Opus 5 (1M context)",
-                        "provider": "claude",
-                        "supportsEffort": true,
-                        "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
-                        "supportsAdaptiveThinking": true,
-                    },
-                ],
-            })
-        );
-    }
-
     assert_eq!(probe.call_count().await, 0, "static paths never probe");
+}
+
+#[test]
+fn claude_catalog_keeps_live_effort_choices_and_deduplicates_models() {
+    let models = normalize_claude_catalog(json!([
+        { "value": "sonnet", "displayName": "Claude Sonnet", "supportedEffortLevels": ["low", "high", "high"], "supportsAdaptiveThinking": true },
+        { "value": "haiku", "displayName": "Claude Haiku" },
+        { "value": "sonnet", "displayName": "Duplicate" }
+    ])).unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].id, "sonnet");
+    assert_eq!(models[0].provider, "claude");
+    assert_eq!(models[0].supported_effort_levels, vec!["low", "high"]);
+    assert!(models[0].supports_effort);
+    assert!(!models[1].supports_effort);
+    assert!(normalize_claude_catalog(json!([])).is_err());
+    assert!(normalize_claude_catalog(json!([{"displayName": "No id"}])).is_err());
 }
 
 // ── route level (model-capabilities-router.ts ports) ─────────────────────────

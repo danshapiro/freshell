@@ -10,6 +10,15 @@ import type { SessionListMetadata } from '../types'
 import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import type { CodexDurabilityRef, CodexDurabilityStateName } from '../../../shared/codex-durability.js'
+import { sessionStatusTierRank, type SessionStatusTier } from '@/store/selectors/sessionStatusTiers'
+import { makeSelectSessionStatusTiers } from '@/store/selectors/sessionStatusTiers'
+
+/**
+ * Module-scope instance of the status-tier selector, shared by every
+ * makeSelectSortedSessionItems() instance (pure function of store state, and
+ * createSelector's last-args memo makes shared use safe).
+ */
+const selectSessionStatusTiers = makeSelectSessionStatusTiers()
 
 export interface SidebarSessionItem {
   id: string
@@ -670,7 +679,7 @@ export function filterSessionItemsByVisibility(
 export function sortSessionItems(
   items: SidebarSessionItem[],
   sortMode: string,
-  options?: { disableTabPinning?: boolean },
+  options?: { disableTabPinning?: boolean; statusTiers?: Record<string, SessionStatusTier> },
 ): SidebarSessionItem[] {
   const sorted = [...items]
 
@@ -690,6 +699,40 @@ export function sortSessionItems(
     const bTime = b.ratchetedActivity ?? b.timestamp
     return bTime - aTime || compareBySessionKey(a, b)
   }
+
+  /**
+   * Activity-recency WITHOUT the hasRatcheted-first sub-partition. Used by the
+   * tiered path: within a status tier the ordering is pure recency
+   * (ratchetedActivity ?? timestamp), so a grey session touched on transition
+   * to grey competes with untouched greys on timestamp alone.
+   */
+  const compareByActivityRecency = (a: SidebarSessionItem, b: SidebarSessionItem) => {
+    const aTime = a.ratchetedActivity ?? a.timestamp
+    const bTime = b.ratchetedActivity ?? b.timestamp
+    return bTime - aTime || compareBySessionKey(a, b)
+  }
+
+  /**
+   * Tiered activity ordering for the default sidebar sort: local-busy (solid
+   * blue) → local-open (solid green) → remote-busy (blue ring) → remote-open
+   * (green ring) → grey, with activity recency inside each tier. The tier map
+   * is authoritative — an item absent from it is grey here even if it happens
+   * to carry hasTab (the producing selector owns that mapping).
+   *
+   * Within-tier comparators preserve the pre-tiering semantics exactly:
+   * locally-open tiers reuse the old withTabs comparator (pure recency), while
+   * remote/grey tiers reuse the old withoutTabs comparator (ratchet-presence
+   * first, then recency) — so a grey-transition touch (a ratchet write) floats
+   * the session to the very top of the grey tier.
+   */
+  const LOCAL_TIER_MAX_RANK = 1
+  const compareByStatusTiers = (statusTiers: Record<string, SessionStatusTier>) =>
+    (a: SidebarSessionItem, b: SidebarSessionItem) => {
+      const aRank = sessionStatusTierRank(statusTiers, `${a.provider}:${a.sessionId}`)
+      const bRank = sessionStatusTierRank(statusTiers, `${b.provider}:${b.sessionId}`)
+      if (aRank !== bRank) return aRank - bRank
+      return aRank <= LOCAL_TIER_MAX_RANK ? compareByActivityRecency(a, b) : compareByActivity(a, b)
+    }
 
   const sortByMode = (list: SidebarSessionItem[]) => {
     const copy = [...list]
@@ -715,6 +758,10 @@ export function sortSessionItems(
     if (sortMode === 'activity') {
       if (options?.disableTabPinning) {
         return copy.sort(compareByActivity)
+      }
+
+      if (options?.statusTiers) {
+        return copy.sort(compareByStatusTiers(options.statusTiers))
       }
 
       const withTabs = copy.filter((i) => i.hasTab)
@@ -773,6 +820,7 @@ export const makeSelectSortedSessionItems = () =>
       selectAppliedSearchTier,
       selectTerminals,
       selectFilter,
+      selectSessionStatusTiers,
     ],
     (
       projects,
@@ -791,7 +839,8 @@ export const makeSelectSortedSessionItems = () =>
       appliedQuery,
       appliedSearchTier,
       terminals,
-      filter
+      filter,
+      sessionStatusTiers,
     ) => {
       const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping, paneLastInputAt)
       const visible = filterSessionItemsByVisibility(items, {
@@ -806,6 +855,7 @@ export const makeSelectSortedSessionItems = () =>
       const filtered = filterSessionItems(searchAware, filter)
       return sortSessionItems(filtered, sortMode, {
         disableTabPinning: appliedQuery.trim().length > 0,
+        statusTiers: sessionStatusTiers,
       })
     }
   )

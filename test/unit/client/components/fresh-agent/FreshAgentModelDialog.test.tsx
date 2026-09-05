@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { FreshAgentModelDialog } from '@/components/fresh-agent/FreshAgentModelDialog'
 import { useAppSelector } from '@/store/hooks'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer, { initLayout, mergePaneContent } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
@@ -231,6 +231,10 @@ beforeEach(() => {
   window.localStorage.removeItem('freshcodex.modelMru.v2')
   window.localStorage.removeItem('freshopencode.modelLevelMru.v1')
   window.localStorage.removeItem('freshcodex.modelLevelMru.v1')
+  window.localStorage.removeItem('freshclaude.modelMru.v2')
+  window.localStorage.removeItem('freshclaude.modelLevelMru.v1')
+  window.localStorage.removeItem('kilroy.modelMru.v2')
+  window.localStorage.removeItem('kilroy.modelLevelMru.v1')
 })
 
 afterEach(() => {
@@ -374,15 +378,16 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
   it('preselects the model’s last-used level from the per-model level store', async () => {
     seedLevelMru([{ modelId: 'opencode-go/glm-5.2', level: 'high', cwdKey: '/repo/project-a', lastUsedAt: 1_000 }])
     const store = createStore()
-    seedFreshopencodePane(store)
+    seedFreshopencodePane(store, { model: 'kimi-for-coding/kimi-k3' })
 
     renderDialog(store, { open: true })
 
+    fireEvent.click(await screen.findByRole('option', { name: /^GLM 5.2$/ }))
+
     expect(await screen.findByRole('button', { name: 'Use GLM 5.2 · high' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: /high last used/ })).toBeInTheDocument()
-    // highest (max) is also the pane's current level → ● shown, no double-annotation
-    expect(screen.getByRole('option', { name: /max current/ })).toBeInTheDocument()
-    expect(screen.queryByRole('option', { name: /max.*highest/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /max highest/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /max.*current/ })).not.toBeInTheDocument()
   })
 
   it('renders exactly one Default row for a model with no declared levels', async () => {
@@ -534,6 +539,24 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
 })
 
 describe('FreshAgentModelDialog (freshcodex)', () => {
+  it('preserves the current thinking level when confirming an unchanged model', () => {
+    const store = createStore()
+    seedFreshcodexPane(store, { effort: 'low' })
+    renderDialog(store, { open: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.5 · low' }))
+    expect(paneContent(store).effort).toBe('low')
+  })
+
+  it('discards a cancelled model selection when the dialog reopens', () => {
+    const store = createStore()
+    seedFreshcodexPane(store)
+    const view = renderDialog(store, { open: true })
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+    view.rerender(<Provider store={store}><StoreBackedDialog open={false} /></Provider>)
+    view.rerender(<Provider store={store}><StoreBackedDialog open /></Provider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.5 · max' }))
+    expect(paneContent(store).model).toBe('gpt-5.5')
+  })
   it('uses the static freshcodex table without probing the catalog endpoint', async () => {
     const store = createStore()
     seedFreshcodexPane(store)
@@ -586,6 +609,58 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
 })
 
 describe('FreshAgentModelDialog (freshclaude)', () => {
+  it('does not prune another project’s recent models with the previous project’s catalog', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValueOnce({
+      ...CLAUDE_CATALOG_RESPONSE,
+      models: [{ ...CLAUDE_CATALOG_RESPONSE.models[1], id: 'old-model', displayName: 'Old model' }],
+    }).mockReturnValueOnce(new Promise(() => {}))
+    window.localStorage.setItem('freshclaude.modelMru.v2', JSON.stringify([{
+      id: 'sonnet', displayName: 'Sonnet', source: { id: 'claude', displayName: 'Claude' },
+      cwdKey: '/repo/project-b', lastVerifiedAt: Date.now(),
+    }]))
+    const store = createStore()
+    seedFreshclaudePane(store)
+    renderDialog(store, { open: true })
+    await screen.findByRole('option', { name: /^Old model$/ })
+    store.dispatch(mergePaneContent({ tabId: 'tab-1', paneId: 'pane-1', updates: { initialCwd: '/repo/project-b' } }))
+    await waitFor(() => expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledTimes(2))
+    expect(JSON.parse(window.localStorage.getItem('freshclaude.modelMru.v2') ?? '[]')).toContainEqual(
+      expect.objectContaining({ id: 'sonnet', cwdKey: '/repo/project-b' }),
+    )
+    expect(screen.queryByRole('option', { name: /^Old model$/ })).not.toBeInTheDocument()
+  })
+  it('keeps typed search text when the live catalog arrives', async () => {
+    let resolveProbe!: (value: typeof CLAUDE_CATALOG_RESPONSE) => void
+    getFreshAgentModelCapabilitiesSpy.mockReturnValueOnce(new Promise((resolve) => { resolveProbe = resolve }))
+    const store = createStore()
+    seedFreshclaudePane(store)
+    renderDialog(store, { open: true })
+    const search = screen.getByRole('searchbox', { name: 'Filter models' })
+    fireEvent.change(search, { target: { value: 'sonnet' } })
+    resolveProbe(CLAUDE_CATALOG_RESPONSE)
+    await screen.findByRole('option', { name: /^Sonnet$/ })
+    expect(search).toHaveValue('sonnet')
+    expect(screen.queryByRole('option', { name: /Opus/ })).not.toBeInTheDocument()
+  })
+
+  it('remembers Claude models and thinking choices across dialog sessions', async () => {
+    getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CLAUDE_CATALOG_RESPONSE)
+    const store = createStore()
+    seedFreshclaudePane(store)
+    const view = renderDialog(store, { open: true })
+    fireEvent.click(await screen.findByRole('option', { name: /^Sonnet$/ }))
+    fireEvent.click(screen.getByRole('option', { name: /^low$/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Sonnet · low' }))
+    view.unmount()
+    const nextStore = createStore()
+    seedFreshclaudePane(nextStore)
+    renderDialog(nextStore, { open: true })
+    await waitFor(() => expect(screen.getByRole('listbox', { name: 'Models' })).toHaveTextContent('Recent'))
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Filter models' }), { target: { value: 'Sonnet' } })
+    fireEvent.click((await screen.findAllByRole('option', { name: /^Sonnet$/ }))[0])
+    fireEvent.click(screen.getByRole('button', { name: 'Use Sonnet · low' }))
+    expect(paneContent(nextStore)).toMatchObject({ model: 'sonnet', effort: 'low' })
+  })
   it('renders the static claude row immediately and merges the probed claude catalog static-wins', async () => {
     // Deferred probe: statics render instantly (no loading gate), exactly like
     // the settings popover's claude path.
@@ -659,6 +734,7 @@ describe('FreshAgentModelDialog (freshclaude)', () => {
     renderDialog(store, { open: true, onClose })
 
     fireEvent.click(await screen.findByRole('option', { name: /Claude Opus 5 \(1M context\)/ }))
+    fireEvent.click(screen.getByRole('option', { name: /^max highest$/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Use Claude Opus 5 (1M context) · max' }))
 
     expect(onClose).toHaveBeenCalled()

@@ -25,6 +25,8 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
     onMessage: mockOnMessage,
+    // Interest is transient and negotiated; this suite does not exercise it.
+    sendTerminalInterest: vi.fn(() => false),
     onReconnect: mockOnReconnect,
     connect: mockConnect,
     setHelloExtensionProvider: vi.fn(),

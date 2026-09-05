@@ -172,6 +172,10 @@ async fn get_snapshot(
                         approvals,
                         questions,
                     );
+                    state
+                        .claude
+                        .apply_snapshot_metadata(&thread_id, &mut snapshot)
+                        .await;
                     Json(snapshot).into_response()
                 }
                 Err(crate::claude_snapshot::ClaudeSnapshotError::NotFound) => fail_with_code(
@@ -713,9 +717,8 @@ mod tests {
         assert_eq!(prefix, vec!["u1", "a1"]);
     }
 
-    /// Task 3: a live session with NOTHING pending must keep the exact pre-overlay
-    /// response shape (fields/values) — reload-while-idle is unchanged, and the golden
-    /// FIXTURE (`builder_output_matches_the_golden_snapshot_fixture`) stays untouched.
+    /// An idle live session keeps the disk-backed history and empty pending
+    /// shape, with an additive marker proving its idle status is live truth.
     #[tokio::test]
     async fn claude_locator_with_a_live_but_empty_pending_set_keeps_the_empty_shape() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -748,9 +751,10 @@ mod tests {
         );
         // `revision` is transcript-mtime-derived — not the shape under test.
         expected["revision"] = value["revision"].clone();
+        expected["extensions"]["claude"]["statusFromLiveState"] = json!(true);
         assert_eq!(
             value, expected,
-            "empty pending ⇒ byte-shape identical to the pre-overlay builder output"
+            "empty live pending preserves the snapshot apart from its status authority marker"
         );
     }
 

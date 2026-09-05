@@ -36,6 +36,8 @@ const wsMocks = vi.hoisted(() => {
       messageHandlers.add(callback)
       return () => messageHandlers.delete(callback)
     }),
+    // Interest is transient and negotiated; this suite does not exercise it.
+    sendTerminalInterest: vi.fn(() => false),
     onReconnect: vi.fn(() => () => {}),
     setHelloExtensionProvider: vi.fn(),
     isReady: false,
@@ -59,6 +61,7 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsMocks.send,
     connect: wsMocks.connect,
+    sendTerminalInterest: wsMocks.sendTerminalInterest,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,

@@ -951,6 +951,37 @@ impl FreshOpencodeState {
         self.sessions.lock().await.contains_key(session_id)
     }
 
+    /// Snapshot of every live fresh-opencode session key (placeholder AND
+    /// durable `ses_*` ids — the `sessions` map mirrors both). A consumer
+    /// that can await should prefer per-id [`FreshOpencodeState::has_live_session`]
+    /// checks against CURRENT state: a snapshot taken earlier is stale the
+    /// moment `handle_send` keys a new session mid-window — delta repair 2
+    /// moved the identity-invariant sweep's probe off its pre-read snapshot
+    /// to a post-read `has_live_session` for exactly that reason.
+    pub async fn live_session_ids(&self) -> std::collections::HashSet<String> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Test-only seeding route for cross-crate consumers (freshell-ws's
+    /// identity-invariant probe-phase tests): insert the smallest possible
+    /// live session record under exactly this key, mirroring the direct-map
+    /// seeding the in-crate unit tests use
+    /// (`live_session_ids_snapshots_every_session_map_key`). Real sessions
+    /// enter the map through `handle_create` / `handle_send` — production
+    /// code must never call this.
+    #[doc(hidden)]
+    pub async fn insert_live_session_for_test(&self, session_id: &str) {
+        self.sessions.lock().await.insert(
+            session_id.to_string(),
+            Arc::new(TokioMutex::new(OpencodeSession::new(
+                session_id.to_string(),
+                None,
+                None,
+                None,
+            ))),
+        );
+    }
+
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
 
     /// Handle a `freshAgent.kill` for opencode: remove the session's bookkeeping (both
@@ -3903,6 +3934,66 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("SESSION_NOT_FOUND"));
+    }
+
+    /// Delta-review round 3, finding 1: `live_session_ids` snapshots EVERY live
+    /// session-map key (placeholder AND durable `ses_*` ids — the map mirrors
+    /// both, per [`FreshOpencodeState::has_live_session`]'s doc) so a consumer
+    /// that cannot await per-id lookups (freshell-ws's identity-invariant
+    /// sweep, whose probe pass runs on the blocking pool) can collect the
+    /// keyset once per tick, off the blocking pool.
+    #[tokio::test]
+    async fn live_session_ids_snapshots_every_session_map_key() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        assert!(
+            st.live_session_ids().await.is_empty(),
+            "an empty sessions map yields an empty snapshot"
+        );
+
+        // Direct-map seeding with the minimal OpencodeSession construction the
+        // same module's tests use (`insert_compact_session` et al.), keyed
+        // under BOTH ids the way materialization mirrors the map.
+        let mut session =
+            OpencodeSession::new("freshopencode-req-live".to_string(), None, None, None);
+        session.real_session_id = Some("ses_live".to_string());
+        let session_arc = Arc::new(TokioMutex::new(session));
+        {
+            let mut guard = st.sessions.lock().await;
+            guard.insert("freshopencode-req-live".to_string(), session_arc.clone());
+            guard.insert("ses_live".to_string(), session_arc);
+        }
+
+        assert_eq!(
+            st.live_session_ids().await,
+            std::collections::HashSet::from([
+                "freshopencode-req-live".to_string(),
+                "ses_live".to_string(),
+            ]),
+            "the snapshot carries exactly the live keys (placeholder AND durable)"
+        );
+    }
+
+    /// The cross-crate test seeding route (delta repair 2): freshell-ws's
+    /// identity-invariant probe-phase tests need a live sessions-map entry
+    /// WITHOUT driving a real `opencode serve` (the finding's exact case is
+    /// "live in the sessions map, NOT yet ledgered").
+    #[tokio::test]
+    async fn insert_live_session_for_test_keys_the_sessions_map() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        assert!(!st.has_live_session("ses_testlive").await);
+        st.insert_live_session_for_test("ses_testlive").await;
+
+        assert!(st.has_live_session("ses_testlive").await);
+        assert!(
+            st.live_session_ids().await.contains("ses_testlive"),
+            "the seeded key is visible to both liveness probes"
+        );
     }
 
     // ── P1.13: identity-sink writes (pending at create, binding at materialization,

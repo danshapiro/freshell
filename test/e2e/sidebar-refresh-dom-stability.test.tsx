@@ -71,6 +71,8 @@ vi.mock('@/lib/ws-client', () => ({
       wsHandlers.add(handler)
       return () => wsHandlers.delete(handler)
     },
+    // Interest is transient and negotiated; not exercised here.
+    sendTerminalInterest: vi.fn(() => false),
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
     cancelCreate: vi.fn(),
