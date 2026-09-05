@@ -1,12 +1,35 @@
 # PR699 Integration Repair Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute this plan task by task with a fresh implementer and a specification-plus-quality review after every task. Track progress with the checkbox steps below. Source code becomes authoritative over the draft code examples once execution starts.
+
+## User Request
+
+### Requested result
+Implement the PR699 integration repair plan with the standard the-usual workflow, fixing the remaining defects and completing its regression, browser, and native-package verification.
+
+### Explicit constraints
+- Continue the existing PR699 work in its dedicated worktree, preserve completed review fixes, and update the existing branch rather than changing main directly.
+- Fix CLI Host Stats forwarding, prove terminal-free Host Stats creation/splitting, cover metric calculations and memory-source precedence, and isolate the new runtime test configurations from ambient environment settings.
+- Preserve Rust-only backend retirement and the integrated Host Stats, fresh-agent undo/redo, and other main-branch behavior.
+- Use red/green/refactor where applicable and meaningful behavior tests; do not skip tests, weaken coverage, or conceal flaky failures. Investigate and fix failures that block the required verification, including the reported executable-fixture CI failure.
+- Verify actual affected browser scenarios and all four native package platforms, not just test selection or installer creation.
+- Follow repository test coordination and sandbox rules. Do not silently change configured test backends or incur cloud-test costs without the required user choice.
+- Keep commits focused, preserve unrelated agents' work, use the specified GitHub account, and leave a clean committed and pushed feature branch.
+- Do not merge the PR, deploy assets, restart production, or change the existing restart-survival guarantees.
+
+### Accepted tradeoffs and residuals
+- Missing metric test coverage is not itself evidence of incorrect production calculations; add tests without inventing production changes.
+- No new macOS metric collector or restoration of the retired Node backend is required.
 
 **Goal:** Finish PR699's Rust-only runtime retirement while preserving main's Host Stats and fresh-agent undo/redo behavior, with executable regression and native-package evidence.
 
 **Architecture:** Keep capability metadata shared by the standalone CLI and MCP, and forward supported options into the existing Rust REST handlers. Exercise metric calculations through the Rust collector's existing fixture roots and explicit sample timestamps; do not restore Node backend code or introduce a second collector. Keep new collector tests in a separate child module rather than expanding the large implementation file.
 
 **Tech Stack:** TypeScript/Node ESM CLI and MCP, Rust/Tokio/Axum, React, Vitest, Playwright, Electron, GitHub Actions.
+
+## Global Constraints
+
+Follow the current repository instructions for worktree isolation, meaningful tests, coordinated broad checks, sandboxed process tests, account-qualified GitHub access, and production safety. Preserve existing behavior and user changes. This repair run's immutable review base is `ff8ee3f6e9c1ac71844f3e783c531cc2d04e3275`; its run record is `/home/dan/code/freshell/.worktrees/.the-usual-logs/pr699-integration-repair/run-state.md`. Keep this adopted plan at its existing path. Independent plan review precedes implementation; task review and a final full-delta review follow implementation. Pushing to the existing PR is authorized by this plan; merging and deployment are not.
 
 ---
 
@@ -65,6 +88,37 @@ The second integration at `bd1b6c32c` passed 82 focused tests (sanitizer 5, clas
 
 Non-goals: new macOS metric collectors, restoring the retired backend, deleting historical fixture corpora, provider features unrelated to this review, creating another PR, merging PR699, deploying client assets, or restarting production. Existing Rust behavior reports unavailable sections when platform sources are absent; do not reintroduce Node's macOS fallback as an incidental test migration.
 
+## Current-main integration checkpoints
+
+At execution setup, `origin/main` is `1463021212246c631ab943adf0dfa70d5a3d22e2`. Integrate that pinned commit once before the original seven tasks; do not chase later main changes unless they prevent PR integration. Preserve its terminal-interest delivery, serialized fresh-agent message queue, provider controls, and sidebar status sorting. The read-only integration map is `/home/dan/code/freshell/.worktrees/.the-usual-logs/pr699-integration-repair/reports/plan-main-drift.md`.
+
+### Task A: Integrate current main without restoring retired behavior
+
+- [ ] Merge the pinned main commit in this worktree and resolve the 21 mapped conflicts by behavior, not whole-file replacement. Keep retired Node implementations and their implementation-specific tests deleted. Keep incoming standalone Claude sidecar tests at `test/unit/claude-sidecar/`; repair their four relative crate imports.
+- [ ] Preserve both the unavailable shell-command notice and main's expandable queue controls. Preserve the complete one-at-a-time outgoing-turn lifecycle while adapting the composer callback to plain text; do not restore attachments or `/api/fresh-agent/exec`.
+- [ ] Keep negotiated `terminalInterestV1` and `terminal.interest`. The retained combined inventory is 34 inbound / 55 outbound / 89 total at protocol v8. Regenerate contracts with the supported generator; do not hand-maintain generated schemas.
+- [ ] Keep incoming provider/browser scenarios using PR699's owned Rust fixture API. Change the new sidebar spec from the removed `TestServerInfo` to `E2eServerInfo`. Remove only newly reintroduced unsupported attachment claims from README/mock documentation.
+- [ ] Run typechecks, protocol/port tests, retained sidecar tests, FreshAgent Composer/View/control tests, terminal-interest tests, and sidebar tests. Preserve failing receipts; correct merge regressions with targeted behavioral coverage. Commit the integration checkpoint and obtain its independent task review.
+
+### Task B: Preserve installed Claude runtime and model discovery
+
+**Files:** `scripts/prepare-electron-runtime.ts`, its Electron unit tests, `crates/freshell-freshagent/src/model_capabilities.rs` and the existing Claude sidecar-entry resolver, and `test/integration/electron/checkout-free-runtime.test.ts`.
+
+- [ ] Add failing behavior regressions that stage and execute the relocated sidecar and request live Claude model discovery from a copied runtime using the existing fake-SDK seam. The fake SDK must implement `supportedModels()`; require its distinctive model data, not a successful fallback response.
+- [ ] Include new `session-settings.mjs` and `model-catalog.mjs` in the existing explicit staged-file list and required-file contract where applicable.
+- [ ] Resolve the catalog helper beside the configured `FRESHELL_CLAUDE_SIDECAR` entry, with the existing source fallback. Reuse the established path resolver rather than introducing another setting. Preserve `FRESHELL_CLAUDE_NODE` and process lifetime behavior.
+- [ ] Verify focused staging and Rust resolver/probe coverage, then actual checkout-free runtime execution inside the sandbox. Refactor duplication if needed, commit, and obtain the task review. Require this runtime/catalog behavior in all four native receipts in Task 7.
+
+### Task C: Fix the shared executable-fixture race
+
+**Files:** `crates/freshell-ws/tests/common/mod.rs` and a focused integration regression importing that real shared helper.
+
+- [ ] Add a deterministic failing regression calling `common::sleeper_cli_spec` twice for the same provider and proving distinct usable executable paths. Run executable/process tests in the disposable sandbox.
+- [ ] Allocate a unique path per call, retaining existing CLI arguments and permissions. Do not serialize production behavior or conceal the race with retries. Preserve the separately fixed private cross-kind fixture.
+- [ ] Run the regression, `pane_ledger_triggers` explicitly with four test threads, and `cross_kind_liveness`; inspect cleanup and keep temporary data isolated. Refactor, commit, and obtain the task review.
+
+These are bounded prerequisites for preserving integrated behavior and completing the original verification request, not new provider features. The execution order is A, B, C, then 1–7: ten tasks total.
+
 ## Execution rules and dependencies
 
 - [ ] Read `AGENTS.md` and `docs/development/test-sandbox.md` before execution. Confirm the current worktree is clean and belongs to PR699; do not touch the main checkout's unrelated edits.
@@ -74,7 +128,7 @@ Non-goals: new macOS metric collectors, restoring the retired backend, deleting 
 - [ ] Use explicit GitHub identity on every call, for example `GH_TOKEN="$(gh auth token --user danshapiro)" gh pr view 699 --repo danshapiro/freshell`. Preserve the existing noreply git identity.
 - [ ] Use red/green/refactor for Task 1's confirmed defect. Tasks 2–4 add tests of currently implemented behavior and may immediately pass; do not deliberately damage production code to manufacture a red phase. If a new assertion fails, preserve the failure and trace the calculation before changing implementation.
 - [ ] Do not write prose/config-content assertions, skip tests, or weaken assertions to obtain green results.
-- [ ] Task 1, Tasks 3–4, and Task 5 can be assigned to independent workers with exclusive file ownership. Task 2 follows Task 1. Task 4 follows Task 3. Run broad verification only after all edits are committed.
+- [ ] Use sequential fresh implementers with exclusive file ownership and a fresh specification-plus-quality review after each task, as required by the standard workflow. Task 2 follows Task 1; Task 4 follows Task 3. Run broad verification only on committed inputs and at the workflow's ten-non-merge-commit checkpoints.
 
 ## Task 1: Forward Host Stats flags in the standalone CLI
 
@@ -697,6 +751,8 @@ Expected: all commands exit zero; contract regeneration produces no diff. Record
 
 - [ ] Prepare a committed-source, git-aware sandbox run for the approved local backend. A host worktree's `.git` points outside `/workspace`; mounting it alone can make build IDs `unknown`. The recipe below carries a Git bundle into a disposable repository and worktree **inside** the container, so build-mismatch tests exercise real stamps without mounting the host's Git internals or user data.
 
+Prerequisites before this draft recipe is executed: use the validated same-user Docker access (`sudo -n -u dan -g docker`); prepare a task-isolated disposable image with Rust 1.96.0, the workspace's Tauri development libraries, and Chromium. Do not modify a shared image underneath other agents. Verify cached dependencies against the current lockfile. Acquire and hold the **host repository's shared coordinator gate** across the complete broad sandbox run: the inner clone has its own Git common directory and therefore cannot coordinate with host worktrees by itself. A status read is not a reservation. Prefer the existing coordinator endpoint/store APIs in ignored orchestration code; never fake a passing test phase. Preserve logs and browser artifacts on the host before the container exits. The environment assessment is in `reports/workspace-baseline.md` under this run's log directory. Validate this execution approach before implementing the draft launcher below.
+
 Run on the host from the PR worktree, after confirming these two artifact names are not owned by another task:
 
 ~~~bash
@@ -746,6 +802,8 @@ scripts/sandbox-test.sh "bash /workspace/dist/pr699-review-gate.sh"
 ~~~
 
 Expected: exact bundled SHA printed, `npm run check` completes all default JavaScript, source-runtime, Rust, and Electron lanes, port contracts pass, helper selection passes, and every selected browser spec actually executes. In particular require eight rollback tests, five Host Stats tests, both CLI tests after Task 2, and non-skipped build-mismatch tests. Keep the full logs and the actual counts instead of copying pre-merge counts. The container owns all started/stopped servers.
+
+The browser set also includes the preserved main behavior: `freshagent-settings-resume-rust.spec.ts`, `fresh-agent-model-dialog-parity.spec.ts`, `freshopencode-model-picker.spec.ts`, the affected `fresh-agent.spec.ts` queue/control cases, `sidebar-status-tier-sort-rust.spec.ts`, and `opencode-terminal-restore-rust.spec.ts`. Extend the draft command to include these files on the chosen backend. Do not treat fixed old counts as a ceiling; require all applicable scenarios, including incoming control cases, to execute.
 
 If dependencies in the reused sandbox cache no longer match the committed lockfile, run `scripts/sandbox-test.sh "npm ci --no-audit --no-fund"` before retrying; do not alter the lockfile to fit a stale cache. If container resource limits cause failure, diagnose that limit rather than rerunning destructive tests on the host.
 
@@ -797,12 +855,15 @@ A green installer build alone is insufficient. Acceptance must launch the packag
 
 - [ ] Append exact native run URLs/results to the receipt. If a platform fails, investigate its real log and leave the plan incomplete until the failure is resolved or a concrete external blocker is reported. Do not label local Linux success as macOS/Windows verification.
 
-- [ ] Perform a final scoped review of new commits against `bd1b6c32c`. Verify no Node listener was restored, rollback handling remains present, Host Stats works through both CLI and MCP, and no unrelated work was changed. Request an independent code review of the implementation before claiming completion.
+- [ ] Perform the standard workflow's independent full-delta review against immutable repair base `ff8ee3f6e9c1ac71844f3e783c531cc2d04e3275`. Verify no Node listener was restored, rollback handling remains present, Host Stats works through both CLI and MCP, incoming main behavior remains supported in native packages, and no unrelated work was changed. Clear or explicitly disposition every finding before claiming completion.
 
 - [ ] Commit the final receipt, push it, and confirm the worktree is clean. Report the implemented findings, test evidence, remaining caveats, and PR link. Stop before merging PR699 or deploying anything; this plan does not grant that authority.
 
 ## Completion criteria
 
+- [ ] Pinned main behavior is preserved, including terminal interest, queued sends, provider controls, and sidebar sorting, without restoring retired features.
+- [ ] Copied native runtimes load the new Claude helpers and return actual live model data without the build checkout.
+- [ ] The real shared sleeper helper uses distinct executable paths and concurrent ledger tests pass.
 - [ ] Both CLI creation commands forward enabled Host Stats options and treat explicit false correctly.
 - [ ] Compiled CLI + Rust + browser show two Host Stats panes with no terminal allocation.
 - [ ] Rust tests protect exact nonzero CPU, paging, disk, and network calculations.
