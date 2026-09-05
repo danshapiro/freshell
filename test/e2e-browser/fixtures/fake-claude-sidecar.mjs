@@ -98,7 +98,7 @@ rl.on('line', (line) => {
     // CLI's transcript filename stem provides across restarts).
     const cliSessionId = msg.resumeSessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
-    sessions.set(sessionId, { cliSessionId, cwd })
+    sessions.set(sessionId, { cliSessionId, cwd, model: msg.model ?? 'claude-opus-4-6', effort: msg.effort, permissionMode: msg.permissionMode })
     // Ensure the transcript file EXISTS from create (the attach arm's
     // transcript-present gate reads it before any send happens post-restart).
     fs.closeSync(fs.openSync(transcriptPath(cliSessionId), 'a'))
@@ -115,8 +115,18 @@ rl.on('line', (line) => {
       emit({ type: 'sdk.session.snapshot', sessionId, messages: [] })
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
+  } else if (msg.type === 'configure') {
+    const session = sessions.get(msg.sessionId)
+    if (!session) {
+      emit({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok: false, message: 'Session not found' })
+      return
+    }
+    for (const key of ['model', 'effort', 'permissionMode', 'cwd']) {
+      if (msg.settings?.[key] != null || (key === 'effort' && msg.settings?.effort === null)) session[key] = msg.settings[key]
+    }
+    emit({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok: true, settings: session })
   } else if (msg.type === 'send') {
-    const { cliSessionId, cwd } = sessions.get(msg.sessionId) ?? { cliSessionId: CLI_SESSION_ID }
+    const { cliSessionId, cwd, model, effort, permissionMode } = sessions.get(msg.sessionId) ?? { cliSessionId: CLI_SESSION_ID }
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'running' })
     appendTranscript(cliSessionId, 'user', msg.text, cwd)
     const holdOnce = HOLD_ONCE_MARKER && !fs.existsSync(HOLD_ONCE_MARKER)
@@ -126,12 +136,15 @@ rl.on('line', (line) => {
       return // wedged: running forever (busy-restart scenario)
     }
     if (HOLD_TURN) return
-    appendTranscript(cliSessionId, 'assistant', 'Fixture claude turn', cwd)
+    const text = process.env.FAKE_CLAUDE_SIDECAR_ECHO_SETTINGS === '1'
+      ? `Fixture claude turn (${model}, ${effort ?? 'default'}, ${permissionMode ?? 'default'})`
+      : 'Fixture claude turn'
+    appendTranscript(cliSessionId, 'assistant', text, cwd)
     emit({
       type: 'sdk.assistant',
       sessionId: msg.sessionId,
-      content: [{ type: 'text', text: 'Fixture claude turn' }],
-      model: 'claude-opus-4-6',
+      content: [{ type: 'text', text }],
+      model,
     })
     emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, subtype: 'success', at: Date.now() })
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })

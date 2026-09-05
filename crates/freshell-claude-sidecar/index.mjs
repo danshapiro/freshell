@@ -16,7 +16,8 @@
 //                                    resumeDropsTurn arms the fork-time discard-guard). Covered by
 //                                    crates/freshell-ws/tests/freshagent_claude_rollback.rs + the
 //                                    rust-chromium e2e rollback spec.
-//     { type:'send',               sessionId, text }
+//     { type:'configure',          sessionId, requestId, settings }
+//     { type:'send',               sessionId, text, images? }
 //     { type:'interrupt',          sessionId }
 //     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
 //     { type:'question.respond',   sessionId, requestId, answers }
@@ -25,6 +26,7 @@
 //   sidecar → Rust (stdout, one JSON per line):
 //     { type:'created',                 requestId, sessionId }            // the SDK bridge's BARE nanoid placeholder
 //     { type:'create.failed',           requestId, message }
+//     { type:'sdk.configured',          sessionId, requestId, ok, settings?, message? }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
 //     { type:'sdk.assistant',           sessionId, content, model }
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
@@ -63,6 +65,7 @@
 
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
+import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -81,7 +84,7 @@ function emit(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`)
 }
 function logerr(msg) {
-  process.stderr.write(`[claude-sidecar] ${msg}\n`)
+  process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', message: msg })}\n`)
 }
 
 // ── nanoid()-compatible bare id: 21 url-safe chars ([A-Za-z0-9_-]) ───────────
@@ -171,6 +174,31 @@ function nextMonotonic(last, now) {
 /** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
 const sessions = new Map()
 
+function normalizeCommands(rows, strict = false) {
+  if (!Array.isArray(rows)) return undefined
+  const result = []
+  for (const row of rows) {
+    if (!row || typeof row.name !== 'string' || !row.name || (Array.isArray(row.aliases) && !row.aliases.every((alias) => typeof alias === 'string'))) {
+      if (strict) return undefined
+      continue
+    }
+    result.push({
+      name: row.name,
+      description: typeof row.description === 'string' ? row.description : '',
+      ...(typeof row.argumentHint === 'string' ? { argumentHint: row.argumentHint } : {}),
+      ...(Array.isArray(row.aliases) ? { aliases: row.aliases } : {}),
+    })
+  }
+  return result
+}
+
+function publishCommands(sessionId, state) {
+  if (!state.commandsInitSeen || state.commandCatalog === undefined) return
+  const terminal = new Set(state.terminalCommandNames ?? [])
+  const commands = state.commandCatalog.filter((row) => !terminal.has(row.name))
+  emit({ type: 'sdk.session.changed', sessionId, reason: 'session-commands', commands })
+}
+
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──
 function handleSdkMessage(sessionId, msg) {
   const st = sessions.get(sessionId)
@@ -201,6 +229,9 @@ function handleSdkMessage(sessionId, msg) {
     case 'system': {
       if (msg.subtype === 'init') {
         st.cliSessionId = msg.session_id
+        st.settings.cwd ??= msg.cwd
+        st.commandsInitSeen = true
+        st.terminalCommandNames = Array.isArray(msg.terminal_slash_commands) ? msg.terminal_slash_commands : []
         emit({
           type: 'sdk.session.init',
           sessionId,
@@ -209,6 +240,14 @@ function handleSdkMessage(sessionId, msg) {
           cwd: msg.cwd,
           tools: Array.isArray(msg.tools) ? msg.tools.map((t) => ({ name: t })) : undefined,
         })
+        publishCommands(sessionId, st)
+      } else if (msg.subtype === 'commands_changed') {
+        const commands = normalizeCommands(msg.commands, true)
+        if (commands !== undefined) {
+          st.commandCatalog = commands
+          st.commandsChangedSeen = true
+          publishCommands(sessionId, st)
+        }
       } else if (msg.subtype === 'status' && msg.status === 'compacting') {
         emit({ type: 'sdk.status', sessionId, status: 'compacting' })
       } else if (msg.subtype === 'compact_boundary') {
@@ -247,6 +286,8 @@ function handleSdkMessage(sessionId, msg) {
           }
         : undefined
       emit({ type: 'sdk.result', sessionId, result: msg.subtype, durationMs: msg.duration_ms, costUsd: msg.total_cost_usd, usage })
+      const failure = resultErrorMessage(msg)
+      if (failure) emit({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
       // Server-authoritative completion edge: ONLY a positively-completed turn
       // ('success') chimes. Interrupts yield no result at all; errored turns carry
       // a non-success subtype — so this never fires green on an aborted/errored turn.
@@ -305,6 +346,7 @@ function handleCreate(req) {
     const state = {
       abort,
       permissionMode: req.permissionMode,
+      settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
       turnOpen: false,
       handedCompactLikely: false,
     }
@@ -331,6 +373,9 @@ function handleCreate(req) {
         resumeDropsTurn: req.resumeDropsTurn || undefined,
         model: req.model,
         permissionMode: req.permissionMode,
+        // Enables the user's in-session permission selector; the selected mode
+        // still controls whether approval is required for each tool.
+        allowDangerouslySkipPermissions: true,
         effort: req.effort,
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
@@ -349,6 +394,16 @@ function handleCreate(req) {
       },
     })
     state.query = sdkQuery
+    state.commandsChangedSeen = false
+    if (typeof sdkQuery.supportedCommands === 'function') {
+      Promise.resolve().then(() => sdkQuery.supportedCommands()).then((rows) => {
+        if (state.query !== sdkQuery || state.commandsChangedSeen) return
+        const commands = normalizeCommands(rows)
+        if (commands === undefined) return
+        state.commandCatalog = commands
+        publishCommands(sessionId, state)
+      }).catch((error) => logerr(`session commands unavailable: ${error?.message || error}`))
+    }
 
     // Placeholder returns IMMEDIATELY (the SDK query is lazy) — exactly as
     // SdkBridge.createSession returns the nanoid before system/init arrives.
@@ -373,12 +428,29 @@ function handleSend(req) {
   st.inputStream.push(
     {
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: req.text }] },
+      message: { role: 'user', content: userMessageContent(req.text, req.images) },
       parent_tool_use_id: null,
       session_id: st.cliSessionId || 'default',
     },
     isCompact,
   )
+}
+
+async function handleConfigure(req) {
+  const st = sessions.get(req.sessionId)
+  if (!st) {
+    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, message: 'Claude session is no longer available.' })
+    return
+  }
+  try {
+    const settings = await configureSession(st, req.settings ?? {}, {
+      busy: req.busy === true || st.turnOpen || st.handedCompactLikely,
+    })
+    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: true, settings })
+  } catch (err) {
+    logerr(`session settings failed: ${err?.message || err}`)
+    emit({ type: 'sdk.configured', sessionId: req.sessionId, requestId: req.requestId, ok: false, settings: { ...st.settings }, message: String(err?.message || err) })
+  }
 }
 
 // kata 1wxv ep4 (rollback quiesce probe): rollback pre-teardown sends this
@@ -453,6 +525,12 @@ rl.on('line', (line) => {
   switch (req?.type) {
     case 'create': handleCreate(req); break
     case 'send': handleSend(req); break
+    case 'configure': {
+      const st = sessions.get(req.sessionId)
+      if (st) st.configureChain = (st.configureChain ?? Promise.resolve()).then(() => handleConfigure(req))
+      else void handleConfigure(req)
+      break
+    }
     case 'interrupt': handleInterrupt(req); break
     case 'rollback.quiesce': handleRollbackQuiesce(req); break
     case 'permission.respond': {

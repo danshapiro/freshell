@@ -8,12 +8,11 @@ use tracing::Instrument;
 
 /// Where a `terminal.create` reply goes.
 pub(crate) enum CreateOutput<'a> {
-    /// Direct socket sink — the inline (non-restore) path. A send failure
-    /// propagates as `false`, which closes the connection (existing
-    /// semantics, unchanged).
+    /// The handler's nonblocking connection outbox. Admission failure closes
+    /// the reader; actual socket errors are observed by writer supervision.
     Socket(&'a mut crate::terminal::WsSink),
-    /// The connection's mpsc frame sink — the spawned (restore) path. The
-    /// select loop drains it to the socket; pushing is non-blocking, so a
+    /// The connection's frame sink — used by both create workers. The
+    /// independent writer drains it; pushing is non-blocking, so a
     /// stalled client can never wedge a gate permit. A dead connection just
     /// drops the frames.
     Channel(&'a FrameSink),

@@ -38,14 +38,6 @@ import { highestThinkingLevelId, orderThinkingLevelIds } from '@shared/fresh-age
 
 const MAX_RENDERED_MODEL_ROWS = 250
 
-/** Recent-model (MRU) bookkeeping is scoped to providers with a cwd-keyed
- * catalog history: freshopencode and freshcodex. Claude providers
- * (freshclaude/kilroy) get no MRU — the dialog still renders for them and
- * serves their statics merged with the probed claude catalog. */
-function mruProviderForSession(sessionType: FreshAgentPaneContent['sessionType']): FreshAgentModelMruProvider | undefined {
-  return sessionType === 'freshopencode' || sessionType === 'freshcodex' ? sessionType : undefined
-}
-
 /** A right-column row: a real thinking level declared by the highlighted
  * model, or the single Default row (no variant) for models without levels. */
 type LevelRow = { kind: 'level'; id: string } | { kind: 'default' }
@@ -92,7 +84,7 @@ export function FreshAgentModelDialog({
 }) {
   const dispatch = useAppDispatch()
   const sessionType = paneContent.sessionType
-  const mruProvider = mruProviderForSession(sessionType)
+  const mruProvider: FreshAgentModelMruProvider = sessionType
   const providerDefaults = useAppSelector(
     (state) => state.settings.settings.freshAgent?.providers?.[sessionType]
       ?? state.settings.serverSettings?.freshAgent?.providers?.[sessionType],
@@ -109,7 +101,12 @@ export function FreshAgentModelDialog({
   const searchRef = useRef<HTMLInputElement>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
 
-  const [probe, setProbe] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
+  const probeKey = `${sessionType}:${cwdKey}`
+  const [probeResult, setProbeResult] = useState<{
+    key: string
+    response: FreshAgentModelCapabilitiesResponse
+  }>()
+  const probe = probeResult?.key === probeKey ? probeResult.response : undefined
   const [probing, setProbing] = useState(false)
   const [query, setQuery] = useState('')
   const [activeColumn, setActiveColumn] = useState<'models' | 'levels'>('models')
@@ -124,15 +121,15 @@ export function FreshAgentModelDialog({
   useEffect(() => {
     if (!open || sessionType === 'freshcodex') return
     let cancelled = false
-    setProbe(undefined)
+    setProbeResult(undefined)
     setProbing(true)
     void getFreshAgentModelCapabilities(sessionType, { cwd: paneContent.initialCwd })
       .then((result) => {
-        if (!cancelled) setProbe(result)
+        if (!cancelled) setProbeResult({ key: probeKey, response: result })
       })
       .catch(() => {
         if (cancelled) return
-        setProbe({
+        setProbeResult({ key: probeKey, response: {
           ok: false,
           sessionType,
           runtimeProvider: paneContent.provider,
@@ -140,20 +137,20 @@ export function FreshAgentModelDialog({
           fetchedAt: Date.now(),
           models: [],
           error: { code: 'CAPABILITY_PROBE_FAILED', message: 'Catalog fetch failed' },
-        })
+        } })
       })
       .finally(() => {
         if (!cancelled) setProbing(false)
       })
     return () => { cancelled = true }
-  }, [open, sessionType, paneContent.provider, paneContent.initialCwd])
+  }, [open, sessionType, paneContent.provider, paneContent.initialCwd, probeKey])
 
   const staticCapabilities = useMemo(() => getFreshAgentStaticModelCapabilities(sessionType), [sessionType])
-  const capabilities: FreshAgentModelCapabilities | undefined = sessionType === 'freshopencode'
+  const capabilities = useMemo<FreshAgentModelCapabilities | undefined>(() => sessionType === 'freshopencode'
     ? (probe?.ok ? probe : undefined)
     : paneContent.provider === 'claude' && staticCapabilities
       ? mergeClaudeModelCapabilities(staticCapabilities, probe?.ok === true ? probe : undefined)
-      : staticCapabilities
+      : staticCapabilities, [sessionType, paneContent.provider, staticCapabilities, probe])
   // Catalog-unavailable stays opencode-only: claude panes degrade to their
   // static rows (the same fallback the settings popover uses) instead of
   // closing with the unavailable notice.
@@ -172,41 +169,45 @@ export function FreshAgentModelDialog({
     return resolveFreshAgentModelLastUsedLevel(mruProvider, { modelId, cwdKey })
   }, [mruProvider, cwdKey])
 
-  // Preselection = the model's last-used level (when it is still a declared
-  // level), else its canonically highest level, else the single Default row.
+  // Reconfirming the current model preserves its current level. Other models
+  // use the last chosen level, then their highest available level.
   const preselectLevelIndex = useCallback((rows: LevelRow[], modelId: string): number => {
+    if (modelId === effectiveModelId) {
+      const currentIndex = rows.findIndex((row) => row.kind === 'level' && row.id === effectiveEffort)
+      if (currentIndex >= 0) return currentIndex
+    }
     const lastUsed = lastUsedLevelFor(modelId)
     if (lastUsed) {
       const index = rows.findIndex((row) => row.kind === 'level' && row.id === lastUsed)
       if (index >= 0) return index
     }
     return rows.length - 1
-  }, [lastUsedLevelFor])
+  }, [effectiveEffort, effectiveModelId, lastUsedLevelFor])
 
-  // One init per dialog session: MRU upkeep (record the effective current
-  // model so Recent can show it; drop catalog-removed ids) and cache the
-  // Recent list. MRU bookkeeping only runs where a provider mapping exists —
-  // claude providers get the query reset with no Recent group. Highlight
-  // state is deliberately NOT set here — the initial highlight is derived at
-  // render time so it cannot race the row set.
-  const initKeyRef = useRef<string | null>(null)
+  // Reset only when opening or changing panes, never when an asynchronous
+  // catalog arrives while the user is typing or choosing a level.
   useEffect(() => {
-    if (!open) {
-      initKeyRef.current = null
-      return
-    }
-    if (!capabilities) return
-    const initKey = `${paneId}:${capabilities.models.map((model) => model.id).join('|')}`
-    if (initKeyRef.current === initKey) return
-    initKeyRef.current = initKey
-
     setQuery('')
     setActiveColumn('models')
+    setHighlightedRowKey(undefined)
+    setHighlightedLevelIndex(0)
+  }, [open, paneId, cwdKey, sessionType])
+
+  useEffect(() => {
+    if (!open || !capabilities) return
     let recent: FreshAgentModelCapability[] = []
     if (mruProvider && cwdKey) {
+      const existing = loadFreshAgentModelMru(mruProvider)
       const current = capabilities.models.find((model) => model.id === effectiveModelId)
-      if (current) recordFreshAgentModelUse(mruProvider, current, cwdKey)
-      pruneFreshAgentModelMru(mruProvider, capabilities, cwdKey)
+      // Claude's small static list needs no duplicate Recent row until the
+      // user has chosen a model. A partial/fallback catalog must never erase
+      // previously chosen live models.
+      if (current && (paneContent.provider !== 'claude' || existing.length > 0)) {
+        recordFreshAgentModelUse(mruProvider, current, cwdKey)
+      }
+      if (paneContent.provider !== 'claude' || probe?.ok) {
+        pruneFreshAgentModelMru(mruProvider, capabilities, cwdKey)
+      }
       recent = buildFreshAgentVisibleMru(mruProvider, {
         currentModelId: effectiveModelId,
         cwdKey,
@@ -216,7 +217,7 @@ export function FreshAgentModelDialog({
       }).map((item) => item.model)
     }
     setRecentModels(recent)
-  }, [open, capabilities, mruProvider, paneId, cwdKey, effectiveModelId])
+  }, [open, capabilities, mruProvider, cwdKey, effectiveModelId, paneContent.provider, probe])
 
   // Focus management: Escape cancels (capture phase, ahead of parent
   // popovers/views); previous focus is restored on close.
@@ -240,13 +241,14 @@ export function FreshAgentModelDialog({
   // `disabled` while the freshopencode probe is in flight, and focus() on a
   // disabled element is a silent no-op — a mount-time-only timer would lose
   // the race and leave focus on whatever opened the dialog.
+  const hasCapabilities = Boolean(capabilities)
   useEffect(() => {
-    if (!open || !capabilities) return
+    if (!open || !hasCapabilities) return
     const focusTimer = window.setTimeout(() => {
       searchRef.current?.focus()
     }, 0)
     return () => window.clearTimeout(focusTimer)
-  }, [open, capabilities])
+  }, [open, hasCapabilities])
 
   const { groups, hiddenCount } = useMemo(() => {
     if (!capabilities) return { groups: [] as FreshAgentModelSourceGroup[], hiddenCount: 0 }

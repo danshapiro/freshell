@@ -12,16 +12,13 @@
 //! `shared/fresh-agent-model-capabilities.ts` (`ok:true` success at 200,
 //! `ok:false` `unavailable` + typed error at 503).
 //!
-//! ## Deviation (tracked)
-//!
-//! `freshclaude`/`kilroy`: Node probes the Claude Agent SDK's `supportedModels()`
-//! (`registry.probeCatalog`). There is no Claude SDK in the Rust workspace, so this
-//! module serves the shared static table for the claude providers as well (the
-//! same list `createStaticSuccess` would build for `freshcodex` with claude
-//! entries substituted). The endpoint stays uniformly functional; live claude
-//! probing lands with the two-column model-selector slice.
+//! Claude and Kilroy share a short-lived Claude SDK `supportedModels()` probe
+//! through the existing vendored Node sidecar package. Probing never starts an
+//! agent turn or modifies an existing session.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,6 +149,138 @@ impl ModelCatalogProbe for OpencodeCatalogProbe {
     }
 }
 
+/// Runs only the SDK catalog control query, separately from live Claude sessions.
+#[derive(Default)]
+pub struct ClaudeCatalogProbe;
+
+fn claude_probe_error(message: impl Into<String>) -> CapabilityError {
+    CapabilityError {
+        code: "CAPABILITY_PROBE_FAILED".into(),
+        message: message.into(),
+        retryable: true,
+    }
+}
+
+impl ModelCatalogProbe for ClaudeCatalogProbe {
+    fn probe<'a>(&'a self, _cwd: Option<&'a str>) -> BoxFuture<'a, CatalogOut> {
+        Box::pin(async move {
+            let entry = PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../freshell-claude-sidecar/model-catalog.mjs"
+            ));
+            let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".into());
+            let mut command = tokio::process::Command::new(node);
+            command
+                .arg(entry)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            // The probe owns this new process group, including its SDK CLI.
+            // A hung SDK close cannot leave that grandchild behind on timeout.
+            #[cfg(target_os = "linux")]
+            command.process_group(0);
+            let child = command.spawn().map_err(|error| {
+                claude_probe_error(format!("Cannot start Claude model catalog: {error}"))
+            })?;
+            #[cfg(target_os = "linux")]
+            let process_group = child.id();
+            let output =
+                match tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
+                {
+                    Ok(result) => result.map_err(|error| claude_probe_error(error.to_string()))?,
+                    Err(_) => {
+                        #[cfg(target_os = "linux")]
+                        if let Some(id) = process_group {
+                            // SAFETY: this is the group created for this probe only.
+                            unsafe {
+                                libc::kill(-(id as i32), libc::SIGKILL);
+                            }
+                        }
+                        tracing::warn!(
+                            component = "claude_model_catalog",
+                            "Claude model catalog process timed out"
+                        );
+                        return Err(claude_probe_error("Claude model catalog process timed out"));
+                    }
+                };
+            if !output.status.success() {
+                let details = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(component = "claude_model_catalog", status = ?output.status, stderr = %details, "Claude model catalog unavailable");
+                return Err(claude_probe_error("Claude model catalog is unavailable. Check Claude authentication and the server logs."));
+            }
+            let raw: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+                claude_probe_error(format!("Invalid Claude model catalog: {error}"))
+            })?;
+            normalize_claude_catalog(raw)
+        })
+    }
+}
+
+fn normalize_claude_catalog(raw: Value) -> CatalogOut {
+    let invalid = || CapabilityError {
+        code: "CAPABILITY_PAYLOAD_INVALID".into(),
+        message: "Claude returned an invalid model catalog".into(),
+        retryable: false,
+    };
+    let rows = raw.as_array().ok_or_else(invalid)?;
+    if rows.is_empty() {
+        return Err(invalid());
+    }
+    let mut models = Vec::new();
+    for row in rows {
+        let id = row
+            .get("value")
+            .or_else(|| row.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(invalid)?;
+        let name = row
+            .get("displayName")
+            .or_else(|| row.get("display_name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id);
+        let levels = row
+            .get("supportedEffortLevels")
+            .or_else(|| row.get("supported_effort_levels"));
+        let mut supported_effort_levels = Vec::new();
+        if let Some(levels) = levels {
+            for level in levels.as_array().ok_or_else(invalid)? {
+                let level = level
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|level| !level.is_empty())
+                    .ok_or_else(invalid)?;
+                if !supported_effort_levels
+                    .iter()
+                    .any(|existing| existing == level)
+                {
+                    supported_effort_levels.push(level.to_string());
+                }
+            }
+        }
+        if !models.iter().any(|model: &ModelCapability| model.id == id) {
+            models.push(ModelCapability {
+                id: id.into(),
+                display_name: name.into(),
+                provider: "claude",
+                source: None,
+                supports_effort: !supported_effort_levels.is_empty(),
+                supported_effort_levels,
+                supports_adaptive_thinking: row
+                    .get("supportsAdaptiveThinking")
+                    .or_else(|| row.get("supports_adaptive_thinking"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+    }
+    Ok(models)
+}
+
 // ── registry (FreshAgentModelCapabilityRegistry) ───────────────────────────────
 
 #[derive(Clone)]
@@ -172,6 +301,7 @@ struct RegistryState {
 /// `opencodeInFlightByKey` (`model-capability-registry.ts:193-194`).
 pub struct ModelCapabilityRegistry {
     probe: Arc<dyn ModelCatalogProbe>,
+    claude_probe: Arc<dyn ModelCatalogProbe>,
     ttl: Duration,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
     state: Arc<Mutex<RegistryState>>,
@@ -188,6 +318,7 @@ impl ModelCapabilityRegistry {
     pub fn new(probe: Arc<dyn ModelCatalogProbe>) -> Self {
         Self {
             probe,
+            claude_probe: Arc::new(ClaudeCatalogProbe),
             ttl: MODEL_CAPABILITY_CACHE_TTL,
             now: Arc::new(system_now_ms),
             state: Arc::new(Mutex::new(RegistryState::default())),
@@ -203,19 +334,24 @@ impl ModelCapabilityRegistry {
     ) -> Self {
         Self {
             probe,
+            claude_probe: Arc::new(ClaudeCatalogProbe),
             ttl,
             now,
             state: Arc::new(Mutex::new(RegistryState::default())),
         }
     }
 
+    pub fn with_claude_probe(mut self, probe: Arc<dyn ModelCatalogProbe>) -> Self {
+        self.claude_probe = probe;
+        self
+    }
+
     /// `getCapabilities` (`model-capability-registry.ts:211-234`): cache hit within
     /// TTL → `cached`; otherwise single-flight refresh → `fresh`; probe failure →
-    /// the `unavailable` envelope at 503 (cache untouched). Non-opencode runtimes
-    /// serve the static catalog (`createStaticSuccess`, `:354-378`) — for claude
-    /// providers that is the documented deviation above.
+    /// the `unavailable` envelope at 503 (cache untouched). Codex uses its
+    /// built-in catalog; Claude/Kilroy share their SDK catalog cache.
     pub async fn get(&self, session_type: SessionType, cwd: Option<String>) -> (StatusCode, Value) {
-        if session_type != SessionType::FreshOpencode {
+        if session_type == SessionType::FreshCodex {
             return (
                 StatusCode::OK,
                 success_body(
@@ -226,7 +362,7 @@ impl ModelCapabilityRegistry {
                 ),
             );
         }
-        let key = cache_key(cwd.as_deref());
+        let key = catalog_cache_key(session_type, cwd.as_deref());
         {
             let state = self.state.lock().await;
             if let Some(cached) = state.cache.get(&key) {
@@ -245,7 +381,7 @@ impl ModelCapabilityRegistry {
                 }
             }
         }
-        self.finish_opencode(session_type, key, cwd).await
+        self.finish_catalog(session_type, key, cwd).await
     }
 
     /// `refreshCapabilities` (`:236-254`): skips the TTL check but shares any
@@ -256,7 +392,7 @@ impl ModelCapabilityRegistry {
         session_type: SessionType,
         cwd: Option<String>,
     ) -> (StatusCode, Value) {
-        if session_type != SessionType::FreshOpencode {
+        if session_type == SessionType::FreshCodex {
             return (
                 StatusCode::OK,
                 success_body(
@@ -267,17 +403,21 @@ impl ModelCapabilityRegistry {
                 ),
             );
         }
-        self.finish_opencode(session_type, cache_key(cwd.as_deref()), cwd)
-            .await
+        self.finish_catalog(
+            session_type,
+            catalog_cache_key(session_type, cwd.as_deref()),
+            cwd,
+        )
+        .await
     }
 
-    async fn finish_opencode(
+    async fn finish_catalog(
         &self,
         session_type: SessionType,
         key: String,
         cwd: Option<String>,
     ) -> (StatusCode, Value) {
-        match self.refreshed_catalog(key, cwd).await {
+        match self.refreshed_catalog(session_type, key, cwd).await {
             Ok(catalog) => (
                 StatusCode::OK,
                 success_body(session_type, "fresh", catalog.fetched_at_ms, catalog.models),
@@ -294,6 +434,7 @@ impl ModelCapabilityRegistry {
     /// the reference's `.then(cache.set).finally(inflight.delete)`.
     async fn refreshed_catalog(
         &self,
+        session_type: SessionType,
         key: String,
         cwd: Option<String>,
     ) -> Result<CachedCatalog, CapabilityError> {
@@ -302,7 +443,11 @@ impl ModelCapabilityRegistry {
             match state.inflight.get(&key) {
                 Some(existing) => existing.clone(),
                 None => {
-                    let probe = self.probe.clone();
+                    let probe = if session_type == SessionType::FreshOpencode {
+                        self.probe.clone()
+                    } else {
+                        self.claude_probe.clone()
+                    };
                     let now = self.now.clone();
                     let state_arc = self.state.clone();
                     let key_for_cleanup = key.clone();
@@ -335,7 +480,10 @@ impl ModelCapabilityRegistry {
 }
 
 /// `opencodeCacheKey` (`:256-261`).
-fn cache_key(cwd: Option<&str>) -> String {
+fn catalog_cache_key(session_type: SessionType, cwd: Option<&str>) -> String {
+    if session_type != SessionType::FreshOpencode {
+        return "claude".into();
+    }
     let cwd = cwd.map(str::trim).filter(|s| !s.is_empty());
     format!("opencode:{}", cwd.unwrap_or("<default>"))
 }
@@ -363,14 +511,7 @@ fn static_models(session_type: SessionType) -> Vec<ModelCapability> {
                 &["none", "minimal", "low", "medium", "high", "max"],
             ),
         ],
-        // DEVIATION (module doc): Node probes the Claude SDK `supportedModels()`
-        // for the claude providers; the Rust port serves the shared static table.
-        SessionType::FreshClaude | SessionType::Kilroy => &[(
-            "opus[1m]",
-            "Claude Opus 5 (1M context)",
-            &["low", "medium", "high", "xhigh", "max"],
-        )],
-        SessionType::FreshOpencode => &[],
+        SessionType::FreshClaude | SessionType::Kilroy | SessionType::FreshOpencode => &[],
     };
     rows.iter()
         .map(|(id, display_name, levels)| ModelCapability {

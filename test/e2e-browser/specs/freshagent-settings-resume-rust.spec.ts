@@ -210,21 +210,22 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
-/** Create a Freshcodex pane through the real pane-picker UI.
+/** Create a Claude or Codex pane through the real pane-picker UI.
  * (donor: agent-checkpoint-rewind.spec.ts :188-214, availableClis preamble from
  * freshclaude-restart-parity-rust.spec.ts :177-205) */
-async function createFreshcodexPane(page: Page, cwd: string): Promise<void> {
+async function createFreshAgentPane(page: Page, cwd: string, provider: 'claude' | 'codex'): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app bootstrap +
   // /api/platform fetch; callers reach this only after waitForConnection().
-  await page.evaluate(() => {
+  await page.evaluate((provider) => {
     ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
       type: 'connection/setAvailableClis',
-      payload: { claude: false, codex: true },
+      payload: { claude: provider === 'claude', codex: provider === 'codex' },
     })
-  })
+  }, provider)
   const picker = await openPanePicker(page)
-  await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
-  const directoryInput = page.getByRole('combobox', { name: 'Starting directory for Freshcodex' })
+  const label = provider === 'claude' ? 'Freshclaude' : 'Freshcodex'
+  await picker.getByRole('button', { name: label, exact: true }).click({ force: true })
+  const directoryInput = page.getByRole('combobox', { name: `Starting directory for ${label}` })
   await expect(directoryInput).toBeVisible({ timeout: 15_000 })
   await directoryInput.fill(cwd)
   await directoryInput.press('Enter')
@@ -238,6 +239,64 @@ async function createFreshcodexPane(page: Page, cwd: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 test.describe('fresh-agent settings survive restart (rust)', () => {
+  test('claude: model, thinking, and permission changes apply to the next message in the same conversation', async ({ page, e2eServerKind }) => {
+    test.setTimeout(180_000)
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-settings-next-claude-'))
+    const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
+    // Deterministic catalog only: the conversation and settings writes run
+    // through the real browser, WebSocket handler, and Rust Claude runtime.
+    await page.route('**/api/fresh-agent/model-capabilities/freshclaude**', (route) => route.fulfill({ json: {
+      ok: true, sessionType: 'freshclaude', runtimeProvider: 'claude', status: 'fresh', fetchedAt: Date.now(),
+      models: [{ id: 'sonnet', displayName: 'Sonnet', provider: 'claude', supportsEffort: true,
+        supportedEffortLevels: ['low', 'medium', 'high'], supportsAdaptiveThinking: false }],
+    } }))
+    const { server, harness } = await bootWall(page, {
+      env: { FRESHELL_CLAUDE_SIDECAR: CLAUDE_FIXTURE, FAKE_CLAUDE_SIDECAR_LOG: sidecarLogPath, FAKE_CLAUDE_SIDECAR_ECHO_SETTINGS: '1' },
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      const tabId = (await harness.getActiveTabId())!
+      await createFreshAgentPane(page, sharedRoot, 'claude')
+      const pane = page.locator('[data-context="fresh-agent"]').last()
+      const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+      await expect(composer).toBeEnabled({ timeout: 30_000 })
+      await composer.fill('First message before settings change')
+      await pane.getByRole('button', { name: 'Send', exact: true }).click()
+      await expect(pane.getByText(/^Fixture claude turn/)).toBeVisible({ timeout: 30_000 })
+      await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toBeHidden()
+      const before = findFreshAgentLeaf(await harness.getPaneLayout(tabId)).content
+
+      await pane.getByRole('button', { name: /^Model:.*change model$/ }).click()
+      const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await dialog.getByRole('option', { name: 'Sonnet', exact: true }).click()
+      await dialog.getByRole('option', { name: 'low', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Use Sonnet · low' }).click()
+      await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('plan')
+      await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
+      await composer.fill('Second message uses the selected settings')
+      await pane.getByRole('button', { name: 'Send', exact: true }).click()
+      await expect(pane.getByText('Fixture claude turn (sonnet, low, plan)', { exact: true })).toBeVisible({ timeout: 30_000 })
+
+      const requests = readJsonl(sidecarLogPath).map((row) => row.msg)
+      const secondSend = requests.findIndex((msg) => msg.type === 'send' && msg.text === 'Second message uses the selected settings')
+      const configure = requests.findLastIndex((msg) => msg.type === 'configure')
+      expect(configure).toBeGreaterThan(-1)
+      expect(configure).toBeLessThan(secondSend)
+      expect(requests[configure].settings).toMatchObject({ model: 'sonnet', effort: 'low', permissionMode: 'plan' })
+      expect(requests.filter((msg) => msg.type === 'create')).toHaveLength(1)
+      const after = findFreshAgentLeaf(await harness.getPaneLayout(tabId)).content
+      expect(after.sessionId).toBe(before.sessionId)
+      expect(after.sessionRef).toEqual(before.sessionRef)
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
   test('codex: create-shaped resume after restart carries the recorded model', async ({ e2eServerKind }) => {
     test.setTimeout(180_000)
     expect(e2eServerKind).toBe('rust')
@@ -590,7 +649,7 @@ test.describe('fresh-agent settings survive restart (rust)', () => {
       // Wait for the boot pane to become a REAL terminal before opening the
       // pane picker (donor: freshclaude-restart-parity-rust.spec.ts :229-232).
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      await createFreshcodexPane(page, projectDir)
+      await createFreshAgentPane(page, projectDir, 'codex')
 
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       await expect

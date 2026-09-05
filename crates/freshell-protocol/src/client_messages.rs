@@ -30,6 +30,8 @@ pub enum ClientMessage {
     TerminalCodexCandidatePersisted(TerminalCodexCandidatePersisted),
     #[serde(rename = "terminal.attach")]
     TerminalAttach(TerminalAttach),
+    #[serde(rename = "terminal.interest")]
+    TerminalInterest(TerminalInterest),
     #[serde(rename = "terminal.autoResumeCancel")]
     TerminalAutoResumeCancel(TerminalAutoResumeCancel),
     #[serde(rename = "terminal.detach")]
@@ -110,7 +112,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 39] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 40] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -146,6 +148,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 39] = [
     "terminal.create",
     "terminal.detach",
     "terminal.input",
+    "terminal.interest",
     "terminal.kill",
     "terminal.resize",
     "ui.layout.sync",
@@ -165,6 +168,8 @@ pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 0] = [];
 pub struct HelloCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_output_batch_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_interest_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_screenshot_v1: Option<bool>,
     /// Reconciliation handshake opt-in (design §4.1). A client that sets this
@@ -215,6 +220,16 @@ pub struct Hello {
     /// new one; same value `tabs.sync.push` carries).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_instance_id: Option<String>,
+}
+
+/// Full presentation-interest snapshot for this connection. Validation of
+/// cardinality, safe revision range and focused-in-visible runs at dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInterest {
+    pub revision: u64,
+    pub focused_terminal_id: Option<String>,
+    pub visible_terminal_ids: Vec<String>,
 }
 
 // --- client.diagnostic ------------------------------------------------------

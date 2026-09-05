@@ -33,6 +33,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
+- Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped at vitest config load by `config/vitest/sanitize-test-env.ts` (imported first by every config EXCEPT the two real-provider smoke configs); local test runs do not need env pre-stripping.
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).

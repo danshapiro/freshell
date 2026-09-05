@@ -6,8 +6,9 @@
 //! (`TerminalRegistry`), and REAL `tokio-tungstenite` WS clients -- one that
 //! deliberately stops reading while a terminal floods output (the slow
 //! client), and one that keeps reading throughout (the fast client). This
-//! exercises the actual `ConnectionOutputQueue` wired into
-//! `crate::terminal::run`, not a mock.
+//! exercises the actual per-connection byte-fair delivery queue owned by the
+//! connection socket writer (`crate::terminal`'s `connection_writer`), not a
+//! mock.
 
 use std::sync::Arc;
 use std::time::Duration;

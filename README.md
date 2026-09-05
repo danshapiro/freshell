@@ -66,6 +66,12 @@ npm run serve   # Production build and run
 
 `npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
 
+### Fresh agents
+
+Freshclaude, Freshcodex, and Freshopencode share a chat interface with attachments, tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
+
+You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
+
 ## Stream Deck
 
 Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — by default the **Status icons** style: title on top, centered repo icons, and a status background (green for tabs that want attention), with keys sorted so attention-seeking tabs come first. Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab plus busy/waiting counts (waiting = tabs that finished a turn or are waiting for approval). The deck dims after a configurable idle timeout and wakes on activity.

@@ -413,6 +413,7 @@ export const HelloSchema = z.object({
   capabilities: z.object({
     uiScreenshotV1: z.boolean().optional(),
     terminalOutputBatchV1: z.boolean().optional(),
+    terminalInterestV1: z.literal(true).optional(),
     // REQUIRED here (not just in the sent object): Zod non-strict objects silently
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
@@ -973,12 +974,22 @@ export type PaneReconcileResultMessage = z.infer<typeof PaneReconcileResultSchem
 /** Server capability advertisement on `ready`: present iff the client's hello opted in via capabilities.paneReconcileV1. */
 export const ReadyCapabilitiesSchema = z
   .object({
+    terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
   })
   .optional()
 
 export type ReadyCapabilities = z.infer<typeof ReadyCapabilitiesSchema>
+
+/** Transient per-connection presentation state. Does not attach or resize. */
+export const TerminalInterestSchema = z.object({
+  type: z.literal('terminal.interest'),
+  revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+  focusedTerminalId: z.string().min(1).max(512).nullable().optional(),
+  visibleTerminalIds: z.array(z.string().min(1).max(512)).max(1024),
+})
+export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
 
 // ── Client message discriminated union ──
 
@@ -991,6 +1002,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalCreateSchema,
   TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
+  TerminalInterestSchema,
   TerminalAutoResumeCancelSchema,
   TerminalDetachSchema,
   PaneClosedSchema,

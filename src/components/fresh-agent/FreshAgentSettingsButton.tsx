@@ -48,10 +48,10 @@ const PERMISSION_MODES_BY_PROVIDER: Record<string, PermissionModeOption[]> = {
     { value: 'plan', label: 'Plan mode (read-only)', description: 'Research and propose; no edits until approved.' },
   ],
   codex: [
-    { value: 'read-only', label: 'Read-only' },
+    { value: 'untrusted', label: 'Ask for untrusted commands' },
     { value: 'on-request', label: 'On request' },
     { value: 'on-failure', label: 'On failure' },
-    { value: 'never', label: 'Never ask (full access)' },
+    { value: 'never', label: 'Never ask', description: 'Commands still follow the session’s file and network access limits.' },
   ],
 }
 

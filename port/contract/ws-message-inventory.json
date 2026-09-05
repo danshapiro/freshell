@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 39,
+    "count": 40,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -37,6 +37,7 @@
       "terminal.create",
       "terminal.detach",
       "terminal.input",
+      "terminal.interest",
       "terminal.kill",
       "terminal.resize",
       "ui.layout.sync",

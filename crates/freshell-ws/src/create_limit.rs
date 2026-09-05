@@ -32,7 +32,10 @@ pub struct CreateProtectConfig {
     pub rate_window_ms: u64,
     /// Server-wide max concurrent PTY spawns (spawn-gate permits).
     pub spawn_concurrency: usize,
-    /// Max creates queued waiting on the gate before failing loud.
+    /// Max creates queued waiting on the gate before failing loud. Also the
+    /// per-connection ordinary-create worker queue depth
+    /// (`terminal::interactive_creates`): one operator-level ceiling for
+    /// "creates parked, not running" anywhere.
     pub spawn_queue_cap: usize,
     /// Max wait for a spawn-gate permit before failing loud, ms. Must stay
     /// far below the frozen client's ~38s RATE_LIMITED ladder patience

@@ -197,6 +197,7 @@ export const FreshAgentPendingApprovalSchema = z.object({
 }).strict()
 
 export const FreshAgentQuestionDefinitionSchema = z.object({
+  id: z.string().optional(),
   question: z.string(),
   header: z.string().optional(),
   options: z.array(z.object({

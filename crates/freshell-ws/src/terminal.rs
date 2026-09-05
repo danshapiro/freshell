@@ -23,13 +23,12 @@
 //!
 //! ## Concurrency model
 //!
-//! One `tokio::select!` loop per connection. The connection owns a single mpsc
-//! channel (`conn_rx`); a [`FrameSink`] wrapping its sender is what the registry
-//! hands to `attach` — so `terminal.attach.ready`, the replayed scrollback, and the
-//! live fan-out for THIS connection all arrive on the one channel, in strict seq
-//! order (the registry enqueues the replay under the per-terminal lock before any
-//! live frame). The loop drains `conn_rx` to the socket. The `attachRequestId`
-//! stamping from 3.10 is preserved per-connection by the registry.
+//! A read/dispatch loop, a single supervised socket writer, and a serial ordinary-
+//! create worker per connection. Network flushes and CLI launch work do not hold
+//! the reader. The writer admits preludes and output under one lock, preserves
+//! per-stream output order and final-output-before-exit, and consumes one output
+//! frame at a time. Restore creates keep their existing server-wide gated path.
+//! The registry still owns `attachRequestId` stamping and replay/live handoff.
 //!
 //! ## Safety
 //!
@@ -78,8 +77,14 @@ mod terminal_create_ordering_tests;
 #[path = "terminal_launch_prep_tests.rs"]
 mod terminal_launch_prep_tests;
 
-/// The write half of a split axum WebSocket.
-pub(crate) type WsSink = SplitSink<WebSocket, Message>;
+#[path = "connection_writer.rs"]
+mod connection_writer;
+#[path = "interactive_creates.rs"]
+mod interactive_creates;
+
+/// Handlers enqueue to the connection's bounded outbox. Only the supervised
+/// writer task owns the actual SplitSink and awaits network writes.
+pub(crate) type WsSink = connection_writer::WriterSender;
 
 /// Task 9: per-connection `hoststats.refresh` floor (legacy parity:
 /// `ws-handler.ts` `HOST_STATS_REFRESH_MIN_INTERVAL_MS`, default 1000).
@@ -256,6 +261,7 @@ pub async fn run(
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
     conn_identity: ConnectionIdentity,
+    terminal_interest_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -296,6 +302,7 @@ pub async fn run(
         conn_id,
         origin_kind,
         conn_identity,
+        terminal_interest_v1,
     )
     .instrument(span)
     .await;
@@ -306,7 +313,7 @@ pub async fn run(
 /// here polls with the `ws_conn` span as the current context.
 #[allow(clippy::too_many_arguments)] // Same connection-scoped plumbing as run().
 async fn run_loop(
-    mut ws_tx: WsSink,
+    socket_tx: SplitSink<WebSocket, Message>,
     mut ws_rx: futures_util::stream::SplitStream<WebSocket>,
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
@@ -317,39 +324,33 @@ async fn run_loop(
     conn_id: u64,
     origin_kind: &'static str,
     mut conn_identity: ConnectionIdentity,
+    terminal_interest_v1: bool,
 ) {
-    // This connection's single outbound channel. The registry delivers this
-    // connection's attach.ready / replay / live-output / exit frames here (via the
-    // FrameSink below); the loop drains it to the socket in FIFO — hence in-order.
-    //
-    // TERM-09: live terminal OUTPUT frames (`TerminalOutput`/`TerminalOutputBatch`)
-    // are intercepted by `output_queue` BEFORE reaching this channel -- a bounded,
-    // drop-oldest queue (mirrors `ClientOutputQueue`) that keeps ONE slow reader
-    // from growing server memory without bound. `terminal.exit` ALSO travels the
-    // queue (as a zero-weight, non-evictable sequenced frame) so it can never
-    // overtake queued output/replay and blank an exited pane -- see
-    // `ConnectionOutputQueue::route`. Other frame families (`attach.ready`,
-    // `terminal.created`, ...) go direct on this channel (see
-    // `freshell_terminal::output_queue` and `crate::backpressure` module docs
-    // for the full mapping).
-    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let output_queue = Arc::new(crate::backpressure::ConnectionOutputQueue::new(
-        state.term09.queue_max_bytes,
-    ));
-    // Per-connection `terminal.create` sliding-window rate limiter (legacy
-    // parity: `ClientState.terminalCreateTimestamps`, `ws-handler.ts:2376-2389`)
-    // — fresh/empty on every (re)connect, exactly like the original.
-    let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
-        state.create_protect.rate_limit,
-        state.create_protect.rate_window_ms,
+    // One independently supervised socket writer. The read/dispatch path
+    // never awaits socket capacity; output is reconsidered one frame at a time.
+    // Keep the existing output cap and add a bounded control-mailbox budget.
+    let write_timeout = std::time::Duration::from_millis(
+        state
+            .term09
+            .catastrophic_stall_ms
+            .max(state.ping_interval_ms.saturating_mul(2))
+            .max(1000),
     );
+    let (mut ws_tx, writer) = connection_writer::WriterSender::new(
+        state.term09.queue_max_bytes,
+        state.term09.queue_max_bytes.max(64 * 1024),
+        write_timeout,
+    );
+    if terminal_interest_v1 {
+        ws_tx.enable_terminal_interest();
+    }
+    let mut writer_task = tokio::spawn(writer.run(socket_tx).instrument(tracing::Span::current()));
+    let _writer_lifetime = connection_writer::AbortWriterOnDrop(writer_task.abort_handle());
+    let mut writer_finished = false;
     let conn_sink: FrameSink = {
-        let tx = conn_tx.clone();
-        let output_queue = Arc::clone(&output_queue);
+        let sender = ws_tx.clone();
         Arc::new(move |msg| {
-            if let Some(msg) = output_queue.route(msg) {
-                let _ = tx.send(msg);
-            }
+            sender.push_server(msg);
         })
     };
     // Per-connection cancel signal for gated restore creates. The sender
@@ -358,17 +359,26 @@ async fn run_loop(
     // keepalive timeout, or server shutdown (4009): the explicit send below
     // plus the sender drop at return both unblock waiters.
     let (create_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+    let (interactive_create_tx, mut interactive_create_task) = interactive_creates::spawn(
+        state,
+        &conn_sink,
+        create_cancel_rx.clone(),
+        conn_id,
+        pane_reconcile_v1,
+    );
+    let mut interactive_create_finished = false;
     if ui_screenshot_v1 {
-        let tx = conn_tx.clone();
-        state
-            .screenshots
-            .add_capable_client(conn_id, Arc::new(move |message| tx.send(message).is_ok()));
+        let sender = ws_tx.clone();
+        state.screenshots.add_capable_client(
+            conn_id,
+            Arc::new(move |message| sender.push_server(message)),
+        );
     }
     // Catastrophic-backpressure monitor: fires if this connection's queued
     // output stays above `catastrophic_buffered_bytes` continuously for
     // `catastrophic_stall_ms` (mirrors `broker.ts`'s `catastrophicBlocked`).
-    // Checked on a dedicated ticker rather than only between sends -- see
-    // `crate::backpressure` module doc for why, and its one known trade-off.
+    // The ticker now runs independently of network writes. The pressure
+    // reading includes the writer's in-flight output frame, not just the queue.
     let mut catastrophic = crate::backpressure::CatastrophicMonitor::new(
         state.term09.catastrophic_buffered_bytes,
         state.term09.catastrophic_stall_ms,
@@ -380,7 +390,7 @@ async fn run_loop(
     // Task 9 (host-pressure pane): THIS connection's last `hoststats.refresh`
     // stamp — the per-connection 1s floor (legacy parity:
     // `ClientState.hostStatsLastRefreshAt`, `ws-handler.ts:3330-3336`). Fresh
-    // on every (re)connect, exactly like `create_limiter` above.
+    // on every (re)connect, like the limiter owned by the create worker.
     let mut host_stats_last_refresh_at: Option<std::time::Instant> = None;
 
     // Whether the broadcast bus is still open (guards the select branch so a closed
@@ -403,7 +413,7 @@ async fn run_loop(
     // real cadence starts one full interval out, matching the original.
     ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping_ticker.tick().await;
-    let mut pong_since_last_ping = true;
+    let mut keepalive = connection_writer::Keepalive::default();
 
     // DIAG-01: the reason (and, when the peer supplied one, the WS close
     // code) this connection's loop broke -- captured at each `break` site,
@@ -417,6 +427,26 @@ async fn run_loop(
 
     loop {
         tokio::select! {
+            result = &mut writer_task => {
+                writer_finished = true;
+                match result {
+                    Ok(exit) => {
+                        close_reason = exit.reason();
+                        close_code = exit.close_code();
+                    }
+                    Err(error) => {
+                        tracing::error!(connection_id = conn_id, error = %error, "ws.writer.failed");
+                        close_reason = "writer_task_failed";
+                    }
+                }
+                break;
+            }
+            result = &mut interactive_create_task => {
+                interactive_create_finished = true;
+                tracing::error!(connection_id = conn_id, result = ?result, "ws.create_worker.exited");
+                close_reason = "create_worker_exited";
+                break;
+            }
             // Graceful shutdown (`ws-handler.ts:3843`): close 4009 "Server shutting
             // down" so a live client sees the original's exact disconnect UX.
             _ = state.shutdown.notified() => {
@@ -429,16 +459,18 @@ async fn run_loop(
                 break;
             }
             _ = ping_ticker.tick() => {
-                if !pong_since_last_ping {
-                    // No pong since the previous tick: legacy's `ws.terminate()`.
-                    tracing::warn!(connection_id = conn_id, missed = 1u32, "ws.keepalive.terminated");
-                    close_reason = "keepalive_timeout";
-                    break;
-                }
-                pong_since_last_ping = false;
-                if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    close_reason = "send_error";
-                    break;
+                match keepalive.tick(&ws_tx) {
+                    Ok(()) => {},
+                    Err(connection_writer::KeepaliveError::TimedOut) => {
+                        tracing::warn!(connection_id = conn_id, missed = 1u32, "ws.keepalive.terminated");
+                        close_reason = "keepalive_timeout";
+                        break;
+                    }
+                    Err(connection_writer::KeepaliveError::Writer(exit)) => {
+                        close_reason = exit.reason();
+                        close_code = exit.close_code();
+                        break;
+                    }
                 }
             }
             inbound = ws_rx.next() => {
@@ -453,7 +485,7 @@ async fn run_loop(
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
                             pane_reconcile_fresh_agent_v1,
-                            &mut create_limiter,
+                            &interactive_create_tx,
                             &create_cancel_rx,
                             &mut host_stats_last_refresh_at,
                             &mut conn_identity,
@@ -481,54 +513,10 @@ async fn run_loop(
                         break;
                     }
                     // A pong answers our keepalive ping (`ws.on('pong')`, ws-handler.ts:1149-1150).
-                    Some(Ok(Message::Pong(_))) => { pong_since_last_ping = true; }
+                    Some(Ok(Message::Pong(_))) => { keepalive.observe_pong(); }
                     // Binary / inbound ping: ignored (an inbound ping's pong reply is
                     // handled automatically by the underlying transport).
                     _ => {}
-                }
-            }
-            maybe_out = conn_rx.recv() => {
-                if let Some(out) = maybe_out {
-                    // A terminal frame destined for THIS connection (registry fan-out).
-                    if !send(&mut ws_tx, &out).await {
-                        close_reason = "send_error";
-                        break;
-                    }
-                }
-            }
-            // TERM-09: this connection's bounded terminal-output queue has new
-            // (or still-pending) frames -- drain everything currently queued
-            // and send it, in order (gaps first, then frames; see
-            // `OutputQueue::drain_all`).
-            _ = output_queue.notified() => {
-                let mut send_failed = false;
-                // Protocol-order guarantee: `attach.ready` (and every other
-                // non-output frame) travels the DIRECT `conn_rx` channel while
-                // replay/live output travels this bounded queue. This unbiased
-                // `select!` could otherwise deliver already-queued replay
-                // frames BEFORE the `attach.ready` enqueued ahead of them —
-                // inverting the documented "attach.ready, then replay, then
-                // live" order the client depends on (it arms its pendingReplay
-                // window only on ready; src/lib/terminal-attach-seq-state.ts:143,
-                // "attach.ready arrives before replay frames"). Drain every
-                // direct frame already pending before any queued output.
-                while let Ok(out) = conn_rx.try_recv() {
-                    if !send(&mut ws_tx, &out).await {
-                        send_failed = true;
-                        break;
-                    }
-                }
-                if !send_failed {
-                    for out in output_queue.drain_all() {
-                        if !send(&mut ws_tx, &out).await {
-                            send_failed = true;
-                            break;
-                        }
-                    }
-                }
-                if send_failed {
-                    close_reason = "send_error";
-                    break;
                 }
             }
             // TERM-09 catastrophic backpressure: this connection's queued
@@ -536,10 +524,10 @@ async fn run_loop(
             // full stall duration -- close now (mirrors `broker.ts`'s
             // `catastrophicBlocked` closing with 4008 "Catastrophic backpressure").
             _ = catastrophic_ticker.tick() => {
-                if catastrophic.tick(output_queue.pending_bytes()) {
+                if catastrophic.tick(ws_tx.pending_output_bytes()) {
                     tracing::warn!(
                         connection_id = conn_id,
-                        pending_bytes = output_queue.pending_bytes(),
+                        pending_bytes = ws_tx.pending_output_bytes(),
                         threshold = state.term09.catastrophic_buffered_bytes,
                         "ws.terminal_stream.catastrophic_close"
                     );
@@ -610,6 +598,45 @@ async fn run_loop(
         }
     }
 
+    // A mid-dispatch admission failure or a lost-keepalive-receipt lands here
+    // as the generic "send_error"/"writer_stopped"; if the writer had already
+    // exited with a precise reason (stalled send, control overflow,
+    // serialization failure), adopt that reason and close code so the DIAG-01
+    // lifecycle event stays truthful. Non-blocking peek only: the join below
+    // still owns the unfinished case. A COMPLETED handle must be marked
+    // finished on both arms: polling it again after now_or_never delivered
+    // its result panics, and a writer panic is exactly the Err arm here.
+    if matches!(close_reason, "send_error" | "writer_stopped") && !writer_finished {
+        use futures_util::FutureExt;
+        if let Some(result) = (&mut writer_task).now_or_never() {
+            writer_finished = true;
+            match result {
+                Ok(exit) => {
+                    close_reason = exit.reason();
+                    close_code = exit.close_code();
+                }
+                Err(error) => {
+                    tracing::error!(connection_id = conn_id, error = %error, "ws.writer.failed");
+                    close_reason = "writer_task_failed";
+                }
+            }
+        }
+    }
+
+    // Close network admission immediately. Cancelling a pending socket send
+    // drops the socket rather than retrying an ambiguously sent frame. Create
+    // admission closes now; already-received creates drain to settle before
+    // the lease sweep below runs.
+    let _ = create_cancel_tx.send(true);
+    drop(interactive_create_tx);
+    drop(ws_rx); // release the read half before waiting for a started create
+    ws_tx.stop_without_close();
+    if !writer_finished {
+        if let Err(error) = (&mut writer_task).await {
+            tracing::error!(connection_id = conn_id, error = %error, "ws.writer.join_failed");
+        }
+    }
+
     // DIAG-01: one summary lifecycle event per connection teardown, whatever
     // the actual reason -- see `close_reason`/`close_code` above. Both
     // identity fields are EVENT-level (not span-only): the dual-carrier
@@ -662,6 +689,15 @@ async fn run_loop(
     // gone). Redundant with the sender drop at return; explicit for clarity.
     let _ = create_cancel_tx.send(true);
 
+    // Do not revoke a started ordinary create's lease while spawn_blocking
+    // can still insert its PTY. This preserves the former inline-create
+    // lifecycle while allowing reader/writer progress during the create.
+    if !interactive_create_finished {
+        if let Err(error) = (&mut interactive_create_task).await {
+            tracing::error!(connection_id = conn_id, error = %error, "ws.create_worker.join_failed");
+        }
+    }
+
     // D8 conn-death lease release (council rule 8): pid-less in-flight leases
     // are released inside the registry call; pid-carrying ones come back
     // STILL-HELD — kill via the registry handle, confirm, then force-release
@@ -693,7 +729,7 @@ async fn handle_client_text(
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
-    create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
     create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
     // Task 9: per-connection hoststats.refresh floor stamp (see run_loop).
     host_stats_last_refresh_at: &mut Option<std::time::Instant>,
@@ -828,6 +864,23 @@ async fn handle_client_text(
     let Ok(message) = serde_json::from_value::<ClientMessage>(value) else {
         return true;
     };
+    match &message {
+        ClientMessage::TerminalAttach(attach)
+            if terminal_dims_in_range(attach.cols, attach.rows) =>
+        {
+            ws_tx.set_attachment_priority(
+                &attach.terminal_id,
+                matches!(
+                    attach.priority.as_ref(),
+                    Some(freshell_protocol::TerminalAttachPriority::Background)
+                ),
+            );
+        }
+        ClientMessage::TerminalDetach(detach) => {
+            ws_tx.discard_terminal_delivery(&detach.terminal_id)
+        }
+        _ => {}
+    }
     // Capability refusal table (Task 2 of the approval-respond run; the silent-drop
     // fix of bug-hunt pbh-20260807): the fresh-agent control frames (approval.respond
     // / question.respond / fork / compact) that hit a genuinely unsupported provider x
@@ -840,6 +893,27 @@ async fn handle_client_text(
         return send(ws_tx, &reply).await;
     }
     match message {
+        ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
+            Ok(()) => true,
+            Err(message) => {
+                send(
+                    ws_tx,
+                    &ServerMessage::Error(ErrorMsg {
+                        code: ErrorCode::InvalidMessage,
+                        message: message.to_string(),
+                        timestamp: crate::now_iso(),
+                        request_id: None,
+                        terminal_id: None,
+                        actual_session_ref: None,
+                        expected_session_ref: None,
+                        retry_after_ms: None,
+                        terminal_exit_code: None,
+                        live_terminal_id: None,
+                    }),
+                )
+                .await
+            }
+        },
         // SAFE-08: structured restore-diagnostic record, parity with
         // server/ws-handler.ts:1901-1915's `client_restore_unavailable`
         // session-lifecycle event. Server-side this is a PURE diagnostic --
@@ -928,26 +1002,39 @@ async fn handle_client_text(
                 );
                 true
             } else {
-                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
                 let request_id = create.request_id.clone();
-                let sent = handle_create(
+                // Main's serial interactive-create queue (terminal-foreground
+                // delivery) keeps THIS lane's stamping intact: the Job carries
+                // the connection's provenance and the message-receipt
+                // assertion time, captured NOW (queue latency must never
+                // fabricate freshness in the recovery judgment).
+                match interactive_create_tx.try_send(interactive_creates::Job::new(
                     create,
-                    None,
-                    &mut out,
                     state,
-                    conn_id,
-                    pane_reconcile_v1,
-                    create_limiter,
                     conn_identity,
                     asserted_at,
-                )
-                .await;
-                // No-op on success (the entry is Settled by `handle_create`'s
-                // main spawn path); drops the InFlight sentinel on every
-                // other exit (adopt/session-reserved/sessionRef-attach/
-                // rate-limited/failed) so a retry proceeds fresh (A2).
-                state.create_dedupe.clear_if_in_flight(&request_id);
-                sent
+                )) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        let full = matches!(&error, mpsc::error::TrySendError::Full(_));
+                        drop(error); // drops the job's in-flight dedupe guard
+                        if !full {
+                            // TrySendError::Closed: the create worker is gone
+                            // and the loop's supervision branch already closes
+                            // us as `create_worker_exited` — don't race it to
+                            // a misleading `send_error` teardown label.
+                            return true;
+                        }
+                        let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                        send_create_error(
+                            &mut out,
+                            ErrorCode::RateLimited,
+                            "Too many queued terminal creates".to_string(),
+                            &request_id,
+                        )
+                        .await
+                    }
+                }
             }
         }
         // RETIRED (campaign §2.3.2, Lane B2): codex identity has exactly one
@@ -1232,11 +1319,18 @@ async fn handle_client_text(
         // freshAgent.approval.respond / question.respond / compact (approval-respond
         // Task 2): the refusal table already answered every unsupported provider x op
         // cell before this match; the remaining cells route to real handlers.
-        // Claude/kilroy route to the FreshClaudeState sidecar handlers as DETACHED
+        // Claude/kilroy and Codex route to their sidecar handlers as DETACHED
         // tasks (same shape as FreshAgentSend above — a sidecar stdin write never
-        // blocks this connection's select loop). Non-claude cells here are
-        // unreachable post-refusal; the `if` keeps the arm total defensively.
+        // blocks this connection's select loop).
         ClientMessage::FreshAgentApprovalRespond(respond) => {
+            if respond.provider == freshell_protocol::AgentProvider::Codex {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_approval_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
+                return true;
+            }
             if respond.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
                 tokio::spawn(
@@ -1247,6 +1341,14 @@ async fn handle_client_text(
             true
         }
         ClientMessage::FreshAgentQuestionRespond(respond) => {
+            if respond.provider == freshell_protocol::AgentProvider::Codex {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_question_respond(respond).await }
+                        .instrument(tracing::Span::current()),
+                );
+                return true;
+            }
             if respond.provider == freshell_protocol::AgentProvider::Claude {
                 let fresh_claude = state.fresh_claude.clone();
                 tokio::spawn(
@@ -5413,7 +5515,7 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// freshAgent.error{code:'UNSUPPORTED_CAPABILITY', message:<parity text>}})` ONLY for
 /// the genuinely unsupported provider x op cells, with the legacy `runtime-manager.ts`
 /// wording (`"Approvals are not supported for <sessionType>"`, `"Questions are …"`,
-/// `"Fork is …"`, `"Compact is …"`): approvals/questions are claude-only, fork is
+/// `"Fork is …"`, `"Compact is …"`): approvals/questions support Claude and Codex, fork is
 /// refused for claude (permanently — the claude path has no fork) and amplifier
 /// (always); the opencode fork arm landed in Task 5 and the codex arm in Task 6.
 /// Compact is refused ONLY for amplifier (every other provider has a real
@@ -5426,14 +5528,14 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<ServerMessage> {
     let (refused, wording, provider, session_id, session_type) = match message {
         ClientMessage::FreshAgentApprovalRespond(m) => (
-            m.provider != AgentProvider::Claude,
+            !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
             "Approvals are",
             m.provider,
             m.session_id.as_str(),
             m.session_type,
         ),
         ClientMessage::FreshAgentQuestionRespond(m) => (
-            m.provider != AgentProvider::Claude,
+            !matches!(m.provider, AgentProvider::Claude | AgentProvider::Codex),
             "Questions are",
             m.provider,
             m.session_id.as_str(),
@@ -7805,8 +7907,17 @@ mod pane_reconcile_gate_tests {
                 async move {
                     upgrade.on_upgrade(move |socket| async move {
                         let (sink, _read) = socket.split();
+                        // Mirror the production wiring: `handle_client_text`
+                        // enqueues onto the bounded outbox; a supervised pump
+                        // owns the real socket half and flushes in order.
+                        let (sender, pump) = connection_writer::WriterSender::new(
+                            16 * 1024 * 1024,
+                            16 * 1024 * 1024,
+                            std::time::Duration::from_secs(5),
+                        );
+                        tokio::spawn(pump.run(sink));
                         if let Some(tx) = sink_tx.lock().await.take() {
-                            let _ = tx.send(sink);
+                            let _ = tx.send(sender);
                         }
                         // Park: keep the upgraded socket (and with it the
                         // handed-out write half) alive until the test's
@@ -7904,7 +8015,10 @@ mod pane_reconcile_gate_tests {
         let (mut ws_tx, mut client) = loopback_sink_and_client().await;
         let state = state();
         let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
-        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        // No ordinary `terminal.create` is sent by these tests; the worker
+        // channel only needs to exist so dispatch can hand off if one arrives.
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
         let mut conn_identity = ConnectionIdentity::default();
@@ -7918,7 +8032,7 @@ mod pane_reconcile_gate_tests {
             false,
             false, // pane_reconcile_v1: NOT negotiated on this connection
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
@@ -7942,7 +8056,7 @@ mod pane_reconcile_gate_tests {
             false,
             false,
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
@@ -7961,14 +8075,70 @@ mod pane_reconcile_gate_tests {
         let pong = next_text_frame(&mut client).await;
         assert_eq!(pong["type"], "pong");
     }
-}
 
-/// Task 9 (host-pressure pane): the `hoststats.subscribe` / `.unsubscribe` /
-/// `.refresh` dispatch arms. A REAL loopback websocket pair (same scaffold as
-/// `pane_reconcile_gate_tests`) drives `handle_client_text`'s real
-/// serialization + send path; the collector is a fake implementing the
-/// freshell-server-owned trait (dependency direction is frozen — freshell-ws
-/// can never import the concrete collector).
+    #[tokio::test]
+    async fn full_create_queue_gets_loud_rate_limited_reply_and_retries_clean() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let state = state();
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        // Capacity 1 with NO worker draining: the filler create occupies the
+        // slot, so the tested creates deterministically observe a full
+        // queue. Nothing here spawns a PTY.
+        let (interactive_create_tx, interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+        let mut conn_identity = ConnectionIdentity::default();
+        let filler =
+            r#"{"type":"terminal.create","requestId":"filler","mode":"shell","shell":"system"}"#;
+        let ok = handle_client_text(
+            filler,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &interactive_create_tx,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+            &mut conn_identity,
+        )
+        .await;
+        assert!(ok);
+
+        // Each attempt must be answered loudly (never silently queued or
+        // masked as a dead socket), and the rejected job's dedupe guard must
+        // clear so the NEXT attempt with the same requestId is judged on its
+        // own — i.e. both replies are independent RATE_LIMITED answers, not
+        // one answer followed by duplicate-in-flight silence.
+        for attempt in 0..2 {
+            let create = r#"{"type":"terminal.create","requestId":"q-full","mode":"shell","shell":"system"}"#;
+            let ok = handle_client_text(
+                create,
+                &mut ws_tx,
+                &state,
+                1,
+                &conn_sink,
+                false,
+                false,
+                false,
+                &interactive_create_tx,
+                &create_cancel_rx,
+                &mut host_stats_last_refresh_at,
+                &mut conn_identity,
+            )
+            .await;
+            assert!(ok, "attempt {attempt}: a full queue must be answered");
+            let error = next_text_frame(&mut client).await;
+            assert_eq!(error["type"], "error", "attempt {attempt}");
+            assert_eq!(error["requestId"], "q-full", "attempt {attempt}");
+            assert_eq!(error["code"], "RATE_LIMITED", "attempt {attempt}");
+        }
+        drop(interactive_create_rx);
+    }
+}
 #[cfg(test)]
 mod host_stats_dispatch_tests {
     use super::*;
@@ -8160,8 +8330,17 @@ mod host_stats_dispatch_tests {
                 async move {
                     upgrade.on_upgrade(move |socket| async move {
                         let (sink, _read) = socket.split();
+                        // Mirror the production wiring: `handle_client_text`
+                        // enqueues onto the bounded outbox; a supervised pump
+                        // owns the real socket half and flushes in order.
+                        let (sender, pump) = connection_writer::WriterSender::new(
+                            16 * 1024 * 1024,
+                            16 * 1024 * 1024,
+                            std::time::Duration::from_secs(5),
+                        );
+                        tokio::spawn(pump.run(sink));
                         if let Some(tx) = sink_tx.lock().await.take() {
-                            let _ = tx.send(sink);
+                            let _ = tx.send(sender);
                         }
                         std::future::pending::<()>().await;
                     })
@@ -8264,7 +8443,10 @@ mod host_stats_dispatch_tests {
             collector: Some(fake.clone()),
         });
         let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
-        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        // No ordinary `terminal.create` is sent by these tests; the worker
+        // channel only needs to exist so dispatch can hand off if one arrives.
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
         let mut conn_identity = ConnectionIdentity::default();
@@ -8282,7 +8464,7 @@ mod host_stats_dispatch_tests {
                 false,
                 false,
                 false,
-                &mut create_limiter,
+                &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
@@ -8313,7 +8495,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
@@ -8334,7 +8516,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
@@ -8358,7 +8540,10 @@ mod host_stats_dispatch_tests {
             collector: Some(fake.clone()),
         });
         let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
-        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        // No ordinary `terminal.create` is sent by these tests; the worker
+        // channel only needs to exist so dispatch can hand off if one arrives.
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
         let mut conn_identity = ConnectionIdentity::default();
@@ -8373,7 +8558,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
@@ -8400,7 +8585,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
@@ -8428,7 +8613,10 @@ mod host_stats_dispatch_tests {
         let (mut ws_tx, mut client) = loopback_sink_and_client().await;
         let state = state_with_host_stats(WsHostStatsState::default());
         let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
-        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        // No ordinary `terminal.create` is sent by these tests; the worker
+        // channel only needs to exist so dispatch can hand off if one arrives.
+        let (interactive_create_tx, _interactive_create_rx) =
+            mpsc::channel::<interactive_creates::Job>(1);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
         let mut host_stats_last_refresh_at = None;
         let mut conn_identity = ConnectionIdentity::default();
@@ -8442,7 +8630,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
-            &mut create_limiter,
+            &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,

@@ -4,6 +4,43 @@ import { createClaudeFreshAgentAdapter } from '../../../../server/fresh-agent/ad
 import { makeClaudeLiveSession, makeClaudeRestoreResolution } from '../../../fixtures/fresh-agent/claude/thread.js'
 
 describe('Claude fresh-agent adapter', () => {
+  it('serializes concurrent settings and message submissions within each session', async () => {
+    let release!: () => void
+    const firstConfiguration = new Promise<void>((resolve) => { release = resolve })
+    const order: string[] = []
+    const sdkBridge = {
+      configureSession: vi.fn(async (_id: string, settings: { model?: string }) => {
+        order.push(`configure:${settings.model}`)
+        if (settings.model === 'opus') await firstConfiguration
+      }),
+      sendUserMessage: vi.fn((_id: string, text: string) => { order.push(text); return true }),
+    }
+    const adapter = createClaudeFreshAgentAdapter({ sdkBridge: sdkBridge as any })
+    const first = adapter.send?.('session', { text: 'first', settings: { requestId: 'a', sessionType: 'freshclaude', model: 'opus' } })
+    const second = adapter.send?.('session', { text: 'second', settings: { requestId: 'b', sessionType: 'freshclaude', model: 'sonnet' } })
+    await Promise.resolve()
+    expect(order).toEqual(['configure:opus'])
+    release()
+    await Promise.all([first, second])
+    expect(order).toEqual(['configure:opus', 'first', 'configure:sonnet', 'second'])
+  })
+
+  it('applies settings before sending and leaves the message unsent if configuration fails', async () => {
+    const order: string[] = []
+    const sdkBridge = {
+      configureSession: vi.fn(async () => { order.push('configure') }),
+      sendUserMessage: vi.fn(() => { order.push('send'); return true }),
+    }
+    const adapter = createClaudeFreshAgentAdapter({ sdkBridge: sdkBridge as any })
+    const settings = { requestId: 'config', sessionType: 'freshclaude' as const, model: 'sonnet', effort: 'low' }
+    await adapter.send?.('session', { text: 'hello', settings })
+    expect(sdkBridge.configureSession).toHaveBeenCalledWith('session', settings)
+    expect(order).toEqual(['configure', 'send'])
+    sdkBridge.configureSession.mockRejectedValueOnce(new Error('Model unavailable'))
+    await expect(adapter.send?.('session', { text: 'keep this draft', settings })).rejects.toThrow('Model unavailable')
+    expect(sdkBridge.sendUserMessage).toHaveBeenCalledTimes(1)
+  })
+
   it('delegates create, resume, send, interrupt, and interactive responses to the sdk bridge', async () => {
     const sdkBridge = {
       createSession: vi.fn().mockResolvedValue({ sessionId: 'sdk-claude-1' }),
@@ -87,6 +124,13 @@ describe('Claude fresh-agent adapter', () => {
       model: 'opus[1m]',
       effort: 'high',
     }))
+  })
+
+  it.each(['freshclaude', 'kilroy'] as const)('accepts the advertised xhigh effort for %s', async (sessionType) => {
+    const sdkBridge = { createSession: vi.fn().mockResolvedValue({ sessionId: 'session' }) }
+    const adapter = createClaudeFreshAgentAdapter({ sdkBridge: sdkBridge as any })
+    await adapter.create({ requestId: 'create', sessionType, model: 'opus[1m]', effort: 'xhigh' })
+    expect(sdkBridge.createSession).toHaveBeenCalledWith(expect.objectContaining({ effort: 'xhigh' }))
   })
 
   it('uses a Claude.ai-compatible default effort for fresh Freshclaude sessions', async () => {

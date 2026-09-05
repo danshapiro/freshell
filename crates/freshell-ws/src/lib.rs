@@ -534,7 +534,7 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false).await
+    build_handshake_with_capabilities(state, false, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -556,6 +556,7 @@ pub async fn build_handshake_with_capabilities(
     state: &WsState,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    terminal_interest_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
@@ -564,12 +565,14 @@ pub async fn build_handshake_with_capabilities(
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
             build_id: ready_build_id(),
-            capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1).then_some(
-                freshell_protocol::ReadyCapabilities {
+            capabilities: (pane_reconcile_v1
+                || pane_reconcile_fresh_agent_v1
+                || terminal_interest_v1)
+                .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
-                },
-            ),
+                    terminal_interest_v1: terminal_interest_v1.then_some(true),
+                }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.handshake_settings.read().await.clone(),
@@ -782,12 +785,22 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let terminal_interest_v1 = value
+        .get("capabilities")
+        .and_then(|caps| caps.get("terminalInterestV1"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
-    for msg in
-        build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
-            .await
+    for msg in build_handshake_with_capabilities(
+        &state,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        terminal_interest_v1,
+    )
+    .await
     {
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
@@ -846,6 +859,7 @@ async fn handle_socket(
         pane_reconcile_fresh_agent_v1,
         origin_kind,
         conn_identity,
+        terminal_interest_v1,
     )
     .await;
 }
@@ -907,61 +921,66 @@ async fn send_error(
 }
 
 #[cfg(test)]
+pub(crate) fn test_ws_state() -> WsState {
+    let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+    WsState {
+        pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+        layout: Default::default(),
+        identity: crate::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-1111".to_string()),
+        boot_id: Arc::new("boot-2222".to_string()),
+        settings: Arc::new(test_settings()),
+        handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+        ),
+        registry: freshell_terminal::TerminalRegistry::new(),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        tabs: crate::tabs::TabsRegistry::new(),
+        screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(Vec::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: crate::backpressure::Term09Config::default(),
+        create_protect: crate::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     fn state() -> WsState {
-        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
-        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
-        WsState {
-            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
-            layout: Default::default(),
-            identity: crate::identity::TerminalIdentityRegistry::new(),
-            terminal_meta: Default::default(),
-            auth_token: Arc::clone(&auth_token),
-            server_instance_id: Arc::new("srv-1111".to_string()),
-            boot_id: Arc::new("boot-2222".to_string()),
-            settings: Arc::new(test_settings()),
-            handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
-            broadcast_tx: Arc::clone(&broadcast_tx),
-            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
-            auto_resume_cancels: Default::default(),
-            fresh_codex: freshell_freshagent::FreshCodexState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-                serde_json::json!({ "freshAgent": { "enabled": false } }),
-            ),
-            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
-            ),
-            registry: freshell_terminal::TerminalRegistry::new(),
-            shutdown: Arc::new(tokio::sync::Notify::new()),
-            tabs: crate::tabs::TabsRegistry::new(),
-            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
-            subagent_interest: Default::default(),
-            host_stats: Default::default(),
-            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            cli_commands: Arc::new(Vec::new()),
-            ping_interval_ms: 30_000,
-            hello_timeout_ms: 5_000,
-            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
-            ws_max_payload_bytes: 16 * 1024 * 1024,
-            term09: crate::backpressure::Term09Config::default(),
-            create_protect: crate::create_limit::CreateProtectConfig::default(),
-            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
-            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
-            config_fallback: None,
-            opencode_locator: None,
-            codex_locator: None,
-            activity: None,
-            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
-            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
-        }
+        test_ws_state()
     }
 
     #[test]
@@ -1020,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false).await;
+        let negotiated = build_handshake_with_capabilities(&s, true, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1034,7 +1053,7 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false).await;
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }

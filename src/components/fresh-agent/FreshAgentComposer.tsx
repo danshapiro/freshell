@@ -218,6 +218,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const [fileSuggestions, setFileSuggestions] = useState<FileSuggestion[]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [attachments, setAttachments] = useState<FreshAgentAttachment[]>([])
+  const [queueExpanded, setQueueExpanded] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const filterRef = useRef<HTMLInputElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -703,24 +704,37 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       ) : null}
 
       {queuedMessages.length > 0 ? (
-        <div className="fresh-agent-queued-message mb-2 flex items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground">
+        <div className="fresh-agent-queued-message mb-2 flex flex-wrap items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground">
           <span role="status" aria-label="Queued messages" className="min-w-0 flex-1">
             {queuedMessages.length} queued
           </span>
-          {onCancelQueued ? (
-            <span className="flex shrink-0 items-center gap-1" role="group" aria-label="Queued message actions">
-              {queuedMessages.map((_, index) => (
-                <button
-                  key={index}
-                  type="button"
-                  className="-m-2 p-2 hover:text-destructive sm:m-0 sm:p-0"
-                  aria-label={`Remove queued message ${index + 1}`}
-                  onClick={() => onCancelQueued(index)}
-                >
-                  <X className="h-3 w-3" />
-                </button>
+          <button
+            type="button"
+            aria-label={queueExpanded ? 'Hide queued messages' : 'Show queued messages'}
+            aria-expanded={queueExpanded}
+            onClick={() => setQueueExpanded((expanded) => !expanded)}
+            className="min-h-9 underline underline-offset-2"
+          >
+            {queueExpanded ? 'Hide' : 'Review'}
+          </button>
+          {queueExpanded ? (
+            <ol className="max-h-44 w-full space-y-2 overflow-y-auto" aria-label="Queued message actions">
+              {queuedMessages.map((message, index) => (
+                <li key={index} className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{message}</span>
+                  {onCancelQueued ? (
+                    <button
+                      type="button"
+                      className="p-2 hover:text-destructive"
+                      aria-label={`Remove queued message ${index + 1}`}
+                      onClick={() => onCancelQueued(index)}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  ) : null}
+                </li>
               ))}
-            </span>
+            </ol>
           ) : null}
         </div>
       ) : null}

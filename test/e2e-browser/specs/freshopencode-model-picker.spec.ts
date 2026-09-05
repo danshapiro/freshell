@@ -9,7 +9,7 @@ import path from 'node:path'
  * The shared two-column model + thinking selector (freshopencode leg).
  * Covers: gear-popover entry, /model entry, search filtering, keyboard
  * navigation, commit persistence, the Default row, and the
- * catalog-unavailable state. freshclaude/kilroy keep the old popover list.
+ * catalog-unavailable state.
  */
 
 const CATALOG = {
@@ -211,7 +211,14 @@ async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
       payload: {
         tabId,
         paneId: leaf.id,
-        content: { ...leaf.content, sessionId: 'ses_e2e', status: 'idle' },
+        content: {
+          ...leaf.content, sessionId: 'ses_e2e', status: 'idle',
+          // This selector scenario starts with a known selection. OpenCode's
+          // unset effort means Default, not the catalog's highest level.
+          model: 'opencode-go/glm-5.2',
+          modelSelection: { kind: 'tracked', modelId: 'opencode-go/glm-5.2' },
+          effort: 'max',
+        },
       },
     })
   })

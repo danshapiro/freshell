@@ -697,6 +697,13 @@ export function FreshAgentView({
   const idleIncompleteRetryCountRef = useRef(0)
   const idleIncompleteRetryTimerRef = useRef<number | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
+  // Reserve a turn synchronously: the provider's running event may arrive
+  // after another submit. Only completion (or failure) releases the reservation.
+  const outgoingTurnRef = useRef<(LocalEcho & {
+    sawBusy: boolean
+    previousTurns: readonly FreshAgentTurn[]
+  }) | null>(null)
+  const [outgoingTurnVersion, refreshOutgoingTurn] = useReducer((value: number) => value + 1, 0)
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
@@ -1115,6 +1122,7 @@ export function FreshAgentView({
    * so the retry's eventual acceptance or failure correlates with what is on
    * screen. */
   const resendPendingMessage = useCallback((retryRequestId: string, text: string, cwd: string) => {
+    if (outgoingTurnRef.current) outgoingTurnRef.current.requestId = retryRequestId
     recordPendingSendMetadata(retryRequestId, { text })
     sendFreshAgentSendFrame(retryRequestId, text, cwd)
     const echo = localEchoRef.current
@@ -1169,6 +1177,7 @@ export function FreshAgentView({
       } else {
         autoTitleFreshBoundaryRef.current = true
         autoTitleSentRef.current = false
+        outgoingTurnRef.current = null
         setSnapshotAutoTitleIdentity(null)
       }
       return
@@ -1876,6 +1885,9 @@ export function FreshAgentView({
           : undefined
         if (submittedTurnId) {
           recordPendingSendMetadata(message.requestId, { submittedTurnId })
+          if (outgoingTurnRef.current?.requestId === message.requestId) {
+            outgoingTurnRef.current.submittedTurnId = submittedTurnId
+          }
           if (echo?.requestId === message.requestId) {
             setLocalEcho({ ...echo, submittedTurnId })
           }
@@ -1930,6 +1942,10 @@ export function FreshAgentView({
         // pending-metadata entry, the stale local echo (dual-write), and the
         // optimistic `running` status.
         pendingSendMetadataRef.current.delete(failedRequestId)
+        if (outgoingTurnRef.current?.requestId === failedRequestId) {
+          outgoingTurnRef.current = null
+          refreshOutgoingTurn()
+        }
         if (localEchoRef.current?.requestId === failedRequestId) {
           setLocalEcho(null)
         }
@@ -1937,6 +1953,20 @@ export function FreshAgentView({
           dispatch(mergePaneContent({ tabId, paneId, updates: { status: 'idle' } }))
         }
         return
+      }
+      if (
+        message.type === 'freshAgent.event'
+        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
+        && outgoingTurnRef.current && isRecord(message.event)
+      ) {
+        const event = message.event
+        const stream = isRecord(event.event) ? event.event : undefined
+        const isBusyEvent = ((event.type === 'freshAgent.status' || event.type === 'freshAgent.session.snapshot')
+          && typeof event.status === 'string' && BUSY_STATES.has(event.status))
+          || (event.type === 'freshAgent.stream' && (stream?.type === 'content_block_start' || stream?.type === 'content_block_delta'))
+        // Observe fast turns even when React batches running and idle into
+        // one render. The status version below still observes that final idle.
+        if (isBusyEvent) outgoingTurnRef.current.sawBusy = true
       }
       if (
         isSnapshotInvalidatingFreshAgentEvent(message)
@@ -2041,6 +2071,7 @@ export function FreshAgentView({
     // one key -- keying on raw initialCwd would let the N-pane fan-out survive.
     const requestCwd = freshOpenCodeRouteCwdRef.current ?? paneContentRef.current.initialCwd
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
+    const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const applySnapshot = (next: FreshAgentSnapshot) => {
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
@@ -2055,6 +2086,25 @@ export function FreshAgentView({
       const previousSnapshot = snapshotRef.current
       const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
       const snapshotAccepted = displaySnapshot !== previousSnapshot
+      const snapshotStatusAuthoritative = provider === 'codex'
+        || resolved.extensions?.[provider]?.statusFromLiveState === true
+      const outgoing = outgoingTurnRef.current
+      if (
+        outgoing && outgoing.requestId === requestOutgoingTurnId
+        && snapshotAccepted && displaySnapshot.status === 'idle'
+        && snapshotStatusAuthoritative
+        && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
+        && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
+          allowTextMatch: true,
+          previousTurns: outgoing.previousTurns,
+        })
+      ) {
+        // Reconnect may miss every stream/status event. A current idle snapshot
+        // containing this submitted turn is sufficient evidence to advance.
+        // Snapshots requested before this send, or newer activity, cannot unlock it.
+        outgoingTurnRef.current = null
+        refreshOutgoingTurn()
+      }
       commitSnapshot(displaySnapshot)
       setSnapshotAutoTitleIdentity(snapshotIdentity)
       const echo = localEchoRef.current
@@ -2118,16 +2168,14 @@ export function FreshAgentView({
       const wouldRegressStatus = sessionStatus
         ? isStatusRegression(currentSessionStatus, sessionStatus)
         : false
-      const opencodeStatusFromLiveState =
-        (next as { extensions?: { opencode?: { statusFromLiveState?: unknown } } })
-          .extensions?.opencode?.statusFromLiveState === true
       const canAdoptSnapshotStatus =
         (provider === 'codex' && requestSessionType === 'freshcodex')
+        || (provider === 'claude' && snapshotStatusAuthoritative)
         || (provider === 'opencode' && requestSessionType === 'freshopencode'
           // busy (running) may always be adopted; idle (busy-CLEARING) only when
           // live-reconciled -- otherwise the restore-window idle default (untracked
           // or mid-reconcile adapter state) would clear a genuinely running turn.
-          && (snapshotIsBusy || opencodeStatusFromLiveState))
+          && (snapshotIsBusy || snapshotStatusAuthoritative))
       if (
         sessionStatus
         && nextSessionId
@@ -2426,6 +2474,13 @@ export function FreshAgentView({
   const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy)
 
   useEffect(() => {
+    const outgoing = outgoingTurnRef.current
+    if (!outgoing) return
+    if (isBusy) outgoing.sawBusy = true
+    else if (outgoing.sawBusy || sessionEnded) outgoingTurnRef.current = null
+  }, [agentSession?.statusVersion, isBusy, sessionEnded])
+
+  useEffect(() => {
     if (!isActivePane) return
     const frame = requestAnimationFrame(() => {
       const active = document.activeElement
@@ -2464,6 +2519,7 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (!current.sessionId) return
     const requestId = nanoid()
+    outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
     // Task 16: a new send starts a fresh idle-incomplete re-poll budget.
     idleIncompleteRetryCountRef.current = 0
     const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
@@ -2518,17 +2574,14 @@ export function FreshAgentView({
     }))
   }, [dispatch, paneId, recordPendingSendMetadata, sendFreshAgentSendFrame, snapshotConfirmsNoUserTurns, tabId])
 
-  // Flush queued messages when the turn ends. One flush per status change is
-  // enough: all queued entries are delivered in order for the next turn.
+  // Providers accept one active turn. Keep follow-ups until the session can
+  // actually accept them, including across disconnects and provider failures.
   useEffect(() => {
-    if (isBusy || queuedMessages.length === 0) return
-    if (!paneContentRef.current.sessionId) return
-    const toSend = queuedMessages
-    setQueuedMessages([])
-    for (const message of toSend) {
-      sendUserText(message)
-    }
-  }, [isBusy, queuedMessages, sendUserText])
+    if (isBusy || !canSend || connectionStatus !== 'ready' || isRestoring || hasRestoreFailure) return
+    if (outgoingTurnRef.current || queuedMessages.length === 0 || !paneContentRef.current.sessionId) return
+    sendUserText(queuedMessages[0])
+    setQueuedMessages((queue) => queue.slice(1))
+  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, outgoingTurnVersion, queuedMessages, sendUserText])
 
   // Session-scoped auto-approval: any pending approval whose tool the user
   // marked "always allow" is answered immediately.
@@ -2567,16 +2620,12 @@ export function FreshAgentView({
       .then((result) => {
         const status = result.exitCode === 0 ? '' : ` (exit ${result.exitCode})`
         const body = `I ran \`${command}\`${status} in ${current.initialCwd ?? 'the home directory'}. Output:\n\`\`\`\n${result.output || '(no output)'}\n\`\`\``
-        if (isBusy) {
-          setQueuedMessages((queue) => [...queue, body])
-        } else {
-          sendUserText(body)
-        }
+        setQueuedMessages((queue) => [...queue, body])
       })
       .catch((error: unknown) => {
         setNotice(error instanceof Error ? `Shell command failed: ${error.message}` : 'Shell command failed')
       })
-  }, [isBusy, sendUserText])
+  }, [])
 
   /** Rewind the working tree to the checkpoint taken when a user turn was
    * sent. Conversation history is untouched — this is the code half of
@@ -2784,6 +2833,7 @@ export function FreshAgentView({
                   question={{
                     requestId: String(question.requestId),
                     questions: (question.questions ?? []).map((entry) => ({
+                      ...(entry.id ? { id: entry.id } : {}),
                       question: entry.question,
                       header: entry.header ?? 'Question',
                       options: entry.options ?? [],
@@ -2918,11 +2968,7 @@ export function FreshAgentView({
                 if (!canSend && !isBusy) return
                 const outgoing = composeOutgoingText(text, attachmentPaths)
                 if (!outgoing) return
-                if (isBusy) {
-                  setQueuedMessages((queue) => [...queue, outgoing])
-                  return
-                }
-                sendUserText(outgoing)
+                setQueuedMessages((queue) => [...queue, outgoing])
               }}
             />
             <FreshAgentModelDialog
@@ -2981,7 +3027,6 @@ export function FreshAgentView({
     runSlashCommand,
     sendFork,
     sendRollback,
-    sendUserText,
     snapshot,
     slashCommands,
     dispatch,

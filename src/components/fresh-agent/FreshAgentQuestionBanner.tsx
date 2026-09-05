@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 type FreshAgentQuestion = {
   requestId: string
   questions: Array<{
+    id?: string
     question: string
     header: string
     options: Array<{ label: string; description: string }>
@@ -14,23 +15,29 @@ type FreshAgentQuestion = {
 
 function SingleSelectQuestion({
   question,
+  answer,
   onSelect,
   disabled,
 }: {
   question: FreshAgentQuestion['questions'][number]
+  answer?: string
   onSelect: (answer: string) => void
   disabled?: boolean
 }) {
   const [showOther, setShowOther] = useState(false)
   const [otherText, setOtherText] = useState('')
   const otherInputRef = useRef<HTMLInputElement>(null)
+  const submitOther = () => {
+    if (!disabled && otherText.trim()) onSelect(otherText.trim())
+  }
 
   useEffect(() => {
     if (showOther) otherInputRef.current?.focus()
   }, [showOther])
 
   return (
-    <div className="fresh-agent-question-block space-y-2">
+    <div className="fresh-agent-question-block space-y-2" role="group" aria-label={question.header}>
+      <p className="text-xs text-muted-foreground">{question.header}</p>
       <p className="fresh-agent-question-text text-sm font-medium">{question.question}</p>
       <div className="fresh-agent-question-options flex flex-wrap gap-2">
         {question.options.map((option) => (
@@ -43,8 +50,10 @@ function SingleSelectQuestion({
               'fresh-agent-question-option px-3 py-1.5 text-xs rounded-md border transition-colors',
               'bg-sky-600/10 border-sky-500/30 hover:bg-sky-600/20 hover:border-sky-500/50',
               'disabled:opacity-50',
+              answer === option.label && 'bg-sky-600/30 border-sky-500/60 ring-1 ring-sky-500/40',
             )}
             aria-label={option.label}
+            aria-pressed={answer === option.label}
           >
             <span className="font-medium">{option.label}</span>
             {option.description ? (
@@ -62,6 +71,7 @@ function SingleSelectQuestion({
             'disabled:opacity-50',
           )}
           aria-label="Other"
+          aria-pressed={answer !== undefined && !question.options.some((option) => option.label === answer)}
         >
           Other
         </button>
@@ -71,14 +81,23 @@ function SingleSelectQuestion({
           <input
             ref={otherInputRef}
             type="text"
+            aria-label={question.question}
+            disabled={disabled}
             value={otherText}
             onChange={(event) => setOtherText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                event.preventDefault()
+                event.stopPropagation()
+                submitOther()
+              }
+            }}
             placeholder="Type your answer..."
             className="fresh-agent-question-input flex-1 rounded border bg-background px-2 py-1 text-xs"
           />
           <button
             type="button"
-            onClick={() => otherText.trim() && onSelect(otherText.trim())}
+            onClick={submitOther}
             disabled={disabled || !otherText.trim()}
             className={cn(
               'fresh-agent-question-submit px-3 py-1 text-xs rounded font-medium',
@@ -120,7 +139,8 @@ function MultiSelectQuestion({
   }, [onSelect, selected])
 
   return (
-    <div className="fresh-agent-question-block space-y-2">
+    <div className="fresh-agent-question-block space-y-2" role="group" aria-label={question.header}>
+      <p className="text-xs text-muted-foreground">{question.header}</p>
       <p className="fresh-agent-question-text text-sm font-medium">{question.question}</p>
       <div className="fresh-agent-question-options flex flex-wrap gap-2">
         {question.options.map((option) => (
@@ -177,13 +197,14 @@ function FreshAgentQuestionBanner({
   const [answered, setAnswered] = useState<Record<string, string>>({})
   const questions = question.questions
 
-  const handleAnswer = useCallback((idx: number, questionText: string, answer: string) => {
+  const handleAnswer = useCallback((idx: number, answer: string) => {
     if (questions.length === 1) {
-      onAnswer({ [questionText]: answer })
+      const entry = questions[idx]
+      onAnswer({ [entry.id ?? entry.question]: answer })
       return
     }
     setAnswered((prev) => ({ ...prev, [String(idx)]: answer }))
-  }, [onAnswer, questions.length])
+  }, [onAnswer, questions])
 
   const allAnswered = questions.length > 1 && questions.every((_, idx) => answered[String(idx)] !== undefined)
   const regionLabel = `Question from ${providerLabel}`
@@ -203,16 +224,17 @@ function FreshAgentQuestionBanner({
       {questions.map((entry, idx) => (
         entry.multiSelect ? (
           <MultiSelectQuestion
-            key={`${idx}-${entry.question}`}
+            key={entry.id ?? `${idx}-${entry.question}`}
             question={entry}
-            onSelect={(answer) => handleAnswer(idx, entry.question, answer)}
+            onSelect={(answer) => handleAnswer(idx, answer)}
             disabled={disabled}
           />
         ) : (
           <SingleSelectQuestion
-            key={`${idx}-${entry.question}`}
+            key={entry.id ?? `${idx}-${entry.question}`}
             question={entry}
-            onSelect={(answer) => handleAnswer(idx, entry.question, answer)}
+            answer={answered[String(idx)]}
+            onSelect={(answer) => handleAnswer(idx, answer)}
             disabled={disabled}
           />
         )
@@ -224,7 +246,7 @@ function FreshAgentQuestionBanner({
           onClick={() => {
             const result: Record<string, string> = {}
             questions.forEach((entry, idx) => {
-              result[entry.question] = answered[String(idx)]
+              result[entry.id ?? entry.question] = answered[String(idx)]
             })
             onAnswer(result)
           }}

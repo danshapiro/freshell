@@ -619,8 +619,20 @@ function claimCrossProcessCloseSocketOnce(method) {
 wss.on('connection', (socket) => {
   let initialized = false
   let initializedNotification = false
+  const pendingClientRequests = new Map()
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
+    if (message.method === undefined && ('result' in message || 'error' in message)) {
+      const pending = pendingClientRequests.get(message.id)
+      if (pending) {
+        pendingClientRequests.delete(message.id)
+        if (behavior.appendClientResponseLogPath) {
+          fs.appendFileSync(behavior.appendClientResponseLogPath, JSON.stringify(message) + '\n')
+        }
+        pending.resolve(message)
+      }
+      return
+    }
     if (!Object.prototype.hasOwnProperty.call(message, 'id')) {
       if (message.method === 'initialized') {
         initializedNotification = true
@@ -781,6 +793,14 @@ wss.on('connection', (socket) => {
         // The compact RPC result is empty; the lifecycle rides notifications.
         await emitCompactNotificationSequence(message.params?.threadId)
       }
+      if (method === 'turn/interrupt') {
+        for (const [id, pending] of pendingClientRequests) {
+          if (pending.threadId !== message.params?.threadId) continue
+          pendingClientRequests.delete(id)
+          broadcastNotification('serverRequest/resolved', { threadId: pending.threadId, requestId: id })
+          pending.resolve({ cancelled: true })
+        }
+      }
       if (method === 'turn/start' && behavior.recordTurns && result?.turn?.id) {
         // recordTurns opt-in: a recorded turn closes with the real turn
         // lifecycle notifications (turn/started → turn/completed{completed})
@@ -794,10 +814,24 @@ wss.on('connection', (socket) => {
           threadId: message.params?.threadId,
           turn: { id: result.turn.id, status: 'inProgress' },
         })
+        const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        const userRequest = behavior.serverRequestsByPrompt?.[prompt]
+        let interrupted = false
+        if (userRequest) {
+          const id = userRequest.id ?? `request-${result.turn.id}`
+          const response = await new Promise((resolve) => {
+            pendingClientRequests.set(id, { resolve, threadId: message.params.threadId })
+            socket.send(JSON.stringify({ id, method: userRequest.method, params: {
+              threadId: message.params.threadId, turnId: result.turn.id, itemId: `item-${result.turn.id}`,
+              ...userRequest.params,
+            } }))
+          })
+          interrupted = response.cancelled === true
+        }
         await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
-          turn: { id: result.turn.id, status: 'completed' },
+          turn: { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
         })
       }
       if (method === 'initialize') {

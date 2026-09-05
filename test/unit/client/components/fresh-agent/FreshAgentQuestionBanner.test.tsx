@@ -18,6 +18,32 @@ const singleQuestion = {
 describe('FreshAgentQuestionBanner', () => {
   afterEach(() => cleanup())
 
+  it('keeps distinct provider question IDs when question text repeats', () => {
+    const onAnswer = vi.fn()
+    render(<FreshAgentQuestionBanner providerLabel="Codex" onAnswer={onAnswer} question={{
+      requestId: 'questions-with-ids',
+      questions: [
+        { id: 'frontend', header: 'Frontend', question: 'Which approach?', options: [{ label: 'React', description: '' }], multiSelect: false },
+        { id: 'backend', header: 'Backend', question: 'Which approach?', options: [{ label: 'Rust', description: '' }], multiSelect: false },
+      ],
+    }} />)
+    fireEvent.click(screen.getByRole('button', { name: 'React' }))
+    expect(screen.getByRole('button', { name: 'React', pressed: true })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Rust' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Submit all answers' }))
+    expect(onAnswer).toHaveBeenCalledWith({ frontend: 'React', backend: 'Rust' })
+  })
+
+  it('submits a free-text answer with Enter using an accessible question label', () => {
+    const onAnswer = vi.fn()
+    render(<FreshAgentQuestionBanner question={singleQuestion} providerLabel="Claude" onAnswer={onAnswer} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    const input = screen.getByRole('textbox', { name: 'How should Claude proceed?' })
+    fireEvent.change(input, { target: { value: '  Please investigate  ' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onAnswer).toHaveBeenCalledWith({ 'How should Claude proceed?': 'Please investigate' })
+  })
+
   it('answers a single-select Question from the provider immediately', () => {
     const onAnswer = vi.fn()
     render(

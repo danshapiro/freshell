@@ -87,6 +87,8 @@ export function createClaudeSdkOptions(input: ClaudeSdkOptionsInput): SdkOptions
     resume: input.resumeSessionId,
     model: input.model,
     permissionMode: input.permissionMode as any,
+    // Permit a later explicit UI selection; this does not enable bypass itself.
+    allowDangerouslySkipPermissions: true,
     effort: input.effort as any,
     pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
     includePartialMessages: input.includePartialMessages,
@@ -229,6 +231,7 @@ export class SdkBridge extends EventEmitter {
       cwd: options.cwd,
       model: options.model,
       permissionMode: options.permissionMode,
+      effort: options.effort,
       plugins: options.plugins ? sanitizeFreshAgentPluginPaths(options.plugins) : undefined,
       status: 'starting',
       createdAt: Date.now(),
@@ -458,7 +461,7 @@ export class SdkBridge extends EventEmitter {
           state.model = init.model || state.model
           state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
-          state.status = 'connected'
+          if (state.status === 'starting') state.status = 'connected'
           // Capture the init frame's terminal slash-command name-list (optional per
           // sdk.d.ts:4766-4770). It drives the publish subtract; absent = empty
           // subtract list (data-driven, no name denylist).
@@ -565,6 +568,16 @@ export class SdkBridge extends EventEmitter {
           costUsd: rMsg.total_cost_usd,
           usage,
         })
+        if (rMsg.subtype !== 'success') {
+          const message = rMsg.errors?.filter((error) => error.trim()).join('\n')
+            || (rMsg.subtype === 'error_max_turns'
+              ? 'Claude reached its turn limit. Send a message to continue.'
+              : rMsg.subtype === 'error_max_budget_usd'
+                ? 'Claude reached the configured spending limit.'
+                : 'Claude could not complete this turn. Try sending your message again.')
+          log.warn({ sessionId, subtype: rMsg.subtype }, 'Claude turn did not complete')
+          this.broadcastToSession(sessionId, { type: 'sdk.error', sessionId, message })
+        }
         // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
         // Only a positively-completed turn ('success') chimes; interrupts yield no
         // result message at all, and tool-only/error turns surface a non-success
@@ -857,6 +870,8 @@ export class SdkBridge extends EventEmitter {
 
     const state = this.sessions.get(sessionId)
     if (state) {
+      // Reserve the turn before the first asynchronous provider event arrives.
+      state.status = 'running'
       const timestamp = new Date().toISOString()
       const content = [{ type: 'text', text } as ContentBlock]
       state.messages.push({
@@ -914,6 +929,40 @@ export class SdkBridge extends EventEmitter {
       log.warn({ sessionId, err }, 'Interrupt failed')
     })
     return true
+  }
+
+  async configureSession(sessionId: string, requested: { model?: string; effort?: string; permissionMode?: string; cwd?: string }): Promise<void> {
+    const sp = this.processes.get(sessionId)
+    const state = this.sessions.get(sessionId)
+    if (!sp || !state || state.status === 'exited') throw new Error(`Claude session ${sessionId} is not available`)
+    if (requested.cwd !== undefined && requested.cwd !== state.cwd) {
+      throw new Error('Start a new conversation to change the working directory.')
+    }
+    const modelChanged = requested.model !== undefined && requested.model !== state.model
+    const effort = requested.effort ?? (modelChanged ? undefined : state.effort)
+    const effortChanged = effort !== state.effort
+    const permissionChanged = requested.permissionMode !== undefined && requested.permissionMode !== state.permissionMode
+    if ((modelChanged || effortChanged || permissionChanged) && (state.status === 'running' || state.pendingPermissions.size > 0 || state.pendingQuestions.size > 0)) {
+      throw new Error('Wait for the current turn to finish before changing agent settings.')
+    }
+    try {
+      // Record each accepted change, including when a later setter fails.
+      if (modelChanged) {
+        await sp.query.setModel(requested.model!)
+        state.model = requested.model
+      }
+      if (effortChanged) {
+        await sp.query.applyFlagSettings({ effortLevel: (effort ?? null) as Parameters<SdkQuery['applyFlagSettings']>[0]['effortLevel'] })
+        state.effort = effort
+      }
+      if (permissionChanged) {
+        await sp.query.setPermissionMode(requested.permissionMode as Parameters<SdkQuery['setPermissionMode']>[0])
+        state.permissionMode = requested.permissionMode
+      }
+    } catch (err) {
+      log.warn({ sessionId, err }, 'Claude session settings update failed; message not sent')
+      throw err
+    }
   }
 
   setModel(sessionId: string, model: string): boolean {

@@ -229,6 +229,8 @@ describe('FreshAgentComposer', () => {
     expect(screen.queryByText('Do not pin my newest message at the bottom')).not.toBeInTheDocument()
     expect(screen.queryByText('Keep this queued follow-up private until expanded')).not.toBeInTheDocument()
 
+    fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+    expect(screen.getByText('Keep this queued follow-up private until expanded')).toBeVisible()
     const removeButtons = screen.getAllByRole('button', { name: /Remove queued message/ })
     expect(removeButtons).toHaveLength(2)
     fireEvent.click(removeButtons[0])

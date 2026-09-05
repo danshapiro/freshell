@@ -555,6 +555,34 @@ impl CodexAppServerClient {
             })
     }
 
+    /// Answer a provider-initiated request using its original JSON-RPC id.
+    pub async fn respond(&self, id: &RequestId, result: Value) -> Result<(), CodexAppServerError> {
+        self.transport
+            .send(json!({ "id": id.to_json(), "result": result }).to_string())
+            .await
+            .map_err(|message| CodexAppServerError::Transport {
+                method: "server-request/respond".into(),
+                message,
+            })
+    }
+
+    pub async fn reject_request(
+        &self,
+        id: &RequestId,
+        message: &str,
+    ) -> Result<(), CodexAppServerError> {
+        self.transport
+            .send(
+                json!({ "id": id.to_json(), "error": { "code": -32601, "message": message } })
+                    .to_string(),
+            )
+            .await
+            .map_err(|message| CodexAppServerError::Transport {
+                method: "server-request/reject".into(),
+                message,
+            })
+    }
+
     /// Close the transport and fail any in-flight requests (`close`, `client.ts:441-470`).
     pub async fn close(&self) {
         fail_all_pending(&self.pending, "connection closed");
@@ -647,6 +675,9 @@ async fn read_loop(
             break;
         };
         match parse_incoming_frame(&frame) {
+            Some(IncomingMessage::Request { id, method, params }) => {
+                let _ = notify_tx.send(CodexNotification::ServerRequest { id, method, params });
+            }
             Some(IncomingMessage::Response { id, result }) => {
                 resolve_pending(&pending, &id, Ok(result))
             }
@@ -729,6 +760,17 @@ pub struct ChannelPeer {
 }
 
 impl ChannelPeer {
+    /// Send a provider-initiated request to exercise the bidirectional RPC path.
+    pub fn request_client(&self, id: &RequestId, method: &str, params: Value) {
+        let _ = self
+            .to_client
+            .send(build_request_frame(id, method, &params));
+    }
+
+    pub async fn next_raw_frame(&self) -> Option<Value> {
+        let raw = self.from_client.lock().await.recv().await?;
+        serde_json::from_str(&raw).ok()
+    }
     /// Await the next client→server frame, decoded (`None` when the client dropped).
     pub async fn next_frame(&self) -> Option<ClientFrame> {
         let raw = self.from_client.lock().await.recv().await?;

@@ -40,9 +40,11 @@
 //! - The window's **upper bound (deadline)** is `arm_ms + spawn_window_ms` if
 //!   no Enter has been observed yet — a spawn-anchored fallback that lets a
 //!   row-at-spawn resolve without ever waiting for input — or
-//!   `first_submit_ms + window_ms` once [`OpencodeLocator::note_submit`] has
-//!   been called, extending the deadline outward (`submit_ms >= arm_ms`, so
-//!   this can only push the deadline later, never earlier).
+//!   `enter_ms + window_ms` once [`OpencodeLocator::note_submit`] has opened
+//!   (or re-opened) an evaluation, extending the deadline outward
+//!   (`enter_ms >= arm_ms`, so this can only push the deadline later, never
+//!   earlier). (`enter_ms` is the anchor of the CURRENT evaluation; the
+//!   separate `first_submit_ms` field only feeds `probe_candidates`.)
 //! - Any [`OpencodeLocator::tick`] outcome (bound / zero-candidate /
 //!   ambiguous) marks the pending evaluation `resolved`; a LATER Enter still
 //!   re-opens a fresh evaluation window for a terminal that hasn't been
@@ -113,6 +115,13 @@ struct Armed {
     /// the deadline from the spawn-anchored fallback to the Enter-anchored
     /// bound. `None` until an Enter is observed.
     enter_ms: Option<i64>,
+    /// The FIRST Enter ever observed for this pane — never cleared while
+    /// armed; distinguishes "the pane provably has (or soon will have) a
+    /// session of its own" from "idle pane typed nothing" for
+    /// [`OpencodeLocator::probe_candidates`]. (It is NOT the
+    /// correlation-window driver — `enter_ms` keeps that role, including
+    /// mid-turn re-open suppression.)
+    first_submit_ms: Option<i64>,
     /// Whether the current pending evaluation has already been drained by a
     /// `tick()` (bound / zero-candidate / ambiguous-refuse). A later
     /// `note_submit` re-opens a fresh evaluation for a still-armed terminal.
@@ -122,7 +131,27 @@ struct Armed {
 #[derive(Default)]
 struct Inner {
     armed: HashMap<String, Armed>,
+    /// First ms an evaluated window ended in an ambiguous or contested
+    /// refusal for this terminal — the moment identity became RESOLVABLE
+    /// but provably unattributable. Sole-candidate emissions never latch
+    /// (a drain-side refusal of one is a FOREIGN session; plan-review R2).
+    /// Also fed by [`OpencodeLocator::note_resolvable_evidence`] (the ws
+    /// identity-invariant sweep's probe phase). Cleared only by
+    /// [`OpencodeLocator::disarm`].
+    resolvable_evidence_ms: HashMap<String, i64>,
+    /// Last [`OpencodeLocator::probe_candidates`] read time per terminal
+    /// (throttle; wall-clock ms — the probe is the one locator input whose
+    /// caller, the ws identity sweep, runs in real time and supplies no
+    /// synthetic clock); cleared by `disarm` alongside the other
+    /// per-terminal state.
+    last_probe_ms: HashMap<String, i64>,
 }
+
+/// Per-terminal probe throttle: at most one bounded candidate read this
+/// often for an ever-submitted pane whose windows never latched evidence
+/// (plan-review R2, finding 2 — an empty-Enter pane must never become a
+/// permanent 2s read loop; the invariant sweep runs every 2s).
+const PROBE_THROTTLE_MS: i64 = 60_000;
 
 /// Deterministic, poll-driven PTY↔session correlator for fresh opencode
 /// terminals. See the module doc for the row-diff algorithm.
@@ -175,6 +204,23 @@ impl OpencodeLocator {
         self.lock().armed.len()
     }
 
+    /// The first time an evaluated correlation window for this terminal
+    /// ended in an ambiguous or contested refusal — a correlatable
+    /// cwd-confirmed row existed and could not be attributed — plus any
+    /// [`OpencodeLocator::note_resolvable_evidence`] latch (the ws
+    /// identity-invariant sweep's probe phase): the moment the pane's
+    /// identity became RESOLVABLE (danshapiro/freshell#702 gate input).
+    /// `None` means nothing resolvable has ever existed for the pane
+    /// (opencode writes its `session` row lazily at the first prompt, so
+    /// pre-prompt panes are never evidence). Sole-candidate emissions are
+    /// deliberately NOT evidence: the healthy bind discharges via the
+    /// identity row, and a drain-side refusal of one
+    /// (`session_bound_elsewhere` / `freshagent_*`) is a FOREIGN session.
+    /// Cleared by [`OpencodeLocator::disarm`] (terminal exit). No I/O.
+    pub fn identity_resolvable_since(&self, terminal_id: &str) -> Option<i64> {
+        self.lock().resolvable_evidence_ms.get(terminal_id).copied()
+    }
+
     /// How many bounded `list_sessions_since` reads have run so far
     /// (test/diagnostic hook, mirrors the deleted
     /// `AmplifierLocator::fs_scan_count`, kata qmpk).
@@ -193,6 +239,134 @@ impl OpencodeLocator {
         crate::parse::session_is_subagent_by_id(&self.data_home, session_id)
             .ok()
             .flatten()
+    }
+
+    /// The invariant sweep's queue-skip predicate (danshapiro/freshell#702,
+    /// delta repair 4): whether an opencode row past the create-age grace
+    /// should be QUEUED for the sweep's probe phase at all — armed AND no
+    /// latched resolvable evidence AND ever-submitted
+    /// (`first_submit_ms.is_some()`) AND outside the [`PROBE_THROTTLE_MS`]
+    /// window since the last probe. ONE mutex lock, no I/O. The armed /
+    /// ever-submitted / throttle guards mirror
+    /// [`OpencodeLocator::probe_candidates`]' own (defense in depth — it
+    /// still answers `None` with zero DB reads for the same classes even if
+    /// a caller queues one anyway); the no-latched-evidence leg is the
+    /// sweep's queueing rule (only latch-miss panes are ever queued). The
+    /// predicate exists so a pane that can never yield candidates — the
+    /// #702 idle never-submitted class — is never queued at all, sparing a
+    /// per-sweep `spawn_blocking` round-trip that would only return `None`.
+    pub fn probe_eligible(&self, terminal_id: &str, now_ms: i64) -> bool {
+        let inner = self.lock();
+        let Some(armed) = inner.armed.get(terminal_id) else {
+            return false;
+        };
+        if inner.resolvable_evidence_ms.contains_key(terminal_id) {
+            return false;
+        }
+        if armed.first_submit_ms.is_none() {
+            return false;
+        }
+        inner
+            .last_probe_ms
+            .get(terminal_id)
+            .is_none_or(|t| now_ms - t >= PROBE_THROTTLE_MS)
+    }
+
+    /// The READ half of the late-row probe (danshapiro/freshell#702, delta
+    /// repair 2): for an ARMED terminal that has ever submitted, at most ONE
+    /// bounded `list_sessions_since(arm_ms − pre_epsilon)` read per
+    /// `PROBE_THROTTLE_MS`, returning every session id passing the same
+    /// candidate filters `resolve_windows` applies (cwd match, no
+    /// `parent_id` rows, no 3-views-marked rows, not in the arm-time
+    /// `known_ids`, `time_created >= arm_ms − pre_epsilon`) with NO deadline
+    /// (`deadline: None` — a late-landing row still counts).
+    ///
+    /// Availability exclusions (session claimed by a live-or-retired
+    /// terminal, fresh-agent ledger rows, LIVE fresh-opencode sessions) and
+    /// the evidence LATCH are deliberately NOT here — they are the caller's
+    /// job so they can be applied against CURRENT async state AFTER this
+    /// read: the ws identity-invariant sweep's probe phase runs this on the
+    /// blocking pool, then awaits `has_live_session` per candidate (a live
+    /// set snapshotted BEFORE this read is stale by construction —
+    /// `handle_send` keys the fresh-opencode sessions map mid-tick), and
+    /// only then calls [`OpencodeLocator::note_resolvable_evidence`].
+    ///
+    /// Returns `None` — with ZERO DB reads — when the terminal is unarmed,
+    /// when it has never submitted (the #702 idle never-typed class has no
+    /// session of its own, so nothing is attributable), when a probe ran
+    /// within the throttle window, or when the terminal disarmed mid-probe
+    /// (drop, never resurrect). Returns `Some(vec)` (possibly empty) only
+    /// when the bounded read actually ran; the `last_probe_ms` throttle
+    /// stamp is written ONLY for such attempted reads, and only when the
+    /// terminal is still armed after the read. The throttle clock is the
+    /// wall clock — this is the one locator entry point whose caller (the
+    /// ws sweep) runs in real time, so it takes no synthetic `now`
+    /// (unlike `arm` / `note_submit` / `tick`).
+    pub fn probe_candidates(&self, terminal_id: &str) -> Option<Vec<String>> {
+        let now_ms = wall_now_ms();
+        let (armed, throttled) = {
+            let inner = self.lock();
+            (
+                inner.armed.get(terminal_id).cloned(),
+                inner
+                    .last_probe_ms
+                    .get(terminal_id)
+                    .is_some_and(|t| now_ms - t < PROBE_THROTTLE_MS),
+            )
+        };
+        if throttled {
+            return None; // throttle before ANY DB read (R2 finding 2)
+        }
+        let armed = armed?;
+        // Never typed: no session of its own exists — no read (the #702 idle
+        // never-submitted class; nothing is attributable to the pane).
+        armed.first_submit_ms?;
+        let lower_bound = armed.arm_ms - self.pre_epsilon_ms;
+        let candidates: Vec<String> = self
+            .query_candidates(lower_bound) // OFF the lock: bounded read
+            .into_iter()
+            .filter(|row| {
+                row_is_candidate(
+                    row,
+                    lower_bound,
+                    None,
+                    &armed.known_ids,
+                    &armed.cwd_normalized,
+                )
+            })
+            .map(|row| row.session_id)
+            .collect();
+        let mut inner = self.lock();
+        if !inner.armed.contains_key(terminal_id) {
+            // Disarmed mid-probe: the pane is gone — drop, never resurrect
+            // (and never stamp the throttle for it).
+            return None;
+        }
+        inner.last_probe_ms.insert(terminal_id.to_string(), now_ms);
+        Some(candidates)
+    }
+
+    /// The LATCH half of the late-row probe (delta repair 2): called by the
+    /// ws identity-invariant sweep's probe phase after a probe candidate
+    /// survives every availability exclusion. Under the lock, if the
+    /// terminal is still armed, record this as its FIRST
+    /// resolvable-evidence time
+    /// (`resolvable_evidence_ms.entry(...).or_insert(at_ms)` — first
+    /// evidence wins, matching the window latch) and return the stored
+    /// value. Returns `None` — dropping the evidence — when the terminal
+    /// disarmed between the caller's read and this call: identity evidence
+    /// must never resurrect for a gone pane. No I/O.
+    pub fn note_resolvable_evidence(&self, terminal_id: &str, at_ms: i64) -> Option<i64> {
+        let mut inner = self.lock();
+        if !inner.armed.contains_key(terminal_id) {
+            return None;
+        }
+        Some(
+            *inner
+                .resolvable_evidence_ms
+                .entry(terminal_id.to_string())
+                .or_insert(at_ms),
+        )
     }
 
     /// Arm a terminal for Enter↔row correlation. Only fresh opencode panes
@@ -230,6 +404,7 @@ impl OpencodeLocator {
                 arm_ms: now_ms,
                 known_ids,
                 enter_ms: None,
+                first_submit_ms: None,
                 resolved: false,
             },
         );
@@ -238,7 +413,10 @@ impl OpencodeLocator {
 
     /// Stop tracking a terminal (exit, or already resolved/bound).
     pub fn disarm(&self, terminal_id: &str) {
-        self.lock().armed.remove(terminal_id);
+        let mut inner = self.lock();
+        inner.armed.remove(terminal_id);
+        inner.resolvable_evidence_ms.remove(terminal_id);
+        inner.last_probe_ms.remove(terminal_id);
     }
 
     /// Note a submit-shaped input (Enter) for an armed terminal at `at_ms`,
@@ -254,6 +432,9 @@ impl OpencodeLocator {
         };
         if !armed.resolved && armed.enter_ms.is_some() {
             return false;
+        }
+        if armed.first_submit_ms.is_none() {
+            armed.first_submit_ms = Some(at_ms);
         }
         armed.enter_ms = Some(at_ms);
         armed.resolved = false;
@@ -344,25 +525,13 @@ impl OpencodeLocator {
             let matches: Vec<_> = rows
                 .into_iter()
                 .filter(|row| {
-                    if known_ids.contains(&row.session_id) {
-                        return false;
-                    }
-                    let Some(cwd) = row.cwd.as_deref() else {
-                        return false;
-                    };
-                    if normalize_cwd(cwd) != cwd_normalized {
-                        return false;
-                    }
-                    let Some(created) = row.created_at else {
-                        return false;
-                    };
-                    if created < lower_bound || created > deadline {
-                        return false;
-                    }
-                    if row.has_three_views_marker == Some(1) {
-                        return false;
-                    }
-                    true
+                    row_is_candidate(
+                        row,
+                        lower_bound,
+                        Some(deadline),
+                        &known_ids,
+                        &cwd_normalized,
+                    )
                 })
                 .collect();
 
@@ -384,6 +553,12 @@ impl OpencodeLocator {
                     candidates = ?matches.iter().map(|r| r.session_id.clone()).collect::<Vec<_>>(),
                     "opencode_locator_ambiguous: multiple cwd-confirmed opencode session rows within the correlation window; refusing to bind"
                 );
+                // Candidate-evidence latch: this refusal provably observed a
+                // correlatable row it could not attribute. First evidence wins.
+                inner
+                    .resolvable_evidence_ms
+                    .entry(terminal_id.clone())
+                    .or_insert(now_ms);
                 continue;
             }
 
@@ -397,6 +572,12 @@ impl OpencodeLocator {
                     session_id = %matches[0].session_id,
                     "opencode_locator_contested_cwd: >=2 contenders (in-flight evaluation windows) share this cwd; refusing to bind"
                 );
+                // Candidate-evidence latch: this refusal provably observed a
+                // correlatable row it could not attribute. First evidence wins.
+                inner
+                    .resolvable_evidence_ms
+                    .entry(terminal_id.clone())
+                    .or_insert(now_ms);
                 continue;
             }
 
@@ -415,6 +596,44 @@ impl OpencodeLocator {
     }
 }
 
+/// The shared per-row candidate predicate for `resolve_windows` and
+/// `probe_candidates`: a session row is a candidate for an armed terminal
+/// when it is not in the arm-time `known_ids` snapshot, its cwd normalizes
+/// to the terminal's cwd, its `time_created` is at/after `lower_bound`
+/// (`arm_ms − pre_epsilon_ms`) and — when `deadline` is `Some` (the
+/// correlation window; the probe passes `None` — no upper bound — so a
+/// late-landing row still counts) — at/below it, and it carries no 3-views
+/// marker. (`parent_id IS NULL` and `time_archived IS NULL` are refused
+/// SQL-side by `list_sessions_since`; both callers go through
+/// `query_candidates`.)
+fn row_is_candidate(
+    row: &OpencodeSessionRow,
+    lower_bound: i64,
+    deadline: Option<i64>,
+    known_ids: &HashSet<String>,
+    cwd_normalized: &str,
+) -> bool {
+    if known_ids.contains(&row.session_id) {
+        return false;
+    }
+    let Some(cwd) = row.cwd.as_deref() else {
+        return false;
+    };
+    if normalize_cwd(cwd) != cwd_normalized {
+        return false;
+    }
+    let Some(created) = row.created_at else {
+        return false;
+    };
+    if created < lower_bound || deadline.is_some_and(|d| created > d) {
+        return false;
+    }
+    if row.has_three_views_marker == Some(1) {
+        return false;
+    }
+    true
+}
+
 /// Lexical cwd normalization (mirrors the deleted `amplifier_locator`'s):
 /// trailing-slash / separator only — no realpath; `std::fs::canonicalize` is
 /// used opportunistically where the path exists.
@@ -429,6 +648,18 @@ pub(crate) fn normalize_cwd(input: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Wall-clock now in milliseconds — used ONLY by [`OpencodeLocator::probe_candidates`]'s
+/// throttle (`last_probe_ms`), the one locator input whose caller (the ws
+/// identity-invariant sweep) runs in real time and supplies no synthetic
+/// clock (every other entry point — `arm` / `note_submit` / `tick` /
+/// `note_resolvable_evidence` — takes its timestamps explicitly).
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -980,6 +1211,376 @@ mod tests {
         let located = locator.tick(100 + 2 * OPENCODE_WINDOW_MS + 3);
         assert_eq!(located.len(), 1);
         assert_eq!(located[0].session_id, "ses_after_db_appears");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- 17. resolvable-evidence latch (issue #702): the invariant gate's
+    // "a correlatable row provably existed" signal. --
+
+    #[test]
+    fn no_candidate_ever_seen_reports_no_evidence() {
+        // The #702 false-fire class: a fresh pane whose user has not
+        // submitted a prompt has NO session row anywhere (opencode writes it
+        // lazily at first prompt) -- neither the empty spawn-anchored
+        // evaluation nor a later empty Enter is resolvable identity.
+        let home = unique_temp_dir("evidence-none");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 1_000));
+        // Spawn-anchored window closes with zero candidates.
+        assert!(locator.tick(1_000 + OPENCODE_WINDOW_MS + 1).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+
+        // An empty Enter (no row created) also yields no evidence.
+        let enter_at = 10_000;
+        assert!(locator.note_submit("t1", enter_at));
+        assert!(locator.tick(enter_at + OPENCODE_WINDOW_MS + 1).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        assert_eq!(locator.identity_resolvable_since("never-armed"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ambiguous_candidates_latch_resolvable_evidence() {
+        let home = unique_temp_dir("evidence-ambiguous");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        insert_session(&db, "ses_a", "/proj", 150, None, None);
+        insert_session(&db, "ses_b", "/proj", 160, None, None);
+
+        let evidence_at = 100 + OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(evidence_at).is_empty(), "still refused");
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(evidence_at));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn contested_cwd_latches_evidence_for_every_contender() {
+        let home = unique_temp_dir("evidence-contested");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.arm("t2", "opencode", true, None, Some("/proj"), 10));
+        assert!(locator.note_submit("t1", 100));
+        assert!(locator.note_submit("t2", 150));
+        insert_session(&db, "ses_contested", "/proj", 200, None, None);
+
+        let evidence_at = 150 + OPENCODE_WINDOW_MS + 1;
+        assert!(
+            locator.tick(evidence_at).is_empty(),
+            "contested: binds nobody"
+        );
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(evidence_at));
+        assert_eq!(locator.identity_resolvable_since("t2"), Some(evidence_at));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn located_emission_never_latches_evidence() {
+        // Plan-review R2, finding 1: a sole-candidate emission is NOT this
+        // pane's resolvable-identity evidence. The healthy bind discharges
+        // via the identity row; a drain-side refusal of a sole candidate
+        // (`session_bound_elsewhere`, `freshagent_*`) is a FOREIGN session —
+        // latching it would false-alarm 10s later on a pane whose own row
+        // may never have existed. Ambiguity/contested refusals are the only
+        // window-latch producers.
+        let home = unique_temp_dir("evidence-no-emission");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 1_000));
+        assert!(locator.note_submit("t1", 1_100));
+        insert_session(&db, "ses_emitted", "/proj", 1_150, None, None);
+
+        let located = locator.tick(1_100 + OPENCODE_WINDOW_MS + 1);
+        assert_eq!(located.len(), 1);
+        assert_eq!(locator.armed_count(), 0, "emission disarms");
+        assert_eq!(
+            locator.identity_resolvable_since("t1"),
+            None,
+            "a sole-candidate emission must never count as evidence"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn disarm_clears_resolvable_evidence() {
+        let home = unique_temp_dir("evidence-disarm");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        insert_session(&db, "ses_a", "/proj", 150, None, None);
+        insert_session(&db, "ses_b", "/proj", 160, None, None); // ambiguous: stays armed, evidence latched
+        let evidence_at = 100 + OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(evidence_at).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(evidence_at));
+
+        locator.disarm("t1");
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn disarm_clears_the_probe_throttle() {
+        // An uncleared `last_probe_ms` would wrongly throttle a re-armed
+        // same-id terminal for up to PROBE_THROTTLE_MS; disarm must clear it.
+        let home = unique_temp_dir("evidence-disarm-throttle");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        let scans_before_probe = locator.db_scan_count();
+        assert_eq!(locator.probe_candidates("t1"), Some(Vec::new()));
+        assert!(
+            locator.db_scan_count() > scans_before_probe,
+            "the first probe performs its bounded read"
+        );
+
+        locator.disarm("t1");
+
+        // Re-arm the same id and probe immediately: a fresh pane must pay
+        // its own bounded read, never inherit the old pane's throttle.
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 51_000));
+        assert!(locator.note_submit("t1", 51_100));
+        let scans_after_rearm = locator.db_scan_count();
+        assert_eq!(locator.probe_candidates("t1"), Some(Vec::new()));
+        assert!(
+            locator.db_scan_count() > scans_after_rearm,
+            "throttle from the disarmed pane must not survive into the re-armed one"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolvable_evidence_keeps_the_first_observation_time() {
+        let home = unique_temp_dir("evidence-first-wins");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        insert_session(&db, "ses_a", "/proj", 150, None, None);
+        insert_session(&db, "ses_b", "/proj", 160, None, None); // ambiguous
+        let first_at = 100 + OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(first_at).is_empty());
+
+        // A later re-opened window also sees candidates; the FIRST time wins.
+        insert_session(&db, "ses_c", "/proj", first_at + 10, None, None);
+        assert!(locator.note_submit("t1", first_at + 50));
+        let second_at = first_at + 50 + OPENCODE_WINDOW_MS + 1;
+        let _ = locator.tick(second_at);
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(first_at));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- 18. probe_candidates + note_resolvable_evidence: closes the
+    // signal-lost / late-row hole the window-latch cannot see (plan review
+    // R1). `probe_candidates` is the READ half: the same bounded read and
+    // locator-side candidate filters `resolve_windows` applies, with
+    // `deadline: None`; availability exclusions and the evidence latch are
+    // the ws caller's job (the identity-invariant sweep's async probe
+    // phase, which re-checks live fresh-agent state AFTER this read).
+    // `note_resolvable_evidence` is the LATCH half: first-evidence-wins,
+    // dropped when the terminal disarmed mid-flight. Neither probes a
+    // never-submitted pane; unarmed/never-submitted probes perform ZERO DB
+    // reads. --
+
+    #[test]
+    fn probe_candidates_never_reads_for_unarmed_or_never_submitted_terminals() {
+        let home = unique_temp_dir("probe-noread");
+        let db = open_seed_db(&home);
+        insert_session(&db, "ses_neighbor", "/proj", 150, None, None);
+        let locator = OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 100));
+
+        // arm() performs its own one-shot snapshot read; baseline AFTER it.
+        let scans = locator.db_scan_count();
+        // Never submitted => no probe, no DB read, no evidence (the #702
+        // idle-neighbor case: a pane whose user typed nothing has no session
+        // of its own, so nothing may be attributed to it).
+        assert_eq!(locator.probe_candidates("t-idle"), None);
+        assert_eq!(locator.probe_candidates("never-armed"), None);
+        assert_eq!(
+            locator.db_scan_count(),
+            scans,
+            "never-submitted/unarmed probes must perform zero DB reads"
+        );
+        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn probe_candidates_returns_a_late_row_for_a_submitted_pane() {
+        let home = unique_temp_dir("probe-late-row");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 1_000));
+        assert!(locator.note_submit("t1", 1_100));
+        // Window closed EMPTY (row not yet visible), then the row lands LATE —
+        // after the 2s Enter-anchored deadline — with no further Enter (the
+        // plan-review R1 hole).
+        let closed_at = 1_100 + OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(closed_at).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        insert_session(&db, "ses_late", "/proj", closed_at + 500, None, None);
+
+        assert_eq!(
+            locator.probe_candidates("t1"),
+            Some(vec!["ses_late".to_string()]),
+            "late row + submitted pane = a probe candidate (the caller decides availability)"
+        );
+        // The probe itself never latches evidence — the latch is the
+        // caller's write (`note_resolvable_evidence`) once the caller's
+        // availability exclusions pass.
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn note_resolvable_evidence_latches_and_the_first_observation_wins() {
+        let home = unique_temp_dir("note-first-wins");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+
+        assert_eq!(locator.note_resolvable_evidence("t1", 50_000), Some(50_000));
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(50_000));
+        // First evidence wins: a later note never overwrites the stored time.
+        assert_eq!(locator.note_resolvable_evidence("t1", 60_000), Some(50_000));
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(50_000));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn note_resolvable_evidence_is_dropped_when_the_terminal_was_disarmed_mid_flight() {
+        // The caller's DB read runs off the locator lock; a terminal that
+        // disarmed (exit/bind) between the read and the latch must never
+        // have evidence resurrected for it.
+        let home = unique_temp_dir("note-disarmed");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        locator.disarm("t1");
+
+        assert_eq!(locator.note_resolvable_evidence("t1", 50_000), None);
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn probe_candidates_respects_locator_side_candidate_filters() {
+        let home = unique_temp_dir("probe-filters");
+        let db = open_seed_db(&home);
+        insert_session(&db, "ses_pre_arm", "/proj", 50, None, None); // snapshotted at arm
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 100));
+        assert!(locator.note_submit("t1", 120));
+
+        // Seeded AFTER arm so each row's exclusion is exercised by the probe
+        // filter itself, not masked by the arm-time known_ids snapshot.
+        insert_session(&db, "ses_wrong_cwd", "/other", 60_000, None, None);
+        insert_session(&db, "ses_child", "/proj", 60_001, Some("ses_pre_arm"), None);
+        insert_session(&db, "ses_archived", "/proj", 60_002, None, Some(60_003));
+        insert_three_views_session(&db, "ses_3views", "/proj", 60_003);
+
+        // Every row is excluded probe-side (known-at-arm snapshot, foreign
+        // cwd, subagent parent, archived, 3-views marker): the probe DID
+        // run and found no candidates (Some(vec![]), not None).
+        assert_eq!(locator.probe_candidates("t1"), Some(Vec::new()));
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn probe_candidates_after_empty_enter_reads_once_then_throttles() {
+        // Plan-review R2, finding 2: a bare Enter on an empty prompt creates
+        // no row. The first probe may read (bounded) and finds nothing; a
+        // re-probe inside the throttle interval performs ZERO DB reads, so an
+        // empty-Enter pane never degrades into a permanent 2s read loop.
+        // (The throttle clock is the wall clock — `probe_candidates` takes
+        // no synthetic `now` — so the two probes below land within the same
+        // PROBE_THROTTLE_MS window by construction.)
+        let home = unique_temp_dir("probe-throttle");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100)); // bare Enter: window resolves empty
+        assert!(locator.tick(100 + OPENCODE_WINDOW_MS + 1).is_empty());
+
+        let scans_after_tick = locator.db_scan_count();
+        assert_eq!(locator.probe_candidates("t1"), Some(Vec::new()));
+        let scans_after_first_probe = locator.db_scan_count();
+        assert!(
+            scans_after_first_probe > scans_after_tick,
+            "the first probe is allowed exactly one bounded read"
+        );
+        assert_eq!(locator.probe_candidates("t1"), None);
+        assert_eq!(
+            locator.db_scan_count(),
+            scans_after_first_probe,
+            "re-probe within the throttle interval performs no DB read"
+        );
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- 19. probe_eligible: the invariant sweep's queue-skip predicate
+    // (issue #702, delta repair 4). Pure in-memory (one lock, no I/O);
+    // mirrors the probe's armed/ever-submitted/throttle guards (plus the
+    // sweep's latch-miss rule) so a pane that can never yield candidates is
+    // never queued for probing at all. --
+
+    #[test]
+    fn probe_eligible_tracks_the_probe_guards() {
+        let home = unique_temp_dir("probe-eligible");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        // Never armed => not eligible.
+        assert!(!locator.probe_eligible("never-armed", 50_000));
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+
+        // Fresh arm, never submitted (the #702 idle class): NOT eligible —
+        // the pane has no session of its own, so the sweep must never queue
+        // it for a probe.
+        assert!(!locator.probe_eligible("t1", 50_000));
+
+        // Submitted and never probed (=> not throttled): eligible.
+        assert!(locator.note_submit("t1", 100));
+        assert!(locator.probe_eligible("t1", 50_000));
+
+        // A probe read stamps the wall-clock throttle inside
+        // `probe_candidates` (the one locator entry point that runs on real
+        // time): within the throttle window the pane is not eligible again;
+        // past it, it is.
+        assert_eq!(locator.probe_candidates("t1"), Some(Vec::new()));
+        let wall_now = wall_now_ms();
+        assert!(!locator.probe_eligible("t1", wall_now));
+        assert!(locator.probe_eligible("t1", wall_now + PROBE_THROTTLE_MS + 1));
+
+        // Latched evidence (here via the ws phase's explicit note; a window
+        // refusal latches identically): the gate already has its answer, so
+        // the pane must never be queued for another probe.
+        assert_eq!(locator.note_resolvable_evidence("t1", 60_000), Some(60_000));
+        assert!(!locator.probe_eligible("t1", wall_now + PROBE_THROTTLE_MS + 1));
+
+        // Disarmed (pane gone): not eligible.
+        locator.disarm("t1");
+        assert!(!locator.probe_eligible("t1", wall_now + PROBE_THROTTLE_MS + 1));
         let _ = std::fs::remove_dir_all(&home);
     }
 }

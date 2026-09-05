@@ -1,3 +1,7 @@
+// Deliberately NOT importing ./sanitize-test-env.js: this config's package
+// script does not set FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1, and its tests
+// spawn real provider CLIs that may need ambient proxy egress on some hosts.
+
 // Vitest inherits NODE_ENV from the parent process. Override when running
 // inside a production Freshell server.
 if (process.env.NODE_ENV === 'production') {

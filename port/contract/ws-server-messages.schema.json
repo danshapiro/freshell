@@ -2631,6 +2631,9 @@
             },
             "paneReconcileV1": {
               "type": "boolean"
+            },
+            "terminalInterestV1": {
+              "type": "boolean"
             }
           },
           "type": "object"

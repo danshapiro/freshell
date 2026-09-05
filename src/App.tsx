@@ -57,6 +57,7 @@ import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { DeadSessionPanel } from '@/components/DeadSessionPanel'
+import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
@@ -2040,6 +2041,7 @@ npm run serve`}</pre>
         </div>
       )}
       <AuthRequiredModal />
+      <TerminalInterestReporter workspaceVisible={view === 'terminal'} />
       <DeadSessionPanel />
       <ReconcileWarmingBanner />
       {showSetupWizard && (

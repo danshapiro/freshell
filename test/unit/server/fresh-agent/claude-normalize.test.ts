@@ -4,6 +4,18 @@ import { normalizeClaudeThreadSnapshot } from '../../../../server/fresh-agent/ad
 import { makeClaudeLiveSession, makeClaudeRestoreResolution } from '../../../fixtures/fresh-agent/claude/thread.js'
 
 describe('Claude fresh-agent normalization', () => {
+  it('marks status as authoritative only for snapshots with a live session and carries current effort', () => {
+    const live = normalizeClaudeThreadSnapshot({
+      threadId: 'session', resolved: makeClaudeRestoreResolution(), status: 'running',
+      liveSession: makeClaudeLiveSession({ status: 'running', effort: 'low' }),
+    })
+    expect(live.extensions?.claude?.statusFromLiveState).toBe(true)
+    expect(live.status).toBe('running')
+    expect(live.settings.effort).toBe('low')
+    const disk = normalizeClaudeThreadSnapshot({ threadId: 'session', resolved: makeClaudeRestoreResolution(), status: 'idle' })
+    expect(disk.extensions?.claude?.statusFromLiveState).not.toBe(true)
+  })
+
   it('normalizes Claude block messages into shared fresh-agent items and metadata', () => {
     const snapshot = normalizeClaudeThreadSnapshot({
       threadId: 'sdk-claude-1',

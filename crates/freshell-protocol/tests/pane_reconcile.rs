@@ -79,6 +79,7 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
         capabilities: Some(ReadyCapabilities {
             pane_reconcile_v1: Some(true),
             pane_reconcile_fresh_agent_v1: None,
+            terminal_interest_v1: None,
         }),
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");

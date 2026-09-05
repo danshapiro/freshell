@@ -244,7 +244,7 @@ async function render(event) {
         type: 'sdk.assistant',
         sessionId,
         content: [{ type: 'text', text: data.text ?? 'Fixture turn' }],
-        model: 'fixture-model',
+        model: sessions.get(sessionId)?.settings.model ?? 'fixture-model',
       })
       const st = sessions.get(sessionId)
       if (st) appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn')
@@ -307,7 +307,8 @@ async function handleInput(line) {
       ? randomUUID()
       : (msg.resumeSessionId ?? program.sessionId ?? randomUUID())
     const cwd = msg.cwd ?? process.cwd()
-    sessions.set(sessionId, { cliSessionId, cwd, pending: 0, pendingEntries: [] })
+    sessions.set(sessionId, { cliSessionId, cwd, pending: 0, pendingEntries: [],
+      settings: { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd } })
     // A durable transcript EXISTS from create on (the reload-while-pending
     // snapshot route reads it before any turn completes) — touch, no bogus row.
     const transcript = transcriptPath(cliSessionId, cwd)
@@ -371,6 +372,17 @@ async function handleInput(line) {
       await engine.emitResume(cliSessionId)
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
+  } else if (msg.type === 'configure') {
+    const st = sessions.get(msg.sessionId)
+    if (!st) {
+      emit({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok: false, message: 'Session not found' })
+      return
+    }
+    for (const key of ['model', 'effort', 'permissionMode', 'cwd']) {
+      if (msg.settings?.[key] != null || (key === 'effort' && msg.settings?.effort === null)) st.settings[key] = msg.settings[key]
+    }
+    st.cwd = st.settings.cwd
+    emit({ type: 'sdk.configured', sessionId: msg.sessionId, requestId: msg.requestId, ok: true, settings: st.settings })
   } else if (msg.type === 'send') {
     activeSessionId = msg.sessionId ?? activeSessionId
     const st = sessions.get(msg.sessionId)

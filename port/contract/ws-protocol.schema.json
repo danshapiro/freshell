@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 81,
+  "schemaCount": 82,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -530,6 +530,10 @@
                   "const": true,
                   "type": "boolean"
                 },
+                "terminalInterestV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "terminalOutputBatchV1": {
                   "type": "boolean"
                 },
@@ -1021,6 +1025,47 @@
             "intent",
             "cols",
             "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "focusedTerminalId": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "revision": {
+              "maximum": 9007199254740991,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": {
+              "const": "terminal.interest",
+              "type": "string"
+            },
+            "visibleTerminalIds": {
+              "items": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 1024,
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "visibleTerminalIds"
           ],
           "type": "object"
         },
@@ -4246,6 +4291,10 @@
               "const": true,
               "type": "boolean"
             },
+            "terminalInterestV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "terminalOutputBatchV1": {
               "type": "boolean"
             },
@@ -7222,6 +7271,10 @@
         "paneReconcileV1": {
           "const": true,
           "type": "boolean"
+        },
+        "terminalInterestV1": {
+          "const": true,
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -7817,6 +7870,48 @@
         "type",
         "terminalId",
         "data"
+      ],
+      "type": "object"
+    },
+    "TerminalInterestSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "focusedTerminalId": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "terminal.interest",
+          "type": "string"
+        },
+        "visibleTerminalIds": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "revision",
+        "visibleTerminalIds"
       ],
       "type": "object"
     },

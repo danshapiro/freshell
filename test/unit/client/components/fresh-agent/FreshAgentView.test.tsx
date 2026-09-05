@@ -15,7 +15,7 @@ import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { ApiError } from '@/lib/api'
-import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
+import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
 import {
   ROLLBACK_BUSY_REDO_NOTICE,
   ROLLBACK_BUSY_UNDO_NOTICE,
@@ -198,6 +198,13 @@ function getFreshAgentPaneContent(store: ReturnType<typeof createStore>) {
   return layout.content
 }
 
+function finishOutgoingTurn(store: ReturnType<typeof createStore>) {
+  const content = getFreshAgentPaneContent(store)
+  const locator = { sessionId: content.sessionId!, sessionType: content.sessionType, provider: content.provider }
+  act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+  act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+}
+
 function sentFreshAgentMessages(type: string) {
   return wsMock.send.mock.calls
     .map(([message]) => message)
@@ -322,6 +329,234 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
+  describe('outgoing message queue', () => {
+    async function setup(status = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status, capabilities: { send: canSend, interrupt: true }, turns: [],
+      })
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: provider === 'claude' ? 'freshclaude' as const : 'freshcodex' as const,
+        provider, createRequestId: 'queue-create',
+        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status: status as 'running' | 'idle',
+      }
+      const view = (nextStatus: string) => (
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{ ...content, status: nextStatus as 'idle' }} />
+        </Provider>
+      )
+      const rendered = render(view(status))
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      return { send, store, status: (nextStatus: string) => {
+        act(() => store.dispatch(setSessionStatus({
+          sessionId: content.sessionId, sessionType: content.sessionType, provider,
+          status: nextStatus as 'idle',
+        })))
+        rendered.rerender(view(nextStatus))
+      } }
+    }
+
+    it('keeps queued work when the provider exits', async () => {
+      const queue = await setup()
+      queue.send('Keep this follow-up')
+      queue.status('exited')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('sends queued messages one turn at a time', async () => {
+      const queue = await setup()
+      queue.send('First follow-up')
+      queue.send('Second follow-up')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'First follow-up' })
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      queue.status('running')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second follow-up' })
+    })
+
+    it('queues rapid sends before the provider reports running', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('advances after a fast interrupted turn whose status updates share one render', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        listener({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.status', status: 'running' } })
+        queue.store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+        queue.store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it('advances after real Codex snapshot lifecycle frames complete within one render', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        for (const status of ['running', 'idle']) {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null, timelineSessionId: locator.sessionId, status } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+    })
+
+    it('does not unlock the next Codex send with an earlier turn HTTP response', async () => {
+      const queue = await setup('idle')
+      queue.send('Repeat this task')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const snapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => snapshot.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: first.requestId }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      queue.send('Repeat this task')
+      queue.send('Last follow-up')
+      act(() => {
+        for (const status of ['running', 'idle']) {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null, timelineSessionId: locator.sessionId, status } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      await act(async () => snapshot.resolve({
+        ...freshopencodeSnapshot('finished first turn', 1),
+        sessionType: 'freshcodex', provider: 'codex', sessionId: locator.sessionId, threadId: locator.sessionId,
+        turns: [{ id: 'first-user-turn', turnId: 'first-user-turn', role: 'user', summary: 'Repeat this task', items: [{ id: 'first-user-text', kind: 'text', text: 'Repeat this task' }] }],
+      }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('advances after Claude streams and completes within one render', async () => {
+      const queue = await setup('idle', true, 'claude')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        for (const event of [
+          { type: 'freshAgent.stream', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+          { type: 'freshAgent.stream', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } } },
+          { type: 'freshAgent.result' },
+          { type: 'freshAgent.status', status: 'idle' },
+        ]) {
+          const message = { type: 'freshAgent.event', ...locator, event }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it.each(['codex', 'claude'] as const)('advances %s after reconnect when an authoritative idle snapshot contains the submitted turn', async (provider) => {
+      const queue = await setup('idle', true, provider)
+      queue.send('First message')
+      queue.send('Second message')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'disconnected' }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionId: first.sessionId, status: 'idle', capabilities: { send: true, interrupt: true },
+        extensions: provider === 'claude' ? { claude: { statusFromLiveState: true } } : {},
+        turns: [{ id: 'completed-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'user-text', kind: 'text', text: 'First message' }] }],
+      })
+      act(() => {
+        queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' })
+        reconnect()
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+    })
+
+    it('does not advance Claude from disk-only idle history after accepting a prompt', async () => {
+      const queue = await setup('idle', true, 'claude')
+      queue.send('Accepted but not finished')
+      queue.send('Later follow-up')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const beforeRefresh = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionId: CLAUDE_THREAD_ID, status: 'idle', capabilities: { send: true, interrupt: true },
+        turns: [{ id: 'accepted-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'accepted-text', kind: 'text', text: 'Accepted but not finished' }] }],
+        extensions: { claude: { liveSessionId: CLAUDE_THREAD_ID } },
+      })
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({
+        type: 'freshAgent.send.accepted', sessionId: CLAUDE_THREAD_ID,
+        sessionType: 'freshclaude', provider: 'claude', requestId: first.requestId,
+        submittedTurnId: 'accepted-user-turn',
+      }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps the reservation when a reconnect idle snapshot does not contain the submitted turn', async () => {
+      const queue = await setup('idle')
+      queue.send('Still awaiting acceptance')
+      queue.send('Later follow-up')
+      const beforeRefresh = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      act(() => reconnect())
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps queued work while the idle snapshot does not allow sends', async () => {
+      const queue = await setup('running', false)
+      queue.send('Wait for permission to send')
+      queue.status('idle')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps queued work while disconnected and sends after reconnect', async () => {
+      const queue = await setup()
+      queue.send('After reconnect')
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'disconnected' }))
+      queue.status('idle')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    })
+
+    it('checks current agent status when a shell command finishes', async () => {
+      const queue = await setup('idle')
+      let finishShell!: (result: { output: string; exitCode: number }) => void
+      apiMock.post.mockImplementationOnce(() => new Promise((resolve) => { finishShell = resolve }))
+      queue.send('!pwd')
+      queue.status('running')
+      await act(async () => finishShell({ output: '/workspace', exitCode: 0 }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: expect.stringContaining('/workspace') }))
+    })
+  })
+
   it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -2353,6 +2588,7 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second title' },
     })
@@ -2421,6 +2657,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-session-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second durable title' },
     })
@@ -2501,6 +2738,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-session-refine-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second refined title' },
     })
@@ -2716,6 +2954,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('thread-same-identity')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Should not replace codex same identity title' },
     })
@@ -2784,6 +3023,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-same-durable-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Should not replace durable title' },
     })
@@ -6339,31 +6579,47 @@ describe('snapshot scheduler integration (zrrj)', () => {
   })
 
   it('keeps the last good snapshot visible and stops fetching during 429 backoff', async () => {
-    const store = createStore()
-    const broadcast = captureWsBroadcast()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
+    // Wall-clock debounce plus waitFor's 1s deadline races CPU contention in
+    // cloud shards. Advance the actual scheduler/React timers deterministically.
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const broadcast = captureWsBroadcast()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
 
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-    await screen.findByText('hello world')
-    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
 
-    broadcast(sessionChanged())
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
-    await flushMs(50)
-    // Last good transcript stays visible; no load-error banner.
-    expect(screen.getByText('hello world')).toBeInTheDocument()
-    expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
+      broadcast(sessionChanged())
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      // Last good transcript stays visible; no load-error banner.
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
 
-    // Further invalidations during backoff are suppressed without network.
-    broadcast(sessionChanged())
-    await flushMs(400)
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
-    expect(screen.getByText('hello world')).toBeInTheDocument()
+      // Invalidations stay suppressed throughout Retry-After, then the view's
+      // automatic retry refreshes the transcript once backoff has elapsed.
+      broadcast(sessionChanged())
+      await act(async () => { await vi.advanceTimersByTimeAsync(59_999) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('recovered transcript', 11))
+      await act(async () => { await vi.advanceTimersByTimeAsync(51) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(screen.getByText('recovered transcript')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 
   it('does not refetch when another session sends (send.accepted for a foreign request)', async () => {

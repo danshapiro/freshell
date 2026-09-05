@@ -3991,13 +3991,12 @@ export class WsHandler {
       case 'pane.closed':
         // The durable pane-close evidence is journaled only by the Rust
         // freshell-ws pane ledger (this server has no recovery ledger).
-        // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close is
-        // ACKNOWLEDGED on every floor — the client's close gate awaits one
-        // correlated `pane.closed.result` per pane.closed, so answer success
-        // (this server's close-durability model records exactly nothing:
-        // there is no ledger read path to protect, hence nothing that can
-        // fail). Answer, never ignore: a v10 client treats silence as an
-        // unconfirmed close.
+        // The close is ACKNOWLEDGED on every floor — the client's close gate
+        // awaits one correlated `pane.closed.result` per pane.closed, so
+        // answer success (this server's close-durability model records
+        // exactly nothing: there is no ledger read path to protect, hence
+        // nothing that can fail). Answer, never ignore: a v10 client treats
+        // silence as an unconfirmed close.
         this.send(ws, {
           type: 'pane.closed.result',
           createRequestId: m.createRequestId,
@@ -4007,12 +4006,10 @@ export class WsHandler {
         return
 
       case 'panes.closed':
-        // Focused-episode-7 round 3 (Finding F1): the whole-tab BATCH close.
-        // Same floor rule as pane.closed — the v10 client gates tab removal
-        // on the ONE correlated `panes.closed.result`, and this server
-        // journals nothing (no recovery ledger), so answer success by the
-        // batch's requestId. Answer, never ignore: a v10 client treats
-        // silence as an unconfirmed close.
+        // The whole-tab BATCH close. Same floor rule as pane.closed — the
+        // v10 client gates tab removal on the ONE correlated
+        // `panes.closed.result`, and this server journals nothing (no
+        // recovery ledger), so answer success by the batch's requestId.
         this.send(ws, {
           type: 'panes.closed.result',
           requestId: m.requestId,
@@ -4021,19 +4018,23 @@ export class WsHandler {
         return
 
       case 'pane.opened':
-        // Focused-episode-7 round 5 (Finding F3): the durable open
-        // re-assertion is ANSWERED on every floor — the client tracks a
-        // failed consume for its next-sweep retry. Only the Rust pane ledger
-        // consumes the pane's standing close record; this server records
-        // nothing (no ledger, no recovery pipeline), so there is nothing that
-        // can fail and the answer is success. Answer, never ignore: silence
-        // is harmless (the listen is bounded and non-blocking) but answering
-        // keeps the client's failure bookkeeping exact.
+        // The durable open re-assertion is ANSWERED on every floor — the
+        // client tracks a failed consume for its next-sweep retry. Only the
+        // Rust pane ledger consumes the pane's standing close record; this
+        // server records nothing (no ledger, no recovery pipeline), so there
+        // is nothing that can fail and the answer is success. Answering keeps
+        // the client's failure bookkeeping exact.
         this.send(ws, {
           type: 'pane.opened.result',
           createRequestId: m.createRequestId,
           success: true,
         })
+        return
+
+      case 'terminal.interest':
+        // Rust-only feature (terminalInterestV1, never advertised by this
+        // server): connection-local delivery-order hint. Presentation-only —
+        // accept and ignore; it must never attach, resize, or error.
         return
 
       default:
