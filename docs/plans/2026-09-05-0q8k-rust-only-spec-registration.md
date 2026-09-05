@@ -59,7 +59,10 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import baseConfig, { RUST_ONLY_SPECS } from '../../test/e2e-browser/playwright.config'
+import baseConfig, {
+  MATRIX_SPECS,
+  RUST_ONLY_SPECS,
+} from '../../test/e2e-browser/playwright.config'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const specsDir = path.resolve(__dirname, '../../test/e2e-browser/specs')
@@ -104,8 +107,12 @@ describe('playwright e2e rust-only spec registration', () => {
   it('every rust-chromium testMatch entry is in RUST_ONLY_SPECS or allowlisted for intentional chromium double coverage', () => {
     const rustMatch = toRegexes(rust?.testMatch as Pattern | Pattern[] | undefined)
     const ignoreSources = new Set(RUST_ONLY_SPECS.map((re) => re.source))
+    // MATRIX_SPECS are multi-server BY DESIGN (HARNESS-02): they run under
+    // legacy-chromium, rust-chromium, AND the match-all chromium project.
+    const matrixSources = new Set(MATRIX_SPECS.map((re) => re.source))
     const violators = rustMatch
       .map((re) => re.source)
+      .filter((source) => !matrixSources.has(source))
       .filter(
         (source) =>
           !ignoreSources.has(source) &&
@@ -120,7 +127,7 @@ describe('playwright e2e rust-only spec registration', () => {
 
 Run: `npm run test:vitest -- run test/unit/e2e-browser-spec-registration.test.ts`
 
-Expected: FAIL because (a) "every on-disk *-rust.spec.ts is registered…" fails listing `reconcile-handshake-rust.spec.ts` and `sidebar-remote-status-rings-rust.spec.ts` (absent from BOTH lists at base), and (b) "every rust-chromium testMatch entry…" fails listing the sources of `amplifier-restore-rust`, `opencode-terminal-restore-rust`, `codex-terminal-bounce-rust`, `mcp-bridge-rust`, `mcp-qa-smoke-rust`, `term28-path-shadow-rust`, `rest-tab-persistence`, and `diag03-rotation-redaction-rust` (in `rust-chromium` `testMatch` but not `RUST_ONLY_SPECS` at base). Test 1 (identity) passes at base. The failure must enumerate spec names — no syntax/setup accident.
+Expected: FAIL because (a) "every on-disk *-rust.spec.ts is registered…" fails listing exactly nine files — the seven kata-named testMatch-only specs (`amplifier-restore-rust`, `codex-terminal-bounce-rust`, `diag03-rotation-redaction-rust`, `mcp-bridge-rust`, `mcp-qa-smoke-rust`, `opencode-terminal-restore-rust`, `term28-path-shadow-rust`) plus the never-registered `reconcile-handshake-rust` and `sidebar-remote-status-rings-rust` (`remote-tab-linkage-rust` is already registered on both sides at base and must NOT appear), and (b) "every rust-chromium testMatch entry…" fails listing exactly the sources of `amplifier-restore-rust`, `opencode-terminal-restore-rust`, `codex-terminal-bounce-rust`, `mcp-bridge-rust`, `mcp-qa-smoke-rust`, `term28-path-shadow-rust`, `rest-tab-persistence`, and `diag03-rotation-redaction-rust`. Test 1 (identity) passes at base. Verified during load-bearing validation (execution log: the test was run at base and produced exactly this enumeration — see `<logs_dir>/reports/load-bearing-validators.md`).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -263,7 +270,7 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --project=chr
   test/e2e-browser/specs/sidebar-opencode-rail.spec.ts test/e2e-browser/specs/harness-01-rust-server.spec.ts
 ```
 
-Expected: the `--project=chromium` run over the ten reconciled specs prints "No tests found" (this is the pass condition — Playwright exits 1 with that message when nothing matches); the `--project=rust-chromium` run over the two newly registered specs lists a NON-ZERO number of tests; the chromium positive-control run lists a non-zero number of tests for `sidebar-opencode-rail` and `harness-01-rust-server`.
+Expected: the `--project=chromium` run over the ten reconciled specs reports "Error: No tests found."/"Total: 0 tests in 0 files" (this message shape is the pass condition — observed verbatim at base for an ignored spec, see load-bearing validator log); the `--project=rust-chromium` run over the two newly registered specs lists a NON-ZERO number of tests; the chromium positive-control run lists a non-zero number of tests for `sidebar-opencode-rail` and `harness-01-rust-server`.
 
 - [ ] **Step 7: Commit the task**
 
