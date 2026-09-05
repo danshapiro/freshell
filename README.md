@@ -135,7 +135,10 @@ configuration.
   directory, the value now takes effect at next start (state relocates to that
   directory): remove the line from your unit, or move your existing
   `~/.freshell` contents into the directory it names. Units using the default
-  `~/.freshell` path are unaffected; Rust-server installs never read this
+  `~/.freshell` path are unaffected — and if your service's working directory
+  is not the config dir (systemd user units default to `$HOME`), the server
+  copies an existing `.env` from the old location into the config dir rather
+  than rotating your token. Rust-server installs never read this
   variable.
 
 ## Usage

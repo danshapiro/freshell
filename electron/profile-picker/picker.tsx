@@ -50,6 +50,11 @@ export function ProfilePicker() {
       {error ? (
         <p role="alert" className="picker-error">{error}</p>
       ) : null}
+      {entries === null && !error ? (
+        window.freshellDesktop?.getProfiles
+          ? <p className="picker-subtitle">Loading profiles…</p>
+          : <p role="alert" className="picker-error">The profile list is unavailable (preload did not load).</p>
+      ) : null}
       <ul className="picker-list">
         {(entries ?? []).map((entry) => (
           <li key={entry.id}>

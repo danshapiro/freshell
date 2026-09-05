@@ -59,6 +59,13 @@ export interface StartupContext {
   /** Active profile id; named profiles own their app-bound server and skip
    *  localhost discovery (see launch-policy.ts). Defaults to 'default'. */
   profileId?: string
+  /** Port availability probe (entry.ts wires the production check). When
+   *  provided AND the active profile is named AND app-bound, a busy
+   *  desktopConfig.port is auto-bumped to the next free port (and persisted),
+   *  since two profiles sharing one port cannot both hold it. */
+  isPortAvailable?: (port: number) => Promise<boolean>
+  /** Persist a changed default port for named profiles (config-dir scoped). */
+  patchDesktopConfig?: (patch: { port?: number }) => Promise<unknown>
 }
 
 export type StartupResult =
@@ -284,6 +291,7 @@ async function startAppBoundServer(ctx: StartupContext, port: number): Promise<s
     port,
     envFile: path.join(ctx.configDir, '.env'),
     configDir: ctx.configDir,
+    pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== 'default',
   })
   return `http://localhost:${port}`
 }
@@ -370,7 +378,41 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
       break
     }
     case 'app-bound': {
-      serverUrl = await startAppBoundServer(ctx, port)
+      const namedProfile = ctx.profileId !== undefined && ctx.profileId !== 'default'
+      let launchPort = port
+      if (namedProfile && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
+        // The profile's configured port is already held (typically by another
+        // profile's resident server). Bump to the next free port rather than
+        // spawning a doomed server whose health check would succeed against
+        // the OTHER instance (/api/health is unauthenticated).
+        let chosen = -1
+        for (let candidate = port + 1; candidate < port + 200; candidate++) {
+          if (await ctx.isPortAvailable(candidate)) {
+            chosen = candidate
+            break
+          }
+        }
+        if (chosen !== -1) {
+          launchPort = chosen
+          ctx.mainProcessLogger?.log({
+            severity: 'info',
+            event: 'profile_port_reassigned',
+            profileId: ctx.profileId,
+            from: port,
+            to: chosen,
+          })
+          try {
+            await ctx.patchDesktopConfig?.({ port: chosen })
+          } catch (err) {
+            ctx.mainProcessLogger?.log({
+              severity: 'warn',
+              event: 'profile_port_persist_failed',
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+      }
+      serverUrl = await startAppBoundServer(ctx, launchPort)
       break
     }
     case 'remote': {

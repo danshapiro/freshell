@@ -75,7 +75,8 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'start-local' }
   }
 
-  if (candidates.length > 1) {    return { type: 'show-chooser', candidates, reason: 'multiple-candidates' }
+  if (candidates.length > 1) {
+    return { type: 'show-chooser', candidates, reason: 'multiple-candidates' }
   }
 
   if (candidates.length === 1) {

@@ -83,7 +83,7 @@ if (registryAtBoot.error) {
   mainProcessLogger.log({ severity: 'warn', event: 'profiles_registry_invalid', error: registryAtBoot.error })
 }
 if (bootShape.error) {
-  mainProcessLogger.log({ severity: 'warn', component: 'electron-profile', event: 'profile_selection_invalid', error: bootShape.error })
+  mainProcessLogger.log({ severity: 'warn', event: 'profile_selection_invalid', error: bootShape.error })
 }
 
 /** True once this process holds its (userData-keyed) instance lock;
@@ -130,7 +130,10 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
 
   ipcMain.removeHandler('get-profiles')
   ipcMain.removeHandler('choose-profile')
-  ipcMain.handle('get-profiles', () => entries)
+  ipcMain.handle('get-profiles', (event) => {
+    if ((event as { sender?: { id?: number } }).sender?.id !== pickerWebContentsId) return []
+    return entries
+  })
   ipcMain.handle('choose-profile', createChooseProfileHandler({
     entries,
     isAllowedSender: (event) =>
@@ -147,12 +150,19 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
     app.exit(0)
   })
 
-  if (isDev) {
-    void pickerWin.loadURL('http://localhost:5179')
-  } else {
-    const packaged = path.join(process.resourcesPath, 'profile-picker', 'index.html')
-    const unpackaged = path.join(app.getAppPath(), 'dist', 'profile-picker', 'index.html')
-    void pickerWin.loadFile(fs.existsSync(packaged) ? packaged : unpackaged)
+  try {
+    if (isDev) {
+      await pickerWin.loadURL('http://localhost:5179')
+    } else {
+      const packaged = path.join(process.resourcesPath, 'profile-picker', 'index.html')
+      const unpackaged = path.join(app.getAppPath(), 'dist', 'profile-picker', 'index.html')
+      await pickerWin.loadFile(fs.existsSync(packaged) ? packaged : unpackaged)
+    }
+  } catch (err) {
+    // The picker is the default boot path once profiles.json exists — log the
+    // failure loudly and still show the (broken) window so the user can close
+    // it instead of the app dying as a background zombie.
+    mainProcessLogger.log({ severity: 'error', event: 'profile_picker_load_failed', error: err instanceof Error ? err.message : String(err) })
   }
   pickerWin.show()
   return new Promise<void>(() => {
@@ -486,6 +496,8 @@ async function main(): Promise<void> {
     resourcesPath,
     configDir,
     mainProcessLogger,
+    isPortAvailable,
+    patchDesktopConfig: (patch: { port?: number }) => patchDesktopConfig(patch, configDir),
     platform: process.platform,
     fetchHealthCheck: (url: string): Promise<boolean> => {
       // Use Node's http module instead of global fetch() — Electron's main

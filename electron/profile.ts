@@ -25,7 +25,7 @@ export const ProfileEntrySchema = z.object({
 })
 
 export const ProfilesRegistrySchema = z.object({
-  profiles: z.array(ProfileEntrySchema).min(1),
+  profiles: z.array(ProfileEntrySchema),
 }).superRefine((value, ctx) => {
   const seen = new Set<string>()
   for (const entry of value.profiles) {

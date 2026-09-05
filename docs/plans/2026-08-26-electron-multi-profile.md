@@ -479,6 +479,8 @@ test must fail because the module does not exist yet.
 
 **Files:**
 - Create: `electron/profile.ts`
+- Modify: `server/bootstrap.ts` (as-built: config-dir .env anchor + migration) — see **As-built changes**
+- Modify: `server/index.ts` (as-built: dotenv load moved into bootstrap) — see **As-built changes**
 - Test: `test/unit/electron/profile.test.ts`
 
 **Interfaces:**
@@ -3081,7 +3083,8 @@ git commit -m "docs: desktop profiles for multiple instances"
 
 ## As-built changes from the post-execution independent review
 
-One behavioral change landed after the original 9 tasks, driven by review:
+All of the following landed after the original 9 tasks, driven by independent
+review rounds on the delta:
 
 - **Named app-bound/daemon profiles never adopt a discovery-found server.**
   `chooseLaunchAction` previously auto-connected to a single scanning-based
@@ -3094,6 +3097,41 @@ One behavioral change landed after the original 9 tasks, driven by review:
   unchanged. Regression coverage: `test/unit/electron/launch-policy.test.ts`
   ('named profiles') and `test/unit/electron/startup.test.ts` ('app-bound
   mode').
+- **Named profiles auto-bump a busy port.** If a named profile's configured
+  port is already held (typically by another resident profile), startup scans
+  forward for a free port, logs `profile_port_reassigned`, and persists the
+  choice via the profile-scoped config patch — without this, the
+  unauthenticated `/api/health` probe would have succeeded against the
+  NEIGHBOR profile's server and the window would have loaded it with the
+  wrong token. Regression coverage: `test/unit/electron/startup.test.ts`
+  ('app-bound mode').
+- **dotenv ordering kept at module scope.** Loading `.env` inside
+  `server/index.ts` module body would run only after all imports evaluate and
+  silently disable every `.env`-backed knob (`LOG_LEVEL`, scrollback caps,
+  the debug-log filename's `PORT`). The load is inside `server/bootstrap.ts`,
+  which every server entry imports first: the anchor resolves
+  `FRESHELL_CONFIG_DIR` first, cwd second, and `.env` is created/migrated/
+  loaded before any other module evaluates.
+- **`.env` migration for daemon units.** When the anchored `.env` is missing
+  but `<cwd>/.env` exists (the systemd/launchd templates lack WorkingDirectory,
+  so a pre-feature install parks its token at `$HOME/.env`), bootstrap copies
+  (never moves) it into the anchored location; no AUTH_TOKEN rotation. Task
+  4's consumer list and staging block were amended to include
+  `server/bootstrap.ts` and `server/index.ts`; `server/config-store.ts` per
+  the earlier review note.
+- **Environment contract tightened.** App-bound spawn env: `AUTH_TOKEN` and
+  inherited `FRESHELL_CONFIG_DIR` are always dropped; `FRESHELL_CONFIG_DIR`
+  is pinned ONLY for named profiles (the default profile keeps its legacy
+  `FRESHELL_HOME` resolution, so `FRESHELL_HOME`-exported deployments never
+  silently switch dirs). PTYs also drop `FRESHELL_PROFILE` so nested launches
+  keep picker/default behavior.
+- **Profile-aware client surfaces.** `config.fallback` now carries the
+  effective `backupPath`; `/api/bootstrap` carries `configDir`; the picker
+  has explicit loading/missing-preload states; picker loads are awaited with
+  a logged `profile_picker_load_failed` failure path (no blank zombie
+  window); `get-profiles` is sender-checked; `initMainProcess` no longer
+  carries an unreachable duplicate `second-instance` handler;
+  `{"profiles": []}` is a valid "no named profiles" registry, not invalid.
 
 ---
 

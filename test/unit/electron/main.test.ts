@@ -64,23 +64,9 @@ describe('initMainProcess', () => {
     })
   })
 
-  it('shows a hidden main window before focusing it on second-instance', async () => {
+  it('does not register a second-instance handler (entry.ts installs the canonical one in main())', async () => {
     await initMainProcess(deps)
-
-    app.emit('second-instance')
-
-    expect(mockWindow.show).toHaveBeenCalled()
-    expect(mockWindow.focus).toHaveBeenCalled()
-    expect(mockWindow.show.mock.invocationCallOrder[0])
-      .toBeLessThan(mockWindow.focus.mock.invocationCallOrder[0])
-  })
-
-  it('does not double-register second-instance when an early canonical handler exists', async () => {
-    // entry.ts installs its own canonical handler in main() before any window
-    // creation; initMainProcess must defer to it.
-    app.on('second-instance', () => {})
-    await initMainProcess(deps)
-    expect(app.listenerCount('second-instance')).toBe(1)
+    expect(app.listenerCount('second-instance')).toBe(0)
   })
 
   it('close-to-tray hides window instead of quitting', async () => {

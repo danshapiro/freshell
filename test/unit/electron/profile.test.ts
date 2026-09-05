@@ -1,5 +1,4 @@
 // test/unit/electron/profile.test.ts
-import os from 'os'
 import path from 'path'
 import { describe, it, expect } from 'vitest'
 import {
@@ -122,12 +121,16 @@ describe('readProfilesRegistry', () => {
       { profiles: [{ id: 'BAD ID' }] },
       { profiles: [{ id: 'default' }] },
       { profiles: [{ id: 'a' }, { id: 'a' }] },
-      { profiles: [] },
     ]) {
       const r = readProfilesRegistry('/x/profiles.json', withFile(JSON.stringify(bad)))
       expect(r.profiles).toEqual([])
       expect(r.error).toBeTruthy()
     }
+  })
+  it('an explicit empty profiles array is valid (means "no named profiles")', () => {
+    const r = readProfilesRegistry('/x/profiles.json', withFile(JSON.stringify({ profiles: [] })))
+    expect(r.error).toBeUndefined()
+    expect(r.profiles).toEqual([])
   })
   it('accepts a valid registry', () => {
     const r = readProfilesRegistry('/x/profiles.json',

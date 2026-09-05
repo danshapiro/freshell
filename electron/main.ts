@@ -38,9 +38,10 @@ export function acquireInstanceLock(app: ElectronApp, onDenied?: () => void): bo
 }
 
 export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
+  // The caller must hold the instance lock already (see acquireInstanceLock)
+  // and install the canonical `second-instance` surfacing handler (entry.ts
+  // registers it right after the lock gate, covering every boot phase).
   const { app, minimizeToTray } = deps
-
-  // The caller must hold the instance lock already (see acquireInstanceLock);
   let mainWindow: any = null
   let isQuitting = false
 
@@ -72,20 +73,6 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
       mainWindow.show()
     }
   })
-
-  // Second instance: surface and focus the existing window. Skipped if entry
-  // already installed a canonical early handler.
-  if (app.listenerCount('second-instance') === 0) {
-    app.on('second-instance', () => {
-      if (mainWindow) {
-        if (mainWindow.isMinimized?.()) {
-          mainWindow.restore?.()
-        }
-        mainWindow.show?.()
-        mainWindow.focus?.()
-      }
-    })
-  }
 
   // Note: window-all-closed is handled by entry.ts with a lifecycle-aware
   // guard (wizardPhase). This prevents the app from quitting during the

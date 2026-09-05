@@ -201,8 +201,7 @@ describe('runStartup', () => {
   })
 
   describe('app-bound mode', () => {
-    it('a named app-bound profile ignores discovered local servers and spawns its own', async () => {
-      const ctx = createDefaultContext({
+    it('a named app-bound profile ignores discovered local servers and spawns its own', async () => {      const ctx = createDefaultContext({
         isDev: false,
         resourcesPath: '/app/resources',
         discoverLaunchCandidates: vi.fn().mockResolvedValue([{
@@ -227,6 +226,56 @@ describe('runStartup', () => {
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
       }
+    })
+
+    it('auto-bumps a busy port for a named profile and persists the choice', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      const busyPorts = new Set([3001])
+      ctx.isPortAvailable = vi.fn(async (p: number) => !busyPorts.has(p))
+      const patchDesktopConfig = vi.fn().mockResolvedValue({})
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(startArgs.port).toBe(3002)
+      expect(patchDesktopConfig).toHaveBeenCalledWith({ port: 3002 })
+    })
+
+    it('a named profile keeps its configured port when it is free (no persistence churn)', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(true)
+      const patchDesktopConfig = vi.fn()
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
+    })
+
+    it('the default profile keeps legacy behavior when its port is busy (no auto-bump)', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(false)
+      const patchDesktopConfig = vi.fn()
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
     })
 
     it('spawns server in production mode with paths from resourcesPath', async () => {
