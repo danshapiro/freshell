@@ -22,7 +22,7 @@ Fix the defect confirmed by the investigation of GitHub issue danshapiro/freshel
 
 **Goal:** `terminal_identity_unresolved` never fires for an opencode terminal pane while no correlatable session row exists for it (the #702 false-fire), and still fires when candidate evidence existed but no identity ever bound.
 
-**Architecture:** One re-gate across two crates. `freshell-sessions`' `OpencodeLocator` gains a per-terminal *candidate-evidence latch* (first ms an evaluated correlation window observed ≥1 in-window cwd-confirmed row) exposed as `identity_resolvable_since(terminal_id)`. `freshell-ws`'s `warn_unresolved_terminal_identities` replaces the create-age gate for `mode == "opencode"` rows with an evidence-age gate when a locator is available (no evidence ⇒ nothing resolvable ⇒ no alarm; evidence older than the grace ⇒ alarm), and keeps today's create-age tripwire when the locator is unavailable. Non-opencode modes are byte-identical in behavior. A scoped end-to-end pin lands on the existing never-submitted negative-control pane in `opencode-terminal-restore-rust.spec.ts`. Known, accepted residual (recorded in the load-bearing ledger): a session row materializing AFTER a closed Enter window with no later Enter and a silently-lost TUI signal leaves neither evidence nor a bind — unreachable in practice because the rebind plugin polls `route.current` every 1s (production evidence: it bound both incident panes within ~1s of row creation) and a dead plugin is caught by the sibling `opencode_rebind_heartbeat_missing` alarm.
+**Architecture:** One re-gate across two crates. `freshell-sessions`' `OpencodeLocator` gains a per-terminal *candidate-evidence latch* (first ms an evaluated correlation window observed ≥1 in-window cwd-confirmed row) exposed as `identity_resolvable_since(terminal_id)`, plus a probe path `probe_resolvable(terminal_id, now_ms, is_unavailable)` for the plan-review R1 hole: an ARMED opencode terminal that has EVER submitted but holds no latched evidence gets one bounded candidate read [arm−ε, now] (same cwd/exclusion filters as `resolve_windows`, minus the deadline) — covering rows that materialized after a closed window and windows zeroed by a transient DB error. The probe short-circuits on `first_submit_ms == None` BEFORE any DB read, so the never-submitted (#702 idle) class costs nothing and stays silent; the ws layer passes a `is_unavailable` predicate that excludes sessions already claimed by any live-or-retired terminal and sessions with fresh-agent ledger rows, so a healthy neighbor pane's bound row in the same cwd can never produce evidence. `freshell-ws`'s `warn_unresolved_terminal_identities` replaces the create-age gate for `mode == "opencode"` rows with an evidence-age gate when a locator is available (no evidence ⇒ nothing resolvable ⇒ no alarm; evidence older than the grace ⇒ alarm; probe runs only for rows already past the create-age grace), and keeps today's create-age tripwire when the locator is unavailable. Non-opencode modes are byte-identical in behavior. The sweep moves its warn pass into `tokio::task::spawn_blocking` (mirroring `drain_and_associate`'s precedent) because the probe can now issue a bounded SQLite read. A scoped end-to-end pin lands on the existing never-submitted negative-control pane in `opencode-terminal-restore-rust.spec.ts`. Accepted residual: a same-cwd sibling in a genuinely broken state (submitted, row created, bound nowhere) latches evidence on an idle-but-submitted pane too — collateral alarm noise only in an already-broken world; and a DB read error AT the probe itself defers detection to the next 2s sweep (self-healing).
 
 **Tech Stack:** Rust workspace (`freshell-sessions`, `freshell-ws`), rusqlite-seeded temp-DB unit tests (existing in-file patterns), Playwright e2e (`rust-chromium` project, fake-opencode fixture).
 
@@ -48,8 +48,10 @@ Fix the defect confirmed by the investigation of GitHub issue danshapiro/freshel
 - Modify: `crates/freshell-sessions/src/opencode_locator.rs` (state struct `Inner` ~:122-125, `resolve_windows` ~:367-373, `disarm` ~:240-242, new accessor next to `armed_count` ~:174-176; tests in `mod tests` at end of same file)
 
 **Interfaces:**
-- Consumes: nothing new (pure in-memory latch inside the existing `Mutex<Inner>`).
-- Produces: `pub fn identity_resolvable_since(&self, terminal_id: &str) -> Option<i64>` — first ms an evaluated window saw ≥1 in-window cwd-confirmed candidate; `None` = nothing resolvable has ever existed for this terminal.
+- Consumes: nothing new (pure in-memory latch inside the existing `Mutex<Inner>`; the probe reuses `query_candidates` and the `resolve_windows` candidate filters).
+- Produces:
+  - `pub fn identity_resolvable_since(&self, terminal_id: &str) -> Option<i64>` — first ms an evaluated window saw ≥1 in-window cwd-confirmed candidate; `None` = nothing resolvable has ever existed for this terminal.
+  - `pub fn probe_resolvable(&self, terminal_id: &str, now_ms: i64, is_unavailable: &dyn Fn(&str) -> bool) -> Option<i64>` — for an ARMED terminal with no latched evidence that has ever submitted (`first_submit_ms.is_some()`): one bounded `list_sessions_since(arm_ms − pre_epsilon)` read, locator-side candidate filters (cwd match, `parent_id` null, 3-views unmarked, not in `known_ids`, `time_created >= arm_ms − pre_epsilon`; NO deadline), minus any id the predicate rejects (already-claimed or fresh-agent); non-empty result latches and returns `Some(now_ms)`. Returns latched evidence unchanged when already present; `None` when not armed / never submitted (no DB read) / probe empty.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -181,13 +183,118 @@ Append these tests to `mod tests` in `crates/freshell-sessions/src/opencode_loca
         assert_eq!(locator.identity_resolvable_since("t1"), Some(first_at));
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    // -- 18. probe_resolvable: closes the signal-lost / late-row hole the
+    // window-latch cannot see (plan review R1). Never probes a
+    // never-submitted pane; never reads the DB for unarmed/never-submitted
+    // terminals. --
+
+    #[test]
+    fn probe_never_reads_for_unarmed_or_never_submitted_terminals() {
+        let home = unique_temp_dir("probe-noread");
+        let db = open_seed_db(&home);
+        insert_session(&db, "ses_neighbor", "/proj", 150, None, None);
+        let locator = OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 100));
+
+        // arm() performs its own one-shot snapshot read; baseline AFTER it.
+        let scans = locator.db_scan_count();
+        // Never submitted => no probe, no DB read, no evidence (the #702
+        // idle-neighbor case: a pane whose user typed nothing has no session
+        // of its own, so nothing may be attributed to it).
+        assert_eq!(
+            locator.probe_resolvable("t-idle", 50_000, &|_| false),
+            None
+        );
+        assert_eq!(
+            locator.probe_resolvable("never-armed", 50_000, &|_| false),
+            None
+        );
+        assert_eq!(
+            locator.db_scan_count(),
+            scans,
+            "never-submitted/unarmed probes must perform zero DB reads"
+        );
+        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn probe_latches_evidence_for_a_submitted_pane_with_an_unclaimed_row() {
+        let home = unique_temp_dir("probe-latch");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 1_000));
+        assert!(locator.note_submit("t1", 1_100));
+        // Window closed EMPTY (row not yet visible), then the row lands LATE —
+        // after the 2s Enter-anchored deadline — with no further Enter (the
+        // plan-review R1 hole).
+        let closed_at = 1_100 + OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(closed_at).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        insert_session(&db, "ses_late", "/proj", closed_at + 500, None, None);
+
+        let probe_at = closed_at + 60_000;
+        assert_eq!(
+            locator.probe_resolvable("t1", probe_at, &|_| false),
+            Some(probe_at),
+            "late row + submitted pane + no bind = resolvable evidence"
+        );
+        assert_eq!(locator.identity_resolvable_since("t1"), Some(probe_at));
+        // Idempotent: a later probe keeps the FIRST probe time.
+        assert_eq!(
+            locator.probe_resolvable("t1", probe_at + 5_000, &|_| false),
+            Some(probe_at)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn probe_excludes_unavailable_sessions_claimed_or_freshagent() {
+        let home = unique_temp_dir("probe-excluded");
+        let db = open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        // Seeded AFTER arm so it is NOT in the arm-time known_ids snapshot —
+        // the ws predicate rejection is what the test isolates.
+        insert_session(&db, "ses_foreign", "/proj", 150, None, None);
+
+        // The ws predicate rejects every id (claimed by another terminal or a
+        // fresh-agent row): no evidence, no latch.
+        assert_eq!(locator.probe_resolvable("t1", 50_000, &|_| true), None);
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn probe_respects_locator_side_candidate_filters() {
+        let home = unique_temp_dir("probe-filters");
+        let db = open_seed_db(&home);
+        insert_session(&db, "ses_pre_arm", "/proj", 50, None, None); // snapshotted at arm
+        insert_session(&db, "ses_wrong_cwd", "/other", 60_000, None, None);
+        insert_session(&db, "ses_child", "/proj", 60_001, Some("ses_pre_arm"), None);
+        insert_session(&db, "ses_archived", "/proj", 60_002, None, Some(60_003));
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 100));
+        assert!(locator.note_submit("t1", 120));
+
+        // Every row above is excluded locator-side (known-at-arm snapshot,
+        // foreign cwd, subagent parent, archived), so the probe finds nothing.
+        assert_eq!(locator.probe_resolvable("t1", 60_004, &|_| false), None);
+        assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 ```
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `cargo test -p freshell-sessions opencode_locator::tests:: -- --nocapture`
 
-Expected: FAIL — compile error `no method named identity_resolvable_since` (NEW-API red; intended failure is the missing latch + accessor, not a setup accident). All pre-existing tests in the module still compile and are unaffected.
+Expected: FAIL — compile error `no method named identity_resolvable_since` / `no method named probe_resolvable` (NEW-API red; intended failure is the missing latch + accessor + probe, not a setup accident). All pre-existing tests in the module still compile and are unaffected.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -252,6 +359,84 @@ struct Inner {
     }
 ```
 
+(e) `first_submit_ms` latch: add `first_submit_ms: Option<i64>` to `Armed` (init `None` in `arm`); in `note_submit`, set it once before/around the existing `enter_ms` update:
+
+```rust
+        if armed.first_submit_ms.is_none() {
+            armed.first_submit_ms = Some(at_ms);
+        }
+```
+
+Field doc: the FIRST Enter ever observed for this pane — never cleared while armed; distinguishes "the pane provably has (or soon will have) a session of its own" from "idle pane typed nothing" for [`probe_resolvable`]. (It is NOT the correlation-window driver — `enter_ms` keeps that role, including mid-turn re-open suppression.)
+
+(f) `probe_resolvable` — the plan-review-R1 hole closure. A terminal the window-latch cannot see (row landed after the Enter deadline with no later Enter, or the window's read hit a transient DB error that `query_candidates` swallows to empty) still reaches resolvability detection here. Add near `classify_resume_target`:
+
+```rust
+    /// Probe-based resolvability for an ARMED terminal that has ever
+    /// submitted but holds no latched evidence: ONE bounded
+    /// `list_sessions_since(arm_ms − pre_epsilon)` read, the same candidate
+    /// filters `resolve_windows` applies (cwd match, no `parent_id` rows,
+    /// no 3-views-marked rows, not in the arm-time `known_ids`,
+    /// `time_created >= arm_ms − pre_epsilon`), with NO deadline — plus the
+    /// caller's `is_unavailable` predicate (ws-side: session already claimed
+    /// by any live-or-retired terminal, or carries a fresh-agent ledger row).
+    /// Any survivor means an unbound correlatable row provably exists:
+    /// latch + return `Some(now_ms)`. Returns the latched evidence unchanged
+    /// when already present; returns `None` with ZERO DB reads when the
+    /// terminal is not armed or has never submitted (the #702 idle
+    /// never-typed class has no session of its own — nothing is
+    /// attributable).
+    pub fn probe_resolvable(
+        &self,
+        terminal_id: &str,
+        now_ms: i64,
+        is_unavailable: &dyn Fn(&str) -> bool,
+    ) -> Option<i64> {
+        let (armed, latched) = {
+            let inner = self.lock();
+            (
+                inner.armed.get(terminal_id).cloned(),
+                inner.resolvable_evidence_ms.get(terminal_id).copied(),
+            )
+        };
+        if latched.is_some() {
+            return latched;
+        }
+        let armed = armed?;
+        if armed.first_submit_ms.is_none() {
+            return None; // never typed: no session of its own exists — no read
+        }
+        let lower_bound = armed.arm_ms - self.pre_epsilon_ms;
+        let any = self
+            .query_candidates(lower_bound) // OFF the lock: bounded read
+            .into_iter()
+            .any(|row| {
+                !armed.known_ids.contains(&row.session_id)
+                    && row
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|cwd| normalize_cwd(cwd) == armed.cwd_normalized)
+                    && row.created_at.is_some_and(|created| created >= lower_bound)
+                    && row.has_three_views_marker != Some(1)
+                    && !is_unavailable(&row.session_id)
+            });
+        if !any {
+            return None;
+        }
+        let mut inner = self.lock();
+        if !inner.armed.contains_key(terminal_id) {
+            return None; // disarmed mid-probe: the pane is gone — drop, never resurrect
+        }
+        inner
+            .resolvable_evidence_ms
+            .entry(terminal_id.to_string())
+            .or_insert(now_ms);
+        Some(now_ms)
+    }
+```
+
+Whether the filter's field accesses match `OpencodeSessionRow` one-for-one with `resolve_windows`' match-filter is settled by the Step 5 refactor: extract the shared per-row candidate predicate into a private helper (`fn row_is_candidate(row, lower_bound, deadline: Option<i64>, known_ids, cwd_normalized) -> bool`) used by both `resolve_windows` and `probe_resolvable`; the probe passes `deadline: None`. If extraction proves fussy under the borrow rules, `probe_resolvable` may keep its own copy with a comment noting the deliberate duplication (repo norm: duplication over premature sharing) — the paired tests pin identical behavior either way.
+
 - [ ] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-sessions opencode_locator::tests:: -- --nocapture`
@@ -285,14 +470,14 @@ git commit -m "feat(freshell-sessions): opencode locator candidate-evidence latc
 - Modify: `crates/freshell-ws/src/invariants.rs` (doc header, `IDENTITY_RESOLUTION_GRACE_MS` comment, `spawn_identity_invariant_sweep` :48-63, `warn_unresolved_terminal_identities` :65-102, tests :217-387)
 
 **Interfaces:**
-- Consumes: `freshell_sessions::opencode_locator::OpencodeLocator::identity_resolvable_since` (Task 1); `WsState.opencode_locator` (already a field; the sweep's `spawn_identity_invariant_sweep(state, interval)` call site in `crates/freshell-server/src/main.rs:1383` needs NO change).
-- Produces: same WARN on `freshell_ws::invariants` target with the same leading token; for opencode rows it now fires only when evidence is stale (or, locator absent, on create-age as today).
+- Consumes: `freshell_sessions::opencode_locator::OpencodeLocator::{identity_resolvable_since, probe_resolvable}` (Task 1); `WsState.opencode_locator` and `WsState.pane_ledger` (already fields; the sweep's `spawn_identity_invariant_sweep(state, interval)` call site in `crates/freshell-server/src/main.rs:1383` needs NO change); `crate::identity::TerminalIdentityRegistry::find_by_session_including_retired` (already used by `opencode_association.rs`); `crate::pane_ledger::PaneLedger::lookup_by_session`.
+- Produces: same WARN on `freshell_ws::invariants` target with the same leading token; for opencode rows it now fires only when evidence is stale (window-latched OR probe-latched; or, locator absent, on create-age as today).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
 In `crates/freshell-ws/src/invariants.rs` `mod tests`:
 
-(a) Update the five existing direct calls of `warn_unresolved_terminal_identities` (test lines :274, :276, :303, :323, :383) with a trailing `None` locator argument (their amplifier/shell rows are unaffected by the gate).
+(a) Update the five existing direct calls of `warn_unresolved_terminal_identities` (test lines :274, :276, :303, :323, :383) to the new 7-argument signature: trailing `None` locator argument and a shared `&crate::pane_ledger::PaneLedger::disabled()` ledger reference (their amplifier/shell rows are unaffected by the gate). Add one small helper-local binding `let ledger = crate::pane_ledger::PaneLedger::disabled();` per test that needs it.
 
 (b) Add a small duplicated seed helper in this module (the repo duplicates rather than shares test scaffolds — see the identical helpers in `opencode_association.rs` tests):
 
@@ -348,7 +533,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
     }
 ```
 
-(c) The new tests:
+(c) The new tests (each constructs its own disabled `PaneLedger` unless stated):
 
 ```rust
     #[test]
@@ -366,6 +551,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 10_000));
         let _ = locator.tick(10_000 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 500);
         let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-idle",
@@ -381,6 +567,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
             &mut warned,
             10_000 + 61_000, // +61s: the incident's first-prompt delay
             Some(&locator),
+            &ledger,
         );
 
         assert!(
@@ -409,6 +596,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row("t-ev", "opencode", TerminalRunStatus::Running, 0, None)];
 
@@ -418,6 +606,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
             &mut warned,
             evidence_at + IDENTITY_RESOLUTION_GRACE_MS + 1,
             Some(&locator),
+            &ledger,
         );
 
         let warnings = unresolved_warnings(&events.lock().unwrap());
@@ -446,6 +635,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row("t-ev", "opencode", TerminalRunStatus::Running, 0, None)];
 
@@ -455,6 +645,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
             &mut warned,
             evidence_at + IDENTITY_RESOLUTION_GRACE_MS, // boundary: not yet overdue
             Some(&locator),
+            &ledger,
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -480,6 +671,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
 
         let identity = TerminalIdentityRegistry::new();
         identity.upsert("t-bound", Some("opencode"), Some("ses_a"), Some("/proj"), 1);
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row("t-bound", "opencode", TerminalRunStatus::Running, 0, None)];
 
@@ -489,6 +681,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
             &mut warned,
             i64::MAX,
             Some(&locator),
+            &ledger,
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -502,10 +695,11 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         // topology itself is broken and must stay loud.
         let (events, _guard) = capture::capture();
         let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row("t-noloc", "opencode", TerminalRunStatus::Running, 0, None)];
 
-        super::warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX, None);
+        super::warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX, None, &ledger);
 
         let warnings = unresolved_warnings(&events.lock().unwrap());
         assert_eq!(warnings.len(), 1);
@@ -518,6 +712,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         let home = unique_opencode_home("resume-skip");
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
         let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-resume",
@@ -527,12 +722,167 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
             Some("ses_existing"),
         )];
 
-        super::warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX, Some(&locator));
+        super::warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX, Some(&locator), &ledger);
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn opencode_probe_closes_the_late_row_and_db_error_hole() {
+        // Plan-review R1 hole: the pane DID submit; its Enter-anchored window
+        // closed empty; the row then landed LATE (or the window's read hit a
+        // transient DB error that query_candidates swallows to empty) and the
+        // TUI signal was lost (the rebind plugin marks `lastEmitted` BEFORE
+        // its possibly-throwing write, so a lost signal never retries). The
+        // probe must find the row per se: first pass past the create-age
+        // grace LATCHES evidence (too fresh to warn); once the evidence ages
+        // past the grace the alarm fires.
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("late-row-hole");
+        let db = seed_opencode_db(&home);
+        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-late", "opencode", true, None, Some("/proj"), 10_000));
+        assert!(locator.note_submit("t-late", 10_100));
+        let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(window_closed).is_empty(), "window saw nothing");
+        insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
+
+        let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
+        let mut warned = HashSet::new();
+        let rows = vec![row("t-late", "opencode", TerminalRunStatus::Running, 10_000, None)];
+
+        let probe_at = 10_000 + 61_000;
+        super::warn_unresolved_terminal_identities(
+            &rows, &identity, &mut warned, probe_at, Some(&locator), &ledger,
+        );
+        assert!(
+            unresolved_warnings(&events.lock().unwrap()).is_empty(),
+            "evidence JUST latched: inside the grace, no warn yet"
+        );
+        assert_eq!(locator.identity_resolvable_since("t-late"), Some(probe_at));
+
+        super::warn_unresolved_terminal_identities(
+            &rows,
+            &identity,
+            &mut warned,
+            probe_at + IDENTITY_RESOLUTION_GRACE_MS + 1,
+            Some(&locator),
+            &ledger,
+        );
+        let warnings = unresolved_warnings(&events.lock().unwrap());
+        assert_eq!(warnings.len(), 1, "resolvable-but-unbound must warn (R1 hole)");
+        assert_eq!(
+            warnings[0].fields.get("terminal_id").map(String::as_str),
+            Some("t-late")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_idle_pane_stays_silent_with_a_foreign_row_in_cwd() {
+        // Never-submitted pane; somebody ELSE's unclaimed row exists in the
+        // same cwd. The probe's never-submitted short-circuit runs BEFORE
+        // any read: an idle pane has no session of its own, so nothing may
+        // be attributed to it -- no evidence, no alarm, no DB read.
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("idle-foreign-row");
+        let db = seed_opencode_db(&home);
+        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 0));
+        insert_opencode_session(&db, "ses_foreign", "/proj", 5_000);
+
+        let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
+        let mut warned = HashSet::new();
+        let rows = vec![row("t-idle", "opencode", TerminalRunStatus::Running, 0, None)];
+
+        super::warn_unresolved_terminal_identities(
+            &rows, &identity, &mut warned, i64::MAX, Some(&locator), &ledger,
+        );
+
+        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_probe_never_latches_a_session_claimed_by_another_terminal() {
+        // Two panes share a cwd; the row already belongs to the sibling.
+        // The ws-side claim exclusion (identity registry, retired-inclusive)
+        // must keep the probe from inventing evidence for this pane.
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("claimed-row");
+        let db = seed_opencode_db(&home);
+        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t-pending", 100));
+        insert_opencode_session(&db, "ses_sibling", "/proj", 150);
+
+        let identity = TerminalIdentityRegistry::new();
+        identity.upsert("t-sibling", Some("opencode"), Some("ses_sibling"), Some("/proj"), 1);
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
+        let mut warned = HashSet::new();
+        let rows = vec![row("t-pending", "opencode", TerminalRunStatus::Running, 0, None)];
+
+        super::warn_unresolved_terminal_identities(
+            &rows, &identity, &mut warned, i64::MAX, Some(&locator), &ledger,
+        );
+
+        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-pending"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_probe_never_latches_a_freshagent_session() {
+        // fresh-agent `opencode serve` rows land in the same opencode.db;
+        // the kind:fresh-agent ledger row excludes them (mirrors the
+        // association guards' `freshagent_ledger_row` refusal).
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("freshagent-row");
+        let ledger_home = unique_opencode_home("freshagent-ledger");
+        let db = seed_opencode_db(&home);
+        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t-pending", 100));
+        insert_opencode_session(&db, "ses_freshagent", "/proj", 150);
+
+        std::fs::create_dir_all(&ledger_home).unwrap();
+        let ledger = crate::pane_ledger::PaneLedger::new(Some(ledger_home.clone()));
+        ledger
+            .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
+                provider: "opencode",
+                session_id: "ses_freshagent",
+                mode: "freshopencode",
+                cwd: Some("/proj"),
+                create_request_id: None,
+                model: None,
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                supersedes: None,
+                now_ms: 1,
+            })
+            .expect("seed fresh-agent ledger row");
+
+        let identity = TerminalIdentityRegistry::new();
+        let mut warned = HashSet::new();
+        let rows = vec![row("t-pending", "opencode", TerminalRunStatus::Running, 0, None)];
+
+        super::warn_unresolved_terminal_identities(
+            &rows, &identity, &mut warned, i64::MAX, Some(&locator), &ledger,
+        );
+
+        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-pending"), None);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_home);
+    }
 ```
+
+If `PaneLedger::disabled()` or `FreshAgentBindingWrite`'s exact field set has drifted from what these snippets assume, adapt the snippet to the real signatures in `crates/freshell-ws/src/pane_ledger.rs` — the ASSERTIONS (no latch / no warn) are the contract, the fixture plumbing is filler.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -556,29 +906,59 @@ In `crates/freshell-ws/src/invariants.rs`:
 /// prompt, so before that moment nothing is resolvable and any create-age
 /// alarm is pure noise (danshapiro/freshell#702 — 12/12 real panes fired the
 /// old gate). For opencode rows the grace therefore runs from the locator's
-/// first CANDIDATE EVIDENCE (`identity_resolvable_since`): the moment an
-/// in-window cwd-confirmed row provably existed yet never bound. When the
-/// locator is unavailable at boot, opencode keeps the create-age tripwire so
-/// a broken topology still alarms.
+/// first CANDIDATE EVIDENCE (`identity_resolvable_since`), whether it came
+/// from an evaluated correlation window or from the alarm-time
+/// `probe_resolvable` read for ever-submitted panes (the late-row /
+/// swallowed-DB-error hole): the moment an in-cwd correlatable row provably
+/// existed yet never bound. When the locator is unavailable at boot,
+/// opencode keeps the create-age tripwire so a broken topology still alarms.
 /// (Previously derived from the deleted amplifier locator's
 /// AMPLIFIER_DIR_APPEAR_WINDOW_MS; the alarm also previously rode the
 /// amplifier locator sweep's 150ms ticker and silently never ran when no
 /// provider home existed — it now owns its sweep unconditionally.)
 ```
 
-(b) In `spawn_identity_invariant_sweep`, pass the locator through:
+(b) In `spawn_identity_invariant_sweep`, the pass can now issue ONE bounded SQLite read per rare submitted-but-unbound opencode row (the Task-1 probe). Move the pass into `tokio::task::spawn_blocking` (the `drain_and_associate` precedent at `opencode_association.rs:91`) and add the new forwards. On a `JoinError` (a pass panicked — a bug, not a routine condition), log a named event and continue with a FRESH warned set (bounded re-warn noise beats silently losing the sweep; mirrors the locator tick panic handling):
 
 ```rust
-            warn_unresolved_terminal_identities(
-                &state.registry.identity_probe_rows(),
-                &state.identity,
-                &mut identity_warned,
-                crate::terminal::now_ms(),
-                state.opencode_locator.as_deref(),
-            );
+pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time::Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // Once-per-terminal bound, sweep-task-lifetime scoped.
+        let mut identity_warned = std::collections::HashSet::new();
+        loop {
+            ticker.tick().await;
+            let state = state.clone(); // WsState: Clone; Arc-backed fields
+            let mut warned = std::mem::take(&mut identity_warned);
+            identity_warned = match tokio::task::spawn_blocking(move || {
+                warn_unresolved_terminal_identities(
+                    &state.registry.identity_probe_rows(),
+                    &state.identity,
+                    &mut warned,
+                    crate::terminal::now_ms(),
+                    state.opencode_locator.as_deref(),
+                    &state.pane_ledger,
+                );
+                warned
+            })
+            .await
+            {
+                Ok(warned) => warned,
+                Err(join_error) => {
+                    tracing::warn!(
+                        error = %join_error,
+                        "identity_invariant_sweep_pass_panicked: skip this cycle; warned-set reset \
+                         (terminals may re-warn once)"
+                    );
+                    std::collections::HashSet::new()
+                }
+            };
+        }
+    });
+}
 ```
 
-(c) Re-shape `warn_unresolved_terminal_identities` (:65-102): new sixth parameter `opencode_locator: Option<&freshell_sessions::opencode_locator::OpencodeLocator>`; move the identity check ahead of the overdue computation; per-mode overdue definition. The warn body, fields, and message are untouched except that `age_ms` is computed at warn time from `row.created_at`:
+(c) Re-shape `warn_unresolved_terminal_identities` (:65-102): two new trailing parameters — `opencode_locator: Option<&freshell_sessions::opencode_locator::OpencodeLocator>` and `pane_ledger: &crate::pane_ledger::PaneLedger`; move the identity check ahead of the overdue computation; per-mode overdue definition. The opencode arm consults the latch first and falls back to the Task-1 probe (latch-miss only), with the ws-side claim/fresh-agent predicate. The warn body, fields, and message are untouched except that `age_ms` is computed at warn time from `row.created_at`:
 
 ```rust
 /// One sweep pass: WARN (once per terminal, tracked in `warned`) for every
@@ -586,14 +966,19 @@ In `crates/freshell-ws/src/invariants.rs`:
 /// window with no resolvable identity in either identity home. Exited
 /// terminals are skipped (their identity story is over); shell terminals
 /// never carry session identity by design. opencode rows are gated on
-/// locator candidate evidence (see the grace-constant doc): a pane with no
-/// evidence has nothing resolvable and is never alarmed (issue #702).
+/// locator RESOLVABILITY evidence (see the grace-constant doc): window-latch
+/// first, probe fallback for the late-row/DB-error hole (plan-review R1);
+/// a pane with neither has nothing resolvable and is never alarmed
+/// (issue #702). The probe's `is_unavailable` predicate keeps sessions
+/// already claimed by any live-or-retired terminal and fresh-agent ledger
+/// rows from ever counting as evidence.
 pub(crate) fn warn_unresolved_terminal_identities(
     rows: &[IdentityProbeRow],
     identity: &TerminalIdentityRegistry,
     warned: &mut HashSet<String>,
     now_ms: i64,
     opencode_locator: Option<&freshell_sessions::opencode_locator::OpencodeLocator>,
+    pane_ledger: &crate::pane_ledger::PaneLedger,
 ) {
     for row in rows {
         if row.mode == "shell"
@@ -608,10 +993,26 @@ pub(crate) fn warn_unresolved_terminal_identities(
         }
         let overdue_ms = match row.mode.as_str() {
             "opencode" => match opencode_locator {
-                Some(locator) => match locator.identity_resolvable_since(&row.terminal_id) {
-                    Some(since_ms) => now_ms - since_ms,
-                    None => continue, // nothing resolvable has ever existed for this pane
-                },
+                Some(locator) => {
+                    let since = locator
+                        .identity_resolvable_since(&row.terminal_id)
+                        .or_else(|| {
+                            locator.probe_resolvable(&row.terminal_id, now_ms, &|session_id| {
+                                identity
+                                    .find_by_session_including_retired("opencode", session_id)
+                                    .is_some()
+                                    || pane_ledger
+                                        .lookup_by_session("opencode", session_id)
+                                        .is_some_and(|r| {
+                                            r.row.pane_kind.as_deref() == Some("fresh-agent")
+                                        })
+                            })
+                        });
+                    match since {
+                        Some(since_ms) => now_ms - since_ms,
+                        None => continue, // nothing resolvable exists for this pane
+                    }
+                }
                 None => now_ms - row.created_at,
             },
             _ => now_ms - row.created_at,
@@ -633,17 +1034,17 @@ pub(crate) fn warn_unresolved_terminal_identities(
 }
 ```
 
-(d) Update the module doc header (:1-24): extend the "Resolvable identity" bullet list with one sentence noting that for `mode == "opencode"` the alarm additionally requires stale locator candidate evidence (issue #702), since fresh opencode panes provably have no session row before the first prompt.
+(d) Update the module doc header (:1-24): extend the "Resolvable identity" section to reflect the opencode re-gate — for `mode == "opencode"` the alarm additionally requires stale locator resolvability evidence (window latch or the ever-submitted probe; issue #702), since fresh opencode panes provably have no session row before the first prompt.
 
 - [ ] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-ws invariants:: -- --nocapture`
 
-Expected: PASS — the six new opencode tests plus all updated pre-existing tests.
+Expected: PASS — the ten new opencode tests plus all updated pre-existing tests.
 
 - [ ] **Step 5: Refactor while green**
 
-No structural refactor expected. Confirm the four existing non-opencode tests read identically in intent with their new trailing `None`, and the module doc / constant doc / fn doc tell one consistent story. Re-run `cargo test -p freshell-ws invariants::`.
+No structural refactor expected. Confirm the existing non-opencode tests read identically in intent with their new trailing args, and the module doc / constant doc / fn doc tell one consistent story. Re-run `cargo test -p freshell-ws invariants::`.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -665,7 +1066,7 @@ git commit -m "fix(freshell-ws): gate terminal_identity_unresolved on opencode c
 ### Task 3: E2E regression pin on the never-submitted pane
 
 **Files:**
-- Modify: `test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts` (add `readServerLogs` helper ~:60 area; timestamp anchor after the post-restart ready-poll ~:295-298; pin block at the end of the never-submitted assertions ~:365-370)
+- Modify: `test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts` (add `readServerLogs` helper ~:60 area; pin block at the end of the never-submitted assertions ~:365-370)
 
 **Interfaces:**
 - Consumes: `info.logsDir` from `server.start()` (same field `compound-restart-rust.spec.ts:318,417` reads); `restoredNeverSubmittedTerminalId` already in scope at :362-364; Task 2's server-side behavior.
