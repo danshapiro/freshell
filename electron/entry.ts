@@ -73,9 +73,18 @@ const bootShape = resolveBootShape(
 )
 if (bootShape.userDataDir) {
   // Electron's doc contract for app.setPath: the target directory must
-  // exist. Create-first is the documented-correct order.
-  fs.mkdirSync(bootShape.userDataDir, { recursive: true })
-  app.setPath('userData', bootShape.userDataDir)
+  // exist. Create-first is the documented-correct order. On EACCES/EROFS, fall
+  // back to Electron's default userData rather than dying with no window and
+  // no log line (the logger isn't live this early — console is all we have).
+  try {
+    fs.mkdirSync(bootShape.userDataDir, { recursive: true })
+    app.setPath('userData', bootShape.userDataDir)
+  } catch (err) {
+    console.error(
+      `[freshell] could not create profile userData dir ${bootShape.userDataDir}; falling back to the default userData.`,
+      err instanceof Error ? err.message : String(err),
+    )
+  }
 }
 const activeProfileId = bootShape.profileId
 const isPickerLauncher = bootShape.kind === 'picker'
@@ -384,8 +393,8 @@ async function main(): Promise<void> {
   }
 
   // Canonical duplicate-launch surfacing, registered ONCE, as early as
-  // possible: covers the wizard, chooser, and (until initMainProcess's own
-  // handler supersedes it for the main window) every intermediate phase.
+  // possible: covers the wizard, chooser, main window, and picker (initMain
+  // registers no second-instance handler — this one owns it end to end).
   if (!app.listenerCount('second-instance')) {
     app.on('second-instance', () => {
       const win = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed())
@@ -496,9 +505,11 @@ async function main(): Promise<void> {
       // Only DIRECTORIES whose suffix is a valid profile id count (a backup
       // tarball or the port's oracle seeds must not flip ownership).
       listHomeDirsWithState: () => {
+        // Match the `.freshell-` prefix BEFORE stat-ing anything: a large or
+        // partially network-mounted home should not make boot pay per-entry cwd sync.
         let names: string[] = []
         try {
-          names = fs.readdirSync(os.homedir())
+          names = fs.readdirSync(os.homedir()).filter((name) => name.startsWith('.freshell-'))
         } catch (err) {
           // A broken home read must not crash the boot before a window exists.
           mainProcessLogger.log({ severity: 'warn', event: 'profile_state_scan_failed', error: err instanceof Error ? err.message : String(err) })

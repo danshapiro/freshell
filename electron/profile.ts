@@ -299,10 +299,12 @@ export function buildPickerEntries(registry: RegistryReadResult): PickerEntry[] 
  * "simply starts with a fresh configuration" in `~/.freshell-work`).
  *
  * A `~/.freshell-<id>` directory proves a profile ran here; the picker
- * launcher's own userData dir lives under appData, NOT homedir. Match ONLY
- * directories whose suffix is a valid profile id — anything else in home
- * resembling `.freshell-*` (backups, thirds' dumps, tarballs, the port's
- * oracle seed dirs) must not flip the Default boot into a server-owner.
+ * launcher's own userData dir lives under appData, NOT homedir. Only
+ * directories whose suffix is a valid profile id count. CAUTION: this cannot
+ * distinguish a real profile from a hand-made backup named like one
+ * (`~/.freshell-backup` matches): that direction is deliberately fail-safe
+ * (isolation-for-Default), and fixing the honest naming/docs matters more
+ * than being clever here.
  */
 export function hasNamedProfileState(
   listHomeDirs: () => string[],

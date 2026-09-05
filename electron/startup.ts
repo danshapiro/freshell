@@ -1,6 +1,7 @@
 import path from 'path'
 import os from 'os'
 import { configDirForProfile, DEFAULT_PROFILE_ID } from './profile.js'
+import { readDesktopConfig } from './desktop-config.js'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
 import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
@@ -344,9 +345,12 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   const discoverCandidates = ctx.discoverLaunchCandidates ?? (() => defaultDiscoverLaunchCandidates(ctx))
   // A named profile's app-bound/daemon boot owns its server; discovery is
   // skipped entirely so a neighbor profile's server is never surfaced.
+  // Owning boots skip the discovery probe UNLESS the user opted into
+  // always-ask: an always-ask boot shows the chooser with the real candidate
+  // list (never auto-connects — chooseLaunchAction checks ownsServer first).
   const skipDiscovery =
     (ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)) &&
-    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
+    !desktopConfig.alwaysAskOnLaunch
   const candidates = skipDiscovery ? [] : await discoverCandidates()
   const savedRemoteReachable = desktopConfig.serverMode === 'remote' && !!desktopConfig.remoteUrl
     ? await checkRemoteReachable(ctx, desktopConfig.remoteUrl)
@@ -390,7 +394,11 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
       if (!status.running) {
         await ctx.daemonManager.start()
       }
-      serverUrl = `http://localhost:${port}`
+      // The daemon is machine-global: it serves from the DEFAULT profile's
+      // port, not this profile's (which may have been auto-bumped/persisted).
+      const defaultDesktopConfig = (await readDesktopConfig(configDirForProfile(DEFAULT_PROFILE_ID, os.homedir())))
+      const daemonPort = defaultDesktopConfig?.port ?? port
+      serverUrl = `http://localhost:${daemonPort}`
       break
     }
     case 'app-bound': {

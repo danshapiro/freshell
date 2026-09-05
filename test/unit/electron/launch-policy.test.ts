@@ -87,9 +87,19 @@ describe('server ownership', () => {
     expect(result.type).toBe('show-chooser')
     if (result.type === 'show-chooser') {
       expect(result.reason).toBe('always-ask')
-      // runStartup has skipDiscovery'd the candidate list — an owning boot
-      // never surfaces its neighbor in the chooser either.
-      expect(result.candidates).toEqual([candidate('http://localhost:3001', 'tok')])
+    }
+  })
+
+  it('an owning remote-mode boot with no saved URL NEVER auto-connects a discovered candidate', () => {
+    const result = chooseLaunchAction({
+      desktopConfig: config({ serverMode: 'remote' }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })
+    expect(result.type).toBe('show-chooser')
+    if (result.type === 'show-chooser') {
+      expect(result.reason).toBe('manual-choice')
     }
   })
 })

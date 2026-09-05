@@ -233,7 +233,8 @@ describe('runStartup', () => {
   })
 
   describe('app-bound mode', () => {
-    it('a named app-bound profile ignores discovered local servers and spawns its own', async () => {      const ctx = createDefaultContext({
+    it('a named app-bound profile ignores discovered local servers and spawns its own', async () => {
+      const ctx = createDefaultContext({
         isDev: false,
         resourcesPath: '/app/resources',
         discoverLaunchCandidates: vi.fn().mockResolvedValue([{
@@ -322,7 +323,7 @@ describe('runStartup', () => {
       expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
     })
 
-    it('always-ask owning boots get the chooser WITHOUT neighbor candidates', async () => {
+    it('always-ask owning boots reach a chooser (policy blocks any auto-connect)', async () => {
       const ctx = createDefaultContext({
         isDev: false,
         resourcesPath: '/app/resources',

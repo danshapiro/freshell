@@ -37,17 +37,6 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'show-setup' }
   }
 
-  // A server-owning boot NEVER attaches to a discovery-surfaced instance
-  // (which could belong to a neighbor profile with a different config dir and
-  // identity) via auto-connect; it starts its own server (the app-bound path
-  // in runStartup) or the machine daemon (machine-global by design, see
-  // README). NOTE: this runs AFTER alwaysAskOnLaunch on purpose — the chooser
-  // also renders "Remote server" and "New local server" sections
-  // unconditionally (chooser.tsx), is the ONLY place a user can toggle
-  // alwaysAskOnLaunch, and hosts the manual remote entry — suppressing it
-  // would strand the user. The chooser is identity-safe for owning boots
-  // because runStartup passes an empty candidate list (skipDiscovery), so no
-  // neighbor server ever appears in it.
   if (desktopConfig.alwaysAskOnLaunch) {
     return { type: 'show-chooser', candidates, reason: 'always-ask' }
   }
@@ -78,14 +67,17 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'show-chooser', candidates, reason: 'saved-remote-unreachable' }
   }
 
-  // Owning-boot override (see comment above alwaysAskOnLaunch). Sits after
-  // remote-mode handling on purpose: a saved remote URL is a per-profile
-  // intent that stays valid even against an empty candidate list.
-  if (
-    options.ownsServer &&
-    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
-  ) {
-    return { type: 'start-local' }
+  // Owning-boot override. Runs AFTER remote-mode handling on purpose: a saved
+  // remote URL is a per-profile intent that stays valid even against an empty
+  // candidate list. For every other owning boot: app-bound/daemon start their
+  // own server; remote-without-a-URL goes to the manual chooser — NEVER to a
+  // discovery-derived auto-connect, which would attach a neighbor profile's
+  // server with a token resolved from the wrong config dir.
+  if (options.ownsServer) {
+    if (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon') {
+      return { type: 'start-local' }
+    }
+    return { type: 'show-chooser', candidates, reason: 'manual-choice' }
   }
 
   if (candidates.length > 1) {
