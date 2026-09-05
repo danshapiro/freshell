@@ -18,7 +18,9 @@ async function requireMessageCapture(page: Page) {
   })
 }
 async function noReattach(harness: TestHarness, terminalId: string, requestId: string) {
-  const messages=await harness.getSentWsMessages() as Array<{type?: string;terminalId?: string;requestId?: string}>
+  const messages=await harness.getSentWsMessages() as Array<{type?: string
+  terminalId?: string
+  requestId?: string}>
   expect(messages.filter(message =>
     (['terminal.attach','terminal.detach','terminal.kill'].includes(message.type??'') && message.terminalId===terminalId)
     || (message.type==='terminal.create' && message.requestId===requestId),
@@ -32,21 +34,27 @@ async function splitPicker(page: Page, current: Locator) {
 async function chooseShell(page: Page) {
   const picker=page.locator('[data-context="pane-picker"]').last()
   const button=picker.getByRole('button',{name:/^(Shell|WSL|CMD|PowerShell|Bash)$/i}).first()
-  await expect(button).toBeVisible();await button.click()
+  await expect(button).toBeVisible()
+  await button.click()
 }
 
 test.describe('Stable terminal surfaces',()=>{
   test('split and sibling close preserve the original xterm DOM, output, and attachment',async({freshellPage,page,harness,terminal})=>{
     void freshellPage
-    await terminal.waitForTerminal();await terminal.waitForPrompt();await requireMessageCapture(page)
-    const tabId=await harness.getActiveTabId();expect(tabId).toBeTruthy()
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+    await requireMessageCapture(page)
+    const tabId=await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
     const layout=await harness.getPaneLayout(tabId!)
     expect(layout.type).toBe('leaf')
     const paneId=layout.id as string, terminalId=layout.content.terminalId as string, requestId=layout.content.createRequestId as string
     expect(terminalId).toBeTruthy()
     const selector=`[data-pane-shell="true"][data-pane-id="${paneId}"] .xterm`
-    const original=await page.locator(selector).elementHandle();expect(original).not.toBeNull()
-    await terminal.executeCommand('echo stable-surface-marker');await harness.waitForTerminalText('stable-surface-marker',{terminalId})
+    const original=await page.locator(selector).elementHandle()
+    expect(original).not.toBeNull()
+    await terminal.executeCommand('echo stable-surface-marker')
+    await harness.waitForTerminalText('stable-surface-marker',{terminalId})
     await harness.clearSentWsMessages()
     await splitPicker(page,pane(page,paneId))
     await sameSurface(original!,selector)
@@ -60,9 +68,13 @@ test.describe('Stable terminal surfaces',()=>{
 
   test('zoom and unzoom preserve both real xterms while excluding hidden input and dividers',async({freshellPage,page,harness,terminal})=>{
     void freshellPage
-    await terminal.waitForTerminal();await terminal.waitForPrompt();await requireMessageCapture(page)
-    const tabId=await harness.getActiveTabId();const initial=await harness.getPaneLayout(tabId!)
-    await splitPicker(page,pane(page,initial.id));await chooseShell(page)
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+    await requireMessageCapture(page)
+    const tabId=await harness.getActiveTabId()
+    const initial=await harness.getPaneLayout(tabId!)
+    await splitPicker(page,pane(page,initial.id))
+    await chooseShell(page)
     await expect(page.locator('.xterm:visible')).toHaveCount(2)
     const layout=await harness.getPaneLayout(tabId!)
     const first=layout.children[0], second=layout.children[1]
@@ -75,7 +87,8 @@ test.describe('Stable terminal surfaces',()=>{
     const secondSelector=`[data-pane-shell="true"][data-pane-id="${second.id}"] .xterm`
     const firstElement=await page.locator(firstSelector).elementHandle()
     const secondElement=await page.locator(secondSelector).elementHandle()
-    expect(firstElement).not.toBeNull();expect(secondElement).not.toBeNull()
+    expect(firstElement).not.toBeNull()
+    expect(secondElement).not.toBeNull()
     // Positive traffic proves the second pane is anchored before clearing
     // capture; merely registering an empty xterm buffer is not attach readiness.
     await page.locator(secondSelector).click()
@@ -88,12 +101,15 @@ test.describe('Stable terminal surfaces',()=>{
       await expect(page.locator('.xterm:visible')).toHaveCount(1)
       await expect(page.locator('[data-context="pane-divider"]:visible')).toHaveCount(0)
       expect(await pane(page,second.id).evaluate(node=>(node.closest('[data-stable-pane-id]') as HTMLElement)?.inert)).toBe(true)
-      await sameSurface(firstElement!,firstSelector);await sameSurface(secondElement!,secondSelector)
+      await sameSurface(firstElement!,firstSelector)
+      await sameSurface(secondElement!,secondSelector)
       await pane(page,first.id).getByRole('button',{name:'Restore pane',exact:true}).click()
       await expect(page.locator('.xterm:visible')).toHaveCount(2)
     }
     await noReattach(harness,first.content.terminalId,first.content.createRequestId)
     await noReattach(harness,secondId,second.content.createRequestId)
-    await sameSurface(firstElement!,firstSelector);await sameSurface(secondElement!,secondSelector)
+    await sameSurface(firstElement!,firstSelector)
+    await sameSurface(secondElement!,secondSelector)
   })
 })
+

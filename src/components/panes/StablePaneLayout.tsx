@@ -81,6 +81,15 @@ const readRect = (element: HTMLElement): SurfaceRect => {
  * zoom. The empty split tree retains the existing flex/divider geometry; the
  * measured leaf rectangles position the real pane shells in a sibling layer.
  * No portals, DOM reparenting, terminal serialization, or global cache.
+ *
+ * The `hidden` prop fans out to three distinct consumers under one flag:
+ * inactive-tab hiding (PaneLayout's own `hidden`), zoom-hidden siblings, and
+ * surfaces whose measurement is temporarily unavailable. TerminalView's
+ * hidden path routes to the background-hydration queue, which assumes
+ * tab-level semantics; a zoom-hidden pane in the ACTIVE tab may therefore be
+ * deprioritized by that queue. This is no worse than the previous behavior
+ * (zoom used to unmount the pane entirely), but the overload is explicit so
+ * later hydration work can split the two meanings.
  */
 export default function StablePaneLayout({ tabId, layout, zoomedPaneId, hidden = false }: Props) {
   const rootRef = useRef<HTMLDivElement>(null)
@@ -96,10 +105,30 @@ export default function StablePaneLayout({ tabId, layout, zoomedPaneId, hidden =
 
   const getSplitElement = useCallback((id: string) => slotsRef.current.get(`split:${id}`) ?? null, [])
 
+  // The measurement effect must NOT rerun on content-only leaf updates (new
+  // layout object, same pane/divider/sizes structure): tearing down and
+  // recreating the ResizeObserver for every output-driven content assignment
+  // would force synchronous layout reads during provider churn. The effect
+  // keys on the structural signature and reads the freshest items via ref.
+  const structure = useMemo(
+    () =>
+      items
+        .map((n) =>
+          n.type === 'leaf'
+            ? `pane:${n.id}`
+            : `divider:${n.id}:${n.direction}:${n.sizes[0]}:${n.sizes[1]}`,
+        )
+        .join('|'),
+    [items],
+  )
+  const itemsRef = useRef(items)
+  itemsRef.current = items
+
   useLayoutEffect(() => {
     const root = rootRef.current
     if (!root) return
     let disposed = false
+    const items = itemsRef.current
     const measure = () => {
       if (disposed) return
       // Read all geometry before setState can cause any writes. No per-token
@@ -134,7 +163,8 @@ export default function StablePaneLayout({ tabId, layout, zoomedPaneId, hidden =
       disposed = true
       observer.disconnect()
     }
-  }, [items, zoom])
+    // Structure (not content) or zoom changes re-arm the measurement pass.
+  }, [structure, zoom])
 
   return (
     <div ref={rootRef} data-stable-pane-layout className="relative h-full w-full min-w-0 min-h-0">

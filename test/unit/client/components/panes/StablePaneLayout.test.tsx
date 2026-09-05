@@ -17,7 +17,6 @@ vi.mock('@/store/hooks', () => ({
   useAppSelector: (select: (state: unknown) => unknown) => select({ settings: { settings: { panes: { snapThreshold: 0 } } } }),
 }))
 vi.mock('@/store/panesSlice', () => ({ resizePanes: (payload: unknown) => ({ type: 'panes/resizePanes', payload }) }))
-vi.mock('@/lib/utils', () => ({ cn: (...parts: unknown[]) => parts.filter(Boolean).join(' ') }))
 vi.mock('@/components/panes/PaneContainer', async () => {
   const { useEffect } = await import('react')
   return { default: ({ node, hidden }: { node: Extract<PaneNode, { type: 'leaf' }>; hidden?: boolean }) => {
@@ -178,5 +177,61 @@ describe('stable pane ownership', () => {
     render(<StablePaneLayout tabId="tab" layout={leaf('a')} />)
     for(let i=0;i<50;i++) notifyResize()
     expect(observed.mounts.get('a')).toBe(1);expect(observed.disposals.size).toBe(0)
+  })
+
+
+describe('stable divider resizing', () => {
+  it('a real mouse drag on the stable divider resizes through the shared hook', () => {
+    const layout = split('s', leaf('a'), leaf('b'))
+    render(<StablePaneLayout tabId="tab" layout={layout} />)
+    const divider = screen.getByRole('separator')
+
+    fireEvent.mouseDown(divider, { clientX: 500, clientY: 300 })
+    fireEvent.mouseMove(document, { clientX: 600, clientY: 300 })
+    fireEvent.mouseUp(document)
+
+    expect(observed.dispatch).toHaveBeenCalled()
+    const last = observed.dispatch.mock.calls.at(-1)![0]
+    expect(last.type).toBe('panes/resizePanes')
+    expect(last.payload.tabId).toBe('tab')
+    expect(last.payload.splitId).toBe('s')
+    // Split slot is 1000px wide in the geometry harness: +100px = +10% from 50.
+    expect(last.payload.sizes).toEqual([60, 40])
+  })
+
+  it('a keyboard nudge resizes without snapping machinery', () => {
+    const layout = split('s', leaf('a'), leaf('b'))
+    render(<StablePaneLayout tabId="tab" layout={layout} />)
+    const divider = screen.getByRole('separator')
+
+    fireEvent.keyDown(divider, { key: 'ArrowRight' })
+
+    expect(observed.dispatch).toHaveBeenCalled()
+    const last = observed.dispatch.mock.calls.at(-1)![0]
+    expect(last.type).toBe('panes/resizePanes')
+    expect(last.payload.sizes[0]).toBeGreaterThan(50)
+  })
+})
+
+})
+
+
+describe('stable divider resizing', () => {
+  it('refuses to resize from an unreadable or zero-area container', () => {
+    const layout = split('s', leaf('a'), leaf('b'))
+    render(<StablePaneLayout tabId="tab" layout={layout} />)
+    const divider = screen.getByRole('separator')
+
+    // A zero-sized container can never produce a valid pixel-to-percent
+    // mapping: the event is a no-op (previously this dispatched NaN sizes).
+    const zeroWidth = vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(0)
+    try {
+      fireEvent.mouseDown(divider, { clientX: 500, clientY: 300 })
+      fireEvent.mouseMove(document, { clientX: 600, clientY: 300 })
+      fireEvent.mouseUp(document)
+      expect(observed.dispatch).not.toHaveBeenCalled()
+    } finally {
+      zeroWidth.mockRestore()
+    }
   })
 })

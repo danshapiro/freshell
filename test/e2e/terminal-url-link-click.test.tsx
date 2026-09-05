@@ -14,7 +14,6 @@ const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn().mockReturnValue(() => {}),
-  DEBUG: true,
   onReconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
 }))

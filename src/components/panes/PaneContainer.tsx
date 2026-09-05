@@ -493,7 +493,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     )
   }
 
-  // Render a split
+  // Render a split: RECURSIVE COMPATIBILITY RENDERER. In production
+  // PaneLayout always renders StablePaneLayout, which only ever hands
+  // PaneContainer leaf nodes; this branch survives solely to serve the pane
+  // unit suite's split-shaped fixtures. Do not extend it for new behavior —
+  // new split-path behavior belongs in StablePaneLayout/StablePaneDivider
+  // (and its tests in StablePaneLayout.test.tsx).
   const [size1, size2] = node.sizes
 
   return (

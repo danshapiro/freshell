@@ -203,6 +203,7 @@ describe('PaneLayout', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   describe('layout initialization', () => {
@@ -273,6 +274,34 @@ describe('PaneLayout', () => {
       const state = store.getState().panes
       // The active pane should be the same as the layout's pane id
       expect(state.activePane[tabId]).toBe(state.layouts[tabId].id)
+    })
+  })
+
+  describe('malformed persistence', () => {
+    it('fails loudly on duplicate pane ids instead of looping or ambiguity', () => {
+      const dup = {
+        type: 'split' as const,
+        id: 's',
+        direction: 'horizontal' as const,
+        sizes: [50, 50] as [number, number],
+        children: [
+          { type: 'leaf' as const, id: 'same', content: createTerminalContent() },
+          { type: 'leaf' as const, id: 'same', content: createTerminalContent() },
+        ],
+      }
+      // React logs the thrown render error through console.error on purpose;
+      // the suite's console guard must allow THIS expected failure.
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+      const store = createStore({
+        layouts: { 'tab-1': dup },
+        activePane: { 'tab-1': 'same' },
+      })
+      expect(() =>
+        renderWithStore(
+          <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+          store
+        )
+      ).toThrow(/Duplicate pane ID/)
     })
   })
 

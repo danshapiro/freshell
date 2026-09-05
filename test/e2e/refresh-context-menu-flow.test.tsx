@@ -186,51 +186,64 @@ describe('refresh context menu flow (e2e)', () => {
 
   it('Refresh tab exits zoom and refreshes all browser panes in the stored layout', async () => {
     vi.mocked(api.post).mockImplementation(() => new Promise(() => {}))
+    let reloadCount = 0
+    const contentWindowSpy = vi.spyOn(window.HTMLIFrameElement.prototype, 'contentWindow', 'get').mockImplementation(() => {
+      return {
+        location: {
+          reload: () => {
+            reloadCount += 1
+          },
+        },
+      } as any
+    })
 
-    const layout: PaneNode = {
-      type: 'split',
-      id: 'split-1',
-      direction: 'horizontal',
-      sizes: [50, 50],
-      children: [
-        createBrowserLeaf('pane-1', 'browser-1', 'http://127.0.0.1:3000'),
-        createBrowserLeaf('pane-2', 'browser-2', 'http://127.0.0.1:3001'),
-      ],
+    try {
+      const layout: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          createBrowserLeaf('pane-1', 'browser-1', 'http://127.0.0.1:3000'),
+          createBrowserLeaf('pane-2', 'browser-2', 'http://127.0.0.1:3001'),
+        ],
+      }
+      const store = createStore(layout, { zoomedPaneId: 'pane-1' })
+      const user = userEvent.setup()
+      const { container } = renderFlow(store)
+
+      // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's
+      // own port so the HTTP proxy skips it; pane-2 uses the same-origin
+      // /api/proxy path and never posts. The forward promise never resolves,
+      // so pane-1 has no iframe and one in-flight forward.
+      await waitFor(() => {
+        expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
+      })
+      vi.mocked(api.post).mockClear()
+
+      await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+      await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
+
+      await waitFor(() => {
+        expect(store.getState().panes.zoomedPane['tab-1']).toBeUndefined()
+      })
+      await waitFor(() => {
+        expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
+      })
+      // Zoom exit keeps BOTH panes mounted (the stable surface layer — the old
+      // recursive tree remounted the zoomed sibling). pane-1's refresh takes
+      // the recover path: still no iframe (forward never resolved), so it
+      // retries the forward exactly once. pane-2 reloads its iframe in place.
+      await waitFor(() => {
+        expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
+      })
+      expect(reloadCount).toBe(1)
+      await waitFor(() => {
+        expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
+      })
+    } finally {
+      contentWindowSpy.mockRestore()
     }
-    const store = createStore(layout, { zoomedPaneId: 'pane-1' })
-    const user = userEvent.setup()
-    const { container } = renderFlow(store)
-
-    await waitFor(() => {
-      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
-    })
-    vi.mocked(api.post).mockClear()
-
-    // The now-mounted hidden pane is refreshed TOO (stable surfaces keep it
-    // alive; the old recursive layout only refreshed the zoomed pane). Its
-    // iframe reload hits jsdom's "Not implemented: navigation" console.error;
-    // that emission is the expected refresh happening, so allow it here.
-    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
-    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
-
-    await waitFor(() => {
-      expect(store.getState().panes.zoomedPane['tab-1']).toBeUndefined()
-    })
-    await waitFor(() => {
-      expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
-    })
-    // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's own
-    // port so the HTTP proxy skips it. Pane-2 (port 3001) is proxied through
-    // /api/proxy/http/3001/ (same-origin) instead. The zoom exit used to
-    // REMOUNT pane-1's browser (destroying the iframe and re-forwarding the
-    // port — a second api.post); the stable surface layer keeps both panes
-    // mounted, so exactly the initial forward remains, and both panes consume
-    // their refresh requests in place (asserted via the store clear below).
-    expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
-    await waitFor(() => {
-      expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
-    })
   })
 
   it('Refresh pane from the pane shell queues and consumes a matching browser refresh request', async () => {
