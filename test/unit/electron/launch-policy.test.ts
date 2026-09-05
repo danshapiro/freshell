@@ -29,6 +29,45 @@ function candidate(url: string, token?: string): LaunchServerCandidate {
   }
 }
 
+describe('named profiles', () => {
+  it('a named app-bound profile ALWAYS starts its own server (never auto-connects to a discovered one)', () => {
+    expect(chooseLaunchAction({
+      desktopConfig: config({ serverMode: 'app-bound', port: 3002 }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      profileId: 'work',
+    })).toEqual({ type: 'start-local' })
+  })
+
+  it('a named daemon profile skips discovery-driven chooser/auto-connect', () => {
+    expect(chooseLaunchAction({
+      desktopConfig: config({ serverMode: 'daemon' }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      profileId: 'work',
+    })).toEqual({ type: 'start-local' })
+  })
+
+  it('the default profile keeps historical discovery behavior', () => {
+    const c = candidate('http://localhost:3001', 'tok')
+    expect(chooseLaunchAction({
+      desktopConfig: config(),
+      candidates: [c],
+      savedRemoteReachable: false,
+      profileId: 'default',
+    })).toEqual({ type: 'auto-connect', candidate: c })
+  })
+
+  it('an absent profileId (legacy call shape) keeps historical discovery behavior', () => {
+    const c = candidate('http://localhost:3001', 'tok')
+    expect(chooseLaunchAction({
+      desktopConfig: config(),
+      candidates: [c],
+      savedRemoteReachable: false,
+    })).toEqual({ type: 'auto-connect', candidate: c })
+  })
+})
+
 describe('launch policy', () => {
   it('shows setup when setup is incomplete', () => {
     expect(chooseLaunchAction({

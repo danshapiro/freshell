@@ -475,6 +475,7 @@ async function main(): Promise<void> {
   const ctx: StartupContext = {
     desktopConfig,
     forcedLaunch,
+    profileId: activeProfileId,
     daemonManager,
     serverSpawner,
     hotkeyManager,

@@ -56,6 +56,9 @@ export interface StartupContext {
    * skips discovery and policy and performs exactly this action.
    */
   forcedLaunch?: ForcedLaunch
+  /** Active profile id; named profiles own their app-bound server and skip
+   *  localhost discovery (see launch-policy.ts). Defaults to 'default'. */
+  profileId?: string
 }
 
 export type StartupResult =
@@ -316,7 +319,12 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   }
 
   const discoverCandidates = ctx.discoverLaunchCandidates ?? (() => defaultDiscoverLaunchCandidates(ctx))
-  const candidates = await discoverCandidates()
+  // A named profile's app-bound/daemon boot owns its server; discovery is
+  // skipped entirely so a neighbor profile's server is never surfaced.
+  const skipDiscovery =
+    ctx.profileId !== undefined && ctx.profileId !== 'default' &&
+    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
+  const candidates = skipDiscovery ? [] : await discoverCandidates()
   const savedRemoteReachable = desktopConfig.serverMode === 'remote' && !!desktopConfig.remoteUrl
     ? await checkRemoteReachable(ctx, desktopConfig.remoteUrl)
     : false
@@ -328,6 +336,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     candidates,
     savedRemoteReachable,
     savedRemoteAuthenticated,
+    profileId: ctx.profileId,
   })
 
   if (launchAction.type === 'show-setup') {

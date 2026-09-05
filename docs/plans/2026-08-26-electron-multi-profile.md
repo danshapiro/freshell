@@ -1493,6 +1493,14 @@ OUTSIDE the git worktree and outside git history).
 | `server/mcp/config-writer.ts:163,167` (per-project MCP sidecar) | Deliberately project-scoped. |
 | `server/config-store.ts:236` | Hardcoded `~/.freshell` in a user-facing warning string — cosmetic drift only, not a resolution site; leave. |
 
+> **As-built reconciliation (post-review):** `config-store.ts:236` was
+> revisited by the delta review (Minor: the hint targeted `~/.freshell` paths
+> even under a named profile) and the later independent review (Minor: quote
+> the rendered paths). The final text logs computed
+> `backupPath()`/`configPath()` with shell quoting:
+> ``mv "<backupPath>" "<configPath>"``. The exact-file staging list below is
+> accordingly amended to include `server/config-store.ts`.
+
 Already-clean call-time consumers (no changes; was the plan's old list):
 `bootstrap.ts:168`, `tabs-registry/store.ts:314`, `instance-id.ts:9`,
 `index.ts:241`, `cli/config.ts:10`, `get-network-host.ts:45`,
@@ -1539,6 +1547,7 @@ git add server/freshell-home.ts server/logger.ts \
   server/coding-cli/codex-app-server/durability-store.ts \
   server/coding-cli/codex-app-server/runtime.ts \
   server/fresh-agent-extras-router.ts server/fresh-agent/recovery-store.ts \
+  server/config-store.ts \
   test/unit/server/freshell-home.test.ts test/unit/server/logger.test.ts \
   test/unit/server/coding-cli/codex-app-server/durability-store.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
@@ -3067,6 +3076,24 @@ surrounding document (heading levels, fenced code block language tags).
 git add README.md docs/plans/2026-08-26-electron-multi-profile.md
 git commit -m "docs: desktop profiles for multiple instances"
 ```
+
+---
+
+## As-built changes from the post-execution independent review
+
+One behavioral change landed after the original 9 tasks, driven by review:
+
+- **Named app-bound/daemon profiles never adopt a discovery-found server.**
+  `chooseLaunchAction` previously auto-connected to a single scanning-based
+  localhost candidate before falling through to `start-local`; with one
+  profile's server resident, a different app-bound profile would attach to
+  the wrong server and config identity. `launch-policy.ts` and `startup.ts`
+  now treat `profileId` (passed from `entry.ts`) as an ownership boundary:
+  named profiles in `app-bound`/`daemon` mode skip discovery and always
+  `start-local`. The default profile's historical discovery behavior is
+  unchanged. Regression coverage: `test/unit/electron/launch-policy.test.ts`
+  ('named profiles') and `test/unit/electron/startup.test.ts` ('app-bound
+  mode').
 
 ---
 

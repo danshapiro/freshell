@@ -201,6 +201,34 @@ describe('runStartup', () => {
   })
 
   describe('app-bound mode', () => {
+    it('a named app-bound profile ignores discovered local servers and spawns its own', async () => {
+      const ctx = createDefaultContext({
+        isDev: false,
+        resourcesPath: '/app/resources',
+        discoverLaunchCandidates: vi.fn().mockResolvedValue([{
+          id: 'http://localhost:3057',
+          url: 'http://localhost:3057',
+          origin: 'port-scan',
+          ownership: 'detected-local',
+          label: 'http://localhost:3057',
+          ready: true,
+          requiresAuth: true,
+          token: 'someone-elses-token',
+        }]) as unknown as () => Promise<never[]>,
+      })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+
+      const result = await runStartup(ctx)
+
+      // Own server spawned at this profile's config port (3001 in the default
+      // fixture); the resident 3057 candidate must NOT be adopted.
+      expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+    })
+
     it('spawns server in production mode with paths from resourcesPath', async () => {
       const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
       const result = await runStartup(ctx)

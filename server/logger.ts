@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 import pino, { type DestinationStream, type LevelWithSilent } from 'pino'
 import { createStream, type RotatingFileStream } from 'rotating-file-stream'
-import { getFreshellHomeDir, getFreshellConfigDir } from './freshell-home.js'
+import { getFreshellConfigDir } from './freshell-home.js'
 
 const env = process.env.NODE_ENV || 'development'
 const level = process.env.LOG_LEVEL || 'debug'

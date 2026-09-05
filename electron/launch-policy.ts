@@ -21,6 +21,8 @@ export interface ChooseLaunchActionOptions {
   candidates: LaunchServerCandidate[]
   savedRemoteReachable: boolean
   savedRemoteAuthenticated?: boolean
+  /** Active profile id ('default' or undefined for the legacy single-profile boot). */
+  profileId?: string
 }
 
 export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAction {
@@ -60,8 +62,20 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'show-chooser', candidates, reason: 'saved-remote-unreachable' }
   }
 
-  if (candidates.length > 1) {
-    return { type: 'show-chooser', candidates, reason: 'multiple-candidates' }
+  // A named profile OWNS its server: never attach a discovery-surfaced
+  // instance (which could belong to a DIFFERENT profile with a different
+  // config dir and identity) via auto-connect or the chooser. Start this
+  // profile's own server (app-bound path in runStartup) or the machine
+  // daemon (daemon mode — machine-global by design, see README).
+  if (
+    options.profileId !== undefined &&
+    options.profileId !== 'default' &&
+    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
+  ) {
+    return { type: 'start-local' }
+  }
+
+  if (candidates.length > 1) {    return { type: 'show-chooser', candidates, reason: 'multiple-candidates' }
   }
 
   if (candidates.length === 1) {
