@@ -126,9 +126,8 @@ fn format_ignored_frames(ignored: &std::collections::VecDeque<String>) -> String
 /// is RECORDED (its `type` plus `tid`/`status`/`code`/`reason`/`attempt`/
 /// `sessionRef` when present, last 10 in a ring — the settle-diagnostic field
 /// set widened at delta-r2 plan addition #5(a) so every future mechanism-B
-/// occurrence self-names its settle tail for the follow-up task, and `tid`
-/// added at delta-r6 so the waiver classifier can correlate the settle frame
-/// to the crashed terminal) and dumped
+/// occurrence self-names its settle tail, and `tid` added at delta-r6 so a
+/// settle frame in the ring correlates to the crashed terminal) and dumped
 /// into BOTH panic arms — the catch-all `other` arm (which
 /// fires on the final `Err(Elapsed)` when the peer simply stops sending, the
 /// exact mechanism-B receipt shape; delta-review r1) and the end-of-loop
@@ -152,12 +151,10 @@ async fn wait_frame_matching(
     // those fields (the wire TerminalStatus settle/recovering shapes carry
     // `reason`/`attempt`; error frames carry `code`; `terminal.replaced`
     // carries `oldTerminalId`/`newTerminalId`, rendered as oldTid/newTid —
-    // delta-r7, the waiver classifier's same-terminal replacement guard).
-    // `tid` (delta-review r6):
-    // the mechanism-B waiver classifier
-    // (scripts/classify-resume-waiver.ts) must correlate a settle frame to
-    // its terminal — without `terminalId` the ring cannot distinguish the
-    // crashed terminal's settle tail from an unrelated terminal's frames.
+    // delta-r7's same-terminal replacement guard).
+    // `tid` (delta-review r6): without `terminalId` the ring cannot
+    // distinguish the crashed terminal's settle tail from an unrelated
+    // terminal's frames.
     let mut ignored: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -174,10 +171,9 @@ async fn wait_frame_matching(
                     // delta-r7: `terminal.replaced` frames carry neither
                     // `terminalId` nor `status` — their identifiers are
                     // `oldTerminalId`/`newTerminalId` (server_messages.rs
-                    // TerminalReplaced). Without these, the waiver classifier
-                    // could never correlate an arrived replacement to the
-                    // settled terminal and the "no recovery" half of the
-                    // mechanism-B signature was unenforceable.
+                    // TerminalReplaced). Without these, the ring could never
+                    // correlate an arrived replacement to the settled
+                    // terminal.
                     if let Some(old_tid) = value.get("oldTerminalId") {
                         summary.push_str(&format!(" oldTid={old_tid}"));
                     }
@@ -753,8 +749,9 @@ async fn crash_with_identity_arriving_during_grace_is_resumed() {
 
     // Poll for the shim marker (crash imminent), then upsert INSIDE the
     // grace: query#1 happens at the shim's exit (~marker+1.2s); the upsert
-    // lands at ~marker+1.45s — inside the first 2s grace step with ~1.75s of
-    // headroom both directions against ordinary load skew.
+    // lands at ~marker+1.45s — ~250ms of lower margin after the shim's exit
+    // instant (grace must already be engaged), ~2s of upper margin inside
+    // the first grace step, against ordinary load skew.
     let marker_seen = {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !marker.exists() {
