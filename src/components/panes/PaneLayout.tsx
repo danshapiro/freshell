@@ -1,16 +1,11 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { initLayout, addPane, splitPane } from '@/store/panesSlice'
-import type { PaneContentInput, PaneNode } from '@/store/paneTypes'
-import PaneContainer from './PaneContainer'
+import type { PaneContentInput } from '@/store/paneTypes'
+import StablePaneLayout from './StablePaneLayout'
+import { collectSurfaceLeaves, resolveSurfaceZoom } from '@/lib/pane-surface-layout'
 import FloatingActionButton from './FloatingActionButton'
 import IntersectionDragOverlay from './IntersectionDragOverlay'
-
-/** Find a leaf node by id in the pane tree. */
-function findLeaf(node: PaneNode, id: string): Extract<PaneNode, { type: 'leaf' }> | null {
-  if (node.type === 'leaf') return node.id === id ? node : null
-  return findLeaf(node.children[0], id) || findLeaf(node.children[1], id)
-}
 
 interface PaneLayoutProps {
   tabId: string
@@ -63,14 +58,13 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
     return <div className="h-full w-full" /> // Loading state
   }
 
-  // When zoomed, find the leaf and render only that pane
-  const zoomedLeaf = zoomedPaneId ? findLeaf(layout, zoomedPaneId) : null
-  const nodeToRender = zoomedLeaf ?? layout
+  // Invalid/stale zoom IDs use the normal layout, including its dividers.
+  const effectiveZoom = resolveSurfaceZoom(collectSurfaceLeaves(layout), zoomedPaneId)
 
   return (
     <div ref={containerRef} data-pane-root className="relative h-full w-full">
-      <PaneContainer tabId={tabId} node={nodeToRender} hidden={hidden} />
-      {!zoomedPaneId && (
+      <StablePaneLayout tabId={tabId} layout={layout} zoomedPaneId={effectiveZoom} hidden={hidden} />
+      {!effectiveZoom && (
         <IntersectionDragOverlay tabId={tabId} containerRef={containerRef} />
       )}
       <FloatingActionButton

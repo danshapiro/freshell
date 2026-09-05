@@ -1,6 +1,6 @@
 import { Suspense, lazy, useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
+import { setActivePane, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
@@ -31,7 +31,7 @@ import {
   formatPaneRuntimeTooltip,
   type PaneRuntimeMeta,
 } from '@/lib/format-terminal-title-meta'
-import { snap1D, collectCollinearSnapTargets, convertThresholdToLocal } from '@/lib/pane-snap'
+import { usePaneSplitResize } from './usePaneSplitResize'
 import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
@@ -234,10 +234,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     (s) => s.freshAgent?.pendingCreates ?? EMPTY_FRESH_AGENT_PENDING_CREATES
   )
 
-  // Drag state for snapping: track the original size and accumulated delta
-  const dragStartSizeRef = useRef<number>(0)
-  const accumulatedDeltaRef = useRef<number>(0)
-
   // Check if this is the only pane (root is a leaf)
   const rootNode = useAppSelector((s) => s.panes.layouts[tabId])
   const isOnlyPane = rootNode?.type === 'leaf'
@@ -384,63 +380,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     dispatch(toggleZoom({ tabId, paneId }))
   }, [dispatch, tabId])
 
-  const handleResizeStart = useCallback(() => {
-    if (node.type !== 'split') return
-    dragStartSizeRef.current = node.sizes[0]
-    accumulatedDeltaRef.current = 0
-  }, [node])
-
-  const handleResize = useCallback((splitId: string, delta: number, direction: 'horizontal' | 'vertical', shiftHeld?: boolean) => {
-    if (!containerRef.current) return
-    if (node.type !== 'split' || node.id !== splitId) return
-
-    const container = containerRef.current
-    const totalSize = direction === 'horizontal' ? container.offsetWidth : container.offsetHeight
-    const percentDelta = (delta / totalSize) * 100
-
-    let newSize: number
-
-    if (dragStartSizeRef.current === 0) {
-      // Keyboard resize (no drag start): apply delta directly without snapping
-      newSize = node.sizes[0] + percentDelta
-    } else {
-      // Mouse/touch drag: accumulate delta and apply snapping
-      accumulatedDeltaRef.current += percentDelta
-      const rawNewSize = dragStartSizeRef.current + accumulatedDeltaRef.current
-
-      // Get root container dimensions for coordinate conversion
-      const rootContainer = containerRef.current.closest('[data-pane-root]') as HTMLElement | null
-      const rootW = rootContainer?.offsetWidth ?? container.offsetWidth
-      const rootH = rootContainer?.offsetHeight ?? container.offsetHeight
-
-      // Collect snap targets in local % space using absolute coordinate conversion
-      const collinearPositions = rootNode
-        ? collectCollinearSnapTargets(rootNode, direction, splitId, rootW, rootH)
-        : []
-
-      // Convert snap threshold from "% of smallest dimension" to local split %
-      const localThreshold = convertThresholdToLocal(snapThreshold, rootW, rootH, totalSize)
-
-      // Apply snapping
-      newSize = snap1D(
-        rawNewSize,
-        dragStartSizeRef.current,
-        collinearPositions,
-        localThreshold,
-        shiftHeld ?? false,
-      )
-    }
-
-    const clampedSize = Math.max(10, Math.min(90, newSize))
-    const newSize2 = 100 - clampedSize
-
-    dispatch(resizePanes({ tabId, splitId, sizes: [clampedSize, newSize2] }))
-  }, [dispatch, tabId, node, rootNode, snapThreshold])
-
-  const handleResizeEnd = useCallback(() => {
-    dragStartSizeRef.current = 0
-    accumulatedDeltaRef.current = 0
-  }, [])
+  const { handleResizeStart, handleResize, handleResizeEnd } = usePaneSplitResize({
+    tabId, node, rootNode, containerRef, snapThreshold,
+  })
 
   // Render a leaf pane
   if (node.type === 'leaf') {
@@ -574,7 +516,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     )
   }
 
-  // Render a split
+  // Render a split: RECURSIVE COMPATIBILITY RENDERER. In production
+  // PaneLayout always renders StablePaneLayout, which only ever hands
+  // PaneContainer leaf nodes; this branch survives solely to serve the pane
+  // unit suite's split-shaped fixtures. Do not extend it for new behavior —
+  // new split-path behavior belongs in StablePaneLayout/StablePaneDivider
+  // (and its tests in StablePaneLayout.test.tsx).
   const [size1, size2] = node.sizes
 
   return (
