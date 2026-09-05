@@ -37,6 +37,7 @@ PR699 follow-up: [Rust-only integration repair plan](docs/superpowers/plans/2026
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. Zero-argument and explicit broad `--run` server/integration invocations are coordinated; narrowed Cargo selectors are delegated.
+- Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped by `config/vitest/sanitize-test-env.ts` at standard client, Electron-unit, contract/oracle, and browser-helper Vitest config load. The PR699 repair plan covers extending this to the new source-runtime and packaged-runtime configs.
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).

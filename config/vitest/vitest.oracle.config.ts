@@ -1,3 +1,6 @@
+// Strip ambient shell env (proxies, FRESHELL_BIND_HOST) before anything else — see sanitize-test-env.ts.
+import './sanitize-test-env.js'
+
 // Vitest inherits NODE_ENV from the parent process. When this runs from inside
 // a production Freshell server (NODE_ENV=production), force it back to `test`
 // so the harness boots cleanly.

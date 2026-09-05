@@ -18,6 +18,14 @@ use freshell_ws::WsState;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// Frame-receive / poll budget for the WS e2e suites. DEFLAKE (the-usual
+/// test-flake-hardening): `auto_resume_e2e` and `restore_spawn_gate` flaked at
+/// 5–10s budgets only under heavy machine load (evidence: run-state receipts
+/// of the 2026-09 host-pressure-pane run; f3wp prior art f2c505e9f). Assertions
+/// are unchanged; only the wait budget grew — a genuinely missing frame still
+/// fails, ~25s later.
+pub const FRAME_BUDGET: Duration = Duration::from_secs(30);
+
 /// Launcher-assigned amplifier identity (F7/V9): tests that create
 /// amplifier terminals now WRITE stub dirs into the amplifier home.
 /// Isolate eagerly at this choke point so no test ever touches the real
@@ -426,6 +434,10 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         cli_commands: Arc::new(cli_commands),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
+        // DEFLAKE-keep (the-usual test-flake-hardening): the server-side hello
+        // timeout stays 5s — no evidence it fired in the load flakes (2026-09
+        // host-pressure-pane receipts); a separate door from the widened
+        // client-side read budgets (see FRAME_BUDGET).
         hello_timeout_ms: 5_000,
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes: 16 * 1024 * 1024,
@@ -932,8 +944,15 @@ pub async fn connect_and_capture_inventory(url: &str) -> (TestWs, serde_json::Va
     .expect("send hello");
 
     let mut inventory = serde_json::Value::Null;
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the loop.
+    // The 4-frame handshake cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..4u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next())
             .await
             .expect("handshake message within timeout")
             .expect("stream not ended")
@@ -965,6 +984,10 @@ pub async fn create_shell_terminal(ws: &mut TestWs, request_id: &str) -> String 
     .await
     .expect("send terminal.create");
 
+    // DEFLAKE-keep (the-usual test-flake-hardening): the 10s outer budget and
+    // 5s per-read here stay narrow — the suites using this helper did not
+    // flake, and widening would only raise their failure latency (see
+    // FRAME_BUDGET's doc comment for the widened set).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -1060,6 +1083,10 @@ pub async fn attach_with(
 }
 
 pub async fn wait_for_attach_ready(ws: &mut TestWs, attach_request_id: &str) {
+    // DEFLAKE-keep (the-usual test-flake-hardening): the 10s outer budget and
+    // 5s per-read here stay narrow — the suites using this helper did not
+    // flake, and widening would only raise their failure latency (see
+    // FRAME_BUDGET's doc comment for the widened set).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -1096,8 +1123,16 @@ pub async fn send_input(ws: &mut TestWs, terminal_id: &str, data: &str) {
 
 /// Read text frames until one with `type == wanted` arrives (bounded).
 pub async fn next_frame_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the 20-frame
+    // loop (a genuinely missing frame fails in ≤ FRAME_BUDGET, restored
+    // exactly). The 20-message cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..20u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
             .expect("stream not ended")

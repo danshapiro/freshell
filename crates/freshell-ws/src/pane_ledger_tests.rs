@@ -189,6 +189,95 @@ fn index_loads_existing_rows_at_construction() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+// ── tracing capture for the lock test's failure classification (delta-r2 M2) ──
+//
+// Adapted from the LogCapture/Visitor pattern in
+// tests/pane_reconcile_freshagent.rs (~:761-845). Thread-local capture is
+// sufficient HERE (no tokio involved): `new_locked` logs
+// `pane_ledger_lock_unavailable` SYNCHRONOUSLY on the construction thread
+// (pane_ledger.rs:248-254), and the `#[test]` body IS the construction
+// thread, so a `tracing::subscriber::set_default` guard scopes the capture
+// layer to exactly this thread. cfg(unix): the only consumer is the
+// cfg(unix) lock test below.
+#[cfg(unix)]
+mod lock_log_capture {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CapturedEvent {
+        pub message: String,
+        /// The event's OWN fields (the lock-unavailable log records root +
+        /// error on the event; no span merge needed).
+        pub fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct CapVisitor {
+        message: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    impl Visit for CapVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+    }
+
+    struct LogCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> Layer<S> for LogCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = CapVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push(CapturedEvent {
+                    message: visitor.message,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    /// Install the thread-local capture layer; the returned guard restores the
+    /// previous default dispatcher on drop.
+    pub fn lock_failure_capture() -> (
+        Arc<Mutex<Vec<CapturedEvent>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = LogCapture {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (events, guard)
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn new_locked_degrades_to_disabled_when_another_holder_exists() {
@@ -206,6 +295,42 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // this binary installs no tracing subscriber. Per C1's reasoning we do
     // NOT retry-mask; instead every assertion below carries the on-disk and
     // errno evidence needed to diagnose the next occurrence on sight.
+    //
+    // DEFLAKE-2 (the-usual test-flake-hardening): the proven flake signature
+    // is errno=11 EWOULDBLOCK at the re-acquire after `drop(holder)`: the
+    // dropped holder's flock can remain kernel-held for a tick, and
+    // `new_locked` swallows the errno into a DISABLED ledger
+    // (pane_ledger.rs:247-255). The one-shot probe-2 acquire (which panicked
+    // on exactly that signature) and the third construction are therefore
+    // REPLACED by one bounded wait whose RETRY UNIT is the third construction
+    // itself, with a TWO-BRANCH diagnosis per failed construction keyed on
+    // `candidate.is_enabled()` (pane_ledger.rs:295 — false only when the
+    // candidate's own lock acquisition FAILED):
+    //  - ENABLED but blind (the candidate holds the flock yet cannot see
+    //    s1.json — load_index swallowed an I/O error, H2): panic
+    //    IMMEDIATELY, never probed and never retried. A probe cannot
+    //    diagnose this branch at all — it would misread the candidate's
+    //    OWN still-held lock as the transient EWOULDBLOCK, and the
+    //    resulting retry would silently mask the exact H2 regression C1
+    //    requires to fail loudly.
+    //  - DISABLED (the candidate's lock acquisition failed): classify from
+    //    the `pane_ledger_lock_unavailable` tracing event captured AT the
+    //    failure instant on this thread (`new_locked` logs it synchronously
+    //    with the io error's Display string, pane_ledger.rs:248-254) —
+    //    retry ONLY when the captured error text shows the proven transient
+    //    ("os error 11" in EWOULDBLOCK's Display); ANY other captured error
+    //    text panics immediately with it; NO captured event panics
+    //    immediately (the disabled path failed to log the expected event —
+    //    a third, real signal); budget expiry panics naming the last
+    //    captured error text. A follow-up acquire_store_lock probe CANNOT
+    //    classify the errno `new_locked` swallowed (delta-review r2 M2):
+    //    the drop→probe window lets a released-holder probe succeed and
+    //    mislabel the transient as H2, so NO probe calls remain — the
+    //    transient loop is classified ONLY by evidence captured at the
+    //    exact failure instant.
+    // The loser-construction property and the on-disk evidence probe stay
+    // one-shot and untouched — the C1 no-retry-masking decision holds for
+    // everything the wait does not cover.
     let root = temp_root("lock");
     let holder = PaneLedger::new_locked(Some(root.clone()));
     holder
@@ -229,28 +354,124 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         "holder's s1.json must be durably on disk before the re-acquire"
     );
 
-    // Evidence probe 2: re-acquire through the SAME private code path
-    // production uses, so an Err surfaces its errno instead of being
-    // swallowed into a DISABLED ledger.
-    match PaneLedger::acquire_store_lock(&root) {
-        Ok(lock) => drop(lock), // release before constructing `next`
-        Err(err) => panic!(
-            "acquire_store_lock failed after holder drop: errno={:?} kind={:?} \
-             (EWOULDBLOCK => flock genuinely still held after drop; \
-             ENOSPC/EMFILE/EACCES => resource pressure, H1)",
-            err.raw_os_error(),
-            err.kind()
-        ),
-    }
-
-    let next = PaneLedger::new_locked(Some(root.clone()));
-    assert!(
-        next.ever_bound("claude", "s1"),
-        "third new_locked came up blind despite the lock being acquirable and \
-         s1.json on disk ({s1_on_disk}): load_index silently returned empty \
-         (H2, pane_ledger.rs:299-321 swallows I/O errors) or a second \
-         acquire Err raced in after the probe"
-    );
+    // Bounded wait whose retry UNIT is the third construction itself. Each
+    // failed construction takes ONE of two branches keyed on
+    // `candidate.is_enabled()`:
+    //  - ENABLED but blind — the candidate holds the flock itself yet cannot
+    //    see s1.json: fail IMMEDIATELY, never probed and never retried (a
+    //    probe could misread the candidate's OWN lock as the benign
+    //    EWOULDBLOCK transient and silently retry an H2 regression).
+    //  - DISABLED — the candidate's lock acquisition failed: classify from
+    //    the `pane_ledger_lock_unavailable` event the thread-local capture
+    //    collected AT that failure instant — retry ONLY when the captured
+    //    error text shows the proven flake signature (EWOULDBLOCK: flock
+    //    still vapor-held after the holder's drop; its io Display contains
+    //    "os error 11"); ANY other captured error text fails immediately
+    //    with it; NO captured event fails immediately (the disabled path
+    //    did not log the expected event — a third, real signal); budget
+    //    expiry panics naming the last captured error text. NO
+    //    acquire_store_lock probe calls remain (delta-review r2 M2: the
+    //    drop→probe window could mislabel a released-holder transient as
+    //    H2).
+    // The loser-construction property above and the on-disk probe stay
+    // one-shot and untouched.
+    let (events, _trace_guard) = lock_log_capture::lock_failure_capture();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // libc supplies EWOULDBLOCK's portable errno value (11 on Linux, 35 on
+    // macOS), so the marker is derived from the compiled constant, not a literal.
+    let would_block_marker = format!("(os error {})", libc::EWOULDBLOCK);
+    // `next` is intentionally unused: the bounded wait's success IS the
+    // assertion (a bare `next` binding would trip the repo's -D warnings gate);
+    // the name documents that the loop value is the third construction.
+    let _next = loop {
+        let seen_before = events.lock().expect("capture lock").len();
+        let candidate = PaneLedger::new_locked(Some(root.clone()));
+        if candidate.ever_bound("claude", "s1") {
+            break candidate;
+        }
+        // Branch 1 — ENABLED yet blind: the candidate ITSELF holds the flock
+        // (the lock WAS free / was acquired by us) and s1.json is confirmed
+        // on disk, so load_index swallowed an I/O error. This is the
+        // provisional-final H2 shape: panic NOW — do NOT probe (the probe
+        // could read our own lock as the transient EWOULDBLOCK) and do NOT
+        // drop-and-retry (C1 no-retry-masking).
+        if candidate.is_enabled() {
+            panic!(
+                "third new_locked came up ENABLED yet BLIND — the candidate \
+                 itself holds the flock (lock WAS free/held by us) and \
+                 s1.json is confirmed on disk by the on-disk probe above, so \
+                 load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
+                 — provisional-final, never retried"
+            );
+        }
+        // Branch 2 — DISABLED: the candidate's lock acquisition failed, so
+        // it holds nothing — and `new_locked` logged the failure
+        // synchronously on THIS thread. Classify from THAT captured event
+        // (never a later probe call).
+        drop(candidate);
+        // delta-r5 (finding 2): capture the first lock- OR scan-unavailable
+        // event — after qzka's 9a3d74e09 lands, `new_locked` can also come up
+        // DISABLED via the construction scan fault
+        // (`pane_ledger_scan_unavailable`) while HOLDING the flock; that shape
+        // must be named with its captured fields, never fall through to the
+        // generic not-captured branch.
+        let captured = {
+            let log = events.lock().expect("capture lock");
+            log[seen_before..]
+                .iter()
+                .find(|e| {
+                    e.message.contains("pane_ledger_lock_unavailable")
+                        || e.message.contains("pane_ledger_scan_unavailable")
+                })
+                .cloned()
+        };
+        match captured {
+            // UNREACHABLE until qzka's 9a3d74e09 lands — today's pane_ledger.rs
+            // logs ONLY pane_ledger_lock_unavailable, so no test targets this
+            // arm today by design (delta-review r5 finding 2).
+            Some(evt) if evt.message.contains("pane_ledger_scan_unavailable") => panic!(
+                "candidate DISABLED via scan fault (pane_ledger_scan_unavailable): \
+                 the construction scan failed under the HELD flock — the qzka \
+                 scan-fault shape, NOT the EWOULDBLOCK lock transient; never \
+                 retried; captured fields: {:?}",
+                evt.fields
+            ),
+            // The proven flake signature: flock still vapor-held after the
+            // holder's drop (EWOULDBLOCK's io error Display contains
+            // "os error 11").
+            Some(evt)
+                if evt
+                    .fields
+                    .get("error")
+                    .is_some_and(|e| e.contains(&would_block_marker)) =>
+            {
+                let err_text = evt.fields.get("error").cloned().unwrap_or_default();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "flock still EWOULDBLOCK after the 10s bounded wait — the \
+                     proven flake signature persisted past the wait; last \
+                     captured lock failure: {err_text} (fossils family: \
+                     pane-ledger-test-lock-*)"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Some(evt) => panic!(
+                "third new_locked came up DISABLED with a non-transient lock \
+                 failure captured at the failure instant: {} \
+                 (ENOSPC/EMFILE/EACCES => resource pressure, H1)",
+                evt.fields.get("error").cloned().unwrap_or_default()
+            ),
+            None => panic!(
+                "third new_locked came up DISABLED but neither the \
+                 pane_ledger_lock_unavailable nor the pane_ledger_scan_unavailable \
+                 event was captured — the disabled path did not log the failure \
+                 (a third, real signal)"
+            ),
+        }
+    };
+    // The loop above breaks only when the third construction sees the binding —
+    // the old trailing `assert!(next.ever_bound(...))` is subsumed by the loop's
+    // success criterion and is removed (it would have been unreachable).
     std::fs::remove_dir_all(&root).ok();
 }
 

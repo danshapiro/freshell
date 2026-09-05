@@ -1,6 +1,8 @@
 // Dedicated Vitest config for Rust fixture, shared-support, external-target,
 // selection, and perf helper tests. These infrastructure tests run in Node,
 // outside the root Vitest configs, during E2E helper development.
+// Strip ambient shell env (proxies, FRESHELL_BIND_HOST) before anything else — see sanitize-test-env.ts.
+import '../../config/vitest/sanitize-test-env.js'
 import { defineConfig } from 'vitest/config'
 import path from 'path'
 import { fileURLToPath } from 'url'
