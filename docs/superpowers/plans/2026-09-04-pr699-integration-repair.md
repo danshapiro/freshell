@@ -749,61 +749,28 @@ git diff --exit-code -- port/contract
 
 Expected: all commands exit zero; contract regeneration produces no diff. Record pre-existing lint warnings separately, never as new failures or as warning-free output.
 
-- [ ] Prepare a committed-source, git-aware sandbox run for the approved local backend. A host worktree's `.git` points outside `/workspace`; mounting it alone can make build IDs `unknown`. The recipe below carries a Git bundle into a disposable repository and worktree **inside** the container, so build-mismatch tests exercise real stamps without mounting the host's Git internals or user data.
+- [ ] Prepare the approved backend's committed-source, Git-aware disposable verification route. Implement task-owned ignored orchestration scripts, not permanent product tooling. The architecture was independently validated as feasible; no launcher or test result was validated by that inspection. Decision evidence: `/home/dan/code/freshell/.worktrees/.the-usual-logs/pr699-integration-repair/reports/load-bearing-validator-lb1.md`.
 
-Prerequisites before this draft recipe is executed: use the validated same-user Docker access (`sudo -n -u dan -g docker`); prepare a task-isolated disposable image with Rust 1.96.0, the workspace's Tauri development libraries, and Chromium. Do not modify a shared image underneath other agents. Verify cached dependencies against the current lockfile. Acquire and hold the **host repository's shared coordinator gate** across the complete broad sandbox run: the inner clone has its own Git common directory and therefore cannot coordinate with host worktrees by itself. A status read is not a reservation. Prefer the existing coordinator endpoint/store APIs in ignored orchestration code; never fake a passing test phase. Preserve logs and browser artifacts on the host before the container exits. The environment assessment is in `reports/workspace-baseline.md` under this run's log directory. Validate this execution approach before implementing the draft launcher below.
+The host supervisor must acquire the existing host repository coordinator endpoint through its exported endpoint/store APIs, write an honest task-specific holder without a suite key, and retain the reservation until the canonical sandbox invocation terminates and its exact owned container is confirmed gone. Wait for foreign holders. Handle normal exit, test failure, and catchable cancellation without releasing early; do not add crash-recovery guarantees or fabricate standard-suite success.
 
-Run on the host from the PR worktree, after confirming these two artifact names are not owned by another task:
+Invoke unchanged `scripts/sandbox-test.sh` through a narrow task-local Docker adapter. Select a prepared task-specific immutable image and record a unique container identity; preserve the canonical namespaces, resource limits, ordinary caches, and automatic removal. Reject unexpected image-build calls rather than retagging the shared image. Use the validated same-user Docker access (`sudo -n -u dan -g docker`). Prepare Rust 1.96.0, the workspace's Tauri development libraries, and Chromium inside the disposable environment; cache warming also holds the host reservation. Do not mount user data, host Git internals, the Docker socket, or production environment.
+
+Keep the existing Git-bundle approach: bundle the exact committed feature HEAD into a task-owned ignored file, clone it into an inner temporary bare repository, create a detached linked worktree there, and connect the canonical dependency caches. This gives real Git build stamps without host Git access. Verify the lockfile-compatible cache and exact inner SHA. Capture stdout/stderr continuously on the host; copy inner coordinator/browser artifacts to a task-owned `/workspace/dist` receipt directory before normal or handled-error disposal, preserving the original failing status.
+
+Before trusting the launcher for broad tests, exercise its real canonical entrypoint and proportionate behavior checks for contention, exact-image selection, failed commands, cancellation during launch/execution, owned-container reconciliation, and failure-preserving artifact capture. An uncatchably killed supervisor cannot retain a process-owned socket; this is not a new production recovery requirement.
+
+For an approved local run, execute this command sequence inside the committed-source sandbox with Rust 1.96.0, bounded build jobs, and the selected local backend environment:
 
 ~~~bash
-mkdir -p dist
-git bundle create dist/pr699-review.bundle HEAD
-~~~
-
-Use `apply_patch` to create the ignored `dist/pr699-review-gate.sh` with this complete content:
-
-~~~bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-review_root="$(mktemp -d /tmp/pr699-review.XXXXXX)"
-git clone --bare /workspace/dist/pr699-review.bundle "$review_root/repository.git"
-git --git-dir="$review_root/repository.git" worktree add --detach "$review_root/.worktrees/verification" HEAD
-cd "$review_root/.worktrees/verification"
-ln -s /workspace/node_modules node_modules
-ln -s /workspace/target target
-
-export FRESHELL_VITEST_BACKEND=local
-export FRESHELL_E2E_BACKEND=local
-export FRESHELL_TEST_SUMMARY="PR699 repaired merge verification"
-export RUST_TEST_THREADS=1
-export CARGO_BUILD_JOBS=4
-
 git rev-parse HEAD
-npm run test:status
 npm run check
 npm run test:vitest -- run --config config/vitest/vitest.port.config.ts
 npm run test:e2e:helpers -- helpers/selection-nonvacuity.test.ts
 npm exec -- playwright install chromium
-npm run test:e2e -- --project=chromium --workers=2 \
-  test/e2e-browser/specs/cli-rust.spec.ts \
-  test/e2e-browser/specs/mcp-bridge-rust.spec.ts \
-  test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts \
-  test/e2e-browser/specs/fresh-agent-control-rust.spec.ts \
-  test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts \
-  test/e2e-browser/specs/host-stats-pane.spec.ts \
-  test/e2e-browser/specs/server-build-mismatch-rust.spec.ts
+npm run test:e2e -- --project=chromium --workers=2 test/e2e-browser/specs/cli-rust.spec.ts test/e2e-browser/specs/mcp-bridge-rust.spec.ts test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts test/e2e-browser/specs/fresh-agent-control-rust.spec.ts test/e2e-browser/specs/fresh-agent-rollback-rust.spec.ts test/e2e-browser/specs/host-stats-pane.spec.ts test/e2e-browser/specs/server-build-mismatch-rust.spec.ts test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts test/e2e-browser/specs/fresh-agent-model-dialog-parity.spec.ts test/e2e-browser/specs/freshopencode-model-picker.spec.ts test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/sidebar-status-tier-sort-rust.spec.ts test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
 ~~~
 
-Then run:
-
-~~~bash
-scripts/sandbox-test.sh "bash /workspace/dist/pr699-review-gate.sh"
-~~~
-
-Expected: exact bundled SHA printed, `npm run check` completes all default JavaScript, source-runtime, Rust, and Electron lanes, port contracts pass, helper selection passes, and every selected browser spec actually executes. In particular require eight rollback tests, five Host Stats tests, both CLI tests after Task 2, and non-skipped build-mismatch tests. Keep the full logs and the actual counts instead of copying pre-merge counts. The container owns all started/stopped servers.
-
-The browser set also includes the preserved main behavior: `freshagent-settings-resume-rust.spec.ts`, `fresh-agent-model-dialog-parity.spec.ts`, `freshopencode-model-picker.spec.ts`, the affected `fresh-agent.spec.ts` queue/control cases, `sidebar-status-tier-sort-rust.spec.ts`, and `opencode-terminal-restore-rust.spec.ts`. Extend the draft command to include these files on the chosen backend. Do not treat fixed old counts as a ceiling; require all applicable scenarios, including incoming control cases, to execute.
+Require every applicable scenario to actually execute, including both CLI Host Stats actions, rollback/redo, build mismatch, incoming provider controls/settings/queue behavior, and sidebar sorting. Record actual counts and exclusions; selection or an old fixed count is not evidence. `npm run check` must cover default JavaScript, source-runtime, Rust workspace, and Electron lanes. Keep the explicit concurrent Task C fixture test even if the broad suite uses bounded/serial Rust execution.
 
 If dependencies in the reused sandbox cache no longer match the committed lockfile, run `scripts/sandbox-test.sh "npm ci --no-audit --no-fund"` before retrying; do not alter the lockfile to fit a stale cache. If container resource limits cause failure, diagnose that limit rather than rerunning destructive tests on the host.
 
