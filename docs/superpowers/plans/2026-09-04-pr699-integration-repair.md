@@ -13,7 +13,7 @@ Implement the PR699 integration repair plan with the standard the-usual workflow
 - Preserve Rust-only backend retirement and the integrated Host Stats, fresh-agent undo/redo, and other main-branch behavior.
 - Use red/green/refactor where applicable and meaningful behavior tests; do not skip tests, weaken coverage, or conceal flaky failures. Investigate and fix failures that block the required verification, including the reported executable-fixture CI failure.
 - Verify actual affected browser scenarios and all four native package platforms, not just test selection or installer creation.
-- Follow repository test coordination and sandbox rules. Do not silently change configured test backends or incur cloud-test costs without the required user choice.
+- Follow repository test coordination and sandbox rules. Use cloud tests for Vitest and browser coverage, with the required supplemental local sandbox checks; do not silently fall back from a failing cloud backend.
 - Keep commits focused, preserve unrelated agents' work, use the specified GitHub account, and leave a clean committed and pushed feature branch.
 - Do not merge the PR, deploy assets, restart production, or change the existing restart-survival guarantees.
 
@@ -125,7 +125,7 @@ These are bounded prerequisites for preserving integrated behavior and completin
 
 - [ ] Read `AGENTS.md` and `docs/development/test-sandbox.md` before execution. Confirm the current worktree is clean and belongs to PR699; do not touch the main checkout's unrelated edits.
 - [ ] Inspect `npm run test:status` before broad checks; wait for any foreign holder. Never kill another agent's test process.
-- [ ] Preserve the selected test backend. At plan-writing time neither backend preference was persistently configured; local focused review checks did not establish permission for paid cloud runs. Resolve an unset preference before broader execution. Never silently substitute local for a failing configured cloud backend.
+- [x] Preserve the selected test backend. Dan selected cloud tests on 2026-09-05, including the required supplemental local sandbox checks offered with that choice. Both preferences are persisted in `/home/dan/.bashrc`. Explicitly supply them to ongoing agent processes that predate that change. Never silently substitute local for a failing configured cloud backend.
 - [ ] Run process-kill, config-corruption, restart-storm, and owned-server browser suites only inside the disposable sandbox or a disposable CI runner. Never point tests at port 3001 or real user data.
 - [ ] Use explicit GitHub identity on every call, for example `GH_TOKEN="$(gh auth token --user danshapiro)" gh pr view 699 --repo danshapiro/freshell`. Preserve the existing noreply git identity.
 - [ ] Use red/green/refactor for Task 1's confirmed defect. Tasks 2–4 add tests of currently implemented behavior and may immediately pass; do not deliberately damage production code to manufacture a red phase. If a new assertion fails, preserve the failure and trace the calculation before changing implementation.
