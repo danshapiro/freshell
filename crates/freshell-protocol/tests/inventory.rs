@@ -92,7 +92,8 @@ fn terminal_replaced_roundtrips_camel_case() {
 /// parse; the new fields ride through).
 #[test]
 fn terminal_killed_roundtrips_camel_case() {
-    let json = r#"{"type":"terminal.killed","requestId":"req-kill-1","terminalId":"t-1","success":true}"#;
+    let json =
+        r#"{"type":"terminal.killed","requestId":"req-kill-1","terminalId":"t-1","success":true}"#;
     let msg: freshell_protocol::ServerMessage = serde_json::from_str(json).expect("parse");
     let back = serde_json::to_string(&msg).expect("serialize");
     let v: serde_json::Value = serde_json::from_str(&back).unwrap();
@@ -162,7 +163,10 @@ fn pane_opened_result_roundtrips_camel_case() {
     .expect("parse failure shape");
     let v: serde_json::Value = serde_json::to_value(&fail).unwrap();
     assert_eq!(v["success"], false);
-    assert_eq!(v["error"], "the open re-assertion could not be written durably");
+    assert_eq!(
+        v["error"],
+        "the open re-assertion could not be written durably"
+    );
 }
 
 /// Focused-episode-7 round 3 (Findings F1+F2, protocol v10): the batch
@@ -184,19 +188,17 @@ fn panes_closed_batch_and_pane_opened_roundtrip_camel_case() {
     assert_eq!(v["panes"][1]["createRequestId"], "req-b");
     assert!(v["panes"][1].get("terminalId").is_none(), "{v}");
 
-    let opened: freshell_protocol::ClientMessage = serde_json::from_str(
-        r#"{"type":"pane.opened","createRequestId":"req-a","tabId":"tab-9"}"#,
-    )
-    .expect("parse opened");
+    let opened: freshell_protocol::ClientMessage =
+        serde_json::from_str(r#"{"type":"pane.opened","createRequestId":"req-a","tabId":"tab-9"}"#)
+            .expect("parse opened");
     let v: serde_json::Value = serde_json::to_value(&opened).expect("serialize");
     assert_eq!(v["type"], "pane.opened");
     assert_eq!(v["createRequestId"], "req-a");
     assert_eq!(v["tabId"], "tab-9");
 
-    let result: freshell_protocol::ServerMessage = serde_json::from_str(
-        r#"{"type":"panes.closed.result","requestId":"bc-1","success":true}"#,
-    )
-    .expect("parse result");
+    let result: freshell_protocol::ServerMessage =
+        serde_json::from_str(r#"{"type":"panes.closed.result","requestId":"bc-1","success":true}"#)
+            .expect("parse result");
     let v: serde_json::Value = serde_json::to_value(&result).expect("serialize");
     assert_eq!(v["type"], "panes.closed.result");
     assert_eq!(v["requestId"], "bc-1");
@@ -207,10 +209,9 @@ fn panes_closed_batch_and_pane_opened_roundtrip_camel_case() {
 #[test]
 fn terminal_kill_accepts_and_carries_the_optional_correlation_fields() {
     // Legacy shape (no new fields) parses unchanged.
-    let legacy: freshell_protocol::ClientMessage = serde_json::from_str(
-        r#"{"type":"terminal.kill","terminalId":"t-1"}"#,
-    )
-    .expect("legacy parse");
+    let legacy: freshell_protocol::ClientMessage =
+        serde_json::from_str(r#"{"type":"terminal.kill","terminalId":"t-1"}"#)
+            .expect("legacy parse");
     let freshell_protocol::ClientMessage::TerminalKill(k) = legacy else {
         panic!("expected terminal.kill")
     };

@@ -414,7 +414,8 @@ async fn terminal_create_stamps_the_binding_row_from_the_connection_identity_and
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn fresh_marker_mode_pane_stamps_the_pending_marker_from_the_connection_identity_and_tab_id() {
+async fn fresh_marker_mode_pane_stamps_the_pending_marker_from_the_connection_identity_and_tab_id()
+{
     // Delta-r3 Finding 2 (restore-open-sessions-only): a connection-scoped
     // codex CLI create — the DYNAMIC-identity path (no sessionRef, no
     // pre-spawn binding; only claude preallocates) — must stamp the
@@ -694,7 +695,10 @@ async fn a_kill_before_identity_resolution_records_a_pane_close_the_late_resolut
     // single-threaded test runtime — drain frames instead (terminal.exit /
     // terminals.changed arrive on the success path).
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while server_ledger.pane_close_for_terminal(&terminal_id).is_none() {
+    while server_ledger
+        .pane_close_for_terminal(&terminal_id)
+        .is_none()
+    {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the pane close record never landed — the durable close under the pane's own identity"
@@ -753,7 +757,9 @@ async fn a_kill_before_identity_resolution_records_a_pane_close_the_late_resolut
     );
     assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
     assert!(
-        server_ledger.kill_tombstone_at("codex", "sess-late-resolve").is_some(),
+        server_ledger
+            .kill_tombstone_at("codex", "sess-late-resolve")
+            .is_some(),
         "the identity's kill fence folded"
     );
     let record = server_ledger
@@ -871,7 +877,10 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
     let row_path_row = server_ledger
         .load_binding("claude", &session_id)
         .expect("binding row written at create");
-    assert_eq!(row_path_row.create_request_id.as_deref(), Some("req-detach-close-1"));
+    assert_eq!(
+        row_path_row.create_request_id.as_deref(),
+        Some("req-detach-close-1")
+    );
 
     // THE PANE CLOSE: the dedicated evidence message, then the plain detach.
     let pane_closed = serde_json::json!({
@@ -879,7 +888,9 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
         "createRequestId": "req-detach-close-1",
         "terminalId": terminal_id,
     });
-    ws.send(WsMessage::Text(pane_closed.to_string())).await.unwrap();
+    ws.send(WsMessage::Text(pane_closed.to_string()))
+        .await
+        .unwrap();
     let detach = serde_json::json!({
         "type": "terminal.detach",
         "terminalId": terminal_id,
@@ -904,8 +915,14 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
     // fed, and the kill-lane pane read model stays empty (its terminalId arm
     // must never cover a later pane reattached to this STILL-RUNNING
     // terminal).
-    let row = server_ledger.load_binding("claude", &session_id).expect("row");
-    assert_eq!(row.state, RowState::Bound, "the detach close never retires the row");
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("row");
+    assert_eq!(
+        row.state,
+        RowState::Bound,
+        "the detach close never retires the row"
+    );
     assert_eq!(row.retired_reason, None);
     assert!(
         server_ledger.all_kill_tombstone_keys().is_empty(),
@@ -926,7 +943,10 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
     // record back from the journal.
     let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
     assert_eq!(disk.list_pane_detach_closes().len(), 1);
-    assert_eq!(disk.list_pane_detach_closes()[0].create_request_id, "req-detach-close-1");
+    assert_eq!(
+        disk.list_pane_detach_closes()[0].create_request_id,
+        "req-detach-close-1"
+    );
 
     // A terminalId-less pane.closed (the in-flight-create close shape of F2)
     // journals with NO terminal linkage.
@@ -934,7 +954,9 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
         "type": "pane.closed",
         "createRequestId": "req-inflight-close",
     });
-    ws.send(WsMessage::Text(pane_closed_flight.to_string())).await.unwrap();
+    ws.send(WsMessage::Text(pane_closed_flight.to_string()))
+        .await
+        .unwrap();
     // Fire a follow-up whose reply orders the read AFTER the journal.
     let create2 = serde_json::json!({
         "type": "terminal.create",
@@ -947,7 +969,11 @@ async fn a_pane_closed_message_journals_a_non_retiring_pane_close() {
     let created2 = next_frame_of_type(&mut ws, "terminal.created").await;
     let terminal_id_2 = created2["terminalId"].as_str().unwrap().to_string();
     let closes = server_ledger.list_pane_detach_closes();
-    assert_eq!(closes.len(), 2, "the in-flight close journaled too: {closes:?}");
+    assert_eq!(
+        closes.len(),
+        2,
+        "the in-flight close journaled too: {closes:?}"
+    );
     assert!(
         closes
             .iter()
@@ -996,16 +1022,14 @@ async fn a_pane_closed_is_answered_by_a_correlated_result_after_the_journal() {
 
     // The terminalId-bearing shape: the answer echoes BOTH identity keys and
     // the record is already durable when the answer arrives.
-    ws.send(
-        WsMessage::Text(
-            serde_json::json!({
-                "type": "pane.closed",
-                "createRequestId": "req-ack-1",
-                "terminalId": "term-no-such-terminal", // never registered: the record keys the pane, not the registry
-            })
-            .to_string(),
-        ),
-    )
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.closed",
+            "createRequestId": "req-ack-1",
+            "terminalId": "term-no-such-terminal", // never registered: the record keys the pane, not the registry
+        })
+        .to_string(),
+    ))
     .await
     .unwrap();
     let ack = next_frame_of_type(&mut ws, "pane.closed.result").await;
@@ -1016,20 +1040,22 @@ async fn a_pane_closed_is_answered_by_a_correlated_result_after_the_journal() {
         "a journaled close acknowledges success: {ack}"
     );
     let closes = server_ledger.list_pane_detach_closes();
-    assert_eq!(closes.len(), 1, "the answer follows the durable write: {closes:?}");
+    assert_eq!(
+        closes.len(),
+        1,
+        "the answer follows the durable write: {closes:?}"
+    );
     assert_eq!(closes[0].create_request_id, "req-ack-1");
 
     // The in-flight-create shape (NO terminalId) answers the same way, the
     // terminalId key absent from the wire.
-    ws.send(
-        WsMessage::Text(
-            serde_json::json!({
-                "type": "pane.closed",
-                "createRequestId": "req-ack-2",
-            })
-            .to_string(),
-        ),
-    )
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.closed",
+            "createRequestId": "req-ack-2",
+        })
+        .to_string(),
+    ))
     .await
     .unwrap();
     let ack2 = next_frame_of_type(&mut ws, "pane.closed.result").await;
@@ -1078,20 +1104,18 @@ async fn a_panes_closed_batch_is_journaled_as_one_envelope_and_answered_once() {
         .unwrap()
         .to_string();
 
-    ws.send(
-        WsMessage::Text(
-            serde_json::json!({
-                "type": "panes.closed",
-                "requestId": "batch-close-1",
-                "tabId": "tab-batch",
-                "panes": [
-                    { "createRequestId": "req-batch-a", "terminalId": terminal_id },
-                    { "createRequestId": "req-batch-b" },
-                ],
-            })
-            .to_string(),
-        ),
-    )
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "panes.closed",
+            "requestId": "batch-close-1",
+            "tabId": "tab-batch",
+            "panes": [
+                { "createRequestId": "req-batch-a", "terminalId": terminal_id },
+                { "createRequestId": "req-batch-b" },
+            ],
+        })
+        .to_string(),
+    ))
     .await
     .unwrap();
     let result = next_frame_of_type(&mut ws, "panes.closed.result").await;
@@ -1104,10 +1128,7 @@ async fn a_panes_closed_batch_is_journaled_as_one_envelope_and_answered_once() {
     closes.sort_by(|a, b| a.create_request_id.cmp(&b.create_request_id));
     assert_eq!(closes.len(), 2, "both panes covered: {closes:?}");
     assert_eq!(closes[0].create_request_id, "req-batch-a");
-    assert_eq!(
-        closes[0].terminal_id.as_deref(),
-        Some(terminal_id.as_str())
-    );
+    assert_eq!(closes[0].terminal_id.as_deref(), Some(terminal_id.as_str()));
     assert_eq!(closes[1].create_request_id, "req-batch-b");
     assert_eq!(closes[1].terminal_id, None, "the CRID-only pane shape");
     let row = server_ledger
@@ -1135,7 +1156,9 @@ async fn a_panes_closed_batch_is_journaled_as_one_envelope_and_answered_once() {
             "panes": [{ "createRequestId": "" }],
         }),
     ] {
-        ws.send(WsMessage::Text(malformed.to_string())).await.unwrap();
+        ws.send(WsMessage::Text(malformed.to_string()))
+            .await
+            .unwrap();
         let bad = next_frame_of_type(&mut ws, "panes.closed.result").await;
         assert_eq!(bad["success"], false, "malformed batch: {bad}");
         assert!(bad["error"].is_string(), "the error names it: {bad}");
@@ -1181,21 +1204,21 @@ async fn a_pane_opened_consumes_the_committed_close_durably() {
         .as_str()
         .unwrap()
         .to_string();
-    let bound = server_ledger.load_binding("claude", &session_id).expect("row");
+    let bound = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("row");
     assert_eq!(bound.tab_key.as_deref(), Some("device-po:tab-po"));
 
     // THE COMMITTED CLOSE — acknowledged server-side, the ack lost on the wire
     // (the client keeps the pane; only the record proves "closed").
-    ws.send(
-        WsMessage::Text(
-            serde_json::json!({
-                "type": "pane.closed",
-                "createRequestId": "req-po",
-                "terminalId": terminal_id,
-            })
-            .to_string(),
-        ),
-    )
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.closed",
+            "createRequestId": "req-po",
+            "terminalId": terminal_id,
+        })
+        .to_string(),
+    ))
     .await
     .unwrap();
     let ack = next_frame_of_type(&mut ws, "pane.closed.result").await;
@@ -1208,16 +1231,14 @@ async fn a_pane_opened_consumes_the_committed_close_durably() {
     // `pane.opened.result{createRequestId, success}` once the consumption +
     // re-assertion resolved, so the client learn of (and retries) a failed
     // consume rather than it sitting log-only.
-    ws.send(
-        WsMessage::Text(
-            serde_json::json!({
-                "type": "pane.opened",
-                "createRequestId": "req-po",
-                "tabId": "tab-po",
-            })
-            .to_string(),
-        ),
-    )
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.opened",
+            "createRequestId": "req-po",
+            "tabId": "tab-po",
+        })
+        .to_string(),
+    ))
     .await
     .unwrap();
     let opened = next_frame_of_type(&mut ws, "pane.opened.result").await;
@@ -1229,7 +1250,9 @@ async fn a_pane_opened_consumes_the_committed_close_durably() {
         "the re-assertion consumed the committed close: {:?}",
         server_ledger.list_pane_detach_closes()
     );
-    let row = server_ledger.load_binding("claude", &session_id).expect("row");
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("row");
     assert_eq!(row.state, RowState::Bound);
     assert_eq!(row.create_request_id.as_deref(), Some("req-po"));
     // Durable: a restart over the same dir never re-feeds the consumed close.
@@ -1278,16 +1301,14 @@ async fn a_failed_pane_opened_is_answered_and_the_retry_consumes_durably() {
     assert!(server_ledger.load_binding("claude", &session_id).is_some());
 
     // The committed close (its ack lost on the finding's wire).
-    ws.send(
-        WsMessage::Text(
-            serde_json::json!({
-                "type": "pane.closed",
-                "createRequestId": "req-pf",
-                "terminalId": terminal_id,
-            })
-            .to_string(),
-        ),
-    )
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "pane.closed",
+            "createRequestId": "req-pf",
+            "terminalId": terminal_id,
+        })
+        .to_string(),
+    ))
     .await
     .unwrap();
     let ack = next_frame_of_type(&mut ws, "pane.closed.result").await;
@@ -1333,8 +1354,14 @@ async fn a_failed_pane_opened_is_answered_and_the_retry_consumes_durably() {
         "the retry consumed the standing close: {:?}",
         server_ledger.list_pane_detach_closes()
     );
-    let row = server_ledger.load_binding("claude", &session_id).expect("row");
-    assert_eq!(row.state, RowState::Bound, "the open pane's row was never retired");
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("row");
+    assert_eq!(
+        row.state,
+        RowState::Bound,
+        "the open pane's row was never retired"
+    );
     let disk = PaneLedger::new(Some(dir.clone()));
     assert!(
         disk.list_pane_detach_closes().is_empty(),
@@ -1348,7 +1375,9 @@ async fn a_failed_pane_opened_is_answered_and_the_retry_consumes_durably() {
         "createRequestId": "",
         "tabId": "tab-pf",
     });
-    ws.send(WsMessage::Text(malformed.to_string())).await.unwrap();
+    ws.send(WsMessage::Text(malformed.to_string()))
+        .await
+        .unwrap();
     let bad = next_frame_of_type(&mut ws, "pane.opened.result").await;
     assert_eq!(bad["success"], false, "malformed re-assertion: {bad}");
     assert!(bad["error"].is_string(), "the error names it: {bad}");
@@ -1403,7 +1432,9 @@ async fn an_attach_carrying_the_new_panes_identity_restamps_the_bound_row() {
         "createRequestId": "req-OLD-pane",
         "terminalId": terminal_id,
     });
-    ws.send(WsMessage::Text(pane_closed.to_string())).await.unwrap();
+    ws.send(WsMessage::Text(pane_closed.to_string()))
+        .await
+        .unwrap();
     let detach = serde_json::json!({
         "type": "terminal.detach",
         "terminalId": terminal_id,
@@ -1460,7 +1491,9 @@ async fn an_attach_carrying_the_new_panes_identity_restamps_the_bound_row() {
     });
     ws.send(WsMessage::Text(attach2.to_string())).await.unwrap();
     let _ = next_frame_of_type(&mut ws, "terminal.attach.ready").await;
-    let row = server_ledger.load_binding("claude", &session_id).expect("row");
+    let row = server_ledger
+        .load_binding("claude", &session_id)
+        .expect("row");
     assert_eq!(
         row.updated_at, updated_at_after_restamp,
         "a same-pane attach writes nothing"
@@ -1477,7 +1510,9 @@ async fn an_attach_carrying_the_new_panes_identity_restamps_the_bound_row() {
 
     // Durable across a restart.
     let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone()));
-    let row = disk.load_binding("claude", &session_id).expect("durable reload");
+    let row = disk
+        .load_binding("claude", &session_id)
+        .expect("durable reload");
     assert_eq!(row.create_request_id.as_deref(), Some("req-NEW-pane"));
     assert_eq!(row.tab_key.as_deref(), Some("device-rt:tab-NEW"));
 
@@ -1699,9 +1734,7 @@ async fn a_kill_whose_row_projection_fails_still_ends_the_terminal_and_converges
         let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await;
     }
     let disk = PaneLedger::new(Some(dir.clone()));
-    let row = disk
-        .load_binding("codex", session_id)
-        .expect("row on disk");
+    let row = disk.load_binding("codex", session_id).expect("row on disk");
     assert_eq!(
         row.state,
         RowState::Bound,
@@ -1712,8 +1745,7 @@ async fn a_kill_whose_row_projection_fails_still_ends_the_terminal_and_converges
         "the close fence stands durable (fed by the journal record)"
     );
     assert!(
-        disk
-            .dominant_kill_tombstone_keys()
+        disk.dominant_kill_tombstone_keys()
             .contains(&("codex".to_string(), session_id.to_string())),
         "the Bound row is dominated: it reads closed at every offer boundary (never restored)"
     );

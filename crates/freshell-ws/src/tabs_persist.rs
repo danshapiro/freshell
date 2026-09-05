@@ -56,9 +56,7 @@ pub struct RetainedSnapshotReferences {
 /// an ERROR — the pane-ledger caller maps `Err` to "references unknown", the
 /// keep-everything arm: over-pruning close evidence from an incomplete scan
 /// is never acceptable. A missing root is absence (empty, not error).
-pub fn retained_snapshot_references(
-    dir: &Path,
-) -> std::io::Result<RetainedSnapshotReferences> {
+pub fn retained_snapshot_references(dir: &Path) -> std::io::Result<RetainedSnapshotReferences> {
     with_persist_lock(|| {
         let mut refs = RetainedSnapshotReferences::default();
         for device in list_snapshot_devices_locked(dir)? {

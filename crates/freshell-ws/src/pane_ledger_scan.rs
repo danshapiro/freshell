@@ -496,11 +496,9 @@ impl PaneLedger {
             Vec::new()
         };
         let row_covered = index.bindings.values().any(|row| {
-            close_record_covers_row(
-                row,
-                &|id: &str| record_crids.contains(&id),
-                &|id: &str| detach_terminal_ids.contains(&id),
-            )
+            close_record_covers_row(row, &|id: &str| record_crids.contains(&id), &|id: &str| {
+                detach_terminal_ids.contains(&id)
+            })
         });
         if row_covered {
             return;

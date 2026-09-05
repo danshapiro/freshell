@@ -230,8 +230,8 @@ impl PaneIdentitySink for TestLedgerSink {
                     now,
                 )
             })
-                .await
-                .map_err(std::io::Error::other)?
+            .await
+            .map_err(std::io::Error::other)?
         })
     }
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {

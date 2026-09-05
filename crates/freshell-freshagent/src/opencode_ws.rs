@@ -532,11 +532,18 @@ impl FreshOpencodeState {
     /// an `Err` (io failure deciding or writing) provably left the durable
     /// close untouched (round 5, focused-ep5-r4 Finding 5): warn-loud and
     /// report false — the caller tears the session down, kill wins.
-    async fn commit_session_claim(&self, durable_id: &str, expect_killed_at_ms: Option<i64>) -> bool {
+    async fn commit_session_claim(
+        &self,
+        durable_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> bool {
         let Some(sink) = self.identity_sink() else {
             return true;
         };
-        match sink.commit_claim(PROVIDER, durable_id, expect_killed_at_ms).await {
+        match sink
+            .commit_claim(PROVIDER, durable_id, expect_killed_at_ms)
+            .await
+        {
             Ok(crate::identity_sink::ClaimCommit::Committed) => true,
             Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
                 tracing::info!(target: "freshell_freshagent::opencode",
@@ -1261,16 +1268,17 @@ impl FreshOpencodeState {
             // placeholder-keyed close IS the fresh-agent lane's close
             // record (delta-r6-r2), so a kill with nothing else to close
             // still writes it.
-            let consider = |retire_ids: &mut Vec<String>, marker_ids: &mut Vec<String>, id: &str| {
-                if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
-                    && !marker_ids.iter().any(|m| m == id)
-                {
-                    marker_ids.push(id.to_string());
-                }
-                if !retire_ids.iter().any(|r| r == id) {
-                    retire_ids.push(id.to_string());
-                }
-            };
+            let consider =
+                |retire_ids: &mut Vec<String>, marker_ids: &mut Vec<String>, id: &str| {
+                    if id.starts_with(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                        && !marker_ids.iter().any(|m| m == id)
+                    {
+                        marker_ids.push(id.to_string());
+                    }
+                    if !retire_ids.iter().any(|r| r == id) {
+                        retire_ids.push(id.to_string());
+                    }
+                };
             if let Some(session_arc) = &session_arc {
                 let mut s = session_arc.lock().await;
                 {
@@ -1384,7 +1392,12 @@ impl FreshOpencodeState {
                     .into_iter()
                     .collect();
                 s.killed.store(true, Ordering::SeqCst);
-                (s.turn_task.take(), s.serve_bridge.take(), s.real_session_id.clone(), strays)
+                (
+                    s.turn_task.take(),
+                    s.serve_bridge.take(),
+                    s.real_session_id.clone(),
+                    strays,
+                )
             };
             // DEFENSIVE invariant probe (F6, must never fire): an identity
             // discovered here slipped the phase-1 gate. Retire it under the
@@ -3011,7 +3024,10 @@ impl FreshOpencodeState {
         // dropped, bridge aborted, lease failed open) — a revoked lease whose
         // dead-state is UNCHANGED (an expired handle-less holder, no kill)
         // still commits and keeps the registered session (the round-3 keep).
-        if !self.commit_session_claim(session_id, claim_dead_state).await {
+        if !self
+            .commit_session_claim(session_id, claim_dead_state)
+            .await
+        {
             // Round 6 lock order (focused-ep5-r5 Finding 1): the map removal
             // is its OWN synchronous critical section, completed before the
             // session-lock teardown begins. (The pre-fix `if let Some(removed)
@@ -3729,7 +3745,9 @@ mod tests {
         let state = FreshOpencodeState::new(fresh_agent);
 
         let started = std::time::Instant::now();
-        let out = state.resume_durable_session("ses_wedged_1", None, None).await;
+        let out = state
+            .resume_durable_session("ses_wedged_1", None, None)
+            .await;
         std::env::remove_var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS");
         assert!(
             matches!(out, Err(ResumeOpencodeError::Manager(_))),
@@ -3976,7 +3994,11 @@ mod tests {
         st.handle_create(create_msg("req-kill-retire"), None).await;
         let placeholder = "freshopencode-req-kill-retire";
         assert!(
-            fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
             "precondition: create recorded the pending marker"
         );
         st.handle_send(send_msg(placeholder, "hi")).await;
@@ -4031,7 +4053,11 @@ mod tests {
         st.handle_create(create_msg("req-kill-pending"), None).await;
         let placeholder = "freshopencode-req-kill-pending";
         assert!(
-            fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
             "precondition: create recorded the pending marker"
         );
 
@@ -4043,7 +4069,12 @@ mod tests {
         })
         .await;
         assert!(
-            !fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p.as_str() == placeholder),
+            !fake
+                .pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p.as_str() == placeholder),
             "the pre-materialization kill must delete the pending marker"
         );
         // Focused-episode-6 round 3, Finding 1: the marker delete alone is
@@ -4188,7 +4219,8 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(create_msg("req-kill-before-lock"), None).await;
+        st.handle_create(create_msg("req-kill-before-lock"), None)
+            .await;
         let placeholder = "freshopencode-req-kill-before-lock";
         st.handle_send(send_msg(placeholder, "materialize")).await;
         let session_arc = {
@@ -4234,7 +4266,11 @@ mod tests {
             fake.retires.lock().unwrap()
         );
         assert!(
-            fake.pendings.lock().unwrap().iter().any(|(p, _, _)| p == placeholder),
+            fake.pendings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _, _)| p == placeholder),
             "the pending marker stands (nothing deleted) while the kill parks"
         );
         assert!(
@@ -4313,7 +4349,11 @@ mod tests {
             "a failed durable close must never mark the session killed"
         );
         assert!(
-            !fake.retires.lock().unwrap().contains(&("opencode".to_string(), "ses_1".to_string())),
+            !fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("opencode".to_string(), "ses_1".to_string())),
             "sanity: the failed retire recorded nothing"
         );
         assert!(
@@ -4347,7 +4387,8 @@ mod tests {
     /// never a live session beside durable close evidence) while the answer
     /// reports `success:false`.
     #[tokio::test]
-    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly() {
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly(
+    ) {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let (manager, _killed) = started_manager().await;
@@ -4430,7 +4471,8 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(create_msg("req-kill-one-envelope"), None).await;
+        st.handle_create(create_msg("req-kill-one-envelope"), None)
+            .await;
         let placeholder = "freshopencode-req-kill-one-envelope";
         st.handle_send(send_msg(placeholder, "materialize")).await;
         let session_arc = {
@@ -4459,7 +4501,10 @@ mod tests {
         );
         let (provider, ids, pendings) = &batches[0];
         assert_eq!(provider, "opencode");
-        assert!(ids.contains(&"ses_1".to_string()), "the envelope covers the durable id: {ids:?}");
+        assert!(
+            ids.contains(&"ses_1".to_string()),
+            "the envelope covers the durable id: {ids:?}"
+        );
         // Focused-episode-6 round 3, Finding 1: the placeholder is close
         // evidence too, not only a marker — it belongs in the IDENTITY set of
         // every kill's envelope (a placeholder-claiming retained snapshot
@@ -4562,7 +4607,8 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(create_msg("req-kill-late-order"), None).await;
+        st.handle_create(create_msg("req-kill-late-order"), None)
+            .await;
         let placeholder = "freshopencode-req-kill-late-order";
         let session_arc = {
             let sessions = st.sessions.lock().await;
@@ -4607,7 +4653,10 @@ mod tests {
             .await
             .expect("the kill completes")
             .expect("kill task completed");
-        assert!(killed_flag.load(Ordering::SeqCst), "post-close the flag stands");
+        assert!(
+            killed_flag.load(Ordering::SeqCst),
+            "post-close the flag stands"
+        );
         assert!(
             fake.retires
                 .lock()
@@ -4636,7 +4685,8 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(create_msg("req-kill-late-fails"), None).await;
+        st.handle_create(create_msg("req-kill-late-fails"), None)
+            .await;
         let placeholder = "freshopencode-req-kill-late-fails";
         let session_arc = {
             let sessions = st.sessions.lock().await;
@@ -4685,7 +4735,9 @@ mod tests {
         );
         let retires = fake.retires.lock().unwrap().clone();
         assert!(
-            !retires.iter().any(|(_, id)| id == "ses_late" || id == placeholder),
+            !retires
+                .iter()
+                .any(|(_, id)| id == "ses_late" || id == placeholder),
             "NOTHING of the close is durable — no placeholder fence stands to mis-close \
              the preserved live session (F6's exact regression): {retires:?}"
         );
@@ -4795,7 +4847,11 @@ mod tests {
         // Drive the kill's state reach directly (same-crate white-box seam):
         // what the send must obey is the killed flag the kill sets inside its
         // session-lock phase.
-        session_arc.lock().await.killed.store(true, Ordering::SeqCst);
+        session_arc
+            .lock()
+            .await
+            .killed
+            .store(true, Ordering::SeqCst);
 
         st.handle_send(send_msg(placeholder, "hi")).await;
 
@@ -5017,7 +5073,8 @@ mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(create_msg("req-lock-order-teardown"), None).await;
+        st.handle_create(create_msg("req-lock-order-teardown"), None)
+            .await;
         let placeholder = "freshopencode-req-lock-order-teardown";
         // Materialize (a first send through the fake serve), so the kill's
         // retire batch has the durable id (`ses_1`) to close.
@@ -5049,7 +5106,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("the kill parked inside its durable close");
         assert!(
-            fake.kill_tombstone_at_ms("opencode", "ses_1") .is_some(),
+            fake.kill_tombstone_at_ms("opencode", "ses_1").is_some(),
             "the close is already recorded (the stall only parks the answer)"
         );
 
@@ -5120,7 +5177,8 @@ mod tests {
         // registered, so its real teardown body is what the probe covers).
         let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
         let st2 = state.clone();
-        let mut attach = tokio::spawn(async move { st2.handle_attach(attach_msg(DURABLE_ID)).await });
+        let mut attach =
+            tokio::spawn(async move { st2.handle_attach(attach_msg(DURABLE_ID)).await });
         gate.entered
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("the resume reached its commit");
@@ -5955,9 +6013,15 @@ mod tests {
             .iter()
             .find(|b| b.session_id.starts_with("ses_"))
             .expect("binding at materialization");
-        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-oc"));
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-oc")
+        );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-oc"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-oc:tab-oc"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-oc:tab-oc")
+        );
     }
 
     // ── P1.13 Task 8: settings-from-ledger resume (attach + create-with-resume) ──
@@ -6304,7 +6368,10 @@ mod tests {
             })
             .await;
         let claim_start_snapshot = fake.kill_tombstone_at_ms("opencode", DURABLE_ID);
-        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
 
         // Gate the claim's commit, then start the resume.
         let gate = fake.arm_claim_commit_gate("opencode", DURABLE_ID);
@@ -6608,7 +6675,10 @@ mod tests {
             "stale/None: the resume must stamp the CURRENT connection"
         );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
     }
 
     /// Focused-ep1 Finding A (branch 1 — same-process in-memory hit): a
@@ -6620,8 +6690,7 @@ mod tests {
     /// REPLACE rule then cements the stale tab into the recovery-offer
     /// placement data).
     #[tokio::test]
-    async fn create_resume_hitting_the_in_memory_map_restamps_the_current_connections_provenance()
-    {
+    async fn create_resume_hitting_the_in_memory_map_restamps_the_current_connections_provenance() {
         let (state, _killed) = state().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         state.set_identity_sink(fake.clone());
@@ -6697,7 +6766,10 @@ mod tests {
                 "the in-memory resume must NOT keep re-asserting the OLD connection"
             );
             assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-            assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
         }
 
         // …and a SUBSEQUENT per-send refresh write asserts the CURRENT
@@ -6709,9 +6781,15 @@ mod tests {
             .rev()
             .find(|b| b.session_id == durable_id)
             .expect("the post-resume send's refresh write");
-        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-new"));
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new")
+        );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
     }
 
     /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
@@ -6720,8 +6798,8 @@ mod tests {
     /// the row's provenance to the CURRENT connection: the provenance refresh,
     /// not the settings write, is the point of the resume refresh.
     #[tokio::test]
-    async fn create_resume_with_a_lineage_only_row_still_restamps_the_current_connections_provenance()
-    {
+    async fn create_resume_with_a_lineage_only_row_still_restamps_the_current_connections_provenance(
+    ) {
         let (state, _rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         // A lineage-only row (the "default settings" shape): binding lineage
@@ -6780,7 +6858,10 @@ mod tests {
             "the provenance refresh must not be gated on settings presence"
         );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
         // Settings merge stays as-is: no recoverable snapshot ⇒ the write
         // carries a blank (replace-no-op) settings payload — never invented
         // defaults, and the row stays lineage-only.
@@ -6900,7 +6981,11 @@ mod tests {
 
         let (sink, captured) = capturing_sink();
         state
-            .handle_fork(fork_msg(DURABLE_ID, "fork-req-cold-chain", None), None, sink)
+            .handle_fork(
+                fork_msg(DURABLE_ID, "fork-req-cold-chain", None),
+                None,
+                sink,
+            )
             .await;
         let frames = captured.lock().expect("captured mutex").clone();
         let child_id = match frames.as_slice() {
@@ -6941,8 +7026,14 @@ mod tests {
             Some("client-chain"),
             "the child row must carry the RESUME connection's identity, not None"
         );
-        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-chain"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-chain:tab-chain"));
+        assert_eq!(
+            b.asserted_stamps().device_id.as_deref(),
+            Some("device-chain")
+        );
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-chain:tab-chain")
+        );
     }
 
     /// The paired never-invent pin (session-level twin of
@@ -7014,10 +7105,9 @@ mod tests {
                 .expect("the attach-resume registered the session")
                 .lock()
                 .await;
-            let p = s
-                .provenance
-                .clone()
-                .expect("the conn-less cold attach seeds the parked provenance from the durable row");
+            let p = s.provenance.clone().expect(
+                "the conn-less cold attach seeds the parked provenance from the durable row",
+            );
             assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
             assert_eq!(p.device_id.as_deref(), Some("device-row"));
             assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
@@ -7063,7 +7153,10 @@ mod tests {
             "the child row inherits the row-seeded provenance, not a fork-time None"
         );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-row"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
     }
 
     /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
@@ -7117,7 +7210,11 @@ mod tests {
             .rev()
             .find(|b| b.session_id == DURABLE_ID)
             .expect("the attach-resume refresh write (settings recovered)");
-        assert_eq!(b.asserted_stamps().client_instance_id, None, "never write invented stamps");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id,
+            None,
+            "never write invented stamps"
+        );
         assert_eq!(b.asserted_stamps().device_id, None);
         assert_eq!(b.asserted_stamps().tab_key, None);
     }
@@ -7204,7 +7301,10 @@ mod tests {
             "the fork child row stamps the FORKING connection, not the parent's stale park"
         );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-b"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-b:tab-b"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-b:tab-b")
+        );
     }
 
     /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
@@ -7213,8 +7313,8 @@ mod tests {
     /// with a parent that parks nothing the child stamps fall back to the
     /// parent's DURABLE ROW (the last source that knows the attribution).
     #[tokio::test]
-    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty()
-     {
+    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty(
+    ) {
         let (state, _rx) = state_with_durable_serve_session().await;
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         // The parent's durable row knows the attribution (lineage-only
@@ -7285,7 +7385,10 @@ mod tests {
             "the child row falls back to the parent's durable row stamps, not a hollow None"
         );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-row"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
     }
 
     /// Focused-ep1-r5 Finding 2 (the cold-resume park, `resume_durable_session`):
@@ -7344,7 +7447,10 @@ mod tests {
         }
         let bindings = fake.bindings.lock().unwrap();
         assert_eq!(
-            bindings.iter().filter(|b| b.session_id == DURABLE_ID).count(),
+            bindings
+                .iter()
+                .filter(|b| b.session_id == DURABLE_ID)
+                .count(),
             1,
             "a hollow provenance does not fire the refresh gate (only the seed row exists)"
         );
@@ -7412,7 +7518,10 @@ mod tests {
         }
         let bindings = fake.bindings.lock().unwrap();
         assert_eq!(
-            bindings.iter().filter(|b| b.session_id == DURABLE_ID).count(),
+            bindings
+                .iter()
+                .filter(|b| b.session_id == DURABLE_ID)
+                .count(),
             rows_before,
             "a hollow in-memory resume writes nothing (like the conn-less resume)"
         );
@@ -9915,8 +10024,12 @@ mod tests {
         insert_fork_parent(&st, "ses_parent", None, None, None).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-6", Some("msg_abc")), None, sink)
-            .await;
+        st.handle_fork(
+            fork_msg("ses_parent", "fork-req-6", Some("msg_abc")),
+            None,
+            sink,
+        )
+        .await;
 
         assert_eq!(captured.lock().unwrap().len(), 1, "the forked reply landed");
         let forks = http.fork_requests();

@@ -1508,15 +1508,16 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
     assert!(refs.create_request_ids.contains("cr-other"));
     assert!(refs.terminal_ids.contains("term-9"));
     assert!(refs.terminal_ids.contains("term-other"));
-    assert!(refs.claims.contains(&("codex".to_string(), "S-1".to_string())));
+    assert!(refs
+        .claims
+        .contains(&("codex".to_string(), "S-1".to_string())));
     assert!(
         refs.claims
             .contains(&("opencode".to_string(), "freshopencode-cr-7".to_string())),
         "the placeholder claim is a reference: {refs:?}"
     );
     assert!(
-        refs
-            .session_keys
+        refs.session_keys
             .contains(&("claude".to_string(), "ph-sk-1".to_string()))
             && refs
                 .session_keys
@@ -1537,7 +1538,11 @@ fn retained_snapshot_references_collect_every_pane_identity_shape() {
     // caller treats as unknown).
     let empty = tempfile::tempdir().unwrap();
     let refs = retained_snapshot_references(empty.path()).expect("missing root io");
-    assert!(refs.create_request_ids.is_empty() && refs.terminal_ids.is_empty() && refs.claims.is_empty());
+    assert!(
+        refs.create_request_ids.is_empty()
+            && refs.terminal_ids.is_empty()
+            && refs.claims.is_empty()
+    );
     assert!(refs.session_keys.is_empty());
 
     // Fail-loud like the store's other readers: a corrupt generation file is

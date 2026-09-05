@@ -331,7 +331,13 @@ fn a_live_shell_pane_verdicts_live_via_its_live_terminal_id() {
     };
     // No rows anywhere (shells never write ledger rows) and no durable claims
     // — only the terminal-id evidence.
-    let out = build_inventory(vec![d], vec![], live_terminals(&["t-shell"]), &no_evidence(), &no_closes());
+    let out = build_inventory(
+        vec![d],
+        vec![],
+        live_terminals(&["t-shell"]),
+        &no_evidence(),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(
         pane["live"], true,
@@ -362,7 +368,10 @@ fn a_shell_pane_whose_terminal_is_not_live_stays_dead() {
     };
     let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes());
     let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["live"], false, "no live-terminal membership, no liveness: {pane}");
+    assert_eq!(
+        pane["live"], false,
+        "no live-terminal membership, no liveness: {pane}"
+    );
     assert_eq!(pane["ledgerState"], "unknown", "{pane}");
 }
 
@@ -385,9 +394,18 @@ fn a_close_covered_pane_stays_non_live_even_while_its_terminal_still_runs() {
         ),
     };
     let closes = closes_with("t-mid-close", Some("req-mid-close"), &[], &[]);
-    let out = build_inventory(vec![d], vec![], live_terminals(&["t-mid-close"]), &no_evidence(), &closes);
+    let out = build_inventory(
+        vec![d],
+        vec![],
+        live_terminals(&["t-mid-close"]),
+        &no_evidence(),
+        &closes,
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["ledgerState"], "closed", "the close evidence owns the verdict: {pane}");
+    assert_eq!(
+        pane["ledgerState"], "closed",
+        "the close evidence owns the verdict: {pane}"
+    );
     assert_eq!(
         pane["live"], false,
         "a mid-teardown terminal is Running but the pane was CLOSED — never live: {pane}"
@@ -422,7 +440,10 @@ fn the_durable_ref_arm_stays_primary_and_the_terminal_id_fallback_agrees() {
         &no_closes(),
     );
     let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["live"], true, "the durable-ref arm alone verdicts live: {pane}");
+    assert_eq!(
+        pane["live"], true,
+        "the durable-ref arm alone verdicts live: {pane}"
+    );
     assert_eq!(pane["ledgerState"], "bound", "{pane}");
     // Both arms: identical verdict and liveness.
     let out = build_inventory(
@@ -463,7 +484,13 @@ fn newest_device_wins_others_summarized() {
             json!([{ "paneId": "p1", "kind": "terminal", "payload": {"mode": "shell", "initialCwd": "/w"} }]),
         ),
     };
-    let out = build_inventory(vec![old, new], vec![], no_live(), &no_evidence(), &no_closes());
+    let out = build_inventory(
+        vec![old, new],
+        vec![],
+        no_live(),
+        &no_evidence(),
+        &no_closes(),
+    );
     assert_eq!(out["recoverable"], true);
     assert_eq!(out["device"]["deviceId"], "dev1");
     assert_eq!(out["device"]["tabs"][0]["panes"][0]["cwd"], "/w");
@@ -495,7 +522,9 @@ fn ledger_bound_row_overrides_snapshot_claim_via_superseded_chain() {
         vec![d],
         bindings,
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["ledgerState"], "bound");
     assert_eq!(pane["sessionRef"]["sessionId"], "S2"); // ledger identity beat the snapshot claim
@@ -546,7 +575,9 @@ fn unattributed_rows_are_never_offered() {
         vec![],
         vec![binding_row("codex", "C9", bound())],
         no_live(),
-        &no_evidence(), &no_closes());
+        &no_evidence(),
+        &no_closes(),
+    );
     assert_eq!(out["recoverable"], false);
     assert!(out["device"].is_null());
     assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
@@ -566,7 +597,9 @@ fn unattributed_rows_are_never_offered() {
         vec![d],
         vec![binding_row("codex", "C9", bound())],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
 }
 
@@ -602,7 +635,9 @@ fn bound_row_referenced_by_non_primary_device_is_not_ledger_only() {
             "t9",
         )],
         no_live(),
-        &evidence(&[("dev1", &[("c9", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c9", 5_000)])]),
+        &no_closes(),
+    );
     assert_eq!(out["device"]["deviceId"], "dev1"); // dev0 is NON-primary
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
@@ -650,7 +685,9 @@ fn live_effective_ref_marks_pane_live_and_live_rows_become_reattach_candidates()
         vec![d],
         bindings,
         live(&[("claude", "S2"), ("codex", "C9")]),
-        &evidence(&[("dev1", &[("c9", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c9", 5_000)])]),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["live"], true);
     assert_eq!(pane["sessionRef"]["sessionId"], "S2"); // ref still reported; the CLIENT strips it (Task 4, D7)
@@ -660,15 +697,28 @@ fn live_effective_ref_marks_pane_live_and_live_rows_become_reattach_candidates()
     let entry = only
         .iter()
         .find(|e| e["sessionId"] == "C9")
-        .unwrap_or_else(|| panic!("the live attributed placement-valid row is offERED as a reattach candidate: {out}"));
+        .unwrap_or_else(|| {
+            panic!(
+                "the live attributed placement-valid row is offERED as a reattach candidate: {out}"
+            )
+        });
     assert_eq!(only.len(), 1, "S2 stays referenced; C9 alone joins: {out}");
-    assert_eq!(entry["live"], true, "the live verdict rides the offer entry: {entry}");
+    assert_eq!(
+        entry["live"], true,
+        "the live verdict rides the offer entry: {entry}"
+    );
     assert_eq!(
         entry["liveTerminalId"], "term-c9-live",
         "the row's still-running terminal id arms the client reattach: {entry}"
     );
-    assert_eq!(entry["tabKey"], "dev1:t9", "the original-tab join key: {entry}");
-    assert!(entry.get("paneKind").is_none(), "a terminal row carries no paneKind: {entry}");
+    assert_eq!(
+        entry["tabKey"], "dev1:t9",
+        "the original-tab join key: {entry}"
+    );
+    assert!(
+        entry.get("paneKind").is_none(),
+        "a terminal row carries no paneKind: {entry}"
+    );
 
     // The dead twin: same row, no live evidence — the pre-existing D8 resume
     // cohort. Still offered (never the pinned exclusion), stamped live:false
@@ -693,13 +743,18 @@ fn live_effective_ref_marks_pane_live_and_live_rows_become_reattach_candidates()
             c9_dead,
         ],
         no_live(),
-        &evidence(&[("dev1", &[("c9", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c9", 5_000)])]),
+        &no_closes(),
+    );
     let only_dead = out_dead["ledgerOnly"].as_array().unwrap();
     let entry_dead = only_dead
         .iter()
         .find(|e| e["sessionId"] == "C9")
         .expect("the dead twin stays offered (the D8 resume cohort)");
-    assert_eq!(entry_dead["live"], false, "no live evidence, no live stamp: {entry_dead}");
+    assert_eq!(
+        entry_dead["live"], false,
+        "no live evidence, no live stamp: {entry_dead}"
+    );
     assert!(
         entry_dead.get("liveTerminalId").is_none() || entry_dead["liveTerminalId"].is_null(),
         "a dead row forwards no reattach handle (it restores by resume): {entry_dead}"
@@ -736,7 +791,9 @@ fn live_rows_answer_the_same_attribution_grace_and_placement_gates_as_dead_rows(
             "t1",
         )],
         live_ev,
-        &ev, &no_closes());
+        &ev,
+        &no_closes(),
+    );
     assert!(
         out["ledgerOnly"].as_array().unwrap().is_empty(),
         "a live row past its parent's grace stays excluded: {out}"
@@ -753,7 +810,9 @@ fn live_rows_answer_the_same_attribution_grace_and_placement_gates_as_dead_rows(
             "t1",
         )],
         live(&[("claude", "S-live")]),
-        &ev, &no_closes());
+        &ev,
+        &no_closes(),
+    );
     assert!(
         out["ledgerOnly"].as_array().unwrap().is_empty(),
         "a live row whose stamped tab is not in the union stays excluded: {out}"
@@ -764,7 +823,9 @@ fn live_rows_answer_the_same_attribution_grace_and_placement_gates_as_dead_rows(
         vec![open_union("dev1:t1")],
         vec![binding_row_at("claude", "S-live", bound(), 995_000)],
         live(&[("claude", "S-live")]),
-        &ev, &no_closes());
+        &ev,
+        &no_closes(),
+    );
     assert!(
         out["ledgerOnly"].as_array().unwrap().is_empty(),
         "a live but unattributed row stays excluded: {out}"
@@ -782,9 +843,15 @@ fn live_rows_answer_the_same_attribution_grace_and_placement_gates_as_dead_rows(
             "t1",
         )],
         live(&[("claude", "S-live")]),
-        &ev, &no_closes());
+        &ev,
+        &no_closes(),
+    );
     let only = out["ledgerOnly"].as_array().unwrap();
-    assert_eq!(only.len(), 1, "all gates pass => the live row is offered: {out}");
+    assert_eq!(
+        only.len(),
+        1,
+        "all gates pass => the live row is offered: {out}"
+    );
     assert_eq!(only[0]["live"], true, "{out}");
 }
 
@@ -838,7 +905,10 @@ fn a_detach_close_covered_row_is_never_offered_live_or_dead() {
     };
     for (label, keys) in [
         ("DEAD (post-restart)", &[][..]),
-        ("LIVE (still Running)", &[("claude", "S-closed"), ("claude", "S-open")][..]),
+        (
+            "LIVE (still Running)",
+            &[("claude", "S-closed"), ("claude", "S-open")][..],
+        ),
     ] {
         let out = make(keys);
         let only = out["ledgerOnly"].as_array().unwrap();
@@ -1301,7 +1371,10 @@ fn a_detach_close_covers_its_snapshot_pane_by_create_request_id_but_never_a_reat
         pane["ledgerState"], "closed",
         "the closed pane's own snapshot verdicts closed (never restored): {pane}"
     );
-    assert_eq!(pane["live"], false, "a close-covered pane never reads live: {pane}");
+    assert_eq!(
+        pane["live"], false,
+        "a close-covered pane never reads live: {pane}"
+    );
 
     // The REATTACHED pane: a NEW pane on the SAME still-running terminal
     // (sidebar reattach mints a fresh createRequestId) is NOT covered by the
@@ -1423,7 +1496,9 @@ fn content_id_is_stable_and_input_sensitive() {
             "t9",
         )],
         no_live(),
-        &ev(), &no_closes());
+        &ev(),
+        &no_closes(),
+    );
     let b = build_inventory(
         vec![union("dev1:t9")],
         vec![with_attribution(
@@ -1433,7 +1508,9 @@ fn content_id_is_stable_and_input_sensitive() {
             "t9",
         )],
         no_live(),
-        &ev(), &no_closes());
+        &ev(),
+        &no_closes(),
+    );
     let c = build_inventory(
         vec![union("dev1:t8")],
         vec![with_attribution(
@@ -1443,7 +1520,9 @@ fn content_id_is_stable_and_input_sensitive() {
             "t8",
         )],
         no_live(),
-        &ev(), &no_closes());
+        &ev(),
+        &no_closes(),
+    );
     assert!(
         a["ledgerOnly"]
             .as_array()
@@ -1482,7 +1561,9 @@ fn content_id_ignores_timestamp_churn() {
             "t9",
         )],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let b = build_inventory(
         vec![DeviceUnion {
             device_id: "dev1".into(),
@@ -1495,7 +1576,9 @@ fn content_id_ignores_timestamp_churn() {
             "t9",
         )],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         a["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -1598,7 +1681,9 @@ fn attributed_row_within_grace_of_its_parent_is_offered() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     let only = out["ledgerOnly"].as_array().unwrap();
     assert_eq!(
         only.len(),
@@ -1658,7 +1743,9 @@ fn retired_closed_row_inside_the_grace_window_is_never_offered() {
         vec![d],
         vec![row.clone()],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert!(
         out["ledgerOnly"].as_array().unwrap().is_empty(),
         "an explicitly-killed (Retired/Closed) row is never offered, even inside the grace window: {}",
@@ -1670,7 +1757,9 @@ fn retired_closed_row_inside_the_grace_window_is_never_offered() {
         vec![],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(out["recoverable"], false);
     assert!(out["device"].is_null());
 }
@@ -1705,9 +1794,15 @@ fn attributed_fresh_agent_row_within_grace_forwards_pane_kind() {
         vec![d2],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     let only = out["ledgerOnly"].as_array().unwrap();
-    assert_eq!(only.len(), 1, "the attributed in-grace fresh-agent row is offered");
+    assert_eq!(
+        only.len(),
+        1,
+        "the attributed in-grace fresh-agent row is offered"
+    );
     assert_eq!(only[0]["sessionId"], "ses_9");
     assert_eq!(only[0]["mode"], "freshopencode");
     assert_eq!(
@@ -1746,7 +1841,9 @@ fn attributed_row_before_its_parents_evidence_is_dropped() {
         vec![d],
         vec![drop_row()],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -1757,7 +1854,9 @@ fn attributed_row_before_its_parents_evidence_is_dropped() {
         vec![],
         vec![drop_row()],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(out["recoverable"], false);
     assert!(out["device"].is_null());
 }
@@ -1801,7 +1900,9 @@ fn row_attributed_to_a_non_primary_device_is_dropped() {
         vec![newer, older],
         vec![row],
         no_live(),
-        &evidence(&[("d0", &[("c9", 8_000)]), ("d1", &[("c9", 8_000)])]), &no_closes());
+        &evidence(&[("d0", &[("c9", 8_000)]), ("d1", &[("c9", 8_000)])]),
+        &no_closes(),
+    );
     assert_eq!(out["device"]["deviceId"], "d1"); // d0 is NON-primary
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
@@ -1836,7 +1937,9 @@ fn row_whose_parent_client_left_no_surviving_evidence_is_dropped() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -1874,7 +1977,9 @@ fn attributed_row_whose_tab_key_matches_no_union_tab_is_dropped() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -1919,7 +2024,9 @@ fn attributed_row_whose_union_tab_is_a_retained_closed_record_is_dropped() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -1955,7 +2062,9 @@ fn attributed_row_whose_union_tab_has_no_panes_is_dropped() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -1984,7 +2093,9 @@ fn attributed_row_with_no_primary_device_is_dropped() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert!(out["device"].is_null());
     assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
     assert_eq!(out["recoverable"], false);
@@ -2079,7 +2190,12 @@ fn equal_revision_ties_keep_the_first_entry_of_the_final_revision_agreeing_with_
         ),
     };
     let row = || {
-        with_attribution(binding_row_at("claude", "S1", bound(), 990_000), "c1", "d1", "t1")
+        with_attribution(
+            binding_row_at("claude", "S1", bound(), 990_000),
+            "c1",
+            "d1",
+            "t1",
+        )
     };
     // boot cutoff above every push: the A16 concurrent-client rule drops nothing.
     let selection = select_foreign_recent_generation_ids(&gens, "me", 2_000_000);
@@ -2102,7 +2218,13 @@ fn equal_revision_ties_keep_the_first_entry_of_the_final_revision_agreeing_with_
         "d1".to_string(),
         selection.winner_captured_at_by_client.clone(),
     )];
-    let out = build_inventory(vec![union()], vec![row()], no_live(), &evidence, &no_closes());
+    let out = build_inventory(
+        vec![union()],
+        vec![row()],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2125,7 +2247,13 @@ fn equal_revision_ties_keep_the_first_entry_of_the_final_revision_agreeing_with_
         "d1".to_string(),
         selection.winner_captured_at_by_client.clone(),
     )];
-    let out = build_inventory(vec![union()], vec![row()], no_live(), &evidence, &no_closes());
+    let out = build_inventory(
+        vec![union()],
+        vec![row()],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -2145,7 +2273,13 @@ fn equal_revision_ties_keep_the_first_entry_of_the_final_revision_agreeing_with_
         "d1".to_string(),
         selection.winner_captured_at_by_client.clone(),
     )];
-    let out = build_inventory(vec![union()], vec![row()], no_live(), &evidence, &no_closes());
+    let out = build_inventory(
+        vec![union()],
+        vec![row()],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2171,7 +2305,13 @@ fn equal_revision_ties_keep_the_first_entry_of_the_final_revision_agreeing_with_
         "d1".to_string(),
         selection.winner_captured_at_by_client.clone(),
     )];
-    let out = build_inventory(vec![union()], vec![frozen_row], no_live(), &evidence, &no_closes());
+    let out = build_inventory(
+        vec![union()],
+        vec![frozen_row],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -2214,17 +2354,38 @@ fn monotone_clocks_the_first_entry_of_the_final_revision_is_its_captured_at_max(
         selection.winner_captured_at_by_client.clone(),
     )];
     // 993_000 + 7_000 == 1_000_000: the boundary itself is KEPT (existing matrix).
-    let kept = with_attribution(binding_row_at("claude", "S1", bound(), 993_000), "c1", "d1", "t1");
-    let out = build_inventory(vec![union()], vec![kept], no_live(), &evidence, &no_closes());
+    let kept = with_attribution(
+        binding_row_at("claude", "S1", bound(), 993_000),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![union()],
+        vec![kept],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
         "the in-grace boundary judges exactly as before"
     );
     // 992_999 + 7_000 == 999_999 < 1_000_000: one ms outside is dropped.
-    let dropped =
-        with_attribution(binding_row_at("claude", "S2", bound(), 992_999), "c1", "d1", "t1");
-    let out = build_inventory(vec![union()], vec![dropped], no_live(), &evidence, &no_closes());
+    let dropped = with_attribution(
+        binding_row_at("claude", "S2", bound(), 992_999),
+        "c1",
+        "d1",
+        "t1",
+    );
+    let out = build_inventory(
+        vec![union()],
+        vec![dropped],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2299,7 +2460,13 @@ fn equal_revision_keys_are_parent_relative_and_the_staleness_max_is_unchanged() 
         "d1",
         "t1",
     );
-    let out = build_inventory(vec![union()], vec![r1, r2], no_live(), &evidence, &no_closes());
+    let out = build_inventory(
+        vec![union()],
+        vec![r1, r2],
+        no_live(),
+        &evidence,
+        &no_closes(),
+    );
     let offered: Vec<&str> = out["ledgerOnly"]
         .as_array()
         .unwrap()
@@ -2468,7 +2635,9 @@ fn inherit_maintenance_write_after_frozen_parent_evidence_never_revives_the_offe
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2505,7 +2674,9 @@ fn genuine_attributed_rebind_advances_the_judgment_time() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -2549,7 +2720,9 @@ fn legacy_attached_row_without_a_tabkey_is_attributed_but_stays_unplaceable() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2603,7 +2776,9 @@ fn a_delayed_pre_clear_assertion_never_resurrects_a_cleared_row_into_the_offer()
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c2", 945_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c2", 945_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2638,7 +2813,9 @@ fn the_judgment_time_is_the_attribution_time_not_the_last_write() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -2682,7 +2859,9 @@ fn stamped_row_without_the_attribution_time_field_is_never_offered() {
         vec![d()],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2704,7 +2883,9 @@ fn stamped_row_without_the_attribution_time_field_is_never_offered() {
         vec![d()],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2719,7 +2900,9 @@ fn stamped_row_without_the_attribution_time_field_is_never_offered() {
         vec![d()],
         vec![binding_row_at("claude", "S3", bound(), 995_000)],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2810,7 +2993,9 @@ fn marker_derived_resolution_after_the_pane_closed_never_re_offers_it() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2842,7 +3027,9 @@ fn marker_derived_resolution_within_grace_of_the_frozen_parent_is_offered() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -2881,7 +3068,9 @@ fn an_attributed_rows_judgment_ignores_its_creation_time() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2944,7 +3133,9 @@ fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -2995,7 +3186,9 @@ fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_la
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         1,
@@ -3048,7 +3241,9 @@ fn terminal_post_spawn_write_completed_after_the_pane_closed_is_never_offered() 
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -3124,7 +3319,9 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
         vec![d],
         vec![child],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
         0,
@@ -3176,7 +3373,9 @@ fn out_of_order_delayed_create_keeps_the_newer_tab_and_time() {
         vec![d_only_t2],
         vec![row.clone()],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     let offered = out["ledgerOnly"].as_array().unwrap();
     assert_eq!(
         offered.len(),
@@ -3213,7 +3412,9 @@ fn out_of_order_delayed_create_keeps_the_newer_tab_and_time() {
         vec![d_both],
         vec![row_in_grace],
         no_live(),
-        &evidence(&[("d1", &[("c1", 1_000_000)])]), &no_closes());
+        &evidence(&[("d1", &[("c1", 1_000_000)])]),
+        &no_closes(),
+    );
     let offered = out["ledgerOnly"].as_array().unwrap();
     assert_eq!(offered.len(), 1);
     assert_eq!(
@@ -3289,7 +3490,9 @@ fn ref_less_pane_binds_to_its_late_bound_row_by_create_request_id() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(
         panes.len(),
@@ -3339,7 +3542,9 @@ fn ref_less_pane_binds_to_its_late_bound_row_by_live_terminal_id() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["ledgerState"], "bound");
     assert_eq!(pane["sessionRef"]["provider"], "opencode");
@@ -3376,9 +3581,14 @@ fn correlation_requires_provider_mode_coherence() {
         vec![d],
         vec![row],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["ledgerState"], "unknown", "no coherence => no correlation");
+    assert_eq!(
+        pane["ledgerState"], "unknown",
+        "no coherence => no correlation"
+    );
     assert!(pane["sessionRef"].is_null());
     assert_eq!(
         out["ledgerOnly"].as_array().unwrap().len(),
@@ -3436,7 +3646,9 @@ fn correlation_never_binds_fresh_agent_rows_or_panes() {
         vec![d],
         rows,
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(
         panes[0]["ledgerState"], "unknown",
@@ -3474,7 +3686,11 @@ fn two_bound_rows_sharing_the_panes_create_request_id_never_correlate() {
     };
     let row = |session_id: &str| {
         with_attribution(
-            with_correlation_ids(binding_row_at("codex", session_id, bound(), 1_000), Some("req-1"), None),
+            with_correlation_ids(
+                binding_row_at("codex", session_id, bound(), 1_000),
+                Some("req-1"),
+                None,
+            ),
             "c1",
             "dev1",
             "t1",
@@ -3484,7 +3700,9 @@ fn two_bound_rows_sharing_the_panes_create_request_id_never_correlate() {
         vec![d],
         vec![row("C-a"), row("C-b")],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(
         panes.len(),
@@ -3520,13 +3738,21 @@ fn pane_matching_two_rows_by_both_correlation_ids_never_correlates() {
     };
     let rows = vec![
         with_attribution(
-            with_correlation_ids(binding_row_at("codex", "C-a", bound(), 1_000), Some("req-1"), None),
+            with_correlation_ids(
+                binding_row_at("codex", "C-a", bound(), 1_000),
+                Some("req-1"),
+                None,
+            ),
             "c1",
             "dev1",
             "t1",
         ),
         with_attribution(
-            with_correlation_ids(binding_row_at("codex", "C-b", bound(), 1_000), None, Some("t-9")),
+            with_correlation_ids(
+                binding_row_at("codex", "C-b", bound(), 1_000),
+                None,
+                Some("t-9"),
+            ),
             "c1",
             "dev1",
             "t1",
@@ -3536,7 +3762,9 @@ fn pane_matching_two_rows_by_both_correlation_ids_never_correlates() {
         vec![d],
         rows,
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["ledgerState"], "unknown");
     assert!(pane["sessionRef"].is_null());
@@ -3570,13 +3798,19 @@ fn one_row_matching_two_ref_less_panes_never_correlates_either() {
     let out = build_inventory(
         vec![d],
         vec![with_attribution(
-            with_correlation_ids(binding_row_at("codex", "C-assoc", bound(), 1_000), Some("req-1"), None),
+            with_correlation_ids(
+                binding_row_at("codex", "C-assoc", bound(), 1_000),
+                Some("req-1"),
+                None,
+            ),
             "c1",
             "dev1",
             "t1",
         )],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(panes[0]["ledgerState"], "unknown");
     assert_eq!(panes[1]["ledgerState"], "unknown");
@@ -3608,14 +3842,22 @@ fn ambiguity_suppression_never_touches_rows_that_do_not_correlate() {
     };
     let contested = |session_id: &str| {
         with_attribution(
-            with_correlation_ids(binding_row_at("codex", session_id, bound(), 1_000), Some("req-1"), None),
+            with_correlation_ids(
+                binding_row_at("codex", session_id, bound(), 1_000),
+                Some("req-1"),
+                None,
+            ),
             "c1",
             "dev1",
             "t1",
         )
     };
     let untouched = with_attribution(
-        with_correlation_ids(binding_row_at("codex", "C-z", bound(), 1_000), Some("req-z"), None),
+        with_correlation_ids(
+            binding_row_at("codex", "C-z", bound(), 1_000),
+            Some("req-z"),
+            None,
+        ),
         "c1",
         "dev1",
         "t1",
@@ -3624,7 +3866,9 @@ fn ambiguity_suppression_never_touches_rows_that_do_not_correlate() {
         vec![d],
         vec![contested("C-a"), contested("C-b"), untouched],
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let only = out["ledgerOnly"].as_array().unwrap();
     assert_eq!(
         only.len(),
@@ -3814,7 +4058,9 @@ fn ref_less_pane_correlated_to_a_superseded_row_forwards_to_the_successor_verdic
         vec![d],
         rows,
         no_live(),
-        &evidence(&[("dev1", &[("c1", 5_000)])]), &no_closes());
+        &evidence(&[("dev1", &[("c1", 5_000)])]),
+        &no_closes(),
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(panes.len(), 1);
     assert_eq!(panes[0]["ledgerState"], "bound");
@@ -3891,7 +4137,10 @@ fn retired_row_correlation_requires_provider_mode_coherence() {
     );
     let out = build_inventory(vec![d], vec![row], no_live(), &no_evidence(), &no_closes());
     let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["ledgerState"], "unknown", "no coherence => no correlation");
+    assert_eq!(
+        pane["ledgerState"], "unknown",
+        "no coherence => no correlation"
+    );
     assert!(pane["sessionRef"].is_null());
     assert_eq!(out["ledgerOnly"].as_array().unwrap().len(), 0);
 }
@@ -3952,7 +4201,9 @@ fn two_retired_rows_sharing_the_panes_create_request_id_never_correlate() {
         vec![d],
         vec![row("C-a"), row("C-b")],
         no_live(),
-        &no_evidence(), &no_closes());
+        &no_evidence(),
+        &no_closes(),
+    );
     let pane = &out["device"]["tabs"][0]["panes"][0];
     assert_eq!(pane["ledgerState"], "unknown");
     assert!(pane["sessionRef"].is_null());
@@ -3988,7 +4239,9 @@ fn one_retired_row_matching_two_ref_less_panes_never_correlates_either() {
             None,
         )],
         no_live(),
-        &no_evidence(), &no_closes());
+        &no_evidence(),
+        &no_closes(),
+    );
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(panes[0]["ledgerState"], "unknown");
     assert_eq!(panes[1]["ledgerState"], "unknown");
@@ -4279,9 +4532,7 @@ async fn a_close_record_and_its_snapshot_both_survive_the_ttl_edge_and_the_verdi
     // prunes the record (the TTL still bounds unreferenced evidence).
     let mut refs = freshell_ws::tabs_persist::RetainedSnapshotReferences::default();
     refs.claims.clear();
-    let sweeper = freshell_ws::pane_ledger::PaneLedger::new(Some(
-        home.path().join("pane-ledger"),
-    ));
+    let sweeper = freshell_ws::pane_ledger::PaneLedger::new(Some(home.path().join("pane-ledger")));
     let report = sweeper.gc(aged, &|_, _| false, None, Some(&refs));
     assert!(
         report
@@ -4451,7 +4702,10 @@ async fn route_offers_a_live_attributed_row_as_a_reattach_candidate() {
             row["liveTerminalId"] = json!(t);
         }
         std::fs::write(
-            broot.join("bindings").join("claude").join(format!("{session_id}.json")),
+            broot
+                .join("bindings")
+                .join("claude")
+                .join(format!("{session_id}.json")),
             serde_json::to_vec(&row).unwrap(),
         )
         .unwrap();
@@ -4471,7 +4725,9 @@ async fn route_offers_a_live_attributed_row_as_a_reattach_candidate() {
     let state = RecoveryInventoryState {
         auth_token: "tok".into(),
         snapshots_dir: Some(tmp.path().to_path_buf()),
-        ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(Some(broot))),
+        ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(Some(
+            broot,
+        ))),
         registry,
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
     };
@@ -4487,7 +4743,10 @@ async fn route_offers_a_live_attributed_row_as_a_reattach_candidate() {
     let live_entry = only.iter().find(|e| e["sessionId"] == "S9-live").unwrap_or_else(|| {
         panic!("the LIVE attributed placement-valid row is offered (never categorically excluded): {body}")
     });
-    assert_eq!(live_entry["live"], true, "the live verdict rides the entry: {live_entry}");
+    assert_eq!(
+        live_entry["live"], true,
+        "the live verdict rides the entry: {live_entry}"
+    );
     assert_eq!(
         live_entry["liveTerminalId"], "t-live-9",
         "the still-running terminal id arms the client reattach: {live_entry}"
@@ -4527,8 +4786,9 @@ async fn route_never_offers_a_detach_close_covered_row() {
     let home = tempfile::tempdir().unwrap();
     let broot = home.path().join("pane-ledger");
     std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
-    let seed = |session_id: &str, crid: &str| {
-        std::fs::write(
+    let seed =
+        |session_id: &str, crid: &str| {
+            std::fs::write(
             broot.join("bindings").join("claude").join(format!("{session_id}.json")),
             serde_json::to_vec(&json!({
                 "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
@@ -4540,7 +4800,7 @@ async fn route_never_offers_a_detach_close_covered_row() {
             .unwrap(),
         )
         .unwrap();
-    };
+        };
     seed("S-detached-closed", "req-closed");
     seed("S-detached-open", "req-open");
     // THE DURABLE PANE CLOSE (non-retiring): the detach record exists via the
@@ -4671,7 +4931,10 @@ async fn route_offers_a_reattached_row_despite_the_old_panes_close() {
     let broot = home.path().join("pane-ledger");
     std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
     std::fs::write(
-        broot.join("bindings").join("claude").join("S-reopened.json"),
+        broot
+            .join("bindings")
+            .join("claude")
+            .join("S-reopened.json"),
         serde_json::to_vec(&json!({
             "ledgerVersion": 1, "provider": "claude", "sessionId": "S-reopened", "mode": "claude",
             "cwd": "/w", "createdAt": 994_000, "updatedAt": 995_000, "lastObservedAt": 995_000,
@@ -4795,8 +5058,9 @@ async fn route_never_offers_a_bound_row_whose_kill_tombstone_survived_its_retire
     let home = tempfile::tempdir().unwrap();
     let broot = home.path().join("pane-ledger");
     std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
-    let seed_bound = |session_id: &str| {
-        std::fs::write(
+    let seed_bound =
+        |session_id: &str| {
+            std::fs::write(
             broot.join("bindings").join("claude").join(format!("{session_id}.json")),
             serde_json::to_vec(&json!({
                 "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
@@ -4808,7 +5072,7 @@ async fn route_never_offers_a_bound_row_whose_kill_tombstone_survived_its_retire
             .unwrap(),
         )
         .unwrap();
-    };
+        };
     // Both rows satisfy EVERY D8 clause (the S2 control proves the fixture
     // would offer S1 absent the tombstone).
     seed_bound("S1-killed");
@@ -4817,7 +5081,10 @@ async fn route_never_offers_a_bound_row_whose_kill_tombstone_survived_its_retire
     // did — exactly the finding's split-writes shape.
     std::fs::create_dir_all(broot.join("kill-tombstones").join("claude")).unwrap();
     std::fs::write(
-        broot.join("kill-tombstones").join("claude").join("S1-killed.json"),
+        broot
+            .join("kill-tombstones")
+            .join("claude")
+            .join("S1-killed.json"),
         serde_json::to_vec(&json!({
             "ledgerVersion": 1, "provider": "claude", "sessionId": "S1-killed",
             "killedAtMs": now
@@ -4876,8 +5143,9 @@ async fn route_never_offers_a_bound_row_dominated_by_a_past_ttl_kill_tombstone()
     let home = tempfile::tempdir().unwrap();
     let broot = home.path().join("pane-ledger");
     std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
-    let seed_bound = |session_id: &str| {
-        std::fs::write(
+    let seed_bound =
+        |session_id: &str| {
+            std::fs::write(
             broot.join("bindings").join("claude").join(format!("{session_id}.json")),
             serde_json::to_vec(&json!({
                 "ledgerVersion": 1, "provider": "claude", "sessionId": session_id, "mode": "claude",
@@ -4889,12 +5157,15 @@ async fn route_never_offers_a_bound_row_dominated_by_a_past_ttl_kill_tombstone()
             .unwrap(),
         )
         .unwrap();
-    };
+        };
     seed_bound("S1-killed-old");
     seed_bound("S2-survivor-old");
     std::fs::create_dir_all(broot.join("kill-tombstones").join("claude")).unwrap();
     std::fs::write(
-        broot.join("kill-tombstones").join("claude").join("S1-killed-old.json"),
+        broot
+            .join("kill-tombstones")
+            .join("claude")
+            .join("S1-killed-old.json"),
         serde_json::to_vec(&json!({
             "ledgerVersion": 1, "provider": "claude", "sessionId": "S1-killed-old",
             "killedAtMs": t + 10_000
@@ -4944,7 +5215,11 @@ fn kill_tombstone_dominance_rewrites_only_fresh_tombstoned_bound_rows() {
         out[0].updated_at, 1_000,
         "the read-side transform never re-stamps row keeping"
     );
-    assert_eq!(out[1].state, RowState::Bound, "untombstoned Bound untouched");
+    assert_eq!(
+        out[1].state,
+        RowState::Bound,
+        "untombstoned Bound untouched"
+    );
     assert_eq!(
         out[2].retired_reason,
         Some(RetiredReason::GcExpired),
@@ -5414,11 +5689,15 @@ fn a_close_covered_pane_never_claims_its_correlated_row() {
     );
     let ledger_only = out["ledgerOnly"].as_array().unwrap();
     assert!(
-        ledger_only.iter().all(|e| e["sessionId"] != "sess-closed-pane"),
+        ledger_only
+            .iter()
+            .all(|e| e["sessionId"] != "sess-closed-pane"),
         "the closed pane's own row is close-covered — never offered (F2): {ledger_only:?}"
     );
     assert!(
-        ledger_only.iter().any(|e| e["sessionId"] == "sess-elsewhere"),
+        ledger_only
+            .iter()
+            .any(|e| e["sessionId"] == "sess-elsewhere"),
         "the unrelated control row reaches the ordinary offer judgment \
          (attributed + in grace + placeable + uncovered): {ledger_only:?}"
     );
@@ -5637,7 +5916,10 @@ fn a_reopened_panes_retained_snapshot_verdicts_live_not_closed() {
         &closes,
     );
     let pane = &out["device"]["tabs"][0]["panes"][0];
-    assert_eq!(pane["live"], true, "genuinely reopened: live, not closed: {pane}");
+    assert_eq!(
+        pane["live"], true,
+        "genuinely reopened: live, not closed: {pane}"
+    );
     assert_ne!(pane["ledgerState"], "closed", "{pane}");
     assert_eq!(
         pane["sessionRef"],
@@ -5708,7 +5990,10 @@ fn a_bound_row_association_beats_the_fence_on_another_key() {
         json!({"provider": "claude", "sessionId": "dur-alive"}),
         "{pane}"
     );
-    assert_eq!(pane["live"], false, "not live (the row is Bound, not running): {pane}");
+    assert_eq!(
+        pane["live"], false,
+        "not live (the row is Bound, not running): {pane}"
+    );
 }
 
 /// Control: the pre-existing fallback is untouched — a claim with no row and
@@ -5738,7 +6023,12 @@ fn close_verdicts_apply_only_with_close_evidence() {
     let bindings = vec![binding_row("codex", "sess-bound", bound())];
     // Only p2 has close evidence (killed before the loss; its identity was
     // later resumed by ANOTHER pane — the row reads Bound). p1 has none.
-    let closes = closes_with("t-oldpane", Some("req-oldpane"), &[("codex", "sess-bound")], &[]);
+    let closes = closes_with(
+        "t-oldpane",
+        Some("req-oldpane"),
+        &[("codex", "sess-bound")],
+        &[],
+    );
     let out = build_inventory(vec![d], bindings, no_live(), &no_evidence(), &closes);
     let panes = out["device"]["tabs"][0]["panes"].as_array().unwrap();
     assert_eq!(

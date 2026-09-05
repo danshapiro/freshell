@@ -444,11 +444,18 @@ impl FreshCodexState {
     /// failure deciding or writing) provably left the durable close
     /// untouched (round 5, focused-ep5-r4 Finding 5): warn-loud and report
     /// false — the caller tears the session down, kill wins.
-    async fn commit_session_claim(&self, durable_id: &str, expect_killed_at_ms: Option<i64>) -> bool {
+    async fn commit_session_claim(
+        &self,
+        durable_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> bool {
         let Some(sink) = self.identity_sink() else {
             return true;
         };
-        match sink.commit_claim(PROVIDER, durable_id, expect_killed_at_ms).await {
+        match sink
+            .commit_claim(PROVIDER, durable_id, expect_killed_at_ms)
+            .await
+        {
             Ok(crate::identity_sink::ClaimCommit::Committed) => true,
             Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
                 tracing::info!(target: "freshell_freshagent::codex",
@@ -1064,7 +1071,10 @@ impl FreshCodexState {
         // orphan of a pane the user closed mid-create — tear it down (nothing
         // registered yet; every sessions-map insert lives in finish_create,
         // below) and answer failed, leaving the row the kill retired Retired.
-        if !self.commit_session_claim(&thread_id, claim_dead_state).await {
+        if !self
+            .commit_session_claim(&thread_id, claim_dead_state)
+            .await
+        {
             client.close().await;
             let mut child = child;
             let _ = child.start_kill();
@@ -1075,7 +1085,9 @@ impl FreshCodexState {
             self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
-                &format!("codex thread {thread_id} closed while the resume was in flight; torn down"),
+                &format!(
+                    "codex thread {thread_id} closed while the resume was in flight; torn down"
+                ),
             );
             return;
         }
@@ -1186,7 +1198,8 @@ impl FreshCodexState {
             // re-parks/re-stamps the CURRENT connection's provenance on the
             // incumbent (this arm returns immediately, so moving `provenance`
             // in is safe).
-            self.adopt_live_create(&request_id, &thread_id, provenance).await;
+            self.adopt_live_create(&request_id, &thread_id, provenance)
+                .await;
             return;
         }
 
@@ -1287,7 +1300,9 @@ impl FreshCodexState {
                 self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
-                    &format!("codex thread {thread_id} closed while the resume was in flight; torn down"),
+                    &format!(
+                        "codex thread {thread_id} closed while the resume was in flight; torn down"
+                    ),
                 );
                 return;
             }
@@ -6933,7 +6948,8 @@ pub(crate) mod tests {
     /// cleaned) while the answer still reports `success:false`: the kill
     /// visibly fails, never masquerading as clean success nor clean failure.
     #[tokio::test]
-    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly() {
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly(
+    ) {
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -6998,8 +7014,8 @@ pub(crate) mod tests {
     /// row revived — then the lane parks pre-registration while the kill
     /// lands.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_thread()
-     {
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_thread(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx, fake) = state_with_sink();
@@ -7022,7 +7038,10 @@ pub(crate) mod tests {
         })
         .await;
         let claim_start_snapshot = fake.kill_tombstone_at_ms("codex", thread);
-        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
 
         // Stall the claim AFTER its commit lands, BEFORE the registration.
         let stall = fake.arm_post_commit_stall("codex", thread);
@@ -7100,8 +7119,8 @@ pub(crate) mod tests {
     /// re-check tears the registered session down and the create answers
     /// failed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create()
-     {
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx, fake) = state_with_sink();
@@ -8700,8 +8719,12 @@ pub(crate) mod tests {
         let driver1 = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d1", None), None, sink1)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-fork-dup", "fork-req-d1", None),
+                    None,
+                    sink1,
+                )
+                .await;
             })
         };
         answer_initialize(&peer).await;
@@ -8713,7 +8736,11 @@ pub(crate) mod tests {
         let (sink2, captured2) = capturing_sink();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d2", None), None, sink2),
+            st.handle_fork(
+                fork_msg("parent-fork-dup", "fork-req-d2", None),
+                None,
+                sink2,
+            ),
         )
         .await
         .expect("the duplicate fork is refused inline, never upstream-blocking");
@@ -8741,8 +8768,12 @@ pub(crate) mod tests {
         let driver3 = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d3", None), None, sink3)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-fork-dup", "fork-req-d3", None),
+                    None,
+                    sink3,
+                )
+                .await;
             })
         };
         let (id3, method, _params) = peer.expect_request().await;
@@ -8917,8 +8948,12 @@ pub(crate) mod tests {
             let driver = {
                 let st = st.clone();
                 tokio::spawn(async move {
-                    st.handle_fork(fork_msg("parent-params", "fork-req-p", overrides), None, sink)
-                        .await;
+                    st.handle_fork(
+                        fork_msg("parent-params", "fork-req-p", overrides),
+                        None,
+                        sink,
+                    )
+                    .await;
                 })
             };
 
@@ -9049,8 +9084,12 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-spawn-fail", "fork-req-s", None), None, sink)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-spawn-fail", "fork-req-s", None),
+                    None,
+                    sink,
+                )
+                .await;
             })
         };
 
@@ -9176,8 +9215,12 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-resume-fail", "fork-req-r", None), None, sink)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-resume-fail", "fork-req-r", None),
+                    None,
+                    sink,
+                )
+                .await;
             })
         };
 
@@ -9440,7 +9483,10 @@ pub(crate) mod tests {
                 "the child row inherits the parent's parked provenance, not None"
             );
             assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-p"));
-            assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-p:tab-p"));
+            assert_eq!(
+                row.asserted_stamps().tab_key.as_deref(),
+                Some("device-p:tab-p")
+            );
         }
     }
 
@@ -9489,8 +9535,12 @@ pub(crate) mod tests {
         );
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(&parent_id, "fork-req-crash-prov", None), None, sink)
-            .await;
+        st.handle_fork(
+            fork_msg(&parent_id, "fork-req-crash-prov", None),
+            None,
+            sink,
+        )
+        .await;
         let frames = captured_frames(&captured);
         assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
         assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
@@ -9524,9 +9574,18 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-crash-prov")
             .expect("a binding row for the post-crash fork child");
-        assert_eq!(row.asserted_stamps().client_instance_id.as_deref(), Some("client-crash"));
-        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-crash"));
-        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-crash:tab-crash"));
+        assert_eq!(
+            row.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-crash")
+        );
+        assert_eq!(
+            row.asserted_stamps().device_id.as_deref(),
+            Some("device-crash")
+        );
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-crash:tab-crash")
+        );
     }
 
     /// The mint-new crash-recovery door (the `Respawned { new_session_id }`
@@ -9618,9 +9677,18 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-mint-prov")
             .expect("a binding row for the mint-new fork child");
-        assert_eq!(row.asserted_stamps().client_instance_id.as_deref(), Some("client-mint"));
-        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-mint"));
-        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-mint:tab-mint"));
+        assert_eq!(
+            row.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-mint")
+        );
+        assert_eq!(
+            row.asserted_stamps().device_id.as_deref(),
+            Some("device-mint")
+        );
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-mint:tab-mint")
+        );
     }
 
     /// Focused-ep1-r4 Finding 1 (the MAIN already-live resume arm, the
@@ -9709,7 +9777,10 @@ pub(crate) mod tests {
                 "the adopt refresh re-stamps the row, never keeps the old tab"
             );
             assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-            assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
         }
 
         // …and every later fork of the adopted session asserts the CURRENT
@@ -9726,9 +9797,18 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-adopt")
             .expect("a binding row for the post-adopt fork child");
-        assert_eq!(child.asserted_stamps().client_instance_id.as_deref(), Some("client-new"));
-        assert_eq!(child.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(child.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            child.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().device_id.as_deref(),
+            Some("device-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
     }
 
     /// Focused-ep1-r4 Finding 1 (a LISTED EARLY EXIT — `finish_create`'s
@@ -9736,8 +9816,8 @@ pub(crate) mod tests {
     /// guard) but finds a LIVE incumbent at registration time adopts that
     /// incumbent — this arm must restamp exactly like the fast path.
     #[tokio::test]
-    async fn adopt_live_create_through_the_finish_create_eviction_guard_restamps_the_current_connection()
-     {
+    async fn adopt_live_create_through_the_finish_create_eviction_guard_restamps_the_current_connection(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
@@ -9816,12 +9896,19 @@ pub(crate) mod tests {
                 "the eviction-guard adopt refresh re-stamps the row"
             );
             assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-            assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
         }
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(&thread_id, "fork-req-evict-adopt", None), None, sink)
-            .await;
+        st.handle_fork(
+            fork_msg(&thread_id, "fork-req-evict-adopt", None),
+            None,
+            sink,
+        )
+        .await;
         let frames = captured_frames(&captured);
         assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
         assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
@@ -9831,9 +9918,18 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == "child-after-evict-adopt")
             .expect("a binding row for the post-adopt fork child");
-        assert_eq!(child.asserted_stamps().client_instance_id.as_deref(), Some("client-new"));
-        assert_eq!(child.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(child.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            child.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().device_id.as_deref(),
+            Some("device-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
     }
 
     /// The no-regression pin (the invariant's second half): an adopt answer
@@ -9841,8 +9937,8 @@ pub(crate) mod tests {
     /// incumbent's already-parked Some to None, and writes nothing (the
     /// ledger's keep-when-None merge preserves the row's stamps).
     #[tokio::test]
-    async fn adopt_live_create_with_no_connection_provenance_keeps_the_parked_stamps_and_writes_nothing()
-     {
+    async fn adopt_live_create_with_no_connection_provenance_keeps_the_parked_stamps_and_writes_nothing(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
@@ -9890,7 +9986,10 @@ pub(crate) mod tests {
         }
         let bindings = fake.bindings.lock().expect("bindings mutex");
         assert_eq!(
-            bindings.iter().filter(|b| b.session_id == thread_id).count(),
+            bindings
+                .iter()
+                .filter(|b| b.session_id == thread_id)
+                .count(),
             rows_before,
             "a conn-less adopt writes nothing (keep-when-None preserves the row)"
         );
@@ -9977,7 +10076,10 @@ pub(crate) mod tests {
             "the fork child row stamps the FORKING connection, not the parent's stale park"
         );
         assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-b"));
-        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-b:tab-b"));
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-b:tab-b")
+        );
     }
 
     /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
@@ -9986,8 +10088,8 @@ pub(crate) mod tests {
     /// with a parent that parks nothing the child stamps fall back to the
     /// parent's DURABLE ROW (the last source that knows the attribution).
     #[tokio::test]
-    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty()
-     {
+    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
@@ -10060,8 +10162,14 @@ pub(crate) mod tests {
             Some("client-row"),
             "the child row falls back to the parent's durable row stamps, not a hollow None"
         );
-        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-row"));
-        assert_eq!(row.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(
+            row.asserted_stamps().device_id.as_deref(),
+            Some("device-row")
+        );
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
     }
 
     /// Focused-ep1-r5 Finding 2 (the codex adopt gate, the :1222 named
@@ -10121,7 +10229,10 @@ pub(crate) mod tests {
         }
         let bindings = fake.bindings.lock().expect("bindings mutex");
         assert_eq!(
-            bindings.iter().filter(|b| b.session_id == thread_id).count(),
+            bindings
+                .iter()
+                .filter(|b| b.session_id == thread_id)
+                .count(),
             rows_before,
             "a hollow-provenance adopt writes nothing (like the conn-less adopt)"
         );
@@ -10161,7 +10272,11 @@ pub(crate) mod tests {
             .rev()
             .find(|b| b.session_id == thread_id)
             .expect("the create's binding write");
-        assert_eq!(b.asserted_stamps().client_instance_id, None, "hollow stamps nothing");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id,
+            None,
+            "hollow stamps nothing"
+        );
         assert_eq!(b.asserted_stamps().device_id, None);
         assert_eq!(b.asserted_stamps().tab_key, None);
     }
@@ -10235,7 +10350,10 @@ pub(crate) mod tests {
             "the provenance refresh must not be gated on settings presence"
         );
         assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-new:tab-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
         assert_eq!(
             b.settings,
             crate::identity_sink::FreshAgentSettings::default(),
@@ -10297,10 +10415,9 @@ pub(crate) mod tests {
             let s = guard
                 .get("thread-row-seeded")
                 .expect("the attach-resume registered the session");
-            let p = s
-                .provenance
-                .clone()
-                .expect("the conn-less cold attach seeds the parked provenance from the durable row");
+            let p = s.provenance.clone().expect(
+                "the conn-less cold attach seeds the parked provenance from the durable row",
+            );
             assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
             assert_eq!(p.device_id.as_deref(), Some("device-row"));
             assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
@@ -10315,7 +10432,11 @@ pub(crate) mod tests {
                 .rev()
                 .find(|b| b.session_id == "thread-row-seeded")
                 .expect("the attach-resume refresh write (settings recovered)");
-            assert_eq!(b.asserted_stamps().client_instance_id, None, "conn-less refresh stamps");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id,
+                None,
+                "conn-less refresh stamps"
+            );
             assert_eq!(b.asserted_stamps().device_id, None);
             assert_eq!(b.asserted_stamps().tab_key, None);
         }
@@ -10343,8 +10464,14 @@ pub(crate) mod tests {
             Some("client-row"),
             "the fork child inherits the row-seeded provenance, not a fork-time None"
         );
-        assert_eq!(child.asserted_stamps().device_id.as_deref(), Some("device-row"));
-        assert_eq!(child.asserted_stamps().tab_key.as_deref(), Some("device-row:tab-row"));
+        assert_eq!(
+            child.asserted_stamps().device_id.as_deref(),
+            Some("device-row")
+        );
+        assert_eq!(
+            child.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
     }
 
     /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
@@ -12045,7 +12172,10 @@ pub(crate) mod tests {
         })
         .await;
         let claim_start_snapshot = fake.kill_tombstone_at_ms("codex", thread);
-        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
 
         // Gate the claim's commit, then start the attach.
         let gate = fake.arm_claim_commit_gate("codex", thread);
@@ -13907,9 +14037,18 @@ pub(crate) mod tests {
             .iter()
             .find(|b| b.session_id == thread_id)
             .expect("binding row written at thread/start");
-        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-codex"));
-        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-codex"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-codex:tab-codex"));
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-codex")
+        );
+        assert_eq!(
+            b.asserted_stamps().device_id.as_deref(),
+            Some("device-codex")
+        );
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-codex:tab-codex")
+        );
     }
 
     /// Task 4 (P1.13, awaited-writes policy): a failed ledger write is surfaced as a
@@ -15137,7 +15276,11 @@ pub(crate) mod tests {
         let (sink2, captured2) = capturing_sink();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_fork(fork_msg("parent-new-mint", "fork-req-g2", None), None, sink2),
+            st.handle_fork(
+                fork_msg("parent-new-mint", "fork-req-g2", None),
+                None,
+                sink2,
+            ),
         )
         .await
         .expect("the re-keyed duplicate fork is refused inline, never upstream-blocking");
@@ -15190,8 +15333,12 @@ pub(crate) mod tests {
         let driver3 = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-new-mint", "fork-req-g3", None), None, sink3)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-new-mint", "fork-req-g3", None),
+                    None,
+                    sink3,
+                )
+                .await;
             })
         };
         driver3.await.expect("fork #3 task");

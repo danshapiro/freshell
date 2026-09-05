@@ -4,7 +4,9 @@
 //! snapshot store, the ledger, and the terminal registry, and consumes
 //! `select_foreign_recent_generation_ids` when composing each device's union.
 
-use freshell_ws::pane_ledger::{BindingRow, PaneCloseRecord, PaneDetachClose, RetiredReason, RowState};
+use freshell_ws::pane_ledger::{
+    BindingRow, PaneCloseRecord, PaneDetachClose, RetiredReason, RowState,
+};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -369,7 +371,9 @@ fn correlation_candidates<'a>(
         for &row in rows {
             if row.pane_kind.is_none()
                 && row.provider == mode
-                && !candidates.iter().any(|existing| std::ptr::eq(*existing, row))
+                && !candidates
+                    .iter()
+                    .any(|existing| std::ptr::eq(*existing, row))
             {
                 candidates.push(row);
             }
@@ -1088,11 +1092,13 @@ pub fn build_inventory(
             .into_iter()
             .flatten()
             .filter(|rec| {
-                matches!(rec.get("status").and_then(Value::as_str), None | Some("open"))
-                    && rec
-                        .get("panes")
-                        .and_then(Value::as_array)
-                        .is_some_and(|panes| !panes.is_empty())
+                matches!(
+                    rec.get("status").and_then(Value::as_str),
+                    None | Some("open")
+                ) && rec
+                    .get("panes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|panes| !panes.is_empty())
             })
             .filter_map(|rec| rec.get("tabKey").and_then(Value::as_str).map(String::from))
             .collect()

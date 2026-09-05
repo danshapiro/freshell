@@ -26,7 +26,13 @@ fn write(
     terminal_id: &str,
     now_ms: i64,
 ) -> BindingWrite<'static> {
-    write_with_policy(provider, session_id, terminal_id, now_ms, ProvenancePolicy::Inherit)
+    write_with_policy(
+        provider,
+        session_id,
+        terminal_id,
+        now_ms,
+        ProvenancePolicy::Inherit,
+    )
 }
 
 /// The conn-less lane ([`write`]'s default made explicit) and the
@@ -240,7 +246,10 @@ fn headless_clear_rebind_erases_the_browser_stamps() {
         ))
         .unwrap();
     let row = ledger.load_binding("codex", "th-1").unwrap();
-    assert_eq!(row.client_instance_id, None, "Clear erases the clientInstanceId");
+    assert_eq!(
+        row.client_instance_id, None,
+        "Clear erases the clientInstanceId"
+    );
     assert_eq!(row.device_id, None, "Clear erases the deviceId");
     assert_eq!(row.tab_key, None, "Clear erases the tabKey");
     assert_eq!(
@@ -250,7 +259,10 @@ fn headless_clear_rebind_erases_the_browser_stamps() {
          (max(1_000, clear_now = 5_000)) — it never erases the clock"
     );
     assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
-    assert_eq!(row.updated_at, 5_000, "updated_at still refreshes (rewritten, unattributed)");
+    assert_eq!(
+        row.updated_at, 5_000,
+        "updated_at still refreshes (rewritten, unattributed)"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -367,7 +379,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         "focused-ep4-r5 Finding 2: Clear raises the attribution floor \
          (max(1_000, clear_now = 2_000)) — the clock is floored, not erased"
     );
-    assert_eq!(row.updated_at, 2_000, "updated_at refreshes; the stamps are gone");
+    assert_eq!(
+        row.updated_at, 2_000,
+        "updated_at refreshes; the stamps are gone"
+    );
 
     // Fork-chain arm: Clear + supersedes -> no parent STAMP inheritance (the
     // attribution FLOOR carries through the chain: max(parent_floor, now)).
@@ -410,7 +425,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         })
         .unwrap();
     let child = ledger.load_binding("claude", "sess-4").expect("child row");
-    assert_eq!(child.client_instance_id, None, "Clear never inherits the superseded parent");
+    assert_eq!(
+        child.client_instance_id, None,
+        "Clear never inherits the superseded parent"
+    );
     assert_eq!(child.device_id, None);
     assert_eq!(child.tab_key, None);
     assert_eq!(
@@ -419,7 +437,11 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         "the child floor is max(parent attribution 4_000, clear_now 5_000)"
     );
     let parent = ledger.load_binding("claude", "sess-3").expect("parent row");
-    assert_eq!(parent.state, RowState::Retired, "supersession mechanics unchanged");
+    assert_eq!(
+        parent.state,
+        RowState::Retired,
+        "supersession mechanics unchanged"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -1022,8 +1044,14 @@ fn marker_spawn_time_is_the_write_time_and_assertion_rides_its_own_field() {
         "the provenance's assertion time rides its OWN field"
     );
     ledger
-        .record_pending("t2", "codex", None,
-        None, ProvenanceStamps::default(), 7_000)
+        .record_pending(
+            "t2",
+            "codex",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            7_000,
+        )
         .unwrap();
     let marker = ledger.pending_for_terminal("t2").expect("headless marker");
     assert_eq!(
@@ -1960,8 +1988,14 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
     ledger
-        .record_pending("ph", "freshclaude", None,
-        None, ProvenanceStamps::default(), 1)
+        .record_pending(
+            "ph",
+            "freshclaude",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1,
+        )
         .expect("pending writes keep their silent-no-op policy on a disabled ledger");
     ledger
         .delete_rollback_row("claude", "sid")
@@ -2396,8 +2430,14 @@ fn pending_marker_roundtrips_and_reader_rule_prefers_binding() {
     let root = temp_root("pending");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "opencode", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "opencode",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     let marker = ledger.pending_for_terminal("t1").expect("marker readable");
     assert_eq!(marker.terminal_id, "t1");
@@ -2421,8 +2461,14 @@ fn resolve_pending_writes_binding_first_then_deletes_marker() {
     let root = temp_root("resolve");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     ledger
         .resolve_pending(&write("codex", "th-1", "t1", 2_000))
@@ -2443,8 +2489,14 @@ fn resolve_pending_marker_delete_failure_is_not_a_durability_error() {
     let root = temp_root("marker-delete-fails");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     // Make the pending dir read-only so the marker unlink fails (EACCES).
     let pending_dir = root.join("pending");
@@ -2470,8 +2522,14 @@ fn pending_resolution_collision_is_idempotent() {
     let root = temp_root("collision");
     let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
 
     // Sequential double-resolution.
@@ -2492,8 +2550,14 @@ fn pending_resolution_collision_is_idempotent() {
 
     // Concurrent resolution from two threads (the actual race shape).
     ledger
-        .record_pending("t2", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 3_000)
+        .record_pending(
+            "t2",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            3_000,
+        )
         .unwrap();
     let a = std::sync::Arc::clone(&ledger);
     let b = std::sync::Arc::clone(&ledger);
@@ -2598,10 +2662,7 @@ fn resolve_pending_prefers_the_resolve_calls_own_provenance_over_the_markers() {
     let row = ledger.load_binding("codex", "th-1").expect("binding row");
     assert_eq!(row.client_instance_id.as_deref(), Some("client-resolve"));
     assert_eq!(row.device_id.as_deref(), Some("device-resolve"));
-    assert_eq!(
-        row.tab_key.as_deref(),
-        Some("device-resolve:tab-resolve")
-    );
+    assert_eq!(row.tab_key.as_deref(), Some("device-resolve:tab-resolve"));
     assert_eq!(
         row.last_attributed_at,
         Some(2_000),
@@ -2684,8 +2745,14 @@ fn resolve_pending_from_a_headless_origin_stays_unattributed() {
     let root = temp_root("resolve-headless");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     ledger
         .resolve_pending(&write("codex", "th-1", "t1", 2_000))
@@ -2971,7 +3038,10 @@ fn note_pane_reattach_rekeys_the_origin_lineage_wholesale() {
         })
         .unwrap();
     let row = ledger.load_binding("codex", "th-1").expect("row");
-    assert_eq!(row.origin_create_request_id.as_deref(), Some("req-OLD-original"));
+    assert_eq!(
+        row.origin_create_request_id.as_deref(),
+        Some("req-OLD-original")
+    );
     // A new pane (fresh createRequestId) reattaches the still-running
     // terminal: the row's pane keys move wholesale — create_request_id AND
     // origin — leaving NO key the closed old pane's record can match.
@@ -3036,8 +3106,13 @@ fn old_rows_and_markers_without_the_lineage_fields_still_deserialize() {
     )
     .unwrap();
     let ledger = PaneLedger::new(Some(root.clone()));
-    let row = ledger.load_binding("codex", "th-legacy").expect("row parses");
-    assert_eq!(row.origin_create_request_id, None, "legacy row: no origin key");
+    let row = ledger
+        .load_binding("codex", "th-legacy")
+        .expect("row parses");
+    assert_eq!(
+        row.origin_create_request_id, None,
+        "legacy row: no origin key"
+    );
     let marker = ledger
         .pending_for_terminal("t-legacy-pending")
         .expect("marker parses");
@@ -3077,8 +3152,14 @@ fn stamped_marker_retention_keys_on_creation_time_never_assertion_time() {
         )
         .unwrap();
     ledger
-        .record_pending("aged-t", "codex", Some("/tmp/p"),
-        None, stamps_at(1_000), 1_000)
+        .record_pending(
+            "aged-t",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            stamps_at(1_000),
+            1_000,
+        )
         .unwrap();
     let report = ledger.gc(now, &never_absent, None, Some(&no_snapshot_refs()));
     assert_eq!(
@@ -3133,9 +3214,15 @@ fn sigkill_inside_locator_window_leaves_a_durable_marker() {
     let root = temp_root("sigkill-window");
     {
         let gen1 = PaneLedger::new(Some(root.clone()));
-        gen1.record_pending("t1", "opencode", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
-            .unwrap();
+        gen1.record_pending(
+            "t1",
+            "opencode",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
+        .unwrap();
         // gen1 "dies" here — dropped without resolving.
     }
     let gen2 = PaneLedger::new(Some(root.clone()));
@@ -3255,8 +3342,14 @@ fn crash_between_binding_write_and_marker_delete_is_repaired_at_boot() {
     let root = temp_root("crash-window");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     ledger
         .record_binding(&write("codex", "th-1", "t1", 2_000))
@@ -3279,8 +3372,14 @@ fn boot_scan_never_sweeps_a_marker_merely_because_the_terminal_is_not_live() {
     let root = temp_root("marker-preserved");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "opencode", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "opencode",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     let report = ledger.boot_scan(2_000, &never_absent, Some(&no_snapshot_refs()));
     assert!(report.stale_markers_removed.is_empty());
@@ -3298,10 +3397,20 @@ fn aged_out_marker_is_swept_after_its_ttl() {
     let root = temp_root("marker-ttl");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
-    let report = ledger.boot_scan(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent, Some(&no_snapshot_refs()));
+    let report = ledger.boot_scan(
+        1_000 + PENDING_MARKER_TTL_MS + 1,
+        &never_absent,
+        Some(&no_snapshot_refs()),
+    );
     assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
     assert!(ledger.list_pending_raw().is_empty());
     std::fs::remove_dir_all(&root).ok();
@@ -3316,15 +3425,26 @@ fn periodic_gc_sweeps_aged_markers_without_a_restart() {
     let root = temp_root("marker-ttl-gc");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("t1", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "t1",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     // A fresh marker survives a GC pass (never swept merely for age < TTL)...
     let report = ledger.gc(2_000, &never_absent, None, Some(&no_snapshot_refs()));
     assert!(report.stale_markers_removed.is_empty());
     assert!(ledger.pending_for_terminal("t1").is_some());
     // ...but an aged-out one is swept by gc() alone — no boot_scan involved.
-    let report = ledger.gc(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent, None, Some(&no_snapshot_refs()));
+    let report = ledger.gc(
+        1_000 + PENDING_MARKER_TTL_MS + 1,
+        &never_absent,
+        None,
+        Some(&no_snapshot_refs()),
+    );
     assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
     assert!(ledger.list_pending_raw().is_empty());
     std::fs::remove_dir_all(&root).ok();
@@ -3343,16 +3463,34 @@ fn orphaned_pending_marker_is_gced_after_orphan_ttl() {
     let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
     let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
     ledger
-        .record_pending("dead-t", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), orphan_age)
+        .record_pending(
+            "dead-t",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            orphan_age,
+        )
         .unwrap();
     ledger
-        .record_pending("live-t", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), orphan_age)
+        .record_pending(
+            "live-t",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            orphan_age,
+        )
         .unwrap();
     ledger
-        .record_pending("young-t", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), now - 60_000)
+        .record_pending(
+            "young-t",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            now - 60_000,
+        )
         .unwrap();
     let live: HashSet<String> = HashSet::from(["live-t".to_string()]);
 
@@ -3384,8 +3522,14 @@ fn boot_path_never_runs_the_orphan_rule() {
     let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
     let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
     ledger
-        .record_pending("dead-t", "codex", Some("/tmp/p"),
-        None, ProvenanceStamps::default(), orphan_age)
+        .record_pending(
+            "dead-t",
+            "codex",
+            Some("/tmp/p"),
+            None,
+            ProvenanceStamps::default(),
+            orphan_age,
+        )
         .unwrap();
 
     let report = ledger.boot_scan(now, &never_absent, Some(&no_snapshot_refs()));
@@ -3512,7 +3656,12 @@ fn gc_expired_tombstone_rebinds_on_a_live_identity_event() {
     ledger
         .record_binding(&write("claude", "sess-x", "t1", 1_000))
         .unwrap();
-    ledger.gc(1_000 + BOUND_GC_TTL_MS + 1, &never_absent, None, Some(&no_snapshot_refs()));
+    ledger.gc(
+        1_000 + BOUND_GC_TTL_MS + 1,
+        &never_absent,
+        None,
+        Some(&no_snapshot_refs()),
+    );
     assert_eq!(
         ledger
             .load_binding("claude", "sess-x")
@@ -4165,9 +4314,7 @@ fn an_expired_kill_tombstone_no_longer_suppresses_and_is_swept() {
 fn clear_kill_tombstone_reopens_the_identity_for_a_genuine_claim() {
     let root = temp_root("kill-tombstone-clear");
     let ledger = PaneLedger::new(Some(root.clone()));
-    ledger
-        .retire_closed("claude", "durable-r", 10_000)
-        .unwrap();
+    ledger.retire_closed("claude", "durable-r", 10_000).unwrap();
     ledger
         .record_fresh_agent_binding(&fa_write("claude", "durable-r", 10_100))
         .unwrap();
@@ -4193,7 +4340,9 @@ fn clear_kill_tombstone_reopens_the_identity_for_a_genuine_claim() {
     );
     // Idempotent: re-clears (and clears of never-tombstoned ids) are Ok.
     ledger.clear_kill_tombstone("claude", "durable-r").unwrap();
-    ledger.clear_kill_tombstone("claude", "never-tombstoned").unwrap();
+    ledger
+        .clear_kill_tombstone("claude", "never-tombstoned")
+        .unwrap();
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -4205,9 +4354,13 @@ fn clear_kill_tombstone_reopens_the_identity_for_a_genuine_claim() {
 fn gc_sweeps_expired_kill_tombstones_and_keeps_fresh_ones() {
     let root = temp_root("kill-tombstone-gc");
     let ledger = PaneLedger::new(Some(root.clone()));
-    ledger.retire_closed("claude", "durable-old", 10_000).unwrap();
+    ledger
+        .retire_closed("claude", "durable-old", 10_000)
+        .unwrap();
     let now = 10_000 + KILL_TOMBSTONE_TTL_MS + 60_000;
-    ledger.retire_closed("codex", "thread-fresh", now - 1_000).unwrap();
+    ledger
+        .retire_closed("codex", "thread-fresh", now - 1_000)
+        .unwrap();
     let report = ledger.gc(now, &|_, _| false, None, Some(&no_snapshot_refs()));
     assert_eq!(
         ledger.kill_tombstone_at("claude", "durable-old"),
@@ -4347,7 +4500,10 @@ fn boot_scan_retires_a_bound_row_dominated_by_a_fresh_kill_tombstone() {
     // A fresh boot loads the remnant as-is: Bound row + its tombstone.
     let ledger2 = PaneLedger::new(Some(root.clone()));
     assert_eq!(
-        ledger2.load_binding("claude", "remnant-boot").unwrap().state,
+        ledger2
+            .load_binding("claude", "remnant-boot")
+            .unwrap()
+            .state,
         RowState::Bound,
         "fixture: the crash remnant loads Bound"
     );
@@ -4367,7 +4523,10 @@ fn boot_scan_retires_a_bound_row_dominated_by_a_fresh_kill_tombstone() {
     // The repair is DURABLE — a fresh reload agrees (not an in-memory read patch).
     let ledger3 = PaneLedger::new(Some(root.clone()));
     assert_eq!(
-        ledger3.load_binding("claude", "remnant-boot").unwrap().state,
+        ledger3
+            .load_binding("claude", "remnant-boot")
+            .unwrap()
+            .state,
         RowState::Retired,
         "the boot-scan repair is durable on disk"
     );
@@ -4377,12 +4536,18 @@ fn boot_scan_retires_a_bound_row_dominated_by_a_fresh_kill_tombstone() {
     // (the TTL only prunes converged or never-Bound pairs). The pair then
     // prunes: row retired first, tombstone swept Expired.
     assert_eq!(
-        ledger2.load_binding("claude", "expired-boot").unwrap().state,
+        ledger2
+            .load_binding("claude", "expired-boot")
+            .unwrap()
+            .state,
         RowState::Retired,
         "a tombstone paired with a still-Bound row never expires (Finding 4)"
     );
     assert_eq!(
-        ledger2.load_binding("claude", "expired-boot").unwrap().retired_reason,
+        ledger2
+            .load_binding("claude", "expired-boot")
+            .unwrap()
+            .retired_reason,
         Some(RetiredReason::Closed)
     );
     std::fs::remove_dir_all(&root).ok();
@@ -4446,7 +4611,10 @@ fn periodic_gc_retires_a_bound_row_dominated_by_a_fresh_kill_tombstone() {
         "a tombstone paired with a still-Bound row never expires (Finding 4)"
     );
     assert_eq!(
-        ledger2.load_binding("claude", "expired-gc").unwrap().retired_reason,
+        ledger2
+            .load_binding("claude", "expired-gc")
+            .unwrap()
+            .retired_reason,
         Some(RetiredReason::Closed)
     );
     std::fs::remove_dir_all(&root).ok();
@@ -4544,7 +4712,9 @@ fn dominant_kill_tombstone_keys_answers_only_rows_a_close_outranks() {
         "only the dominated Bound row answers — dominance is TTL-free and residue/blanks are excluded"
     );
     // A disabled ledger answers empty (never an error).
-    assert!(PaneLedger::disabled().dominant_kill_tombstone_keys().is_empty());
+    assert!(PaneLedger::disabled()
+        .dominant_kill_tombstone_keys()
+        .is_empty());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -4688,7 +4858,10 @@ fn commit_claim_refuses_a_newer_close_and_commits_an_unchanged_dead_state() {
     assert_eq!(row.state, RowState::Bound);
     assert_eq!(row.retired_reason, None);
     assert_eq!(row.updated_at, 11_000);
-    assert_eq!(row.created_at, 9_000, "the row's own keeping survives the flip");
+    assert_eq!(
+        row.created_at, 9_000,
+        "the row's own keeping survives the flip"
+    );
     assert_eq!(ledger.kill_tombstone_at("claude", "d"), None);
     let ledger2 = PaneLedger::new(Some(root.clone()));
     assert_eq!(
@@ -4766,13 +4939,15 @@ fn commit_claim_keeps_the_round_3_revive_narrowness() {
         .record_binding(&write("amplifier", "sid-m", "t1", 1_000))
         .unwrap();
     assert!(ledger.retire_missing("amplifier", "sid-m"));
-    ledger
-        .retire_closed("amplifier", "sid-m", 10_000)
-        .unwrap(); // a kill's fence over the missing-marked row
+    ledger.retire_closed("amplifier", "sid-m", 10_000).unwrap(); // a kill's fence over the missing-marked row
     let outcome = ledger
         .commit_claim("amplifier", "sid-m", Some(10_000), 11_000)
         .unwrap();
-    assert_eq!(outcome, ClaimCommitOutcome::Committed, "the fence still clears");
+    assert_eq!(
+        outcome,
+        ClaimCommitOutcome::Committed,
+        "the fence still clears"
+    );
     assert_eq!(ledger.kill_tombstone_at("amplifier", "sid-m"), None);
     let row = ledger.load_binding("amplifier", "sid-m").unwrap();
     assert_eq!(row.state, RowState::Retired);
@@ -4795,7 +4970,10 @@ fn commit_claim_keeps_the_round_3_revive_narrowness() {
         .unwrap();
     assert_eq!(outcome, ClaimCommitOutcome::Committed);
     assert_eq!(
-        ledger.load_binding("claude", "parent-s").unwrap().retired_reason,
+        ledger
+            .load_binding("claude", "parent-s")
+            .unwrap()
+            .retired_reason,
         Some(RetiredReason::Superseded),
         "a superseded row is never revived back over its chain"
     );
@@ -4948,9 +5126,7 @@ fn persisted_alias_tombstones_survive_a_restart_and_clear_per_durable() {
         "an unknown placeholder answers empty"
     );
     assert!(
-        ledger2
-            .alias_tombstone_records("codex", "ph-1")
-            .is_empty(),
+        ledger2.alias_tombstone_records("codex", "ph-1").is_empty(),
         "the records are provider-namespaced"
     );
 
@@ -5023,7 +5199,9 @@ fn the_alias_tombstone_sweep_drops_only_records_whose_rows_are_gone() {
         "the partially-kept placeholder's file was rewritten, not deleted"
     );
     assert!(
-        ledger.alias_tombstone_records("claude", "ph-dead").is_empty(),
+        ledger
+            .alias_tombstone_records("claude", "ph-dead")
+            .is_empty(),
         "a placeholder whose every record's row is gone is swept whole"
     );
     assert!(
@@ -5043,7 +5221,9 @@ fn the_alias_tombstone_sweep_drops_only_records_whose_rows_are_gone() {
     // next sweep at the same clock prunes it).
     ledger.retire_closed("claude", "d-bound", now).unwrap();
     let report2 = ledger.gc(now, &|_, _| false, None, Some(&no_snapshot_refs()));
-    assert!(ledger.alias_tombstone_records("claude", "ph-live").is_empty());
+    assert!(ledger
+        .alias_tombstone_records("claude", "ph-live")
+        .is_empty());
     assert!(
         report2
             .alias_tombstones_swept
@@ -5091,7 +5271,13 @@ fn commit_claim_aliased_refuses_on_a_placeholder_fence_and_commits_past_a_clean_
     // then claim — the genuine reopen shape, carried from round 4).
     ledger.retire_closed("claude", "d", 12_000).unwrap();
     let outcome = ledger
-        .commit_claim_aliased("claude", "d", Some(12_000), &["seat-clean".to_string()], 13_000)
+        .commit_claim_aliased(
+            "claude",
+            "d",
+            Some(12_000),
+            &["seat-clean".to_string()],
+            13_000,
+        )
         .unwrap();
     assert_eq!(outcome, ClaimCommitOutcome::Committed);
     let row = ledger.load_binding("claude", "d").unwrap();
@@ -5117,7 +5303,11 @@ fn a_corrupt_alias_tombstone_row_quarantines_loudly() {
     std::fs::write(&bad, b"{ not json").unwrap();
 
     let report = ledger.boot_scan(2_000, &never_absent, Some(&no_snapshot_refs()));
-    assert_eq!(report.quarantined.len(), 1, "the corrupt row is quarantined");
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "the corrupt row is quarantined"
+    );
     assert!(!bad.exists(), "renamed aside, not deleted");
     assert_eq!(
         ledger.alias_tombstone_records("claude", "ph-good"),
@@ -5461,7 +5651,8 @@ fn a_close_pane_whose_writes_all_fail_leaves_nothing_durable() {
                 if entry.path().is_dir() {
                     allow_recursive(&entry.path());
                 } else {
-                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644)).ok();
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644))
+                        .ok();
                 }
             }
         }
@@ -5472,11 +5663,20 @@ fn a_close_pane_whose_writes_all_fail_leaves_nothing_durable() {
         .record_binding(&write("codex", "sess-nofail", "term-nofail", 1_000))
         .unwrap();
     ledger
-        .record_pending("term-nofail", "codex", None,
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "term-nofail",
+            "codex",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     // Baseline: the marker exists before the close attempt.
-    assert!(ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-nofail"));
+    assert!(ledger
+        .list_pending_raw()
+        .iter()
+        .any(|m| m.terminal_id == "term-nofail"));
 
     deny_recursive(&root);
     let err = ledger
@@ -5535,7 +5735,9 @@ fn the_pane_close_sweep_drops_only_fully_aged_records() {
     let now = 1_000 + KILL_TOMBSTONE_TTL_MS + 1; // only term-old's record aged out
     let report = ledger.gc(now, &never_absent, None, Some(&no_snapshot_refs()));
     assert!(
-        report.pane_closes_swept.contains(&"pane:term-old".to_string()),
+        report
+            .pane_closes_swept
+            .contains(&"pane:term-old".to_string()),
         "the aged record was swept (record keys carry the lane prefix): {report:?}"
     );
     assert!(ledger.pane_close_for_terminal("term-old").is_none());
@@ -5671,8 +5873,14 @@ fn a_close_envelope_whose_record_write_fails_reports_clean_and_leaves_nothing_du
         .record_binding(&write("codex", "sess-cl", "term-cl", 1_000))
         .unwrap();
     ledger
-        .record_pending("term-cl", "codex", None,
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "term-cl",
+            "codex",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     let env_dir = PaneLedger::close_envelope_dir(&root);
     std::fs::create_dir_all(&env_dir).unwrap();
@@ -5701,7 +5909,10 @@ fn a_close_envelope_whose_record_write_fails_reports_clean_and_leaves_nothing_du
     );
     assert!(ledger.pane_close_for_terminal("term-cl").is_none());
     assert!(
-        ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-cl"),
+        ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == "term-cl"),
         "the marker is consumed only by a durable close"
     );
     // Heal + retry: the close completes idempotently.
@@ -5793,8 +6004,14 @@ fn a_close_envelope_whose_rollback_delete_fails_reports_persisted_close() {
         .record_binding(&write("codex", "sess-pe", "term-pe", 1_000))
         .unwrap();
     ledger
-        .record_pending("term-pe", "codex", None,
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "term-pe",
+            "codex",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     ledger.land_then_fail_next_close_envelope_writes(1);
     ledger.fail_next_close_envelope_deletes(1);
@@ -5852,8 +6069,14 @@ fn a_close_identities_envelope_is_one_journal_record() {
         .record_binding(&write("opencode", "ses-a", "term-a", 1_000))
         .unwrap();
     ledger
-        .record_pending("ph-x", "opencode", None,
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "ph-x",
+            "opencode",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     // Side A: the write never lands — clean failure, nothing durable.
     ledger.fail_next_close_envelope_writes(1);
@@ -5873,7 +6096,10 @@ fn a_close_identities_envelope_is_one_journal_record() {
         RowState::Bound
     );
     assert!(
-        ledger.list_pending_raw().iter().any(|m| m.terminal_id == "ph-x"),
+        ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == "ph-x"),
         "markers delete only once the close is durable"
     );
     // Success: ONE record carries the whole set; the flip lands; the marker goes.
@@ -5891,7 +6117,10 @@ fn a_close_identities_envelope_is_one_journal_record() {
         ledger.load_binding("opencode", "ses-a").unwrap().state,
         RowState::Retired
     );
-    assert!(ledger.list_pending_raw().iter().all(|m| m.terminal_id != "ph-x"));
+    assert!(ledger
+        .list_pending_raw()
+        .iter()
+        .all(|m| m.terminal_id != "ph-x"));
     let disk = PaneLedger::new(Some(root.clone()));
     assert_eq!(disk.kill_tombstone_at("opencode", "ph-x"), Some(3_000));
     std::fs::remove_dir_all(&root).ok();
@@ -5926,10 +6155,19 @@ fn a_close_pane_writes_the_close_record_before_the_pending_marker_is_deleted() {
     let root = temp_root("record-before-marker");
     let ledger = PaneLedger::new(Some(root.clone()));
     ledger
-        .record_pending("term-rbm", "codex", None,
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "term-rbm",
+            "codex",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
-    assert!(ledger.list_pending_raw().iter().any(|m| m.terminal_id == "term-rbm"));
+    assert!(ledger
+        .list_pending_raw()
+        .iter()
+        .any(|m| m.terminal_id == "term-rbm"));
     // The close-envelope dir is read-only: the record write fails. Nothing
     // else may have been consumed by then — above all NOT the marker.
     let closes_dir = PaneLedger::close_envelope_dir(&root);
@@ -5998,10 +6236,8 @@ fn a_close_pane_whose_projection_fails_for_one_identity_still_closes_the_whole_s
     ledger
         .record_binding(&write("opencode", "sess-second", "term-env-b", 1_000))
         .unwrap();
-    std::fs::create_dir_all(
-        PaneLedger::bindings_dir(&root).join(encode_segment("opencode")),
-    )
-    .unwrap();
+    std::fs::create_dir_all(PaneLedger::bindings_dir(&root).join(encode_segment("opencode")))
+        .unwrap();
     // The second identity's projection cannot land (read-only provider
     // bindings dir); everything else is writable.
     let opencode_rows = PaneLedger::bindings_dir(&root).join(encode_segment("opencode"));
@@ -6011,8 +6247,14 @@ fn a_close_pane_whose_projection_fails_for_one_identity_still_closes_the_whole_s
             terminal_id: "term-env".to_string(),
             create_request_id: Some("cr-env".to_string()),
             resolved: vec![
-                SessionLocator { provider: "codex".into(), session_id: "sess-first".into() },
-                SessionLocator { provider: "opencode".into(), session_id: "sess-second".into() },
+                SessionLocator {
+                    provider: "codex".into(),
+                    session_id: "sess-first".into(),
+                },
+                SessionLocator {
+                    provider: "opencode".into(),
+                    session_id: "sess-second".into(),
+                },
             ],
             now_ms: 2_000,
         })
@@ -6040,18 +6282,19 @@ fn a_close_pane_whose_projection_fails_for_one_identity_still_closes_the_whole_s
     let record = ledger.pane_close_for_terminal("term-env").expect("record");
     for (p, s) in [("codex", "sess-first"), ("opencode", "sess-second")] {
         assert!(
-            record.kills.iter().any(|k| k.provider == p && k.session_id == s),
+            record
+                .kills
+                .iter()
+                .any(|k| k.provider == p && k.session_id == s),
             "the ONE record covers ({p}, {s}): {record:?}"
         );
     }
     // The healed sweep converges the remnant durably.
     let report = ledger.gc(3_000, &never_absent, None, Some(&no_snapshot_refs()));
-    assert!(
-        report
-            .kill_tombstone_enforced_retires
-            .iter()
-            .any(|s| s.session_id == "sess-second")
-    );
+    assert!(report
+        .kill_tombstone_enforced_retires
+        .iter()
+        .any(|s| s.session_id == "sess-second"));
     let disk = PaneLedger::new(Some(root.clone()));
     assert_eq!(
         disk.load_binding("opencode", "sess-second").unwrap().state,
@@ -6075,8 +6318,14 @@ fn a_close_identities_batch_closes_every_identity_and_deletes_markers_last() {
         .record_binding(&write("claude", "sess-b", "term-b", 1_000))
         .unwrap();
     ledger
-        .record_pending("ph-a", "claude", None,
-        None, ProvenanceStamps::default(), 1_000)
+        .record_pending(
+            "ph-a",
+            "claude",
+            None,
+            None,
+            ProvenanceStamps::default(),
+            1_000,
+        )
         .unwrap();
     ledger
         .close_identities(
@@ -6100,7 +6349,10 @@ fn a_close_identities_batch_closes_every_identity_and_deletes_markers_last() {
         assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
     }
     assert!(
-        !ledger.list_pending_raw().iter().any(|m| m.terminal_id == "ph-a"),
+        !ledger
+            .list_pending_raw()
+            .iter()
+            .any(|m| m.terminal_id == "ph-a"),
         "the marker deleted"
     );
     let disk = PaneLedger::new(Some(root.clone()));
@@ -6227,7 +6479,6 @@ fn a_close_envelope_failure_over_a_prior_record_that_covers_the_whole_set_report
     std::fs::remove_dir_all(&root).ok();
 }
 
-
 // ── Delta-round-7 (round-7 Finding F2): the non-retiring DETACH pane close ──
 
 /// The terminal pane's deliberate X-close is a DETACH (the session keeps
@@ -6275,9 +6526,16 @@ fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() 
         "a detach close feeds no kill fence"
     );
     let row = ledger.load_binding("claude", "sess-det").expect("row");
-    assert_eq!(row.state, RowState::Bound, "the row stays Bound (sidebar reattach)");
+    assert_eq!(
+        row.state,
+        RowState::Bound,
+        "the row stays Bound (sidebar reattach)"
+    );
     assert_eq!(row.retired_reason, None);
-    assert_eq!(row.updated_at, 1_000, "the detach close never rewrites the row");
+    assert_eq!(
+        row.updated_at, 1_000,
+        "the detach close never rewrites the row"
+    );
     assert_eq!(row.create_request_id.as_deref(), Some("req-det"));
     assert_eq!(row.live_terminal_id.as_deref(), Some("term-det"));
 
@@ -6333,10 +6591,7 @@ fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() 
             now_ms: 4_000,
         })
         .expect("the later kill lands");
-    assert_eq!(
-        ledger.kill_tombstone_at("claude", "sess-det"),
-        Some(4_000)
-    );
+    assert_eq!(ledger.kill_tombstone_at("claude", "sess-det"), Some(4_000));
     assert_eq!(
         ledger.load_binding("claude", "sess-det").unwrap().state,
         RowState::Retired,
@@ -6347,7 +6602,11 @@ fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() 
         1,
         "the detach record stands beside the kill record"
     );
-    assert_eq!(ledger.list_pane_closes().len(), 1, "the kill record surfaces alone");
+    assert_eq!(
+        ledger.list_pane_closes().len(),
+        1,
+        "the kill record surfaces alone"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -6435,9 +6694,10 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_its_create_request_id(
 fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
     let root = temp_root("batch-close");
     let ledger = PaneLedger::new(Some(root.clone()));
-    for (session_id, terminal_id, crid) in
-        [("sess-b1", "term-b1", "req-b1"), ("sess-b2", "term-b2", "req-b2")]
-    {
+    for (session_id, terminal_id, crid) in [
+        ("sess-b1", "term-b1", "req-b1"),
+        ("sess-b2", "term-b2", "req-b2"),
+    ] {
         ledger
             .record_binding(&BindingWrite {
                 provider: "claude",
@@ -6473,9 +6733,14 @@ fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
         .expect("the batch close persists");
 
     // ONE record under the batch key — the per-pane keys were never written.
-    let batch_path =
-        PaneLedger::close_envelope_path(&root, &PaneLedger::pane_detach_batch_envelope_key("tab-batch"));
-    assert!(batch_path.exists(), "the batch envelope is one journal file");
+    let batch_path = PaneLedger::close_envelope_path(
+        &root,
+        &PaneLedger::pane_detach_batch_envelope_key("tab-batch"),
+    );
+    assert!(
+        batch_path.exists(),
+        "the batch envelope is one journal file"
+    );
     for crid in ["req-b1", "req-b2"] {
         assert!(
             !PaneLedger::close_envelope_path(&root, &PaneLedger::pane_detach_envelope_key(crid))
@@ -6505,9 +6770,10 @@ fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
     // family (the kill-lane read model never surfaces it either).
     assert!(ledger.all_kill_tombstone_keys().is_empty());
     assert!(ledger.list_pane_closes().is_empty());
-    for (session_id, terminal_id, crid) in
-        [("sess-b1", "term-b1", "req-b1"), ("sess-b2", "term-b2", "req-b2")]
-    {
+    for (session_id, terminal_id, crid) in [
+        ("sess-b1", "term-b1", "req-b1"),
+        ("sess-b2", "term-b2", "req-b2"),
+    ] {
         let row = ledger.load_binding("claude", session_id).unwrap();
         assert_eq!(row.state, RowState::Bound);
         assert_eq!(row.updated_at, 1_000);
@@ -6744,7 +7010,10 @@ fn a_pane_open_re_assertion_consumes_the_detach_close_durably() {
     );
     let disk = PaneLedger::new(Some(root.clone()));
     assert_eq!(disk.list_pane_detach_closes().len(), 1);
-    assert_eq!(disk.list_pane_detach_closes()[0].create_request_id, "req-kept");
+    assert_eq!(
+        disk.list_pane_detach_closes()[0].create_request_id,
+        "req-kept"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -6909,20 +7178,56 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
     let none = |_: &str| false;
 
     // The advisory-crid arm and the origin-lineage arm each cover alone.
-    assert!(close_record_covers_row(&row(Some("req-closed"), None, None), &crid, &none));
-    assert!(close_record_covers_row(&row(None, Some("req-closed"), None), &crid, &none));
+    assert!(close_record_covers_row(
+        &row(Some("req-closed"), None, None),
+        &crid,
+        &none
+    ));
+    assert!(close_record_covers_row(
+        &row(None, Some("req-closed"), None),
+        &crid,
+        &none
+    ));
     // The terminal arm covers ONLY the fully lineage-less row…
-    assert!(close_record_covers_row(&row(None, None, Some("term-closed")), &none, &tid));
+    assert!(close_record_covers_row(
+        &row(None, None, Some("term-closed")),
+        &none,
+        &tid
+    ));
     // …never a lineage-keyed one (an empty-string key is not lineage).
-    assert!(!close_record_covers_row(&row(Some("req-other"), None, Some("term-closed")), &none, &tid));
-    assert!(!close_record_covers_row(&row(None, Some("req-other"), Some("term-closed")), &none, &tid));
+    assert!(!close_record_covers_row(
+        &row(Some("req-other"), None, Some("term-closed")),
+        &none,
+        &tid
+    ));
+    assert!(!close_record_covers_row(
+        &row(None, Some("req-other"), Some("term-closed")),
+        &none,
+        &tid
+    ));
     // Nothing covers when no arm matches; empty-string keys are never
     // lineage (an empty advisory crid does NOT take the row out of the
     // terminal arm — only a real pane key does).
-    assert!(!close_record_covers_row(&row(Some("req-other"), None, Some("term-closed")), &crid, &none));
-    assert!(!close_record_covers_row(&row(Some(""), None, Some("term-closed")), &none, &none));
-    assert!(close_record_covers_row(&row(Some(""), None, Some("term-closed")), &none, &tid));
-    assert!(!close_record_covers_row(&row(None, None, None), &crid, &tid));
+    assert!(!close_record_covers_row(
+        &row(Some("req-other"), None, Some("term-closed")),
+        &crid,
+        &none
+    ));
+    assert!(!close_record_covers_row(
+        &row(Some(""), None, Some("term-closed")),
+        &none,
+        &none
+    ));
+    assert!(close_record_covers_row(
+        &row(Some(""), None, Some("term-closed")),
+        &none,
+        &tid
+    ));
+    assert!(!close_record_covers_row(
+        &row(None, None, None),
+        &crid,
+        &tid
+    ));
 }
 
 // ── Delta-r6-r4 (focused-episode-6 round 3, Finding 2): reference-time close-evidence retention ──
@@ -6959,7 +7264,8 @@ fn a_fully_aged_close_record_survives_while_a_retained_snapshot_references_it() 
     // included (and durable across a reload).
     let mut refs = crate::tabs_persist::RetainedSnapshotReferences::default();
     refs.create_request_ids.insert("cr-ref".to_string());
-    refs.claims.insert(("opencode".to_string(), "freshopencode-cr-z".to_string()));
+    refs.claims
+        .insert(("opencode".to_string(), "freshopencode-cr-z".to_string()));
     let report = ledger.gc(aged, &never_absent, None, Some(&refs));
     assert!(
         report.pane_closes_swept.is_empty(),
@@ -6982,7 +7288,10 @@ fn a_fully_aged_close_record_survives_while_a_retained_snapshot_references_it() 
     let mut refs = crate::tabs_persist::RetainedSnapshotReferences::default();
     refs.terminal_ids.insert("term-ref".to_string());
     let report = ledger.gc(aged, &never_absent, None, Some(&refs));
-    assert!(report.pane_closes_swept.iter().all(|k| k != "pane:term-ref"));
+    assert!(report
+        .pane_closes_swept
+        .iter()
+        .all(|k| k != "pane:term-ref"));
     assert!(ledger.pane_close_for_terminal("term-ref").is_some());
 
     // And when NOTHING references them anymore (a scanned store that
@@ -6990,11 +7299,16 @@ fn a_fully_aged_close_record_survives_while_a_retained_snapshot_references_it() 
     let empty = crate::tabs_persist::RetainedSnapshotReferences::default();
     let report = ledger.gc(aged, &never_absent, None, Some(&empty));
     assert!(
-        report.pane_closes_swept.contains(&"pane:term-ref".to_string()),
+        report
+            .pane_closes_swept
+            .contains(&"pane:term-ref".to_string()),
         "unreferenced + fully aged prunes: {report:?}"
     );
     assert!(ledger.pane_close_for_terminal("term-ref").is_none());
-    assert_eq!(ledger.kill_tombstone_at("opencode", "freshopencode-cr-z"), None);
+    assert_eq!(
+        ledger.kill_tombstone_at("opencode", "freshopencode-cr-z"),
+        None
+    );
 
     // The sessionKeys arm (focused-episode-6 round 4, Finding F3): a close
     // whose identity a retained generation claims ONLY through the rings
@@ -7105,10 +7419,7 @@ fn a_claim_commit_consumes_the_fences_it_clears_durably_a_restart_never_refed_th
         None,
         "durable consumption: the reload must NOT re-feed the consumed fence"
     );
-    assert_eq!(
-        reload.kill_tombstone_at("claude", "ph-c1"),
-        Some(2_000)
-    );
+    assert_eq!(reload.kill_tombstone_at("claude", "ph-c1"), Some(2_000));
     assert!(
         !reload
             .all_kill_tombstone_keys()
@@ -7325,7 +7636,10 @@ fn reattach_restamps_the_bound_rows_pane_identity_and_advances_attribution() {
     assert_eq!(row.mode, "claude");
     assert_eq!(row.cwd.as_deref(), Some("/tmp/proj"));
     assert_eq!(row.state, RowState::Bound, "the restamp never retires");
-    assert_eq!(row.updated_at, 2_050, "a genuine re-observation stamps the write's now");
+    assert_eq!(
+        row.updated_at, 2_050,
+        "a genuine re-observation stamps the write's now"
+    );
     assert_eq!(row.last_observed_at, 2_050);
     // Durable: the restamp survives a reload.
     let reload = PaneLedger::new(Some(root.clone()));
@@ -7381,7 +7695,13 @@ fn reattach_is_a_no_op_without_a_bound_row_and_never_resurrects_a_retired_one() 
     let root = temp_root("reattach-no-row");
     let ledger = PaneLedger::new(Some(root.clone()));
     let stamped = ledger
-        .note_pane_reattach(&reattach_write("claude", "sess-absent", "term-x", "req-n1", 1_000))
+        .note_pane_reattach(&reattach_write(
+            "claude",
+            "sess-absent",
+            "term-x",
+            "req-n1",
+            1_000,
+        ))
         .unwrap();
     assert!(!stamped, "no row to restamp");
     assert!(ledger.load_binding("claude", "sess-absent").is_none());
@@ -7403,7 +7723,13 @@ fn reattach_is_a_no_op_without_a_bound_row_and_never_resurrects_a_retired_one() 
         })
         .unwrap();
     let stamped = ledger
-        .note_pane_reattach(&reattach_write("codex", "sess-killed", "term-killed", "req-n2", 3_000))
+        .note_pane_reattach(&reattach_write(
+            "codex",
+            "sess-killed",
+            "term-killed",
+            "req-n2",
+            3_000,
+        ))
         .unwrap();
     assert!(!stamped, "a Retired row is never restamped");
     let row = ledger.load_binding("codex", "sess-killed").unwrap();

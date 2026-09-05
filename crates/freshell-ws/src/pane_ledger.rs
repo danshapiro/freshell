@@ -476,10 +476,7 @@ pub fn close_record_covers_row(
     crid_covered: &dyn Fn(&str) -> bool,
     detach_terminal_covered: &dyn Fn(&str) -> bool,
 ) -> bool {
-    let advisory = row
-        .create_request_id
-        .as_deref()
-        .filter(|id| !id.is_empty());
+    let advisory = row.create_request_id.as_deref().filter(|id| !id.is_empty());
     let origin = row
         .origin_create_request_id
         .as_deref()
@@ -540,7 +537,10 @@ impl std::fmt::Display for CloseEnvelopeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CloseEnvelopeError::Clean(e) => {
-                write!(f, "the close envelope failed and nothing of it is durable: {e}")
+                write!(
+                    f,
+                    "the close envelope failed and nothing of it is durable: {e}"
+                )
             }
             CloseEnvelopeError::Persisted(e) => write!(
                 f,
@@ -659,11 +659,7 @@ fn classify_kill_tombstone(
 /// persist time and at load. The record's `kills` ARE the close fences: each
 /// folds into the `kill_tombstones` index, max stamp winning across records
 /// and legacy files (a re-kill re-stamps forward).
-fn feed_close_envelope(
-    index: &mut LedgerIndex,
-    key: String,
-    record: CloseEnvelopeRecord,
-) {
+fn feed_close_envelope(index: &mut LedgerIndex, key: String, record: CloseEnvelopeRecord) {
     for kill in &record.kills {
         index
             .kill_tombstones
@@ -1611,10 +1607,7 @@ impl PaneLedger {
                     }
                     if let Ok(tombstone) = load_row::<KillTombstone>(&path) {
                         if tombstone.ledger_version == LEDGER_VERSION {
-                            let key = (
-                                tombstone.provider.clone(),
-                                tombstone.session_id.clone(),
-                            );
+                            let key = (tombstone.provider.clone(), tombstone.session_id.clone());
                             index.legacy_tombstone_keys.insert(key.clone());
                             index
                                 .kill_tombstones
@@ -1985,10 +1978,7 @@ impl PaneLedger {
         // outranks its own crashed clear) is inert: the write proceeds and
         // the residue is pruned.
         if let Some(killed_at) = index.kill_tombstones.get(&key).copied() {
-            let row_view = index
-                .bindings
-                .get(&key)
-                .map(|r| (r.state, r.updated_at));
+            let row_view = index.bindings.get(&key).map(|r| (r.state, r.updated_at));
             match classify_kill_tombstone(killed_at, row_view, w.now_ms) {
                 KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh => {
                     tracing::info!(
@@ -2246,10 +2236,7 @@ impl PaneLedger {
     pub(crate) fn arm_resolve_pending_gate(&self) -> ResolveGateHandles {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        *self
-            .resolve_gate
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(ResolveGate {
+        *self.resolve_gate.lock().unwrap_or_else(|p| p.into_inner()) = Some(ResolveGate {
             entered_tx,
             release_rx: Mutex::new(Some(release_rx)),
         });
@@ -2276,12 +2263,12 @@ impl PaneLedger {
         provider: &str,
         session_id: &str,
     ) -> std::io::Result<()> {
-        let result = match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id))
-        {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        };
+        let result =
+            match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id)) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            };
         if result.is_ok() {
             let key = (provider.to_string(), session_id.to_string());
             index.kill_tombstones.remove(&key);
@@ -2319,18 +2306,17 @@ impl PaneLedger {
         let key = (provider.to_string(), session_id.to_string());
         let mut first_err: Option<std::io::Error> = None;
         // 1. the legacy per-identity file (the pre-journal fence shape).
-        let legacy_survives = match std::fs::remove_file(Self::kill_tombstone_path(
-            root, provider, session_id,
-        )) {
-            Ok(()) => false,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
+        let legacy_survives =
+            match std::fs::remove_file(Self::kill_tombstone_path(root, provider, session_id)) {
+                Ok(()) => false,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    true
                 }
-                true
-            }
-        };
+            };
         if !legacy_survives {
             index.legacy_tombstone_keys.remove(&key);
         }
@@ -2436,7 +2422,11 @@ impl PaneLedger {
         };
         let mut index = self.guard();
         let key = (provider.to_string(), placeholder.to_string());
-        let mut records = index.alias_tombstones.get(&key).cloned().unwrap_or_default();
+        let mut records = index
+            .alias_tombstones
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
         if let Some(existing) = records.iter_mut().find(|(d, _)| d == durable) {
             existing.1 = at_ms;
         } else {
@@ -2454,7 +2444,10 @@ impl PaneLedger {
                 })
                 .collect(),
         };
-        write_row_atomic(&Self::alias_tombstone_path(root, provider, placeholder), &row)?;
+        write_row_atomic(
+            &Self::alias_tombstone_path(root, provider, placeholder),
+            &row,
+        )?;
         index.alias_tombstones.insert(key, records);
         Ok(())
     }
@@ -2462,11 +2455,7 @@ impl PaneLedger {
     /// The placeholder's recorded durable ids, TTL-agnostic (the sweep owns
     /// expiry; the claude kill consult applies the row-state rule).
     /// Memory-only (V1.md read policy); a disabled ledger answers empty.
-    pub fn alias_tombstone_records(
-        &self,
-        provider: &str,
-        placeholder: &str,
-    ) -> Vec<(String, i64)> {
+    pub fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
         if self.root.is_none() {
             return Vec::new();
         }
@@ -2499,9 +2488,7 @@ impl PaneLedger {
         let placeholders: Vec<String> = index
             .alias_tombstones
             .iter()
-            .filter(|((p, _), records)| {
-                p == provider && records.iter().any(|(d, _)| d == durable)
-            })
+            .filter(|((p, _), records)| p == provider && records.iter().any(|(d, _)| d == durable))
             .map(|((_, placeholder), _)| placeholder.clone())
             .collect();
         let mut first_err: Option<std::io::Error> = None;
@@ -2511,8 +2498,11 @@ impl PaneLedger {
             let Some(records) = index.alias_tombstones.get(&key).cloned() else {
                 continue;
             };
-            let kept: Vec<(String, i64)> =
-                records.iter().filter(|(d, _)| d != durable).cloned().collect();
+            let kept: Vec<(String, i64)> = records
+                .iter()
+                .filter(|(d, _)| d != durable)
+                .cloned()
+                .collect();
             let outcome = if kept.is_empty() {
                 match std::fs::remove_file(Self::alias_tombstone_path(root, provider, &placeholder))
                 {
@@ -2533,7 +2523,10 @@ impl PaneLedger {
                         })
                         .collect(),
                 };
-                write_row_atomic(&Self::alias_tombstone_path(root, provider, &placeholder), &row)
+                write_row_atomic(
+                    &Self::alias_tombstone_path(root, provider, &placeholder),
+                    &row,
+                )
             };
             match outcome {
                 Ok(()) => {
@@ -2600,10 +2593,7 @@ impl PaneLedger {
             .kill_tombstones
             .iter()
             .filter(|(key, killed_at)| {
-                let row_view = index
-                    .bindings
-                    .get(*key)
-                    .map(|r| (r.state, r.updated_at));
+                let row_view = index.bindings.get(*key).map(|r| (r.state, r.updated_at));
                 // Dominance is TTL-free; `now` only disambiguates the
                 // non-Bound arms, which this filter never selects anyway.
                 classify_kill_tombstone(**killed_at, row_view, i64::MAX)
@@ -2751,7 +2741,8 @@ impl PaneLedger {
         let tombstone_present = current.is_some();
         if tombstone_present {
             if let Some(mut row) = index.bindings.get(&key).cloned() {
-                if row.state == RowState::Retired && row.retired_reason == Some(RetiredReason::Closed)
+                if row.state == RowState::Retired
+                    && row.retired_reason == Some(RetiredReason::Closed)
                 {
                     row.state = RowState::Bound;
                     row.retired_reason = None;
@@ -3136,7 +3127,9 @@ impl PaneLedger {
         if fail > 0 {
             self.close_envelope_write_failures
                 .store(fail - 1, std::sync::atomic::Ordering::SeqCst);
-            return Err(std::io::Error::other("injected close-envelope write failure"));
+            return Err(std::io::Error::other(
+                "injected close-envelope write failure",
+            ));
         }
         write_row_atomic(path, record)
     }
@@ -3149,7 +3142,9 @@ impl PaneLedger {
         if fail > 0 {
             self.close_envelope_delete_failures
                 .store(fail - 1, std::sync::atomic::Ordering::SeqCst);
-            return Err(std::io::Error::other("injected close-envelope delete failure"));
+            return Err(std::io::Error::other(
+                "injected close-envelope delete failure",
+            ));
         }
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -3595,8 +3590,9 @@ impl PaneLedger {
                 record.create_request_id = None;
                 record.terminal_id = None;
             }
-            let delete_record =
-                record.create_request_id.is_none() && record.panes.is_empty() && record.kills.is_empty();
+            let delete_record = record.create_request_id.is_none()
+                && record.panes.is_empty()
+                && record.kills.is_empty();
             let path = Self::close_envelope_path(root, &key);
             let outcome = if delete_record {
                 match std::fs::remove_file(&path) {

@@ -205,7 +205,10 @@ impl AliasTombstones {
         now_ms: i64,
         row_bound: &dyn Fn(&str) -> bool,
     ) {
-        let entries = self.by_placeholder.entry(placeholder.to_string()).or_default();
+        let entries = self
+            .by_placeholder
+            .entry(placeholder.to_string())
+            .or_default();
         if let Some(existing) = entries.iter_mut().find(|e| e.durable == durable) {
             existing.at_ms = now_ms;
         } else {
@@ -248,7 +251,10 @@ impl AliasTombstones {
         now_ms: i64,
         row_bound: &dyn Fn(&str) -> bool,
     ) {
-        let entries = self.by_placeholder.entry(placeholder.to_string()).or_default();
+        let entries = self
+            .by_placeholder
+            .entry(placeholder.to_string())
+            .or_default();
         if let Some(existing) = entries.iter_mut().find(|e| e.durable == durable) {
             existing.at_ms = existing.at_ms.max(at_ms);
         } else {
@@ -1661,7 +1667,12 @@ impl FreshClaudeState {
             return true;
         };
         match sink
-            .commit_claim_aliased(PROVIDER, durable_id, expect_killed_at_ms, through_placeholders)
+            .commit_claim_aliased(
+                PROVIDER,
+                durable_id,
+                expect_killed_at_ms,
+                through_placeholders,
+            )
             .await
         {
             Ok(crate::identity_sink::ClaimCommit::Committed) => true,
@@ -7300,7 +7311,8 @@ rl.on('line', (line) => {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(dedup_create_msg("req-retire-claude"), None).await;
+        st.handle_create(dedup_create_msg("req-retire-claude"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-retire-claude").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         let durable = "3d3d3d3d-3d3d-4d3d-8d3d-3d3d3d3d3d3d";
@@ -7335,7 +7347,8 @@ rl.on('line', (line) => {
 
         // Re-create + re-alias (the kill removed both), then kill addressed by
         // the PLACEHOLDER — the same durable row must retire.
-        st.handle_create(dedup_create_msg("req-retire-claude-2"), None).await;
+        st.handle_create(dedup_create_msg("req-retire-claude-2"), None)
+            .await;
         let created2 = await_claude_created(&mut rx, "req-retire-claude-2").await;
         let placeholder2 = created2["sessionId"].as_str().unwrap().to_string();
         st.cli_index
@@ -7514,7 +7527,8 @@ rl.on('line', (line) => {
     /// never a live session beside durable close evidence) while the answer
     /// reports `success:false`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly() {
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly(
+    ) {
         let (st, mut rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -7672,7 +7686,10 @@ rl.on('line', (line) => {
             if present {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "adoption aliases the durable id"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         // The whole close envelope fails (disk-full/permission shape).
@@ -7752,7 +7769,10 @@ rl.on('line', (line) => {
             if present {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "adoption aliases the durable id");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "adoption aliases the durable id"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
@@ -7952,15 +7972,16 @@ rl.on('line', (line) => {
     /// alias to the retained tombstones (never drop it), so the kill still
     /// resolves and retires the durable-keyed row.
     #[tokio::test]
-    async fn handle_kill_after_exit_eviction_with_the_bare_placeholder_still_retires_the_durable_row()
-     {
+    async fn handle_kill_after_exit_eviction_with_the_bare_placeholder_still_retires_the_durable_row(
+    ) {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (st, mut rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        st.handle_create(dedup_create_msg("req-alias-exit"), None).await;
+        st.handle_create(dedup_create_msg("req-alias-exit"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-alias-exit").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         // The fake sidecar's default durable cliSessionId (its script emits it
@@ -8072,13 +8093,10 @@ rl.on('line', (line) => {
         })
         .await;
         assert!(
-            fake.kill_tombstones
-                .lock()
-                .unwrap()
-                .contains_key(&(
-                    "claude".to_string(),
-                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()
-                )),
+            fake.kill_tombstones.lock().unwrap().contains_key(&(
+                "claude".to_string(),
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string()
+            )),
             "the kill folded the durable identity's kill tombstone"
         );
 
@@ -8122,7 +8140,8 @@ rl.on('line', (line) => {
         let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
         // Create, let the alias land, kill (placeholder — the real wire shape).
-        st.handle_create(dedup_create_msg("req-claim-kill"), None).await;
+        st.handle_create(dedup_create_msg("req-claim-kill"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-claim-kill").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -8136,7 +8155,10 @@ rl.on('line', (line) => {
             if present {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "alias lands pre-kill");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "alias lands pre-kill"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         st.handle_kill(FreshAgentKill {
@@ -8266,7 +8288,8 @@ rl.on('line', (line) => {
         // Epoch 1: create + adoption, then the close (bare placeholder — the
         // real wire shape), which retires D and demotes P1→D to the alias
         // tombstones.
-        st.handle_create(dedup_create_msg("req-reopen-1"), None).await;
+        st.handle_create(dedup_create_msg("req-reopen-1"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-reopen-1").await;
         let placeholder_old = created["sessionId"].as_str().unwrap().to_string();
         await_alias(&st, durable, &placeholder_old).await;
@@ -8352,7 +8375,8 @@ rl.on('line', (line) => {
         let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
         // A live session owning D under a NEW placeholder (the reopened shape).
-        st.handle_create(dedup_create_msg("req-live-owner"), None).await;
+        st.handle_create(dedup_create_msg("req-live-owner"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-live-owner").await;
         let placeholder_live = created["sessionId"].as_str().unwrap().to_string();
         await_alias(&st, durable, &placeholder_live).await;
@@ -8363,7 +8387,12 @@ rl.on('line', (line) => {
         st.alias_tombstones
             .lock()
             .expect("alias tombstones lock")
-            .record("placeholder-old-epoch", durable, now, &st.alias_row_bound_probe());
+            .record(
+                "placeholder-old-epoch",
+                durable,
+                now,
+                &st.alias_row_bound_probe(),
+            );
 
         st.handle_kill(kill_msg("placeholder-old-epoch")).await;
 
@@ -8395,7 +8424,8 @@ rl.on('line', (line) => {
         st.set_identity_sink(fake.clone());
         let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-        st.handle_create(dedup_create_msg("req-evict-gap"), None).await;
+        st.handle_create(dedup_create_msg("req-evict-gap"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-evict-gap").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         await_alias(&st, durable, &placeholder).await;
@@ -8410,7 +8440,11 @@ rl.on('line', (line) => {
             st.alias_tombstones
                 .lock()
                 .expect("alias tombstones lock")
-                .durables_for(&placeholder, crate::session_lease::now_epoch_ms() as i64, &st.alias_row_bound_probe())
+                .durables_for(
+                    &placeholder,
+                    crate::session_lease::now_epoch_ms() as i64,
+                    &st.alias_row_bound_probe()
+                )
                 .is_empty(),
             "fixture: no alias tombstone exists yet either"
         );
@@ -8451,7 +8485,8 @@ rl.on('line', (line) => {
         st.set_identity_sink(fake.clone());
         let durable = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-        st.handle_create(dedup_create_msg("req-evict-cs"), None).await;
+        st.handle_create(dedup_create_msg("req-evict-cs"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-evict-cs").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         await_alias(&st, durable, &placeholder).await;
@@ -8722,7 +8757,10 @@ rl.on('line', (line) => {
         // The close the user will MEAN: row Closed + fence, before the attach.
         state.handle_kill(kill_msg(DURABLE)).await;
         let claim_start_snapshot = fake.kill_tombstone_at_ms("claude", DURABLE);
-        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
 
         // The attach starts; the fake sidecar holds `created` for 1.5s, so the
         // resume parks inside its provider await.
@@ -8976,8 +9014,7 @@ rl.on('line', (line) => {
             "the row is never revived"
         );
         assert!(
-            !st
-                .alias_tombstones
+            !st.alias_tombstones
                 .lock()
                 .expect("alias tombstones lock")
                 .durables_for("placeholder-old", now, &st.alias_row_bound_probe())
@@ -9060,7 +9097,8 @@ rl.on('line', (line) => {
         );
         for gone in ["p1", "p2", "p3", "p4"] {
             assert!(
-                t.durables_for(gone, ALIAS_TOMBSTONE_CAP as i64 + 4, &probe).is_empty(),
+                t.durables_for(gone, ALIAS_TOMBSTONE_CAP as i64 + 4, &probe)
+                    .is_empty(),
                 "oldest unbound placeholders are the eviction candidates ({gone} must go)"
             );
         }
@@ -9091,7 +9129,12 @@ rl.on('line', (line) => {
         st.alias_tombstones
             .lock()
             .expect("alias tombstones lock")
-            .record("placeholder-old", durable, stale_at, &st.alias_row_bound_probe());
+            .record(
+                "placeholder-old",
+                durable,
+                stale_at,
+                &st.alias_row_bound_probe(),
+            );
 
         st.handle_kill(kill_msg("placeholder-old")).await;
 
@@ -9120,8 +9163,8 @@ rl.on('line', (line) => {
     /// answers promptly; the fake sink's post-commit stall holds the lane
     /// exactly in the finding's window.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_session()
-     {
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_session(
+    ) {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let home = tempfile::tempdir().unwrap();
@@ -9144,7 +9187,10 @@ rl.on('line', (line) => {
         // The close the user MEANT (before this attach): row Closed + fence.
         state.handle_kill(kill_msg(DURABLE)).await;
         let claim_start_snapshot = fake.kill_tombstone_at_ms("claude", DURABLE);
-        assert!(claim_start_snapshot.is_some(), "fixture: the fence is durable");
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
 
         let stall = fake.arm_post_commit_stall("claude", DURABLE);
         let st2 = state.clone();
@@ -9216,8 +9262,8 @@ rl.on('line', (line) => {
     /// is between commit and the sessions/cli_index inserts — the create
     /// answers failed and nothing registers.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create()
-     {
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create(
+    ) {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (state, mut rx) = state_with_bus();
@@ -9315,7 +9361,8 @@ rl.on('line', (line) => {
 
         // A live session owning the durable (the alias written directly, the
         // trick the kill tests use — the fake sidecar mints its own cli id).
-        st.handle_create(dedup_create_msg("req-sweep-1"), None).await;
+        st.handle_create(dedup_create_msg("req-sweep-1"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-sweep-1").await;
         assert_eq!(created["type"].as_str().unwrap(), "freshAgent.created");
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
@@ -9360,7 +9407,8 @@ rl.on('line', (line) => {
         st.set_identity_sink(fake.clone());
         let durable = "cfcfcfcf-cfcf-4cfc-8cfc-cfcfcfcfcfcf";
 
-        st.handle_create(dedup_create_msg("req-sweep-2"), None).await;
+        st.handle_create(dedup_create_msg("req-sweep-2"), None)
+            .await;
         let created = await_claude_created(&mut rx, "req-sweep-2").await;
         assert_eq!(created["type"].as_str().unwrap(), "freshAgent.created");
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
@@ -9558,7 +9606,8 @@ rl.on('line', (line) => {
     /// persisted alias tombstones, so the close names the bare placeholder
     /// and still fences + retires the durable row.
     #[tokio::test]
-    async fn a_kill_naming_a_bare_placeholder_resolves_the_persisted_alias_record_into_the_retire_set() {
+    async fn a_kill_naming_a_bare_placeholder_resolves_the_persisted_alias_record_into_the_retire_set(
+    ) {
         let (st, _rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -9609,7 +9658,8 @@ rl.on('line', (line) => {
     /// same claim over a CLEAN seat commits (and consumes the durable
     /// store's stale records for the durable, clearing their fences).
     #[tokio::test]
-    async fn a_claim_is_refused_when_the_seat_it_rides_carries_a_close_fence_and_commits_over_a_clean_seat() {
+    async fn a_claim_is_refused_when_the_seat_it_rides_carries_a_close_fence_and_commits_over_a_clean_seat(
+    ) {
         let (st, _rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -9674,7 +9724,8 @@ rl.on('line', (line) => {
             "the unfenced seat commits"
         );
         assert!(
-            fake.alias_tombstone_records("claude", "seat-old").is_empty(),
+            fake.alias_tombstone_records("claude", "seat-old")
+                .is_empty(),
             "the older persisted records were consumed"
         );
         assert!(
@@ -9746,10 +9797,7 @@ rl.on('line', (line) => {
             saw_resume_failed,
             "the phantom attach must fail, never register a session over the closed seat"
         );
-        assert!(
-            state.sessions.lock().await.is_empty(),
-            "nothing registers"
-        );
+        assert!(state.sessions.lock().await.is_empty(), "nothing registers");
         assert!(
             state.cli_index.lock().await.get(DURABLE).is_none(),
             "no registration alias survives"
@@ -9766,7 +9814,8 @@ rl.on('line', (line) => {
             "the durable identity is untouched — no fence invented, none cleared"
         );
         assert!(
-            fake.alias_tombstone_records("claude", "seat-closed").is_empty()
+            fake.alias_tombstone_records("claude", "seat-closed")
+                .is_empty()
                 && fake
                     .alias_record_writes
                     .lock()
@@ -9832,7 +9881,8 @@ rl.on('line', (line) => {
     /// records (their ledger fences too — the reopened identity's every
     /// known alias reopens together).
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_attach_over_a_clean_seat_commits_persists_its_alias_and_consumes_the_older_records() {
+    async fn an_attach_over_a_clean_seat_commits_persists_its_alias_and_consumes_the_older_records()
+    {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let home = tempfile::tempdir().unwrap();
@@ -9892,7 +9942,8 @@ rl.on('line', (line) => {
             "the attach registration persisted its alias record"
         );
         assert!(
-            fake.alias_tombstone_records("claude", "seat-old").is_empty(),
+            fake.alias_tombstone_records("claude", "seat-old")
+                .is_empty(),
             "the durable's older persisted records were consumed"
         );
         drop(env);
@@ -10951,9 +11002,18 @@ rl.on('line', (line) => {
 
         let bindings = fake.bindings.lock().unwrap();
         let b = bindings.last().expect("binding at sdk.session.init");
-        assert_eq!(b.asserted_stamps().client_instance_id.as_deref(), Some("client-claude"));
-        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-claude"));
-        assert_eq!(b.asserted_stamps().tab_key.as_deref(), Some("device-claude:tab-claude"));
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-claude")
+        );
+        assert_eq!(
+            b.asserted_stamps().device_id.as_deref(),
+            Some("device-claude")
+        );
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-claude:tab-claude")
+        );
         drop(env);
     }
 

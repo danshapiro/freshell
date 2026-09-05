@@ -227,8 +227,9 @@ impl std::error::Error for SinkCloseError {}
 /// The close writes' completion future (the `retire_closed` /
 /// `retire_closed_batch` lanes) — the [`SinkWrite`] discipline with the
 /// classed error.
-pub type SinkCloseWrite =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SinkCloseError>> + Send + 'static>>;
+pub type SinkCloseWrite = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), SinkCloseError>> + Send + 'static>,
+>;
 
 /// How a kill lane reads the durable close's answer (delta-r6-r4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,8 +276,9 @@ pub enum ClaimCommit {
 
 /// The claim commit's completion future — the [`SinkWrite`] discipline with
 /// a payload: awaited at every claim lane before its binding writes.
-pub type SinkCommitWrite =
-    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<ClaimCommit>> + Send + 'static>>;
+pub type SinkCommitWrite = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<ClaimCommit>> + Send + 'static>,
+>;
 
 /// The alias-tombstone consumption's completion future (focused-ep5-r5
 /// Finding 2, retire-on-kill round 6) — the [`SinkWrite`] discipline whose
@@ -578,8 +580,7 @@ pub(crate) struct FakeIdentitySink {
     /// Same-key only (the real ledger additionally inherits from a superseded
     /// PARENT row; no fake consumer needs that — the providers' fork-child
     /// assertions read the child row's upsert off `bindings`, not this map).
-    pub provenance:
-        std::sync::Mutex<std::collections::HashMap<(String, String), BindProvenance>>,
+    pub provenance: std::sync::Mutex<std::collections::HashMap<(String, String), BindProvenance>>,
     /// (provider, sessionId) -> stored rollback record (kata 1wxv).
     pub rollbacks: std::sync::Mutex<std::collections::HashMap<(String, String), RollbackRecord>>,
     /// Retire-on-kill record (delta-review round 5): every `retire_closed`
@@ -606,8 +607,7 @@ pub(crate) struct FakeIdentitySink {
     /// stamps); what IS modeled faithfully is the round-4 claim
     /// CONDITION: `commit_claim` compares the current stamp against the
     /// claim-start snapshot and refuses on any advance.
-    pub kill_tombstones:
-        std::sync::Mutex<std::collections::HashMap<(String, String), i64>>,
+    pub kill_tombstones: std::sync::Mutex<std::collections::HashMap<(String, String), i64>>,
     /// The stamp source for [`Self::kill_tombstones`] (see its doc).
     kill_clock: std::sync::Mutex<i64>,
     /// Every `clear_kill_tombstone` call (the genuine-claim lanes' lifecycle
@@ -630,8 +630,7 @@ pub(crate) struct FakeIdentitySink {
     /// Retire-on-kill round 3: the row's CURRENT state per identity (see
     /// [`FakeRowState`]). Keyed only by identities a binding write ever
     /// landed for — the real "missing row" answer for anything else.
-    pub states:
-        std::sync::Mutex<std::collections::HashMap<(String, String), FakeRowState>>,
+    pub states: std::sync::Mutex<std::collections::HashMap<(String, String), FakeRowState>>,
     /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
     /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
     /// through [`RollbackRecord::from_stored_payload`] exactly like the real
@@ -686,22 +685,22 @@ pub(crate) struct FakeIdentitySink {
     self_weak: std::sync::Mutex<std::sync::Weak<FakeIdentitySink>>,
 }
 
-    /// Retire-on-kill round 3: the fake's ROW-STATE model (the in-memory twin
-    /// of the real ledger's `state`/`retired_reason` columns), so kill/claim
-    /// lanes can be pinned on "the row ends Retired(Closed), never Bound"
-    /// instead of on call traces. `record_binding` produces a Bound row;
-    /// `retire_closed` flips a Bound row to Closed (a missing or
-    /// already-retired row is unaffected — the real retire's no-op shape).
-    #[cfg(test)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum FakeRowState {
-        Bound,
-        Closed,
-    }
+/// Retire-on-kill round 3: the fake's ROW-STATE model (the in-memory twin
+/// of the real ledger's `state`/`retired_reason` columns), so kill/claim
+/// lanes can be pinned on "the row ends Retired(Closed), never Bound"
+/// instead of on call traces. `record_binding` produces a Bound row;
+/// `retire_closed` flips a Bound row to Closed (a missing or
+/// already-retired row is unaffected — the real retire's no-op shape).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FakeRowState {
+    Bound,
+    Closed,
+}
 
-    /// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
-    #[cfg(test)]
-    struct OrphanBindingGate {
+/// Focused-ep5-r1 Finding 2 test hook: the armed orphan gate's state.
+#[cfg(test)]
+struct OrphanBindingGate {
     /// The (provider, session_id) key this gate intercepts.
     key: (String, String),
     /// Signaled when `record_binding` was INVOKED for the key (the
@@ -1047,7 +1046,12 @@ impl FakeIdentitySink {
     ) -> ClaimCommit {
         for alias in fence_checked_aliases {
             let alias_key = (provider.to_string(), alias.clone());
-            if self.kill_tombstones.lock().unwrap().contains_key(&alias_key) {
+            if self
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&alias_key)
+            {
                 self.claim_refusals
                     .lock()
                     .unwrap()
@@ -1170,10 +1174,8 @@ impl FakeIdentitySink {
                     if let Some(record) =
                         rollbacks.remove(&(upsert.provider.clone(), old_id.to_string()))
                     {
-                        rollbacks.insert(
-                            (upsert.provider.clone(), upsert.session_id.clone()),
-                            record,
-                        );
+                        rollbacks
+                            .insert((upsert.provider.clone(), upsert.session_id.clone()), record);
                     }
                 }
             }
@@ -1418,9 +1420,7 @@ impl PaneIdentitySink for FakeIdentitySink {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|(p, s)| {
-                p == provider && session_ids.iter().any(|id| id == s)
-            });
+            .is_some_and(|(p, s)| p == provider && session_ids.iter().any(|id| id == s));
         if key_fail {
             return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
                 std::io::Error::other("fake write failure (identity-conditional)"),
@@ -1606,11 +1606,7 @@ impl PaneIdentitySink for FakeIdentitySink {
                 let _ = decided_tx.send(());
                 let _ = outcome_tx.send(outcome);
             });
-            return Box::pin(async move {
-                outcome_rx
-                    .await
-                    .map_err(std::io::Error::other)
-            });
+            return Box::pin(async move { outcome_rx.await.map_err(std::io::Error::other) });
         }
         // Retire-on-kill round 5 (focused-ep5-r4 Finding 1) stall arm: the
         // decide+apply runs INLINE (the durable transition has landed), then
@@ -1631,8 +1627,12 @@ impl PaneIdentitySink for FakeIdentitySink {
         if let Some((applied_tx, release_rx)) = stall_arm {
             // One-shot: disarm so later commits proceed inline.
             *self.post_commit_stall.lock().unwrap() = None;
-            let outcome =
-                self.apply_claim_commit_aliased(provider, session_id, expect_killed_at_ms, &aliases);
+            let outcome = self.apply_claim_commit_aliased(
+                provider,
+                session_id,
+                expect_killed_at_ms,
+                &aliases,
+            );
             let _ = applied_tx.send(());
             return Box::pin(async move {
                 let _ = release_rx.await;
@@ -2213,7 +2213,9 @@ mod tests {
                 ..FreshAgentSettings::default()
             },
         );
-        fake.retire_closed("claude", "durable-cc").await.expect("kill");
+        fake.retire_closed("claude", "durable-cc")
+            .await
+            .expect("kill");
         let snap = fake.kill_tombstone_at_ms("claude", "durable-cc");
         assert!(snap.is_some(), "the fence answers the snapshot read");
 
@@ -2239,7 +2241,9 @@ mod tests {
 
         // A NEWER close re-fences (stamp advances); a claim holding the
         // stale (now-absent) snapshot is refused — and the fence stands.
-        fake.retire_closed("claude", "durable-cc").await.expect("re-kill");
+        fake.retire_closed("claude", "durable-cc")
+            .await
+            .expect("re-kill");
         let outcome = fake
             .commit_claim("claude", "durable-cc", None)
             .await

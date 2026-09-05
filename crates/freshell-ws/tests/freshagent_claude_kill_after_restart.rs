@@ -148,8 +148,7 @@ impl PaneIdentitySink for TestLedgerSink {
         let now = Self::now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                ledger.record_pending(&p, &m, c.as_deref(),
-                None, Default::default(), now)
+                ledger.record_pending(&p, &m, c.as_deref(), None, Default::default(), now)
             })
             .await
             .map_err(std::io::Error::other)?
@@ -490,9 +489,12 @@ async fn await_condition(what: &str, cond: impl Fn() -> bool) {
 /// reconnect's late attach (riding the closed seat) must be refused —
 /// nothing registers, the row never revives.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kill_naming_the_bare_placeholder_after_a_restart_retires_the_durable_row_and_blocks_the_late_attach() {
+async fn a_kill_naming_the_bare_placeholder_after_a_restart_retires_the_durable_row_and_blocks_the_late_attach(
+) {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let rig = Rig { dir: tempfile::tempdir().expect("temp dir") };
+    let rig = Rig {
+        dir: tempfile::tempdir().expect("temp dir"),
+    };
     rig.install();
     let durable = "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1".to_string();
     rig.write_transcript(&durable);
@@ -536,7 +538,11 @@ async fn a_kill_naming_the_bare_placeholder_after_a_restart_retires_the_durable_
     let row = ledger2
         .load_binding("claude", &durable)
         .expect("the durable row");
-    assert_eq!(row.state, RowState::Retired, "the close retired the durable row");
+    assert_eq!(
+        row.state,
+        RowState::Retired,
+        "the close retired the durable row"
+    );
     assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
     assert!(
         ledger2.kill_tombstone_at("claude", &durable).is_some(),
@@ -580,7 +586,9 @@ async fn a_kill_naming_the_bare_placeholder_after_a_restart_retires_the_durable_
 #[tokio::test(flavor = "multi_thread")]
 async fn a_close_fenced_before_the_restart_blocks_the_late_claim_and_the_row_stays_retired() {
     let _guard = CLAUDE_ENV_LOCK.lock().await;
-    let rig = Rig { dir: tempfile::tempdir().expect("temp dir") };
+    let rig = Rig {
+        dir: tempfile::tempdir().expect("temp dir"),
+    };
     rig.install();
     let durable = "a2a2a2a2-a2a2-42a2-82a2-a2a2a2a2a2a2".to_string();
     rig.write_transcript(&durable);
@@ -609,7 +617,11 @@ async fn a_close_fenced_before_the_restart_blocks_the_late_claim_and_the_row_sta
         let row = ledger1
             .load_binding("claude", &durable)
             .expect("the durable row");
-        assert_eq!(row.state, RowState::Retired, "pre-restart: the close retired the row");
+        assert_eq!(
+            row.state,
+            RowState::Retired,
+            "pre-restart: the close retired the row"
+        );
         assert!(ledger1.kill_tombstone_at("claude", &durable).is_some());
         placeholder
     };

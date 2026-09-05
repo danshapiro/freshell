@@ -60,10 +60,10 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach,
-    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly,
-    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
-    LEGACY_RESUME_IDENTITY_REFUSAL,
+    PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator,
+    SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated,
+    TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
+    TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -1408,15 +1408,23 @@ async fn handle_client_text(
                 let fresh_opencode = state.fresh_opencode.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
-                    async move { fresh_opencode.handle_fork(fork, Some(provenance), conn_sink).await }
-                        .instrument(tracing::Span::current()),
+                    async move {
+                        fresh_opencode
+                            .handle_fork(fork, Some(provenance), conn_sink)
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
                 );
             } else if is_codex_provider(fork.provider) {
                 let fresh_codex = state.fresh_codex.clone();
                 let conn_sink = conn_sink.clone();
                 tokio::spawn(
-                    async move { fresh_codex.handle_fork(fork, Some(provenance), conn_sink).await }
-                        .instrument(tracing::Span::current()),
+                    async move {
+                        fresh_codex
+                            .handle_fork(fork, Some(provenance), conn_sink)
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
                 );
             }
             true
@@ -5684,15 +5692,16 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState, ws_tx: &mut Ws
     let crid = closed.create_request_id.clone();
     let tid = closed.terminal_id.clone();
     let now = now_ms();
-    let result = spawn_blocking_in_span(move || {
-        ledger.close_pane_detached(&crid, tid.as_deref(), now)
-    })
-    .await
-    .unwrap_or_else(|join_err| {
-        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
-            std::io::Error::other(format!("pane.closed record task join failed: {join_err}")),
-        ))
-    });
+    let result =
+        spawn_blocking_in_span(move || ledger.close_pane_detached(&crid, tid.as_deref(), now))
+            .await
+            .unwrap_or_else(|join_err| {
+                Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+                    std::io::Error::other(format!(
+                        "pane.closed record task join failed: {join_err}"
+                    )),
+                ))
+            });
     let answer = |success: bool, error: Option<String>| {
         ServerMessage::PaneClosedResult(PaneClosedResult {
             create_request_id: closed.create_request_id.clone(),
@@ -5723,7 +5732,10 @@ async fn handle_pane_closed(closed: &PaneClosed, state: &WsState, ws_tx: &mut Ws
             // close as failed — the client keeps the pane on success:false.
             crate::pane_ledger::surface_write_failure(
                 state,
-                closed.terminal_id.as_deref().unwrap_or(&closed.create_request_id),
+                closed
+                    .terminal_id
+                    .as_deref()
+                    .unwrap_or(&closed.create_request_id),
                 Err(std::io::Error::other(format!(
                     "pane-close record write failed: {err}"
                 ))),
@@ -5771,10 +5783,7 @@ async fn handle_panes_closed(
     if closed.request_id.is_empty()
         || closed.tab_id.is_empty()
         || closed.panes.is_empty()
-        || closed
-            .panes
-            .iter()
-            .any(|p| p.create_request_id.is_empty())
+        || closed.panes.iter().any(|p| p.create_request_id.is_empty())
     {
         return send(
             ws_tx,
@@ -5796,15 +5805,16 @@ async fn handle_panes_closed(
         })
         .collect();
     let now = now_ms();
-    let result = spawn_blocking_in_span(move || {
-        ledger.close_panes_detached(&tab_id, &linkages, now)
-    })
-    .await
-    .unwrap_or_else(|join_err| {
-        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
-            std::io::Error::other(format!("panes.closed record task join failed: {join_err}")),
-        ))
-    });
+    let result =
+        spawn_blocking_in_span(move || ledger.close_panes_detached(&tab_id, &linkages, now))
+            .await
+            .unwrap_or_else(|join_err| {
+                Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+                    std::io::Error::other(format!(
+                        "panes.closed record task join failed: {join_err}"
+                    )),
+                ))
+            });
     match result {
         Ok(()) => send(ws_tx, &answer(true, None)).await,
         Err(err) if err.is_persisted() => {
@@ -5882,16 +5892,15 @@ async fn handle_pane_opened(
         );
         return send(
             ws_tx,
-            &answer(
-                false,
-                Some("createRequestId must be non-empty".to_string()),
-            ),
+            &answer(false, Some("createRequestId must be non-empty".to_string())),
         )
         .await;
     }
     let asserted_at = now_ms();
-    let provenance =
-        conn_identity.bind_provenance(Some(opened.tab_id.as_str()).filter(|t| !t.is_empty()), asserted_at);
+    let provenance = conn_identity.bind_provenance(
+        Some(opened.tab_id.as_str()).filter(|t| !t.is_empty()),
+        asserted_at,
+    );
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let crid = opened.create_request_id.clone();
     let now = now_ms();

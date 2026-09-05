@@ -4,7 +4,8 @@
 
 use freshell_freshagent::{
     BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
-    RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
+    RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
+    SinkWrite,
 };
 use freshell_ws::pane_ledger::{CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
@@ -269,15 +270,13 @@ impl PaneIdentitySink for LedgerIdentitySink {
         let (p, s) = (provider.to_string(), session_id.to_string());
         let now = now_ms();
         Box::pin(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                ledger.retire_closed(&p, &s, now)
-            })
-            .await
-            .map_err(|join| {
-                freshell_freshagent::identity_sink::SinkCloseError::Clean(
-                    std::io::Error::other(join),
-                )
-            })?;
+            let result = tokio::task::spawn_blocking(move || ledger.retire_closed(&p, &s, now))
+                .await
+                .map_err(|join| {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(
+                        std::io::Error::other(join),
+                    )
+                })?;
             result.map_err(map_close_envelope_error)
         })
     }
@@ -305,9 +304,9 @@ impl PaneIdentitySink for LedgerIdentitySink {
             })
             .await
             .map_err(|join| {
-                freshell_freshagent::identity_sink::SinkCloseError::Clean(
-                    std::io::Error::other(join),
-                )
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
             })?;
             result.map_err(map_close_envelope_error)
         })
@@ -1181,8 +1180,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn retire_closed_batch_closes_the_whole_envelope_or_nothing() {
-        use std::os::unix::fs::PermissionsExt;
         use freshell_freshagent::PaneIdentitySink;
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
@@ -1201,8 +1200,12 @@ mod tests {
                 ..FreshAgentSettings::default()
             },
         };
-        sink.record_binding(bind("ses_x", "cr-x")).await.expect("seed x");
-        sink.record_binding(bind("ses_y", "cr-y")).await.expect("seed y");
+        sink.record_binding(bind("ses_x", "cr-x"))
+            .await
+            .expect("seed x");
+        sink.record_binding(bind("ses_y", "cr-y"))
+            .await
+            .expect("seed y");
         sink.record_pending("ph-batch-sink", "freshopencode", Some("/w"))
             .await
             .expect("pending write ok");
@@ -1239,8 +1242,12 @@ mod tests {
         // FAILURE: re-seed two Bound rows, then break the ledger's
         // close-envelope subtree (delta-r6-r4: THE durable act of the batch)
         // — the batch must Err CLEAN (nothing durable of its own survives).
-        sink.record_binding(bind("ses_p", "cr-p")).await.expect("seed p");
-        sink.record_binding(bind("ses_q", "cr-q")).await.expect("seed q");
+        sink.record_binding(bind("ses_p", "cr-p"))
+            .await
+            .expect("seed p");
+        sink.record_binding(bind("ses_q", "cr-q"))
+            .await
+            .expect("seed q");
         sink.record_pending("ph-batch-sink-2", "freshopencode", Some("/w"))
             .await
             .expect("pending write ok");
@@ -1445,7 +1452,10 @@ mod tests {
         );
 
         // The placeholder-fence gate: the pane seat's close blocks the commit.
-        sink2.retire_closed("claude", "ph-seat").await.expect("seat fence");
+        sink2
+            .retire_closed("claude", "ph-seat")
+            .await
+            .expect("seat fence");
         let outcome = sink2
             .commit_claim_aliased("claude", "d-alias", None, &["ph-seat".to_string()])
             .await
@@ -1459,7 +1469,10 @@ mod tests {
 
         // The clean-seat claim commits (durable closed first — the genuine
         // reopen), and the consumption sweeps both placeholders.
-        sink2.retire_closed("claude", "d-alias").await.expect("close");
+        sink2
+            .retire_closed("claude", "d-alias")
+            .await
+            .expect("close");
         let fence = ledger2.kill_tombstone_at("claude", "d-alias");
         let outcome = sink2
             .commit_claim_aliased("claude", "d-alias", fence, &["ph-clean".to_string()])
@@ -1559,9 +1572,7 @@ mod tests {
             };
             w.expect("write ok");
             k.expect("retire ok");
-            let state = ledger
-                .load_binding("claude", &session_id)
-                .map(|r| r.state);
+            let state = ledger.load_binding("claude", &session_id).map(|r| r.state);
             assert!(
                 state != Some(freshell_ws::pane_ledger::RowState::Bound),
                 "iteration {i}: a killed identity converged to not-Bound, got {state:?}"
@@ -1602,8 +1613,12 @@ mod tests {
             },
         };
 
-        sink.record_binding(upsert("revive-1")).await.expect("seed write");
-        sink.retire_closed("claude", "revive-1").await.expect("kill closes");
+        sink.record_binding(upsert("revive-1"))
+            .await
+            .expect("seed write");
+        sink.retire_closed("claude", "revive-1")
+            .await
+            .expect("kill closes");
         assert_eq!(
             ledger.load_binding("claude", "revive-1").unwrap().state,
             freshell_ws::pane_ledger::RowState::Retired,
@@ -1634,7 +1649,9 @@ mod tests {
             "the committed reopen is durable on disk"
         );
         // And the claim's own binding write is never fenced afterwards.
-        sink.record_binding(upsert("revive-1")).await.expect("claim write");
+        sink.record_binding(upsert("revive-1"))
+            .await
+            .expect("claim write");
         assert_eq!(
             ledger.load_binding("claude", "revive-1").unwrap().state,
             freshell_ws::pane_ledger::RowState::Bound,
@@ -1643,7 +1660,10 @@ mod tests {
 
         // Narrow cases: a plain Bound row with NO fence is untouched
         // (updated_at frozen), and an unknown id gains no row.
-        let before = ledger.load_binding("claude", "revive-1").unwrap().updated_at;
+        let before = ledger
+            .load_binding("claude", "revive-1")
+            .unwrap()
+            .updated_at;
         std::thread::sleep(std::time::Duration::from_millis(2));
         let outcome = sink
             .commit_claim("claude", "revive-1", None)
@@ -1651,7 +1671,10 @@ mod tests {
             .expect("noop commit ok");
         assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
         assert_eq!(
-            ledger.load_binding("claude", "revive-1").unwrap().updated_at,
+            ledger
+                .load_binding("claude", "revive-1")
+                .unwrap()
+                .updated_at,
             before,
             "an unfenced re-claim is a true no-op"
         );
@@ -1667,7 +1690,9 @@ mod tests {
 
         // The CONDITION (Finding 1): a newer close mid-claim refuses the
         // commit wholesale — no clear, no revive, the row stays Retired.
-        sink.retire_closed("claude", "refuse-1").await.expect("kill #1");
+        sink.retire_closed("claude", "refuse-1")
+            .await
+            .expect("kill #1");
         let stale_snapshot = None; // the claim believed the identity untouched
         let outcome = sink
             .commit_claim("claude", "refuse-1", stale_snapshot)
