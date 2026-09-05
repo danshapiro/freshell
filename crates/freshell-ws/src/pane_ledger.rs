@@ -25,7 +25,11 @@
 //!
 //! Corruption policy: fail loud PER-ROW, never per-store — an unparsable row
 //! is quarantined (renamed aside + logged), never silently dropped, and never
-//! causes healthy rows to be skipped.
+//! causes healthy rows to be skipped. H2: `load_index` logs a structured
+//! ERROR (`pane_ledger_load_index_dir_unreadable` /
+//! `pane_ledger_load_index_row_unreadable`) for any I/O failure; only
+//! parse/wrong-version rows stay silent for the boot scan to quarantine
+//! loudly.
 //!
 //! Write-failure policy: a ledger write failure never blocks the
 //! create/identity event, but it is never silent — see
@@ -361,37 +365,83 @@ impl PaneLedger {
     }
 
     /// The ONE directory scan — construction-time only (V1.md).
+    ///
+    /// H2 loudness contract: I/O failures are never silent here. An unreadable
+    /// directory or row would otherwise present as a silently-EMPTY index —
+    /// the exact compounding mode behind "came up blind despite the lock being
+    /// acquirable and rows on disk". Parse/wrong-version skips stay silent BY
+    /// POLICY: the boot scan (`quarantine_unparsable`) is their loud path.
+    /// A row that vanishes between listing and read (Missing) is benign TOCTOU
+    /// residue and stays silent.
     fn load_index(root: &Path) -> LedgerIndex {
+        fn unreadable_dir(path: &std::path::Path, err: &std::io::Error) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %path.display(),
+                error = %err,
+                "pane_ledger_load_index_dir_unreadable: rows under this directory are ABSENT from the in-memory index"
+            );
+        }
+        fn unreadable_row(path: &std::path::Path, err: &RowLoadError) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %path.display(),
+                error = %err,
+                "pane_ledger_load_index_row_unreadable: this row is ABSENT from the in-memory index (boot-scan quarantine cannot repair an unreadable file)"
+            );
+        }
         let mut index = LedgerIndex::default();
-        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
-            for provider in providers.flatten() {
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let path = file.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue; // *.tmp-* and *.quarantined-* residue
-                    }
-                    if let Ok(row) = load_row::<BindingRow>(&path) {
-                        if row.ledger_version == LEDGER_VERSION {
-                            index
-                                .bindings
-                                .insert((row.provider.clone(), row.session_id.clone()), row);
+        match std::fs::read_dir(Self::bindings_dir(root)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {} // fresh root — normal
+            Err(err) => unreadable_dir(&Self::bindings_dir(root), &err),
+            Ok(providers) => {
+                for provider in providers.flatten() {
+                    match std::fs::read_dir(provider.path()) {
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => unreadable_dir(&provider.path(), &err),
+                        Ok(files) => {
+                            for file in files.flatten() {
+                                let path = file.path();
+                                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                                    continue; // *.tmp-* and *.quarantined-* residue
+                                }
+                                match load_row::<BindingRow>(&path) {
+                                    Ok(row) => {
+                                        if row.ledger_version == LEDGER_VERSION {
+                                            index.bindings.insert(
+                                                (row.provider.clone(), row.session_id.clone()),
+                                                row,
+                                            );
+                                        }
+                                    }
+                                    Err(RowLoadError::Io(err)) => {
+                                        unreadable_row(&path, &RowLoadError::Io(err))
+                                    }
+                                    Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(marker) = load_row::<PendingMarker>(&path) {
-                    if marker.ledger_version == LEDGER_VERSION {
-                        index.pending.insert(marker.terminal_id.clone(), marker);
+        match std::fs::read_dir(Self::pending_dir(root)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => unreadable_dir(&Self::pending_dir(root), &err),
+            Ok(files) => {
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    match load_row::<PendingMarker>(&path) {
+                        Ok(marker) => {
+                            if marker.ledger_version == LEDGER_VERSION {
+                                index.pending.insert(marker.terminal_id.clone(), marker);
+                            }
+                        }
+                        Err(RowLoadError::Io(err)) => unreadable_row(&path, &RowLoadError::Io(err)),
+                        Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
                     }
                 }
             }

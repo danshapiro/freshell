@@ -1276,3 +1276,76 @@ fn session_missing_serde_round_trips() {
     let deserialized: RetiredReason = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized, RetiredReason::SessionMissing);
 }
+
+#[cfg(unix)]
+#[test]
+fn load_index_dir_io_errors_are_loud_not_silently_empty() {
+    // H2 (kata s52d companion): an I/O failure while listing the store must
+    // NEVER surface as a silently-empty index. `bindings` forged as a
+    // REGULAR FILE makes read_dir deterministic-ENOTDIR on any uid (chmod
+    // tricks are root-skip-flaky); same for `pending`.
+    let root = temp_root("load-loud-dir");
+    std::fs::write(root.join("bindings"), b"not a dir").unwrap();
+    std::fs::write(root.join("pending"), b"not a dir").unwrap();
+    let (events, guard) = crate::invariants::capture::capture();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    drop(guard);
+    let events = events.lock().unwrap();
+    let hits: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ws::pane_ledger"
+                && e.message.contains("pane_ledger_load_index_dir_unreadable")
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        2,
+        "one ERROR per unreadable top-level dir (bindings + pending); got: {events:?}"
+    );
+    assert!(hits.iter().all(|h| h.fields.get("path").is_some()));
+    drop(events);
+    assert!(
+        !ledger.ever_bound("claude", "anything"),
+        "index correctly empty; loudness is the contract"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn load_index_row_io_errors_are_loud_per_row() {
+    // Same H2 lane, per-ROW: an entry ending in .json that is a DIRECTORY
+    // makes the row read deterministic-EISDIR (uid-independent). Parse
+    // errors of REAL rows stay silent-by-contract here (boot-scan quarantine
+    // owns loudness) — this test must NOT flip that: only Io arms the event.
+    let root = temp_root("load-loud-row");
+    std::fs::create_dir_all(root.join("bindings").join("claude").join("ghost.json")).unwrap();
+    let (events, guard) = crate::invariants::capture::capture();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    drop(guard);
+    let events = events.lock().unwrap();
+    let hits: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ws::pane_ledger"
+                && e.message.contains("pane_ledger_load_index_row_unreadable")
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "one ERROR for the unreadable row; got: {events:?}"
+    );
+    let want_path = format!(
+        "{}",
+        root.join("bindings")
+            .join("claude")
+            .join("ghost.json")
+            .display()
+    );
+    assert_eq!(hits[0].fields.get("path"), Some(&want_path));
+    drop(events);
+    assert!(ledger.list_bindings().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
