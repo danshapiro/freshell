@@ -156,7 +156,11 @@ async fn cancel_during_grace_settles_cancelled_and_skips_further_rechecks() {
 
     tx.send(crash("t6", 1, "claude", Some("cr-6"), 1_000)).unwrap();
     drain().await; // hub is now parked in grace sleep #1
-    fake.set_cancelled("t6"); // user clicks abort during the grace
+    // Cancel AND identity revival land in the same grace sleep (the race
+    // round-3 flagged): both must be handled — cancelled settle AND
+    // re-retire, never a live leftover.
+    fake.set_cancelled("t6");
+    fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
     tokio::time::advance(std::time::Duration::from_millis(500)).await;
     drain().await;
     assert_eq!(
@@ -167,8 +171,11 @@ async fn cancel_during_grace_settles_cancelled_and_skips_further_rechecks() {
             None
         )]
     );
-    // Neither a later identity nor further steps resurrect anything:
-    fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
+    assert!(
+        fake.retired().contains(&"t6".to_string()),
+        "identity revived during the cancelled sleep must be re-retired"
+    );
+    // Neither a further identity nor further steps resurrect anything:
     tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
     drain().await;
     assert!(fake.recovering_calls().is_empty());
@@ -206,6 +213,46 @@ async fn grace_revived_identity_is_re_retired_even_on_settle_outcomes() {
 ```
 
 (e) Existing test RESTRUCTURE (review-driven): `cap_exhausted_and_no_identity_and_clean_and_shell_settle_without_respawn` keeps session None through t2's WHOLE grace before restoring Some for t3/t4 — set the cfg grace to `vec![500, 500]`, and after the t2 send advance 500+drain twice (2-step grace), assert t2's settle, THEN `fake.set_session(Some(...))` before the t3/t4 leg. All four final settle-frame assertions unchanged in content (order t1, t2, t3 as today). Do NOT touch the `decide()`-level pin in `missing_identity_settles_exited_immediately` — `decide` still returns `no_resumable_identity`; the grace lives in the loop, not in `decide`.
+
+(g) Env-fn pin (round-3 minor): `auto_resume_identity_grace_delays` default/empty/garbage arms. Env mutation is process-global, so serialize through a module-static mutex and RESTORE the prior value on drop (the clap of repo precedent is the CLAUDE_ENV_LOCK-style mutex in pane_reconcile_freshagent.rs):
+
+```rust
+#[test]
+fn identity_grace_env_defaults_and_escape_hatch() {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = ENV_LOCK.lock().unwrap();
+    let prior = std::env::var_os("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS");
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", v),
+                None => std::env::remove_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS"),
+            }
+        }
+    }
+    let _r = Restore(prior);
+
+    std::env::remove_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS");
+    assert_eq!(
+        auto_resume_identity_grace_delays(),
+        AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec()
+    );
+    std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", "");
+    assert!(
+        auto_resume_identity_grace_delays().is_empty(),
+        "explicit empty value disables the grace (escape hatch)"
+    );
+    std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", "100,,0");
+    assert_eq!(
+        auto_resume_identity_grace_delays(),
+        AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS.to_vec(),
+        "unparseable output falls back loudly to the default"
+    );
+    std::env::set_var("FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS", "100,200");
+    assert_eq!(auto_resume_identity_grace_delays(), vec![100, 200]);
+}
+```
 
 - [ ] **Step 2: Run the new tests and verify the intended failures**
 
@@ -304,6 +351,15 @@ fn retire_identity(&self, terminal_id: &str);
                     // arm's post-sleep take_cancel) — never consumed
                     // silently by the settle tail's hygiene cleanup.
                     if driver.take_cancel(&ev.terminal_id) {
+                        // A cancel and an identity revival can land in the
+                        // SAME grace sleep: upsert has already un-retired
+                        // (identity.rs:123) by the time we observe either of
+                        // them, so this tail must re-query and restore the
+                        // crash invariant before continuing — the dead
+                        // terminal must not stay in live-only lookups.
+                        if driver.resumable_session_ref(&ev.terminal_id).is_some() {
+                            driver.retire_identity(&ev.terminal_id);
+                        }
                         driver.emit_settled(&ev.terminal_id, SETTLE_REASON_CANCELLED, None);
                         driver.log_settled(&ev.terminal_id, "user_cancelled");
                         continue 'events;
@@ -453,6 +509,10 @@ Test (i) — grace success:
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 async fn crash_with_identity_arriving_during_grace_is_resumed() {
+    // Plain-CLI codex, not the managed app-server launch (default-on;
+    // opt-out is exactly "0", terminal.rs:1706-1808 — read per create, so
+    // a same-binary set_var is safe; precedent codex_session_ref_resume.rs:350).
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     let marker = std::env::temp_dir().join(format!(
         "freshell-e2e-grace-resume-marker-{}.txt",
         std::process::id()
@@ -538,6 +598,8 @@ Test (ii) — grace exhaustion (the loud-settle regression contract):
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 async fn crash_with_identity_never_arriving_settles_exited_after_grace() {
+    // Plain-CLI codex (see test (i); the same-binary "0" set is idempotent).
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     let marker = std::env::temp_dir().join(format!(
         "freshell-e2e-grace-exhaust-marker-{}.txt",
         std::process::id()
