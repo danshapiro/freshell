@@ -1467,7 +1467,10 @@ export function getFreshellConfigDir(env: NodeJS.ProcessEnv = process.env): stri
 
 Then route the consumer set through the helper, from the PRE-ENUMERATED table
 below (load-bearing validation LB-01 replaced ad-hoc auditing; the validators'
-file:line evidence is at `.worktrees/.the-usual-logs/electron-multi-profile/reports/load-bearing-validator-lb-01.md`).
+file:line evidence is in the run-log directory of the main checkout, at
+`<freshell repo main checkout>/.worktrees/.the-usual-logs/electron-multi-profile/reports/load-bearing-validator-lb-01.md`
+(i.e. the `.worktrees/.the-usual-logs/` directory; these run artifacts live
+OUTSIDE the git worktree and outside git history).
 
 **a) Re-route through `getFreshellConfigDir()` (call-time) — profile-scoped:**
 
@@ -1777,7 +1780,8 @@ creates its file lazily on the first `log()` call (which fires after
 `whenReady()`), so an un-wrapped run produces no log file at all. The smoke
 MUST therefore run under `xvfb-run -a` with a fully throwaway HOME so the real
 `~/.freshell*` is never touched (procedure executed and pinned during
-load-bearing validation — `.worktrees/.the-usual-logs/electron-multi-profile/reports/load-bearing-validator-lb-03.md`).
+load-bearing validation — report in the main checkout's run-log directory:
+`<freshell repo main checkout>/.worktrees/.the-usual-logs/electron-multi-profile/reports/load-bearing-validator-lb-03.md`).
 From the worktree:
 
 ```bash
@@ -2579,6 +2583,10 @@ test.describe('Profile picker', () => {
 
   test.afterEach(async () => {
     if (app) {
+      // Hard-exit first (see the as-built reconciliation note at the end of
+      // this task's snippet): wizard/picker-phase apps veto app.quit(), so a
+      // bare close would hang the worker teardown.
+      await app.evaluate(() => process.exit(0)).catch(() => {})
       await app.close().catch(() => {})
       app = undefined
     }
@@ -2878,6 +2886,28 @@ test.describe('Profile picker', () => {
   })
 })
 ```
+
+> **As-built reconciliation (post-execution):** three places above were revised
+> during implementation; the committed file
+> (`test/e2e-electron/profile-picker.test.ts`) is authoritative:
+>
+> 1. `test.afterEach` hard-exits the app before `app.close()`:
+>    `await app.evaluate(() => process.exit(0)).catch(() => {})` — wizard/picker
+>    phase apps veto `app.quit()` via the `wizardPhase` will-quit guard, so a
+>    plain close hangs Playwright's worker teardown (120 s).
+> 2. Both turn-away specs (the picker-race one at ~line 2830 and the duplicate
+>    one at ~line 2869) spawn the duplicate as a raw `child_process` of the
+>    Electron binary via a `spawnDuplicateAndWaitForExit(tmpHome, extraArgs)`
+>    helper instead of `electron.launch` — `electron.launch`'s `process()`
+>    handle throws (`Cannot read properties of undefined (reading '_object')`)
+>    for a short-lived turned-away app; the committed assertions are
+>    `expect(await spawnDuplicateAndWaitForExit(tmpHome[, '--profile=work'])).toBe(0)`.
+> 3. The Electron binary path is resolved portably via the `electron` package
+>    export (`createRequire(import.meta.url)('electron')` as `ELECTRON_BIN`),
+>    not the hardcoded Linux `node_modules/electron/dist/electron` path.
+>
+> These were discovered because the as-drafted specs hung/failed on first run;
+> no plan-behavior contract changed.
 
 - [ ] **Step 2: Run the spec and verify it passes against the integrated implementation**
 
