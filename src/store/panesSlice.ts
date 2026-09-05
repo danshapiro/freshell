@@ -1974,9 +1974,12 @@ export const panesSlice = createSlice({
 
     /**
      * Focused-episode-7 round 5 (Finding F2) — mark/un-mark ONE pane's close
-     * as IN FLIGHT (the single-pane and replace gates). Two overlapping
-     * single-pane closes in one tab mark independently: acking one never
-     * unfreezes the other (the `${tabId}:${paneId}` key is per pane).
+     * as IN FLIGHT (the single-pane and replace gates). The
+     * `${tabId}:${paneId}` key is per pane; the delta-round-9 close-op
+     * serialization (one close per TAB at a time — `hasAnyClosePending` in
+     * the thunks) means two panes' marks never stand in one tab at once, but
+     * the keying keeps the reducer-side guard pane-scoped exactly as the
+     * round-5 freeze needs.
      */
     markPaneClosing: (state, action: PayloadAction<{ tabId: string; paneId: string }>) => {
       if (!state.closingPanes) state.closingPanes = {}

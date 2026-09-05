@@ -435,10 +435,11 @@ export interface PanesState {
    * pane refuses, so the acknowledgement always covers exactly the identity
    * the post-ack removal applies — never a re-keyed replacement removed
    * evidenceless. The same marks drive the close-op serialization
-   * (delta-round-8 Finding F2): ONE close op per tab at a time — a
-   * pane-scope start rejects while its pane's own close or its tab's is
-   * outstanding, and a tab-scope start rejects while ANY of these marks (or
-   * its own) stands. Ephemeral: never persisted (stripped in
+   * (delta-round-8 Finding F2, strengthened delta-round-9): ONE close op
+   * per tab at a time, ANY scope — a pane-scope start rejects while ANY of
+   * these marks (or the tab's) stands in its tab, and a tab-scope start
+   * rejects likewise, so even two different panes' closes never overlap in
+   * one tab. Ephemeral: never persisted (stripped in
    * persistMiddleware beside the other volatile maps), never hydrated,
    * `removeLayout` drops the tab's entries alongside the layout.
    */

@@ -791,33 +791,6 @@ describe('focused-episode-7 round 5 (F2) — a pending SINGLE-pane close freezes
     expect(paneContents(store, 'tab-1').map((p) => p.paneId).sort()).toEqual(['pane-1', 'pane-late'])
   })
 
-  it('two overlapping single-pane closes freeze independently — acking one never unfreezes the other', async () => {
-    const store = createStore()
-    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', 'term-a') }))
-    store.dispatch(splitPane({
-      tabId: 'tab-1', paneId: 'pane-1', direction: 'vertical', newContent: terminalContent('req-b', 'term-b'), newPaneId: 'pane-2',
-    }))
-    store.dispatch(splitPane({
-      tabId: 'tab-1', paneId: 'pane-1', direction: 'vertical', newContent: terminalContent('req-c', 'term-c'), newPaneId: 'pane-3',
-    }))
-    mockSend.mockClear()
-    const closeB = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
-    const closeC = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-3' }))
-    // Ack pane-2's close only; pane-2 is removed. pane-3's window is STILL
-    // pending: term-c going dead mid-wait must not rekey it.
-    emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: true })
-    await closeB
-    expect(paneContents(store, 'tab-1').some((p) => p.paneId === 'pane-2')).toBe(false)
-    store.dispatch(clearDeadTerminals({ liveTerminalIds: ['term-a', 'term-b'] }))
-    const p3 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-3')?.content as { createRequestId?: string; terminalId?: string }
-    expect(p3.createRequestId).toBe('req-c')
-    expect(p3.terminalId).toBe('term-c')
-    emit({ type: 'pane.closed.result', createRequestId: 'req-c', success: true })
-    await closeC
-    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
-  })
-
   it('a FAILED single-pane close lifts its pane freeze — the kept pane rekeys normally again', async () => {
     const store = createTwoPaneStore()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
@@ -1037,9 +1010,19 @@ describe('delta-round-8 (F1) — swapPanes consults the pending-close guard', ()
  *    rejects while ANY close touching that tab is outstanding for the SAME
  *    pane (duplicate — idempotent-rejected) or for the WHOLE tab;
  *  - a tab-scope start (`closeTab`) rejects while ANY close touching that
- *    tab is outstanding (its own — the round-4 no-op — or any pane's);
- *  - overlapping closes of DIFFERENT panes in one tab stay allowed (the
- *    round-5 pinned regime: ref-counted, independently frozen).
+ *    tab is outstanding (its own — the round-4 no-op — or any pane's).
+ *
+ * Delta-round-9 (review fresheyes/usual-fresheyes-20260905T014750Z-2491856.md,
+ * the single Major) STRENGTHENED the pane-scope half: the different-pane
+ * overlap this describe used to pin as allowed produced the round-9 finding
+ * verbatim — two acknowledged closes on a two-pane tab collapsed the split
+ * with the first removal, the second removal was refused by the last-leaf
+ * rule, and the survivor stayed displayed under a durable close record (the
+ * ack SUCCEEDED, so no heal fired) — recovery omitted a genuinely open pane.
+ * Pane-scope starts now reject while ANY close touching the tab is
+ * outstanding (`hasAnyClosePending`): ONE close op per tab, full stop; the
+ * retargeted pin is below, and the surviving-pane compensation is pinned in
+ * the removal-refusal describe at the file's end.
  *
  * F2-half-2 (the heal's display check): the failure/timeout healing path
  * (`reassertKeptPanesOpen`) consults the CURRENT layout before each
@@ -1144,7 +1127,7 @@ describe('delta-round-8 (F2) — close ops serialize per tab', () => {
     expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
   })
 
-  it('an overlapping close of a DIFFERENT pane in the same tab stays allowed (the round-5 pinned regime)', async () => {
+  it('an overlapping close of a DIFFERENT pane in the same tab is REFUSED (delta-round-9: one close op per tab, any scope) — and the refusal never latches a later close', async () => {
     const store = createTwoPaneStore()
     store.dispatch(splitPane({
       tabId: 'tab-1',
@@ -1155,10 +1138,49 @@ describe('delta-round-8 (F2) — close ops serialize per tab', () => {
     }))
     const closeB = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
     const closeC = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-3' }))
-    expect(sentCallsOf('pane.closed')).toHaveLength(2)
+    // The in-flight close is the tab's ONLY close op: pane-3's never left.
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-b')).toHaveLength(1)
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-c')).toEqual([])
     ackAllPaneCloses()
     await Promise.all([closeB, closeC])
+    // One survivor by construction — but the un-closed pane-3 stays too.
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId).sort()).toEqual(['pane-1', 'pane-3'])
+    // No latch: once the first close settled, pane-3's close starts and
+    // completes normally.
+    const retry = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-3' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-c')).toHaveLength(1)
+    ackAllPaneCloses()
+    await retry
     expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('a replace of a DIFFERENT pane while a close is pending is REJECTED (the close-op serialization is per TAB, not per pane)', async () => {
+    const store = createTwoPaneStore()
+    const first = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const rejected = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }))
+    // Exactly ONE pane.closed ever left — the pending close's own.
+    expect(sentCallsOf('pane.closed')).toEqual([
+      expect.objectContaining({ type: 'pane.closed', createRequestId: 'req-b' }),
+    ])
+    ackAllPaneCloses()
+    await Promise.all([first, rejected])
+    // The close completed; the rejected replace moved nothing.
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+    expect(paneContents(store, 'tab-1')[0]?.content.kind).toBe('terminal')
+  })
+
+  it('a close of a DIFFERENT pane while a replace is pending is REJECTED (same per-TAB rule, the other direction)', async () => {
+    const store = createTwoPaneStore()
+    const first = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const rejected = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }))
+    expect(sentCallsOf('pane.closed')).toEqual([
+      expect.objectContaining({ type: 'pane.closed', createRequestId: 'req-b' }),
+    ])
+    ackAllPaneCloses()
+    await Promise.all([first, rejected])
+    // The replace completed; the rejected close moved nothing.
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-1')?.content.kind).toBe('terminal')
   })
 })
 
@@ -1215,5 +1237,106 @@ describe('delta-round-8 (F2) — the unconfirmed-close heal re-asserts only stil
     emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: false })
     await close
     expect(sentCallsOf('pane.opened')).toEqual([])
+  })
+})
+
+/**
+ * Delta-round-9 (review fresheyes/usual-fresheyes-20260905T014750Z-2491856.md,
+ * the single Major), second half — the removal-refusal compensation. The
+ * finding's interleave: two acknowledged closes target both panes of a
+ * two-pane tab; the first removal collapses the split to ONE leaf; the second
+ * close's post-ack `closePane` is REFUSED by the last-leaf rule. The survivor
+ * stays displayed AND running but carries a durable acknowledged close
+ * record, and no heal fires — the ack SUCCEEDED, so the failure/timeout
+ * re-assertion path never ran. Recovery then omitted a genuinely open pane.
+ * The per-tab close serialization (the describe above) makes the interleave
+ * unreachable among the three gated thunks; the compensation below is the
+ * defense-in-depth for EVERY other way the layout can refuse the removal of
+ * an acked pane (the pins drive the collapse through the direct reducer —
+ * the committed-close shape — because the refusal is the layout's, however
+ * it came to hold a single leaf).
+ *
+ * The rule: the ack succeeded but the pane is STILL DISPLAYED after the
+ * removal dispatch ⇒ the close op treats it as failure for durable purposes
+ * — the pane.opened re-assertion goes out (the fenced consume ⇒ the survivor
+ * is restorable again) and the normal error chrome surfaces.
+ */
+describe('delta-round-9 — the removal-refusal compensation', () => {
+  it('the acked close whose removal the last-leaf rule refused re-asserts open and wears the error chrome (the survivor carries NO standing close evidence)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-b')).toHaveLength(1)
+    // Mid-wait: pane-1's own committed close lands (the direct reducer — the
+    // shape every committed close ends in). The split collapses to the sole
+    // leaf pane-2 — the close's removal target is now the tab's only pane.
+    store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-2'])
+    // The ack arrives — SUCCESS. The closePane reducer refuses the removal
+    // (the last leaf): the pane stays displayed under a durable close record.
+    emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: true })
+    await close
+    // The survivor stays displayed and running...
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-2'])
+    // ...wears the normal error chrome (the close op surfaces the refusal)...
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-2': 'the pane close was recorded, but the pane could not be removed; the pane was left open',
+    })
+    // ...and carries NO standing close evidence: the open re-assertion went
+    // out AFTER the close on the wire (the fenced consume ⇒ a later recovery
+    // offers the survivor again).
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+    expect(firstSendIndexOf('pane.closed')).toBeLessThan(firstSendIndexOf('pane.opened'))
+  })
+
+  it('the same compensation covers a fresh-agent survivor (the CRID-only identity re-asserts too)', async () => {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', 'term-a') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'vertical',
+      newContent: freshAgentContent('req-fa'),
+      newPaneId: 'pane-fa',
+    }))
+    mockSend.mockClear()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-fa' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-fa')).toHaveLength(1)
+    store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+    emit({ type: 'pane.closed.result', createRequestId: 'req-fa', success: true })
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-fa'])
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-fa', tabId: 'tab-1' }),
+    ])
+  })
+
+  it('control: the acked close whose removal LANDS re-asserts nothing and surfaces no error (the healthy path is unchanged)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+    expect(sentCallsOf('pane.opened')).toEqual([])
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({})
+  })
+
+  it('the refused survivor re-closes normally: the sole-leaf follow-up delegates to the whole-tab close (never a stuck pane)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+    emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: true })
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-2'])
+    // A fresh close attempt on the survivor takes the normal last-pane path.
+    const retry = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const batches = sentCallsOf('panes.closed')
+    expect(batches).toHaveLength(1)
+    expect(batches[0].panes).toEqual([{ createRequestId: 'req-b', terminalId: 'term-b' }])
+    ackPanesClosedBatches()
+    await retry
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
   })
 })

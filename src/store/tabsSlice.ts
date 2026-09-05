@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, isPaneClosePending, hasAnyClosePending } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -18,8 +18,8 @@ import {
   shouldKeepClosedTab,
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
-import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
-import { collectSessionPaneIdentities } from '@/lib/pane-utils'
+import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, PANE_CLOSE_REMOVAL_REFUSED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
+import { collectSessionPaneIdentities, findPaneContent } from '@/lib/pane-utils'
 import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
@@ -609,17 +609,19 @@ export const closePaneWithCleanup = createAsyncThunk(
       await dispatch(closeTab(tabId))
       return
     }
-    // Delta-round-8 (Finding F2) — the close-op serialization rule, the same
-    // shared guard the reducers consult: ONE close op per tab at a time.
-    // THIS pane's own close (a duplicate — idempotent-rejected: the
-    // in-flight close completes it) or the whole tab's close already
-    // outstanding ⇒ refuse to start; never deferred. Pre-fix the batch close
-    // and this close could resolve in either order and the loser's timeout
-    // re-asserted a stale identity the winner's committed close had removed.
-    // Overlapping closes of DIFFERENT panes in the tab stay allowed (the
-    // round-5 ref-counted regime).
-    if (isPaneClosePending((getState() as RootState).panes, tabId, paneId)) {
-      log.warn('refusing to start a pane close while a close for it or its tab is already in flight', { tabId, paneId })
+    // Delta-round-8 (Finding F2), strengthened delta-round-9 (the review's
+    // single Major) — the close-op serialization rule, the same shared guard
+    // the reducers consult: ONE close op per TAB at a time, any scope. ANY
+    // close touching the tab already outstanding — this pane's own close (a
+    // duplicate — idempotent-rejected: the in-flight close completes it), a
+    // DIFFERENT pane's close, or the whole tab's — ⇒ refuse to start; never
+    // deferred. The round-9 finding's interleave: two acknowledged different-
+    // pane closes on a two-pane tab collapsed the split with the first
+    // removal, the second removal was refused by the last-leaf rule, and the
+    // survivor stayed displayed under a durable close record (its ack
+    // SUCCEEDED, so no heal fired) — recovery omitted a genuinely open pane.
+    if (hasAnyClosePending((getState() as RootState).panes, tabId)) {
+      log.warn('refusing to start a pane close while a close is already in flight for its tab', { tabId, paneId })
       return
     }
     // F2: confirm the durable close evidence BEFORE the layout loses the pane.
@@ -651,6 +653,22 @@ export const closePaneWithCleanup = createAsyncThunk(
     }
     dispatch(closePane({ tabId, paneId }))
     const after = (getState() as RootState).panes.layouts[tabId]
+    // Delta-round-9 — the removal-refusal compensation: the ack SUCCEEDED but
+    // the layout refused the removal (the last-leaf rule — the pane became
+    // the tab's only pane while the acknowledgement was outstanding). The
+    // pane stays displayed and running under a durable close record, and the
+    // ack's success means no failure/timeout heal ever fires: recovery would
+    // omit a genuinely open pane. Treat the close as failed for durable
+    // purposes — re-assert the pane open (the fenced consume ⇒ the survivor
+    // is restorable again) and surface the normal error chrome. The per-tab
+    // close serialization above makes the two-gated-thunk interleave
+    // unreachable; this is the defense for EVERY removal path.
+    if (identity.length > 0 && after && findPaneContent(after, paneId)) {
+      log.warn('the pane close evidence committed but the layout refused the removal; the pane stays open and is re-asserted', { tabId, paneId })
+      dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
+      reassertKeptPanesOpen(after, tabId, identity)
+      return
+    }
     if (before !== after) {
       clearDraft(paneId)
       dispatch(clearPaneAttention({ paneId }))
@@ -691,13 +709,18 @@ export const closeTab = createAsyncThunk(
     // close of an already-closing tab is a no-op; the in-flight close
     // completes it.
     //
-    // Delta-round-8 (Finding F2) — the close-op serialization rule: ONE
-    // close op per tab at a time. The tab-scope start rejects while ANY
-    // close touching this tab is outstanding — its own prior start (above)
-    // OR any pane-scope close inside it (pre-fix the batch and the pane
-    // close ran concurrently and could resolve in either order; the loser's
-    // timeout then re-asserted a stale identity the winner's committed close
-    // had already removed, and the server re-attributed it open).
+    // Delta-round-8 (Finding F2), strengthened delta-round-9 — the close-op
+    // serialization rule: ONE close op per tab at a time, ANY scope. The
+    // tab-scope start rejects while ANY close touching this tab is
+    // outstanding — its own prior start (above) OR any pane-scope close
+    // inside it (pre-fix the batch and the pane close ran concurrently and
+    // could resolve in either order; the loser's timeout then re-asserted a
+    // stale identity the winner's committed close had already removed, and
+    // the server re-attributed it open). The pane-scope starts reject on the
+    // same predicate, so even two DIFFERENT panes' closes never overlap in
+    // one tab (delta-round-9: the second removal of a collapsed split was
+    // refused by the last-leaf rule and left the survivor under a durable
+    // close record).
     const stateAtClose = getState() as RootState
     if (hasAnyClosePending(stateAtClose.panes, tabId)) {
       log.warn('refusing to start a tab close while a close for it or one of its panes is already in flight', { tabId })
@@ -799,12 +822,13 @@ export const closeTab = createAsyncThunk(
 export const replacePaneWithCleanup = createAsyncThunk(
   'tabs/replacePaneWithCleanup',
   async ({ tabId, paneId }: { tabId: string; paneId: string }, { dispatch, getState }) => {
-    // Delta-round-8 (Finding F2) — the close-op serialization rule (the same
-    // shared guard): the replace gate IS a single-pane close of the
-    // discarded pane, so it rejects while that pane's own close or the whole
-    // tab's is already outstanding — never deferred.
-    if (isPaneClosePending((getState() as RootState).panes, tabId, paneId)) {
-      log.warn('refusing to start a pane replace while a close for it or its tab is already in flight', { tabId, paneId })
+    // Delta-round-8 (Finding F2), strengthened delta-round-9 — the close-op
+    // serialization rule (the same shared guard): the replace gate IS a
+    // single-pane close of the discarded pane, so it rejects while ANY close
+    // touching the tab is already outstanding — the pane's own close, a
+    // DIFFERENT pane's close, or the whole tab's — never deferred.
+    if (hasAnyClosePending((getState() as RootState).panes, tabId)) {
+      log.warn('refusing to start a pane replace while a close is already in flight for its tab', { tabId, paneId })
       return
     }
     const identity = collectPaneCloseIdentities(

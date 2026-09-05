@@ -172,6 +172,17 @@ export const PANE_CLOSE_FAILED_MESSAGE =
   'the pane close could not be recorded durably; the pane was left open'
 export const PANE_CLOSE_ACK_TIMEOUT_MESSAGE =
   'the server did not acknowledge the pane close in time; the pane was left open'
+/**
+ * The removal-refusal banner copy (delta-round-9): the close EVIDENCE
+ * confirmed (the server journaled it) but the layout refused the removal
+ * (the last-leaf rule — the pane became the tab's only pane while the ack
+ * was outstanding). The pane stays displayed under a durable close record,
+ * so the close op treats it as failure for durable purposes: this chrome
+ * plus the pane.opened re-assertion (the fenced consume) that makes the
+ * survivor restorable again.
+ */
+export const PANE_CLOSE_REMOVAL_REFUSED_MESSAGE =
+  'the pane close was recorded, but the pane could not be removed; the pane was left open'
 
 /** One pane identity inside a batch close (`panes.closed[].panes`). */
 export type PaneCloseIdentityInput = { createRequestId: string; terminalId?: string }
