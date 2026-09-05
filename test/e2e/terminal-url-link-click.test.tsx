@@ -8,11 +8,13 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import { installPaneGeometry } from '../helpers/pane-geometry'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn().mockReturnValue(() => {}),
+  DEBUG: true,
   onReconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
 }))
@@ -234,6 +236,15 @@ function createStore(opts?: { warnExternalLinks?: boolean }) {
     },
   })
 }
+
+const paneGeometry: { current: ReturnType<typeof installPaneGeometry> | null } = { current: null }
+beforeEach(() => {
+  paneGeometry.current = installPaneGeometry()
+})
+afterEach(() => {
+  paneGeometry.current?.restore()
+  paneGeometry.current = null
+})
 
 describe('terminal URL links open browser pane on the clicked pane branch without navigating tabs', () => {
   beforeEach(() => {

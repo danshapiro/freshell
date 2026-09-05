@@ -14,6 +14,7 @@ import PaneLayout from '@/components/panes/PaneLayout'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { PaneNode } from '@/store/paneTypes'
+import { installPaneGeometry } from '../helpers/pane-geometry'
 
 const wsMocks = {
   send: vi.fn(),
@@ -236,6 +237,15 @@ async function settleMenu() {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
   })
 }
+
+const paneGeometry: { current: ReturnType<typeof installPaneGeometry> | null } = { current: null }
+beforeEach(() => {
+  paneGeometry.current = installPaneGeometry()
+})
+afterEach(() => {
+  paneGeometry.current?.restore()
+  paneGeometry.current = null
+})
 
 describe('terminal URL context menu items (e2e)', () => {
   beforeEach(() => {

@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
+import { installPaneGeometry } from '@test/helpers/pane-geometry'
 
 // Hoist mock functions so vi.mock can reference them
 const { mockSend, mockTerminalView } = vi.hoisted(() => ({
@@ -193,6 +194,10 @@ describe('PaneLayout', () => {
       y: 0,
       toJSON: () => {},
     }))
+    // jsdom reports 0-area geometry and has no ResizeObserver, so the stable
+    // surface layer would keep every pane unmounted. Install the shared
+    // harness (uniform positive rects + drivable observer).
+    installPaneGeometry()
   })
 
   afterEach(() => {
