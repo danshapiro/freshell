@@ -37,6 +37,20 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     return { type: 'show-setup' }
   }
 
+  // A server-owning boot NEVER attaches to a discovery-surfaced instance
+  // (which could belong to a neighbor profile with a different config dir and
+  // identity) via auto-connect or the chooser; it starts its own server
+  // (app-bound path in runStartup) or the machine daemon (daemon mode —
+  // machine-global by design, see README). This runs BEFORE alwaysAskOnLaunch:
+  // a chooser offered no candidates would just be an empty trap for owning
+  // boots, so the question moots itself.
+  if (
+    options.ownsServer &&
+    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
+  ) {
+    return { type: 'start-local' }
+  }
+
   if (desktopConfig.alwaysAskOnLaunch) {
     return { type: 'show-chooser', candidates, reason: 'always-ask' }
   }
@@ -65,18 +79,6 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     }
 
     return { type: 'show-chooser', candidates, reason: 'saved-remote-unreachable' }
-  }
-
-  // A server-owning boot NEVER attaches to a discovery-surfaced instance
-  // (which could belong to a neighbor profile with a different config dir and
-  // identity) via auto-connect or the chooser; it starts its own server
-  // (app-bound path in runStartup) or the machine daemon (daemon mode —
-  // machine-global by design, see README).
-  if (
-    options.ownsServer &&
-    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
-  ) {
-    return { type: 'start-local' }
   }
 
   if (candidates.length > 1) {

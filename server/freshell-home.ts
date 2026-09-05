@@ -22,3 +22,15 @@ export function getFreshellConfigDir(env: NodeJS.ProcessEnv = process.env): stri
   if (configOverride) return path.resolve(configOverride)
   return path.join(getFreshellHomeDir(env), '.freshell')
 }
+
+/**
+ * Where this process's `.env` lives: FRESHELL_CONFIG_DIR when explicit
+ * (daemon units, named Electron profiles), else the process cwd (dev runs
+ * from the repo root). Shared by bootstrap.ts, server/env-load.ts, and
+ * server/get-network-host.ts so every reader resolves the same anchor.
+ */
+export function resolveEnvAnchorDir(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): string {
+  const override = env.FRESHELL_CONFIG_DIR?.trim()
+  if (override) return path.resolve(override)
+  return cwd
+}

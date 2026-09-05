@@ -1,6 +1,6 @@
 import path from 'path'
 import os from 'os'
-import { configDirForProfile } from './profile.js'
+import { configDirForProfile, DEFAULT_PROFILE_ID } from './profile.js'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
 import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
@@ -59,7 +59,7 @@ export interface StartupContext {
    */
   forcedLaunch?: ForcedLaunch
   /** Active profile id; named profiles own their app-bound server (see
-   *  launch-policy.ts). Defaults to 'default'. */
+   *  launch-policy.ts). Defaults to DEFAULT_PROFILE_ID. */
   profileId?: string
   /**
    * Canonical server-ownership gate for this boot: true for every named
@@ -286,7 +286,7 @@ async function startAppBoundServer(ctx: StartupContext, port: number): Promise<s
       configDir: ctx.configDir,
       // Same pinning contract as the production branch below — dev spawns of
       // named profiles must not fall back to the default config dir.
-      pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== 'default',
+      pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID,
     })
     return 'http://localhost:5173'
   }
@@ -306,7 +306,7 @@ async function startAppBoundServer(ctx: StartupContext, port: number): Promise<s
     port,
     envFile: path.join(ctx.configDir, '.env'),
     configDir: ctx.configDir,
-    pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== 'default',
+    pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID,
   })
   return `http://localhost:${port}`
 }
@@ -345,7 +345,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   // A named profile's app-bound/daemon boot owns its server; discovery is
   // skipped entirely so a neighbor profile's server is never surfaced.
   const skipDiscovery =
-    (ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== 'default')) &&
+    (ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)) &&
     (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
   const candidates = skipDiscovery ? [] : await discoverCandidates()
   const savedRemoteReachable = desktopConfig.serverMode === 'remote' && !!desktopConfig.remoteUrl
@@ -360,7 +360,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     savedRemoteReachable,
     savedRemoteAuthenticated,
     ownsServer:
-      ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== 'default'),
+      ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID),
   })
 
   if (launchAction.type === 'show-setup') {
@@ -395,7 +395,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     }
     case 'app-bound': {
       const ownsServer =
-        ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== 'default')
+        ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)
       let launchPort = port
       if (ownsServer && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
         // The profile's configured port is already held (typically by another
@@ -428,14 +428,17 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
             })
           }
         } else {
-          // Never silently land on the knowably-busy port: that is exactly
-          // the neighbor-server hijack this gate exists for.
+          // Never land on the knowably-busy port: the unauthenticated
+          // /api/health on the NEIGHBOR's server would satisfy the health
+          // probe and the window would load the wrong identity. Leave the
+          // decision to the user instead of spawning into a black hole.
           ctx.mainProcessLogger?.log({
             severity: 'warn',
             event: 'profile_port_scan_exhausted',
             profileId: ctx.profileId,
             port,
           })
+          return { type: 'chooser', candidates, reason: 'manual-choice' }
         }
       }
       if (launchPort !== port) {
@@ -469,7 +472,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     // profile-scoped dir.
     const envDir =
       desktopConfig.serverMode === 'daemon'
-        ? configDirForProfile('default', os.homedir())
+        ? configDirForProfile(DEFAULT_PROFILE_ID, os.homedir())
         : ctx.configDir
     authToken = await ctx.readEnvToken(path.join(envDir, '.env'))
   }

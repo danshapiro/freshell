@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest'
 import {
   DEFAULT_PROFILE_ID,
   buildPickerEntries,
+  computeOwnsServer,
   configDirForProfile,
   parseProfileArg,
   readProfilesRegistry,
@@ -208,5 +209,54 @@ describe('resolveBootShape', () => {
     expect(shape.kind).toBe('default')
     expect(shape.userDataDir).toBeUndefined()
     expect(shape.error).toContain('../evil')
+  })
+})
+
+describe('computeOwnsServer', () => {
+  const noReg = { profiles: [] }
+  const noHome = () => [] as string[]
+
+  it('is always true for named profiles', () => {
+    expect(computeOwnsServer({ profileId: 'work', registry: noReg, homedir: '/h', listHomeEntries: noHome })).toBe(true)
+  })
+  it('is true for Default when the registry names any profile (multi-profile install)', () => {
+    expect(computeOwnsServer({
+      profileId: DEFAULT_PROFILE_ID,
+      registry: { profiles: [{ id: 'work' }] },
+      homedir: '/h',
+      listHomeEntries: noHome,
+    })).toBe(true)
+  })
+  it('is true for Default when the registry is unreadable (fail-closed)', () => {
+    expect(computeOwnsServer({
+      profileId: DEFAULT_PROFILE_ID,
+      registry: { profiles: [], error: 'not valid JSON' },
+      homedir: '/h',
+      listHomeEntries: noHome,
+    })).toBe(true)
+  })
+  it('is true for Default when a ~/.freshell-<id> state dir exists even without a registry entry (unlisted ids)', () => {
+    expect(computeOwnsServer({
+      profileId: DEFAULT_PROFILE_ID,
+      registry: noReg,
+      homedir: '/h',
+      listHomeEntries: () => ['.freshell-work', '.other'],
+    })).toBe(true)
+  })
+  it('is false on a legacy single-profile install', () => {
+    expect(computeOwnsServer({
+      profileId: DEFAULT_PROFILE_ID,
+      registry: noReg,
+      homedir: '/h',
+      listHomeEntries: () => ['.freshell', '.config', '.freshell'],
+    })).toBe(false)
+  })
+  it('ignores misleading names (.freshell- alone is not a profile dir)', () => {
+    expect(computeOwnsServer({
+      profileId: DEFAULT_PROFILE_ID,
+      registry: noReg,
+      homedir: '/h',
+      listHomeEntries: () => ['.freshell-'],
+    })).toBe(false)
   })
 })

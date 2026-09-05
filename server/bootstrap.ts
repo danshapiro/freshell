@@ -17,7 +17,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { getFreshellConfigDir } from './freshell-home.js'
+import { getFreshellConfigDir, resolveEnvAnchorDir } from './freshell-home.js'
 import { isWSL } from './platform.js'
 
 export type BootstrapResult = {
@@ -387,9 +387,7 @@ export function ensureEnvFile(envPath: string): BootstrapResult {
  * there would split write (.env file) and read (dotenv) sides apart.
  */
 export function resolveProjectRoot(): string {
-  const override = process.env.FRESHELL_CONFIG_DIR?.trim()
-  if (override) return path.resolve(override)
-  return process.cwd()
+  return resolveEnvAnchorDir()
 }
 
 interface EnvMigrationDeps {

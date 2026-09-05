@@ -68,7 +68,8 @@ Each named profile gets its own:
 
 - settings, window state, and logs (`~/.freshell-<id>/`; the default profile
   keeps using `~/.freshell/`)
-- Electron storage dir (`…/Freshell-<id>`), so cookies and localStorage never
+- Electron storage dir (`…/Freshell-<id>` in packaged builds,
+  `freshell-<id>` in dev/unpackaged runs), so cookies and localStorage never
   mix
 - single-instance lock: launching the same profile twice focuses the running
   window; different profiles run side by side
@@ -109,7 +110,12 @@ configuration.
 - App-bound servers: each profile spawns its own server pinned to that
   profile's config dir (`FRESHELL_CONFIG_DIR`) and port — a named profile
   never adopts another profile's already-running local server; choose a
-  distinct port per profile.
+  distinct port per profile. Once named profiles exist (listed in
+  `profiles.json`, used from the command line, or previously run), the same
+  applies to the **Default** profile: it no longer auto-attaches to a
+  discovered local server, and if its configured port is held by a neighbor
+  profile, Freshell bumps to the next free port and saves that port into the
+  profile's settings (visible in the setup summary).
 - Daemon services (`freshell.service`, `com.freshell.server`,
   "Freshell Server" task) are machine-global single instances — do not use
   daemon mode in two profiles at once.

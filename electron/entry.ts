@@ -34,6 +34,7 @@ import { acquireInstanceLock, initMainProcess } from './main.js'
 import {
   DEFAULT_PROFILE_ID,
   buildPickerEntries,
+  computeOwnsServer,
   readProfilesRegistry,
   registryPathForHome,
   resolveBootShape,
@@ -400,6 +401,10 @@ async function main(): Promise<void> {
   // picker, and ends here. See resolveBootShape (module top) for the shape
   // decision and runProfilePicker for choice semantics.
   if (isPickerLauncher) {
+    // The picker is its own lifecycle — there is no wizard transition to
+    // protect. Let will-quit/window-all-closed behave normally so Cmd+Q and
+    // closing the window both exit the launcher cleanly.
+    wizardPhase = false
     await runProfilePicker(buildPickerEntries(registryAtBoot))
     return
   }
@@ -480,10 +485,16 @@ async function main(): Promise<void> {
     desktopConfig,
     forcedLaunch,
     profileId: activeProfileId,
-    // Default is just another tenant in a multi-profile install: once the
-    // registry names any named profile, even the default boot owns its own
-    // server (skips discovery auto-connect, auto-bumps a busy port).
-    ownsServer: activeProfileId !== DEFAULT_PROFILE_ID || registryAtBoot.profiles.length > 0,
+    // Default is just another tenant once any profile evidence exists
+    // (registry entries, unreadable registry, or ~/.freshell-<id> dirs from
+    // unlisted ids): it must never auto-attach to a neighbor's server and it
+    // auto-bumps a busy port. computeOwnsServer is the tested, pure gate.
+    ownsServer: computeOwnsServer({
+      profileId: activeProfileId,
+      registry: registryAtBoot,
+      homedir: os.homedir(),
+      listHomeEntries: () => fs.readdirSync(os.homedir()),
+    }),
     daemonManager,
     serverSpawner,
     hotkeyManager,

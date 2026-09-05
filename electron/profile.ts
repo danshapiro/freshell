@@ -291,3 +291,43 @@ export function buildPickerEntries(registry: RegistryReadResult): PickerEntry[] 
     ...registry.profiles.map((p) => ({ id: p.id, label: p.label ?? p.id })),
   ]
 }
+
+/**
+ * True when any named-profile state exists on disk, even when the registry is
+ * missing/unreadable or an id was used without being listed (both are
+ * documented: `FRESHELL_PROFILE=work` works with no registry entry — the id
+ * "simply starts with a fresh configuration" in `~/.freshell-work`).
+ *
+ * A `~/.freshell-<id>` directory proves a profile ran here; the picker
+ * launcher's own userData dir lives under appData, NOT homedir, so `.freshell-`
+ * prefixes in the home directory are real profiles only.
+ */
+export function hasNamedProfileState(
+  homedir: string,
+  listHomeEntries: () => string[],
+): boolean {
+  return listHomeEntries().some((name) => /^\.freshell-.+$/.test(name))
+}
+
+/**
+ * Canonical server-ownership gate for a boot. A boot OWNS its server when:
+ *   1. it is a named profile, OR
+ *   2. the registry names any named profile (multi-profile install), OR
+ *   3. the registry could not be read (fail closed: a broken registry must
+ *      never re-enable neighbor-server adoption), OR
+ *   4. a named-profile state dir exists on disk (covers unlisted ids and a
+ *      deleted-after-use registry).
+ * Anything else is a legacy single-profile install and keeps historical
+ * discovery-based behavior.
+ */
+export function computeOwnsServer(options: {
+  profileId: string
+  registry: RegistryReadResult
+  homedir: string
+  listHomeEntries: () => string[]
+}): boolean {
+  if (options.profileId !== DEFAULT_PROFILE_ID) return true
+  if (options.registry.error !== undefined) return true
+  if (options.registry.profiles.length > 0) return true
+  return hasNamedProfileState(options.homedir, options.listHomeEntries)
+}

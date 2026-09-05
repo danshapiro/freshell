@@ -480,7 +480,10 @@ test must fail because the module does not exist yet.
 **Files:**
 - Create: `electron/profile.ts`
 - Modify: `server/bootstrap.ts` (as-built: config-dir .env anchor + migration) — see **As-built changes**
-- Modify: `server/index.ts` (as-built: dotenv load moved into bootstrap) — see **As-built changes**
+- Create: `server/env-load.ts` (as-built: dotenv load at module-eval anchor) — see **As-built changes**
+- Modify: `server/get-network-host.ts` (as-built: anchor-aware dotenv) — see **As-built changes**
+- Modify: `server/freshell-home.ts` (as-built: shared `resolveEnvAnchorDir`) — see **As-built changes**
+- Modify: `server/index.ts` (as-built: dotenv load moved into env-load.ts; bootstrap + env-load are the first two imports) — see **As-built changes**
 - Test: `test/unit/electron/profile.test.ts`
 
 **Interfaces:**
@@ -3086,39 +3089,52 @@ git commit -m "docs: desktop profiles for multiple instances"
 All of the following landed after the original 9 tasks, driven by independent
 review rounds on the delta:
 
-- **Named app-bound/daemon profiles never adopt a discovery-found server.**
+- **Server-owning boots never adopt a discovery-found neighbor server.**
   `chooseLaunchAction` previously auto-connected to a single scanning-based
   localhost candidate before falling through to `start-local`; with one
-  profile's server resident, a different app-bound profile would attach to
-  the wrong server and config identity. `launch-policy.ts` and `startup.ts`
-  now treat `profileId` (passed from `entry.ts`) as an ownership boundary:
-  named profiles in `app-bound`/`daemon` mode skip discovery and always
-  `start-local`. The default profile's historical discovery behavior is
-  unchanged. Regression coverage: `test/unit/electron/launch-policy.test.ts`
-  ('named profiles') and `test/unit/electron/startup.test.ts` ('app-bound
-  mode').
-- **Named profiles auto-bump a busy port.** If a named profile's configured
-  port is already held (typically by another resident profile), startup scans
-  forward for a free port, logs `profile_port_reassigned`, and persists the
-  choice via the profile-scoped config patch — without this, the
-  unauthenticated `/api/health` probe would have succeeded against the
-  NEIGHBOR profile's server and the window would have loaded it with the
-  wrong token. Regression coverage: `test/unit/electron/startup.test.ts`
-  ('app-bound mode').
-- **dotenv ordering kept at module scope.** Loading `.env` inside
-  `server/index.ts` module body would run only after all imports evaluate and
-  silently disable every `.env`-backed knob (`LOG_LEVEL`, scrollback caps,
-  the debug-log filename's `PORT`). The load is inside `server/bootstrap.ts`,
-  which every server entry imports first: the anchor resolves
-  `FRESHELL_CONFIG_DIR` first, cwd second, and `.env` is created/migrated/
-  loaded before any other module evaluates.
+  profile's server resident, a different profile's boot would attach to the
+  wrong server and config (the token resolution reads the WRONG config dir's
+  .env, so the window fails auth). Ownership now extends to ANY tenant boot:
+  named profiles always, the Default profile whenever any named profile is
+  registered/used/evidenced by a `~/.freshell-<id>` dir, and fail-closed when
+  the registry is unreadable. The canonical gate is `computeOwnsServer` in
+  `electron/profile.ts` (unit-tested in `test/unit/electron/profile.test.ts`);
+  `entry.ts` passes its result through to launch policy and startup. The gate
+  runs BEFORE `alwaysAskOnLaunch` (an owning boot's chooser would otherwise
+  be an empty trap). Regression coverage:
+  `test/unit/electron/launch-policy.test.ts` ('server ownership') and
+  `test/unit/electron/startup.test.ts` ('app-bound mode').
+- **Server-owning boots auto-bump a busy port.** If an owning profile's
+  configured port is already held (typically by another resident profile),
+  startup scans forward for a free port, logs `profile_port_reassigned`,
+  updates the in-memory desktop config, and persists the choice via the
+  profile-scoped config patch — without this, the unauthenticated
+  `/api/health` probe would have succeeded against the NEIGHBOR profile's
+  server and the window would have loaded it with the wrong token. Exhaustion
+  (no free port in 200) logs `profile_port_scan_exhausted` and shows the
+  manual chooser instead of spawning into a black hole. Regression coverage:
+  `test/unit/electron/startup.test.ts` ('app-bound mode').
+- **dotenv ordering kept at module scope via `server/env-load.ts`.** Loading
+  `.env` inside `server/index.ts` module body would run only after all
+  imports evaluate and silently disable every `.env`-backed knob
+  (`LOG_LEVEL`, scrollback caps, the debug-log filename's `PORT`). The load
+  lives in `server/env-load.ts` and `server/index.ts` imports bootstrap first,
+  env-load second, THEN everything else (`fresh-agent-extras-router` etc.) —
+  so `.env` exists and loads before any module-level env reader evaluates.
+  `server/bootstrap.ts` itself has no dotenv load (keeps the module safe to
+  import in unit tests without env side effects).
 - **`.env` migration for daemon units.** When the anchored `.env` is missing
   but `<cwd>/.env` exists (the systemd/launchd templates lack WorkingDirectory,
   so a pre-feature install parks its token at `$HOME/.env`), bootstrap copies
-  (never moves) it into the anchored location; no AUTH_TOKEN rotation. Task
-  4's consumer list and staging block were amended to include
-  `server/bootstrap.ts` and `server/index.ts`; `server/config-store.ts` per
-  the earlier review note.
+  (never moves) it into the anchored location; no AUTH_TOKEN rotation. The
+  logic is the exported `migrateLegacyEnvFile` (dependency-injected, five
+  unit cases in `test/unit/server/bootstrap.test.ts`). The `.env` anchor rule
+  (explicit `FRESHELL_CONFIG_DIR` first, else cwd) is shared by
+  `resolveEnvAnchorDir` in `server/freshell-home.ts` — `bootstrap.ts`,
+  `env-load.ts`, and `get-network-host.ts` all consume it. Task 4's consumer
+  list and staging block also cover `server/bootstrap.ts`, `server/index.ts`,
+  `server/env-load.ts`, `server/get-network-host.ts`, and
+  `server/config-store.ts` (per the earlier review note).
 - **Environment contract tightened.** App-bound spawn env: `AUTH_TOKEN` and
   inherited `FRESHELL_CONFIG_DIR` are always dropped; `FRESHELL_CONFIG_DIR`
   is pinned ONLY for named profiles (the default profile keeps its legacy
