@@ -606,5 +606,27 @@ Ethernet adapter vEthernet (WSL):
 
       expect(root).toBe(process.cwd())
     })
+
+    it('returns FRESHELL_CONFIG_DIR (resolved) when explicitly set (daemon units / named profiles)', () => {
+      const original = process.env.FRESHELL_CONFIG_DIR
+      process.env.FRESHELL_CONFIG_DIR = '/tmp/fx-profile-work'
+      try {
+        expect(resolveProjectRoot()).toBe(path.resolve('/tmp/fx-profile-work'))
+      } finally {
+        if (original === undefined) delete process.env.FRESHELL_CONFIG_DIR
+        else process.env.FRESHELL_CONFIG_DIR = original
+      }
+    })
+
+    it('ignores a blank FRESHELL_CONFIG_DIR', () => {
+      const original = process.env.FRESHELL_CONFIG_DIR
+      process.env.FRESHELL_CONFIG_DIR = '   '
+      try {
+        expect(resolveProjectRoot()).toBe(process.cwd())
+      } finally {
+        if (original === undefined) delete process.env.FRESHELL_CONFIG_DIR
+        else process.env.FRESHELL_CONFIG_DIR = original
+      }
+    })
   })
 })

@@ -369,11 +369,19 @@ export function ensureEnvFile(envPath: string): BootstrapResult {
 }
 
 /**
- * Resolve the project root for .env placement.
- * Uses process.cwd() to match where dotenv/config looks,
- * so the auto-generated .env is always found on the next import.
+ * Resolve the directory anchoring the server's `.env` file.
+ *
+ * Default: process.cwd(), so dev runs read the repo-root `.env` where
+ * dotenv/config looks.
+ *
+ * When FRESHELL_CONFIG_DIR is explicitly set (daemon service units, Electron
+ * named profiles), the .env belongs to that config dir instead — daemon
+ * templates set the variable but not WorkingDirectory, so anchoring to cwd
+ * there would split write (.env file) and read (dotenv) sides apart.
  */
 export function resolveProjectRoot(): string {
+  const override = process.env.FRESHELL_CONFIG_DIR?.trim()
+  if (override) return path.resolve(override)
   return process.cwd()
 }
 

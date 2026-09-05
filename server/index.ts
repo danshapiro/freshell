@@ -1,6 +1,14 @@
 import { createFreshAgentExtrasRouter } from './fresh-agent-extras-router.js'
 import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
-import 'dotenv/config'
+import dotenv from 'dotenv'
+// .env lives with the rest of the Freshell state: an explicit
+// FRESHELL_CONFIG_DIR (daemon units / named profiles) relocates it; otherwise
+// dotenv's default cwd lookup is kept for dev runs.
+if (process.env.FRESHELL_CONFIG_DIR?.trim()) {
+  dotenv.config({ path: path.join(path.resolve(process.env.FRESHELL_CONFIG_DIR.trim()), '.env') })
+} else {
+  dotenv.config()
+}
 import express from 'express'
 import fs from 'fs'
 import http from 'http'

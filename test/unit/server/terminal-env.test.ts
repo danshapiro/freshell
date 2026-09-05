@@ -65,6 +65,7 @@ describe('TerminalRegistry env injection', () => {
     process.env.AUTH_TOKEN = 'secret-token'
     process.env.ALLOWED_ORIGINS = 'http://localhost:3001'
     process.env.FRESHELL_CONFIG_DIR = '/tmp/profile-scoped-config'
+    process.env.FRESHELL_PROFILE = 'work'
     process.env.HOME = '/home/test'
 
     const registry = new TerminalRegistry()
@@ -77,6 +78,7 @@ describe('TerminalRegistry env injection', () => {
     expect(env.AUTH_TOKEN).toBeUndefined()
     expect(env.ALLOWED_ORIGINS).toBeUndefined()
     expect(env.FRESHELL_CONFIG_DIR).toBeUndefined()
+    expect(env.FRESHELL_PROFILE).toBeUndefined()
     expect(env.HOME).toBe('/home/test')
   })
 })
