@@ -117,8 +117,9 @@ configuration.
   profile, Freshell bumps to the next free port and saves that port into the
   profile's settings (visible in the setup summary).
 - Daemon services (`freshell.service`, `com.freshell.server`,
-  "Freshell Server" task) are machine-global single instances — do not use
-  daemon mode in two profiles at once.
+  "Freshell Server" task) are machine-global single instances — daemon mode is
+  available only on the **Default** profile; named profiles fall back to the
+  chooser instead.
 - Silent-install provisioning (`desktop.provision`) applies to the default
   profile only.
 - Auto-update relaunches the app without `--profile`: after an update, the

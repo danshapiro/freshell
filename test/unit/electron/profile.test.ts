@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest'
 import {
   DEFAULT_PROFILE_ID,
   buildPickerEntries,
+  buildRelaunchOptions,
   computeOwnsServer,
   configDirForProfile,
   parseProfileArg,
@@ -247,11 +248,25 @@ describe('computeOwnsServer', () => {
       listHomeDirsWithState: () => ['.freshell', '.config'],
     })).toBe(false)
   })
-  it('does not count invalid-id dirs (.freshell- alone, .freshell-backup directries, oracle seeds)', () => {
+  it('does not count entries whose suffix is not a valid profile id', () => {
+    // Backup-with-dot, uppercase seeds, spaces — none of these are valid ids.
+    // Note the honest boundary: a valid-id-shaped dir (e.g. ~/.freshell-backup
+    // or the port oracle's own QA seed names) WILL count; that side is the
+    // deliberate fail-safe. See the doc comment on hasNamedProfileState.
     expect(computeOwnsServer({
       profileId: DEFAULT_PROFILE_ID,
       registry: noReg,
       listHomeDirsWithState: () => ['.freshell-', '.freshell-backup.tar', '.freshell-QA-007i-seed', '.freshell-My Work'],
     })).toBe(false)
+  })
+})
+
+describe('buildRelaunchOptions', () => {
+  it('is a plain argv relaunch outside AppImage', () => {
+    expect(buildRelaunchOptions(['--profile=work'], {})).toEqual({ args: ['--profile=work'] })
+  })
+  it('pins execPath to the real AppImage on Linux packaged runs', () => {
+    const out = buildRelaunchOptions(['--profile=work'], { APPIMAGE: '/opt/Freshell.AppImage' } as NodeJS.ProcessEnv)
+    expect(out).toEqual({ args: ['--profile=work'], execPath: '/opt/Freshell.AppImage' })
   })
 })

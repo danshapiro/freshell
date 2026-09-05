@@ -3151,6 +3151,22 @@ review rounds on the delta:
   window); `get-profiles` is sender-checked; `initMainProcess` no longer
   carries an unreachable duplicate `second-instance` handler;
   `{"profiles": []}` is a valid "no named profiles" registry, not invalid.
+- **Server-owning boots distinguish "my own resident server" from a
+  neighbor.** When an owning boot's base port is busy, startup probes the
+  resident's unauthenticated `/api/health` for `instanceId` and compares
+  against `<configDir>/instance-id`; a match (post-crash restart, or the
+  self-hosted server sharing one state dir) attaches without spawning a
+  second server, anything else bumps. Regression coverage:
+  `test/unit/electron/startup.test.ts` ('app-bound mode').
+- **Picker relaunch survives AppImage.** `app.relaunch` gets
+  `execPath: process.env.APPIMAGE` when set (transient-mount workaround),
+  via the tested `buildRelaunchOptions` in `electron/profile.ts`.
+- **Daemon mode is refused on named profiles** (a daemon's port is the
+  install-time Default port, never the named profile's). README says daemon
+  mode is Default-only.
+- **Package/build hygiene.** The WS contract artifacts regenerated after the
+  `backupPath` addition; the Rust `STRIP_ENV` list gained the two profile
+  vars with a parity test; the port spec docs enumerate them once.
 
 ---
 

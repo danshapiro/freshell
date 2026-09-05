@@ -392,6 +392,7 @@ export function resolveProjectRoot(): string {
 
 interface EnvMigrationDeps {
   existsSync: (p: string) => boolean
+  readFileSync: (p: string) => string
   mkdirSync: (p: string, opts: { recursive: true }) => unknown
   copyFileSync: (src: string, dest: string) => void
   log: (msg: string) => void
@@ -415,6 +416,7 @@ export function migrateLegacyEnvFile(
   cwdEnvPath: string,
   deps: EnvMigrationDeps = {
     existsSync: fs.existsSync,
+    readFileSync: (p) => fs.readFileSync(p, 'utf-8'),
     mkdirSync: (p, o) => fs.mkdirSync(p, o),
     copyFileSync: fs.copyFileSync,
     log: (msg) => console.log(msg),
@@ -424,6 +426,15 @@ export function migrateLegacyEnvFile(
   if (envPath === cwdEnvPath) return false
   if (deps.existsSync(envPath)) return false
   if (!deps.existsSync(cwdEnvPath)) return false
+  // Never copy an unrelated dotfile: the legacy path is only a Freshell .env
+  // when it carries AUTH_TOKEN. (A WorkingDirectory-less systemd user unit
+  // previously loaded ANY found `$HOME/.env`, and we mirror that location —
+  // but we don't DUPLICATE its secrets into the config dir.)
+  try {
+    if (!/^\s*AUTH_TOKEN=\S+/.test(deps.readFileSync(cwdEnvPath))) return false
+  } catch {
+    return false
+  }
   try {
     deps.mkdirSync(path.dirname(envPath), { recursive: true })
     deps.copyFileSync(cwdEnvPath, envPath)

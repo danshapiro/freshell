@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
+import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
 import { runStartup, type StartupContext, type BrowserWindowLike } from '../../../electron/startup.js'
@@ -253,6 +254,68 @@ describe('runStartup', () => {
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
       }
+    })
+
+    it('attaches to its OWN running server instead of bumping (instance-id match)', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-cfg-'))
+      await fsp.writeFile(path.join(configDir, 'instance-id'), 'srv-own-123'
+      )
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.configDir = configDir
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(false) // 3001 busy
+      ctx.fetchServerInstanceId = vi.fn().mockResolvedValue('srv-own-123')
+      const patchDesktopConfig = vi.fn()
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
+      await fsp.rm(configDir, { recursive: true, force: true })
+    })
+
+    it('bumps when the resident server instance-id does NOT match this config dir', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-cfg-'))
+      await fsp.writeFile(path.join(configDir, 'instance-id'), 'srv-own-123')
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.configDir = configDir
+      ctx.isPortAvailable = vi.fn(async (p: number) => p !== 3001) // 3001 busy
+      ctx.fetchServerInstanceId = vi.fn().mockResolvedValue('srv-foreign-zzz')
+      const patchDesktopConfig = vi.fn().mockResolvedValue({})
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      expect(patchDesktopConfig).toHaveBeenCalledWith({ port: 3002 })
+      await fsp.rm(configDir, { recursive: true, force: true })
+    })
+
+    it('bumps when no instance-id file exists (fresh profile config dir)', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-cfg-'))
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.configDir = configDir
+      ctx.isPortAvailable = vi.fn(async (p: number) => p !== 3001)
+      ctx.fetchServerInstanceId = vi.fn().mockResolvedValue('srv-anything')
+      ctx.patchDesktopConfig = vi.fn().mockResolvedValue({})
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      await fsp.rm(configDir, { recursive: true, force: true })
     })
 
     it('auto-bumps a busy port for a named profile and persists the choice', async () => {

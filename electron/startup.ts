@@ -1,4 +1,5 @@
 import path from 'path'
+import fsp from 'fs/promises'
 import { DEFAULT_PROFILE_ID } from './profile.js'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
@@ -72,9 +73,14 @@ export interface StartupContext {
   ownsServer?: boolean
   /** Port availability probe (entry.ts wires the production check). When
    *  provided AND this boot owns its server AND app-bound, a busy
-   *  desktopConfig.port is auto-bumped to the next free port (and persisted),
-   *  since two profiles sharing one port cannot both hold it. */
+   *  desktopConfig.port is first probed for SAME-PROFILE identity (see
+   *  fetchServerInstanceId) and reused when the resident server belongs to
+   *  this config dir; otherwise auto-bumped to the next free port (and
+   *  persisted). */
   isPortAvailable?: (port: number) => Promise<boolean>
+  /** Fetch the unauthenticated /api/health payload's instanceId (entry wires
+   *  http). Used to distinguish "my own config dir's server" from a neighbor. */
+  fetchServerInstanceId?: (url: string) => Promise<string | undefined>
   /** Persist a changed default port for named profiles (config-dir scoped). */
   patchDesktopConfig?: (patch: { port?: number }) => Promise<unknown>
 }
@@ -329,6 +335,20 @@ async function executeForcedLaunch(ctx: StartupContext, forced: ForcedLaunch): P
   return loadMainWindow(ctx, serverUrl, authToken)
 }
 
+/**
+ * Read the server instance-id file for this config dir. The (Node) server
+ * anchors `<configDir>/instance-id`; a missing/corrupt file just means the
+ * resident server cannot be proven ours.
+ */
+async function readInstanceIdFile(configDir: string): Promise<string | undefined> {
+  try {
+    const raw = await fsp.readFile(path.join(configDir, 'instance-id'), 'utf-8')
+    return raw.trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
 export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   const { desktopConfig, port } = ctx
 
@@ -336,7 +356,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     return { type: 'wizard' }
   }
 
-    if (ctx.forcedLaunch) {
+  if (ctx.forcedLaunch) {
     return executeForcedLaunch(ctx, ctx.forcedLaunch)
   }
 
@@ -414,48 +434,72 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     }
     case 'app-bound': {
       let launchPort = port
+      let attachedOwnServer = false
       if (ownsServerNow && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
-        // The profile's configured port is already held (typically by another
-        // profile's resident server). Bump to the next free port rather than
-        // spawning a doomed server whose health check would succeed against
-        // the OTHER instance (/api/health is unauthenticated).
-        let chosen = -1
-        for (let candidate = port + 1; candidate <= Math.min(port + 200, 65535); candidate++) {
-          if (await ctx.isPortAvailable(candidate)) {
-            chosen = candidate
-            break
-          }
-        }
-        if (chosen !== -1) {
-          launchPort = chosen
+        // The profile's configured port is already held. Before bumping, check
+        // whether the resident server BELONGS to this profile (it anchors its
+        // identity at <configDir>/instance-id): a restarted/crashed-orphaned
+        // app-bound server of THIS profile, or the self-hosted server over the
+        // same state dir, must get attached — bumping would double-spawn over
+        // the same state.
+        const candidateUrl = `http://localhost:${port}`
+        const localInstanceId = await readInstanceIdFile(ctx.configDir)
+        const residentId = ctx.fetchServerInstanceId
+          ? await ctx.fetchServerInstanceId(candidateUrl)
+          : undefined
+        const residentIsOurs =
+          residentId !== undefined && localInstanceId !== undefined && residentId === localInstanceId
+
+        if (residentIsOurs) {
           ctx.mainProcessLogger?.log({
             severity: 'info',
-            event: 'profile_port_reassigned',
-            profileId: ctx.profileId,
-            from: port,
-            to: chosen,
-          })
-          try {
-            await ctx.patchDesktopConfig?.({ port: chosen })
-          } catch (err) {
-            ctx.mainProcessLogger?.log({
-              severity: 'warn',
-              event: 'profile_port_persist_failed',
-              error: err instanceof Error ? err.message : String(err),
-            })
-          }
-        } else {
-          // Never land on the knowably-busy port: the unauthenticated
-          // /api/health on the NEIGHBOR's server would satisfy the health
-          // probe and the window would load the wrong identity. Leave the
-          // decision to the user instead of spawning into a black hole.
-          ctx.mainProcessLogger?.log({
-            severity: 'warn',
-            event: 'profile_port_scan_exhausted',
+            event: 'profile_attached_own_server',
             profileId: ctx.profileId,
             port,
           })
-          return { type: 'chooser', candidates, reason: 'manual-choice' }
+          attachedOwnServer = true
+        } else {
+          // The resident server is NOT ours: bump to the next free port rather
+          // than spawning a doomed server whose health check would succeed
+          // against the OTHER instance (/api/health is unauthenticated).
+          let chosen = -1
+          for (let candidate = port + 1; candidate <= Math.min(port + 200, 65535); candidate++) {
+            if (await ctx.isPortAvailable(candidate)) {
+              chosen = candidate
+              break
+            }
+          }
+          if (chosen !== -1) {
+            launchPort = chosen
+            ctx.mainProcessLogger?.log({
+              severity: 'info',
+              event: 'profile_port_reassigned',
+              profileId: ctx.profileId,
+              from: port,
+              to: chosen,
+            })
+            try {
+              await ctx.patchDesktopConfig?.({ port: chosen })
+            } catch (err) {
+              ctx.mainProcessLogger?.log({
+                severity: 'warn',
+                event: 'profile_port_persist_failed',
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+          } else {
+            // Never land on the knowably-busy port: the unauthenticated
+            // /api/health on the NEIGHBOR's server would satisfy the health
+            // probe and the window would load the wrong identity. Leave the
+            // decision to the user instead of spawning into a black hole.
+            ctx.mainProcessLogger?.log({
+              severity: 'warn',
+              event: 'profile_port_scan_exhausted',
+              profileId: ctx.profileId,
+              port,
+            })
+            return { type: 'chooser', candidates, reason: 'manual-choice' }
+          }
         }
       }
       if (launchPort !== port) {
@@ -463,7 +507,12 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
         // (e.g. the chooser's getCurrentPort) see the effective port.
         desktopConfig.port = launchPort
       }
-      serverUrl = await startAppBoundServer(ctx, launchPort)
+      if (attachedOwnServer) {
+        // Reuse — never spawn a second server over this profile's state dir.
+        serverUrl = `http://localhost:${launchPort}`
+      } else {
+        serverUrl = await startAppBoundServer(ctx, launchPort)
+      }
       break
     }
     case 'remote': {

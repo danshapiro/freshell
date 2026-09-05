@@ -34,6 +34,7 @@ import { acquireInstanceLock, initMainProcess } from './main.js'
 import {
   DEFAULT_PROFILE_ID,
   buildPickerEntries,
+  buildRelaunchOptions,
   computeOwnsServer,
   readProfilesRegistry,
   registryPathForHome,
@@ -148,7 +149,9 @@ async function runProfilePicker(entries: PickerEntry[]): Promise<void> {
       (event as { sender?: { id?: number } }).sender?.id === pickerWebContentsId,
     relaunchWithProfile: (id) => {
       const args = [...stripProfileArgs(process.argv.slice(1)), `--profile=${id}`]
-      app.relaunch({ args })
+      // On Linux AppImage, execPath points into a transient squashfs mount —
+      // relaunch needs the real AppImage path (electron-builder #1727/#4650).
+      app.relaunch(buildRelaunchOptions(args))
       app.exit(0)
     },
   }))
@@ -538,6 +541,34 @@ async function main(): Promise<void> {
     mainProcessLogger,
     isPortAvailable,
     patchDesktopConfig: (patch: { port?: number }) => patchDesktopConfig(patch, configDir),
+    fetchServerInstanceId: (url: string): Promise<string | undefined> => {
+      // Unauthenticated /api/health only; failure => indistinct (caller treats
+      // as foreign — safer to bump than to misidentify a neighbor as ours).
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(undefined), 10_000)
+        const req = http.get(`${url}/api/health`, { timeout: 8_000 }, (res) => {
+          const chunks: Buffer[] = []
+          res.on('data', (chunk: Buffer) => chunks.push(chunk))
+          res.on('end', () => {
+            clearTimeout(timer)
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
+              resolve(typeof body?.instanceId === 'string' && body.instanceId ? body.instanceId : undefined)
+            } catch {
+              resolve(undefined)
+            }
+          })
+          res.on('error', () => {
+            clearTimeout(timer)
+            resolve(undefined)
+          })
+        })
+        req.on('error', () => {
+          clearTimeout(timer)
+          resolve(undefined)
+        })
+      })
+    },
     platform: process.platform,
     fetchHealthCheck: (url: string): Promise<boolean> => {
       // Use Node's http module instead of global fetch() — Electron's main

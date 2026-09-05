@@ -206,7 +206,10 @@ export function readProfilesRegistry(
   return { profiles: parsed.data.profiles }
 }
 
-/** The picker appears when the choice set (default + named) has >1 entries. */
+/**
+ * The picker appears when the choice set (default + named) has more than one
+ * entry — that equals any non-empty named list, since Default always counts.
+ */
 export function shouldShowProfilePicker(
   selection: ProfileSelection,
   registry: RegistryReadResult,
@@ -284,6 +287,20 @@ export interface PickerEntry {
   label: string
 }
 
+/**
+ * `app.relaunch` options for switching profiles. When the current process is
+ * an AppImage, `process.execPath` points into a TRANSIENT squashfs mount and a
+ * plain relaunch silently fails (electron-builder #1727/#4650) — so we pin
+ * execPath to the real AppImage path from `process.env.APPIMAGE`.
+ */
+export function buildRelaunchOptions(
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): { args: string[]; execPath?: string } {
+  const appImage = env.APPIMAGE
+  return appImage ? { args, execPath: appImage } : { args }
+}
+
 /** Picker entries: the default profile first, then the registry in file order. */
 export function buildPickerEntries(registry: RegistryReadResult): PickerEntry[] {
   return [
@@ -300,11 +317,12 @@ export function buildPickerEntries(registry: RegistryReadResult): PickerEntry[] 
  *
  * A `~/.freshell-<id>` directory proves a profile ran here; the picker
  * launcher's own userData dir lives under appData, NOT homedir. Only
- * directories whose suffix is a valid profile id count. CAUTION: this cannot
- * distinguish a real profile from a hand-made backup named like one
- * (`~/.freshell-backup` matches): that direction is deliberately fail-safe
- * (isolation-for-Default), and fixing the honest naming/docs matters more
- * than being clever here.
+ * directories whose suffix is a valid profile id count. CAUTION: anything
+ * validly named — including a hand-made backup like `~/.freshell-backup` and
+ * the port oracle's seed dirs (`~/.freshell-qa-...`) — DOES count. That is
+ * the deliberate fail-safe side (Default boot treats itself as a tenant once
+ * it could collide); it changes Default's launch behavior on hosts where
+ * such a dir exists, so document, don't pretend.
  */
 export function hasNamedProfileState(
   listHomeDirs: () => string[],

@@ -646,6 +646,11 @@ describe('migrateLegacyEnvFile', () => {
     }
     const deps = {
       existsSync: (p: string) => fsMap.has(p),
+      readFileSync: (p: string) => {
+        const v = fsMap.get(p)
+        if (v === undefined) throw new Error(`ENOENT ${p}`)
+        return v
+      },
       mkdirSync: (_p: string, _o: { recursive: true }): void => {},
       copyFileSync: (src: string, dest: string) => {
         if (opts.copyFails) throw new Error('EACCES: permission denied')
@@ -667,6 +672,12 @@ describe('migrateLegacyEnvFile', () => {
 
   it('is a no-op when there is nothing to copy', () => {
     const { deps, calls } = makeDeps({})
+    expect(migrateLegacyEnvFile(anchor, legacy, deps)).toBe(false)
+    expect(calls.copied).toEqual([])
+  })
+
+  it('refuses to copy a legacy file without AUTH_TOKEN (not a Freshell .env)', () => {
+    const { deps, calls } = makeDeps({ [legacy]: 'HOME_TOKEN=justaguess' })
     expect(migrateLegacyEnvFile(anchor, legacy, deps)).toBe(false)
     expect(calls.copied).toEqual([])
   })
