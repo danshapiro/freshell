@@ -46,7 +46,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 63,
+    "count": 64,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -78,6 +78,7 @@
       "opencode.activity.list.response",
       "opencode.activity.updated",
       "pane.closed.result",
+      "pane.opened.result",
       "pane.reconcile.result",
       "panes.closed.result",
       "perf.logging",

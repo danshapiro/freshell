@@ -177,6 +177,76 @@ export const PANE_CLOSE_ACK_TIMEOUT_MESSAGE =
 export type PaneCloseIdentityInput = { createRequestId: string; terminalId?: string }
 
 /**
+ * Focused-episode-7 round 5 (Finding F1) — the pending-close registry. A
+ * `pane.closed` / `panes.closed` whose acknowledgement is outstanding (in
+ * flight, or QUEUED-BUT-UNSENT while the socket is down) marks every pane
+ * identity it carries as pending-close until the wait settles (success,
+ * failure, or the bounded timeout). The per-ready open sweep
+ * (`reassertAllOpenPanes` below) must NEVER open-assert a pending-close
+ * identity: across a reconnect the queued close flushes FIRST and the
+ * ready-time sweep second (WsClient replays `pendingMessages` inside the
+ * ready handling, before App's handler runs), and an open-assert landing
+ * behind the flushed close consumes the just-committed close record — the
+ * success ack then removes the pane with its evidence confirmed, leaving a
+ * ghost row with NO close evidence: offered and restored later, exactly the
+ * never-open-session shape this campaign exists to kill. Ordering alone
+ * cannot fix it (the close flushes first EITHER WAY); the fix is that no
+ * open-assert lands for the identity until its ack resolves. The
+ * failure/timeout settlement re-asserts open from the close path itself
+ * (batch-4's `reassertKeptPanesOpen`), so the sweep's skip is strictly the
+ * outstanding window — never a latch.
+ *
+ * Ref-counted: two overlapping closes of the same identity (a double-close
+ * fires two correlated waits over the one createRequestId) hold the mark
+ * until BOTH settle. Registration lives with the send helpers (not the
+ * store) so EVERY caller — present and future — marks pending at send time,
+ * including while the send sits in the reconnect queue.
+ *
+ * The detach middleware's fire-and-forget belt sends are deliberately NOT
+ * registered: they fire only for panes ALREADY out of the layout, which the
+ * sweep never enumerates.
+ */
+const pendingPaneCloses = new Map<string, number>()
+
+function noteClosePending(createRequestId: string): void {
+  pendingPaneCloses.set(createRequestId, (pendingPaneCloses.get(createRequestId) ?? 0) + 1)
+}
+
+function noteCloseSettled(createRequestId: string): void {
+  const left = (pendingPaneCloses.get(createRequestId) ?? 0) - 1
+  if (left > 0) {
+    pendingPaneCloses.set(createRequestId, left)
+  } else {
+    pendingPaneCloses.delete(createRequestId)
+  }
+}
+
+/** True while a close's acknowledgement is outstanding for this pane identity. */
+export function hasPendingPaneClose(createRequestId: string): boolean {
+  return pendingPaneCloses.has(createRequestId)
+}
+
+/**
+ * Focused-episode-7 round 5 (Finding F3) — the failed-consume marks. The
+ * `pane.opened.result{success:false}` answer (the consume/re-assert could
+ * NOT be journaled durably) marks the pane here so the failure is never
+ * server-log-only: the client LOGS it, and the next reconnect/sweep tick
+ * retries the re-assertion (the sweep re-asserts every DISPLAYED pane every
+ * ready — idempotent by construction, fsync-free when nothing stands). A
+ * later success clears the mark; a mark for a pane no longer displayed is
+ * PRUNED at the sweep (never re-asserted) — the harmful direction is
+ * open-asserting a pane whose genuine close came after the failed consume.
+ * In-memory BY DESIGN: a page reload loses the marks, and the per-ready
+ * blanket sweep is the healing floor for every shape the marks never knew.
+ */
+const openReassertFailures = new Set<string>()
+
+/** True when the pane's last answered open re-assertion failed to journal durably. */
+export function hasOpenReassertFailure(createRequestId: string): boolean {
+  return openReassertFailures.has(createRequestId)
+}
+
+/**
  * The whole-tab BATCH close (focused-episode-7 round 3, Finding F1): the
  * gated `closeTab` sends ONE `panes.closed` carrying the tab's full
  * terminal-pane identity set and resolves on the ONE correlated
@@ -197,6 +267,11 @@ export function sendPanesClosedAndAwait(
 ): Promise<KillAck> {
   const requestId = nanoid()
   const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
+  // F1: every carried identity is pending-close until the ONE result
+  // resolves — the ready sweep never open-asserts any of them in between
+  // (see the registry note above; registration precedes the send so a QUEUED
+  // close marks pending exactly as an in-flight one does).
+  for (const p of panes) noteClosePending(p.createRequestId)
   const wait = awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>
     if (m.type === 'panes.closed.result' && m.requestId === requestId) {
@@ -214,6 +289,7 @@ export function sendPanesClosedAndAwait(
     })),
   })
   return wait.then((ack) => {
+    for (const p of panes) noteCloseSettled(p.createRequestId)
     if (!ack.ok) {
       log.warn('tab close was not acknowledged as durably recorded — the tab stays', {
         tabId,
@@ -234,21 +310,60 @@ export function sendPanesClosedAndAwait(
  * `pane-detach[-batch]` close record durably and re-asserts the row's
  * attribution, so recovery re-agrees with the displayed layout.
  *
- * Fire-and-forget BY DESIGN: `getWsClient().send` queues the message until
- * `ready`, so over a socket-down close the replay delivers the close BEFORE
- * this re-assertion on the returned socket (the ordering is the fix, not a
- * race). There is deliberately no result frame: the assert is idempotent (a
- * no-op when nothing stands). The per-ready sweep below is the healing half
- * for every shape that outlives the queue (a page reload drops queued
- * sends): on EVERY ws `ready` the client re-asserts every terminal pane it
- * is displaying, so a standing-but-contradicted close record is consumed on
- * the next connection regardless of how the page got there.
+ * Focused-episode-7 round 5 (Finding F3) — the re-assertion is ANSWERED:
+ * the server sends ONE correlated `pane.opened.result{createRequestId,
+ * success, error?}` once the consume/re-assert resolved. A `success:false`
+ * is marked in `openReassertFailures` (logged — never server-log-only) and
+ * retried by the client on the next reconnect/sweep tick (the sweep
+ * re-asserts every displayed pane every ready; the re-assertion is
+ * idempotent by construction). The listen is deliberately NON-BLOCKING and
+ * BOUNDED (KILL_ACK_TIMEOUT_MS): silence is NOT a failure — a server
+ * predating this frame (the additive server→client change needs no version
+ * bump; the client never GATES on the answer, so a mixed pair degrades to
+ * the pre-frame behavior the per-ready sweep already heals) or a lost answer
+ * simply unsubscribes, marked by nothing.
+ *
+ * `getWsClient().send` queues the message until `ready`, so over a
+ * socket-down close the replay delivers the close BEFORE this re-assertion
+ * on the returned socket (the ordering, not a race). The per-ready sweep
+ * below is the healing half for every shape that outlives the queue (a page
+ * reload drops queued sends AND the failure marks): on EVERY ws `ready` the
+ * client re-asserts every session pane it is displaying, so a
+ * standing-but-contradicted close record is consumed on the next connection
+ * regardless of how the page got there.
  */
 export function sendPaneOpened(
   identity: { createRequestId: string; tabId: string },
   opts?: { send?: (msg: unknown) => void },
 ): void {
   const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
+  // F3: subscribe BEFORE the send (an inline answer still lands); the listen
+  // settles on the correlated result or the bounded window, never both, and
+  // never leaks (the settled listen unsubscribes).
+  let settled = false
+  let unsubscribe: () => void = () => {}
+  const settle = () => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+    unsubscribe()
+  }
+  const timer = setTimeout(settle, KILL_ACK_TIMEOUT_MS)
+  unsubscribe = getWsClient().onMessage((msg) => {
+    const m = msg as Record<string, unknown>
+    if (m.type !== 'pane.opened.result' || m.createRequestId !== identity.createRequestId) return
+    settle()
+    if (m.success === false) {
+      openReassertFailures.add(identity.createRequestId)
+      log.warn('the open re-assertion did not journal durably — the next sweep retries it', {
+        createRequestId: identity.createRequestId,
+        tabId: identity.tabId,
+        error: typeof m.error === 'string' ? m.error : undefined,
+      })
+    } else {
+      openReassertFailures.delete(identity.createRequestId)
+    }
+  })
   send({
     type: 'pane.opened',
     createRequestId: identity.createRequestId,
@@ -287,15 +402,38 @@ export function reassertAllOpenPanes(
   opts?: { send?: (msg: unknown) => void },
 ): void {
   let count = 0
+  let skippedPendingClose = 0
+  const displayed = new Set<string>()
   for (const [tabId, root] of Object.entries(layouts)) {
     if (!root) continue
     for (const identity of collectSessionPaneIdentities(root)) {
+      displayed.add(identity.createRequestId)
+      // F1: NEVER open-assert a pane whose close acknowledgement is
+      // outstanding (queued or in flight) — across a reconnect the close
+      // flushes before this sweep runs, and an assert landing behind it
+      // would consume the just-committed close evidence (see the registry
+      // note above). The close path owns any re-assertion on failure.
+      if (hasPendingPaneClose(identity.createRequestId)) {
+        skippedPendingClose++
+        continue
+      }
       sendPaneOpened({ createRequestId: identity.createRequestId, tabId }, opts)
       count++
     }
   }
-  if (count > 0) {
-    log.debug('re-asserted the displayed open panes on ready', { count })
+  // F3: failure marks for panes no longer displayed prune here — a genuine
+  // close that landed after the failed consume must never be followed by a
+  // re-assert (that direction erases the close evidence).
+  for (const crid of [...openReassertFailures]) {
+    if (!displayed.has(crid)) {
+      openReassertFailures.delete(crid)
+      log.debug('dropping the open re-assertion failure mark of a no-longer-displayed pane', {
+        createRequestId: crid,
+      })
+    }
+  }
+  if (count > 0 || skippedPendingClose > 0) {
+    log.debug('re-asserted the displayed open panes on ready', { count, skippedPendingClose })
   }
 }
 
@@ -308,7 +446,7 @@ export function reassertAllOpenPanes(
  * request id). The wait SUBSCRIBES BEFORE THE SEND, so a test double or a
  * server answering inline during `send()` still lands.
  *
- * No legacy fallbacks BY DESIGN (Finding F4 / WS_PROTOCOL_VERSION 9): a
+ * No legacy fallbacks BY DESIGN (Finding F4 / WS_PROTOCOL_VERSION 10): a
  * server that never learned this frame silently drops unknown typed
  * messages, and the strict hello handshake makes that server unreachable
  * for this client — an unanswered wait is always a REAL unconfirmed close
@@ -322,6 +460,10 @@ export function sendPaneClosedAndAwait(
   opts?: { timeoutMs?: number; send?: (msg: unknown) => void },
 ): Promise<KillAck> {
   const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
+  // F1: pending-close from send time (queued or in flight) until the wait
+  // settles — the ready sweep never open-asserts this identity in between
+  // (the registry note above).
+  noteClosePending(identity.createRequestId)
   const wait = awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>
     if (m.type === 'pane.closed.result' && m.createRequestId === identity.createRequestId) {
@@ -335,6 +477,7 @@ export function sendPaneClosedAndAwait(
     ...(identity.terminalId ? { terminalId: identity.terminalId } : {}),
   })
   return wait.then((ack) => {
+    noteCloseSettled(identity.createRequestId)
     if (!ack.ok) {
       log.warn('pane close was not acknowledged as durably recorded — the pane stays', {
         createRequestId: identity.createRequestId,

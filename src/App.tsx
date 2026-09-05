@@ -1130,8 +1130,14 @@ export default function App() {
             // server consumes any standing close record that contradicts the
             // displayed layout (the healed shape is a committed close whose
             // ack was lost mid-socket-death — incl. across a page reload,
-            // which drops the send queue). One idempotent fire-and-forget
-            // message per displayed pane.
+            // which drops the send queue). One idempotent message per
+            // displayed pane EXCEPT a pane whose close acknowledgement is
+            // outstanding (round-5 F1: the queued close flushed immediately
+            // above, inside the ws-client's ready handling, and an
+            // open-assert behind it would consume the just-committed close
+            // evidence before its ack arrives). Each send listens for its
+            // bounded correlated `pane.opened.result` (round-5 F3): a failed
+            // consume is marked, logged, and retried by the next sweep.
             reassertAllOpenPanes(appStore.getState().panes.layouts)
           }
           dispatch(resetWsSnapshotReceived())

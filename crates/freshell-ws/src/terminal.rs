@@ -985,7 +985,9 @@ async fn handle_client_text(
         }
         ClientMessage::PaneClosed(closed) => handle_pane_closed(&closed, state, ws_tx).await,
         ClientMessage::PanesClosed(closed) => handle_panes_closed(&closed, state, ws_tx).await,
-        ClientMessage::PaneOpened(opened) => handle_pane_opened(&opened, state, conn_identity).await,
+        ClientMessage::PaneOpened(opened) => {
+            handle_pane_opened(&opened, state, conn_identity, ws_tx).await
+        }
         ClientMessage::TerminalInput(input) => {
             // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
             // the opencode lane (see input_session_identity_ok): a
@@ -5736,31 +5738,54 @@ async fn handle_panes_closed(
     }
 }
 
-/// `pane.opened` (focused-episode-7 round 3, Finding F2) — the durable OPEN
-/// re-assertion: the client is still DISPLAYING this pane (its close's ack
-/// was lost or failed), so the server re-agrees with the displayed layout —
-/// [`PaneLedger::note_pane_opened`] consumes the pane's standing
-/// detach-family close record durably (a later genuine close of the same
-/// pane re-journals after it on the client's own wire order) and re-asserts
-/// the Bound row's attribution from this connection's identity + the
-/// message's tab (the full-triple advance rule). Fire-and-forget: the
-/// client replays it on every reconnect until the consumption lands, and a
-/// write failure surfaces through the ledger's standard loud seam (the same
-/// `surface_write_failure` the close lanes use) — never a client-visible
-/// failure (nothing ends server-side; the pane's own display IS the state).
+/// `pane.opened` (focused-episode-7 round 3, Finding F2; round 5 Finding F3)
+/// — the durable OPEN re-assertion: the client is still DISPLAYING this pane
+/// (its close's ack was lost or failed), so the server re-agrees with the
+/// displayed layout — [`PaneLedger::note_pane_opened`] consumes the pane's
+/// standing detach-family close record durably (a later genuine close of the
+/// same pane re-journals after it on the client's own wire order) and
+/// re-asserts the Bound row's attribution from this connection's identity +
+/// the message's tab (the full-triple advance rule).
+///
+/// Focused-episode-7 round 5 (Finding F3): the re-assertion is ANSWERED. ONE
+/// correlated `pane.opened.result{createRequestId, success, error?}` follows
+/// the journal resolution — pre-fix a failed consume was broadcast-log-only,
+/// and client state lost before another reconnect could omit a genuinely open
+/// pane from recovery. `success:false` (a Clean write failure, or the
+/// malformed empty-createRequestId shape — answered immediately, never an
+/// unacknowledged message) means NOTHING changed durably: the standing close
+/// record is untouched (the consumption's fail-loud rule), the standard loud
+/// degradation seam fires, and the client marks the pane and retries on its
+/// next sweep tick. The client's listen is bounded and never gates (the
+/// per-ready sweep re-asserts regardless), so the frame is additive with no
+/// protocol bump — a predated server degrades to the pre-answer behavior the
+/// sweep already heals.
 async fn handle_pane_opened(
     opened: &freshell_protocol::PaneOpened,
     state: &WsState,
     conn_identity: &ConnectionIdentity,
+    ws_tx: &mut WsSink,
 ) -> bool {
+    let answer = |success: bool, error: Option<String>| {
+        ServerMessage::PaneOpenedResult(freshell_protocol::PaneOpenedResult {
+            create_request_id: opened.create_request_id.clone(),
+            success,
+            error,
+        })
+    };
     if opened.create_request_id.is_empty() {
-        // Loud, never silent — but fire-and-forget by design, so no reply
-        // frame (and no client waiter to wedge).
         tracing::warn!(
             target: "freshell_ws::terminal",
-            "pane.opened dropped: createRequestId must not be empty"
+            "pane.opened rejected: createRequestId must not be empty"
         );
-        return true;
+        return send(
+            ws_tx,
+            &answer(
+                false,
+                Some("createRequestId must be non-empty".to_string()),
+            ),
+        )
+        .await;
     }
     let asserted_at = now_ms();
     let provenance =
@@ -5786,8 +5811,30 @@ async fn handle_pane_opened(
             "pane.opened task join failed: {join_err}"
         )))
     });
-    crate::pane_ledger::surface_write_failure(state, &opened.create_request_id, result);
-    true
+    match result {
+        Ok(()) => send(ws_tx, &answer(true, None)).await,
+        Err(err) => {
+            // The loud degradation seam stands (invariant + broadcast), and
+            // the CORRELATED failure now reaches the client too — it marks
+            // the pane and retries on its next sweep tick (the standing close
+            // record is untouched either way: the never-pretend rule).
+            crate::pane_ledger::surface_write_failure(
+                state,
+                &opened.create_request_id,
+                Err(std::io::Error::other(format!(
+                    "pane-opened re-assertion write failed: {err}"
+                ))),
+            );
+            send(
+                ws_tx,
+                &answer(
+                    false,
+                    Some("the open re-assertion could not be written durably".to_string()),
+                ),
+            )
+            .await
+        }
+    }
 }
 
 /// `terminal.kill` — SIGKILL + reap the shared PTY and remove it. The registry fans

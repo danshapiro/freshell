@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -587,12 +587,26 @@ export const closePaneWithCleanup = createAsyncThunk(
     // F2: confirm the durable close evidence BEFORE the layout loses the pane.
     const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
     if (identity.length > 0) {
-      const failed = await awaitPaneCloseEvidence(identity)
-      if (failed.length > 0) {
-        log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
-        surfacePaneCloseFailures(dispatch, tabId, failed)
-        reassertKeptPanesOpen(tabId, identity)
-        return
+      // Focused-episode-7 round 5 (Finding F2): freeze THIS pane's identity
+      // while the acknowledgement is outstanding — the one shared guard
+      // (`isPaneClosePending`) refuses every identity-changing fold of the
+      // pane (clearDeadTerminals/clearTerminalLiveHandles re-mints,
+      // repairCodexIdentityMismatch, identity-changing updatePaneContent /
+      // mergePaneContent / restartFreshAgentCreate folds, hydrate re-keys)
+      // so the ack always covers exactly the identity the removal drops.
+      dispatch(markPaneClosing({ tabId, paneId }))
+      try {
+        const failed = await awaitPaneCloseEvidence(identity)
+        if (failed.length > 0) {
+          log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
+          surfacePaneCloseFailures(dispatch, tabId, failed)
+          reassertKeptPanesOpen(tabId, identity)
+          return
+        }
+      } finally {
+        // The removal flows next (removals are never refused); the freeze
+        // lifts with the wait either way.
+        dispatch(clearPaneClosing({ tabId, paneId }))
       }
     }
     dispatch(closePane({ tabId, paneId }))
@@ -736,15 +750,27 @@ export const replacePaneWithCleanup = createAsyncThunk(
       (getState() as RootState).panes.layouts[tabId],
     ).filter((i) => i.paneId === paneId)
     if (identity.length > 0) {
-      const failed = await awaitPaneCloseEvidence(identity)
-      if (failed.length > 0) {
-        log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
-          tabId,
-          paneId,
-        })
-        surfacePaneCloseFailures(dispatch, tabId, failed)
-        reassertKeptPanesOpen(tabId, identity)
-        return
+      // Focused-episode-7 round 5 (Finding F2): freeze the discarded pane's
+      // identity while the acknowledgement is outstanding (the same shared
+      // guard as the single-pane close).
+      dispatch(markPaneClosing({ tabId, paneId }))
+      try {
+        const failed = await awaitPaneCloseEvidence(identity)
+        if (failed.length > 0) {
+          log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
+            tabId,
+            paneId,
+          })
+          surfacePaneCloseFailures(dispatch, tabId, failed)
+          reassertKeptPanesOpen(tabId, identity)
+          return
+        }
+        // The gate's own follow-through: lift the freeze first — replacePane
+        // is itself a guarded (identity-changing) reducer and must not be
+        // refused by its owner's mark. Synchronous dispatch, no interleave.
+        dispatch(clearPaneClosing({ tabId, paneId }))
+      } finally {
+        dispatch(clearPaneClosing({ tabId, paneId })) // idempotent: failure/throw paths lift the freeze here
       }
     }
     dispatch(replacePane({ tabId, paneId }))

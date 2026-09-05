@@ -138,6 +138,12 @@ pub enum ServerMessage {
     // WITH the protocol version bump 9 → 10.
     #[serde(rename = "panes.closed.result")]
     PanesClosedResult(PanesClosedResult),
+    // Additive (focused-episode-7 round 5, Finding F3): the correlated
+    // `pane.opened` answer — see [`PaneOpenedResult`]. NO version bump: the
+    // client never awaits it (the bounded non-blocking listen degrades to
+    // the per-ready sweep's healing on a predated server).
+    #[serde(rename = "pane.opened.result")]
+    PaneOpenedResult(PaneOpenedResult),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
     #[serde(rename = "terminal.modes.sync")]
@@ -168,7 +174,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 63] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -199,6 +205,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 63] = [
     "opencode.activity.list.response",
     "opencode.activity.updated",
     "pane.closed.result",
+    "pane.opened.result",
     "pane.reconcile.result",
     "panes.closed.result",
     "perf.logging",
@@ -439,6 +446,24 @@ pub struct PaneClosedResult {
 #[serde(rename_all = "camelCase")]
 pub struct PanesClosedResult {
     pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `pane.opened` answer (focused-episode-7 round 5, Finding
+/// F3): sent once per `pane.opened`, AFTER the durable consume/re-assert
+/// resolved — correlated by the pane identity (the re-assertion is keyed by
+/// `createRequestId` end to end, the `pane.closed.result` precedent).
+/// `success: false` (with `error`) means the consume could NOT be journaled
+/// durably: the standing close record is untouched (fail loud, never
+/// pretend), the client marks the pane and retries on its next sweep tick.
+/// Additive, no version bump — the client never awaits this answer (see
+/// `shared/ws-version.ts`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneOpenedResult {
+    pub create_request_id: String,
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

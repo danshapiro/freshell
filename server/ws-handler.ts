@@ -3996,7 +3996,7 @@ export class WsHandler {
         // correlated `pane.closed.result` per pane.closed, so answer success
         // (this server's close-durability model records exactly nothing:
         // there is no ledger read path to protect, hence nothing that can
-        // fail). Answer, never ignore: a v9 client treats silence as an
+        // fail). Answer, never ignore: a v10 client treats silence as an
         // unconfirmed close.
         this.send(ws, {
           type: 'pane.closed.result',
@@ -4021,10 +4021,19 @@ export class WsHandler {
         return
 
       case 'pane.opened':
-        // Focused-episode-7 round 3 (Finding F2): the durable open
-        // re-assertion. Fire-and-forget by design; only the Rust pane ledger
-        // consumes the pane's standing close record (this server records
-        // nothing, so there is nothing to consume and no answer to wedge).
+        // Focused-episode-7 round 5 (Finding F3): the durable open
+        // re-assertion is ANSWERED on every floor — the client tracks a
+        // failed consume for its next-sweep retry. Only the Rust pane ledger
+        // consumes the pane's standing close record; this server records
+        // nothing (no ledger, no recovery pipeline), so there is nothing that
+        // can fail and the answer is success. Answer, never ignore: silence
+        // is harmless (the listen is bounded and non-blocking) but answering
+        // keeps the client's failure bookkeeping exact.
+        this.send(ws, {
+          type: 'pane.opened.result',
+          createRequestId: m.createRequestId,
+          success: true,
+        })
         return
 
       default:

@@ -423,6 +423,21 @@ export interface PanesState {
    * hydrated.
    */
   closingTabs?: Record<string, true>
+  /**
+   * Panes whose SINGLE-pane close is IN FLIGHT (focused-episode-7 round 5,
+   * Finding F2) — set by `closePaneWithCleanup` / `replacePaneWithCleanup`
+   * before they await the pane close's acknowledgement, cleared on either
+   * resolution. Keyed `${tabId}:${paneId}` (the `reconcilePendingPanes`
+   * keying convention). Together with `closingTabs` this is the ONE shared
+   * pending-close guard (`isPaneClosePending` in panesSlice): while a close
+   * is outstanding for a pane, every identity-CHANGING reducer fold of that
+   * pane refuses, so the acknowledgement always covers exactly the identity
+   * the post-ack removal applies — never a re-keyed replacement removed
+   * evidenceless. Ephemeral: never persisted (stripped in persistMiddleware
+   * beside the other volatile maps), never hydrated, `removeLayout` drops
+   * the tab's entries alongside the layout.
+   */
+  closingPanes?: Record<string, true>
 }
 
 /**

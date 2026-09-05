@@ -833,7 +833,7 @@ describe('WebSocket edge cases', () => {
     // gates pane removal on the correlated `pane.closed.result`, so the Node
     // server accepts AND answers success (its close-durability model records
     // nothing: no ledger, no recovery pipeline, nothing to fail) — never an
-    // INVALID_MESSAGE/UNKNOWN_MESSAGE error and never silence (a v9 client
+    // INVALID_MESSAGE/UNKNOWN_MESSAGE error and never silence (a v10 client
     // against silence would refuse every terminal close for 5s).
     it('accepts pane.closed and answers a correlated success result (no error frame, connection stays open)', async () => {
       const { ws, close } = await createAuthenticatedConnection()
@@ -879,10 +879,11 @@ describe('WebSocket edge cases', () => {
     // envelope ON EVERY FLOOR — the v10 client's close gate awaits the ONE
     // correlated `panes.closed.result`, so the Node server accepts the batch
     // and answers success by requestId (it journals nothing: no ledger, no
-    // recovery pipeline). Focused-episode-7 round 3 (Finding F2): the durable
-    // open re-assertion is fire-and-forget — the Node server accepts and
-    // ignores it (nothing recorded, nothing to answer).
-    it('accepts panes.closed with a correlated success result, and accepts pane.opened silently (no error frames)', async () => {
+    // recovery pipeline). Focused-episode-7 round 5 (Finding F3): the durable
+    // open re-assertion is ANSWERED on every floor — the client tracks a
+    // failed consume for its next-sweep retry, so the Node server accepts and
+    // answers success (nothing recorded, nothing that can fail).
+    it('accepts panes.closed and pane.opened with correlated success results (no error frames)', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
       ws.send(JSON.stringify({
@@ -902,6 +903,10 @@ describe('WebSocket edge cases', () => {
       const results = messages.filter((m) => m.type === 'panes.closed.result')
       expect(results).toEqual([
         { type: 'panes.closed.result', requestId: 'batch-node-accept', success: true },
+      ])
+      const openResults = messages.filter((m) => m.type === 'pane.opened.result')
+      expect(openResults).toEqual([
+        { type: 'pane.opened.result', createRequestId: 'req-node-a', success: true },
       ])
       expect(
         messages.filter((m) => m.type === 'error'),

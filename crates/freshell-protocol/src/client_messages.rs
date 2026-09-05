@@ -44,7 +44,9 @@ pub enum ClientMessage {
     #[serde(rename = "panes.closed")]
     PanesClosed(PanesClosed),
     /// Focused-episode-7 round 3 (Finding F2): the durable open re-assertion
-    /// for a still-present pane (see [`PaneOpened`]). Fire-and-forget.
+    /// for a still-present pane (see [`PaneOpened`]). Answered by the
+    /// correlated `pane.opened.result` (focused-episode-7 round 5, F3) — the
+    /// client's listen is bounded and non-blocking.
     #[serde(rename = "pane.opened")]
     PaneOpened(PaneOpened),
     #[serde(rename = "terminal.input")]
@@ -425,8 +427,10 @@ pub struct PanesClosedPane {
 /// close-covered-by-consumed-record pane reads OPEN again. Queued by the
 /// client's send path until `ready`, so a socket-down close replays the
 /// close BEFORE this re-assertion on the returned socket (the ordering is
-/// the fix, not a race). Fire-and-forget (no result frame): idempotent and
-/// replayed on every reconnect until consumed.
+/// the fix, not a race). Idempotent and replayed on every reconnect until
+/// consumed; answered by the correlated [`crate::PaneOpenedResult`]
+/// (focused-episode-7 round 5, F3) so a failed consume is retried by the
+/// client on its next sweep tick rather than sitting server-log-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaneOpened {

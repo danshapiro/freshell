@@ -594,8 +594,15 @@ export const PanesClosedSchema = z.object({
  * displayed layout (a consumed close reads the pane OPEN again). The
  * client's send path queues it until `ready`, so a socket-down close
  * replays BEFORE this re-assertion on the returned socket — the ordering is
- * the fix, not a race. Fire-and-forget (no result frame): idempotent, and
- * replayed on every reconnect until consumed. */
+ * the fix, not a race.
+ *
+ * Focused-episode-7 round 5 (Finding F3): answered by ONE correlated
+ * `pane.opened.result{createRequestId, success, error?}` once the consume
+ * resolved (a failed consume is marked client-side and retried on the next
+ * sweep tick — never server-log-only). The client never GATES on the answer
+ * (the per-ready sweep re-asserts every displayed pane regardless), so the
+ * frame is additive with NO protocol bump: a predated server degrades to the
+ * pre-answer behavior the sweep already heals — see `shared/ws-version.ts`. */
 export const PaneOpenedSchema = z.object({
   type: z.literal('pane.opened'),
   createRequestId: z.string().min(1),
@@ -1142,7 +1149,7 @@ export type TerminalKilledMessage = {
  * server→client only. Introduced WITH the protocol version bump 8 → 9
  * (Finding F4): a server that predates this frame's schema drops unknown
  * typed messages silently, so the client awaits the answer ONLY from a
- * server the strict hello already proved speaks v9 — see
+ * server the strict hello already proved speaks v10 — see
  * `shared/ws-version.ts` for the full mixed-version note.
  */
 export type PaneClosedResultMessage = {
@@ -1168,6 +1175,32 @@ export type PaneClosedResultMessage = {
 export type PanesClosedResultMessage = {
   type: 'panes.closed.result'
   requestId: string
+  success: boolean
+  error?: string
+}
+
+/**
+ * The correlated `pane.opened` answer (focused-episode-7 round 5, Finding
+ * F3): sent once per `pane.opened`, AFTER the durable consume/re-assert
+ * resolved one way or the other, correlated by the pane identity (the
+ * re-assertion is keyed by `createRequestId` end to end — no separate
+ * request id, the `pane.closed.result` precedent). `success: false` (with
+ * `error`) means the consume could NOT be journaled durably — the client
+ * marks the pane and retries the re-assertion on the next sweep tick (the
+ * standing close record is untouched — fail loud, never pretend).
+ *
+ * server→client only. Additive with NO protocol version bump: the client
+ * never GATES on this answer (its listen is bounded and non-blocking — an
+ * unanswered re-assertion is exactly the pre-frame behavior the per-ready
+ * sweep already heals), so a server that predates the frame degrades
+ * harmlessly. Contrast `pane.closed.result`/`panes.closed.result`, which the
+ * close gates AWAIT (the version-bump rule: an awaited answer a predated
+ * server silently drops must never ship unversioned — see
+ * `shared/ws-version.ts`).
+ */
+export type PaneOpenedResultMessage = {
+  type: 'pane.opened.result'
+  createRequestId: string
   success: boolean
   error?: string
 }
@@ -1543,6 +1576,7 @@ export type ServerMessage =
   | TerminalKilledMessage
   | PaneClosedResultMessage
   | PanesClosedResultMessage
+  | PaneOpenedResultMessage
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalReplacedMessage

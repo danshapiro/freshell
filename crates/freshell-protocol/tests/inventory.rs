@@ -48,12 +48,12 @@ fn server_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(63),
-        "inventory declares 63 server→client types"
+        Some(64),
+        "inventory declares 64 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 63, "crate declares 63 server types (no dups)");
+    assert_eq!(actual.len(), 64, "crate declares 64 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_102() {
+fn combined_surface_is_103() {
     let all = all_message_types();
-    assert_eq!(all.len(), 102, "39 client + 63 server = 102 discriminants");
+    assert_eq!(all.len(), 103, "39 client + 64 server = 103 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        102,
+        103,
         "no discriminant collides across directions"
     );
 }
@@ -139,6 +139,30 @@ fn pane_closed_result_roundtrips_camel_case() {
     let v: serde_json::Value = serde_json::to_value(&fail).unwrap();
     assert_eq!(v["success"], false);
     assert_eq!(v["error"], "the record could not be written durably");
+}
+
+/// Focused-episode-7 round 5, Finding F3: the correlated `pane.opened`
+/// answer roundtrips camelCase and elides the absent error — `success:false`
+/// means the consume did NOT land durably (the client retries it on the next
+/// sweep tick; pre-latest servers simply never send the frame and the client
+/// never blocks on it).
+#[test]
+fn pane_opened_result_roundtrips_camel_case() {
+    let json = r#"{"type":"pane.opened.result","createRequestId":"req-1","success":true}"#;
+    let msg: freshell_protocol::ServerMessage = serde_json::from_str(json).expect("parse");
+    let back = serde_json::to_string(&msg).expect("serialize");
+    let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+    assert_eq!(v["type"], "pane.opened.result");
+    assert_eq!(v["createRequestId"], "req-1");
+    assert_eq!(v["success"], true);
+    assert!(v.get("error").is_none(), "no error key without a failure");
+    let fail: freshell_protocol::ServerMessage = serde_json::from_str(
+        r#"{"type":"pane.opened.result","createRequestId":"req-2","success":false,"error":"the open re-assertion could not be written durably"}"#,
+    )
+    .expect("parse failure shape");
+    let v: serde_json::Value = serde_json::to_value(&fail).unwrap();
+    assert_eq!(v["success"], false);
+    assert_eq!(v["error"], "the open re-assertion could not be written durably");
 }
 
 /// Focused-episode-7 round 3 (Findings F1+F2, protocol v10): the batch

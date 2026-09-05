@@ -2131,4 +2131,185 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await ctxB.close()
     await fs.rm(markerDir, { recursive: true, force: true })
   })
+
+  /**
+   * Focused-episode-7 round 5, Finding F1 (the ready-sweep close race): the
+   * pane's close is QUEUED while the socket is down; on the reconnect the
+   * client flushes the queued `pane.closed` FIRST and the ready-time open
+   * sweep MUST NOT re-assert that pane behind it (the still-displayed pane
+   * is awaiting the close's acknowledgement — an open-assert would consume
+   * the committed close record before the ack arrives, and the post-ack
+   * removal would leave a ghost row with no close evidence: silently
+   * re-offered later, exactly the mechanism this campaign exists to kill).
+   * The pin ends at the finding's demanded shape: the close flushes, the
+   * sweep skips the pending pane, the success ack lands, the pane is
+   * removed — and the close evidence STANDS durable. (What a standing record
+   * MEANS for the offer is scenario 7's lane.)
+   *
+   * Disconnection is a `routeWebSocket` gate (Playwright's ws interception —
+   * `context.route` provably does NOT see ws handshakes): the handler
+   * passthroughs normally, and while "blocked" it accepts the page's socket
+   * but never connects it to the server (no `ready` ever arrives; the
+   * client's sends queue — the exact queued-close interleave without any
+   * server cooperation). Blocking starts by closing the live socket so the
+   * client's reconnect lands IN the black hole; unblocking closes the
+   * black-holed socket so the next reconnect passthroughs.
+   *
+   * Placement: last — it re-bases the evidence base and depends on nothing
+   * from prior scenarios (the scenario 7/8 idiom: safe at this serial
+   * boundary, no client connected).
+   */
+  test('scenario 9: a close queued across a reconnect is never re-asserted open behind its own flush — the committed evidence stands (focused-episode-7 round 5 F1)', async ({ browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+
+    // 1. Re-base the evidence base (no client connected at this serial boundary).
+    await fs.rm(path.join(capturedHome, '.freshell', 'tabs-snapshots'), { recursive: true, force: true })
+
+    // 2. Context A: shell pane, then SPLIT a claude CLI pane beside it (the
+    //    shell sibling keeps the tab alive so closePane — the single-pane
+    //    gate — owns the close; scenario 7's construction). The ws gate is
+    //    installed BEFORE the page boots, passthrough until flipped.
+    const ctxA: BrowserContext = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    let blockWs = false
+    const liveSockets: Array<{ client: import('@playwright/test').WebSocketRoute; server: import('@playwright/test').WebSocketRoute }> = []
+    const blockedSockets: Array<import('@playwright/test').WebSocketRoute> = []
+    await ctxA.routeWebSocket((url) => url.pathname === '/ws', (ws) => {
+      if (blockWs) {
+        // The black hole: accepted but never connected — no hello answer, no
+        // ready; the client's sends queue and its ready timeout cycles.
+        blockedSockets.push(ws)
+        return
+      }
+      const server = ws.connectToServer()
+      liveSockets.push({ client: ws, server })
+      ws.onMessage((message) => server.send(message))
+      server.onMessage((message) => ws.send(message))
+      // Keep the real server's view honest when either side closes.
+      ws.onClose((code, reason) => void server.close({ code, reason }).catch(() => {}))
+      server.onClose((code, reason) => void ws.close({ code, reason }).catch(() => {}))
+    })
+    const pageA = await ctxA.newPage()
+    const harnessA = await connect(pageA, info)
+    await selectShellIfPickerShowing(pageA)
+    await expect(pageA.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+    const tabAId = (await harnessA.getActiveTabId())!
+    const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), 'close-race-cli-'))
+    const picker = await openPanePicker(pageA)
+    await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
+    const directoryInput = pageA.getByRole('combobox', { name: /Starting directory/i })
+    await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+    await directoryInput.fill(markerDir)
+    await directoryInput.press('Enter')
+
+    // 3. The panes' identities once the terminal handle has folded in.
+    let claudeLeafA: any
+    let shellLeafA: any
+    let claudeCrIdA = ''
+    let shellCrIdA = ''
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessA.getPaneLayout(tabAId))
+      claudeLeafA = leaves.find((l) => l.content?.kind === 'terminal' && l.content?.mode === 'claude')
+      shellLeafA = leaves.find((l) => l.content?.kind === 'terminal' && l.content?.mode !== 'claude')
+      expect(claudeLeafA?.content?.terminalId, "A's claude pane owns a live terminal id").toBeTruthy()
+      expect(shellLeafA?.content?.terminalId, "A's shell pane owns a live terminal id").toBeTruthy()
+      claudeCrIdA = claudeLeafA?.content?.createRequestId ?? ''
+      shellCrIdA = shellLeafA?.content?.createRequestId ?? ''
+      expect(claudeCrIdA, "A's claude pane owns its createRequestId").toBeTruthy()
+      expect(shellCrIdA, "A's shell pane owns its createRequestId").toBeTruthy()
+    }).toPass({ timeout: 15_000 })
+
+    // 4. The socket "dies": flip the gate and close the live socket — the
+    //    client's reconnect attempt lands in the black hole, so its sends
+    //    QUEUE until the next ready (the finding's disconnected window,
+    //    deterministic).
+    blockWs = true
+    for (const pair of liveSockets.splice(0)) pair.client.close()
+    await pageA.waitForFunction(
+      () => window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() !== 'ready',
+      undefined,
+      { timeout: 30_000 },
+    )
+
+    // 5. THE FINDING'S INTERLEAVE — the close begins while disconnected. The
+    //    sent-when-ready observer starts empty: the queued close must reach
+    //    the wire ONLY via the reconnect flush, never before (anti-vacuity).
+    await harnessA.clearSentWsMessages()
+    await pageA
+      .locator(`[data-pane-id="${claudeLeafA.id}"][data-context='pane'] button[title='Close pane']`)
+      .click()
+    // The gate is mid-wait: the pane is STILL DISPLAYED (nothing drops a pane
+    // whose close evidence is unconfirmed) and NOTHING of the close has hit
+    // the wire.
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessA.getPaneLayout(tabAId))
+      expect(leaves.some((l) => l.id === claudeLeafA.id)).toBe(true)
+      const queuedOut = (await harnessA.getSentWsMessages()) as Array<Record<string, unknown>>
+      expect(
+        queuedOut.some((m) => m?.type === 'pane.closed' && m?.createRequestId === claudeCrIdA),
+        'the close queues while the socket is down — it must not have reached the wire yet',
+      ).toBe(false)
+    }).toPass({ timeout: 10_000 })
+
+    // 6. The socket returns: release the black hole so the next reconnect
+    //    passthroughs; the queue flushes the close FIRST, then the ready
+    //    sweep runs. The ack lands and the pane is removed.
+    blockWs = false
+    for (const ws of blockedSockets.splice(0)) ws.close()
+    await expect(async () => {
+      const leaves = leavesOfLayout(await harnessA.getPaneLayout(tabAId))
+      expect(
+        leaves.some((l) => l.id === claudeLeafA.id),
+        'the success ack removed the closed pane (the shell sibling keeps the tab)',
+      ).toBe(false)
+      expect(leaves.some((l) => l.id === shellLeafA.id)).toBe(true)
+    }).toPass({ timeout: 30_000 })
+
+    // 7. THE WIRE PIN (F1): the close flushed; NO pane.opened for the closing
+    //    pane ever followed it — the sweep skipped the still-acked-pending
+    //    pane. The shell sibling's re-assertion proves the sweep RAN (its
+    //    absence would make the pin vacuous).
+    const sentOnReconnect = (await harnessA.getSentWsMessages()) as Array<Record<string, unknown>>
+    const closeIdx = sentOnReconnect.findIndex(
+      (m) => m?.type === 'pane.closed' && m?.createRequestId === claudeCrIdA,
+    )
+    expect(closeIdx, 'the queued close flushed onto the wire at the reconnect').toBeGreaterThanOrEqual(0)
+    const afterClose = sentOnReconnect.slice(closeIdx + 1)
+    expect(
+      afterClose.some((m) => m?.type === 'pane.opened' && m?.createRequestId === shellCrIdA),
+      'anti-vacuity: the ready sweep DID run (the un-pending shell sibling was re-asserted)',
+    ).toBe(true)
+    expect(
+      afterClose.filter((m) => m?.type === 'pane.opened' && m?.createRequestId === claudeCrIdA),
+      'no open re-assertion lands behind the flushed close while its ack is outstanding',
+    ).toEqual([])
+
+    // 8. AND THE EVIDENCE STANDS (the finding's terminal condition): the
+    //    close record the flush committed is never consumed by the sweep —
+    //    durable, keyed by the closed pane's createRequestId, kills empty.
+    await expect(async () => {
+      const dir = path.join(capturedHome, '.freshell', 'pane-ledger', 'close-envelopes')
+      const files = await fs.readdir(dir).catch(() => [] as string[])
+      let found: any = null
+      for (const name of files.filter((f) => f.endsWith('.json'))) {
+        const body = await fs.readFile(path.join(dir, name), 'utf8').catch(() => '')
+        try {
+          found = JSON.parse(body)
+        } catch {
+          continue
+        }
+        if (found?.createRequestId === claudeCrIdA) break
+        found = null
+      }
+      expect(
+        found,
+        'the committed close evidence must STAND after the reconnect (never consumed by the ready sweep) '
+          + `(looked in ${dir} for createRequestId=${claudeCrIdA})`,
+      ).toBeTruthy()
+      expect(found.kills ?? [], 'the detach close fences nothing (non-retiring)').toHaveLength(0)
+    }).toPass({ timeout: 15_000 })
+
+    await ctxA.close()
+    await fs.rm(markerDir, { recursive: true, force: true })
+  })
 })

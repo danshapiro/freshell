@@ -1203,7 +1203,11 @@ async fn a_pane_opened_consumes_the_committed_close_durably() {
     assert_eq!(server_ledger.list_pane_detach_closes().len(), 1);
 
     // THE RE-ASSERTION (socket returned; the client re-asserts the layout it
-    // is displaying): the record is consumed.
+    // is displaying): the record is consumed. Focused-episode-7 round 5
+    // (Finding F3): the re-assertion is ANSWERED — ONE correlated
+    // `pane.opened.result{createRequestId, success}` once the consumption +
+    // re-assertion resolved, so the client learn of (and retries) a failed
+    // consume rather than it sitting log-only.
     ws.send(
         WsMessage::Text(
             serde_json::json!({
@@ -1216,12 +1220,9 @@ async fn a_pane_opened_consumes_the_committed_close_durably() {
     )
     .await
     .unwrap();
-    // Order the read: the ONE socket loop processes messages sequentially, so
-    // once this later frame's answer arrives the re-assertion has landed.
-    ws.send(WsMessage::Text("{\"type\":\"ping\"}".to_string()))
-        .await
-        .unwrap();
-    let _ = next_frame_of_type(&mut ws, "pong").await;
+    let opened = next_frame_of_type(&mut ws, "pane.opened.result").await;
+    assert_eq!(opened["createRequestId"], "req-po");
+    assert_eq!(opened["success"], true);
 
     assert!(
         server_ledger.list_pane_detach_closes().is_empty(),
@@ -1237,6 +1238,120 @@ async fn a_pane_opened_consumes_the_committed_close_durably() {
         disk.list_pane_detach_closes().is_empty(),
         "the consumption is durable"
     );
+
+    let _ = registry;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Focused-episode-7 round 5, Finding F3 — the FAILED open re-assertion is
+/// answered and the retry heals: a `pane.opened` whose journal update cannot
+/// land answers ONE correlated `pane.opened.result{success:false, error}`
+/// (never log-only), the standing close record is untouched (the fail-loud,
+/// never-pretend consumption rule), and the client's retry on the next tick
+/// consumes it DURABLY — open state durable, no silent inconsistency. The
+/// malformed shape answers failure immediately (never an unanswered frame).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_pane_opened_is_answered_and_the_retry_consumes_durably() {
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let dir = unique_ledger_dir("pane-opened-fail");
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) =
+        connect_and_capture_inventory_with_identity(&url, "device-pf", "client-pf").await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-pf",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+        "tabId": "tab-pf",
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(server_ledger.load_binding("claude", &session_id).is_some());
+
+    // The committed close (its ack lost on the finding's wire).
+    ws.send(
+        WsMessage::Text(
+            serde_json::json!({
+                "type": "pane.closed",
+                "createRequestId": "req-pf",
+                "terminalId": terminal_id,
+            })
+            .to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    let ack = next_frame_of_type(&mut ws, "pane.closed.result").await;
+    assert_eq!(ack["success"], true);
+    assert_eq!(server_ledger.list_pane_detach_closes().len(), 1);
+
+    // THE FAILED CONSUME (the journal layer cannot write): answered
+    // success:false, and the close record STANDS — nothing pretends.
+    set_permissions_recursive(&dir, 0o555, 0o555);
+    let opened = serde_json::json!({
+        "type": "pane.opened",
+        "createRequestId": "req-pf",
+        "tabId": "tab-pf",
+    });
+    ws.send(WsMessage::Text(opened.to_string())).await.unwrap();
+    let failed = next_frame_of_type(&mut ws, "pane.opened.result").await;
+    assert_eq!(failed["createRequestId"], "req-pf");
+    assert_eq!(failed["success"], false);
+    assert!(
+        failed["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the failure carries its reason: {failed}"
+    );
+    assert_eq!(
+        server_ledger.list_pane_detach_closes().len(),
+        1,
+        "the failed consume never pretends: the close record stands"
+    );
+
+    // THE RETRY (the client's next sweep tick re-asserts the still-displayed
+    // pane): answered success, consumed DURABLY — a restart never re-feeds it.
+    set_permissions_recursive(&dir, 0o755, 0o644);
+    let opened = serde_json::json!({
+        "type": "pane.opened",
+        "createRequestId": "req-pf",
+        "tabId": "tab-pf",
+    });
+    ws.send(WsMessage::Text(opened.to_string())).await.unwrap();
+    let retried = next_frame_of_type(&mut ws, "pane.opened.result").await;
+    assert_eq!(retried["createRequestId"], "req-pf");
+    assert_eq!(retried["success"], true);
+    assert!(
+        server_ledger.list_pane_detach_closes().is_empty(),
+        "the retry consumed the standing close: {:?}",
+        server_ledger.list_pane_detach_closes()
+    );
+    let row = server_ledger.load_binding("claude", &session_id).expect("row");
+    assert_eq!(row.state, RowState::Bound, "the open pane's row was never retired");
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert!(
+        disk.list_pane_detach_closes().is_empty(),
+        "the retried consumption is durable across a reload"
+    );
+
+    // Malformed: an empty createRequestId answers failure immediately (never
+    // an unanswered frame) and journals/consumes nothing.
+    let malformed = serde_json::json!({
+        "type": "pane.opened",
+        "createRequestId": "",
+        "tabId": "tab-pf",
+    });
+    ws.send(WsMessage::Text(malformed.to_string())).await.unwrap();
+    let bad = next_frame_of_type(&mut ws, "pane.opened.result").await;
+    assert_eq!(bad["success"], false, "malformed re-assertion: {bad}");
+    assert!(bad["error"].is_string(), "the error names it: {bad}");
 
     let _ = registry;
     std::fs::remove_dir_all(&dir).ok();

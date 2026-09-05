@@ -24,7 +24,7 @@ import tabsReducer, {
   closePaneWithCleanup,
   replacePaneWithCleanup,
 } from '@/store/tabsSlice'
-import panesReducer, { initLayout, splitPane, setPaneCloseError, addPane, replacePane, updatePaneContent, hydratePanes } from '@/store/panesSlice'
+import panesReducer, { initLayout, splitPane, setPaneCloseError, addPane, replacePane, updatePaneContent, hydratePanes, clearDeadTerminals, clearTerminalLiveHandles, repairCodexIdentityMismatch } from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { KILL_ACK_TIMEOUT_MS } from '@/lib/kill-ack'
@@ -102,7 +102,7 @@ function createStore() {
 }
 
 /** A store with one tab holding two terminal panes (vertical split). */
-function createTwoPaneStore(opts?: { cridB?: string; terminalIdB?: string; terminalIdA?: string }) {
+function createTwoPaneStore(opts?: { cridB?: string; terminalIdB?: string; terminalIdA?: string; sessionRefB?: { provider: string; sessionId: string } }) {
   const store = createStore()
   store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
   store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', opts?.terminalIdA ?? 'term-a') }))
@@ -110,7 +110,10 @@ function createTwoPaneStore(opts?: { cridB?: string; terminalIdB?: string; termi
     tabId: 'tab-1',
     paneId: 'pane-1',
     direction: 'vertical',
-    newContent: terminalContent(opts?.cridB ?? 'req-b', opts?.terminalIdB ?? 'term-b'),
+    newContent: {
+      ...terminalContent(opts?.cridB ?? 'req-b', opts?.terminalIdB ?? 'term-b'),
+      ...(opts?.sessionRefB ? { sessionRef: opts.sessionRefB } : {}),
+    },
     newPaneId: 'pane-2',
   }))
   mockSend.mockClear()
@@ -627,6 +630,244 @@ describe('focused-episode-7 round 4 (F3) — a pending tab close freezes the pan
     ackPanesClosedBatches()
     await close
     expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+  })
+
+  it.each([
+    {
+      name: 'clearDeadTerminals (server-reported dead handle → identity re-mint)',
+      rekey: (store: ReturnType<typeof createStore>) => store.dispatch(clearDeadTerminals({ liveTerminalIds: [] })),
+      expectUnrekeyed: (store: ReturnType<typeof createStore>) => {
+        const p1 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-1')?.content as { createRequestId?: string; terminalId?: string }
+        const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string; terminalId?: string }
+        expect(p1.createRequestId).toBe('req-a')
+        expect(p1.terminalId).toBe('term-a')
+        expect(p2.createRequestId).toBe('req-b')
+        expect(p2.terminalId).toBe('term-b')
+      },
+    },
+    {
+      name: 'clearTerminalLiveHandles (server-driven handle wipe → identity re-mint)',
+      rekey: (store: ReturnType<typeof createStore>) => store.dispatch(clearTerminalLiveHandles({ terminalIds: ['term-a', 'term-b'] })),
+      expectUnrekeyed: (store: ReturnType<typeof createStore>) => {
+        const p1 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-1')?.content as { createRequestId?: string; terminalId?: string }
+        const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string; terminalId?: string }
+        expect(p1.createRequestId).toBe('req-a')
+        expect(p1.terminalId).toBe('term-a')
+        expect(p2.createRequestId).toBe('req-b')
+        expect(p2.terminalId).toBe('term-b')
+      },
+    },
+    {
+      name: 'repairCodexIdentityMismatch (server-driven mismatch repair re-keys the pane)',
+      store: () => createTwoPaneStore({ sessionRefB: { provider: 'codex', sessionId: 'sess-mismatch' } }),
+      rekey: (store: ReturnType<typeof createStore>) => store.dispatch(repairCodexIdentityMismatch({
+        tabId: 'tab-1',
+        paneId: 'pane-2',
+        staleTerminalId: 'term-b',
+        expectedSessionRef: { provider: 'codex', sessionId: 'sess-mismatch' },
+        createRequestId: 'req-repaired',
+      })),
+      expectUnrekeyed: (store: ReturnType<typeof createStore>) => {
+        const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string }
+        expect(p2.createRequestId).toBe('req-b')
+      },
+    },
+  ])('focused-ep7 round 5 (F2): a mid-close $name is REFUSED for panes of the closing tab; the acked batch stays the whole truth', async ({ store: makeStore, rekey, expectUnrekeyed }) => {
+    const store = (makeStore ?? createTwoPaneStore)()
+    const close = store.dispatch(closeTab('tab-1'))
+
+    // THE FINDING'S SCENARIO (the tab-close half): a server-driven rekey
+    // lands while the batch acknowledgement is in flight. REFUSED — the
+    // acknowledgement must cover exactly the identity set the post-ack
+    // removal applies; a replacement identity removed evidenceless leaves a
+    // recoverable ghost row.
+    rekey(store)
+    expectUnrekeyed(store)
+
+    ackPanesClosedBatches()
+    await close
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
+  })
+})
+
+describe('focused-episode-7 round 5 (F2) — a pending SINGLE-pane close freezes THAT pane\'s identity (the one shared guard)', () => {
+  it('clearDeadTerminals skips the pending pane but still rekeys its un-pending sibling (pane-scoped discrimination)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+
+    // term-b reported dead mid-wait: the pending pane MUST keep its snapshot
+    // identity (the awaited pane.closed covers 'req-b'; a re-mint would make
+    // the post-ack removal drop evidenceless replacement identity 'req-*').
+    store.dispatch(clearDeadTerminals({ liveTerminalIds: ['term-a'] }))
+    let p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string; terminalId?: string }
+    expect(p2.createRequestId).toBe('req-b')
+    expect(p2.terminalId).toBe('term-b')
+
+    // The SIBLING is not pending: its dead-handle rekey still lands — the
+    // guard is pane-scoped, not a whole-reducer refusal of the tab.
+    store.dispatch(clearDeadTerminals({ liveTerminalIds: ['term-b'] }))
+    const p1 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-1')?.content as { createRequestId?: string; terminalId?: string }
+    expect(p1.terminalId).toBeUndefined()
+    expect(p1.createRequestId).not.toBe('req-a')
+
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('clearTerminalLiveHandles skips the pending pane', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    store.dispatch(clearTerminalLiveHandles({ terminalIds: ['term-b'] }))
+    const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string; terminalId?: string }
+    expect(p2.createRequestId).toBe('req-b')
+    expect(p2.terminalId).toBe('term-b')
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('repairCodexIdentityMismatch is refused for the pending pane', async () => {
+    const store = createTwoPaneStore({ sessionRefB: { provider: 'codex', sessionId: 'sess-mismatch' } })
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    store.dispatch(repairCodexIdentityMismatch({
+      tabId: 'tab-1',
+      paneId: 'pane-2',
+      staleTerminalId: 'term-b',
+      expectedSessionRef: { provider: 'codex', sessionId: 'sess-mismatch' },
+      createRequestId: 'req-repaired',
+    }))
+    const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string }
+    expect(p2.createRequestId).toBe('req-b')
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it.each([
+    {
+      name: 'updatePaneContent minting a fresh identity (the picker-select shape)',
+      rekey: (store: ReturnType<typeof createStore>) => store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-2',
+        content: { kind: 'terminal', mode: 'shell' } as PaneContent, // no createRequestId → normalize mints
+      })),
+      expectUnrekeyed: (store: ReturnType<typeof createStore>) => {
+        const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string }
+        expect(p2.createRequestId).toBe('req-b')
+      },
+    },
+    {
+      name: 'replacePane (the wholesale re-key to a picker)',
+      rekey: (store: ReturnType<typeof createStore>) => store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'pane-2' })),
+      expectUnrekeyed: (store: ReturnType<typeof createStore>) => {
+        expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('terminal')
+      },
+    },
+  ])('a mid-wait $name on the pending pane is refused', async ({ rekey, expectUnrekeyed }) => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    rekey(store)
+    expectUnrekeyed(store)
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('a mid-wait split GAIN is still allowed on a single-pane close (additions carry no evidence hole — only re-keys are frozen)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: terminalContent('req-late'),
+      newPaneId: 'pane-late',
+    }))
+    expect(paneContents(store, 'tab-1').some((p) => (p.content as { createRequestId?: string }).createRequestId === 'req-late')).toBe(true)
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId).sort()).toEqual(['pane-1', 'pane-late'])
+  })
+
+  it('two overlapping single-pane closes freeze independently — acking one never unfreezes the other', async () => {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: terminalContent('req-a', 'term-a') }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1', paneId: 'pane-1', direction: 'vertical', newContent: terminalContent('req-b', 'term-b'), newPaneId: 'pane-2',
+    }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1', paneId: 'pane-1', direction: 'vertical', newContent: terminalContent('req-c', 'term-c'), newPaneId: 'pane-3',
+    }))
+    mockSend.mockClear()
+    const closeB = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const closeC = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-3' }))
+    // Ack pane-2's close only; pane-2 is removed. pane-3's window is STILL
+    // pending: term-c going dead mid-wait must not rekey it.
+    emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: true })
+    await closeB
+    expect(paneContents(store, 'tab-1').some((p) => p.paneId === 'pane-2')).toBe(false)
+    store.dispatch(clearDeadTerminals({ liveTerminalIds: ['term-a', 'term-b'] }))
+    const p3 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-3')?.content as { createRequestId?: string; terminalId?: string }
+    expect(p3.createRequestId).toBe('req-c')
+    expect(p3.terminalId).toBe('term-c')
+    emit({ type: 'pane.closed.result', createRequestId: 'req-c', success: true })
+    await closeC
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('a FAILED single-pane close lifts its pane freeze — the kept pane rekeys normally again', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: false })
+    await close
+    expect(paneContents(store, 'tab-1')).toHaveLength(2)
+    store.dispatch(clearDeadTerminals({ liveTerminalIds: ['term-a'] }))
+    const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string; terminalId?: string }
+    expect(p2.terminalId).toBeUndefined() // rekeyed — no longer pending
+    expect(p2.createRequestId).not.toBe('req-b')
+  })
+
+  it('replacePaneWithCleanup freezes the discarded pane during its own wait, and its post-ack replace still lands', async () => {
+    const store = createTwoPaneStore()
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    // A server-driven handle wipe mid-wait must not rekey the discarded pane.
+    store.dispatch(clearTerminalLiveHandles({ terminalIds: ['term-b'] }))
+    const mid = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string; terminalId?: string }
+    expect(mid.createRequestId).toBe('req-b')
+    expect(mid.terminalId).toBe('term-b')
+    // After the ack the gate's OWN replace lands (the freeze never eats the
+    // close op's own follow-through).
+    ackAllPaneCloses()
+    await replace
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
+  })
+
+  it('a hydratePanes fold mid-single-close never re-keys the pending pane (the remote shape cannot replace the frozen identity)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const local = store.getState().panes
+    store.dispatch(hydratePanes({
+      ...local,
+      layouts: {
+        'tab-1': {
+          type: 'split',
+          id: 'rs1',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            { type: 'leaf', id: 'pane-1', content: terminalContent('req-a', 'term-a') },
+            { type: 'leaf', id: 'pane-2', content: terminalContent('req-remote', 'term-remote') },
+          ],
+        },
+      },
+    }))
+    const p2 = paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content as { createRequestId?: string }
+    expect(p2.createRequestId).toBe('req-b')
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
   })
 })
 

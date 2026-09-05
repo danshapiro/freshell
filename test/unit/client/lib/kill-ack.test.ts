@@ -21,6 +21,7 @@ vi.mock('@/lib/ws-client', () => ({
 import {
   EXIT_FALLBACK_GRACE_MS,
   KILL_ACK_TIMEOUT_MS,
+  hasOpenReassertFailure,
   reassertAllOpenPanes,
   sendFreshAgentKillAndAwait,
   sendPaneClosedAndAwait,
@@ -397,6 +398,83 @@ describe('kill-ack', () => {
     })
   })
 
+  describe('pane.opened.result (focused-episode-7 round 5 Finding F3 — the re-assertion is answered; a failed consume is retried)', () => {
+    const leaf = (paneId: string, content: Record<string, unknown>) => ({
+      type: 'leaf' as const,
+      id: paneId,
+      content,
+    })
+    const layoutWith = (crid: string) => ({
+      'tab-1': leaf('p1', { kind: 'terminal', createRequestId: crid, terminalId: `term-${crid}`, mode: 'shell', status: 'running' }),
+    } as never)
+
+    it('a success result for the pane leaves no failure mark behind', () => {
+      sendPaneOpened({ createRequestId: 'cr-open', tabId: 'tab-1' })
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-open', success: true })
+      expect(hasOpenReassertFailure('cr-open')).toBe(false)
+    })
+
+    it('a FAILED consume is marked (never silent); the next-tick retry that succeeds clears the mark', () => {
+      sendPaneOpened({ createRequestId: 'cr-open', tabId: 'tab-1' })
+      emit({
+        type: 'pane.opened.result',
+        createRequestId: 'cr-open',
+        success: false,
+        error: 'the open re-assertion could not be written durably',
+      })
+      expect(hasOpenReassertFailure('cr-open')).toBe(true)
+
+      // The retry (the next ready sweep re-asserts the still-displayed pane):
+      // its own result resolves the failure — open state durable, never a
+      // silent inconsistency.
+      reassertAllOpenPanes(layoutWith('cr-open'))
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-open', success: true })
+      expect(hasOpenReassertFailure('cr-open')).toBe(false)
+    })
+
+    it('the correlation is exact — a result for ANOTHER pane never marks or unmarks this one', () => {
+      sendPaneOpened({ createRequestId: 'cr-mine', tabId: 'tab-1' })
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-other', success: false })
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-other', success: true })
+      expect(hasOpenReassertFailure('cr-mine')).toBe(false)
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-mine', success: false })
+      expect(hasOpenReassertFailure('cr-mine')).toBe(true)
+      expect(hasOpenReassertFailure('cr-other')).toBe(false)
+    })
+
+    it('a failure-marked pane that is no longer DISPLAYED is pruned at the sweep — never re-asserted open behind its close', () => {
+      sendPaneOpened({ createRequestId: 'cr-gone', tabId: 'tab-1' })
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-gone', success: false })
+      expect(hasOpenReassertFailure('cr-gone')).toBe(true)
+      // The pane left the layout (its close won): the sweep must never
+      // re-assert an undisplayed pane — that direction erases genuine close
+      // evidence. The mark prunes instead.
+      const send = vi.fn()
+      reassertAllOpenPanes({}, { send })
+      expect(send).not.toHaveBeenCalled()
+      expect(hasOpenReassertFailure('cr-gone')).toBe(false)
+    })
+
+    it('no answer inside the bounded window is NOT a failure (older-busy server): the listener unsubscribes, nothing marks, nothing leaks', async () => {
+      vi.useFakeTimers()
+      const baseline = handlers.size
+      sendPaneOpened({ createRequestId: 'cr-silent', tabId: 'tab-1' })
+      expect(handlers.size).toBe(baseline + 1)
+      await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      expect(handlers.size).toBe(baseline)
+      expect(hasOpenReassertFailure('cr-silent')).toBe(false)
+    })
+
+    it('a late answer after the window can never mark a failure (the settled listen is unsubscribed)', async () => {
+      vi.useFakeTimers()
+      sendPaneOpened({ createRequestId: 'cr-late', tabId: 'tab-1' })
+      await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      vi.useRealTimers()
+      emit({ type: 'pane.opened.result', createRequestId: 'cr-late', success: false })
+      expect(hasOpenReassertFailure('cr-late')).toBe(false)
+    })
+  })
+
   describe('reassertAllOpenPanes (F2/r4 — the per-ready sweep re-asserts EVERY displayed pane)', () => {
     const leaf = (paneId: string, content: Record<string, unknown>) => ({
       type: 'leaf' as const,
@@ -445,6 +523,107 @@ describe('kill-ack', () => {
       const send = vi.fn()
       reassertAllOpenPanes({}, { send })
       expect(send).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('focused-episode-7 round 5 (Finding F1) — the sweep never open-asserts a pane whose close is pending', () => {
+    const leaf = (paneId: string, content: Record<string, unknown>) => ({
+      type: 'leaf' as const,
+      id: paneId,
+      content,
+    })
+    const twoPaneLayouts = () => ({
+      'tab-1': {
+        type: 'split' as const,
+        id: 's1',
+        direction: 'horizontal' as const,
+        sizes: [50, 50] as [number, number],
+        children: [
+          leaf('p1', { kind: 'terminal', createRequestId: 'cr-open', terminalId: 'term-open', mode: 'shell', status: 'running' }),
+          leaf('p2', { kind: 'terminal', createRequestId: 'cr-closing', terminalId: 'term-closing', mode: 'shell', status: 'running' }),
+        ],
+      },
+    } as never)
+
+    it('the exact interleave: close queued while disconnected → reconnect flushes the close → the ready sweep MUST NOT open-assert that pane (only the ack resolves the skip)', async () => {
+      // The close is in flight (sent — or queued while the socket was down —
+      // and UNANSWERED). The pane is still displayed: the gate drops it only
+      // after the correlated result.
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-closing', terminalId: 'term-closing' })
+      // The ready-time sweep runs while the acknowledgement is outstanding —
+      // the finding's verbatim shape. The pending pane must be SKIPPED: an
+      // open-assert landing behind the flushed close would consume the
+      // committed close record before its ack arrives, and the post-ack
+      // removal would leave a ghost row with no close evidence.
+      const send = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send })
+      expect(send.mock.calls.map(([m]) => m)).toEqual([
+        { type: 'pane.opened', createRequestId: 'cr-open', tabId: 'tab-1' },
+      ])
+
+      // The success ack resolves the wait; the gate then owns the removal.
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-closing', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+
+      // Post-settle the identity is released: a sweep over a layout that
+      // (hypothetically) still displayed it re-asserts it again — the skip
+      // is strictly the pending window, never a latch.
+      const sendAfter = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send: sendAfter })
+      expect(sendAfter.mock.calls.map(([m]) => m)).toEqual([
+        { type: 'pane.opened', createRequestId: 'cr-open', tabId: 'tab-1' },
+        { type: 'pane.opened', createRequestId: 'cr-closing', tabId: 'tab-1' },
+      ])
+    })
+
+    it('the BATCH close marks every carried identity pending: the sweep skips the whole set until the ONE result resolves', async () => {
+      const identities = [
+        { paneId: 'p1', createRequestId: 'cr-open', terminalId: 'term-open' },
+        { paneId: 'p2', createRequestId: 'cr-closing', terminalId: 'term-closing' },
+      ]
+      const pending = sendPanesClosedAndAwait('tab-1', identities)
+      const send = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send })
+      expect(send, 'no open-assert lands for any batch-carried pane while its ack is outstanding')
+        .not.toHaveBeenCalled()
+
+      const sent = mockSend.mock.calls[0][0] as { requestId: string }
+      emit({ type: 'panes.closed.result', requestId: sent.requestId, success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+
+      const sendAfter = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send: sendAfter })
+      expect(sendAfter.mock.calls.map(([m]) => m)).toHaveLength(2)
+    })
+
+    it('a FAILED close resolves the pending window too — the close path owns the immediate re-assertion (batch-4), later sweeps resume naming it', async () => {
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-closing' })
+      const send = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send })
+      expect(send.mock.calls.map(([m]) => m)).toEqual([
+        { type: 'pane.opened', createRequestId: 'cr-open', tabId: 'tab-1' },
+      ])
+      emit({ type: 'pane.closed.result', createRequestId: 'cr-closing', success: false, error: 'boom' })
+      await expect(pending).resolves.toEqual({ ok: false, error: 'boom' })
+      const sendAfter = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send: sendAfter })
+      expect(sendAfter.mock.calls.map(([m]) => m)).toEqual([
+        { type: 'pane.opened', createRequestId: 'cr-open', tabId: 'tab-1' },
+        { type: 'pane.opened', createRequestId: 'cr-closing', tabId: 'tab-1' },
+      ])
+    })
+
+    it('a TIMED-OUT close resolves the pending window', async () => {
+      vi.useFakeTimers()
+      const pending = sendPaneClosedAndAwait({ createRequestId: 'cr-closing' })
+      const send = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send })
+      expect(send).toHaveBeenCalledTimes(1) // only the un-pending sibling
+      await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
+      await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+      const sendAfter = vi.fn()
+      reassertAllOpenPanes(twoPaneLayouts(), { send: sendAfter })
+      expect(sendAfter).toHaveBeenCalledTimes(2)
     })
   })
 })
