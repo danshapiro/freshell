@@ -20,6 +20,8 @@
 | `test/e2e-browser/specs/cli-rust.spec.ts` | Exercise compiled CLI creation and splitting through a real Rust server and browser without creating terminals. |
 | `crates/freshell-server/src/host_stats.rs` | Attach the new test-only child module; no collector behavior change is currently justified. |
 | `crates/freshell-server/src/host_stats_collection_tests.rs` | New deterministic rate and memory-precedence regression tests. |
+| `config/vitest/vitest.runtime.config.ts` and `config/vitest/vitest.electron-runtime.config.ts` | Extend main's ambient environment isolation to PR699's new runtime lanes. |
+| `test/unit/config/sanitize-test-env.test.ts` and `test/unit/config/fixtures/sanitize-env-child.ts` | Execute both new configs before a real child fetch; verify inherited environment and stderr. |
 | `docs/superpowers/plans/2026-09-04-pr699-integration-repair.md` | Track execution and append commit-specific verification receipts. |
 | `AGENTS.md` | Link this agent-facing plan; already done when the plan is committed. |
 
@@ -49,12 +51,17 @@ Completed review repairs:
 | `0329bccc0` | Windows MCP through WSL, executable/argument conversion, and native Node launching. |
 | `b6b7152dd` | Migration performance measured independently of unrelated CPU scheduling. |
 | `18ed1e414` | Main integration, combined protocol v8 (33 inbound/55 outbound messages), retained rollback/provider tests, Rust-only browser fixtures, and MCP Host Stats support. |
+| `bd1b6c32c` | Second main integration through PR703, retaining test-flakiness fixes and resolving six additional conflicts without restoring retired Node configs. |
 
 Confirmed remaining defect: shared capabilities accept `--hostStats`, but standalone CLI `new-tab` and `split-pane` omit it from their explicit POST bodies. The request can therefore create a terminal instead of the requested Host Stats pane.
+
+While writing this plan, main advanced to PR703's test-flakiness fixes at `5b3851322e0ddc60d6c6c10d9b05a27c490ada2e`. Integration commit `bd1b6c32c` preserves those Rust test changes, their classifier, and environment cleanup without restoring the four retired Node test configs. Task 5 covers a newly identified gap: the two runtime configs added by PR699 also need the environment-cleanup prelude. No Task 1–7 implementation has been executed as part of writing this plan.
 
 Coverage gaps, not demonstrated production bugs: the Rust collector lacks the removed Node suite's exact nonzero rate assertions and memory-source precedence cases. An existing Rust REST Host Stats new-tab test already exists; strengthen it rather than claiming the endpoint is untested.
 
 Integration evidence already obtained at `18ed1e414`: client/tools typechecks, Cargo workspace check, Rust formatting, protocol 45 tests, port-contract 45 tests, runtime-boundary/distribution 58 tests, MCP/Composer/View 324 tests, and retained sidecar/provider/protocol tests. Browser selection found all 13 incoming rollback/Host Stats cases, and four selection-helper tests passed. **Selection is not browser execution.** Earlier full-suite/package/browser results predate the merge and are not a final merged-branch receipt.
+
+The second integration at `bd1b6c32c` passed 82 focused tests (sanitizer 5, classifier 19, runtime boundary 36, distribution 22), all four browser-selection helper tests, both TypeScript checks, and `cargo check --workspace --all-targets --locked`. Independent static review found no additional Rust/classifier integration defect. Logs: `/tmp/freshell-pr699-pr703-typecheck.log`, `/tmp/freshell-pr699-pr703-cargo-check.log`, and `/tmp/freshell-pr699-pr703-selection.log`. Full post-repair verification remains outstanding.
 
 Non-goals: new macOS metric collectors, restoring the retired backend, deleting historical fixture corpora, provider features unrelated to this review, creating another PR, merging PR699, deploying client assets, or restarting production. Existing Rust behavior reports unavailable sections when platform sources are absent; do not reintroduce Node's macOS fallback as an incidental test migration.
 
@@ -67,7 +74,7 @@ Non-goals: new macOS metric collectors, restoring the retired backend, deleting 
 - [ ] Use explicit GitHub identity on every call, for example `GH_TOKEN="$(gh auth token --user danshapiro)" gh pr view 699 --repo danshapiro/freshell`. Preserve the existing noreply git identity.
 - [ ] Use red/green/refactor for Task 1's confirmed defect. Tasks 2–4 add tests of currently implemented behavior and may immediately pass; do not deliberately damage production code to manufacture a red phase. If a new assertion fails, preserve the failure and trace the calculation before changing implementation.
 - [ ] Do not write prose/config-content assertions, skip tests, or weaken assertions to obtain green results.
-- [ ] Task 1 and Tasks 3–4 can be assigned to independent workers with exclusive file ownership. Task 2 follows Task 1. Task 4 follows Task 3. Run broad verification only after all edits are committed.
+- [ ] Task 1, Tasks 3–4, and Task 5 can be assigned to independent workers with exclusive file ownership. Task 2 follows Task 1. Task 4 follows Task 3. Run broad verification only after all edits are committed.
 
 ## Task 1: Forward Host Stats flags in the standalone CLI
 
@@ -560,7 +567,107 @@ git add crates/freshell-server/src/host_stats_collection_tests.rs
 git commit -m "test: preserve Rust Host Stats memory precedence"
 ~~~
 
-## Task 5: Verify the repaired merge, including real browser execution
+## Task 5: Apply main's environment isolation to the two new runtime lanes
+
+**Files:** modify `config/vitest/vitest.runtime.config.ts`, `config/vitest/vitest.electron-runtime.config.ts`, `test/unit/config/sanitize-test-env.test.ts`, `test/unit/config/fixtures/sanitize-env-child.ts`, and the environment-isolation note in `AGENTS.md`.
+
+PR703 introduced `sanitize-test-env.ts` while this plan was being written. Its original configs receive the prelude, but PR699's new source-runtime and packaged-runtime configs do not. Importing those configs therefore still passes ambient proxy/bind settings into their child processes. This is a distinct integration gap; keep the main implementation and extend its real-child regression harness.
+
+- [ ] In `sanitize-env-child.ts`, change its first comment to:
+
+~~~ts
+// Fixture for sanitize-test-env.test.ts. argv[2] = plain, clean, or config.
+~~~
+
+Add this import beside the existing child-process import:
+
+~~~ts
+import { pathToFileURL } from 'node:url'
+~~~
+
+Replace only the existing mode-selection block with:
+
+~~~ts
+const mode = process.argv[2]
+if (mode === 'clean') {
+  const { stripAmbientEnvPoisons } = await import('../../../../config/vitest/sanitize-test-env.js')
+  stripAmbientEnvPoisons(process.env)
+} else if (mode === 'config') {
+  const configPath = process.argv[3]
+  if (!configPath) throw new Error('config mode requires an absolute config path')
+  await import(pathToFileURL(configPath).href)
+}
+~~~
+
+Keep the existing inner-child fetch, pinned Node environment flags, and JSON report unchanged.
+
+- [ ] Add these behavioral cases to `sanitize-test-env.test.ts`. Reuse its existing imports, `POISONED_ENV`, `fixture`, `tsxCli`, and `execFileAsync`.
+
+~~~ts
+it.each([
+  'vitest.runtime.config.ts',
+  'vitest.electron-runtime.config.ts',
+])('%s sanitizes the environment inherited by child processes', async (configName) => {
+  const env = { ...process.env, ...POISONED_ENV }
+  delete env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
+  const configPath = path.resolve(process.cwd(), 'config/vitest', configName)
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [tsxCli, fixture, 'config', configPath],
+    { env, maxBuffer: 1024 * 1024 },
+  )
+  const result = JSON.parse(stdout) as {
+    innerStderr: string
+    envReport: Record<string, string | undefined>
+  }
+  expect(result.innerStderr).toBe('')
+  for (const key of AMBIENT_ENV_POISONS) {
+    expect(result.envReport[key]).toBeUndefined()
+  }
+})
+~~~
+
+- [ ] Run the new config-load regressions.
+
+~~~bash
+npm run test:vitest -- run test/unit/config/sanitize-test-env.test.ts
+~~~
+
+Expected: five existing tests pass; the two new cases fail because the loaded configs do not remove the poisoned environment. The test executes config loading and child inheritance; it does not search config text.
+
+- [ ] Add this first import to both `vitest.runtime.config.ts` and `vitest.electron-runtime.config.ts`:
+
+~~~ts
+import './sanitize-test-env.js'
+~~~
+
+Do not duplicate sanitizer logic or alter its real-provider escape hatch.
+
+- [ ] Replace the temporary environment-isolation note in `AGENTS.md` with this completed description:
+
+~~~text
+- Ambient proxy vars (HTTP(S)_PROXY, either case) and FRESHELL_BIND_HOST are stripped by config/vitest/sanitize-test-env.ts at Vitest config load, including source-runtime and packaged-runtime lanes. The exact FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 escape hatch preserves proxy egress but still removes FRESHELL_BIND_HOST.
+~~~
+
+- [ ] Run the regression and tools typecheck.
+
+~~~bash
+npm run test:vitest -- run test/unit/config/sanitize-test-env.test.ts
+npm run typecheck:tools
+~~~
+
+Expected: all seven tests pass and no type errors. Full source/packaged-runtime execution follows in Tasks 6–7.
+
+- [ ] Refactor review: keep one shared sanitizer and the existing behavioral fixture. No new environment global, duplicate sanitizer, or source-text test is needed.
+
+- [ ] Commit the integration repair.
+
+~~~bash
+git add config/vitest/vitest.runtime.config.ts config/vitest/vitest.electron-runtime.config.ts test/unit/config/sanitize-test-env.test.ts test/unit/config/fixtures/sanitize-env-child.ts AGENTS.md
+git commit -m "fix: isolate new runtime test lanes from ambient environment"
+~~~
+
+## Task 6: Verify the repaired merge, including real browser execution
 
 **Files:** no planned production edits. Update this plan's receipt after verification. Temporary scripts/bundles below are ignored test artifacts, not new product tooling.
 
@@ -655,7 +762,7 @@ The cloud path does not replace native Cargo/source-runtime/Electron evidence. U
 
 - [ ] Append an execution receipt here containing: tested SHA, backend, commands, pass/fail/skip counts, log locations or CI links, documented existing exclusions, and any still-blocked native platform. Commit the receipt only after it accurately reflects observed results.
 
-## Task 6: Verify native packages and hand off a clean branch
+## Task 7: Verify native packages and hand off a clean branch
 
 **Read-only workflow:** `.github/workflows/electron-build.yml`; four native environments: Intel macOS, ARM macOS, Linux, and Windows. Do not trigger the release/publishing workflow.
 
@@ -686,11 +793,11 @@ Expected: PR is mergeable against current main; required checks succeed. A new m
 
 A green installer build alone is insufficient. Acceptance must launch the packaged runtime without depending on checkout source, and Windows must use a native Windows build, not Linux binaries copied into a Windows archive.
 
-- [ ] Confirm the remaining PR jobs cover client typecheck/default Vitest, Rust formatting/clippy/workspace/source runtime, browser selection, and protocol drift. Browser selection alone is not a substitute for Task 5's actual scenarios.
+- [ ] Confirm the remaining PR jobs cover client typecheck/default Vitest, Rust formatting/clippy/workspace/source runtime, browser selection, and protocol drift. Browser selection alone is not a substitute for Task 6's actual scenarios.
 
 - [ ] Append exact native run URLs/results to the receipt. If a platform fails, investigate its real log and leave the plan incomplete until the failure is resolved or a concrete external blocker is reported. Do not label local Linux success as macOS/Windows verification.
 
-- [ ] Perform a final scoped review of new commits against `18ed1e414`. Verify no Node listener was restored, rollback handling remains present, Host Stats works through both CLI and MCP, and no unrelated work was changed. Request an independent code review of the implementation before claiming completion.
+- [ ] Perform a final scoped review of new commits against `bd1b6c32c`. Verify no Node listener was restored, rollback handling remains present, Host Stats works through both CLI and MCP, and no unrelated work was changed. Request an independent code review of the implementation before claiming completion.
 
 - [ ] Commit the final receipt, push it, and confirm the worktree is clean. Report the implemented findings, test evidence, remaining caveats, and PR link. Stop before merging PR699 or deploying anything; this plan does not grant that authority.
 
@@ -700,6 +807,7 @@ A green installer build alone is insufficient. Acceptance must launch the packag
 - [ ] Compiled CLI + Rust + browser show two Host Stats panes with no terminal allocation.
 - [ ] Rust tests protect exact nonzero CPU, paging, disk, and network calculations.
 - [ ] Rust tests protect finite/unlimited/absent memory precedence and unavailable full-shape output.
+- [ ] Both new runtime test configurations apply the shared environment sanitizer, proved through actual config loading and child execution.
 - [ ] Fresh-agent rollback, protocol v8, and Rust-only runtime boundaries remain passing after the repairs.
 - [ ] Full merged-branch regression and actual affected browser scenarios have current receipts.
 - [ ] All four native packaged-runtime jobs have current passing receipts.
@@ -707,4 +815,4 @@ A green installer build alone is insufficient. Acceptance must launch the packag
 
 ## Execution receipt
 
-Not executed yet. The integration evidence in “Starting state and scope” is the only post-merge evidence available when this plan was written; it is not a substitute for Tasks 1–6.
+Not executed yet. The integration evidence in “Starting state and scope” is the only post-merge evidence available when this plan was written; it is not a substitute for Tasks 1–7.
