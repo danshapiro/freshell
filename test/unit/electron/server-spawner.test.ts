@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
+import { PassThrough, Writable } from 'node:stream'
 
 const mockSpawn = vi.fn()
 vi.mock('child_process', () => ({
@@ -12,7 +13,7 @@ vi.mock('http', () => ({
   get: (...args: any[]) => mockHttpGet(...args),
 }))
 
-const mockCreateWriteStream = vi.fn().mockReturnValue({ write: vi.fn(), end: vi.fn() })
+const mockCreateWriteStream = vi.fn()
 vi.mock('fs', () => ({
   default: {
     createWriteStream: (...args: any[]) => mockCreateWriteStream(...args),
@@ -30,13 +31,13 @@ import {
 function createMockProcess(pid = 1234) {
   const proc = new EventEmitter() as EventEmitter & {
     pid: number
-    stdout: EventEmitter
-    stderr: EventEmitter
+    stdout: PassThrough
+    stderr: PassThrough
     kill: ReturnType<typeof vi.fn>
   }
   proc.pid = pid
-  proc.stdout = new EventEmitter()
-  proc.stderr = new EventEmitter()
+  proc.stdout = new PassThrough()
+  proc.stderr = new PassThrough()
   proc.kill = vi.fn().mockReturnValue(true)
   return proc
 }
@@ -82,6 +83,7 @@ describe('ServerSpawner', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockCreateWriteStream.mockReturnValue(new PassThrough())
     vi.useFakeTimers({ shouldAdvanceTime: true })
     spawner = createServerSpawner()
   })
@@ -102,7 +104,7 @@ describe('ServerSpawner', () => {
     expect(command).toBe('/app/resources/bin/freshell-server')
     expect(args).toEqual([])
     expect(options.cwd).toBe('/home/user/.freshell with spaces')
-    expect(options.env).toMatchObject({
+    const expectedEnvironment = {
       PORT: '4311',
       FRESHELL_HOME: '/home/user',
       FRESHELL_CLIENT_DIR: '/app/resources/client with spaces',
@@ -110,7 +112,8 @@ describe('ServerSpawner', () => {
       FRESHELL_CLAUDE_SIDECAR: '/app/resources/claude-sidecar/index.mjs',
       FRESHELL_MCP_NODE: '/app/resources/node/bin/node',
       FRESHELL_MCP_ENTRY: '/app/resources/mcp/server.js',
-    })
+    }
+    expect(Object.fromEntries(Object.keys(expectedEnvironment).map((key) => [key, options.env[key]]))).toEqual(expectedEnvironment)
     expect(options.env.NODE_PATH).toBeUndefined()
     expect(spawner.pid()).toBe(1234)
     expect(spawner.isRunning()).toBe(true)
@@ -123,6 +126,10 @@ describe('ServerSpawner', () => {
     const proc = createMockProcess()
     mockSpawn.mockReturnValue(proc)
     setupRustReadiness({ runtime: 'node', commit: 'legacy' })
+    proc.kill.mockImplementation(() => {
+      queueMicrotask(() => proc.emit('close', 0))
+      return true
+    })
 
     await expect(spawner.start({
       resources: resources(),
@@ -130,9 +137,136 @@ describe('ServerSpawner', () => {
       authToken: 'secret-token',
       healthCheckTimeoutMs: 250,
     })).rejects.toThrow(/runtime.*rust/i)
+
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(spawner.isRunning()).toBe(false)
+    expect(spawner.pid()).toBeUndefined()
   })
 
-  it('clears ownership when the captured child closes or errors', async () => {
+  it('stops a spawned server when readiness times out', async () => {
+    const proc = createMockProcess()
+    mockSpawn.mockReturnValue(proc)
+    mockHttpGet.mockImplementation(() => {
+      const request = Object.assign(new EventEmitter(), { setTimeout: vi.fn(), destroy: vi.fn() })
+      queueMicrotask(() => request.emit('error', new Error('ECONNREFUSED')))
+      return request
+    })
+    proc.kill.mockImplementation(() => {
+      queueMicrotask(() => proc.emit('close', 0))
+      return true
+    })
+
+    const starting = spawner.start({ resources: resources(), port: 4312, authToken: 'secret-token', healthCheckTimeoutMs: 10 })
+    const rejection = expect(starting).rejects.toThrow(/health check timed out/i)
+    await vi.advanceTimersByTimeAsync(101)
+    await rejection
+
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(spawner.pid()).toBeUndefined()
+  })
+
+  it('keeps stderr logging after stdout ends and closes the log with the child', async () => {
+    const proc = createMockProcess()
+    const log = new PassThrough()
+    const chunks: string[] = []
+    log.on('data', (chunk) => chunks.push(chunk.toString()))
+    mockSpawn.mockReturnValue(proc)
+    mockCreateWriteStream.mockReturnValue(log)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4312, authToken: 'secret-token' })
+
+    proc.stdout.end('stdout completed\n')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(log.writableEnded).toBe(false)
+    proc.stderr.end('final shutdown error\n')
+    await vi.advanceTimersByTimeAsync(1)
+    proc.emit('close', 0)
+
+    expect(chunks.join('')).toBe('stdout completed\nfinal shutdown error\n')
+    expect(log.writableEnded).toBe(true)
+  })
+
+  it('reports an asynchronous log-file error without crashing or stopping the server', async () => {
+    const proc = createMockProcess()
+    const log = new PassThrough()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockSpawn.mockReturnValue(proc)
+    mockCreateWriteStream.mockReturnValue(log)
+    setupRustReadiness()
+    try {
+      await spawner.start({ resources: resources(), port: 4312, authToken: 'secret-token' })
+
+      expect(() => log.emit('error', new Error('EACCES opening server.log'))).not.toThrow()
+      expect(spawner.isRunning()).toBe(true)
+      expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('server_log_failed'))
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
+  it.each([
+    { completion: 'finish', exitedBeforeStop: false },
+    { completion: 'error', exitedBeforeStop: false },
+    { completion: 'finish', exitedBeforeStop: true },
+  ])('waits for delayed log $completion before stop resolves (already exited: $exitedBeforeStop)', async ({ completion, exitedBeforeStop }) => {
+    const proc = createMockProcess()
+    let completeLog!: (error?: Error) => void
+    const log = new Writable({
+      write(_chunk, _encoding, callback) { callback() },
+      final(callback) { completeLog = callback },
+    })
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockSpawn.mockReturnValue(proc)
+    mockCreateWriteStream.mockReturnValue(log)
+    setupRustReadiness()
+    try {
+      await spawner.start({ resources: resources(), port: 4312, authToken: 'secret-token' })
+      proc.kill.mockImplementation(() => {
+        queueMicrotask(() => proc.emit('close', 0))
+        return true
+      })
+      if (exitedBeforeStop) proc.emit('close', 0)
+      let stopped = false
+      const stopping = spawner.stop().then(() => { stopped = true })
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(completeLog).toBeTypeOf('function')
+      expect(stopped).toBe(false)
+      completeLog(completion === 'error' ? new Error('disk write failed') : undefined)
+      await stopping
+      expect(stopped).toBe(true)
+      if (completion === 'finish') expect(log.writableFinished).toBe(true)
+      else expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('server_log_failed'))
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
+  it('bounds the wait for a log stream that never finishes', async () => {
+    const proc = createMockProcess()
+    const log = new Writable({
+      write(_chunk, _encoding, callback) { callback() },
+      final() {},
+    })
+    mockSpawn.mockReturnValue(proc)
+    mockCreateWriteStream.mockReturnValue(log)
+    setupRustReadiness()
+    await spawner.start({ resources: resources(), port: 4312, authToken: 'secret-token' })
+    proc.kill.mockImplementation(() => {
+      queueMicrotask(() => proc.emit('close', 0))
+      return true
+    })
+
+    const stopping = spawner.stop({ logFlushTimeoutMs: 10 })
+    const result = stopping.then(() => null, (error: Error) => error)
+    await vi.advanceTimersByTimeAsync(11)
+
+    expect(await result).toMatchObject({ message: expect.stringMatching(/log.*finish/i) })
+    expect(spawner.pid()).toBeUndefined()
+    log.destroy()
+  })
+
+  it('clears ownership when the captured child closes', async () => {
     const proc = createMockProcess()
     mockSpawn.mockReturnValue(proc)
     setupRustReadiness()
@@ -141,14 +275,48 @@ describe('ServerSpawner', () => {
     proc.emit('close', 0)
     expect(spawner.isRunning()).toBe(false)
     expect(spawner.pid()).toBeUndefined()
+  })
 
-    const proc2 = createMockProcess(5678)
-    mockSpawn.mockReturnValue(proc2)
+  it('clears ownership after a spawn failure that never created a process', async () => {
+    const proc = createMockProcess()
+    delete (proc as { pid?: number }).pid
+    mockSpawn.mockImplementation(() => {
+      queueMicrotask(() => {
+        proc.emit('error', new Error('spawn failed'))
+        proc.emit('close', -1)
+      })
+      return proc
+    })
     setupRustReadiness()
-    await spawner.start({ resources: resources(), port: 4314, authToken: 'secret-token' })
-    proc2.emit('error', new Error('spawn failed'))
+
+    await expect(spawner.start({ resources: resources(), port: 4314, authToken: 'secret-token' })).rejects.toThrow(/exited/)
     expect(spawner.isRunning()).toBe(false)
     expect(spawner.pid()).toBeUndefined()
+    expect(proc.kill).not.toHaveBeenCalled()
+  })
+
+  it('keeps ownership when signaling a live child emits an error', async () => {
+    const proc = createMockProcess(5678)
+    mockSpawn.mockReturnValue(proc)
+    setupRustReadiness()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await spawner.start({ resources: resources(), port: 4314, authToken: 'secret-token' })
+      proc.kill.mockImplementation(() => {
+        queueMicrotask(() => proc.emit('error', new Error('kill EPERM')))
+        return false
+      })
+      const stopping = spawner.stop({ gracefulTimeoutMs: 10, forceTimeoutMs: 20 })
+      const rejection = expect(stopping).rejects.toThrow(/did not exit/i)
+      await vi.advanceTimersByTimeAsync(31)
+      await rejection
+
+      expect(spawner.isRunning()).toBe(true)
+      expect(spawner.pid()).toBe(5678)
+      expect(proc.kill).toHaveBeenNthCalledWith(2, 'SIGKILL')
+    } finally {
+      errorLog.mockRestore()
+    }
   })
 
   it('stops only the exact captured child and resolves after graceful close', async () => {

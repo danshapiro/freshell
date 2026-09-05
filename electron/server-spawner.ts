@@ -29,6 +29,8 @@ export interface ServerStopOptions {
   gracefulTimeoutMs?: number
   /** Time to wait for the Rust process to exit after SIGKILL. */
   forceTimeoutMs?: number
+  /** Time to allow the final server log writes to finish after process exit. */
+  logFlushTimeoutMs?: number
 }
 
 export interface ServerSpawner {
@@ -47,6 +49,7 @@ export interface ServerSpawner {
 
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 5_000
 const DEFAULT_FORCE_TIMEOUT_MS = 5_000
+const DEFAULT_LOG_FLUSH_TIMEOUT_MS = 2_000
 const REQUEST_TIMEOUT_MS = 2_000
 
 interface HttpResponseBody {
@@ -162,14 +165,72 @@ function childHasExited(child: ChildProcess): boolean {
   return child.exitCode != null || child.signalCode != null
 }
 
+function logServerFailure(event: string, error: unknown, pid?: number): void {
+  console.error(JSON.stringify({
+    severity: 'error',
+    component: 'electron-server-spawner',
+    event,
+    pid,
+    error: error instanceof Error ? error.message : String(error),
+  }))
+}
+
+function pipeServerLog(child: ChildProcess, logDir: string): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const logStream = fs.createWriteStream(path.join(logDir, 'server.log'), { flags: 'a' })
+      logStream.once('finish', resolve)
+      logStream.once('close', resolve)
+      logStream.on('error', (error) => {
+        // File-open and disk errors arrive asynchronously. Drain the child pipes
+        // after a log failure so a full pipe cannot block the Rust server.
+        child.stdout?.unpipe(logStream)
+        child.stderr?.unpipe(logStream)
+        child.stdout?.resume()
+        child.stderr?.resume()
+        logServerFailure('server_log_failed', error, child.pid)
+        resolve()
+      })
+      child.stdout?.pipe(logStream, { end: false })
+      child.stderr?.pipe(logStream, { end: false })
+      // close runs after both stdio pipes have closed; either pipe ending first
+      // must not close the shared destination while the other still has output.
+      child.once('close', () => logStream.end())
+    } catch (error) {
+      child.stdout?.resume()
+      child.stderr?.resume()
+      logServerFailure('server_log_failed', error, child.pid)
+      resolve()
+    }
+  })
+}
+
 export function createServerSpawner(): ServerSpawner {
   let childProcess: ChildProcess | null = null
   let running = false
   let processExited = false
+  let logCompletion: Promise<void> | undefined
+
+  async function flushServerLog(timeoutMs = DEFAULT_LOG_FLUSH_TIMEOUT_MS): Promise<void> {
+    const completion = logCompletion
+    if (!completion) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        completion,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Server log did not finish before the shutdown deadline')), timeoutMs)
+        }),
+      ])
+      if (logCompletion === completion) logCompletion = undefined
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
 
   return {
     async start(options: ServerSpawnerOptions): Promise<void> {
-      if (childProcess) {
+      if (childProcess || logCompletion) {
         await this.stop()
       }
 
@@ -207,30 +268,44 @@ export function createServerSpawner(): ServerSpawner {
       processExited = false
 
       const markExited = () => {
-        processExited = true
-        running = false
-        if (childProcess === spawned) childProcess = null
+        if (childProcess === spawned) {
+          processExited = true
+          running = false
+          childProcess = null
+        }
       }
       spawned.once('close', markExited)
-      spawned.once('error', markExited)
+      spawned.on('error', (error) => {
+        // A failed spawn has no PID. Errors from kill() or IPC on an existing
+        // child do not establish that it exited, so keep tracking that child.
+        if (spawned.pid === undefined) markExited()
+        logServerFailure('server_process_failed', error, spawned.pid)
+      })
+
+      logCompletion = pipeServerLog(spawned, resources.logDir)
 
       try {
-        const logStream = fs.createWriteStream(path.join(resources.logDir, 'server.log'), { flags: 'a' })
-        spawned.stdout?.pipe(logStream)
-        spawned.stderr?.pipe(logStream)
-      } catch {
-        // Logging must not prevent the app-bound server from starting.
+        await pollHealthCheck(port, timeoutMs, () => processExited)
+        const authToken = options.authToken ?? readAuthToken(resources.configDir)
+        await verifyRustServerInfo(port, authToken, () => processExited)
+      } catch (error) {
+        // A rejected start never reaches the main window's quit cleanup.
+        // Release this exact child before reporting the readiness failure.
+        try {
+          await this.stop()
+        } catch (stopError) {
+          logServerFailure('server_start_cleanup_failed', stopError, spawned.pid)
+          throw new AggregateError([error, stopError], 'Server startup and cleanup failed')
+        }
+        throw error
       }
-
-      await pollHealthCheck(port, timeoutMs, () => processExited)
-      const authToken = options.authToken ?? readAuthToken(resources.configDir)
-      await verifyRustServerInfo(port, authToken, () => processExited)
     },
 
     async stop(options: ServerStopOptions = {}): Promise<void> {
       const proc = childProcess
       if (!proc) {
         running = false
+        await flushServerLog(options.logFlushTimeoutMs)
         return
       }
 
@@ -248,7 +323,6 @@ export function createServerSpawner(): ServerSpawner {
           if (gracefulTimer) clearTimeout(gracefulTimer)
           if (forceTimer) clearTimeout(forceTimer)
           proc.removeListener('close', onExit)
-          proc.removeListener('error', onExit)
           if (error) reject(error)
           else resolve()
         }
@@ -263,7 +337,6 @@ export function createServerSpawner(): ServerSpawner {
         }
 
         proc.once('close', onExit)
-        proc.once('error', onExit)
         if (childHasExited(proc)) {
           onExit()
           return
@@ -296,6 +369,7 @@ export function createServerSpawner(): ServerSpawner {
           }, forceTimeoutMs)
         }, gracefulTimeoutMs)
       })
+      await flushServerLog(options.logFlushTimeoutMs)
     },
 
     isRunning(): boolean {
