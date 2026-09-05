@@ -96,7 +96,11 @@
 //!
 //! Corruption policy: fail loud PER-ROW, never per-store — an unparsable row
 //! is quarantined (renamed aside + logged), never silently dropped, and never
-//! causes healthy rows to be skipped.
+//! causes healthy rows to be skipped. H2: `load_index` logs a structured
+//! ERROR (`pane_ledger_load_index_dir_unreadable` /
+//! `pane_ledger_load_index_row_unreadable`) for any I/O failure; only
+//! parse/wrong-version rows stay silent for the boot scan to quarantine
+//! loudly.
 //!
 //! Write-failure policy: a ledger write failure never blocks the
 //! create/identity event, but it is never silent — see
@@ -108,7 +112,12 @@
 //! at 21ms@1k / 426ms@20k rows; TTL math yields 1.2k-12k rows). Files stay
 //! the durable source of truth; this process is the only writer
 //! (single-writer flock, [`PaneLedger::new_locked`]), so write-through
-//! invalidation is trivial. Reads never touch the fs and may run inline on
+//! invalidation is trivial. H1: the flock's *acquisition* tolerates the
+//! inheritance-mediated transient holder class — the fork→exec open-file-
+//! description handoff can leave `<root>/lock` momentarily held through a
+//! forked child's pre-exec window — via a bounded EWOULDBLOCK-only retry
+//! (see [`LOCK_RETRY_MAX_ATTEMPTS`]); a genuine second writer still
+//! degrades loudly. Reads never touch the fs and may run inline on
 //! async paths; WRITES fsync (~15ms p50 on this host) and must be wrapped in
 //! `spawn_blocking` at async call sites (the `terminal.rs:1369-1379`
 //! PTY-spawn precedent) — the sync API here stays call-site-agnostic.
@@ -126,6 +135,21 @@ pub use pane_ledger_scan::{BootScanReport, QuarantinedRow, PENDING_MARKER_ORPHAN
 /// Gates schema migration (spec §4.2): rows with a different version are
 /// quarantined loudly at boot, never silently reinterpreted.
 pub const LEDGER_VERSION: u32 = 1;
+
+/// H1: a *transient* holder window — the fork→exec open-file-description
+/// inheritance handoff (a forked child transiently carries a reference to
+/// the lock's OFD; std opens O_CLOEXEC, so the window ends AT exec, proven
+/// by validator PoC arm b2 / N6) — can leave `<root>/lock` momentarily held
+/// when `new_locked` runs; single-shot `LOCK_NB` then converted a µs-scale
+/// window (no-fork release measured ~13µs, PoC arm a) into a process-
+/// lifetime DISABLED ledger (deflake kata s52d). Acquisition retries ONLY
+/// on EWOULDBLOCK with a fixed budget: generous vs the measured window
+/// class, small at the one-shot boot call site, and loud-unchanged for a
+/// genuine persistent second writer (same ERROR, ~275ms later).
+#[cfg(unix)]
+const LOCK_RETRY_MAX_ATTEMPTS: u32 = 12;
+#[cfg(unix)]
+const LOCK_RETRY_DELAY_MS: u64 = 25;
 
 /// Bound rows not observed within this TTL are expired TO TOMBSTONES
 /// (`retired/gc_expired`), never deleted (spec §4.2 lifecycle).
@@ -1328,10 +1352,15 @@ impl PaneLedger {
 
     /// Production construction (V2.md single-writer guard): acquire an
     /// exclusive advisory `flock(2)` on `<root>/lock` (the `ConfigLock`
-    /// pattern, `settings_store.rs:385-417`). If another process holds it,
-    /// log a loud structured ERROR and come up DISABLED (no-op) — never two
-    /// writers on one store. Non-unix: no flock primitive is wired;
-    /// construct normally (ConfigLock's non-unix parity).
+    /// pattern, `settings_store.rs:385-417`). Acquisition retries
+    /// EWOULDBLOCK-only on a fixed budget (see `LOCK_RETRY_MAX_ATTEMPTS`)
+    /// so a transient holder window — the fork→exec open-file-description
+    /// inheritance handoff — cannot downgrade this process to a
+    /// lifetime-DISABLED ledger; a persistent second writer still degrades
+    /// loudly. If another process holds it past the budget, log a loud
+    /// structured ERROR and come up DISABLED (no-op) — never two writers
+    /// on one store. Non-unix: no flock primitive is wired; construct
+    /// normally (ConfigLock's non-unix parity).
     pub fn new_locked(root: Option<PathBuf>) -> Self {
         let Some(r) = root.clone() else {
             return Self::new(None);
@@ -1357,10 +1386,35 @@ impl PaneLedger {
 
     #[cfg(unix)]
     fn acquire_store_lock(root: &Path) -> std::io::Result<Option<std::fs::File>> {
+        let mut attempt = 0u32;
+        loop {
+            match Self::flock_once(root) {
+                Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                    attempt += 1;
+                    if attempt >= LOCK_RETRY_MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+                    // Sync sleep is deliberate: this is the one-shot boot-time
+                    // constructor path, never a hot path, and the wait only
+                    // happens while a (transient) holder is actually observed.
+                    std::thread::sleep(std::time::Duration::from_millis(LOCK_RETRY_DELAY_MS));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn flock_once(root: &Path) -> std::io::Result<Option<std::fs::File>> {
         use std::os::unix::io::AsRawFd;
         std::fs::create_dir_all(root)?;
         // Content irrelevant (only existence + flock state matter);
         // truncate(false) avoids clippy's suspicious_open_options.
+        //
+        // O_CLOEXEC: `std::fs::File` opens close-on-exec by DEFAULT — KEEP it
+        // that way: flock state rides the open file description, so a lock fd
+        // carried across exec by a detached child would keep holding the flock
+        // after this process dies (sidecar_store.rs V6.md NA-3 precedent).
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1518,37 +1572,83 @@ impl PaneLedger {
     }
 
     /// The ONE directory scan — construction-time only (V1.md).
+    ///
+    /// H2 loudness contract: I/O failures are never silent here. An unreadable
+    /// directory or row would otherwise present as a silently-EMPTY index —
+    /// the exact compounding mode behind "came up blind despite the lock being
+    /// acquirable and rows on disk". Parse/wrong-version skips stay silent BY
+    /// POLICY: the boot scan (`quarantine_unparsable`) is their loud path.
+    /// A row that vanishes between listing and read (Missing) is benign TOCTOU
+    /// residue and stays silent.
     fn load_index(root: &Path) -> LedgerIndex {
+        fn unreadable_dir(path: &std::path::Path, err: &std::io::Error) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %path.display(),
+                error = %err,
+                "pane_ledger_load_index_dir_unreadable: rows under this directory are ABSENT from the in-memory index"
+            );
+        }
+        fn unreadable_row(path: &std::path::Path, err: &RowLoadError) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %path.display(),
+                error = %err,
+                "pane_ledger_load_index_row_unreadable: this row is ABSENT from the in-memory index (boot-scan quarantine cannot repair an unreadable file)"
+            );
+        }
         let mut index = LedgerIndex::default();
-        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
-            for provider in providers.flatten() {
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let path = file.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue; // *.tmp-* and *.quarantined-* residue
-                    }
-                    if let Ok(row) = load_row::<BindingRow>(&path) {
-                        if row.ledger_version == LEDGER_VERSION {
-                            index
-                                .bindings
-                                .insert((row.provider.clone(), row.session_id.clone()), row);
+        match std::fs::read_dir(Self::bindings_dir(root)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {} // fresh root — normal
+            Err(err) => unreadable_dir(&Self::bindings_dir(root), &err),
+            Ok(providers) => {
+                for provider in providers.flatten() {
+                    match std::fs::read_dir(provider.path()) {
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => unreadable_dir(&provider.path(), &err),
+                        Ok(files) => {
+                            for file in files.flatten() {
+                                let path = file.path();
+                                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                                    continue; // *.tmp-* and *.quarantined-* residue
+                                }
+                                match load_row::<BindingRow>(&path) {
+                                    Ok(row) => {
+                                        if row.ledger_version == LEDGER_VERSION {
+                                            index.bindings.insert(
+                                                (row.provider.clone(), row.session_id.clone()),
+                                                row,
+                                            );
+                                        }
+                                    }
+                                    Err(RowLoadError::Io(err)) => {
+                                        unreadable_row(&path, &RowLoadError::Io(err))
+                                    }
+                                    Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Ok(marker) = load_row::<PendingMarker>(&path) {
-                    if marker.ledger_version == LEDGER_VERSION {
-                        index.pending.insert(marker.terminal_id.clone(), marker);
+        match std::fs::read_dir(Self::pending_dir(root)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => unreadable_dir(&Self::pending_dir(root), &err),
+            Ok(files) => {
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    match load_row::<PendingMarker>(&path) {
+                        Ok(marker) => {
+                            if marker.ledger_version == LEDGER_VERSION {
+                                index.pending.insert(marker.terminal_id.clone(), marker);
+                            }
+                        }
+                        Err(RowLoadError::Io(err)) => unreadable_row(&path, &RowLoadError::Io(err)),
+                        Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
                     }
                 }
             }

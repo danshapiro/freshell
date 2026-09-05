@@ -20,6 +20,40 @@ fn temp_root(label: &str) -> PathBuf {
     dir
 }
 
+/// H1 diagnostic: on a lock-acquisition failure, `/proc/locks` names the
+/// live holder pid(s) for this lock file (self vs foreign is the only
+/// discrimination it can make: the pid column is the LOCKING tgid, so an
+/// inheritance-window transient reports THIS test process's own pid, never
+/// the forked child's). Match the hardened dev+ino token (format
+/// `%02x:%02x:%d`, evidence-locked by validator PoC arm c).
+#[cfg(unix)]
+fn lock_holder_report(lock_path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(lock_path) else {
+        return "lock file itself unreadable".into();
+    };
+    let token = format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(meta.dev()),
+        libc::minor(meta.dev()),
+        meta.ino()
+    );
+    match std::fs::read_to_string("/proc/locks") {
+        Ok(body) => {
+            let hits: Vec<&str> = body
+                .lines()
+                .filter(|l| l.split_whitespace().nth(5) == Some(token.as_str()))
+                .collect();
+            if hits.is_empty() {
+                format!("no /proc/locks row for {token}")
+            } else {
+                hits.join("\n")
+            }
+        }
+        Err(err) => format!("lock-holders unavailable: {err}"),
+    }
+}
+
 fn write(
     provider: &str,
     session_id: &str,
@@ -2156,7 +2190,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // constructor coming up blind -- and the errno that would name the
     // mechanism (EWOULDBLOCK: flock genuinely held, vs ENOSPC/EMFILE:
     // resource pressure, vs a silently-empty load_index) was dropped because
-    // this binary installs no tracing subscriber. Per C1's reasoning we do
+    // this binary installs no tracing subscriber. Per C1's reasoning we did
     // NOT retry-mask; instead every assertion below carries the on-disk and
     // errno evidence needed to diagnose the next occurrence on sight.
     //
@@ -2164,11 +2198,11 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // is errno=11 EWOULDBLOCK at the re-acquire after `drop(holder)`: the
     // dropped holder's flock can remain kernel-held for a tick, and
     // `new_locked` swallows the errno into a DISABLED ledger
-    // (pane_ledger.rs:247-255). The one-shot probe-2 acquire (which panicked
+    // (pane_ledger.rs:1374-1384). The one-shot probe-2 acquire (which panicked
     // on exactly that signature) and the third construction are therefore
     // REPLACED by one bounded wait whose RETRY UNIT is the third construction
     // itself, with a TWO-BRANCH diagnosis per failed construction keyed on
-    // `candidate.is_enabled()` (pane_ledger.rs:295 — false only when the
+    // `candidate.is_enabled()` (pane_ledger.rs:1447 — false only when the
     // candidate's own lock acquisition FAILED):
     //  - ENABLED but blind (the candidate holds the flock yet cannot see
     //    s1.json — load_index swallowed an I/O error, H2): panic
@@ -2195,6 +2229,12 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // The loser-construction property and the on-disk evidence probe stay
     // one-shot and untouched — the C1 no-retry-masking decision holds for
     // everything the wait does not cover.
+    // s52d addendum: production now absorbs this transient class — acquisition retries
+    // EWOULDBLOCK-only on a fixed budget (LOCK_RETRY_MAX_ATTEMPTS / LOCK_RETRY_DELAY_MS,
+    // pane_ledger.rs:150-152), so the DISABLED branch below first requires contention
+    // that outlives the production ~275ms budget; persistent failures still panic with
+    // full evidence (and the budget-expiry assert below now reports the /proc/locks
+    // holder pid for this lock file — the s52d holder-identity deliverable).
     let root = temp_root("lock");
     let holder = PaneLedger::new_locked(Some(root.clone()));
     holder
@@ -2264,7 +2304,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
                 "third new_locked came up ENABLED yet BLIND — the candidate \
                  itself holds the flock (lock WAS free/held by us) and \
                  s1.json is confirmed on disk by the on-disk probe above, so \
-                 load_index swallowed an I/O error (H2, pane_ledger.rs:314) \
+                 load_index swallowed an I/O error (H2, pane_ledger.rs:1583) \
                  — provisional-final, never retried"
             );
         }
@@ -2314,8 +2354,12 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
                     std::time::Instant::now() < deadline,
                     "flock still EWOULDBLOCK after the 10s bounded wait — the \
                      proven flake signature persisted past the wait; last \
-                     captured lock failure: {err_text} (fossils family: \
-                     pane-ledger-test-lock-*)"
+                     captured lock failure: {err_text}; holder report \
+                     (/proc/locks names the LOCKING tgid — an inheritance-\
+                     window transient reports THIS test process's own pid, a \
+                     foreign holder reports a foreign pid): {} (fossils \
+                     family: pane-ledger-test-lock-*)",
+                    lock_holder_report(&root.join("lock"))
                 );
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
@@ -2336,6 +2380,59 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // The loop above breaks only when the third construction sees the binding —
     // the old trailing `assert!(next.ever_bound(...))` is subsumed by the loop's
     // success criterion and is removed (it would have been unreachable).
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn acquire_retries_through_a_transient_holder_release() {
+    // H1 root-cause class: with LOCK_NB a single-shot acquire fails inside a
+    // transient holder window (e.g. a forked child still carrying a dup of
+    // the lock fd pre-exec). Production acquisition must ABSORB a window that
+    // releases well inside the retry budget: the holder is dropped 50ms after
+    // construction starts, far below the worst-case budget (~275ms).
+    // Margin math: 50ms dropper vs ~275ms budget tolerates ~225ms of
+    // scheduling overshoot (N4, proven structurally) — do NOT "tighten" the
+    // 50ms toward the budget; that would reintroduce flakiness.
+    let root = temp_root("lock-retry");
+    let holder = PaneLedger::new_locked(Some(root.clone()));
+    let rehome = root.clone();
+    let dropper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(holder);
+    });
+    let started = std::time::Instant::now();
+    let candidate = PaneLedger::new_locked(Some(rehome));
+    dropper.join().unwrap();
+    assert!(
+        candidate.is_enabled(),
+        "bounded retry must absorb a transient holder window; ledger came up DISABLED"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(50),
+        "acquisition must wait for the real holder release, not race past it"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_contention_still_degrades_disabled_within_a_bounded_budget() {
+    // The single-writer contract is unchanged: a REAL second writer never
+    // acquires. The retry budget only bounds degradation latency (~0.3s),
+    // it never masks persistent contention.
+    let root = temp_root("lock-persist");
+    let _holder = PaneLedger::new_locked(Some(root.clone()));
+    let started = std::time::Instant::now();
+    let loser = PaneLedger::new_locked(Some(root.clone()));
+    assert!(
+        !loser.is_enabled(),
+        "a persistent holder must still degrade"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "degradation is bounded by the fixed retry budget, never a spin"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -7848,5 +7945,78 @@ fn reattach_never_moves_attribution_backwards() {
     assert_eq!(row.create_request_id.as_deref(), Some("req-new-mono"));
     assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-5"));
     assert_eq!(row.last_attributed_at, Some(5_000));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn load_index_dir_io_errors_are_loud_not_silently_empty() {
+    // H2 (kata s52d companion): an I/O failure while listing the store must
+    // NEVER surface as a silently-empty index. `bindings` forged as a
+    // REGULAR FILE makes read_dir deterministic-ENOTDIR on any uid (chmod
+    // tricks are root-skip-flaky); same for `pending`.
+    let root = temp_root("load-loud-dir");
+    std::fs::write(root.join("bindings"), b"not a dir").unwrap();
+    std::fs::write(root.join("pending"), b"not a dir").unwrap();
+    let (events, guard) = crate::invariants::capture::capture();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    drop(guard);
+    let events = events.lock().unwrap();
+    let hits: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ws::pane_ledger"
+                && e.message.contains("pane_ledger_load_index_dir_unreadable")
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        2,
+        "one ERROR per unreadable top-level dir (bindings + pending); got: {events:?}"
+    );
+    assert!(hits.iter().all(|h| h.fields.contains_key("path")));
+    drop(events);
+    assert!(
+        !ledger.ever_bound("claude", "anything"),
+        "index correctly empty; loudness is the contract"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn load_index_row_io_errors_are_loud_per_row() {
+    // Same H2 lane, per-ROW: an entry ending in .json that is a DIRECTORY
+    // makes the row read deterministic-EISDIR (uid-independent). Parse
+    // errors of REAL rows stay silent-by-contract here (boot-scan quarantine
+    // owns loudness) — this test must NOT flip that: only Io arms the event.
+    let root = temp_root("load-loud-row");
+    std::fs::create_dir_all(root.join("bindings").join("claude").join("ghost.json")).unwrap();
+    let (events, guard) = crate::invariants::capture::capture();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    drop(guard);
+    let events = events.lock().unwrap();
+    let hits: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.target == "freshell_ws::pane_ledger"
+                && e.message.contains("pane_ledger_load_index_row_unreadable")
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "one ERROR for the unreadable row; got: {events:?}"
+    );
+    let want_path = format!(
+        "{}",
+        root.join("bindings")
+            .join("claude")
+            .join("ghost.json")
+            .display()
+    );
+    assert_eq!(hits[0].fields.get("path"), Some(&want_path));
+    drop(events);
+    assert!(ledger.list_bindings().is_empty());
     std::fs::remove_dir_all(&root).ok();
 }
