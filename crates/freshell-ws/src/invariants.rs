@@ -77,6 +77,14 @@ pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time
         let mut identity_warned = std::collections::HashSet::new();
         loop {
             ticker.tick().await;
+            // Live fresh-opencode session ids, snapshotted ONCE per tick from
+            // the OUTER state, off the blocking pool (finding 1 of delta round
+            // 3): `handle_send` materialization keys the sessions map BEFORE
+            // its awaited ledger write, so the probe's ledger-row exclusion
+            // alone has a gap — the snapshot is the only gap-covering guard.
+            // The map lock is a tokio Mutex; never take it inside the
+            // blocking closure.
+            let live_fresh = state.fresh_opencode.live_session_ids().await;
             let state = state.clone(); // WsState: Clone; Arc-backed fields
             let mut warned = std::mem::take(&mut identity_warned);
             // The pass can issue ONE bounded SQLite read per rare
@@ -91,6 +99,7 @@ pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time
                     crate::terminal::now_ms(),
                     state.opencode_locator.as_deref(),
                     &state.pane_ledger,
+                    &live_fresh,
                 );
                 warned
             })
@@ -123,7 +132,10 @@ pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time
 /// first, probe fallback for the late-row/DB-error hole (plan-review R1);
 /// a pane with neither has nothing resolvable and is never alarmed
 /// (issue #702). The probe's `is_unavailable` predicate keeps sessions
-/// already claimed by any live-or-retired terminal and fresh-agent ledger
+/// already claimed by any live-or-retired terminal, sessions live in the
+/// fresh-opencode `sessions` map (the per-tick `live_session_ids` snapshot —
+/// it is keyed BEFORE the awaited materialization ledger write, so the
+/// ledger-row exclusion alone cannot cover that gap), and fresh-agent ledger
 /// rows from ever counting as evidence.
 pub(crate) fn warn_unresolved_terminal_identities(
     rows: &[IdentityProbeRow],
@@ -132,6 +144,7 @@ pub(crate) fn warn_unresolved_terminal_identities(
     now_ms: i64,
     opencode_locator: Option<&freshell_sessions::opencode_locator::OpencodeLocator>,
     pane_ledger: &crate::pane_ledger::PaneLedger,
+    live_fresh_sessions: &HashSet<String>,
 ) {
     for row in rows {
         if row.mode == "shell"
@@ -155,9 +168,10 @@ pub(crate) fn warn_unresolved_terminal_identities(
                         // binding lanes' business; never probe them).
                         None if now_ms - row.created_at > IDENTITY_RESOLUTION_GRACE_MS => locator
                             .probe_resolvable(&row.terminal_id, now_ms, &|session_id| {
-                                identity
-                                    .find_by_session_including_retired("opencode", session_id)
-                                    .is_some()
+                                live_fresh_sessions.contains(session_id)
+                                    || identity
+                                        .find_by_session_including_retired("opencode", session_id)
+                                        .is_some()
                                     || pane_ledger
                                         .lookup_by_session("opencode", session_id)
                                         .is_some_and(|r| {
@@ -417,7 +431,15 @@ mod tests {
         )];
         let now = 1_000 + IDENTITY_RESOLUTION_GRACE_MS + 1;
 
-        warn_unresolved_terminal_identities(&rows, &identity, &mut warned, now, None, &ledger);
+        warn_unresolved_terminal_identities(
+            &rows,
+            &identity,
+            &mut warned,
+            now,
+            None,
+            &ledger,
+            &HashSet::new(),
+        );
         // Bounded: a second sweep must NOT warn again for the same terminal.
         warn_unresolved_terminal_identities(
             &rows,
@@ -426,6 +448,7 @@ mod tests {
             now + 5_000,
             None,
             &ledger,
+            &HashSet::new(),
         );
 
         let warnings = unresolved_warnings(&events.lock().unwrap());
@@ -461,6 +484,7 @@ mod tests {
             1_000 + IDENTITY_RESOLUTION_GRACE_MS,
             None,
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -477,7 +501,15 @@ mod tests {
             row("t-gone", "amplifier", TerminalRunStatus::Exited, 0, None),
         ];
 
-        warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX, None, &ledger);
+        warn_unresolved_terminal_identities(
+            &rows,
+            &identity,
+            &mut warned,
+            i64::MAX,
+            None,
+            &ledger,
+            &HashSet::new(),
+        );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
     }
@@ -538,7 +570,15 @@ mod tests {
             ),
         ];
 
-        warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX, None, &ledger);
+        warn_unresolved_terminal_identities(
+            &rows,
+            &identity,
+            &mut warned,
+            i64::MAX,
+            None,
+            &ledger,
+            &HashSet::new(),
+        );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
     }
@@ -576,6 +616,7 @@ mod tests {
             10_000 + 61_000, // +61s: the incident's first-prompt delay
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(
@@ -616,6 +657,7 @@ mod tests {
             evidence_at + IDENTITY_RESOLUTION_GRACE_MS + 1,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         let warnings = unresolved_warnings(&events.lock().unwrap());
@@ -655,6 +697,7 @@ mod tests {
             evidence_at + IDENTITY_RESOLUTION_GRACE_MS, // boundary: not yet overdue
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -697,6 +740,7 @@ mod tests {
             i64::MAX,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -727,6 +771,7 @@ mod tests {
             i64::MAX,
             None,
             &ledger,
+            &HashSet::new(),
         );
 
         let warnings = unresolved_warnings(&events.lock().unwrap());
@@ -757,6 +802,7 @@ mod tests {
             i64::MAX,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -802,6 +848,7 @@ mod tests {
             probe_at,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
         assert!(
             unresolved_warnings(&events.lock().unwrap()).is_empty(),
@@ -816,6 +863,7 @@ mod tests {
             probe_at + IDENTITY_RESOLUTION_GRACE_MS + 1,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
         let warnings = unresolved_warnings(&events.lock().unwrap());
         assert_eq!(
@@ -865,6 +913,7 @@ mod tests {
             10_000 + IDENTITY_RESOLUTION_GRACE_MS,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -908,6 +957,7 @@ mod tests {
             i64::MAX,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -953,6 +1003,7 @@ mod tests {
             i64::MAX,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
@@ -1009,11 +1060,58 @@ mod tests {
             i64::MAX,
             Some(&locator),
             &ledger,
+            &HashSet::new(),
         );
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
         assert_eq!(locator.identity_resolvable_since("t-pending"), None);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ledger_home);
+    }
+
+    #[test]
+    fn opencode_probe_never_latches_a_live_freshagent_session() {
+        // Delta-review round 3, finding 1: `handle_send` materialization keys
+        // the fresh-opencode sessions map BEFORE the awaited `record_binding_row`
+        // ledger write (and the opencode serve DB row exists before both), so
+        // the ledger-row exclusion alone has a GAP — a probe running in it
+        // would latch the fresh-agent row as false resolvability evidence and
+        // fire exactly the WARN this run is fixing. The sweep's per-tick live
+        // session-id snapshot is the only guarantee that covers that gap; a
+        // live fresh-agent row must be refused even with an EMPTY ledger.
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("live-freshagent-row");
+        let db = seed_opencode_db(&home);
+        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t-pending", 100));
+        insert_opencode_session(&db, "ses_freshlive", "/proj", 150);
+
+        let identity = TerminalIdentityRegistry::new();
+        let ledger = crate::pane_ledger::PaneLedger::disabled();
+        let mut warned = HashSet::new();
+        let mut live = HashSet::new();
+        live.insert("ses_freshlive".to_string());
+        let rows = vec![row(
+            "t-pending",
+            "opencode",
+            TerminalRunStatus::Running,
+            0,
+            None,
+        )];
+
+        super::warn_unresolved_terminal_identities(
+            &rows,
+            &identity,
+            &mut warned,
+            i64::MAX,
+            Some(&locator),
+            &ledger,
+            &live,
+        );
+
+        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-pending"), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
