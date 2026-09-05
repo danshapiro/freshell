@@ -80,6 +80,16 @@ async function selectShellIfPickerShowing(page: import('@playwright/test').Page)
   }
 }
 
+/** Concatenated content of every server log file in the fixture's logs dir. */
+async function readServerLogs(logsDir: string): Promise<string> {
+  const names = await fs.readdir(logsDir).catch(() => [] as string[])
+  let combined = ''
+  for (const name of names) {
+    combined += await fs.readFile(path.join(logsDir, name), 'utf8').catch(() => '')
+  }
+  return combined
+}
+
 async function bootAndConnect(
   page: import('@playwright/test').Page,
   info: { baseUrl: string; token: string },
@@ -368,6 +378,32 @@ test.describe('OpenCode Terminal Restore (Rust only)', () => {
           }, restoredNeverSubmittedTerminalId!)
           return typeof buffer === 'string' && buffer.includes('opencode> ')
         }, { timeout: 15_000 }).toBe(true)
+
+        // -------------------------------------------------------------
+        // Issue #702 pin: the never-submitted pane must not trip
+        // `terminal_identity_unresolved`. Identity for an opencode terminal
+        // pane is answer-triggered (opencode writes its `session` row lazily
+        // at the first prompt), so this pane has NOTHING resolvable to
+        // correlate; the old create-age gate warned at +10s regardless —
+        // 12/12 panes in one day of production logs. The restored fresh
+        // pane's terminal was created no later than the moment the client
+        // learned its id above, so a fixed 12s wait from here provably
+        // outlasts the invariant's 10s grace plus one 2s sweep — regardless
+        // of how long the earlier polls happened to take. Then scope the
+        // absence pin to THIS restored terminal id so pre-restart history
+        // and the other (submitted) pane cannot pollute it.
+        // -------------------------------------------------------------
+        await page.waitForTimeout(12_000)
+        const serverLogs = await readServerLogs(info.logsDir)
+        // Positive control (plan-review R2, finding 3): the log feed must
+        // actually be populated and mention this pane — an un-readable or
+        // empty log must fail loudly, never pass vacuously green.
+        expect(serverLogs).toContain(restoredNeverSubmittedTerminalId!)
+        const unresolvedForRestoredPane = serverLogs
+          .split('\n')
+          .filter((line) => line.includes('terminal_identity_unresolved'))
+          .filter((line) => line.includes(restoredNeverSubmittedTerminalId!))
+        expect(unresolvedForRestoredPane).toEqual([])
       } finally {
         await server.stop().catch(() => {})
       }
