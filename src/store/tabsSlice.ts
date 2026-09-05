@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, isPaneClosePending, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneContent, PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -564,9 +564,34 @@ function surfacePaneCloseFailures(
  * server consumes it durably so recovery re-agrees with the displayed
  * layout. Queued until `ready` — over a socket-down close the close replays
  * before this assertion on the returned socket.
+ *
+ * Delta-round-8 (Finding F2) — the display check: the identity list was
+ * frozen at close-SEND time, and between the send and the failed/timed-out
+ * resolution the pane may have left the layout by ANY committed path (the
+ * report's interleave — the tab's batch close committing while a pane close
+ * timed out — is unreachable among the three gated thunks under the
+ * serialization rule above, but a removal is a removal however it arrived).
+ * A pane no longer displayed has nothing to reconcile: re-asserting it would
+ * consume its standing close evidence and re-attribute it OPEN, so a later
+ * recovery offers a session from a tab the user closed. Re-assert only what
+ * the CURRENT layout still shows, keyed by the same createRequestId the
+ * close lanes key by.
  */
-function reassertKeptPanesOpen(tabId: string, identities: PaneCloseIdentity[]) {
+function reassertKeptPanesOpen(
+  currentLayout: PaneNode | undefined,
+  tabId: string,
+  identities: PaneCloseIdentity[],
+) {
+  const displayed = new Set(collectPaneCloseIdentities(currentLayout).map((i) => i.createRequestId))
   for (const identity of identities) {
+    if (!displayed.has(identity.createRequestId)) {
+      log.warn('skipping the open re-assertion of a no-longer-displayed pane', {
+        tabId,
+        paneId: identity.paneId,
+        createRequestId: identity.createRequestId,
+      })
+      continue
+    }
     sendPaneOpened({ createRequestId: identity.createRequestId, tabId })
   }
 }
@@ -582,6 +607,19 @@ export const closePaneWithCleanup = createAsyncThunk(
     const before = (getState() as RootState).panes.layouts[tabId]
     if (before?.type === 'leaf' && before.id === paneId) {
       await dispatch(closeTab(tabId))
+      return
+    }
+    // Delta-round-8 (Finding F2) — the close-op serialization rule, the same
+    // shared guard the reducers consult: ONE close op per tab at a time.
+    // THIS pane's own close (a duplicate — idempotent-rejected: the
+    // in-flight close completes it) or the whole tab's close already
+    // outstanding ⇒ refuse to start; never deferred. Pre-fix the batch close
+    // and this close could resolve in either order and the loser's timeout
+    // re-asserted a stale identity the winner's committed close had removed.
+    // Overlapping closes of DIFFERENT panes in the tab stay allowed (the
+    // round-5 ref-counted regime).
+    if (isPaneClosePending((getState() as RootState).panes, tabId, paneId)) {
+      log.warn('refusing to start a pane close while a close for it or its tab is already in flight', { tabId, paneId })
       return
     }
     // F2: confirm the durable close evidence BEFORE the layout loses the pane.
@@ -600,7 +638,9 @@ export const closePaneWithCleanup = createAsyncThunk(
         if (failed.length > 0) {
           log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
           surfacePaneCloseFailures(dispatch, tabId, failed)
-          reassertKeptPanesOpen(tabId, identity)
+          // The display check (round-8 F2) re-reads the CURRENT layout
+          // post-wait — re-assert only what is still displayed.
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
       } finally {
@@ -650,8 +690,19 @@ export const closeTab = createAsyncThunk(
     // journaled for it — and recovery could later re-offer it). A second
     // close of an already-closing tab is a no-op; the in-flight close
     // completes it.
+    //
+    // Delta-round-8 (Finding F2) — the close-op serialization rule: ONE
+    // close op per tab at a time. The tab-scope start rejects while ANY
+    // close touching this tab is outstanding — its own prior start (above)
+    // OR any pane-scope close inside it (pre-fix the batch and the pane
+    // close ran concurrently and could resolve in either order; the loser's
+    // timeout then re-asserted a stale identity the winner's committed close
+    // had already removed, and the server re-attributed it open).
     const stateAtClose = getState() as RootState
-    if (stateAtClose.panes.closingTabs?.[tabId]) return
+    if (hasAnyClosePending(stateAtClose.panes, tabId)) {
+      log.warn('refusing to start a tab close while a close for it or one of its panes is already in flight', { tabId })
+      return
+    }
     const frozenLayout = stateAtClose.panes.layouts[tabId]
     const frozenTab = stateAtClose.tabs.tabs.find((item) => item.id === tabId)
     const frozenPaneTitles = stateAtClose.panes.paneTitles[tabId]
@@ -668,7 +719,9 @@ export const closeTab = createAsyncThunk(
           })
           const timedOut = ack.timedOut === true
           surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut })))
-          reassertKeptPanesOpen(tabId, identities)
+          // The display check (round-8 F2) re-reads the CURRENT layout
+          // post-wait — re-assert only what is still displayed.
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
           return
         }
         // Confirmed: mark every identity so the detach middleware's belt
@@ -746,6 +799,14 @@ export const closeTab = createAsyncThunk(
 export const replacePaneWithCleanup = createAsyncThunk(
   'tabs/replacePaneWithCleanup',
   async ({ tabId, paneId }: { tabId: string; paneId: string }, { dispatch, getState }) => {
+    // Delta-round-8 (Finding F2) — the close-op serialization rule (the same
+    // shared guard): the replace gate IS a single-pane close of the
+    // discarded pane, so it rejects while that pane's own close or the whole
+    // tab's is already outstanding — never deferred.
+    if (isPaneClosePending((getState() as RootState).panes, tabId, paneId)) {
+      log.warn('refusing to start a pane replace while a close for it or its tab is already in flight', { tabId, paneId })
+      return
+    }
     const identity = collectPaneCloseIdentities(
       (getState() as RootState).panes.layouts[tabId],
     ).filter((i) => i.paneId === paneId)
@@ -762,7 +823,9 @@ export const replacePaneWithCleanup = createAsyncThunk(
             paneId,
           })
           surfacePaneCloseFailures(dispatch, tabId, failed)
-          reassertKeptPanesOpen(tabId, identity)
+          // The display check (round-8 F2) re-reads the CURRENT layout
+          // post-wait — re-assert only what is still displayed.
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
         // The gate's own follow-through: lift the freeze first — replacePane

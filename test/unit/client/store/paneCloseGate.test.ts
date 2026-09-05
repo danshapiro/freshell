@@ -23,8 +23,9 @@ import tabsReducer, {
   closeTab,
   closePaneWithCleanup,
   replacePaneWithCleanup,
+  removeTab,
 } from '@/store/tabsSlice'
-import panesReducer, { initLayout, splitPane, setPaneCloseError, addPane, replacePane, updatePaneContent, hydratePanes, clearDeadTerminals, clearTerminalLiveHandles, repairCodexIdentityMismatch } from '@/store/panesSlice'
+import panesReducer, { initLayout, splitPane, setPaneCloseError, addPane, replacePane, updatePaneContent, hydratePanes, clearDeadTerminals, clearTerminalLiveHandles, repairCodexIdentityMismatch, swapPanes, closePane, removeLayout } from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { KILL_ACK_TIMEOUT_MS } from '@/lib/kill-ack'
@@ -928,5 +929,291 @@ describe('setPaneCloseError reducer', () => {
     const store = createTwoPaneStore()
     store.dispatch(setPaneCloseError({ tabId: 'tab-1', paneId: 'pane-1', error: 'boom' }))
     expect(paneCloseErrors(store, 'tab-1')).toEqual({ 'pane-1': 'boom' })
+  })
+})
+
+/**
+ * Delta-round-8 (review fresheyes/usual-fresheyes-20260905T003747Z-3652059.md)
+ * Finding F1 — `swapPanes` exchanges the two panes' COMPLETE contents,
+ * createRequestId identities included, so it is an identity-CHANGING fold of
+ * BOTH panes and goes through the ONE shared pending-close guard exactly like
+ * `replacePane` et al.: refused (never deferred) while EITHER pane's close —
+ * or the whole tab's — is outstanding.
+ *
+ * The finding's hazard, verbatim: a single-pane close or replacement awaits
+ * its acknowledgement; a mid-wait swap moves the closing identity into the
+ * OTHER pane; the ack then covers the moved identity while the post-ack
+ * removal drops the swapped-IN identity now occupying the original pane ID.
+ * The acknowledged identity stays visibly open under standing close evidence
+ * (excluded from recovery while displayed but tombstoned the moment it leaves
+ * the layout), and the swapped-in identity's removal rests on the
+ * middleware's unacknowledged belt alone.
+ */
+describe('delta-round-8 (F1) — swapPanes consults the pending-close guard', () => {
+  function paneCrid(store: ReturnType<typeof createStore>, tabId: string, paneId: string) {
+    return (paneContents(store, tabId).find((p) => p.paneId === paneId)?.content as { createRequestId?: string } | undefined)?.createRequestId
+  }
+
+  it.each([
+    { name: 'the swap TARGET', closing: 'pane-2', removed: 'pane-2', intact: 'pane-1', intactCrid: 'req-a' },
+    { name: 'the swap SOURCE', closing: 'pane-1', removed: 'pane-1', intact: 'pane-2', intactCrid: 'req-b' },
+  ])('a swap is refused while a single-pane close on $name is pending; the ack removes exactly the frozen identity', async ({ closing, removed, intact, intactCrid }) => {
+    const store = createTwoPaneStore()
+    const other = removed === 'pane-2' ? 'pane-1' : 'pane-2'
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: closing }))
+    expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ type: 'pane.closed' }))
+
+    // THE FINDING'S SCENARIO: the swap would move the pending-close identity
+    // into the other pane while its acknowledgement is in flight — REFUSED.
+    store.dispatch(swapPanes({ tabId: 'tab-1', paneId: removed, otherId: other }))
+    expect(paneCrid(store, 'tab-1', 'pane-1')).toBe('req-a')
+    expect(paneCrid(store, 'tab-1', 'pane-2')).toBe('req-b')
+
+    ackAllPaneCloses()
+    await close
+    // The acked removal dropped exactly the identity the close covered; the
+    // sibling kept its own identity — never a swap-shadowed casualty.
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual([intact])
+    expect(paneCrid(store, 'tab-1', intact)).toBe(intactCrid)
+  })
+
+  it('a swap is refused while a replace is pending on EITHER pane (the replace gate is a single-pane close)', async () => {
+    const store = createTwoPaneStore()
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    store.dispatch(swapPanes({ tabId: 'tab-1', paneId: 'pane-1', otherId: 'pane-2' }))
+    expect(paneCrid(store, 'tab-1', 'pane-1')).toBe('req-a')
+    expect(paneCrid(store, 'tab-1', 'pane-2')).toBe('req-b')
+    ackAllPaneCloses()
+    await replace
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
+    expect(paneCrid(store, 'tab-1', 'pane-1')).toBe('req-a')
+  })
+
+  it('a swap is refused while the whole TAB close is pending (every pane of a closing tab is close-pending)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    store.dispatch(swapPanes({ tabId: 'tab-1', paneId: 'pane-1', otherId: 'pane-2' }))
+    expect(paneCrid(store, 'tab-1', 'pane-1')).toBe('req-a')
+    expect(paneCrid(store, 'tab-1', 'pane-2')).toBe('req-b')
+    ackPanesClosedBatches()
+    await close
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+  })
+
+  it('discrimination control: a swap of two un-pending panes still lands while a THIRD pane\'s close is pending (the guard is pane-scoped)', async () => {
+    const store = createTwoPaneStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: terminalContent('req-c', 'term-c'),
+      newPaneId: 'pane-3',
+    }))
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-3' }))
+    store.dispatch(swapPanes({ tabId: 'tab-1', paneId: 'pane-1', otherId: 'pane-2' }))
+    // Neither swapped pane is close-pending: the exchange lands.
+    expect(paneCrid(store, 'tab-1', 'pane-1')).toBe('req-b')
+    expect(paneCrid(store, 'tab-1', 'pane-2')).toBe('req-a')
+    expect(paneCrid(store, 'tab-1', 'pane-3')).toBe('req-c')
+    ackAllPaneCloses()
+    await close
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId).sort()).toEqual(['pane-1', 'pane-2'])
+    expect(paneCrid(store, 'tab-1', 'pane-1')).toBe('req-b')
+  })
+})
+
+/**
+ * Delta-round-8 (review fresheyes/usual-fresheyes-20260905T003747Z-3652059.md)
+ * Finding F2 — one close op per tab at a time, and the unconfirmed-close heal
+ * re-asserts ONLY still-displayed identities.
+ *
+ * F2-half-1 (serialization): the three gated close thunks used to interleave
+ * across scopes — `closeTab` consulted only the tab mark, so a batch close
+ * and a single-pane/replace close could run CONCURRENTLY and resolve in
+ * either order; the loser's timeout then re-asserted a stale identity the
+ * winner's committed close had already removed. The discipline now (the
+ * guard's established rule — refuse, logged, never deferred):
+ *  - a pane-scope start (`closePaneWithCleanup` / `replacePaneWithCleanup`)
+ *    rejects while ANY close touching that tab is outstanding for the SAME
+ *    pane (duplicate — idempotent-rejected) or for the WHOLE tab;
+ *  - a tab-scope start (`closeTab`) rejects while ANY close touching that
+ *    tab is outstanding (its own — the round-4 no-op — or any pane's);
+ *  - overlapping closes of DIFFERENT panes in one tab stay allowed (the
+ *    round-5 pinned regime: ref-counted, independently frozen).
+ *
+ * F2-half-2 (the heal's display check): the failure/timeout healing path
+ * (`reassertKeptPanesOpen`) consults the CURRENT layout before each
+ * `pane.opened` — a pane no longer displayed (e.g. removed by a committed
+ * close while the wait was outstanding, however that removal arrived) has
+ * nothing to reconcile, and re-asserting it would consume its standing close
+ * evidence and re-attribute it open: a later recovery offering a session
+ * from a tab the user closed. Both orders are pinned below: the pane close
+ * timing out after its tab committed, and the batch timing out after one of
+ * its panes committed. (Post-serialization the two gated thunks cannot
+ * produce these interleaves between themselves; the pins drive the removals
+ * through the direct reducers — the shape every committed close ends in —
+ * because the display check is the defense for ANY mid-wait removal path,
+ * not only the gated ones.)
+ */
+describe('delta-round-8 (F2) — close ops serialize per tab', () => {
+  it('a single-pane close pending → a closeTab start is REJECTED (no batch, tab untouched); the settled close never latches a later tab close', async () => {
+    const store = createTwoPaneStore()
+    const closePaneP = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const rejected = store.dispatch(closeTab('tab-1'))
+    // No batch ever went out — the in-flight pane close is the tab's only
+    // close op.
+    expect(sentCallsOf('panes.closed')).toEqual([])
+    ackAllPaneCloses()
+    await Promise.all([closePaneP, rejected])
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
+    // The rejection is not a latch: once the pane close settled, the tab
+    // close starts and completes normally (NOW the batch covers pane-1 only).
+    const second = store.dispatch(closeTab('tab-1'))
+    const batches = sentCallsOf('panes.closed')
+    expect(batches).toHaveLength(1)
+    expect(batches[0].panes).toEqual([{ createRequestId: 'req-a', terminalId: 'term-a' }])
+    ackPanesClosedBatches()
+    await second
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
+  })
+
+  it('a replace pending → a closeTab start is REJECTED (the replace gate holds the same pane-scope close)', async () => {
+    const store = createTwoPaneStore()
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const rejected = store.dispatch(closeTab('tab-1'))
+    expect(sentCallsOf('panes.closed')).toEqual([])
+    ackAllPaneCloses()
+    await Promise.all([replace, rejected])
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
+  })
+
+  it('a tab close pending → a single-pane close start is REJECTED (no pane.closed; the batch alone covers the pane)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    expect(sentCallsOf('panes.closed')).toHaveLength(1)
+    const rejected = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed')).toEqual([])
+    // The layout stands untouched until the ONE close op resolves.
+    expect(paneContents(store, 'tab-1')).toHaveLength(2)
+    ackPanesClosedBatches()
+    await Promise.all([close, rejected])
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(false)
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+  })
+
+  it('a tab close pending → a replace start is REJECTED (no pane.closed; no picker lands mid-wait)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    const rejected = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed')).toEqual([])
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('terminal')
+    ackPanesClosedBatches()
+    await Promise.all([close, rejected])
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+  })
+
+  it('a duplicate close of the SAME pane is idempotent-rejected — exactly ONE pane.closed; the in-flight close completes it', async () => {
+    const store = createTwoPaneStore()
+    const first = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const duplicate = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-b')).toHaveLength(1)
+    ackAllPaneCloses()
+    await Promise.all([first, duplicate])
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('a replace of a close-pending pane is rejected (same key) — the close alone completes, no picker', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const rejected = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-b')).toHaveLength(1)
+    ackAllPaneCloses()
+    await Promise.all([close, rejected])
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+
+  it('a close of a replace-pending pane is rejected (same key) — the replace alone completes, the picker lands', async () => {
+    const store = createTwoPaneStore()
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const rejected = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-b')).toHaveLength(1)
+    ackAllPaneCloses()
+    await Promise.all([replace, rejected])
+    expect(paneContents(store, 'tab-1').find((p) => p.paneId === 'pane-2')?.content.kind).toBe('picker')
+  })
+
+  it('an overlapping close of a DIFFERENT pane in the same tab stays allowed (the round-5 pinned regime)', async () => {
+    const store = createTwoPaneStore()
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newContent: terminalContent('req-c', 'term-c'),
+      newPaneId: 'pane-3',
+    }))
+    const closeB = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    const closeC = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-3' }))
+    expect(sentCallsOf('pane.closed')).toHaveLength(2)
+    ackAllPaneCloses()
+    await Promise.all([closeB, closeC])
+    expect(paneContents(store, 'tab-1').map((p) => p.paneId)).toEqual(['pane-1'])
+  })
+})
+
+describe('delta-round-8 (F2) — the unconfirmed-close heal re-asserts only still-displayed identities', () => {
+  it('order 1 (the report\'s): the pane close timing out AFTER its tab\'s committed close re-asserts NOTHING — the pane is no longer displayed', async () => {
+    vi.useFakeTimers()
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(sentCallsOf('pane.closed').filter((m) => m.createRequestId === 'req-b')).toHaveLength(1)
+    // The committed batch-close shape (its post-ack ending): the tab and its
+    // layout are BOTH gone before the pane close's wait times out.
+    store.dispatch(removeTab('tab-1'))
+    store.dispatch(removeLayout({ tabId: 'tab-1' }))
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+    // NOTHING re-asserts the stale identity — nothing to reconcile; the
+    // committed close evidence must stand consumed by no one.
+    expect(sentCallsOf('pane.opened')).toEqual([])
+  })
+
+  it('order 2 (the reverse): the batch timing out AFTER one pane\'s committed close re-asserts ONLY the still-displayed siblings', async () => {
+    vi.useFakeTimers()
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closeTab('tab-1'))
+    expect(sentCallsOf('panes.closed')[0]?.panes).toEqual([
+      { createRequestId: 'req-a', terminalId: 'term-a' },
+      { createRequestId: 'req-b', terminalId: 'term-b' },
+    ])
+    // The committed pane-close shape: pane-2 is already out of the layout
+    // when the batch's wait times out.
+    store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+    // The still-displayed pane-1 re-asserts exactly as today; pane-2 is NOT
+    // re-asserted — re-opening it would resurrect a pane whose committed
+    // close already removed it.
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ type: 'pane.opened', createRequestId: 'req-a', tabId: 'tab-1' }),
+    ])
+    // The tab stands (its batch was never confirmed); only pane-1 wears the
+    // timeout surface — the removed pane's error dispatch no-ops by the
+    // content finder.
+    expect(store.getState().tabs.tabs.some((t) => t.id === 'tab-1')).toBe(true)
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-1': 'the server did not acknowledge the pane close in time; the pane was left open',
+    })
+  })
+
+  it('a server-answered FAILURE after the pane left the layout re-asserts NOTHING either (the display check is not timeout-specific)', async () => {
+    const store = createTwoPaneStore()
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    store.dispatch(removeTab('tab-1'))
+    store.dispatch(removeLayout({ tabId: 'tab-1' }))
+    emit({ type: 'pane.closed.result', createRequestId: 'req-b', success: false })
+    await close
+    expect(sentCallsOf('pane.opened')).toEqual([])
   })
 })

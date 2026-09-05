@@ -1149,7 +1149,10 @@ function findFirstLeafId(node: PaneNode): string {
  *   `clearDeadTerminals` and `clearTerminalLiveHandles` (re-mint the
  *   identity via `clearTerminalContentForRecreate`; skipped PER LEAF so a
  *   pending pane never blocks its un-pending siblings),
- *   `repairCodexIdentityMismatch` (re-keys the pane wholesale).
+ *   `repairCodexIdentityMismatch` (re-keys the pane wholesale),
+ *   `swapPanes` (delta-round-8 Finding F1 — exchanges BOTH panes' complete
+ *   contents, identities included; refused when EITHER swapped pane's close
+ *   is outstanding, or the whole tab's).
  * - GAINING (tab-scope guard only — `refuseMutationWhileClosing`):
  *   `splitPane`/`addPane`/`initLayout`/`restoreLayout`/`resetLayout`. A gain
  *   into a tab with only pane-scoped closes pending is SAFE (the post-ack
@@ -1176,12 +1179,12 @@ function isTabClosePending(state: PanesState, tabId: string): boolean {
 }
 
 /** The ONE shared pending-close guard: this pane's own close, or its tab's, is awaiting acknowledgement. */
-function isPaneClosePending(state: PanesState, tabId: string, paneId: string): boolean {
+export function isPaneClosePending(state: PanesState, tabId: string, paneId: string): boolean {
   return isTabClosePending(state, tabId) || state.closingPanes?.[`${tabId}:${paneId}`] === true
 }
 
 /** True while ANY close (tab-wide, or any pane's single close) is outstanding in this tab — the hydrate rule. */
-function hasAnyClosePending(state: PanesState, tabId: string): boolean {
+export function hasAnyClosePending(state: PanesState, tabId: string): boolean {
   if (isTabClosePending(state, tabId)) return true
   const prefix = `${tabId}:`
   for (const key of Object.keys(state.closingPanes ?? {})) {
@@ -1574,6 +1577,21 @@ export const panesSlice = createSlice({
       const { tabId, paneId, otherId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      // The shared pending-close guard (delta-round-8, Finding F1): the swap
+      // exchanges BOTH panes' complete contents — the createRequestId the
+      // close lanes key by INCLUDED — so it is an identity-CHANGING fold of
+      // both panes and obeys the one rule: REFUSED (logged, never deferred)
+      // while EITHER pane's close, or the whole tab's, is outstanding.
+      // Pre-fix, a mid-ack-wait swap moved the closing identity into the
+      // other pane: the ack covered the moved identity while the post-ack
+      // removal dropped the swapped-IN identity now occupying the original
+      // pane ID — the acknowledged identity stayed visibly open under
+      // standing close evidence, and the swapped-in identity's removal was
+      // journaled only by the middleware's unacknowledged belt.
+      if (isPaneClosePending(state, tabId, paneId) || isPaneClosePending(state, tabId, otherId)) {
+        log.warn('refusing an identity-changing pane fold while the close is in flight', { op: 'swapPanes', tabId, paneId, otherId })
+        return
+      }
 
       function findLeaf(node: PaneNode, id: string): Extract<PaneNode, { type: 'leaf' }> | null {
         if (node.type === 'leaf') return node.id === id ? node : null

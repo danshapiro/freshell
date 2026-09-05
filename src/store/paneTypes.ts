@@ -414,10 +414,11 @@ export interface PanesState {
    * its pane identity set is FROZEN: the reducers that gain or re-key a pane
    * (`splitPane`/`addPane`/`replacePane`/`initLayout`/`restoreLayout`/
    * `resetLayout`/`restartFreshAgentCreate`, an identity-changing
-   * `updatePaneContent` fold) refuse — otherwise a pane minted into the
-   * still-visible tab during the bounded ack wait would be removed with the
-   * tab while the acknowledged batch never carried its close evidence, and
-   * recovery could later re-offer it. `removeLayout` clears the flag
+   * `updatePaneContent` fold, a `swapPanes` exchange — delta-round-8 F1)
+   * refuse — otherwise a pane minted into the still-visible tab during the
+   * bounded ack wait would be removed with the tab while the acknowledged
+   * batch never carried its close evidence, and recovery could later
+   * re-offer it. `removeLayout` clears the flag
    * alongside the layout (the tab is gone). Ephemeral: never persisted
    * (stripped in persistMiddleware beside the other volatile maps), never
    * hydrated.
@@ -433,9 +434,13 @@ export interface PanesState {
    * is outstanding for a pane, every identity-CHANGING reducer fold of that
    * pane refuses, so the acknowledgement always covers exactly the identity
    * the post-ack removal applies — never a re-keyed replacement removed
-   * evidenceless. Ephemeral: never persisted (stripped in persistMiddleware
-   * beside the other volatile maps), never hydrated, `removeLayout` drops
-   * the tab's entries alongside the layout.
+   * evidenceless. The same marks drive the close-op serialization
+   * (delta-round-8 Finding F2): ONE close op per tab at a time — a
+   * pane-scope start rejects while its pane's own close or its tab's is
+   * outstanding, and a tab-scope start rejects while ANY of these marks (or
+   * its own) stands. Ephemeral: never persisted (stripped in
+   * persistMiddleware beside the other volatile maps), never hydrated,
+   * `removeLayout` drops the tab's entries alongside the layout.
    */
   closingPanes?: Record<string, true>
 }
