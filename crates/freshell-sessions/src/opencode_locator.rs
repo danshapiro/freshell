@@ -40,9 +40,11 @@
 //! - The window's **upper bound (deadline)** is `arm_ms + spawn_window_ms` if
 //!   no Enter has been observed yet — a spawn-anchored fallback that lets a
 //!   row-at-spawn resolve without ever waiting for input — or
-//!   `first_submit_ms + window_ms` once [`OpencodeLocator::note_submit`] has
-//!   been called, extending the deadline outward (`submit_ms >= arm_ms`, so
-//!   this can only push the deadline later, never earlier).
+//!   `enter_ms + window_ms` once [`OpencodeLocator::note_submit`] has opened
+//!   (or re-opened) an evaluation, extending the deadline outward
+//!   (`enter_ms >= arm_ms`, so this can only push the deadline later, never
+//!   earlier). (`enter_ms` is the anchor of the CURRENT evaluation; the
+//!   separate `first_submit_ms` field only feeds `probe_resolvable`.)
 //! - Any [`OpencodeLocator::tick`] outcome (bound / zero-candidate /
 //!   ambiguous) marks the pending evaluation `resolved`; a LATER Enter still
 //!   re-opens a fresh evaluation window for a terminal that hasn't been
@@ -272,9 +274,9 @@ impl OpencodeLocator {
             return None; // throttle before ANY DB read (R2 finding 2)
         }
         let armed = armed?;
-        if armed.first_submit_ms.is_none() {
-            return None; // never typed: no session of its own exists — no read
-        }
+        // Never typed: no session of its own exists — no read (the #702 idle
+        // never-submitted class; nothing is attributable to the pane).
+        armed.first_submit_ms?;
         let lower_bound = armed.arm_ms - self.pre_epsilon_ms;
         let any = self
             .query_candidates(lower_bound) // OFF the lock: bounded read
@@ -1252,6 +1254,38 @@ mod tests {
     }
 
     #[test]
+    fn disarm_clears_the_probe_throttle() {
+        // An uncleared `last_probe_ms` would wrongly throttle a re-armed
+        // same-id terminal for up to PROBE_THROTTLE_MS; disarm must clear it.
+        let home = unique_temp_dir("evidence-disarm-throttle");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t1", 100));
+        let scans_before_probe = locator.db_scan_count();
+        assert_eq!(locator.probe_resolvable("t1", 50_000, &|_| false), None);
+        assert!(
+            locator.db_scan_count() > scans_before_probe,
+            "the first probe performs its bounded read"
+        );
+
+        locator.disarm("t1");
+
+        // Re-arm the same id and probe immediately: a fresh pane must pay
+        // its own bounded read, never inherit the old pane's throttle.
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 51_000));
+        assert!(locator.note_submit("t1", 51_100));
+        let scans_after_rearm = locator.db_scan_count();
+        assert_eq!(locator.probe_resolvable("t1", 51_500, &|_| false), None);
+        assert!(
+            locator.db_scan_count() > scans_after_rearm,
+            "throttle from the disarmed pane must not survive into the re-armed one"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn resolvable_evidence_keeps_the_first_observation_time() {
         let home = unique_temp_dir("evidence-first-wins");
         let db = open_seed_db(&home);
@@ -1360,16 +1394,20 @@ mod tests {
         let home = unique_temp_dir("probe-filters");
         let db = open_seed_db(&home);
         insert_session(&db, "ses_pre_arm", "/proj", 50, None, None); // snapshotted at arm
-        insert_session(&db, "ses_wrong_cwd", "/other", 60_000, None, None);
-        insert_session(&db, "ses_child", "/proj", 60_001, Some("ses_pre_arm"), None);
-        insert_session(&db, "ses_archived", "/proj", 60_002, None, Some(60_003));
         let locator = OpencodeLocator::new(home.clone());
 
         assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 100));
         assert!(locator.note_submit("t1", 120));
 
-        // Every row above is excluded locator-side (known-at-arm snapshot,
-        // foreign cwd, subagent parent, archived), so the probe finds nothing.
+        // Seeded AFTER arm so each row's exclusion is exercised by the probe
+        // filter itself, not masked by the arm-time known_ids snapshot.
+        insert_session(&db, "ses_wrong_cwd", "/other", 60_000, None, None);
+        insert_session(&db, "ses_child", "/proj", 60_001, Some("ses_pre_arm"), None);
+        insert_session(&db, "ses_archived", "/proj", 60_002, None, Some(60_003));
+        insert_three_views_session(&db, "ses_3views", "/proj", 60_003);
+
+        // Every row is excluded probe-side (known-at-arm snapshot, foreign
+        // cwd, subagent parent, archived, 3-views marker): nothing latches.
         assert_eq!(locator.probe_resolvable("t1", 60_004, &|_| false), None);
         assert_eq!(locator.identity_resolvable_since("t1"), None);
         let _ = std::fs::remove_dir_all(&home);
