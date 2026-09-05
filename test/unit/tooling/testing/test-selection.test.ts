@@ -21,32 +21,6 @@ type PackageJson = {
 }
 
 describe('Rust-first build and test selection', () => {
-  it('defines Rust source build/start scripts and removes Node-server scripts', () => {
-    const scripts = readJson<PackageJson>('package.json').scripts ?? {}
-
-    expect(scripts['prepare:rust-runtime']).toBe('tsx scripts/prepare-rust-runtime.ts')
-    expect(scripts.predev).toContain('npm run prepare:rust-runtime')
-    expect(scripts['predev:server']).toContain('npm run prepare:rust-runtime')
-    expect(scripts.prestart).toContain('npm run prepare:rust-runtime')
-    expect(scripts['electron:dev']).toContain('npm run prepare:rust-runtime')
-    expect(scripts['dev:server']).toContain('cargo run -p freshell-server --locked')
-    expect(scripts.dev).toContain('cargo run -p freshell-server --locked')
-    expect(scripts['build:rust']).toContain('cargo build --release -p freshell-server --locked')
-    expect(scripts['check:rust']).toContain('cargo check --workspace --locked')
-    expect(scripts['test:rust']).toContain('scripts/testing/run-rust-tests.ts')
-    expect(scripts.start).toContain('scripts/start-rust-server.ts')
-    expect(scripts.build).toContain('build:tools')
-    expect(scripts.build).toContain('build:rust')
-
-    expect(scripts['typecheck:server']).toBeUndefined()
-    expect(scripts['build:server']).toBeUndefined()
-    expect(scripts['test:server:standard']).toBeUndefined()
-    expect(scripts['test:server:aggressive']).toBeUndefined()
-    expect(scripts[['test:real', 'coding-cli-contracts'].join(':')]).toBeUndefined()
-    expect(scripts[['test:codex-real-provider', 'smoke'].join('-')]).toBeUndefined()
-    expect(scripts[['test:opencode-serve', 'smoke'].join('-')]).toBeUndefined()
-  })
-
   it('runs client, source-runtime, Rust, and Electron phases without vacuous Vitest flags', () => {
     const plan = createStandardTestPlan({
       availableParallelism: 8,

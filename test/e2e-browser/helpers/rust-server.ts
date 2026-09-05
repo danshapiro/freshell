@@ -67,11 +67,11 @@ const PROJECT_ROOT = findProjectRoot(__dirname)
  * Absolute path of the built Rust server binary (release profile).
  * Source of truth: `port/oracle/harness/external-server.ts`'s `rustServerBinPath`.
  */
-export function rustServerBinPath(root: string = PROJECT_ROOT): string {
-  return path.join(root, 'target', 'release', 'freshell-server')
+export function rustServerBinPath(root: string = PROJECT_ROOT, platform: NodeJS.Platform = process.platform): string {
+  return path.join(root, 'target', 'release', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
 }
 
-let rustBuildDone = false
+const verifiedRustBuilds = new Set<string>()
 
 /**
  * Ensure the Rust `freshell-server` release binary exists, building it once
@@ -96,9 +96,9 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
     }).bin
   }
   const bin = rustServerBinPath(root)
-  if (rustBuildDone && fs.existsSync(bin)) return bin
+  if (verifiedRustBuilds.has(bin) && fs.existsSync(bin)) return bin
 
-  const result = spawnSync('cargo', ['build', '--release', '-p', 'freshell-server'], {
+  const result = spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: root,
     stdio: 'inherit',
     env: process.env,
@@ -112,7 +112,7 @@ export function ensureRustServerBuilt(root: string = PROJECT_ROOT): string {
   if (!fs.existsSync(bin)) {
     throw new Error(`cargo build completed but ${bin} is still missing.`)
   }
-  rustBuildDone = true
+  verifiedRustBuilds.add(bin)
   return bin
 }
 

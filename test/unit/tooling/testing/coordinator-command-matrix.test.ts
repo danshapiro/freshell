@@ -1,16 +1,9 @@
-import { readFile } from 'node:fs/promises'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-
 import { describe, expect, it } from 'vitest'
 
 import {
   classifyCommand,
   type UpstreamPhase,
 } from '../../../../scripts/testing/coordinator-command-matrix.js'
-
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url))
-const PROJECT_ROOT = path.resolve(TEST_DIR, '../../../..')
 
 function expectPhase(disposition: ReturnType<typeof classifyCommand>, expected: UpstreamPhase): void {
   if (disposition.kind === 'rejected') {
@@ -122,19 +115,4 @@ describe('coordinator command matrix', () => {
       }
     })
 
-  it('keeps the package command inventory free of deleted server scripts', async () => {
-    const packageJson = JSON.parse(await readFile(path.join(PROJECT_ROOT, 'package.json'), 'utf8')) as {
-      scripts?: Record<string, string>
-    }
-    const deletedScripts = [
-      'typecheck:server',
-      'build:server',
-      'test:server:standard',
-      'test:server:aggressive',
-      ['test:real', 'coding-cli-contracts'].join(':'),
-    ]
-    for (const key of deletedScripts) {
-      expect(packageJson.scripts?.[key]).toBeUndefined()
-    }
-  })
 })

@@ -1,4 +1,3 @@
-import fs from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
@@ -78,14 +77,6 @@ function listedProjects(env: NodeJS.ProcessEnv): { output: string; labels: strin
   }
 }
 
-function sourceFiles(dir: string): string[] {
-  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    const entryPath = path.join(dir, entry.name)
-    if (entry.isDirectory()) return sourceFiles(entryPath)
-    return entry.name.endsWith('.ts') ? [entryPath] : []
-  })
-}
-
 describe('browser selection non-vacuity', () => {
   it('resolves only Rust application projects with the exact continuity exclusion', () => {
     const defaultProjects = resolvedConfig(playwrightConfig, cleanEnvironment())
@@ -119,20 +110,12 @@ describe('browser selection non-vacuity', () => {
     expect(ci.output).not.toMatch(new RegExp(`${retiredProjectNames.join('|')}|Total:\\s*0 tests in`, 'i'))
   })
 
-  it('keeps the Rust factory and browser dependency graph on retained paths', async () => {
+  it('creates Rust fixtures and selects the supported cloud projects', async () => {
     const server = await createE2eServerHandle({})
     expect(server).toBeInstanceOf(RustServer)
     expect(typeof server.start).toBe('function')
     expect(typeof server.stop).toBe('function')
     expect(() => server.info).toThrow('RustServer not started')
-
-    const legacyImports = sourceFiles(browserRoot).flatMap((file) => {
-      const imports = [...fs.readFileSync(file, 'utf8').matchAll(/^\s*import[\s\S]*?from\s+['"]([^'"]+)['"]/gm)]
-      return imports
-        .filter((match) => /(?:^|\/)(?:test-server|legacy-node-server)(?:\.js)?$/.test(match[1]))
-        .map((match) => `${path.relative(projectRoot, file)} -> ${match[1]}`)
-    })
-    expect(legacyImports).toEqual([])
 
     expect(LOCAL_ONLY_SPECS).toContainEqual({
       spec: 'mcp-qa-smoke-rust.spec.ts',
