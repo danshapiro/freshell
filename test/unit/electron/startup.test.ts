@@ -310,6 +310,43 @@ describe('runStartup', () => {
       expect(patchDesktopConfig).not.toHaveBeenCalled()
     })
 
+    it('port-scan exhaustion falls back to the manual chooser (never hijacks a neighbor server)', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ctx.ownsServer = true
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(false) // every candidate busy
+      const result = await runStartup(ctx)
+      expect(result.type).toBe('chooser')
+      if (result.type === 'chooser') {
+        expect(result.reason).toBe('manual-choice')
+      }
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+    })
+
+    it('always-ask owning boots get the chooser WITHOUT neighbor candidates', async () => {
+      const ctx = createDefaultContext({
+        isDev: false,
+        resourcesPath: '/app/resources',
+        desktopConfig: {
+          serverMode: 'app-bound',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: true,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+      })
+      ctx.ownsServer = true
+
+      const result = await runStartup(ctx)
+      expect(result.type).toBe('chooser')
+      if (result.type === 'chooser') {
+        expect(result.reason).toBe('always-ask')
+        expect(result.candidates).toEqual([])
+      }
+    })
+
     it('the default profile in a multi-profile install is auto-bumped off a neighbor-held port', async () => {
       const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
       // No profileId — this IS the default boot — but the registry named

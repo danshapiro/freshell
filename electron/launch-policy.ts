@@ -39,18 +39,15 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
 
   // A server-owning boot NEVER attaches to a discovery-surfaced instance
   // (which could belong to a neighbor profile with a different config dir and
-  // identity) via auto-connect or the chooser; it starts its own server
-  // (app-bound path in runStartup) or the machine daemon (daemon mode —
-  // machine-global by design, see README). This runs BEFORE alwaysAskOnLaunch:
-  // a chooser offered no candidates would just be an empty trap for owning
-  // boots, so the question moots itself.
-  if (
-    options.ownsServer &&
-    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
-  ) {
-    return { type: 'start-local' }
-  }
-
+  // identity) via auto-connect; it starts its own server (the app-bound path
+  // in runStartup) or the machine daemon (machine-global by design, see
+  // README). NOTE: this runs AFTER alwaysAskOnLaunch on purpose — the chooser
+  // also renders "Remote server" and "New local server" sections
+  // unconditionally (chooser.tsx), is the ONLY place a user can toggle
+  // alwaysAskOnLaunch, and hosts the manual remote entry — suppressing it
+  // would strand the user. The chooser is identity-safe for owning boots
+  // because runStartup passes an empty candidate list (skipDiscovery), so no
+  // neighbor server ever appears in it.
   if (desktopConfig.alwaysAskOnLaunch) {
     return { type: 'show-chooser', candidates, reason: 'always-ask' }
   }
@@ -79,6 +76,16 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     }
 
     return { type: 'show-chooser', candidates, reason: 'saved-remote-unreachable' }
+  }
+
+  // Owning-boot override (see comment above alwaysAskOnLaunch). Sits after
+  // remote-mode handling on purpose: a saved remote URL is a per-profile
+  // intent that stays valid even against an empty candidate list.
+  if (
+    options.ownsServer &&
+    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
+  ) {
+    return { type: 'start-local' }
   }
 
   if (candidates.length > 1) {

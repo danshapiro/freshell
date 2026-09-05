@@ -299,14 +299,18 @@ export function buildPickerEntries(registry: RegistryReadResult): PickerEntry[] 
  * "simply starts with a fresh configuration" in `~/.freshell-work`).
  *
  * A `~/.freshell-<id>` directory proves a profile ran here; the picker
- * launcher's own userData dir lives under appData, NOT homedir, so `.freshell-`
- * prefixes in the home directory are real profiles only.
+ * launcher's own userData dir lives under appData, NOT homedir. Match ONLY
+ * directories whose suffix is a valid profile id — anything else in home
+ * resembling `.freshell-*` (backups, thirds' dumps, tarballs, the port's
+ * oracle seed dirs) must not flip the Default boot into a server-owner.
  */
 export function hasNamedProfileState(
-  homedir: string,
-  listHomeEntries: () => string[],
+  listHomeDirs: () => string[],
 ): boolean {
-  return listHomeEntries().some((name) => /^\.freshell-.+$/.test(name))
+  return listHomeDirs().some((name) => {
+    const m = /^\.freshell-(.+)$/.exec(name)
+    return m !== null && PROFILE_ID_PATTERN.test(m[1])
+  })
 }
 
 /**
@@ -323,11 +327,10 @@ export function hasNamedProfileState(
 export function computeOwnsServer(options: {
   profileId: string
   registry: RegistryReadResult
-  homedir: string
-  listHomeEntries: () => string[]
+  listHomeDirsWithState: () => string[]
 }): boolean {
   if (options.profileId !== DEFAULT_PROFILE_ID) return true
   if (options.registry.error !== undefined) return true
   if (options.registry.profiles.length > 0) return true
-  return hasNamedProfileState(options.homedir, options.listHomeEntries)
+  return hasNamedProfileState(options.listHomeDirsWithState)
 }

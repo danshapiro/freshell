@@ -77,6 +77,21 @@ describe('server ownership', () => {
       savedRemoteReachable: false,
     })).toEqual({ type: 'auto-connect', candidate: c })
   })
+  it('owning boots honor alwaysAskOnLaunch (chooser still reachable — its remote/manual sections stay useful)', () => {
+    const result = chooseLaunchAction({
+      desktopConfig: config({ alwaysAskOnLaunch: true }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })
+    expect(result.type).toBe('show-chooser')
+    if (result.type === 'show-chooser') {
+      expect(result.reason).toBe('always-ask')
+      // runStartup has skipDiscovery'd the candidate list — an owning boot
+      // never surfaces its neighbor in the chooser either.
+      expect(result.candidates).toEqual([candidate('http://localhost:3001', 'tok')])
+    }
+  })
 })
 
 describe('launch policy', () => {

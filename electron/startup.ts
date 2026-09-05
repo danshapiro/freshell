@@ -403,7 +403,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
         // spawning a doomed server whose health check would succeed against
         // the OTHER instance (/api/health is unauthenticated).
         let chosen = -1
-        for (let candidate = port + 1; candidate < port + 200; candidate++) {
+        for (let candidate = port + 1; candidate < Math.min(port + 200, 65536); candidate++) {
           if (await ctx.isPortAvailable(candidate)) {
             chosen = candidate
             break

@@ -214,49 +214,44 @@ describe('resolveBootShape', () => {
 
 describe('computeOwnsServer', () => {
   const noReg = { profiles: [] }
-  const noHome = () => [] as string[]
+  const noDirs = () => [] as string[]
 
   it('is always true for named profiles', () => {
-    expect(computeOwnsServer({ profileId: 'work', registry: noReg, homedir: '/h', listHomeEntries: noHome })).toBe(true)
+    expect(computeOwnsServer({ profileId: 'work', registry: noReg, listHomeDirsWithState: noDirs })).toBe(true)
   })
   it('is true for Default when the registry names any profile (multi-profile install)', () => {
     expect(computeOwnsServer({
       profileId: DEFAULT_PROFILE_ID,
       registry: { profiles: [{ id: 'work' }] },
-      homedir: '/h',
-      listHomeEntries: noHome,
+      listHomeDirsWithState: noDirs,
     })).toBe(true)
   })
   it('is true for Default when the registry is unreadable (fail-closed)', () => {
     expect(computeOwnsServer({
       profileId: DEFAULT_PROFILE_ID,
       registry: { profiles: [], error: 'not valid JSON' },
-      homedir: '/h',
-      listHomeEntries: noHome,
+      listHomeDirsWithState: noDirs,
     })).toBe(true)
   })
-  it('is true for Default when a ~/.freshell-<id> state dir exists even without a registry entry (unlisted ids)', () => {
+  it('is true for Default when a valid ~/.freshell-<id> state dir exists even without a registry entry (unlisted ids)', () => {
     expect(computeOwnsServer({
       profileId: DEFAULT_PROFILE_ID,
       registry: noReg,
-      homedir: '/h',
-      listHomeEntries: () => ['.freshell-work', '.other'],
+      listHomeDirsWithState: () => ['.freshell-work', '.other'],
     })).toBe(true)
   })
   it('is false on a legacy single-profile install', () => {
     expect(computeOwnsServer({
       profileId: DEFAULT_PROFILE_ID,
       registry: noReg,
-      homedir: '/h',
-      listHomeEntries: () => ['.freshell', '.config', '.freshell'],
+      listHomeDirsWithState: () => ['.freshell', '.config'],
     })).toBe(false)
   })
-  it('ignores misleading names (.freshell- alone is not a profile dir)', () => {
+  it('does not count invalid-id dirs (.freshell- alone, .freshell-backup directries, oracle seeds)', () => {
     expect(computeOwnsServer({
       profileId: DEFAULT_PROFILE_ID,
       registry: noReg,
-      homedir: '/h',
-      listHomeEntries: () => ['.freshell-'],
+      listHomeDirsWithState: () => ['.freshell-', '.freshell-backup.tar', '.freshell-QA-007i-seed', '.freshell-My Work'],
     })).toBe(false)
   })
 })

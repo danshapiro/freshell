@@ -3097,12 +3097,15 @@ review rounds on the delta:
   .env, so the window fails auth). Ownership now extends to ANY tenant boot:
   named profiles always, the Default profile whenever any named profile is
   registered/used/evidenced by a `~/.freshell-<id>` dir, and fail-closed when
-  the registry is unreadable. The canonical gate is `computeOwnsServer` in
+  the registry is unreadable. The canonical gate is   `computeOwnsServer` in
   `electron/profile.ts` (unit-tested in `test/unit/electron/profile.test.ts`);
-  `entry.ts` passes its result through to launch policy and startup. The gate
-  runs BEFORE `alwaysAskOnLaunch` (an owning boot's chooser would otherwise
-  be an empty trap). Regression coverage:
+  `entry.ts` passes its result through to launch policy and startup. Owning
+  boots show no discovered neighbors (runStartup skips the discovery probe),
+  but the `alwaysAskOnLaunch` chooser remains reachable: the chooser renders
+  its Remote/New-local sections independently of the candidate list, and is
+  the only place the setting can be flipped off. Regression coverage:
   `test/unit/electron/launch-policy.test.ts` ('server ownership') and
+  `test/unit/electron/startup.test.ts` ('app-bound mode').
   `test/unit/electron/startup.test.ts` ('app-bound mode').
 - **Server-owning boots auto-bump a busy port.** If an owning profile's
   configured port is already held (typically by another resident profile),

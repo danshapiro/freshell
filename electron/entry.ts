@@ -66,6 +66,7 @@ const registryAtBoot = readProfilesRegistry(
   registryPathForHome(os.homedir()),
   (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined),
 )
+
 const bootShape = resolveBootShape(
   process.argv, process.env, registryAtBoot,
   app.getName(), app.getPath('appData'), os.homedir(),
@@ -492,8 +493,24 @@ async function main(): Promise<void> {
     ownsServer: computeOwnsServer({
       profileId: activeProfileId,
       registry: registryAtBoot,
-      homedir: os.homedir(),
-      listHomeEntries: () => fs.readdirSync(os.homedir()),
+      // Only DIRECTORIES whose suffix is a valid profile id count (a backup
+      // tarball or the port's oracle seeds must not flip ownership).
+      listHomeDirsWithState: () => {
+        let names: string[] = []
+        try {
+          names = fs.readdirSync(os.homedir())
+        } catch (err) {
+          // A broken home read must not crash the boot before a window exists.
+          mainProcessLogger.log({ severity: 'warn', event: 'profile_state_scan_failed', error: err instanceof Error ? err.message : String(err) })
+        }
+        return names.filter((name) => {
+          try {
+            return fs.statSync(path.join(os.homedir(), name)).isDirectory()
+          } catch {
+            return false
+          }
+        })
+      },
     }),
     daemonManager,
     serverSpawner,
