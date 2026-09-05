@@ -2545,7 +2545,7 @@ async fn capture(
         None => {
             // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to
             // `fresh-agent` by a remote client's layout sync): mirror the Node
-            // capture route's pane-kind gate (router.ts:942-946) — every
+            // capture route's pane-kind gate (router.ts:955-959) — every
             // non-terminal layout kind answers the 422 validation wording the
             // `content_panes` branch in terminal_tabs.rs already emits, rather
             // than falling through to an unhandled 500 (Node, pre-fix) or a
