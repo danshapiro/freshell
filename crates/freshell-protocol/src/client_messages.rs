@@ -265,10 +265,11 @@ pub struct TerminalCreate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     /// const `"fresh_after_restore_unavailable"`. Legacy client repair hint;
-    /// consumed by the legacy TS server; deliberately ignored by the Rust
-    /// server, superseded by `pane.reconcile` verdicts (intent documented at
-    /// `freshell-ws/src/terminal.rs:506-513`). Retained for frozen-wire
-    /// compat.
+    /// consumed by the TS server and, since kata ywwf, by the Rust server's
+    /// replayed-create cwd re-home (see `freshell-ws/src/terminal.rs`
+    /// `handle_create`); otherwise superseded by `pane.reconcile` verdicts
+    /// (intent discussed at `freshell-ws/src/terminal.rs:760`). Retained for
+    /// frozen-wire compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_intent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

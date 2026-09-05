@@ -859,8 +859,9 @@ async fn handle_client_text(
         // a fresh `terminal.create { recoveryIntent:
         // 'fresh_after_restore_unavailable' }` (TerminalView.tsx:4100-4112),
         // deduped by the client's own createRequestId -- already handled by
-        // the existing `handle_create` path (`recovery_intent` is a plain
-        // passthrough field on `TerminalCreate`). Mirrors legacy's own
+        // the existing `handle_create` path (`recovery_intent` remains a
+        // plain passthrough field, now also consumed there in the
+        // replayed-create cwd re-home gate). Mirrors legacy's own
         // `if (m.event === 'restore_unavailable')` guard so an unrecognized
         // future `event` value is tolerated (accept-and-strip) rather than
         // logged as a diagnostic it isn't.
@@ -1784,6 +1785,42 @@ fn resolve_create_cwd(
         return None;
     }
     home_dir()
+}
+
+/// Replayed creates (restore after a server restart, or fresh recovery after
+/// a restore became unavailable) carry the client-persisted pane
+/// `initialCwd`, which can point at a directory that no longer exists (a
+/// prior server's HOME, a deleted project dir). Parity with the Node server
+/// (ws-handler `resolveReplayedCreateCwd`): an unreachable replayed cwd is
+/// dropped so the `resolve_create_cwd` ladder (defaultCwd → home) supplies a
+/// live directory, instead of dying in OpenCode MCP config injection.
+/// Interactive creates keep the deliberate clear-error behavior.
+#[derive(Debug)]
+enum ReplayedCreateCwd {
+    Keep(Option<String>),
+    DroppedStale { original: String },
+}
+
+fn resolve_replayed_create_cwd(
+    explicit: Option<&str>,
+    restore: Option<bool>,
+    recovery_intent: Option<&str>,
+) -> ReplayedCreateCwd {
+    let replayed = restore == Some(true) || recovery_intent.is_some();
+    match explicit {
+        Some(cwd)
+            if replayed
+                && !cwd.is_empty()
+                && !std::fs::metadata(cwd)
+                    .map(|meta| meta.is_dir())
+                    .unwrap_or(false) =>
+        {
+            ReplayedCreateCwd::DroppedStale {
+                original: cwd.to_string(),
+            }
+        }
+        other => ReplayedCreateCwd::Keep(other.map(|cwd| cwd.to_string())),
+    }
 }
 
 /// `$HOME` (or `FRESHELL_HOME`, matching the server's own home resolution —
@@ -2841,10 +2878,33 @@ pub(crate) async fn handle_create(
     // `resolve_create_cwd`): explicit `create.cwd`, else `settings.defaultCwd`,
     // else (non-Windows) `$HOME`. `mcp_cwd` derives from THIS resolved value
     // (spec §3.3 rev 2.1 — getting it wrong flips opencode's throw-vs-launch).
+    // Replayed creates (restore / fresh-after-restore-unavailable) validate the
+    // client-persisted cwd FIRST: a stale one is dropped so the ladder below
+    // re-homes instead of dying in MCP config injection (kata ywwf; Node parity
+    // with `resolveReplayedCreateCwd`). Interactive creates keep the deliberate
+    // clear-error path.
     // `mut`: the amplifier pre-create block below may assign the ONE
     // effective spawn cwd back into this variable (F4 hard invariant).
-    let mut resolved_cwd = resolve_create_cwd(
+    let replayed_cwd = resolve_replayed_create_cwd(
         create.cwd.as_deref(),
+        create.restore,
+        create.recovery_intent.as_deref(),
+    );
+    let explicit_cwd = match replayed_cwd {
+        ReplayedCreateCwd::Keep(cwd) => cwd,
+        ReplayedCreateCwd::DroppedStale { original } => {
+            tracing::warn!(
+                target: "freshell_ws::terminal",
+                %mode,
+                request_id = %create.request_id,
+                stale_cwd = %original,
+                "terminal.create replay cwd no longer exists; falling back to default/home",
+            );
+            None
+        }
+    };
+    let mut resolved_cwd = resolve_create_cwd(
+        explicit_cwd.as_deref(),
         state.settings.default_cwd.as_deref(),
         host_os,
     );
@@ -6246,6 +6306,62 @@ mod resolve_create_cwd_tests {
     fn no_home_fallback_on_native_windows() {
         let resolved = resolve_create_cwd(None, None, HostOs::Windows);
         assert_eq!(resolved, None);
+    }
+}
+
+#[cfg(test)]
+mod resolve_replayed_create_cwd_tests {
+    use super::{resolve_replayed_create_cwd, ReplayedCreateCwd};
+
+    #[test]
+    fn drops_stale_cwd_on_restore() {
+        let outcome = resolve_replayed_create_cwd(
+            Some("/definitely/missing/freshell-e2e-home"),
+            Some(true),
+            None,
+        );
+        match outcome {
+            ReplayedCreateCwd::DroppedStale { original } => {
+                assert_eq!(original, "/definitely/missing/freshell-e2e-home");
+            }
+            other => panic!("expected DroppedStale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drops_stale_cwd_on_fresh_recovery_intent() {
+        let outcome = resolve_replayed_create_cwd(
+            Some("/definitely/missing/freshell-e2e-home"),
+            None,
+            Some("fresh_after_restore_unavailable"),
+        );
+        assert!(matches!(outcome, ReplayedCreateCwd::DroppedStale { .. }));
+    }
+
+    #[test]
+    fn keeps_live_cwd_on_restore() {
+        let outcome = resolve_replayed_create_cwd(Some("/"), Some(true), None);
+        match outcome {
+            ReplayedCreateCwd::Keep(cwd) => assert_eq!(cwd.as_deref(), Some("/")),
+            other => panic!("expected Keep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_missing_cwd_for_interactive_create() {
+        // Interactive (non-replay) creates keep the deliberate clear-error
+        // path through MCP injection; no fallback.
+        let outcome =
+            resolve_replayed_create_cwd(Some("/definitely/missing/freshell-e2e-home"), None, None);
+        match outcome {
+            ReplayedCreateCwd::Keep(cwd) => {
+                assert_eq!(
+                    cwd.as_deref(),
+                    Some("/definitely/missing/freshell-e2e-home")
+                );
+            }
+            other => panic!("expected Keep, got {other:?}"),
+        }
     }
 }
 
