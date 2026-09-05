@@ -37,7 +37,12 @@
 //! at 21ms@1k / 426ms@20k rows; TTL math yields 1.2k-12k rows). Files stay
 //! the durable source of truth; this process is the only writer
 //! (single-writer flock, [`PaneLedger::new_locked`]), so write-through
-//! invalidation is trivial. Reads never touch the fs and may run inline on
+//! invalidation is trivial. H1: the flock's *acquisition* tolerates the
+//! inheritance-mediated transient holder class — the fork→exec open-file-
+//! description handoff can leave `<root>/lock` momentarily held through a
+//! forked child's pre-exec window — via a bounded EWOULDBLOCK-only retry
+//! (see [`LOCK_RETRY_MAX_ATTEMPTS`]); a genuine second writer still
+//! degrades loudly. Reads never touch the fs and may run inline on
 //! async paths; WRITES fsync (~15ms p50 on this host) and must be wrapped in
 //! `spawn_blocking` at async call sites (the `terminal.rs:1369-1379`
 //! PTY-spawn precedent) — the sync API here stays call-site-agnostic.
@@ -55,6 +60,21 @@ pub use pane_ledger_scan::{BootScanReport, QuarantinedRow, PENDING_MARKER_ORPHAN
 /// Gates schema migration (spec §4.2): rows with a different version are
 /// quarantined loudly at boot, never silently reinterpreted.
 pub const LEDGER_VERSION: u32 = 1;
+
+/// H1: a *transient* holder window — the fork→exec open-file-description
+/// inheritance handoff (a forked child transiently carries a reference to
+/// the lock's OFD; std opens O_CLOEXEC, so the window ends AT exec, proven
+/// by validator PoC arm b2 / N6) — can leave `<root>/lock` momentarily held
+/// when `new_locked` runs; single-shot `LOCK_NB` then converted a µs-scale
+/// window (no-fork release measured ~13µs, PoC arm a) into a process-
+/// lifetime DISABLED ledger (deflake kata s52d). Acquisition retries ONLY
+/// on EWOULDBLOCK with a fixed budget: generous vs the measured window
+/// class, small at the one-shot boot call site, and loud-unchanged for a
+/// genuine persistent second writer (same ERROR, ~275ms later).
+#[cfg(unix)]
+const LOCK_RETRY_MAX_ATTEMPTS: u32 = 12;
+#[cfg(unix)]
+const LOCK_RETRY_DELAY_MS: u64 = 25;
 
 /// Bound rows not observed within this TTL are expired TO TOMBSTONES
 /// (`retired/gc_expired`), never deleted (spec §4.2 lifecycle).
@@ -230,10 +250,15 @@ impl PaneLedger {
 
     /// Production construction (V2.md single-writer guard): acquire an
     /// exclusive advisory `flock(2)` on `<root>/lock` (the `ConfigLock`
-    /// pattern, `settings_store.rs:385-417`). If another process holds it,
-    /// log a loud structured ERROR and come up DISABLED (no-op) — never two
-    /// writers on one store. Non-unix: no flock primitive is wired;
-    /// construct normally (ConfigLock's non-unix parity).
+    /// pattern, `settings_store.rs:385-417`). Acquisition retries
+    /// EWOULDBLOCK-only on a fixed budget (see `LOCK_RETRY_MAX_ATTEMPTS`)
+    /// so a transient holder window — the fork→exec open-file-description
+    /// inheritance handoff — cannot downgrade this process to a
+    /// lifetime-DISABLED ledger; a persistent second writer still degrades
+    /// loudly. If another process holds it past the budget, log a loud
+    /// structured ERROR and come up DISABLED (no-op) — never two writers
+    /// on one store. Non-unix: no flock primitive is wired; construct
+    /// normally (ConfigLock's non-unix parity).
     pub fn new_locked(root: Option<PathBuf>) -> Self {
         let Some(r) = root.clone() else {
             return Self::new(None);
@@ -259,10 +284,35 @@ impl PaneLedger {
 
     #[cfg(unix)]
     fn acquire_store_lock(root: &Path) -> std::io::Result<Option<std::fs::File>> {
+        let mut attempt = 0u32;
+        loop {
+            match Self::flock_once(root) {
+                Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                    attempt += 1;
+                    if attempt >= LOCK_RETRY_MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+                    // Sync sleep is deliberate: this is the one-shot boot-time
+                    // constructor path, never a hot path, and the wait only
+                    // happens while a (transient) holder is actually observed.
+                    std::thread::sleep(std::time::Duration::from_millis(LOCK_RETRY_DELAY_MS));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn flock_once(root: &Path) -> std::io::Result<Option<std::fs::File>> {
         use std::os::unix::io::AsRawFd;
         std::fs::create_dir_all(root)?;
         // Content irrelevant (only existence + flock state matter);
         // truncate(false) avoids clippy's suspicious_open_options.
+        //
+        // O_CLOEXEC: `std::fs::File` opens close-on-exec by DEFAULT — KEEP it
+        // that way: flock state rides the open file description, so a lock fd
+        // carried across exec by a detached child would keep holding the flock
+        // after this process dies (sidecar_store.rs V6.md NA-3 precedent).
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)

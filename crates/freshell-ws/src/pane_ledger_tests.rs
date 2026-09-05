@@ -20,6 +20,40 @@ fn temp_root(label: &str) -> PathBuf {
     dir
 }
 
+/// H1 diagnostic: on a lock-acquisition failure, `/proc/locks` names the
+/// live holder pid(s) for this lock file (self vs foreign is the only
+/// discrimination it can make: the pid column is the LOCKING tgid, so an
+/// inheritance-window transient reports THIS test process's own pid, never
+/// the forked child's). Match the hardened dev+ino token (format
+/// `%02x:%02x:%d`, evidence-locked by validator PoC arm c).
+#[cfg(unix)]
+fn lock_holder_report(lock_path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(lock_path) else {
+        return "lock file itself unreadable".into();
+    };
+    let token = format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(meta.dev()),
+        libc::minor(meta.dev()),
+        meta.ino()
+    );
+    match std::fs::read_to_string("/proc/locks") {
+        Ok(body) => {
+            let hits: Vec<&str> = body
+                .lines()
+                .filter(|l| l.split_whitespace().nth(5) == Some(token.as_str()))
+                .collect();
+            if hits.is_empty() {
+                format!("no /proc/locks row for {token}")
+            } else {
+                hits.join("\n")
+            }
+        }
+        Err(err) => format!("lock-holders unavailable: {err}"),
+    }
+}
+
 fn write(
     provider: &str,
     session_id: &str,
@@ -157,9 +191,28 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // constructor coming up blind -- and the errno that would name the
     // mechanism (EWOULDBLOCK: flock genuinely held, vs ENOSPC/EMFILE:
     // resource pressure, vs a silently-empty load_index) was dropped because
-    // this binary installs no tracing subscriber. Per C1's reasoning we do
+    // this binary installs no tracing subscriber. Per C1's reasoning we did
     // NOT retry-mask; instead every assertion below carries the on-disk and
     // errno evidence needed to diagnose the next occurrence on sight.
+    //
+    // RESOLUTION (s52d, H1): the root-cause CLASS is the fork→exec
+    // open-file-description inheritance handoff — a forked child
+    // transiently carries a reference to the lock's OFD, so `<root>/lock`
+    // stays momentarily held after the holder drops (in-tree trigger: the
+    // `git` spawns from `terminal_meta.rs:492` in this same lib test binary
+    // under parallel libtest). It is NOT a bare drop→acquire race: a no-fork
+    // close→fresh-open re-acquire is ~13µs on this host (PoC arm a), far
+    // below the flake window. The product fix is a bounded EWOULDBLOCK-only
+    // retry inside `acquire_store_lock` (LOCK_RETRY_MAX_ATTEMPTS /
+    // LOCK_RETRY_DELAY_MS). N3: routing this probe through the now-retrying
+    // `acquire_store_lock` means the probe SELF-ABSORBS transients by
+    // design — that retry is production behavior, not test-lane masking —
+    // while persistent contention STILL panics below with the ordered
+    // resight + holder pid report. C2(a) caveat: `/proc/locks` names the
+    // LOCKING tgid; for the inheritance class that is THIS test process
+    // (self vs foreign is the only discrimination available; it never names
+    // the forked child), so a self-pid report confirms the transient class
+    // overshooting the budget rather than contradicting the fix.
     let root = temp_root("lock");
     let holder = PaneLedger::new_locked(Some(root.clone()));
     holder
@@ -188,22 +241,91 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // swallowed into a DISABLED ledger.
     match PaneLedger::acquire_store_lock(&root) {
         Ok(lock) => drop(lock), // release before constructing `next`
-        Err(err) => panic!(
-            "acquire_store_lock failed after holder drop: errno={:?} kind={:?} \
-             (EWOULDBLOCK => flock genuinely still held after drop; \
-             ENOSPC/EMFILE/EACCES => resource pressure, H1)",
-            err.raw_os_error(),
-            err.kind()
-        ),
+        Err(err) => {
+            // Sight the raw single-shot errno BEFORE reading /proc/locks.
+            let resight = match PaneLedger::flock_once(&root) {
+                Ok(lock) => {
+                    drop(lock);
+                    "single-shot resight now SUCCEEDS (window outlived the retry budget)"
+                        .to_string()
+                }
+                Err(e) => format!(
+                    "single-shot resight still fails: errno={:?} kind={:?} (genuinely held)",
+                    e.raw_os_error(),
+                    e.kind()
+                ),
+            };
+            panic!(
+                "acquire_store_lock STILL failed after the bounded retry budget: errno={:?} kind={:?}; {}; \
+                 holder report (/proc/locks names the LOCKING tgid — an inheritance-window transient \
+                 reports THIS test process's own pid, a foreign holder reports a foreign pid): {}",
+                err.raw_os_error(),
+                err.kind(),
+                resight,
+                lock_holder_report(&root.join("lock")),
+            )
+        }
     }
 
     let next = PaneLedger::new_locked(Some(root.clone()));
     assert!(
         next.ever_bound("claude", "s1"),
         "third new_locked came up blind despite the lock being acquirable and \
-         s1.json on disk ({s1_on_disk}): load_index silently returned empty \
-         (H2, pane_ledger.rs:299-321 swallows I/O errors) or a second \
-         acquire Err raced in after the probe"
+         s1.json on disk ({s1_on_disk}): load_index returned empty — an \
+         I/O-failure index load is loud only via the Task 2 tracing events \
+         `pane_ledger_load_index_dir_unreadable`/`pane_ledger_load_index_row_unreadable`, \
+         which this test binary does not capture (no tracing subscriber \
+         installed) — or a second acquire Err raced in after the probe"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn acquire_retries_through_a_transient_holder_release() {
+    // H1 root-cause class: with LOCK_NB a single-shot acquire fails inside a
+    // transient holder window (e.g. a forked child still carrying a dup of
+    // the lock fd pre-exec). Production acquisition must ABSORB a window that
+    // releases well inside the retry budget: the holder is dropped 50ms after
+    // construction starts, far below the worst-case budget (~275ms).
+    // Margin math: 50ms dropper vs ~275ms budget tolerates ~225ms of
+    // scheduling overshoot (N4, proven structurally) — do NOT "tighten" the
+    // 50ms toward the budget; that would reintroduce flakiness.
+    let root = temp_root("lock-retry");
+    let holder = PaneLedger::new_locked(Some(root.clone()));
+    let rehome = root.clone();
+    let dropper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(holder);
+    });
+    let started = std::time::Instant::now();
+    let candidate = PaneLedger::new_locked(Some(rehome));
+    dropper.join().unwrap();
+    assert!(
+        candidate.is_enabled(),
+        "bounded retry must absorb a transient holder window; ledger came up DISABLED"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(50),
+        "acquisition must wait for the real holder release, not race past it"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn persistent_contention_still_degrades_disabled_within_a_bounded_budget() {
+    // The single-writer contract is unchanged: a REAL second writer never
+    // acquires. The retry budget only bounds degradation latency (~0.3s),
+    // it never masks persistent contention.
+    let root = temp_root("lock-persist");
+    let _holder = PaneLedger::new_locked(Some(root.clone()));
+    let started = std::time::Instant::now();
+    let loser = PaneLedger::new_locked(Some(root.clone()));
+    assert!(!loser.is_enabled(), "a persistent holder must still degrade");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "degradation is bounded by the fixed retry budget, never a spin"
     );
     std::fs::remove_dir_all(&root).ok();
 }
