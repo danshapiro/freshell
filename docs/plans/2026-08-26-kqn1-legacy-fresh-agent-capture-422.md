@@ -45,6 +45,15 @@ Runtime-backed fresh-agent panes must keep returning `200` text transcripts.
 - Baseline-recorded unrelated failures (`test/unit/vite-config.test.ts`
   `getNetworkHost`, 3 cases) are pre-existing on `main` and are not repaired
   by this work.
+- **Execution-time discovery (2026-09-05, evidence in the SDD ledger):** the
+  e2e oracle spec's fourth test (`:448 keeps fresh-agent settings and routes
+  while legacy settings and routes are removed`) fails deterministically on
+  pre-existing client settings-UI drift (`page.getByText('Fresh agent')` not
+  rendered anywhere in settings; spec line authored 2026-06-15). This delta
+  changes zero client files, so the outcome is byte-identical at `base_ref`
+  by construction. It is outside this work item (whose pinned expectation at
+  `:420` passes) and is deliberately not repaired; the formal QA gate
+  (`freshell-qa.sh`) does not run Playwright specs, so the gate is unaffected.
 
 **Goal:** Legacy/layout-only `fresh-agent` panes answered by
 `GET /api/panes/:id/capture` receive a clean 422 pane-kind validation error on
@@ -516,9 +525,13 @@ Run: `bash scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/
 local backend, and selecting it explicitly with `--local` is the safe,
 reversible default.)
 
-Expected: PASS — all tests in the spec, including `'normalizes remote legacy
-layout sync before exposing server pane snapshots'` whose line-420 capture
-assertion failed with 500 before Task 1.
+Expected: the kata oracle test `'normalizes remote legacy layout sync before
+exposing server pane snapshots'` — whose line-420 capture assertion failed
+with 500 before Task 1 — passes, along with the other fresh-pane tests in the
+spec. (Amended 2026-09-05: the spec's fourth test, `:448 keeps fresh-agent
+settings…`, fails deterministically on pre-existing settings-UI drift that
+this server-only delta provably cannot affect — see Accepted tradeoffs; the
+original expectation "all tests in the spec" is narrowed accordingly.)
 
 - [ ] **Step 3: Evaluate and run the work-source candidate oracle**
 
@@ -536,6 +549,15 @@ zero exit is also an acceptable surprise if the host environment resolves
 them. This observation does not replace the full QA gate, which runs the same
 command (`darkforge qa` wraps `npm run check` plus the cargo gates) at the
 required full-suite gate in the execution stage.
+
+(Amended 2026-09-05: the command must run in the canonical host environment —
+without the agent harness's RunPod proxy variables (`https_proxy`/`HTTPS_PROXY`
+`NODE_USE_ENV_PROXY=1`). Those vars make every spawned Node child emit an
+experimental `UNDICI-EHPA` stderr warning, deterministically breaking 5
+stderr-equality tests (3 `test/e2e/update-flow.test.ts`, 2
+`test/unit/lib/visible-first-audit-gate.test.ts`); with the vars stripped the
+same 13 tests pass 13/13. The kernel's baseline environment lacked them, so
+gate runs must match it.)
 
 - [ ] **Step 4: Refactor while green**
 
