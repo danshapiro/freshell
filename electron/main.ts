@@ -29,6 +29,8 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
 
   let mainWindow: any = null
   let isQuitting = false
+  let quitContinuationStarted = false
+  let serverStopInProgress: Promise<void> | undefined
 
   await app.whenReady()
 
@@ -46,10 +48,51 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
     })
   }
 
+  // Calling app.quit() from a before-quit listener synchronously emits
+  // before-quit again in Electron. Mark the continuation before calling it so
+  // both rejected and synchronously-throwing stopServer implementations are
+  // safe from re-entering this listener.
+  const continueQuit = () => {
+    if (quitContinuationStarted) return
+    quitContinuationStarted = true
+    app.quit()
+  }
+
+  const resumeQuitAfterServerStopFailure = (error: unknown) => {
+    serverStopInProgress = undefined
+    // Cleanup failure must not strand Electron in a half-quit state. We have
+    // already attempted the exact child; resume the quit while the
+    // structured error below preserves the failure for diagnosis.
+    console.error(JSON.stringify({
+      severity: 'error',
+      component: 'electron-main',
+      event: 'server_stop_before_quit_failed',
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    continueQuit()
+  }
+
   // Cleanup on quit
-  app.on('before-quit', async () => {
+  app.on('before-quit', (event?: { preventDefault: () => void }) => {
+    // Electron does not await async event listeners. Prevent the first quit
+    // request, then explicitly resume it after the exact server child has
+    // stopped. The resumed app.quit() fires before-quit again; the guard lets
+    // that one through without stopping the server twice.
+    if (quitContinuationStarted) return
+
+    event?.preventDefault()
     isQuitting = true
-    await deps.stopServer()
+    if (serverStopInProgress) return
+
+    try {
+      serverStopInProgress = deps.stopServer()
+        .then(() => {
+          continueQuit()
+        })
+        .catch(resumeQuitAfterServerStopFailure)
+    } catch (error) {
+      resumeQuitAfterServerStopFailure(error)
+    }
   })
 
   // macOS: re-show window on activate

@@ -7,7 +7,6 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  * SESSION-16 — "Tolerate malformed and partially written provider data."
  *
  * Playwright validation (deferred-posture probe, per the df1 campaign policy: authored +
- * registered in MATRIX_SPECS + run ONCE per leg with per-leg outcome classification —
  * this spec is NOT iterated to green by the worker):
  *
  *   "Seed healthy, empty, truncated, malformed, and invalid-UTF-8 records for every
@@ -20,24 +19,19 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  *    well-formed-but-cwd-less (R10b discovery gate), truncated-without-a-complete-line,
  *    NULL/empty opencode `directory` row, malformed/empty/`working_dir`-less amplifier
  *    metadata.json,
- *  - tolerated-but-incomplete classes (DO render, legacy parity — NOT quarantined):
  *    truncated-with-valid-prefix (parseable prefix indexed), invalid-UTF-8 payload
  *    (lossy U+FFFD read — Node `fs.readFile(f, 'utf8')` parity).
  *  - one partially-written claude record completed MID-TEST by appending the missing
  *    bytes — exactly one live sidebar addition, no reload (Rust: periodic sweep +
- *    `sessions.changed` broadcast; legacy: real chokidar watcher refresh — this test
  *    passes only if the completing write moves the exclude→include transition).
  *
  * Parity anchors: crate-level pins in
  * `crates/freshell-sessions/tests/malformed_data_quarantine.rs` (Rust, real SessionIndex
  * sweeps) and the frozen-behavior control
- * `test/unit/server/coding-cli/session-indexer-malformed-corpus.test.ts` (legacy, real
  * provider modules). Both legs of THIS spec exercise the REAL servers over an isolated
- * HOME; legacy-chromium is the behavioral control.
  *
  * Visibility discipline: the sidebar's DEFAULT browse projection hides non-interactive
  * sessions (SESSION-15's local filters), so every record this spec asserts as VISIBLE
- * carries >= 2 user-authored messages (matching `session-directory-matrix.spec.ts`'s
  * two-turn realism). Quarantine-marker records also carry markers in the first user
  * message / `name` field so a quarantine regression would render an assertable string.
  */
@@ -152,11 +146,9 @@ function amplifierMetadata(id: string, workingDir: string | undefined, name: str
 const SIDEBAR_TIMEOUT = 15_000
 
 // Routed through the generalized E2eServerHandle seam (HARNESS-02) so the SAME spec
-// exercises the legacy Node server (control) and the Rust server (target).
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           // ── Claude corpus (`<home>/.claude/projects/s16-campaign/*.jsonl`) ──
@@ -232,7 +224,6 @@ const test = base.extend({
           // user message, i.e. non-interactive and HIDDEN by the default browse
           // projection: the completion then changes neither the index count nor (with a
           // newer codex seed present) the corpus max-lastActivityAt, so the Rust sweep
-          // signature never moves and no `sessions.changed` ever fires (legacy's
           // watcher still fires on content diffs). Verified by direct instrumentation:
           // `spawn_sessions_sweep` ticks showed len already including the seed from the
           // first tick while the API browse projection correctly hid it.
@@ -299,7 +290,6 @@ const test = base.extend({
           }
 
           // ── Amplifier corpus (`<home>/.amplifier/projects/<slug>/sessions/<id>/`) ──
-          // The provider EXISTS on both server kinds at this base (the July-19
           // rust-only KNOWN DIVERGENCE is stale at df1/integration), so no kind gate.
           const ampSessionsDir = path.join(homeDir, '.amplifier', 'projects', 's16-project', 'sessions')
           const ampHealthyDir = path.join(ampSessionsDir, AMPLIFIER_SESSION_ID)

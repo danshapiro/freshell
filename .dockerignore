@@ -1,4 +1,5 @@
 # Build artifacts (rebuilt in Docker — never copy from host)
+.worktrees/
 node_modules/
 dist/
 target/
@@ -41,6 +42,85 @@ port/oracle/*
 !port/oracle/baselines/
 port/oracle/baselines/*
 !port/oracle/baselines/mode-preamble/
+!port/laptop-bootstrap/
+port/laptop-bootstrap/*
+!port/laptop-bootstrap/1-install-wsl.cmd
+!port/laptop-bootstrap/2-bootstrap-wsl.sh
+!port/vm-bridge/
+port/vm-bridge/*
+!port/vm-bridge/agent-console-vm.ps1
+!port/vm-bridge/agent-console-wsl.sh
+
+# The Cloud Run default Vitest lane reads these checked-in runtime and
+# distribution surfaces. Keep the exact manifest-owned inputs in the image
+# even though their surrounding directories are not application runtime data.
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/docs-pages-deploy.yml
+!.github/workflows/electron-build.yml
+!.github/workflows/electron-release.yml
+!.github/workflows/port-contract.yml
+!.github/workflows/rust-clippy.yml
+!.github/workflows/typecheck-client.yml
+
+!electron/
+electron/*
+!electron/port-check.ts
+
+!examples/
+examples/*
+!examples/docker/
+examples/docker/*
+!examples/docker/Dockerfile
+!examples/extensions/
+examples/extensions/*
+!examples/extensions/live-counter/
+examples/extensions/live-counter/*
+!examples/extensions/live-counter/server.js
+!examples/extensions/status-dashboard/
+examples/extensions/status-dashboard/*
+!examples/extensions/status-dashboard/server.js
+
+!installers/
+installers/*
+!installers/systemd/
+installers/systemd/*
+!installers/systemd/freshell-rust.service
+
+# Distribution guard fixtures are checked in and needed by the default
+# Cloud Run lane. Re-include only the six controls; sibling dist/node_modules
+# files remain excluded.
+!test/fixtures/distribution/rust-only/dist/
+test/fixtures/distribution/rust-only/dist/*
+!test/fixtures/distribution/rust-only/dist/client/
+test/fixtures/distribution/rust-only/dist/client/*
+!test/fixtures/distribution/rust-only/dist/client/index.html
+!test/fixtures/distribution/rust-only/dist/tools/
+test/fixtures/distribution/rust-only/dist/tools/*
+!test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/
+test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/*
+!test/fixtures/distribution/rust-only/dist/tools/freshell-mcp/server.js
+!test/fixtures/distribution/node-server/dist/
+test/fixtures/distribution/node-server/dist/*
+!test/fixtures/distribution/node-server/dist/client/
+test/fixtures/distribution/node-server/dist/client/*
+!test/fixtures/distribution/node-server/dist/client/index.html
+!test/fixtures/distribution/node-server/dist/server/
+test/fixtures/distribution/node-server/dist/server/*
+!test/fixtures/distribution/node-server/dist/server/index.js
+!test/fixtures/distribution/node-server/dist/tools/
+test/fixtures/distribution/node-server/dist/tools/*
+!test/fixtures/distribution/node-server/dist/tools/freshell-mcp/
+test/fixtures/distribution/node-server/dist/tools/freshell-mcp/*
+!test/fixtures/distribution/node-server/dist/tools/freshell-mcp/server.js
+!test/fixtures/distribution/node-server/node_modules/
+test/fixtures/distribution/node-server/node_modules/*
+!test/fixtures/distribution/node-server/node_modules/node-pty/
+test/fixtures/distribution/node-server/node_modules/node-pty/*
+!test/fixtures/distribution/node-server/node_modules/node-pty/index.js
+
 assets/
 
 # Editor / IDE

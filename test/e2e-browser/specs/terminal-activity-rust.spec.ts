@@ -13,9 +13,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * TERM-15 + TERM-16 (Rust) — terminal-mode CLI activity, server-authoritative
  * turn completion, and the NEW `terminal.idle` truly-idle edge.
  *
- * Rust-only (`playwright.config.ts` registers this under `rust-chromium`):
- * this is the Rust port's implementation of the legacy activity engine; the
- * frozen legacy server has its own (this branch's `server/` predates the
  * amplifier provider entirely — same KNOWN DIVERGENCE as
  * `amplifier-restore-rust.spec.ts`).
  *
@@ -199,13 +196,10 @@ async function typePromptIntoLastPane(page: import('@playwright/test').Page, tex
 test.describe('Terminal-mode CLI activity (Rust only)', () => {
   test.setTimeout(180_000)
 
-  test('claude PTY lane: busy blue, one turn.complete, one terminal.idle, reload re-seeds', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('claude PTY lane: busy blue, one turn.complete, one terminal.idle, reload re-seeds', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-activity-claude-'))
     const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', FAKE_BEL_CLI)
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: { CLAUDE_CMD: fakeClaude },
         setupHome: async (homeDir) => {
@@ -308,16 +302,13 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
     }
   })
 
-  test('codex PTY lane: pending blue, BEL completes once, terminal.idle follows', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('codex PTY lane: pending blue, BEL completes once, terminal.idle follows', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-activity-codex-'))
     // Dual-role: the Rust codex terminal lane boots a `codex app-server`
     // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on
     // that spawn and every codex create fails PTY_SPAWN_FAILED.
     const fakeCodex = await installDualRoleCodexCli(path.join(sharedRoot, 'bin'), FAKE_BEL_CLI)
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: { CODEX_CMD: fakeCodex },
         setupHome: async (homeDir) => {
@@ -390,13 +381,10 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
     }
   })
 
-  test('amplifier events lane: busy from prompt:submit, complete + idle from prompt:complete', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('amplifier events lane: busy from prompt:submit, complete + idle from prompt:complete', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-activity-amp-'))
     const fakeAmplifier = await installFakeCli(path.join(sharedRoot, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         // 15s fake turn: long enough that the events lane (attached at
         // create to the broker's pre-created stub -- identity is
@@ -475,13 +463,10 @@ test.describe('Terminal-mode CLI activity (Rust only)', () => {
     }
   })
 
-  test('amplifier events lane: provider-error turn completes via orchestrator:complete (no prompt:complete)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-
+  test('amplifier events lane: provider-error turn completes via orchestrator:complete (no prompt:complete)', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-activity-amp-err-'))
     const fakeAmplifier = await installFakeCli(path.join(sharedRoot, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           AMPLIFIER_CMD: fakeAmplifier,

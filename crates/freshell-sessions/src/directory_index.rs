@@ -469,11 +469,20 @@ fn item_from_meta(
     source_file: Option<PathBuf>,
     legacy_session_id: Option<String>,
 ) -> IndexedSession {
+    // Session transcripts record the checkout as `cwd`. For a linked git
+    // worktree, the sidebar's project grouping follows the common repository
+    // root, while `cwd` remains the checkout for resume and display details.
+    // This is the same resolver used by terminal metadata.
+    let project_path = meta
+        .cwd
+        .as_deref()
+        .and_then(freshell_platform::git_meta::resolve_git_repo_root)
+        .unwrap_or_else(|| meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()));
     IndexedSession {
         session_id,
         legacy_session_id,
         provider: provider.to_string(),
-        project_path: meta.cwd.clone().unwrap_or_else(|| "unknown".to_string()),
+        project_path,
         title: meta.title.clone(),
         title_provider_generated: meta.title_provider_generated,
         summary: meta.summary.clone(),
@@ -2342,6 +2351,83 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    struct LinkedWorktreeFixture {
+        root: PathBuf,
+        project: PathBuf,
+        checkout: PathBuf,
+        gitdir: PathBuf,
+    }
+
+    impl LinkedWorktreeFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "freshell-directory-index-worktree-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            let project = root.join("project");
+            let checkout = root.join("checkouts/feature");
+            let gitdir = root.join("administrative/.git/worktrees/feature");
+            std::fs::create_dir_all(project.join(".git")).unwrap();
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::create_dir_all(&gitdir).unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", gitdir.display()),
+            )
+            .unwrap();
+            std::fs::write(gitdir.join("commondir"), "../../../../project/.git\n").unwrap();
+
+            Self {
+                root,
+                project,
+                checkout,
+                gitdir,
+            }
+        }
+    }
+
+    impl Drop for LinkedWorktreeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn linked_worktree_session_groups_under_parent_repo_and_keeps_checkout_cwd() {
+        let fixture = LinkedWorktreeFixture::new();
+        assert_eq!(
+            std::fs::read_to_string(fixture.checkout.join(".git")).unwrap(),
+            format!("gitdir: {}\n", fixture.gitdir.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.gitdir.join("commondir")).unwrap(),
+            "../../../../project/.git\n"
+        );
+        let checkout_path = fixture.checkout.to_string_lossy().into_owned();
+        let project_path = fixture.project.to_string_lossy().into_owned();
+        assert_eq!(
+            freshell_platform::git_meta::resolve_git_repo_root(&checkout_path).as_deref(),
+            Some(project_path.as_str()),
+            "the commondir fixture must select the common repository, not the administrative fallback"
+        );
+
+        let indexed = item_from_meta(
+            &ParsedSessionMeta {
+                cwd: Some(checkout_path.clone()),
+                ..Default::default()
+            },
+            "claude",
+            "session-1".to_string(),
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(indexed.project_path, project_path);
+        assert_eq!(indexed.cwd.as_deref(), Some(checkout_path.as_str()));
+    }
 
     /// Poll `predicate` every 10ms until it's true or `timeout` elapses.
     /// Returns whether it became true -- used to observe a detached

@@ -28,9 +28,7 @@ import { TestHarness } from '../helpers/test-harness.js'
  * pre-fix binary) isolates the `136b9e94` resume regression from that
  * commit's concurrent `terminal.created` logging change.
  *
- * Outside the default matrix by design: registered ONLY under the
  * `continuity-smoke` project (npm run smoke:continuity) and listed in
- * playwright.config.ts's RUST_ONLY_SPECS testIgnore for every match-all
  * project.
  *
  * ## Probe findings (Task 6, sdd/task-6-report.md)
@@ -120,8 +118,8 @@ async function paneByMode(harness: TestHarness, mode: Provider): Promise<any | n
 }
 
 test.describe('continuity smoke (REAL CLIs) -- pre-deploy gate', () => {
-  test('three real panes survive server restart + page reload with the same sessions', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust') // rust-only guard (spec is also in every match-all project's testIgnore)
+  test('three real panes survive server restart + page reload with the same sessions', async ({ page }) => {
+    // rust-only guard (spec is also in every match-all project's testIgnore)
     test.setTimeout(300_000) // hard cap 5 min; target wall clock <= 5 min (single scenario, polling waits only)
 
     // EPHEMERAL-ONLY: construct RustServer directly (throwaway port + mkdtemp

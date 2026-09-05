@@ -15,7 +15,6 @@
  *      identity; live panes across reloads take attach verdicts -- zero
  *      spawns).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch, because
  * this spec imports RustServer directly (restartAbrupt()).
  *
  * Helpers are copied, not imported, per the e2e suite's per-spec-ownership
@@ -23,7 +22,8 @@
  * reconcile-client-adoption-rust.spec.ts).
  */
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
@@ -149,7 +149,7 @@ async function bootSpec(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -323,9 +323,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
 
   test('fresh-agent restart recovers via reconcile verdicts (no lost-frame on the happy path)', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-recompl-verdicts-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -393,9 +391,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
 
   test('two clients resuming one fresh-agent sessionRef spawn exactly one sidecar', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-recompl-onesidecar-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -483,9 +479,7 @@ test.describe('reconcile completion (rust server, real SPA)', () => {
 
   test('page.reload storm never spawns an identity-less resume', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-recompl-storm-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })

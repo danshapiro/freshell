@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   startExternalServer,
   type ExternalServerHandle,
-  type OracleTarget,
 } from '../../../../port/oracle/harness/external-server.js'
 import {
   WsCaptureClient,
@@ -28,11 +27,11 @@ import {
  * `event` field of `freshAgent.event` as OPAQUE -- by design, for those tiers,
  * which don't care about fresh-agent inner-event shape). THIS test deliberately
  * does NOT use that registry: the entire point here is comparing the fresh-agent
- * envelope AND every inner `event.*` field, byte-for-byte, between the original
- * (node) server and the Rust port, driving the IDENTICAL WS sequence against a
- * deterministic fake `codex app-server` fixture (no live model calls, no cost).
+ * envelope AND every inner `event.*` field, byte-for-byte, between two owned
+ * Rust runs, driving the IDENTICAL WS sequence against a deterministic fake
+ * `codex app-server` fixture (no live model calls, no cost).
  *
- * Sequence driven against EACH target:
+ * Sequence driven against EACH Rust boot:
  *   hello -> freshAgent.create{sessionType:'freshcodex',provider:'codex'}
  *         -> freshAgent.send{text:'hi'} -> wait for the turn-complete chime
  *         -> freshAgent.attach{same sessionId} -> settle window
@@ -59,8 +58,8 @@ const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
 )
 
 /**
- * Deterministic thread id this differential run pins via
- * `FAKE_CODEX_APP_SERVER_BEHAVIOR.threadStartThreadId` -- both targets get the
+ * Deterministic thread id this Rust differential run pins via
+ * `FAKE_CODEX_APP_SERVER_BEHAVIOR.threadStartThreadId` -- both Rust boots get the
  * exact same id, so `sessionId` is NOT run-specific here and needs no
  * placeholder normalization (unlike the general T0/T1/T2 oracle).
  */
@@ -68,16 +67,15 @@ const THREAD_ID = 'thread-wireshape-differential'
 
 /**
  * Wrapper indirection identical to `restore-matrix.spec.ts`'s
- * `installFakeCodexAppServer`: re-exec `node <original fixture path>` rather
+ * `installFakeCodexAppServer`: re-exec the fixture path rather
  * than copying the fixture elsewhere. A plain copy would (a) touch
  * permission bits on a file outside this test's owned path
  * (`test/unit/port/oracle/**`) and (b) break the fixture's
  * `import { WebSocketServer } from 'ws'` bare-specifier resolution, which is
  * relative to the FIXTURE'S OWN location -- a copy dropped in a bare temp dir
  * has no `node_modules` ancestor. `CODEX_CMD` pointed at this wrapper works
- * identically for both the legacy runtime (spawns `CODEX_CMD` directly) and
- * the Rust sidecar (whitespace-splits `CODEX_CMD`, but a bare single-token
- * executable path works unchanged).
+ * identically for the Rust sidecar (a bare single-token executable path works
+ * unchanged).
  */
 async function installFakeCodexAppServer(destDir: string): Promise<string> {
   await fs.mkdir(destDir, { recursive: true })
@@ -96,13 +94,10 @@ process.exit(result.status ?? 1)
 /**
  * Scripted fixture behavior: pin the thread id, and -- critically -- emit a
  * `turn/completed{status:'completed'}` NOTIFICATION after `turn/start`
- * (`notificationsAfterMethods`, mirroring the exact pattern
- * `test/integration/server/codex-session-flow.test.ts:507-516` uses). Without
- * this, the fixture only returns an already-`completed` turn SYNCHRONOUSLY in
- * the `turn/start` RPC *response* -- both the legacy and Rust codex adapters
- * gate their completion edge on the asynchronous `turn/completed`
- * NOTIFICATION (never the RPC response body), so no notification means no
- * `freshAgent.turn.complete` chime ever fires, for either server.
+ * (`notificationsAfterMethods`, mirroring the exact pattern used by the
+ * codex session fixture). Without this, the fixture only returns an already-
+ * `completed` turn synchronously in the `turn/start` RPC response, while the
+ * Rust adapter gates its completion edge on the asynchronous notification.
  */
 function codexBehaviorEnv(): string {
   return JSON.stringify({
@@ -117,16 +112,13 @@ function codexBehaviorEnv(): string {
 }
 
 interface FreshAgentCapture {
-  target: OracleTarget
   messages: CapturedMessage[]
 }
 
 async function captureCodexFlow(
-  target: OracleTarget,
   fakeCodexPath: string,
 ): Promise<{ handle: ExternalServerHandle; capture: FreshAgentCapture }> {
   const handle = await startExternalServer({
-    target,
     provider: 'freshagent-wireshape',
     env: {
       CODEX_CMD: fakeCodexPath,
@@ -201,7 +193,7 @@ async function captureCodexFlow(
       .getServerMessages()
       .filter((m) => typeof m.type === 'string' && m.type.startsWith('freshAgent.'))
 
-    return { handle, capture: { target, messages } }
+    return { handle, capture: { messages } }
   } catch (err) {
     await client.close().catch(() => {})
     await handle.stop().catch(() => {})
@@ -247,21 +239,21 @@ function toNormalized(messages: CapturedMessage[]): NormalizedMessage[] {
   })
 }
 
-function formatDiff(diff: NormalizedDiff, node: NormalizedMessage[], rust: NormalizedMessage[]): string {
+function formatDiff(diff: NormalizedDiff, first: NormalizedMessage[], second: NormalizedMessage[]): string {
   const lines = diff.differences.map((d) => (
-    `  [#${d.index}] ${d.path} (${d.kind}): node=${JSON.stringify(d.a)} rust=${JSON.stringify(d.b)}`
+    `  [#${d.index}] ${d.path} (${d.kind}): first=${JSON.stringify(d.a)} second=${JSON.stringify(d.b)}`
   ))
-  const nodeTypes = node.map((m, i) => `${i}:${m.type}`).join(', ')
-  const rustTypes = rust.map((m, i) => `${i}:${m.type}`).join(', ')
+  const firstTypes = first.map((m, i) => `${i}:${m.type}`).join(', ')
+  const secondTypes = second.map((m, i) => `${i}:${m.type}`).join(', ')
   return [
-    `${diff.differences.length} divergence(s) between node (original) and rust (port) freshAgent frames:`,
+    `${diff.differences.length} divergence(s) between Rust freshAgent runs:`,
     ...lines,
-    `node frame types:  ${nodeTypes}`,
-    `rust frame types:  ${rustTypes}`,
+    `first frame types:  ${firstTypes}`,
+    `second frame types: ${secondTypes}`,
   ].join('\n')
 }
 
-describe('Fresh-agent wire-shape differential (original vs rust, codex)', () => {
+describe('Fresh-agent wire-shape determinism (Rust, codex)', () => {
   let sharedRoot: string | undefined
   let handles: ExternalServerHandle[] = []
 
@@ -278,29 +270,29 @@ describe('Fresh-agent wire-shape differential (original vs rust, codex)', () => 
       sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wireshape-differential-'))
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
-      const nodeRun = await captureCodexFlow('node', fakeCodexPath)
-      handles.push(nodeRun.handle)
-      const rustRun = await captureCodexFlow('rust', fakeCodexPath)
-      handles.push(rustRun.handle)
+      const firstRun = await captureCodexFlow(fakeCodexPath)
+      handles.push(firstRun.handle)
+      const secondRun = await captureCodexFlow(fakeCodexPath)
+      handles.push(secondRun.handle)
 
       expect(
-        nodeRun.capture.messages.length,
-        'original (node) must have emitted at least one freshAgent.* frame',
+        firstRun.capture.messages.length,
+        'first Rust run must have emitted at least one freshAgent.* frame',
       ).toBeGreaterThan(0)
       expect(
-        rustRun.capture.messages.length,
-        'rust port must have emitted at least one freshAgent.* frame',
+        secondRun.capture.messages.length,
+        'second Rust run must have emitted at least one freshAgent.* frame',
       ).toBeGreaterThan(0)
 
-      const nodeNormalized = toNormalized(nodeRun.capture.messages)
-      const rustNormalized = toNormalized(rustRun.capture.messages)
-      const diff = diffNormalized(nodeNormalized, rustNormalized)
+      const firstNormalized = toNormalized(firstRun.capture.messages)
+      const secondNormalized = toNormalized(secondRun.capture.messages)
+      const diff = diffNormalized(firstNormalized, secondNormalized)
 
       if (!diff.equal) {
         // eslint-disable-next-line no-console
-        console.error(formatDiff(diff, nodeNormalized, rustNormalized))
+        console.error(formatDiff(diff, firstNormalized, secondNormalized))
       }
-      expect(diff.equal, formatDiff(diff, nodeNormalized, rustNormalized)).toBe(true)
+      expect(diff.equal, formatDiff(diff, firstNormalized, secondNormalized)).toBe(true)
     },
     120_000,
   )

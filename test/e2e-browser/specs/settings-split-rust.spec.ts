@@ -16,11 +16,8 @@ const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
  * a full server restart on the same home/port/token (`RustServer.restart()`).
  *
  * The companion spec `settings-persistence-split.spec.ts` covers the SAME
- * split on the matrix, but its journey depends on `legacyLocalSettingsSeed`
  * (CFG-04/SESSION-13, unimplemented in Rust -- it is `test.fail`-annotated on
- * rust-chromium). This spec is the rust-green closure: seed-free, relative
  * theme assertions (toggle AWAY from whatever the context starts with), plus
- * the restart durability leg the matrix spec never exercises.
  */
 
 // Rust-only by registration (playwright.config.ts) AND by construction: the
@@ -35,7 +32,6 @@ const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
 const test = base.extend({
   testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: 'rust',
       construct: {},
     })
     await server.start()

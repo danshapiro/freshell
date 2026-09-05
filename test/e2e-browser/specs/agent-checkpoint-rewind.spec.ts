@@ -42,7 +42,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * instead. Root cause, confirmed by direct inspection of
  * `FreshAgentView.tsx`: this fixture's `turn/start` always answers with the
  * identical static turn id (documented for the ASSISTANT side by
- * `restore-matrix.spec.ts` SCENARIO 5's own HONEST SCOPE NOTE), and the
  * client's single-slot optimistic local-echo (`pendingLocalEcho`) is the
  * ONLY thing rendering a "You: ..." bubble for this fixture (its snapshot
  * turns are assistant-only, per `fake-app-server.mjs`'s `makeTurn`) -- so a
@@ -69,9 +68,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * reveals it, matching real desktop usage.
  *
  * Routed through the generalized E2eServerHandle seam (HARNESS-02) so the
- * SAME spec exercises the legacy Node server and the owned Rust server via
- * the `e2eServerKind` project option (see `playwright.config.ts`'s
- * `MATRIX_SPECS`).
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -84,12 +80,10 @@ const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
 
 /**
  * Re-exec wrapper around the shared fake Codex app-server fixture (see
- * `restore-matrix.spec.ts`'s identically-purposed helper for the full
  * rationale for a wrapper rather than a raw copy -- ESM bare-specifier
  * resolution and permission bits). Duplicated here rather than imported so
  * this spec stays self-contained, matching this test directory's existing
  * convention of each spec owning its own fixture-install helper (e.g.
- * `agent-continuity-matrix.spec.ts`'s `installFakeOpencode`).
  */
 async function installFakeCodexAppServer(destDir: string): Promise<string> {
   await fs.mkdir(destDir, { recursive: true })
@@ -119,15 +113,14 @@ function findFreshAgentLeaf(node: any): any {
 }
 
 test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
-  test('rewinding code through the real UI reverts tracked files while the later turn, model, and durable session survive a restart', async ({ page, e2eServerKind }) => {
-    // KNOWN DIVERGENCE (rust-chromium only): this gesture depends on the
-    // client's single-slot optimistic local echo (`pendingLocalEcho`)
+  test('rewinding code through the real UI reverts tracked files while the later turn, model, and durable session survive a restart', async ({ page }) => {
+    // This test remains explicitly skipped because the client's single-slot
+    // optimistic local echo (`pendingLocalEcho`) is not reliably
     // remaining visible/clickable long enough to hover + click "Rewind
     // code to here" -- the ONLY source for a "You: ..." bubble against
     // this fixture (see the file-level SCOPE NOTE). Empirically, repeated
-    // runs show the Rust server's `freshAgent.send.accepted` ack racing
-    // the client's local-echo reconciliation faster than the legacy
-    // server's, non-deterministically clearing the echo (and thus hiding
+    // runs show the Rust server's `freshAgent.send.accepted` acknowledgement
+    // non-deterministically clearing the echo (and thus hiding
     // the "Rewind" button) before this spec can act, even with every
     // avoidable serial wait removed and the two independent preconditions
     // (row present, checkpoint landed) run concurrently. This is a timing
@@ -137,16 +130,11 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
     // also out of scope -- shared infrastructure), not a Rust SERVER
     // defect in the checkpoint routes themselves (which are proven
     // correct by `crates/freshell-server/src/checkpoints.rs`'s 41 Rust
-    // tests, route-level, real-HTTP). The gesture is fully proven reliable
-    // against the legacy server (`legacy-chromium`, `chromium`, below) --
-    // legacy is the parity control here, matching the divergence-handling
-    // convention already used by `sidebar-click-resume.spec.ts` and
-    // `safe03-origin-matrix.spec.ts` for analogous cases.
-    test.skip(e2eServerKind === 'rust', 'KNOWN DIVERGENCE: optimistic local-echo timing races the Rewind click on the Rust server faster than on legacy -- see comment above; checkpoint routes themselves are proven correct by 41 Rust unit/integration tests.')
+    // tests, route-level, real-HTTP).
+    test.skip(true, 'KNOWN DIVERGENCE: optimistic local-echo timing races the Rewind click; checkpoint routes themselves are proven correct by 41 Rust unit/integration tests.')
 
-    // This scenario's own real-server-restart leg (rebuilding/relaunching a
-    // release binary under `rust-chromium`) can push total wall-clock past
-    // the suite's default 60s per-test budget; extend it rather than touch
+    // This scenario's real-server-restart leg can exceed the suite's default
+    // 60s per-test budget; extend it rather than touch
     // the shared global default.
     test.setTimeout(120_000)
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agent14-rewind-'))
@@ -158,7 +146,6 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
 
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath },
           setupHome: async (homeDir) => {
@@ -288,7 +275,6 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         // present, checkpoint landed) don't depend on each other -- serial
         // waiting was empirically observed to lose the race on the Rust
         // server, where the ack that drives the client's local-echo
-        // reconciliation can arrive faster than on the legacy server.
         const turn1Article = () => paneRoot.locator('[data-turn-role="user"]', { hasText: turn1Text })
         await Promise.all([
           expect(turn1Article()).toBeVisible({ timeout: 10_000 }),
@@ -369,7 +355,7 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         // behind any state that corrupts session/model resumption on the
         // next restart. ---
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await harness.clearSentWsMessages()
         await server.restart()
@@ -409,7 +395,6 @@ test.describe('Agent Checkpoint Rewind (AGENT-14)', () => {
         // process lifecycle.
         await expect.poll(() => fs.readFile(trackedFile, 'utf8')).toBe('original-content\n')
 
-        // HONEST SCOPE NOTE (mirrors `restore-matrix.spec.ts` SCENARIO 5's
         // identically-caused limitation): the fake Codex app-server does
         // NOT persist per-turn transcript content across a process
         // restart (`thread/turns/list`/`thread/read` always answer with

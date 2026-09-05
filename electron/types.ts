@@ -7,7 +7,7 @@ export const KnownServerSchema = z.object({
 })
 
 export const DesktopConfigSchema = z.object({
-  serverMode: z.enum(['daemon', 'app-bound', 'remote']),
+  serverMode: z.enum(['app-bound', 'remote']),
   port: z.number().default(3001),
   remoteUrl: z.string().url().optional(),
   remoteToken: z.string().optional(),

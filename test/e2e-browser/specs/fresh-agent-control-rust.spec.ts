@@ -52,7 +52,6 @@
  *      })
  *      process.stdin.resume()
  *   2. FRESHELL_FAKE_NOOP=1 npx playwright test --config test/e2e-browser/playwright.config.ts \
- *        --project=rust-chromium fresh-agent-control-rust -g "Allow"
  *   Expected: the approval-allow test fails — the approval card never renders
  *   (timeout waiting for role=alert "Permission request for Bash"), proving
  *   the assertion chain is not vacuous. (Recorded in the Task-8 report; with
@@ -75,8 +74,8 @@ import { test, expect } from '../helpers/fixtures.js'
 import {
   RustServer,
   GEMINI_STRIP_ENV_PREFIXES,
-  type TestServerInfo,
 } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js';
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -333,7 +332,7 @@ async function bootWall(
     stripEnvPrefixes?: string[]
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({
     env: options.env,
     stripEnvPrefixes: options.stripEnvPrefixes,
@@ -428,7 +427,7 @@ async function waitForStdinFrame(
 
 /** Direct REST snapshot read — the route every card renders from. */
 async function fetchSnapshot(
-  info: TestServerInfo,
+  info: E2eServerInfo,
   sessionType: string,
   provider: string,
   threadId: string,
@@ -541,7 +540,7 @@ async function bootClaudeLane(
   extraEnv: Record<string, string> = {},
 ): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -625,8 +624,7 @@ async function raisePermissionAndAssertNoDecisions(
 test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test.setTimeout(180_000)
 
-  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -656,8 +654,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -749,8 +746,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -793,8 +789,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -823,8 +818,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('Always Allow answers the second raise without a click', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Always Allow answers the second raise without a click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -863,8 +857,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -932,8 +925,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1005,8 +997,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('capability gate: /fork is not offered for claude', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('capability gate: /fork is not offered for claude', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1038,8 +1029,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
 test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('kilroy lifecycle: create/send/approval/question/reload/cancel on the KILROY_ENABLED gate', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy lifecycle: create/send/approval/question/reload/cancel on the KILROY_ENABLED gate', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1137,8 +1127,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
     }
   })
 
-  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1237,7 +1226,7 @@ function projectSlugOf(cwd: string): string {
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
 async function bootCodexLane(page: Page): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -1338,8 +1327,7 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1376,8 +1364,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('fork from tip: fork→archive→(child) unarchive→resume chain; source untouched; pane repoints', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fork from tip: fork→archive→(child) unarchive→resume chain; source untouched; pane repoints', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1451,8 +1438,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('per-turn fork: :row-N normalizes to the raw turn id, child diverges at the pin, dual durability', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-turn fork: :row-N normalizes to the raw turn id, child diverges at the pin, dual durability', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1629,7 +1615,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 /** Boot a freshopencode pane against the HTTP/SSE fake opencode serve. */
 async function bootOpencodeLane(page: Page): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -1702,8 +1688,7 @@ async function sendOpencodeTurn(
 test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('compact: POST /session/:id/summarize carries {providerID,modelID} exactly', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: POST /session/:id/summarize carries {providerID,modelID} exactly', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const sessionId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)
@@ -1734,8 +1719,7 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
     }
   })
 
-  test('fork from tip: child insert + pane repoint; source untouched after parent kill', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fork from tip: child insert + pane repoint; source untouched after parent kill', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const parentId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)
@@ -1789,8 +1773,7 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
     }
   })
 
-  test('per-turn fork: messageID lands; child history stops at the pin; dual durability', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-turn fork: messageID lands; child history stops at the pin; dual durability', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const parentId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)

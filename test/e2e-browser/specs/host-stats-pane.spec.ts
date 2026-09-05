@@ -8,11 +8,9 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * Authored + standalone-committed in Task 7 with captured RED evidence: the
  * first test fails at the picker click because the 'Host Stats' picker option
  * does not exist until Task 7's GREEN phase lands (this is the only sequence
- * point where absence-RED is reachable). Task 10 registers this spec into
- * MATRIX_SPECS (test/e2e-browser/playwright.config.ts) and re-runs it GREEN
- * under BOTH legs (legacy-chromium + rust-chromium); Rust parity coverage is
- * therefore inherent — the refresh-resolve and em-dash placeholder contracts
- * are identical on both servers (degraded sections resolve with zero-shape).
+ * point where absence-RED is reachable). The shared browser fixtures now
+ * run only the Rust server. Refresh completion and em-dash placeholders are
+ * exercised against that runtime (degraded sections resolve with zero-shape).
  *
  * Selector notes: tile grouping is exposed via [data-host-stats-tile] /
  * [data-host-stats-value] data test contracts (permitted by the HARNESS-11
@@ -90,7 +88,7 @@ test.describe('Host Stats pane', () => {
     await expect(refreshButton).toContainText('Collecting…')
 
     // (b) The refresh always resolves (degraded sections still resolve with
-    //     zero-shape, on both server implementations) and the button recovers.
+    //     zero-shape) and the button recovers.
     await expect(refreshButton).toBeEnabled({ timeout: 15_000 })
     await expect(refreshButton).toContainText('Refresh')
 

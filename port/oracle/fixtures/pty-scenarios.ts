@@ -1,10 +1,10 @@
 /**
- * Deterministic PTY capture scenarios for the equivalence oracle's T1 rung.
+ * Deterministic PTY capture scenarios for the Rust oracle's T1 rung.
  *
- * Each scenario drives a REAL pseudo-terminal (node-pty, spawned by the original
- * server) with a short, byte-stable sequence of shell commands and captures the
- * exact terminal output bytes between two sentinels. The captured bytes become a
- * committed golden that the Rust port must reproduce byte-for-byte.
+ * Each scenario drives a REAL pseudo-terminal owned by the Rust server's terminal
+ * runtime with a short, byte-stable sequence of shell commands and captures the
+ * exact terminal output bytes between two sentinels. The captured bytes are kept
+ * as frozen Rust-baseline provenance and must remain byte-for-byte stable.
  *
  * DETERMINISM RULES for every scenario (why these commands and not others):
  *   - ASCII-only, fixed output. NEVER date/hostname/pwd/ls/random/$RANDOM or

@@ -1,9 +1,11 @@
 import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
+import { z } from 'zod'
 import { DesktopConfigSchema, type DesktopConfig } from './types.js'
 
 const DESKTOP_CONFIG_FILENAME = 'desktop.json'
+const LEGACY_SERVER_MODE = 'daemon'
 
 function getConfigPath(): string {
   return path.join(os.homedir(), '.freshell', DESKTOP_CONFIG_FILENAME)
@@ -31,13 +33,49 @@ export async function readDesktopConfig(): Promise<DesktopConfig | null> {
   try {
     const content = await fsp.readFile(configPath, 'utf-8')
     const parsed = JSON.parse(content)
-    const result = DesktopConfigSchema.safeParse(parsed)
+    const migrated = migratePersistedConfig(parsed)
+    const result = DesktopConfigSchema.safeParse(migrated.config)
     if (!result.success) {
       return null
     }
+
+    if (migrated.changed) {
+      // Preserve fields introduced by newer/older desktop clients while
+      // changing only the retired mode. The schema result above still gives
+      // callers the validated current shape and defaults.
+      await writeDesktopConfig(migrated.config as DesktopConfig)
+      console.info(JSON.stringify({
+        severity: 'info',
+        component: 'electron-desktop-config',
+        event: 'desktop_config_migrated',
+        from: 'daemon',
+        to: 'app-bound',
+      }))
+    }
+
     return result.data
   } catch {
     return null
+  }
+}
+
+const PersistedConfigSchema = z.object({
+  serverMode: z.enum([
+    LEGACY_SERVER_MODE,
+    'app-bound',
+    'remote',
+  ]),
+}).passthrough()
+
+function migratePersistedConfig(value: unknown): { config: unknown; changed: boolean } {
+  const persisted = PersistedConfigSchema.safeParse(value)
+  if (!persisted.success || persisted.data.serverMode !== LEGACY_SERVER_MODE) {
+    return { config: value, changed: false }
+  }
+
+  return {
+    config: { ...persisted.data, serverMode: 'app-bound' },
+    changed: true,
   }
 }
 

@@ -1,7 +1,9 @@
-import { execSync } from 'child_process'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
+import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { resolveNpmExecFileCommand } from '../setup/npm-command.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -16,24 +18,39 @@ function findProjectRoot(): string {
 }
 
 interface EnsureFreshE2eBuildDeps {
-  execSync: typeof execSync
+  execFileSync: typeof execFileSync
   env: NodeJS.ProcessEnv
+  platform: NodeJS.Platform
   log: Pick<Console, 'log'>
 }
 
 export function ensureFreshE2eBuild(
   root: string,
   deps: EnsureFreshE2eBuildDeps = {
-    execSync,
+    execFileSync,
     env: process.env,
+    platform: process.platform,
     log: console,
   },
 ): void {
-  deps.log.log('[e2e-setup] Building client and server...')
-  deps.execSync('npm run build:client && npm run build:server', {
+  const env = { ...deps.env, NODE_ENV: 'production' }
+  const prebuild = resolveNpmExecFileCommand(['run', 'prebuild'], deps.env, deps.platform)
+  deps.execFileSync(prebuild.command, prebuild.args, {
     cwd: root,
     stdio: 'inherit',
-    env: { ...deps.env, NODE_ENV: 'production' },
+    env,
+  })
+  deps.log.log('[e2e-setup] Building client and Rust server...')
+  const npm = resolveNpmExecFileCommand(['run', 'build:client'], deps.env, deps.platform)
+  deps.execFileSync(npm.command, npm.args, {
+    cwd: root,
+    stdio: 'inherit',
+    env,
+  })
+  deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
+    cwd: root,
+    stdio: 'inherit',
+    env,
   })
   deps.log.log('[e2e-setup] Build complete.')
 }

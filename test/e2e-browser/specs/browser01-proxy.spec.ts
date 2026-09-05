@@ -17,9 +17,8 @@ import { test, expect } from '../helpers/fixtures.js'
  * The unit-level contract (duplicate headers, byte-exact anything, strict
  * incremental streaming, error shapes) is pinned by raw-socket tests in
  * `crates/freshell-server/src/proxy.rs` + `tests/browser01_proxy.rs`; this
- * spec is the browser-visible, both-server-kinds leg.
+ * spec is the browser-visible owned-Rust baseline.
  *
- * Runs on BOTH matrix projects (legacy = parity control, rust = the port).
  */
 
 interface CapturedRequest {
@@ -234,7 +233,7 @@ test.describe('BROWSER-01 same-origin reverse proxy', () => {
       // Upstream-side exactness: what the fixture server actually received.
       const root = fixture.captured.find((c) => c.rawUrl === '/')
       expect(root, 'upstream saw the iframe navigation').toBeTruthy()
-      // Wrap-review r3 (both servers): the proxy's gate credentials are
+      // The proxy's gate credentials are
       // withheld from upstream — the root navigation carried ONLY the
       // freshell-auth cookie, so nothing cookie-shaped may survive.
       expect(String(root!.headers.cookie ?? '')).not.toContain('freshell-auth')

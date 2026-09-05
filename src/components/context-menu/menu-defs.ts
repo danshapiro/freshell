@@ -584,11 +584,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'editor-paste', label: 'Paste', onSelect: () => editorActions?.paste(), disabled: !editorActions || readOnly },
       { type: 'item', id: 'editor-select-all', label: 'Select all', onSelect: () => editorActions?.selectAll(), disabled: !editorActions },
       { type: 'separator', id: 'editor-sep' },
-      { type: 'item', id: 'editor-open', label: 'Open in external editor', onSelect: () => editorActions?.openInEditor(), disabled: !editorActions },
       { type: 'item', id: 'editor-save', label: 'Save now', onSelect: () => editorActions?.saveNow(), disabled: !editorActions || readOnly },
       { type: 'item', id: 'editor-toggle-preview', label: 'Toggle preview/source', onSelect: () => editorActions?.togglePreview(), disabled: !editorActions },
       { type: 'item', id: 'editor-copy-path', label: 'Copy file path', onSelect: () => editorActions?.copyPath(), disabled: !editorActions },
-      { type: 'item', id: 'editor-reveal', label: 'Reveal in file explorer', onSelect: () => editorActions?.revealInExplorer(), disabled: !editorActions },
       { type: 'separator', id: 'editor-replace-sep' },
       { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]

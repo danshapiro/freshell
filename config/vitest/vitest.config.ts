@@ -16,6 +16,7 @@ import { fileURLToPath } from 'url'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
+const realProviderContractsEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
 
 export default defineConfig({
   root: projectRoot,
@@ -31,24 +32,16 @@ export default defineConfig({
     setupFiles: ['./test/setup/dom.ts'],
     exclude: [
       '**/node_modules/**',
-      '**/server-node-modules/**',
-      '**/bundled-node/**',
       '**/.worktrees/**',
       '**/.claude/worktrees/**',
       'docs/plans/**',
       // Port contract-freeze tests run under config/vitest/vitest.port.config.ts (node environment)
       'test/unit/port/**',
-      // Server tests run under config/vitest/vitest.server.config.ts (node environment)
-      'test/server/**',
-      'test/unit/server/**',
-      'test/integration/server/**',
-      'test/unit/visible-first/read-model-route-harness.test.ts',
-      'test/unit/visible-first/terminal-mirror-fixture.test.ts',
-      'test/unit/visible-first/cli-command-harness.test.ts',
-      'test/integration/session-repair.test.ts',
-      'test/integration/session-search-e2e.test.ts',
+      // These integration trees own their own runtime/artifact setup.
+      'test/integration/tooling/**',
+      'test/integration/electron/**',
       'test/e2e-browser/**',
-      'test/integration/real/**',
+      ...(realProviderContractsEnabled ? [] : ['test/integration/real/**']),
       // Electron tests run under config/vitest/vitest.electron.config.ts (node environment)
       'test/unit/electron/**',
       // Electron E2E tests run under Playwright, not Vitest

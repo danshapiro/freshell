@@ -650,7 +650,7 @@ describe('oracle mutation-validation — KNOWN LIMITATIONS (documented, not weak
     // here so the gap is VISIBLE rather than hidden. Tightening the schema to
     // require them would let this become a caught `drop-required-field` mutation.
     const ready = clone(serverParsed[READY_SERVER_INDEX]) as Record<string, unknown>
-    expect(ready.serverInstanceId, 'the original always sends serverInstanceId').toBeTruthy()
+    expect(ready.serverInstanceId, 'the Rust server always sends serverInstanceId').toBeTruthy()
 
     const withoutSrv = dropPath(ready, ['serverInstanceId'])
     const rSrv = validator.validateServerMessage(withoutSrv)

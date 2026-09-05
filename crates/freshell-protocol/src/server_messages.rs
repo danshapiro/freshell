@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 60 discriminants).
+//! Server → client messages (`ServerMessage`, 55 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -33,16 +33,6 @@ pub enum ServerMessage {
     CodexActivityListResponse(CodexActivityListResponse),
     #[serde(rename = "codex.activity.updated")]
     CodexActivityUpdated(CodexActivityUpdated),
-    #[serde(rename = "codingcli.created")]
-    CodingCliCreated(CodingCliCreated),
-    #[serde(rename = "codingcli.event")]
-    CodingCliEvent(CodingCliEvent),
-    #[serde(rename = "codingcli.exit")]
-    CodingCliExit(CodingCliExit),
-    #[serde(rename = "codingcli.killed")]
-    CodingCliKilled(CodingCliKilled),
-    #[serde(rename = "codingcli.stderr")]
-    CodingCliStderr(CodingCliStderr),
     #[serde(rename = "config.fallback")]
     ConfigFallback(ConfigFallback),
     // Extension surface (P1.8 pane-identity ledger, not in the frozen T0
@@ -153,18 +143,13 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 55] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",
     "codex.activity.updated",
-    "codingcli.created",
-    "codingcli.event",
-    "codingcli.exit",
-    "codingcli.killed",
-    "codingcli.stderr",
     "config.fallback",
     "error",
     "extension.server.error",
@@ -470,48 +455,6 @@ pub struct OpencodeActivityListResponse {
 pub struct OpencodeActivityUpdated {
     pub remove: Vec<String>,
     pub upsert: Vec<OpencodeActivityRecord>,
-}
-
-// --- codingcli.* ------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliCreated {
-    pub provider: String,
-    pub request_id: String,
-    pub session_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliEvent {
-    /// Provider-specific payload (opaque).
-    pub event: Value,
-    pub provider: String,
-    pub session_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliExit {
-    pub exit_code: i64,
-    pub provider: String,
-    pub session_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliKilled {
-    pub session_id: String,
-    pub success: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodingCliStderr {
-    pub provider: String,
-    pub session_id: String,
-    pub text: String,
 }
 
 // --- config / error ---------------------------------------------------------

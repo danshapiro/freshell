@@ -2,6 +2,10 @@
 
 Freshell is a self-hosted, browser-accessible terminal multiplexer and session organizer. It provides multi-tab terminal management with support for terminals and coding CLI's like Claude Code and Codex. Key features include session history browsing, AI-powered summaries (via Google Gemini), and remote access over LAN/VPN with token-based authentication.
 
+## Active Repair Plan
+
+PR699 follow-up: [Rust-only integration repair plan](docs/superpowers/plans/2026-09-04-pr699-integration-repair.md).
+
 ## Development Philosophy
 - We are working on an infinite schedule with infinite tokens. This is unusual! We do not have time pressure, and can do things correctly.
 - We use Red-Green-Refactor TDD for all changes but the most trivial (e.g. doc changes). We never skip the tests, and never skip the refactor.
@@ -21,8 +25,8 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Merge PRs once their required checks pass, then bring `origin/main` down to local `main`. Self-merging your own PRs is the norm. The only exception is a PR the user has said needs someone else to approve it first — leave those unmerged.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
-- Server uses NodeNext/ESM; relative imports must include `.js` extensions
-- Always consider checking logs for debugging; server logs (including client console logs) are in the server process stdout/stderr (e.g., `npm run dev`/`npm start`).
+- TypeScript tooling and Electron use NodeNext/ESM; relative imports must include `.js` extensions.
+- Always consider checking logs for debugging; Rust server logs and client/Electron logs are in the owning process stdout/stderr (for example, `npm run dev` or `npm start`). The standalone Rust launcher also writes JSONL logs under `~/.freshell/logs/`.
 - Debug logging toggle (UI Settings → Debugging → Debug logging) enables debug-level logs and perf logging; keep OFF outside perf investigations.
 - When adding new user-facing features or making significant UI changes, update `docs/index.html` to reflect them. It's a nonfunctional mock of the default experience, so only major changes need to be added.
 
@@ -32,8 +36,8 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
-- `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
-- Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped at vitest config load by `config/vitest/sanitize-test-env.ts` (imported first by every config EXCEPT the two real-provider smoke configs); local test runs do not need env pre-stripping.
+- `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. Zero-argument and explicit broad `--run` server/integration invocations are coordinated; narrowed Cargo selectors are delegated.
+- Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped by `config/vitest/sanitize-test-env.ts` at standard client, Electron-unit, contract/oracle, and browser-helper Vitest config load. The PR699 repair plan covers extending this to the new source-runtime and packaged-runtime configs.
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).
@@ -58,20 +62,19 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Process Safety (CRITICAL)
 
-- Never use broad kill patterns (for example `pkill -f "tsx watch server/index.ts"`, `pkill -f vite`, `pkill node`).
+- Never use broad kill patterns (for example `pkill -f vite` or `pkill node`).
 - Start manual worktree servers on a unique port and record their PID, then stop only that PID.
-- Dev mode example (full hot reload — Vite client HMR + tsx-watch server): `NODE_ENV=development PORT=3344 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`, then open `http://localhost:5173/?token=<AUTH_TOKEN from .env>` (Vite proxies `/api` + `/ws` to the server port).
-  - `NODE_ENV=development` is required: a lingering `NODE_ENV=production` in the shell (e.g. left by `npm start`) makes `isDev` false, so the server skips the Vite path and `/` 404s on `client/index.html`.
-  - Server-only hot reload (no client UI): `PORT=3344 npm run dev:server ...` instead.
-- Production mode example (built dist): `PORT=3344 npm start > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
-  - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
+- Dev mode example (Vite client HMR plus the Rust server): `PORT=3344 VITE_PORT=5174 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`, then open `http://localhost:5174/?token=<AUTH_TOKEN from .env>` (Vite proxies `/api` and `/ws` to the Rust server on port 3344).
+  - Server-only development (without the Vite UI): `PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`.
+- Production mode example (built Rust binary): `PORT=3344 npm start > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`.
+- The Rust binary is `target/release/freshell-server` (or `.exe` on Windows). It is the only Freshell backend executable.
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
-- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation. As of July 2026 the live self-hosted server is the RUST server on port 3001 (see below), not the Node server.
+- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation. The live self-hosted server is the Rust server on port 3001 (see below).
 
 ## Rust Server (Self-Hosted Production)
 
-The production self-hosted Freshell is the Rust server (`target/release/freshell-server`, workspace crate `freshell-server`), running on **port 3001** from the main checkout (`.env` sets `PORT=3001`; the launcher script's built-in default is 3002, so always confirm the live port via `ls ~/.freshell/rust-server-*.pid` or `ss -tlnp`). The Node server (`npm start`) still exists but is not what the user runs day-to-day.
+The production self-hosted Freshell is the Rust server (`target/release/freshell-server`, workspace crate `freshell-server`), running on **port 3001** from the main checkout (`.env` sets `PORT=3001`; the launcher script's built-in default is 3002, so always confirm the live port via `ls ~/.freshell/rust-server-*.pid` or `ss -tlnp`).
 
 **Canonical launcher: `scripts/launch-rust.sh`** — use this instead of hand-rolled build/launch commands:
 
@@ -118,31 +121,36 @@ Key facts:
 
 ### Development
 ```bash
-npm run dev                 # Run client + server concurrently with hot reload
+npm run dev                 # Run Vite + the Rust server with hot reload
 npm run dev:client          # Vite dev server only (port 5173)
-npm run dev:server          # Node with tsx watch for server auto-reload
+npm run dev:server          # Rust server only
 ```
 
 ### Building
 ```bash
-npm run build               # Full build (client + server)
+npm run build               # Full build (client + tools + Rust server)
 npm run build:client        # Vite build → dist/client
-npm run build:server        # TypeScript compile → dist/server
-npm run serve               # Build and run production server
+npm run build:rust          # Release freshell-server binary
+npm run serve               # Build and run the Rust server
 # `npm run serve` prompts before serving from a non-main branch; use
 # `FRESHELL_ALLOW_NON_MAIN_SERVE=1 npm run serve` only when intentional.
-# Note: `npm run build` is guarded — it will refuse to overwrite dist/
-# if a production server is detected on the configured PORT. Use
-# `npm run check` for safe verification, or build from a worktree.
+# Note: `npm test` (through its source-runtime phase), `npm run build`,
+# `npm run verify`, `npm run check`, and `npm run electron:dev` are guarded —
+# on the main checkout they fail closed
+# before writing artifacts if a production server is detected on the configured
+# PORT. Use `npm run typecheck:client` for a no-write check, or run
+# source-runtime/build verification from a linked worktree
+# (`cd .worktrees/<branch>`). `npm run dev` and `npm run dev:server` bootstrap
+# a first-run `.env` token and the locked Claude sidecar before starting Rust.
 ```
 
-**On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process (WSL cannot compile `node-pty` for win32); drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
+**On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process so Cargo produces a native `freshell-server.exe`; drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
 
 ### Testing
 Backend fallback policy: never silently fall back from the configured cloud test backend to local — if the cloud path fails, fix it; a local-backend run may substitute only when the cloud path cannot be fixed AND the user explicitly approves.
 
 ```bash
-npm test                    # Coordinated full suite (default + server configs)
+npm test                    # Coordinated client, Rust, and Electron suite
 npm run check               # Typecheck, then coordinated full suite
 npm run verify              # Build, then coordinated full suite
 npm run test:coverage       # Coordinated default-config coverage run
@@ -150,20 +158,20 @@ npm run test:status         # Show active holder, latest results, and advisory b
 npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthrough work
 ```
 
-External provider contract tests (`test/integration/real/`) spawn real `claude`, `codex`, and `opencode` binaries to verify external provider behavior, not Freshell code. They are opt-in and skipped by default to avoid blocking the coordinated suite on environment-dependent flakiness:
+External provider contract tests (`test/integration/real/`) exercise the real Amplifier CLI, not Freshell code. When the documented opt-in enables this tree, the version smoke runs when `amplifier` is available; tests that adopt a session or make a model call additionally require provider setup. The tree is excluded from the default suite to avoid blocking the coordinated run on environment-dependent external-tool behavior:
 ```bash
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
-  run test/integration/real/ --config config/vitest/vitest.server.config.ts
+  run test/integration/real/ --config config/vitest/vitest.config.ts
 ```
 
 ### Vitest Test Backend (Cloud Run Jobs)
 
-Vitest unit/server test suites can run locally or on Google Cloud Run Jobs. The `FRESHELL_VITEST_BACKEND` environment variable controls the default:
+Vitest client/tooling suites can run locally or on Google Cloud Run Jobs. The `FRESHELL_VITEST_BACKEND` environment variable controls the default:
 - **Unset or `"local"`**: run locally (the safe default for new clones)
 - **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~5 min local, ~$0.02/run)
 
 ```bash
-npm run test:cloud          # Run vitest on Cloud Run Jobs (client + server suites)
+npm run test:cloud          # Run Vitest on Cloud Run Jobs (client/tooling suites)
 npm run test:cloud:build    # Build and push the Docker image to Artifact Registry
 ```
 
@@ -207,21 +215,35 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 
 ### Tech Stack
 - **Frontend:** React 18, Redux Toolkit, Vite, Tailwind CSS, shadcn/ui, xterm.js, Zod
-- **Backend:** Node.js/Express, node-pty, WebSocket (ws), Chokidar, Vercel AI SDK + Google Generative AI
-- **Testing:** Vitest, Testing Library, supertest, superwstest
+- **Backend:** Rust (`freshell-server`, Axum, Tokio, portable-pty, SQLite), with a React/Vite client
+- **Testing:** Vitest, Testing Library, Playwright, Cargo tests
 
 ### Directory Structure
 - `src/` - React frontend application
   - `components/` - UI components (TabBar, Sidebar, TerminalView, HistoryView, etc.)
   - `store/` - Redux slices (tabs, connection, sessions, settings, claude)
   - `lib/` - Utilities (api.ts, claude-types.ts)
-- `server/` - Node.js/Express backend
-  - `index.ts` - HTTP/REST routes and server entry
-  - `ws-handler.ts` - WebSocket protocol handler
-  - `terminal-registry.ts` - PTY lifecycle management
-  - `claude-session.ts` - Claude session discovery & indexing
-  - `claude-indexer.ts` - File watcher for ~/.claude directory
-- `test/` - Test suites organized by unit/integration and client/server
+- `crates/freshell-server/` - Rust HTTP/WebSocket server entrypoint and routes
+- `crates/freshell-ws/` - WebSocket protocol and terminal/session coordination
+- `crates/freshell-terminal/` - PTY lifecycle, replay, and output framing
+- `crates/freshell-sessions/` - Claude, Codex, OpenCode, and Amplifier session discovery
+- `tools/` - Standalone Node CLI and stdio MCP client; these call the Rust server and never host it
+- `crates/freshell-claude-sidecar/` - Isolated Node stdio sidecar for the Claude SDK, used only by Rust fresh-agent Claude sessions
+- `test/` - Client/tooling, Rust integration, browser, and Electron test suites
+
+### Standalone clients and Claude sidecar
+
+- Build the CLI and MCP client with `npm run build:tools`. The CLI entrypoint is
+  `dist/tools/freshell-cli/index.js`; its `freshell` package bin sends requests
+  to the Rust server configured by `FRESHELL_URL` and `FRESHELL_TOKEN`.
+- The MCP entrypoint is `dist/tools/freshell-mcp/server.js`. It is a stdio
+  client, not a server for Freshell's HTTP/WebSocket API; configure
+  `FRESHELL_URL` and `FRESHELL_TOKEN` explicitly when launching it outside a
+  Freshell terminal.
+- Claude fresh-agent panes use the isolated
+  `crates/freshell-claude-sidecar` package. It is a newline-JSON stdio child
+  launched by Rust and owns the Claude SDK dependency. The sidecar does not
+  listen on a port and is not the Freshell backend.
 
 ### Key Architectural Patterns
 
@@ -239,13 +261,13 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 
 **Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-in... [truncated] Separately, the sidebar shows cross-device remote status rings around a session row's icon: a green ring means the session is open on another device, a blue ring means it is busy on another device (blue wins over green), and rings are suppressed entirely when the session is open on this device (derived from `tabs.sync` registry snapshots — producing clients stamp pane payloads with `sessionKeys`/`busySessionKeys`, consumers re-query remote snapshots on a 30s interval, and the server partitions same-device records into `sameDeviceOpen`, which never produces rings).
 
-**Fresh-Agent Orchestration:** The REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the MCP `freshell` tool accept `agent`/`model`/`effort` parameters to create and drive fresh-agent panes (e.g. `agent=opencode`). The orchestration layer dispatches to the registered `FreshAgentRuntimeManager`, so the same external surface works for any fresh-agent provider. On MCP `new-tab`, resume sugar (`resume`/`resumeSessionId`) is honored for `agent: "opencode"` (Rust server). Agent-resume via `sessionRef` is NOT supported for claude/codex/kilroy agents (the Rust server rejects it with a 400; the Node server silently ignores it) — use an explicit `sessionRef` on MODE panes where that path supports it.
+**Fresh-Agent Orchestration:** The Rust REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the standalone Node MCP client accept `agent`/`model`/`effort` parameters where the Rust contract supports them. The Rust orchestration layer dispatches to the registered fresh-agent runtimes. On MCP `new-tab`, resume sugar (`resume`/`resumeSessionId`) is honored for `agent: "opencode"`; agent resume for Claude/Codex/Kilroy uses an explicit supported `sessionRef` or the appropriate mode-pane flow. Unsupported legacy actions return a deterministic unavailable result instead of contacting a removed backend route.
 
 ### Data Flow
 
-1. Browser loads → fetches settings from `/api/settings` and sessions from `/api/sessions`
+1. Browser loads → fetches settings from the Rust server's `/api/settings` route and sessions from `/api/sessions`
 2. WebSocket connects → client sends `hello` with auth token → server sends `ready`
-3. Terminal creation → Pane content has `createRequestId` → UI sends `terminal.create` WS message with that ID → server spawns PTY → sends back `terminal.created` with `terminalId` → pane content updated
+3. Terminal creation → Pane content has `createRequestId` → UI sends `terminal.create` WS message with that ID → Rust server spawns PTY → sends back `terminal.created` with `terminalId` → pane content updated
 4. Terminal I/O → `terminal.input` WS messages write to PTY stdin → stdout/stderr streams to attached clients
 
 ## Accessibility (A11y) Requirements

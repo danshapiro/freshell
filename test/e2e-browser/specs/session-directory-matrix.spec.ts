@@ -4,14 +4,10 @@ import { test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
- * HARNESS-02 Finding 1 -- the "session" matrix scenario category.
  *
  * Seeds the isolated HOME with real Claude Code session JSONL files (before
  * the server boots, via `construct.setupHome`) and asserts the sidebar's
- * session list discovers and renders them. Routed through the same
- * `E2eServerHandle`/`e2eServerKind` seam as `settings-persistence-split.spec.ts`
- * (HARNESS-02) so this SAME spec exercises both the legacy Node server and
- * the owned Rust server depending on the active project.
+ * session list discovers and renders them through the owned Rust server.
  *
  * Session-file shape is a trimmed version of
  * `perf/seed-server-home.ts`'s `buildSessionJsonl`: a `system`/`init` line,
@@ -23,7 +19,6 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 const SESSION_ALPHA_ID = '00000000-0000-4000-8000-0000000a1111'
 const SESSION_BETA_ID = '00000000-0000-4000-8000-0000000b2222'
 // SESSION-01 extension -- codex + opencode seeds, sharing the same
-// `matrix-*` naming convention as the Claude alpha/beta seeds above so a
 // single sidebar assertion can look for all three providers.
 const CODEX_SESSION_ID = 'codex-matrix-gamma-0001'
 const OPENCODE_SESSION_ID = 'oc-matrix-delta-0001'
@@ -103,13 +98,11 @@ function buildSessionJsonl(input: {
   return `${lines.join('\n')}\n`
 }
 
-// Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
-// SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `e2eServerKind` option.
+// Use the generalized E2eServerHandle seam (HARNESS-02) with the owned Rust
+// fixture so each worker receives an isolated server and home.
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           const projectsDir = path.join(homeDir, '.claude', 'projects')
@@ -189,11 +182,10 @@ const test = base.extend({
           // read by the SAME `OpencodeSource`, so this seed is exercised by
           // the real production reader, not a test-only shape.
           // `default_opencode_data_home()` resolves `$XDG_DATA_HOME/opencode`
-          // (else `<realHome>/.local/share/opencode`). Both owned fixtures'
-          // `applyIsolatedHomeEnvironment` (`helpers/test-server.ts`) already
-          // sets `XDG_DATA_HOME` to `<homeDir>/.local/share` for every spawned
-          // server, so writing the DB there keeps it inside the isolated
-          // sandbox with no extra env override needed.
+          // (else `<realHome>/.local/share/opencode`). The Rust fixture's
+          // isolated-home environment sets `XDG_DATA_HOME` to
+          // `<homeDir>/.local/share`, so writing the DB there keeps it inside
+          // the isolated sandbox with no extra env override needed.
           const opencodeDataDir = path.join(homeDir, '.local', 'share', 'opencode')
           await fs.mkdir(opencodeDataDir, { recursive: true })
           const Database = (await import('node:sqlite')).DatabaseSync
@@ -241,28 +233,8 @@ const test = base.extend({
           // the Codex/OpenCode seeds above; the isolated `homeDir` IS the
           // real home for the spawned server).
           //
-          // KNOWN DIVERGENCE (codex-first triage note): this checked-out
-          // branch's `server/` tree (legacy Node implementation, FROZEN for
-          // this task) predates upstream `origin/main` commit `05c6b1fa`
-          // ("feat(amplifier): durable session tracking via events.jsonl"),
-          // where `server/coding-cli/providers/amplifier.ts` was introduced
-          // -- verified via `git log --oneline HEAD..origin/main --
-          // server/coding-cli/providers/amplifier.ts` (6 commits touch that
-          // path; the unfiltered `git log --oneline HEAD..origin/main`,
-          // with no path filter, is 49 -- that broader count is NOT specific
-          // to this file and should not be quoted as if it were) and by
-          // grepping for zero "amplifier" occurrences under `server/` or
-          // `shared/` in this checkout (`dist/server/index.js` is a
-          // gitignored build artifact, absent in a fresh checkout/worktree
-          // until a build is run, so it is NOT part of this verification --
-          // only present here because this worktree happens to have been
-          // built already). So legacy has NO Amplifier provider registered
-          // at all in this branch -- not a home-layout mismatch to align, an
-          // absent feature. The seed below is still written unconditionally
-          // (same as every other provider seed in this hook) so a future
-          // merge of that upstream commit into this branch picks it up for
-          // free; the per-assertion `e2eServerKind === 'rust'` guards below
-          // are where the divergence is actually handled.
+          // The seed is written unconditionally so the owned Rust session
+          // directory indexes Amplifier alongside the other provider homes.
           const amplifierSessionDir = path.join(
             homeDir, '.amplifier', 'projects', 'matrix-epsilon-project', 'sessions', AMPLIFIER_SESSION_ID,
           )
@@ -324,8 +296,8 @@ test.describe('Session Directory Matrix', () => {
   // SESSION-01 -- "Index Claude, Codex, OpenCode, and Amplifier histories."
   // Extends the Claude-only assertion above to the seeded Codex + OpenCode +
   // Amplifier sessions, proving the sidebar surfaces all four provider
-  // families in one page against the SAME server (either project kind).
-  test('seeded Codex, OpenCode, and Amplifier sessions appear in the sidebar alongside Claude', async ({ freshellPage, page, e2eServerKind }) => {
+  // families in one page against the owned Rust server.
+  test('seeded Codex, OpenCode, and Amplifier sessions appear in the sidebar alongside Claude', async ({ freshellPage, page }) => {
     const sessionList = page.getByTestId('sidebar-session-list')
     await expect(sessionList).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText('No sessions yet')).not.toBeVisible()
@@ -339,40 +311,10 @@ test.describe('Session Directory Matrix', () => {
     await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText(/harness-02 matrix delta/i)).toBeVisible({ timeout: 15_000 })
 
-    // SESSION-01's 4th provider family: Amplifier -- this is the first e2e
-    // proof of the Rust-side Amplifier indexing feature
-    // (`crates/freshell-sessions/src/amplifier.rs`, wired as the fourth
-    // session source in `crates/freshell-server/src/main.rs`).
-    //
-    // KNOWN DIVERGENCE (codex-first triage note): scoped to `rust-chromium`
-    // only. This checked-out branch's `server/` tree (legacy Node
-    // implementation, FROZEN for this task) predates upstream
-    // `origin/main` commit `05c6b1fa` ("feat(amplifier): durable session
-    // tracking via events.jsonl"), which is where
-    // `server/coding-cli/providers/amplifier.ts` was introduced --
-    // verified via `git log --oneline HEAD..origin/main --
-    // server/coding-cli/providers/amplifier.ts` (6 commits touch that path,
-    // at time of writing; the unfiltered `git log --oneline
-    // HEAD..origin/main`, with no path filter, is 49 -- that broader count
-    // is NOT specific to this file) and by grepping for zero "amplifier"
-    // occurrences under `server/` or `shared/` in this checkout
-    // (`dist/server/index.js`, which the `legacy-chromium` project's
-    // `TestServer` runs, is a gitignored build artifact -- absent in a
-    // fresh checkout/worktree until a build is run, so it's confirmatory
-    // only for an already-built checkout, not a standalone proof). So on
-    // `legacy-chromium` the legacy indexer has NO Amplifier provider
-    // registered at all and will never surface this seed -- that is not a
-    // home-layout mismatch to align (legacy and Rust already agree
-    // `~/.amplifier` is the right home; see `amplifier_home()` in
-    // `amplifier.rs` vs `defaultAmplifierHome()` referenced in its doc
-    // comment), it is an absent feature on this branch, outside this task's
-    // frozen `server/` ownership. A follow-up merge of that upstream commit
-    // into this branch (or a Codex-driven port pass) would close the gap;
-    // flagging it here rather than silently asserting only what happens to
-    // pass.
-    if (e2eServerKind === 'rust') {
-      await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
-    }
+    // SESSION-01's fourth provider family: this checks the Rust-side
+    // Amplifier indexer (`crates/freshell-sessions/src/amplifier.rs`) through
+    // the same sidebar list as the other seeded providers.
+    await expect(page.getByText(/harness-02 matrix epsilon/i)).toBeVisible({ timeout: 15_000 })
   })
 
   // SESSION-01 narrowed-MISSING closure -- provider ICON assertion. Each
@@ -395,7 +337,7 @@ test.describe('Session Directory Matrix', () => {
   // assertions. `SidebarItem` (`src/components/Sidebar.tsx`) already puts
   // `data-session-id={item.sessionId}` on the row button, giving an
   // unambiguous per-session locator.
-  test('each seeded session renders its own distinct provider icon in the sidebar', async ({ freshellPage, page, e2eServerKind }) => {
+  test('each seeded session renders its own distinct provider icon in the sidebar', async ({ freshellPage, page }) => {
     await expect(page.getByTestId('sidebar-session-list')).toBeVisible({ timeout: 15_000 })
     await expect(page.getByText(/harness-02 matrix gamma/i)).toBeVisible({ timeout: 15_000 })
 
@@ -429,13 +371,10 @@ test.describe('Session Directory Matrix', () => {
     // DIFFERENT icon from every other, not a shared fallback.
     expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox]).size).toBe(3)
 
-    // Amplifier (rust-chromium only -- see the KNOWN DIVERGENCE note in the
     // sibling test above): the 4th provider family's icon.
-    if (e2eServerKind === 'rust') {
-      const epsilonViewBox = await iconViewBox(AMPLIFIER_SESSION_ID)
-      expect(epsilonViewBox).toBe(PROVIDER_ICON_VIEWBOX.amplifier)
-      expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox, epsilonViewBox]).size).toBe(4)
-    }
+    const epsilonViewBox = await iconViewBox(AMPLIFIER_SESSION_ID)
+    expect(epsilonViewBox).toBe(PROVIDER_ICON_VIEWBOX.amplifier)
+    expect(new Set([alphaViewBox, gammaViewBox, deltaViewBox, epsilonViewBox]).size).toBe(4)
   })
 
   // SESSION-01 -- API-level field-parity + ordering proof. Cheaper and more
@@ -444,7 +383,6 @@ test.describe('Session Directory Matrix', () => {
   // `server/session-directory/service.ts`; same route path on the Rust side
   // at `crates/freshell-server/src/session_directory.rs:315`) and asserts
   // identity (provider+sessionId), cwd/project, and lastActivityAt for each
-  // seeded session, plus that the matrix sessions come back ordered by
   // lastActivityAt DESC -- the acceptance text's "ordering" clause.
   //
   // Scope note (honesty per SESSION-01's Playwright validation, which also
@@ -455,7 +393,7 @@ test.describe('Session Directory Matrix', () => {
   // this spec and is left to a dedicated resume-flow spec. Conflating field
   // parity with a working resume flow here would overreach past what's
   // actually asserted below.
-  test('session-directory API reports identity, cwd, and lastActivityAt for every seeded session, ordered by recency', async ({ freshellPage, page, serverInfo, e2eServerKind }) => {
+  test('session-directory API reports identity, cwd, and lastActivityAt for every seeded session, ordered by recency', async ({ freshellPage, page, serverInfo }) => {
     // Sanity: wait for the sidebar to be populated (indexer's initial scan
     // complete) before querying the API directly.
     await expect(page.getByTestId('sidebar-session-list')).toBeVisible({ timeout: 15_000 })
@@ -533,29 +471,24 @@ test.describe('Session Directory Matrix', () => {
     expect(alphaIdx).toBeLessThan(deltaIdx)
     expect(betaIdx).toBeLessThan(deltaIdx)
 
-    // Amplifier (rust-chromium only -- see the KNOWN DIVERGENCE note in the
     // previous test): exact identity/cwd/lastActivityAt match, computed
     // directly from the metadata.json fixture seeded above -- this is this
     // task's field-parity proof for the 4th provider family. Seeded newest
     // of the five, so it must sort before gamma.
-    if (e2eServerKind === 'rust') {
-      const epsilon = findItem('amplifier', AMPLIFIER_SESSION_ID)
-      expect(epsilon.projectPath).toBe('/tmp/freshell-matrix/epsilon-project')
-      expect(epsilon.cwd).toBe('/tmp/freshell-matrix/epsilon-project')
-      expect(epsilon.lastActivityAt).toBe(Date.parse(AMPLIFIER_LAST_ACTIVITY_AT_ISO))
+    const epsilon = findItem('amplifier', AMPLIFIER_SESSION_ID)
+    expect(epsilon.projectPath).toBe('/tmp/freshell-matrix/epsilon-project')
+    expect(epsilon.cwd).toBe('/tmp/freshell-matrix/epsilon-project')
+    expect(epsilon.lastActivityAt).toBe(Date.parse(AMPLIFIER_LAST_ACTIVITY_AT_ISO))
 
-      const epsilonIdx = orderedIds.indexOf(`amplifier:${AMPLIFIER_SESSION_ID}`)
-      expect(epsilonIdx).toBeGreaterThanOrEqual(0)
-      expect(epsilonIdx).toBeLessThan(gammaIdx)
-    }
+    const epsilonIdx = orderedIds.indexOf(`amplifier:${AMPLIFIER_SESSION_ID}`)
+    expect(epsilonIdx).toBeGreaterThanOrEqual(0)
+    expect(epsilonIdx).toBeLessThan(gammaIdx)
   })
 
   // SESSION-09 -- live sidebar updates. A session written to the isolated
   // HOME's provider directory AFTER boot (not via `setupHome`, which only
   // seeds BEFORE the server starts) must appear in the sidebar without a
-  // page reload. Legacy's `SessionsSyncService` (a real filesystem watcher,
   // `server/sessions-sync/service.ts`) already does this -- this spec's
-  // `legacy-chromium` run is the CONTROL proving the assertion itself is
   // sound. The Rust port has no filesystem watcher (see
   // `crates/freshell-server/src/main.rs`'s `spawn_sessions_sweep` doc
   // comment); it substitutes a periodic sweep that broadcasts
@@ -607,10 +540,7 @@ test.describe('Session Directory Matrix', () => {
   // (`src/components/Sidebar.tsx`'s `<input placeholder="Search...">`,
   // `filter`/`setFilter` state) actually filters the rendered session list
   // to matching titles only, across TWO different provider kinds (claude's
-  // "harness-02 matrix beta" and codex's "harness-02 matrix gamma"), and
   // that clearing the search (`aria-label="Clear search"`) restores the
-  // full list -- on BOTH projects, with `legacy-chromium` as the control
-  // proving the assertions themselves are sound (legacy already has full
   // title-tier search; this proves the Rust port's pre-existing title-tier
   // search reaches the same real UI element identically, not just a raw
   // API check).
@@ -658,7 +588,6 @@ test.describe('Session Directory Matrix', () => {
   // unit-proves pruning a deleted file from its cache/snapshot
   // (`deleted_file_pruned`, `directory_index.rs`) -- this spec is the
   // outer, browser-level proof that the same removal reaches the rendered
-  // sidebar with no reload. `legacy-chromium` is the control (its real
   // filesystem watcher, `SessionsSyncService`, already handles deletions).
   //
   // Writes its OWN session (not alpha/beta/gamma, which earlier tests in

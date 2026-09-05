@@ -36,7 +36,6 @@ import {
 } from '../helpers/harness-06/https.js'
 
 /**
- * HARNESS-06 fixture smoke (MATRIX_SPECS-registered, server-kind-agnostic).
  *
  * Acceptance mirror (checklist Playwright validation text): a fixture smoke
  * that reaches every target directly, records editor/Kilroy invocations,
@@ -48,7 +47,6 @@ import {
  * This spec requests ONLY Playwright's built-in page/browser fixtures; the
  * shared harness's `testServer` is worker-lazy, so NO Freshell server boots
  * (load-bearing ledger L1). It therefore runs identically under
- * `chromium`, `legacy-chromium`, and `rust-chromium`.
  *
  * Each named `test(...)` is one acceptance leg; per-leg observed outcomes are
  * recorded in docs/plans/df1-evidence/HARNESS-06.md.
@@ -272,7 +270,7 @@ test.describe('harness-06 misc fixtures smoke', () => {
       const body = (await res.json()) as {
         candidates: Array<{ content: { parts: Array<{ text: string }> } }>
       }
-      // The EXACT response path @ai-sdk/google@3.0.43's Zod schema validates.
+      // The response path consumed by the Rust summary client.
       expect(body.candidates[0].content.parts[0].text).toBe(FAKE_GEMINI_DEFAULT_TEXT)
 
       const ledger = ai.ledger()

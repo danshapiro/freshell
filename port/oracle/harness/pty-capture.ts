@@ -8,10 +8,10 @@ import type { PtyScenario } from '../fixtures/pty-scenarios.js'
  * PTY byte-stream golden-capture harness (equivalence oracle, T1).
  *
  * Drives a fixed sequence of shell commands through a REAL pseudo-terminal
- * (node-pty, spawned by the ORIGINAL freshell server) over the live WebSocket
+ * (the PTY implementation spawned by the Rust freshell server) over the live WebSocket
  * wire and captures the exact terminal output BYTES the shell produces. Those
- * bytes — bounded deterministically by sentinels — become the committed golden
- * the Rust port must reproduce.
+ * bytes — bounded deterministically by sentinels — are checked against frozen
+ * Rust-baseline fixtures.
  *
  * The whole value is a BYTE-STABLE capture, so every nondeterminism source is
  * pinned:
@@ -30,13 +30,13 @@ import type { PtyScenario } from '../fixtures/pty-scenarios.js'
  *     `terminal.output.batch`), so nondeterministic chunk boundaries never
  *     affect the compared bytes.
  *
- * `data` ENCODING: raw UTF-8 (NOT base64). node-pty is spawned emitting string
+ * `data` ENCODING: raw UTF-8 (NOT base64). PTY output is captured as string
  * data (terminal-registry.ts pty.spawn) and the wire `data` field is that string
  * verbatim (Buffer.byteLength(data,'utf8') accounting in terminal-stream/broker).
  * The scenarios are ASCII-only, so no multi-byte splits at chunk boundaries.
  *
  * This is transport-only: it imports NO server internals, so it will drive the
- * node original and the future Rust port identically.
+ * across fresh Rust boots.
  */
 
 export interface SentinelConfig {

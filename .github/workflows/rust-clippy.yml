@@ -16,9 +16,17 @@ concurrency:
 jobs:
   clippy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript tooling
+        run: npm ci
 
       # Pinned toolchain (NOT @stable): keeps green-local <=> green-CI deterministic.
       # Current stable (1.97.x) already adds default-warn lints this branch was not
@@ -39,17 +47,40 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev librsvg2-dev \
-            libayatana-appindicator3-dev pkg-config build-essential
+            libayatana-appindicator3-dev libdbus-1-dev pkg-config build-essential
 
       - name: cargo fmt
         run: cargo fmt --all --check
 
       - name: cargo clippy (workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # --all-targets does not imply --all-features: the real-transport
       # backends are default-off and would otherwise go unlinted.
       - name: cargo clippy (feature-gated backends)
         run: |
-          cargo clippy -p freshell-codex --features real-transport --all-targets -- -D warnings
-          cargo clippy -p freshell-opencode --features real-transport --all-targets -- -D warnings
+          cargo clippy -p freshell-codex --features real-transport --all-targets --locked -- -D warnings
+          cargo clippy -p freshell-opencode --features real-transport --all-targets --locked -- -D warnings
+
+      # The Tauri shell must launch and reap the real Rust server binary. Build
+      # it explicitly so a missing-artifact test can never pass by omission.
+      - name: Build Rust server for Tauri smoke
+        run: cargo build -p freshell-server --locked
+
+      - name: Rust workspace tests
+        env:
+          FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server
+        run: cargo test --workspace --locked
+
+      - name: Source-runtime smoke
+        run: npm run test:source-runtime
+
+      # Execute the browser-selection contract so a stale project/filter can
+      # never make the supported Rust application lane silently select zero.
+      - name: Browser selection non-vacuity
+        run: npm run test:e2e:helpers -- helpers/selection-nonvacuity.test.ts
+
+      - name: Tauri app-bound server spawn smoke
+        env:
+          FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server
+        run: cargo test -p freshell-tauri --locked --test server_spawn_smoke app_bound_spawn_health_reap_end_to_end -- --exact --nocapture

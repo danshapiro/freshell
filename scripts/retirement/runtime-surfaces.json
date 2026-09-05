@@ -1,0 +1,538 @@
+{
+  "version": 1,
+  "surfaces": [
+    {
+      "id": "workflow-docs-pages",
+      "path": ".github/workflows/docs-pages-deploy.yml",
+      "role": "release-job"
+    },
+    {
+      "id": "workflow-electron-build",
+      "path": ".github/workflows/electron-build.yml",
+      "role": "release-job"
+    },
+    {
+      "id": "workflow-electron-release",
+      "path": ".github/workflows/electron-release.yml",
+      "role": "release-job"
+    },
+    {
+      "id": "workflow-port-contract",
+      "path": ".github/workflows/port-contract.yml",
+      "role": "release-job"
+    },
+    {
+      "id": "workflow-rust-clippy",
+      "path": ".github/workflows/rust-clippy.yml",
+      "role": "release-job"
+    },
+    {
+      "id": "workflow-typecheck-client",
+      "path": ".github/workflows/typecheck-client.yml",
+      "role": "release-job"
+    },
+    {
+      "id": "electron-builder-config",
+      "path": "config/electron-builder.yml",
+      "role": "packaging-config"
+    },
+    {
+      "id": "vite-main-config",
+      "path": "config/vite/vite.config.ts",
+      "role": "vite"
+    },
+    {
+      "id": "vitest-main-config",
+      "path": "config/vitest/vitest.config.ts",
+      "role": "vitest"
+    },
+    {
+      "id": "container-cloud-run-build",
+      "path": "docker/cloud-run/cloudbuild.yaml",
+      "role": "container-release-job"
+    },
+    {
+      "id": "container-cloud-run-dockerfile",
+      "path": "docker/cloud-run/Dockerfile",
+      "role": "container-image"
+    },
+    {
+      "id": "docker-cloud-entrypoint",
+      "path": "docker/cloud-run/entrypoint.sh",
+      "role": "container-entrypoint"
+    },
+    {
+      "id": "container-sandbox-dockerfile",
+      "path": "docker/sandbox/Dockerfile",
+      "role": "container-image"
+    },
+    {
+      "id": "docker-sandbox-entrypoint",
+      "path": "docker/sandbox/entrypoint.sh",
+      "role": "container-entrypoint"
+    },
+    {
+      "id": "listener-electron-port-check",
+      "path": "electron/port-check.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "container-example-dockerfile",
+      "path": "examples/docker/Dockerfile",
+      "role": "legacy-container-image"
+    },
+    {
+      "id": "legacy-example-live-counter",
+      "path": "examples/extensions/live-counter/server.js",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "legacy-example-status-dashboard",
+      "path": "examples/extensions/status-dashboard/server.js",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "service-systemd-rust",
+      "path": "installers/systemd/freshell-rust.service",
+      "role": "rust-service"
+    },
+    {
+      "id": "package-scripts",
+      "path": "package.json:scripts",
+      "role": "package-commands",
+      "entries": [
+        "build",
+        "build:client",
+        "build:electron",
+        "build:launch-chooser",
+        "build:rust",
+        "build:rust:debug",
+        "build:tools",
+        "build:wizard",
+        "check",
+        "check:rust",
+        "contract:generate",
+        "dev",
+        "dev:client",
+        "dev:launch-chooser",
+        "dev:server",
+        "dev:wizard",
+        "electron:build",
+        "electron:build:win",
+        "electron:dev",
+        "lint",
+        "lint:fix",
+        "perf:audit:compare",
+        "perf:audit:gate",
+        "perf:audit:visible-first",
+        "prebuild",
+        "predev",
+        "predev:server",
+        "prestart",
+        "prepare:rust-runtime",
+        "prepare:claude-sidecar",
+        "prepare:electron-runtime",
+        "prepare:icons",
+        "serve",
+        "serve:precheck",
+        "smoke:browser-use",
+        "smoke:continuity",
+        "start",
+        "test",
+        "test:aggressive",
+        "test:all",
+        "test:balanced",
+        "test:client",
+        "test:client:aggressive",
+        "test:client:standard",
+        "test:cloud",
+        "test:cloud:build",
+        "test:coverage",
+        "test:e2e",
+        "test:e2e:a11y-gate",
+        "test:e2e:a11y-gate:deny",
+        "test:e2e:chromium",
+        "test:e2e:cloud",
+        "test:e2e:cloud:build",
+        "test:e2e:debug",
+        "test:e2e:electron",
+        "test:e2e:headed",
+        "test:e2e:helpers",
+        "test:e2e:local",
+        "test:e2e:update-snapshots",
+        "test:electron",
+        "test:electron:runtime",
+        "test:integration",
+        "test:oracle",
+        "test:port",
+        "test:rust",
+        "test:sandbox",
+        "test:sequential",
+        "test:server",
+        "test:source-runtime",
+        "test:status",
+        "test:ui",
+        "test:unit",
+        "test:visible-first:contract",
+        "test:vitest",
+        "test:watch",
+        "typecheck",
+        "typecheck:client",
+        "typecheck:tools",
+        "verify",
+        "verify:electron-artifact",
+        "visible-first:contract:check"
+      ]
+    },
+    {
+      "id": "port-laptop-bootstrap-cmd",
+      "path": "port/laptop-bootstrap/1-install-wsl.cmd",
+      "role": "port-bootstrap"
+    },
+    {
+      "id": "port-laptop-bootstrap",
+      "path": "port/laptop-bootstrap/2-bootstrap-wsl.sh",
+      "role": "port-bootstrap"
+    },
+    {
+      "id": "port-vm-bridge-powershell",
+      "path": "port/vm-bridge/agent-console-vm.ps1",
+      "role": "port-bootstrap"
+    },
+    {
+      "id": "port-vm-bridge-bootstrap",
+      "path": "port/vm-bridge/agent-console-wsl.sh",
+      "role": "port-bootstrap"
+    },
+    {
+      "id": "root-run-rust-server",
+      "path": "run-rust-server.sh",
+      "role": "root-launcher"
+    },
+    {
+      "id": "scripts-base-gate",
+      "path": "scripts/base-gate.sh",
+      "role": "test-coordinator"
+    },
+    {
+      "id": "scripts-build-stamp-check",
+      "path": "scripts/build-stamp-check.sh",
+      "role": "build-tool"
+    },
+    {
+      "id": "scripts-deploy-tab-diff",
+      "path": "scripts/deploy-tab-diff.sh",
+      "role": "release-tool"
+    },
+    {
+      "id": "scripts-e2e-cloud",
+      "path": "scripts/e2e-cloud.sh",
+      "role": "test-runner"
+    },
+    {
+      "id": "scripts-launch-rust",
+      "path": "scripts/launch-rust.sh",
+      "role": "rust-launcher"
+    },
+    {
+      "id": "scripts-launch",
+      "path": "scripts/launch.sh",
+      "role": "rust-launcher"
+    },
+    {
+      "id": "listener-browser-visibility-probe",
+      "path": "scripts/proofs/browser-background-visibility-probe.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "listener-browser-freeze-probe",
+      "path": "scripts/proofs/browser-freeze-lifecycle-probe.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "listener-browser-suspend-probe",
+      "path": "scripts/proofs/browser-process-suspend-probe.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "scripts-sandbox-build",
+      "path": "scripts/sandbox-build.sh",
+      "role": "test-sandbox"
+    },
+    {
+      "id": "scripts-sandbox-selftest",
+      "path": "scripts/sandbox-selftest.sh",
+      "role": "test-sandbox"
+    },
+    {
+      "id": "scripts-sandbox-test",
+      "path": "scripts/sandbox-test.sh",
+      "role": "test-sandbox"
+    },
+    {
+      "id": "scripts-cloud-build-test",
+      "path": "scripts/test/cloud-build.test.sh",
+      "role": "test-coordinator"
+    },
+    {
+      "id": "scripts-cloud-exec-id-test",
+      "path": "scripts/test/cloud-exec-id-parse.test.sh",
+      "role": "test-coordinator"
+    },
+    {
+      "id": "scripts-cloud-vitest-entrypoint-test",
+      "path": "scripts/test/cloud-vitest-entrypoint.test.sh",
+      "role": "test-coordinator"
+    },
+    {
+      "id": "scripts-cloud-vitest-integration-test",
+      "path": "scripts/test/cloud-vitest-integration.test.sh",
+      "role": "test-coordinator"
+    },
+    {
+      "id": "scripts-cloud-vitest-wrapper-test",
+      "path": "scripts/test/cloud-vitest-wrapper.test.sh",
+      "role": "test-coordinator"
+    },
+    {
+      "id": "listener-coordinator",
+      "path": "scripts/testing/coordinator-endpoint.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "scripts-verify-container-layout",
+      "path": "scripts/verify-container-layout.sh",
+      "role": "container-layout-verifier"
+    },
+    {
+      "id": "scripts-verify-remote-access",
+      "path": "scripts/verify-remote-access.sh",
+      "role": "diagnostic-tool"
+    },
+    {
+      "id": "scripts-vitest-cloud",
+      "path": "scripts/vitest-cloud.sh",
+      "role": "test-runner"
+    },
+    {
+      "id": "test-browser-use-coalesce",
+      "path": "test/browser_use/tool_coalesce.py",
+      "role": "test-tool"
+    },
+    {
+      "id": "fixture-fake-opencode-cjs",
+      "path": "test/e2e-browser/fixtures/fake-opencode.cjs",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "fixture-fake-amplifier",
+      "path": "test/e2e-browser/fixtures/providers/fake-amplifier.mjs",
+      "role": "provider-fixture"
+    },
+    {
+      "id": "fixture-fake-claude-sdk",
+      "path": "test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs",
+      "role": "provider-fixture"
+    },
+    {
+      "id": "fixture-fake-claude",
+      "path": "test/e2e-browser/fixtures/providers/fake-claude.mjs",
+      "role": "provider-fixture"
+    },
+    {
+      "id": "fixture-fake-codex",
+      "path": "test/e2e-browser/fixtures/providers/fake-codex-app-server.mjs",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "fixture-fake-gemini",
+      "path": "test/e2e-browser/fixtures/providers/fake-gemini.mjs",
+      "role": "provider-fixture"
+    },
+    {
+      "id": "fixture-fake-kimi",
+      "path": "test/e2e-browser/fixtures/providers/fake-kimi.mjs",
+      "role": "provider-fixture"
+    },
+    {
+      "id": "fixture-fake-opencode",
+      "path": "test/e2e-browser/fixtures/providers/fake-opencode-server.mjs",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "listener-echo-fixture",
+      "path": "test/e2e-browser/helpers/echo-ws-fixture.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "assertion-test-external-target",
+      "path": "test/e2e-browser/helpers/external-target.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "listener-fake-ai",
+      "path": "test/e2e-browser/helpers/harness-06/fake-ai.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "listener-target-server",
+      "path": "test/e2e-browser/helpers/harness-06/target-server.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "listener-update-feed",
+      "path": "test/e2e-browser/helpers/harness-06/update-feed.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "assertion-test-leak-metrics",
+      "path": "test/e2e-browser/helpers/leak-metrics.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-provider-fixture-launcher",
+      "path": "test/e2e-browser/helpers/provider-fixture-launcher.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-raw-clients",
+      "path": "test/e2e-browser/helpers/raw-clients.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-rust-server",
+      "path": "test/e2e-browser/helpers/rust-server.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "fixture-rust-browser-server",
+      "path": "test/e2e-browser/helpers/rust-server.ts",
+      "role": "rust-test-server"
+    },
+    {
+      "id": "listener-server-fixture-support",
+      "path": "test/e2e-browser/helpers/server-fixture-support.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "assertion-test-auto-title-rust",
+      "path": "test/e2e-browser/specs/auto-title-rust.spec.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-browser-pane-screenshot",
+      "path": "test/e2e-browser/specs/browser-pane-screenshot.spec.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-browser01-proxy",
+      "path": "test/e2e-browser/specs/browser01-proxy.spec.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-harness-01-rust-server",
+      "path": "test/e2e-browser/specs/harness-01-rust-server.spec.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-harness-03-provider-fixtures",
+      "path": "test/e2e-browser/specs/harness-03-provider-fixtures.spec.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "legacy-test-coding-cli",
+      "path": "test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "fixture-distribution-node-server",
+      "path": "test/fixtures/distribution/node-server/freshell-server",
+      "role": "distribution-fixture"
+    },
+    {
+      "id": "fixture-distribution-rust-only-server",
+      "path": "test/fixtures/distribution/rust-only/freshell-server",
+      "role": "distribution-fixture"
+    },
+    {
+      "id": "assertion-test-source-runtime-rust",
+      "path": "test/integration/tooling/source-runtime-rust.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-runtime-boundary",
+      "path": "test/unit/architecture/rust-only-server-runtime.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-cli-action-capabilities",
+      "path": "test/unit/cli/action-capabilities.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-cli-retained-flags",
+      "path": "test/unit/cli/retained-flags.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-fake-opencode-fixture",
+      "path": "test/unit/provider-fixtures/fake-opencode-fixture.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-electron-port-check",
+      "path": "test/unit/electron/port-check.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-electron-app-bound-rust",
+      "path": "test/e2e-electron/app-bound-rust-server.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-electron-checkout-free-runtime",
+      "path": "test/integration/electron/checkout-free-runtime.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-prebuild-guard",
+      "path": "test/unit/tooling/prebuild-guard.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    }
+  ]
+}

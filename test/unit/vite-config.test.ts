@@ -4,19 +4,7 @@ import { loadEnv } from 'vite'
 import { readFileSync } from 'node:fs'
 
 vi.mock('node:fs')
-// Mock dotenv to prevent .env file loading in tests. getNetworkHost()
-// calls dotenv.config() at runtime, which would load any .env file from
-// the test runner's working directory — making tests non-hermetic.
-vi.mock('dotenv', () => ({
-  default: { config: vi.fn() },
-  config: vi.fn(),
-}))
-// Mock platform module — WSL detection is now centralized in platform.ts
-vi.mock('../../server/platform.js', () => ({
-  isWSL: vi.fn(() => false),
-}))
-
-import { isWSL } from '../../server/platform.js'
+import { getNetworkHost } from '../../config/vite/get-network-host.js'
 
 const TEST_TIMEOUT_MS = 20_000
 
@@ -42,22 +30,19 @@ describe('getNetworkHost', () => {
 
   it('returns 127.0.0.1 when config file does not exist', async () => {
     vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT') })
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('127.0.0.1')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('127.0.0.1')
   })
 
   it('returns host from config when configured', async () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
       settings: { network: { host: '0.0.0.0', configured: true } },
     }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('0.0.0.0')
   })
 
   it('returns 127.0.0.1 when config has no network settings', async () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ settings: {} }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('127.0.0.1')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('127.0.0.1')
   })
 
   it('honors HOST env override when unconfigured', async () => {
@@ -65,8 +50,7 @@ describe('getNetworkHost', () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
       settings: { network: { host: '127.0.0.1', configured: false } },
     }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('0.0.0.0')
   })
 
   it('ignores HOST env when configured', async () => {
@@ -74,21 +58,17 @@ describe('getNetworkHost', () => {
     vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
       settings: { network: { host: '127.0.0.1', configured: true } },
     }))
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('127.0.0.1')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('127.0.0.1')
   })
 
   it('uses HOST env when no config file exists', async () => {
     process.env.HOST = '0.0.0.0'
     vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT') })
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: false })).toBe('0.0.0.0')
   })
 
   it('always returns 0.0.0.0 on WSL regardless of config', async () => {
-    vi.mocked(isWSL).mockReturnValue(true)
-    const { getNetworkHost } = await import('../../server/get-network-host.js')
-    expect(getNetworkHost()).toBe('0.0.0.0')
+    expect(getNetworkHost({ env: process.env, configDir: '/tmp/freshell-test-config', isWsl: true })).toBe('0.0.0.0')
   })
 })
 
@@ -141,18 +121,18 @@ describe('vite config', () => {
 })
 
 describe('vitest config', () => {
-  const originalRealProviderContracts = process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+  const originalRealProviderContracts = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
 
   beforeEach(() => {
     vi.resetModules()
-    delete process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+    delete process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
   })
 
   afterEach(() => {
     if (originalRealProviderContracts !== undefined) {
-      process.env.FRESHELL_REAL_PROVIDER_CONTRACTS = originalRealProviderContracts
+      process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS = originalRealProviderContracts
     } else {
-      delete process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+      delete process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
     }
   })
 
@@ -164,11 +144,29 @@ describe('vitest config', () => {
     expect(excluded).toContain('test/integration/real/**')
   })
 
-  it('runs real-provider integration contracts in the node server suite', async () => {
-    const configModule = await import('../../config/vitest/vitest.server.config.ts')
+  it('includes real-provider integration contracts when the documented opt-in is enabled', async () => {
+    process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS = '1'
+    const configModule = await import('../../config/vitest/vitest.config.ts')
     const config = configModule.default
-    const included = config.test?.include ?? []
+    const excluded = config.test?.exclude ?? []
 
-    expect(included).toContain('test/integration/real/**/*.test.ts')
+    expect(excluded).not.toContain('test/integration/real/**')
+  })
+
+  it('keeps artifact-owning integration trees out of the default lane', async () => {
+    const configModule = await import('../../config/vitest/vitest.config.ts')
+    const config = configModule.default
+    const excluded = config.test?.exclude ?? []
+
+    expect(excluded).toContain('test/integration/tooling/**')
+    expect(excluded).toContain('test/integration/electron/**')
+  })
+
+  it('keeps the visible-first CLI harness in the default lane', async () => {
+    const configModule = await import('../../config/vitest/vitest.config.ts')
+    const config = configModule.default
+    const excluded = config.test?.exclude ?? []
+
+    expect(excluded).not.toContain('test/unit/visible-first/cli-command-harness.test.ts')
   })
 })

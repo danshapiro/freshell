@@ -12,7 +12,6 @@ import {
 /**
  * RESTORE-01 — unit tests for the harness-level recovery-offer auto-decline.
  * The watcher answers the rust server's "Restore N panes?" offer through the
- * real UI ("Not now" click) so unchanged legacy-derived specs run dialog-free
  * on rust legs. See docs/plans/df1/RESTORE-01.md for the verdict + plan.
  */
 

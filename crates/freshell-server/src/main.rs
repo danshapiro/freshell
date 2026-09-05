@@ -1901,10 +1901,8 @@ async fn main() -> ExitCode {
     rebind.shutdown_all().await;
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
-    // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
-    // (terminals) and the Codex/opencode sidecars together, then
-    // `codingCliSessionManager.shutdown()` covers any remaining coding-CLI
-    // session. This port's equivalents run in the same spot:
+    // drained, the terminal registry and provider runtimes are shut down
+    // together. This port's equivalents run in the same spot:
     //   * `registry.kill_all()` — every tracked PTY terminal (`mode:'shell'`
     //     and any other registry-tracked terminal, e.g. a plain `sleep 300`
     //     shell) — the gap this fix closes; nothing previously killed these.

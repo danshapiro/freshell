@@ -1,9 +1,6 @@
 /**
- * HARNESS-14 — the controllable server clock, proven over the wire on BOTH
- * server implementations (`legacy-chromium` + `rust-chromium` via
- * `MATRIX_SPECS`; legacy is the true parity control: identical paths,
- * envelopes, and seam semantics by construction — see
- * `docs/plans/df1/HARNESS-14.md`).
+ * HARNESS-14 — the controllable server clock, proven over the wire against the
+ * owned Rust baseline (see `docs/plans/df1/HARNESS-14.md`).
  *
  * What this spec proves (the checklist acceptance, verbatim):
  *   "Advance/freeze/reset the clock from one serial spec, assert fixture
@@ -17,7 +14,7 @@
  *     step carries it past `safety.autoKillIdleMinutes`, while a terminal
  *     created at a later frozen instant survives — then a further step
  *     reaps it too (fixture timers firing in deterministic order). The idle
- *     sweep cadence under the gate is 250ms on both servers, so the poll
+ *     sweep cadence under the gate is 250ms, so the poll
  *     budgets here observe virtual crossings in ~1s of real time, not the
  *     30s production cadence and never 15 real minutes.
  *   - ABSENCE: the worker-scoped default fixture (booted WITHOUT the env
@@ -30,7 +27,7 @@
  */
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
@@ -42,17 +39,17 @@ interface ClockState {
   offsetMs: number
 }
 
-function clockHeaders(info: TestServerInfo) {
+function clockHeaders(info: E2eServerInfo) {
   return { 'x-auth-token': info.token, 'content-type': 'application/json' }
 }
 
-async function clockGet(info: TestServerInfo): Promise<ClockState> {
+async function clockGet(info: E2eServerInfo): Promise<ClockState> {
   const res = await fetch(`${info.baseUrl}/api/test-clock`, { headers: clockHeaders(info) })
   expect(res.status, 'GET /api/test-clock').toBe(200)
   return (await res.json()) as ClockState
 }
 
-async function clockPost(info: TestServerInfo, verb: string, body?: unknown): Promise<ClockState> {
+async function clockPost(info: E2eServerInfo, verb: string, body?: unknown): Promise<ClockState> {
   const res = await fetch(`${info.baseUrl}/api/test-clock/${verb}`, {
     method: 'POST',
     headers: clockHeaders(info),
@@ -92,9 +89,8 @@ function connectAndHello(wsUrl: string, token: string): Promise<WebSocket> {
 /** Send one terminal.create; resolve with the `terminal.created` terminalId
  *  (reject on an explicit error frame / timeout). The terminal is NEVER
  *  attached: a never-referenced terminal starts orphan reap-eligible on
- *  BOTH servers (rust stamps `released_by_client: true` at create,
- *  `crates/freshell-terminal/src/registry.rs`; legacy reaps any
- *  `clients.size === 0` row, `server/terminal-registry.ts`). */
+ *  the Rust server (which stamps `released_by_client: true` at create,
+ *  `crates/freshell-terminal/src/registry.rs`). */
 function createDetachedTerminal(ws: WebSocket, requestId: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -122,7 +118,7 @@ function createDetachedTerminal(ws: WebSocket, requestId: string): Promise<strin
 /** Live-terminal inventory from `GET /api/terminals` (a plain array on both
  *  servers), as `{ terminalId → status }`. */
 async function terminalRecords(
-  info: TestServerInfo,
+  info: E2eServerInfo,
 ): Promise<Map<string, { status?: string; lastLine?: string }>> {
   const res = await fetch(`${info.baseUrl}/api/terminals`, { headers: clockHeaders(info) })
   expect(res.status, 'GET /api/terminals').toBe(200)
@@ -144,11 +140,11 @@ function lastLineOf(
  * fixture BEFORE the clock is frozen would leave the spawn output capable
  * of landing after an advance — refreshing the activity stamp at the
  * ADVANCED virtual instant (fresh output at a virtual time genuinely is
- * activity on both servers) and defeating the idle math. A shell sitting
+ * activity and defeating the idle math. A shell sitting
  * at a prompt with no input is truly silent, so post-freeze nothing
  * re-stamps and virtual age is exact.
  */
-async function waitForShellQuiet(info: TestServerInfo, terminalId: string): Promise<void> {
+async function waitForShellQuiet(info: E2eServerInfo, terminalId: string): Promise<void> {
   await expect
     .poll(async () => lastLineOf(await terminalRecords(info), terminalId).length > 0, {
       timeout: 15_000,
@@ -169,14 +165,14 @@ async function waitForShellQuiet(info: TestServerInfo, terminalId: string): Prom
 
 /** Live-terminal inventory from `GET /api/terminals` (a plain array on both
  *  servers), as `{ terminalId → status }`. */
-async function terminalStatuses(info: TestServerInfo): Promise<Map<string, string>> {
+async function terminalStatuses(info: E2eServerInfo): Promise<Map<string, string>> {
   const res = await fetch(`${info.baseUrl}/api/terminals`, { headers: clockHeaders(info) })
   expect(res.status, 'GET /api/terminals').toBe(200)
   const items = (await res.json()) as Array<{ terminalId: string; status?: string }>
   return new Map(items.map((t) => [t.terminalId, t.status ?? 'running']))
 }
 
-async function patchIdleMinutes(info: TestServerInfo, minutes: number): Promise<void> {
+async function patchIdleMinutes(info: E2eServerInfo, minutes: number): Promise<void> {
   const res = await fetch(`${info.baseUrl}/api/settings`, {
     method: 'PATCH',
     headers: clockHeaders(info),
@@ -189,18 +185,17 @@ test.describe('HARNESS-14 controllable server clock', () => {
   test.describe.configure({ mode: 'serial' })
   test.setTimeout(180_000)
 
-  /** Boot an owned server of the CURRENT project's kind with the clock gate on. */
-  async function startGatedServer(e2eServerKind: string): Promise<E2eServerHandle> {
+  /** Boot an owned Rust server with the clock gate on. */
+  async function startGatedServer(): Promise<E2eServerHandle> {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind as 'legacy' | 'rust',
       construct: { env: { FRESHELL_TEST_CLOCK: '1' } },
     })
     await server.start()
     return server
   }
 
-  test('advance/freeze/resume/reset round-trip + validation + auth', async ({ e2eServerKind }) => {
-    const server = await startGatedServer(e2eServerKind)
+  test('advance/freeze/resume/reset round-trip + validation + auth', async () => {
+    const server = await startGatedServer()
     try {
       const info = server.info
 
@@ -265,10 +260,8 @@ test.describe('HARNESS-14 controllable server clock', () => {
     }
   })
 
-  test('fixture timers fire in deterministic virtual order (idle cleanup, zero wall sleeps)', async ({
-    e2eServerKind,
-  }) => {
-    const server = await startGatedServer(e2eServerKind)
+  test('fixture timers fire in deterministic virtual order (idle cleanup, zero wall sleeps)', async () => {
+    const server = await startGatedServer()
     try {
       const info = server.info
 
@@ -358,7 +351,6 @@ test.describe('HARNESS-14 controllable server clock', () => {
 
   test('the control surface is absent in a normal build (ungated fixture)', async ({ serverInfo }) => {
     // The worker-scoped default fixture boots WITHOUT FRESHELL_TEST_CLOCK on
-    // BOTH projects — that boot IS the "normal build" launch: every clock
     // verb must answer the catch-all's indistinguishable 404.
     expect(typeof serverInfo.token).toBe('string')
     for (const [method, path] of [

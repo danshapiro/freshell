@@ -5,24 +5,19 @@ import { test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
- * CROSS-SURFACE TITLE CONVERGENCE (Task 21, MATRIX -- both projects).
  *
  * Pins EDEV-09 (`port/oracle/DEVIATIONS.md`): the Task 19 client
  * title-convergence fixes -- sidebar/history/terminal-menu/Overview renames
  * now mirror into pane titles via `applySessionRenameCascade`
- * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`
- * (`src/store/panesSlice.ts`). The client is SHARED by both backends, so this
- * spec runs on `rust-chromium` AND `legacy-chromium`; the legacy run is the
- * regression control proving the client fixes didn't regress Node behavior.
+ * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`.
  *
  * Each test drives a REAL UI journey (or the automation REST surface, where
  * the scenario is about automation) on its OWN dedicated seeded claude
  * session, then asserts BOTH surfaces (pane header + sidebar/tab) converge.
- * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI
- * (`CLAUDE_CMD` override -- restore-matrix.spec.ts precedent, works on both
- * server kinds). `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so neither
- * server's auto-name pass can reach a real Gemini: with no key, both servers'
- * sweeps settle sessions on the first-message heuristic, and every rename
+ * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI on
+ * the owned Rust baseline. `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so
+ * its auto-name pass cannot reach a real Gemini: with no key, the session
+ * sweep settles on the first-message heuristic, and every rename
  * below writes the finalized `user` ladder rung which the sweeps never
  * clobber.
  */
@@ -116,7 +111,6 @@ process.stdin.resume()
   return dest
 }
 
-// Worker-scoped server (session-directory-matrix.spec.ts pattern): the fake
 // claude CLI is installed BEFORE the handle is constructed so `CLAUDE_CMD`
 // can point at it; the isolated home is seeded with one session per test so
 // no test's rename can poison another's assertions.
@@ -126,10 +120,9 @@ const test = base.extend<Record<never, never>, { sharedRootDir: string }>({
     await use(root)
     await fs.rm(root, { recursive: true, force: true }).catch(() => {})
   }, { scope: 'worker' }],
-  testServer: [async ({ e2eServerKind, sharedRootDir }, use) => {
+  testServer: [async ({ sharedRootDir }, use) => {
     const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRootDir, 'bin'))
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           CLAUDE_CMD: fakeClaudePath,
@@ -180,8 +173,7 @@ function visiblePaneHeader(page: import('@playwright/test').Page) {
   return page.locator('[data-context="pane-header"]:visible').first()
 }
 
-/** Sidebar-click resume of a dedicated seeded session (the WS create path,
- * which registers the terminal's session identity on both server kinds). */
+/** Sidebar-click resume of a dedicated seeded session. */
 async function resumeSeededSession(
   page: import('@playwright/test').Page,
   harness: import('../helpers/test-harness.js').TestHarness,
@@ -262,20 +254,17 @@ test.describe('Title sync convergence', () => {
   // pane in the server-side layout store, broadcasts `ui.command{pane.rename}`
   // (pane header), mirrors to the tab title (single-pane tab), and cascades
   // to the session override for a syncable coding-CLI pane (sidebar row via
-  // the changed-broadcast refetch). On legacy-chromium this already works
-  // (Node behavior) -- the matrix run doubles as the regression control.
   test('automation PATCH /api/panes/:id converges pane header + tab + sidebar', async ({ freshellPage, page, harness, serverInfo }) => {
     const NEW_NAME = 'Automation Name Three'
     const { tabId, paneId } = await resumeSeededSession(page, harness, SESSION_AUTOMATION_RENAME)
 
     // The server-side layout mirror is client-pushed (`ui.layout.sync`,
     // 200 ms trailing debounce, layoutMirrorMiddleware.ts) — until it lands,
-    // BOTH servers answer a rename of the not-yet-mirrored pane with the
-    // Node-parity no-op 200 `{message:'pane not found'}` (router.ts:1411 /
-    // rename_pane lib.rs:1516-1521) and skip the broadcast + cascade
+    // The Rust server answers a rename of a not-yet-mirrored pane with the
+    // no-op 200 `{message:'pane not found'}` and skips the broadcast + cascade
     // entirely. That miss is a real automation-contract outcome, not a
     // convergence failure, so arrange like a real automation client: target
-    // a pane the server actually lists (GET /api/panes on both kinds).
+    // a pane the server actually lists (GET /api/panes).
     await expect.poll(async () => {
       const listRes = await page.request.get(`${serverInfo.baseUrl}/api/panes?tabId=${encodeURIComponent(tabId)}`, {
         headers: { 'x-auth-token': serverInfo.token },

@@ -35,10 +35,7 @@
  * COPIED from pane-ledger-restart-rust.spec.ts per this suite's
  * per-spec-ownership convention.
  *
- * Rust-only: drives `GET /api/recovery/inventory` (no legacy equivalent) and
  * owns a RustServer directly (ephemeral loopback port — NEVER 3001/3002).
- * Registered ONLY under `rust-chromium` and testIgnore'd on every match-all
- * project (see playwright.config.ts's RUST_ONLY_SPECS).
  */
 import { test, expect } from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'
@@ -47,7 +44,7 @@ import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { request, type BrowserContext, type Page } from '@playwright/test'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -180,7 +177,7 @@ async function createBrowserPane(page: Page, url: string): Promise<void> {
  * connected-state of its own. Disposed after use.
  */
 async function waitForRecoverable(
-  info: TestServerInfo,
+  info: E2eServerInfo,
   { timeoutMs = 30_000 }: { timeoutMs?: number } = {},
 ): Promise<void> {
   const req = await request.newContext({
@@ -219,7 +216,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   let capturedHome = ''
   let argLog = ''
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
 
   /**
    * Wait until SOME persisted snapshot generation contains every needle.
@@ -359,8 +356,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   // Scenario 1's claude session — scenario 2/3 reason about the same log.
   let sessionIdA = ''
 
-  test('scenario 1: lose the browser, restart the server, accept — panes recreated, claude resumed, reload never re-offers', async ({ browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('scenario 1: lose the browser, restart the server, accept — panes recreated, claude resumed, reload never re-offers', async ({ browser }) => {
     test.setTimeout(240_000)
 
     // ---- Context A: populate a tab with a claude CLI pane + a browser pane ----
@@ -478,8 +474,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await waitForRecoverable(info)
   })
 
-  test('scenario 2: decline path — panel closes, no recovered tabs added', async ({ browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('scenario 2: decline path — panel closes, no recovered tabs added', async ({ browser }) => {
     test.setTimeout(120_000)
 
     // Fresh context C against the same server (recoverable state still exists
@@ -504,8 +499,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await waitForRecoverable(info)
   })
 
-  test('scenario 3: no-restart browser loss — live session recreates WITHOUT resume (D7)', async ({ browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('scenario 3: no-restart browser loss — live session recreates WITHOUT resume (D7)', async ({ browser }) => {
     test.setTimeout(240_000)
 
     // ---- Context D against the SAME still-running server (no restart) ----
@@ -587,8 +581,7 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
     await ctxE.close()
   })
 
-  test('scenario 4: small-viewport boots offer the full dialog and the decline control is tappable', async ({ browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('scenario 4: small-viewport boots offer the full dialog and the decline control is tappable', async ({ browser }) => {
     test.setTimeout(240_000)
 
     // ---- Populating context: record a 40-shell-tab layout ----

@@ -1,14 +1,11 @@
 {
   "clientToServer": {
-    "count": 36,
+    "count": 33,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
       "client.diagnostic",
       "codex.activity.list",
-      "codingcli.create",
-      "codingcli.input",
-      "codingcli.kill",
       "freshAgent.approval.respond",
       "freshAgent.attach",
       "freshAgent.compact",
@@ -43,7 +40,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 60,
+    "count": 55,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -51,11 +48,6 @@
       "claude.activity.updated",
       "codex.activity.list.response",
       "codex.activity.updated",
-      "codingcli.created",
-      "codingcli.event",
-      "codingcli.exit",
-      "codingcli.killed",
-      "codingcli.stderr",
       "config.fallback",
       "error",
       "extension.server.error",

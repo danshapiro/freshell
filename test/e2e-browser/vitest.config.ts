@@ -1,7 +1,6 @@
-// Dedicated vitest config for E2E helper unit tests (e.g., test-server.test.ts).
-// These tests verify the E2E test infrastructure itself and run in a Node
-// environment. They are NOT run by `npm test` (which uses the root vitest
-// configs); instead, they are run explicitly during E2E helper development.
+// Dedicated Vitest config for Rust fixture, shared-support, external-target,
+// selection, and perf helper tests. These infrastructure tests run in Node,
+// outside the root Vitest configs, during E2E helper development.
 // Strip ambient shell env (proxies, FRESHELL_BIND_HOST) before anything else — see sanitize-test-env.ts.
 import '../../config/vitest/sanitize-test-env.js'
 import { defineConfig } from 'vitest/config'
@@ -23,7 +22,7 @@ export default defineConfig({
     root: __dirname,
     globalSetup: [path.resolve(__dirname, '../setup/e2e-browser-global-setup.ts')],
     include: ['helpers/**/*.test.ts', 'perf/**/*.test.ts'],
-    testTimeout: 60_000, // TestServer startup can take a while
+    testTimeout: 60_000, // RustServer startup can take a while
     hookTimeout: 30_000,
   },
 })

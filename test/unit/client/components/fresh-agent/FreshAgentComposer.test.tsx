@@ -33,6 +33,16 @@ describe('FreshAgentComposer', () => {
   })
   afterEach(() => cleanup())
 
+  it('hides attachment controls and blocks shell escapes without sending', () => {
+    const onSend = vi.fn()
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} />)
+    expect(screen.queryByRole('button', { name: 'Attach files' })).toBeNull()
+    fireEvent.change(getInput(), { target: { value: '!pwd' } })
+    fireEvent.keyDown(getInput(), { key: 'Enter' })
+    expect(screen.getByRole('status')).toHaveTextContent('Shell commands are unavailable here; open a shell pane instead')
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
   it('opens the slash menu when typing / and runs the highlighted command', () => {
     const onCommand = vi.fn()
     render(<FreshAgentComposer commands={GROUPED_COMMANDS} onCommand={onCommand} />)
@@ -366,7 +376,7 @@ describe('FreshAgentComposer', () => {
       fireEvent.change(getInput(), { target: { value: '/pr docs' } })
       fireEvent.keyDown(getInput(), { key: 'Enter' })
 
-      expect(onSend).toHaveBeenCalledWith('/pr docs', [])
+      expect(onSend).toHaveBeenCalledWith('/pr docs')
       expect(onCommand).not.toHaveBeenCalled()
     })
 

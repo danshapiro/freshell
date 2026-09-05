@@ -689,12 +689,12 @@ async fn handle_client_text(
     // (silent drop, no terminal, no error). Presence must be read here, at
     // the raw layer, before dedupe/restore planning (zero side effects on
     // reject). The two INVALID_MESSAGE families (terminal.create,
-    // codingcli.create) were armed in Task 6; Task 7 armed the freshAgent
+    // terminal.create was armed in Task 6; Task 7 armed the freshAgent
     // families (create.failed envelope / attach event channel).
     if let Some(resume_value) = value.get("resumeSessionId") {
         let _ = resume_value; // presence is what matters; the value is never read
         match value.get("type").and_then(|t| t.as_str()) {
-            Some("terminal.create") | Some("codingcli.create") => {
+            Some("terminal.create") => {
                 let reply = ServerMessage::Error(ErrorMsg {
                     code: ErrorCode::InvalidMessage,
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
@@ -1603,9 +1603,7 @@ async fn handle_client_text(
         // (`src/store/layoutMirrorMiddleware.ts`) feeds the shared
         // Deliberately inert remainder -- every arm here is unreachable from the
         // frozen client's live surface: `hello` was already consumed by the
-        // pre-loop handshake (`evaluate_hello`); `codingcli.*` has
-        // no runtime here and the frozen client never sends it (zero senders in
-        // `src/`). The user-reachable fresh-agent control frames
+        // pre-loop handshake (`evaluate_hello`). The user-reachable fresh-agent control frames
         // (approval.respond / question.respond / fork / compact) are refused or
         // dispatched BEFORE/INSIDE this match by `fresh_agent_control_refusal` + the
         // claude arms above -- they must never fall through to this silent arm again.

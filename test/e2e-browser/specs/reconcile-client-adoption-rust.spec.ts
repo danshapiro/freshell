@@ -4,21 +4,20 @@
  * server (docs/plans reconcile-client-adoption lane, Tasks 2-13 merged).
  *
  * Three scenario contracts:
- *   1. restart with mixed pane types: verdicts drive recovery, the legacy
  *      destructive census never destroys a pane (F3 closed);
  *   2. dead sessions surface as ONE batched adjudication panel (council
  *      rule 1) -- nothing auto-closed, per-row explicit decisions;
  *   3. double-restart mid-reconcile converges: no permanent 'creating'
  *      wedge, exactly one live PTY per pane (no duplicates).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch, because
  * this spec imports RustServer directly (restart()/restartAbrupt()).
  *
  * Helpers are copied, not imported, per the e2e suite's per-spec-ownership
  * convention (donor: restore-contract-wall-rust.spec.ts).
  */
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -290,7 +289,7 @@ async function bootAdoption(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -327,7 +326,7 @@ async function allTerminalLeaves(harness: TestHarness): Promise<any[]> {
 // --- REST directory helper (donor: reconcile-handshake-rust.spec.ts) ---
 
 async function listTerminals(
-  info: TestServerInfo,
+  info: E2eServerInfo,
 ): Promise<Array<{ terminalId: string; mode: string; status: string; sessionRef?: { provider: string; sessionId: string } }>> {
   const res = await fetch(`${info.baseUrl}/api/terminals`, {
     headers: { 'x-auth-token': info.token },
@@ -419,9 +418,7 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
 
   test('restart with mixed pane types: verdicts drive recovery, census never destroys', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-adopt-mixed-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -544,9 +541,7 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
 
   test('dead sessions surface as ONE batched adjudication panel', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-adopt-dead-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -649,9 +644,7 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
 
   test('double-restart mid-reconcile converges with no duplicates', async ({
     page,
-    e2eServerKind,
   }) => {
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-adopt-dbl-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })

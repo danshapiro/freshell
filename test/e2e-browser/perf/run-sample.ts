@@ -5,7 +5,8 @@ import { promisify } from 'util'
 import { chromium, type Browser, type BrowserContext, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 import { TestHarness } from '../helpers/test-harness.js'
-import { TestServer, type TestServerInfo } from '../helpers/test-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import {
@@ -330,7 +331,7 @@ function isTerminalOutputFrame(frame: ReceivedWsFrame): boolean {
 async function runReconnectStopResumeProof(input: {
   browser: Browser
   page: Page
-  serverInfo: TestServerInfo
+  serverInfo: E2eServerInfo
   harness: TestHarness
   terminal: TerminalHelper
   receivedWsFrames: ReceivedWsFrame[]
@@ -459,7 +460,7 @@ async function waitForAuditMilestone(
 }
 
 async function withWsConnection<T>(
-  serverInfo: TestServerInfo,
+  serverInfo: E2eServerInfo,
   callback: (ws: WebSocket) => Promise<T>,
 ): Promise<T> {
   const ws = new WebSocket(serverInfo.wsUrl)
@@ -538,7 +539,7 @@ function waitForWsMessage(
 }
 
 async function bootstrapReconnectScenario(
-  serverInfo: TestServerInfo,
+  serverInfo: E2eServerInfo,
   seedResult: VisibleFirstAuditHomeSeedResult,
 ): Promise<ReconnectBootstrapResult> {
   const terminalId = await withWsConnection(serverInfo, async (ws) => {
@@ -622,7 +623,7 @@ async function bootstrapReconnectScenario(
 
 async function resolveBrowserStorageSeed(input: {
   scenarioId: VisibleFirstScenarioId
-  serverInfo: TestServerInfo
+  serverInfo: E2eServerInfo
   seedResult: VisibleFirstAuditHomeSeedResult
 }): Promise<Record<string, string> | null> {
   switch (input.scenarioId) {
@@ -723,7 +724,7 @@ async function executeSampleDefault(
 ): Promise<SampleCollectors> {
   let seedResult: VisibleFirstAuditHomeSeedResult | null = null
   const scenario = getScenarioDefinition(input.scenarioId)
-  const server = new TestServer({
+  const server = new RustServer({
     preserveHomeOnStop: true,
     setupHome: async (homeDir) => {
       seedResult = await seedVisibleFirstAuditServerHome(homeDir)

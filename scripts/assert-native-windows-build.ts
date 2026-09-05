@@ -12,7 +12,7 @@ export function checkNativeWindowsBuildPlatform(
 
   return {
     ok: false,
-    message: 'electron:build:win must run on native Windows so node-pty is compiled for win32.',
+    message: 'electron:build:win must run on native Windows so the Rust server is built for win32.',
   }
 }
 

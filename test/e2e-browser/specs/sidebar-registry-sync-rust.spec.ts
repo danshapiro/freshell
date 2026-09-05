@@ -13,7 +13,7 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -95,7 +95,6 @@ function collectLeaves(node: any): any[] {
 }
 
 function buildClaudeSessionJsonl(sessionId: string, cwd: string, title: string): string {
-  // Donor shape: session-directory-matrix.spec.ts:36 (buildSessionJsonl).
   // Field names verified against the donor (system/init: session_id, uuid,
   // timestamp, cwd; turns: parentUuid, sessionId, cwd, message, uuid, timestamp).
   const t0 = '2026-07-20T08:00:00.000Z'
@@ -177,7 +176,7 @@ function traceInventoryFailures(page: import('@playwright/test').Page, label: st
 test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   test.setTimeout(240_000)
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
   let sharedRoot: string
 
   test.beforeAll(async () => {

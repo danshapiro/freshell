@@ -27,8 +27,8 @@ import type { Direction } from './ws-capture-client.js'
  *   - normalization is IDEMPOTENT: re-normalizing already-normalized output is a
  *     no-op (already-placeholder values pass straight through).
  *
- * Do NOT import server internals here: this must run identically against a
- * captured node-original transcript and a captured Rust-port transcript.
+ * Do NOT import server internals here: this must run identically against two
+ * captured Rust transcripts or a captured Rust transcript and a frozen fixture.
  */
 
 // ── families ────────────────────────────────────────────────────────────────

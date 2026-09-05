@@ -1,15 +1,15 @@
 import { defineConfig } from '@playwright/test'
 import baseConfig from './playwright.config.js'
+import { LOCAL_ONLY_SPECS } from './playwright.config.js'
 
 // Cloud Run Playwright config.
 //
 // Extends the base playwright.config.ts and overrides only the cloud-specific
-// settings. This avoids duplicating the MATRIX_SPECS / RUST_ONLY_SPECS / project
-// testMatch lists, which are tightly coupled to the base config.
+// settings. The base config is Rust-only, so cloud inherits its fixture contract.
 //
 // Key differences from base:
-// - No globalSetup/globalTeardown: the Docker image pre-builds dist/client +
-//   dist/server and the Rust binary, so there's no build step to run.
+// - No globalSetup/globalTeardown: the Docker image pre-builds dist/client and
+//   the Rust binary, so there's no build step to run.
 // - workers: 2, retries: 2: cloud is a CI-like environment.
 // - forbidOnly: true: always enforce in cloud.
 // - Reporter: line + html (open: 'never'): line for log parsing, html for
@@ -27,7 +27,7 @@ import baseConfig from './playwright.config.js'
 // require external CLI binaries (opencode, codex, claude/amplifier) that
 // are not installed, or because they depend on environment-specific
 // rendering/timing that differs in cloud.
-const CLOUD_SKIP_SPECS = [
+export const CLOUD_SKIP_SPECS = [
   // Requires opencode binary
   // (freshopencode-model-picker.spec.ts is cloud-legal: every fetch is routed
   // and the sidecar is suppressed via the test harness, so it needs no binary)
@@ -50,14 +50,11 @@ const CLOUD_SKIP_SPECS = [
   'pane-activity-indicator.spec.ts',
   // Environment-sensitive: timing-sensitive localStorage persistence
   'rest-tab-persistence.spec.ts',
-  // Rust-only: asserts e2eServerKind === 'rust' but runs under chromium
-  // project (not in RUST_ONLY_SPECS — pre-existing config gap)
+  // Rust-only PATH shadow proof requires the local Rust fixture and is not a
+  // cloud-compatible match-all run.
   'term28-path-shadow-rust.spec.ts',
-  // Server-build mismatch reload: the Cloud Run image builds WITHOUT git
-  // metadata (.dockerignore drops .git), so the Rust bake and the Vite
-  // define are both "unknown" there and the client's compare is inert BY
-  // DESIGN — a mismatched ready can never trigger a reload on that lane.
-  // Coverage lives on the local rust-chromium project.
+  // The cloud image has no .git metadata, so the build-id mismatch reload
+  // contract is intentionally exercised only by the local Rust project.
   'server-build-mismatch-rust.spec.ts',
   // Environment-sensitive: page lifecycle (pagehide/unload) timing differs
   // in cloud containers; passes locally but flakes in cloud
@@ -71,8 +68,9 @@ const CLOUD_SKIP_SPECS = [
   // Environment-sensitive: checkpoint/rewind with fake codex sidecar
   // exceeds 120s timeout under cloud resource constraints
   'agent-checkpoint-rewind.spec.ts',
-  // Requires codex binary (creates mode:'codex' tabs via MCP)
-  'mcp-qa-smoke-rust.spec.ts',
+  // Local-only receipt: cloud must never substitute for this provider-binary
+  // contract. The positive local selector is exported by the base config.
+  ...LOCAL_ONLY_SPECS.map(({ spec }) => spec),
 ]
 
 // Test titles to exclude via grepInvert (keeps the spec file but skips

@@ -6,8 +6,6 @@ import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/st
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
-import { normalizeFreshAgentProviderEvent } from '../../../../server/fresh-agent/sdk-events'
-import { parseServeEvent, serveEventToSdk } from '../../../../server/fresh-agent/adapters/opencode/serve-events'
 
 function createFreshAgentStore() {
   return configureStore({
@@ -560,26 +558,10 @@ describe('fresh-agent-ws', () => {
 
     expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'running', revision: 1 })).toBe(true)
 
-    const parsed = parseServeEvent({
-      type: 'session.error',
-      properties: {
-        sessionID: sessionId,
-        error: {
-          name: 'APIError',
-          data: {
-            message: billingMessage,
-            statusCode: 402,
-            isRetryable: false,
-          },
-        },
-      },
-    })
-    if (!parsed) throw new Error('expected parsed OpenCode session.error')
-
-    const sdkEvent = serveEventToSdk(parsed, sessionId)
-    expect(sdkEvent).toEqual({ type: 'sdk.error', sessionId, message: billingMessage })
-    const normalized = normalizeFreshAgentProviderEvent(sdkEvent)
-    expect(normalized).toEqual({ type: 'freshAgent.error', sessionId, message: billingMessage })
+    // Feed the normalized Rust-baseline event shape directly. The client
+    // reducer consumes the shared wire contract; importing a Node adapter here
+    // would make this test pass without exercising that contract.
+    const normalized = { type: 'freshAgent.error', sessionId, message: billingMessage }
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',

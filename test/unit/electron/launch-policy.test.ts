@@ -87,14 +87,6 @@ describe('launch policy', () => {
     })).toEqual({ type: 'start-local' })
   })
 
-  it('continues configured daemon startup when no candidates exist', () => {
-    expect(chooseLaunchAction({
-      desktopConfig: config({ serverMode: 'daemon' }),
-      candidates: [],
-      savedRemoteReachable: false,
-    })).toEqual({ type: 'start-local' })
-  })
-
   it('auto-connects to reachable saved remote config', () => {
     expect(chooseLaunchAction({
       desktopConfig: config({

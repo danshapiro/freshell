@@ -38,7 +38,6 @@
  *     F3-2: render-only assertions can pass on surviving local state with a
  *     fully broken reattach).
  *
- * Rust-only: registered in RUST_ONLY_SPECS + the rust-chromium testMatch
  * (socket-drop/freeze revival; drives RustServer + forceDisconnect +
  * SIGSTOP). Not in CLOUD_SKIP_SPECS -- no real provider binaries needed
  * (every claude interaction uses the committed fakes via CLAUDE_CMD /
@@ -51,7 +50,7 @@
  */
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import type { Page } from '@playwright/test'
@@ -144,7 +143,7 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -258,8 +257,6 @@ async function openClaudePaneAndCapture(
  * Minimal claude transcript the session index treats as interactive and the
  * sidebar renders: TWO user/assistant turns (a one-turn session is classified
  * non-interactive and silently excluded from the sidebar's default query --
- * restore-matrix.spec.ts's root-cause note) plus a summary line carrying the
- * unique title. Shape donor: restore-matrix.spec.ts scenario 3.
  */
 async function writeClaudeTranscript(input: {
   homeDir: string
@@ -422,8 +419,7 @@ async function sidecarSendCount(requestLogPath: string): Promise<number> {
 test.describe('reconnect revive (rust)', () => {
   test.setTimeout(240_000)
 
-  test('terminal pane reattaches and repaints after a bare socket drop', async ({ freshellPage, page, harness, terminal, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('terminal pane reattaches and repaints after a bare socket drop', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
     await terminal.executeCommand('echo "rr-marker-one"')
@@ -447,8 +443,7 @@ test.describe('reconnect revive (rust)', () => {
     await terminal.waitForOutput('rr-marker-two', { timeout: 10_000 })
   })
 
-  test('REST resume door names the live owner in its refusal (red-first contract)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('REST resume door names the live owner in its refusal (red-first contract)', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-rr-rest-door-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -530,8 +525,7 @@ test.describe('reconnect revive (rust)', () => {
     }
   })
 
-  test('sidebar close -> reopen of a live session converges (regression pin)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('sidebar close -> reopen of a live session converges (regression pin)', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-rr-sidebar-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -637,8 +631,7 @@ test.describe('reconnect revive (rust)', () => {
     }
   })
 
-  test('two sequential drops mid-reattach converge to a live pane', async ({ freshellPage, page, harness, terminal, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('two sequential drops mid-reattach converge to a live pane', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
     await terminal.executeCommand('echo "rr-double"')
@@ -654,8 +647,7 @@ test.describe('reconnect revive (rust)', () => {
     expect((await harness.getTerminalBuffer()) ?? '').not.toMatch(noDeadEndText)
   })
 
-  test('server-process freeze forces client-side abandonment before thaw', async ({ freshellPage, page, harness, terminal, testServer, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('server-process freeze forces client-side abandonment before thaw', async ({ freshellPage, page, harness, terminal, testServer }) => {
     test.slow() // freeze window must cover the 30s probe + 10s pong timeout
     test.skip(process.platform === 'win32', 'SIGSTOP/SIGCONT are POSIX-only (freeze-spec gate)')
     await terminal.waitForTerminal()
@@ -710,8 +702,7 @@ test.describe('reconnect revive (rust)', () => {
     expect((await harness.getTerminalBuffer()) ?? '').not.toMatch(noDeadEndText)
   })
 
-  test('fresh-agent pane reattaches and round-trips after a bare socket drop', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fresh-agent pane reattaches and round-trips after a bare socket drop', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-rr-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })

@@ -5,7 +5,7 @@ import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 /**
  * GIT BRANCH/DIRTY BADGES (Task 23, rust-only) -- e2e proof of the Rust
@@ -32,7 +32,6 @@ import type { TestServerInfo } from '../helpers/test-server.js'
  * drives the brief's exact REST flow (`POST /api/tabs {cwd}`): the
  * `freshell-freshagent` spawn pipeline now fires the terminal-created hook
  * `main.rs` wires to `freshell_ws::terminal_meta::seed_from_terminal`
- * (Node `seedFromTerminal` parity, `server/index.ts:647-655` -- legacy
  * seeds off the registry's 'terminal.created' event for EVERY terminal,
  * REST creates included). Test 2 was a `test.fail()` KNOWN-GAP pin until
  * the hook landed; its flip instruction has been executed.
@@ -46,7 +45,7 @@ const BADGE_LABEL = 'badgerepo (main*)'
 
 interface BootedServer {
   server: E2eServerHandle
-  info: TestServerInfo
+  info: E2eServerInfo
   repoDir: string
 }
 
@@ -77,7 +76,6 @@ async function seedBadgeRepo(homeDir: string): Promise<string> {
 async function bootBadgeServer(): Promise<BootedServer> {
   let repoDir = ''
   const server = await createE2eServerHandle(process.env, {
-    kind: 'rust',
     construct: {
       setupHome: async (homeDir: string) => {
         repoDir = await seedBadgeRepo(homeDir)
@@ -89,7 +87,7 @@ async function bootBadgeServer(): Promise<BootedServer> {
   return { server, info, repoDir }
 }
 
-async function connect(page: Page, info: TestServerInfo): Promise<TestHarness> {
+async function connect(page: Page, info: E2eServerInfo): Promise<TestHarness> {
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
   await harness.waitForHarness()
@@ -164,10 +162,8 @@ test.describe('Git branch/dirty badges (Rust only)', () => {
   // `crates/freshell-server/src/main.rs` wires it to
   // `freshell_ws::terminal_meta::seed_from_terminal` -- the SAME seed ->
   // async git enrich -> `commit_if_changed` -> `terminal.meta.updated`
-  // pipeline the WS `terminal.create` handler runs. Node parity:
-  // legacy seeds off the registry's 'terminal.created' EVENT for EVERY
-  // terminal (`server/index.ts:647-655` -> `seedFromTerminal`), REST
-  // creates included. This leg was a `test.fail()` KNOWN-GAP pin until the
+  // pipeline the WS `terminal.create` handler runs. This leg was a
+  // `test.fail()` KNOWN-GAP pin until the
   // hook landed (rest-tab-persistence.spec.ts flip regime).
   // ---------------------------------------------------------------------
   test('a REST-created shell tab (POST /api/tabs {cwd}) shows a git badge (seedFromTerminal parity)', async ({ page }) => {

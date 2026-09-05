@@ -14,11 +14,7 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
  *   controls in A, assert exact membership in A and B, reload/restart, and
  *   verify the shared values and results persist."
  *
- * Routed through the generalized `E2eServerHandle`/`e2eServerKind` seam
- * (HARNESS-02) so this SAME spec exercises the legacy Node server or the
- * owned Rust server depending on the active project. Fixture shapes are
- * copied from `session-directory-matrix.spec.ts` (themselves pinned against
- * both servers' real parsers): a Claude `system/init` + user/assistant turn
+ * owned Rust server. Fixture shapes match the Rust session readers: a Claude `system/init` + user/assistant turn
  * pair + `summary` JSONL, a Codex `session_meta` + `response_item` pair, an
  * Amplifier `metadata.json` + `transcript.jsonl` pair, and an OpenCode
  * `opencode.db` row.
@@ -54,7 +50,6 @@ const AMP_PLAIN_ID = 'amp-s13-plain-0003'
 const OPENCODE_CONTROL_ID = 'oc-s13-control-0001'
 
 // Two turns per Claude session (not one, copied from
-// session-directory-matrix.spec.ts): legacy `claude.ts:478` classifies a
 // session with <= 1 user message as NON-interactive, and the sidebar's
 // default `showNoninteractiveSessions: false` would hide it regardless of
 // any exclusion knobs — the first user message stays line 1 of the
@@ -172,7 +167,6 @@ async function seedAmplifierSession(
       JSON.stringify({ role: 'assistant', content: `${input.name} reply` }),
     ].join('\n') + '\n',
   )
-  // FIXTURE REALISM (copied from session-directory-matrix.spec.ts): the
   // amplifier recency formula folds sidecar mtimes into lastActivityAt; pin
   // them to the seeded metadata timestamp so the fixture matches what it
   // claims.
@@ -182,9 +176,8 @@ async function seedAmplifierSession(
 }
 
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           // Standard settings boilerplate (network configured + one provider
@@ -193,7 +186,7 @@ const test = base.extend({
           // IDEMPOTENT on purpose: `RustServer.restart()` re-runs `boot()`,
           // which re-invokes `setupHome` (`rust-server.ts:466`; its own
           // comment claims "the isolated HOME is never touched" — an
-          // asymmetry vs `TestServer.restart()`'s `bootProcess`, which skips
+          // the former Node fixture restart path, which skipped
           // setupHome entirely). A blind rewrite here would CLOBBER the
           // PATCHed `config.json` the restart leg exists to verify. The
           // transcript seeds below are byte-identical rewrites and safe to
@@ -333,7 +326,6 @@ async function pollServerSidebarSettings(page: any) {
   })
 }
 
-// Exact-membership assertion over the whole seeded matrix.
 async function assertMembership(
   page: any,
   expected: { visible: string[]; hidden: string[] },

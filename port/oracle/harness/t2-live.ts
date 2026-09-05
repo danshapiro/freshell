@@ -1,15 +1,15 @@
 /**
  * T2 LIVE behavioral-invariant harness — opencode + Kimi k2.7 slice.
  * ---------------------------------------------------------------------------
- * Boots the ORIGINAL freshell server as an isolated external process, seeds the
+ * Boots the Rust freshell server as an isolated external process, seeds the
  * user's opencode auth (read-only) into that isolated HOME, drives ONE real
  * coding-CLI turn with a LIVE (cheap) Kimi call THROUGH the server's real
  * fresh-agent surface, and distils the result into a structured `T2Observation`
  * that `assertT2Invariants` (invariants.ts) grades on SHAPE / PRESENCE /
  * PERSISTENCE / PARSEABILITY / WIRE behavior — never LLM-text equality.
  *
- * This is the ORIGINAL-side T2 baseline. The Rust port will later be driven
- * through the identical surface and its T2Observation diffed against this one.
+ * This is a supplemental Rust-only provider contract. It records behavioral
+ * invariants, not equality with historical provider output.
  *
  * ── Exact seed paths (confirmed by probe on this host) ──────────────────────
  *   MODEL   : umans-ai-coding-plan/umans-kimi-k2.7   (the already-wired cheapest path)
@@ -38,25 +38,16 @@
  * AWAITS the turn, treats the idle edge as primary completion, and uses the
  * persisted assistant reply as SECONDARY corroboration. Never LLM-text equality.
  *
- * ── STATUS (original-side, captured this run) ───────────────────────────────
+ * ── STATUS (provider-gated, captured on demand) ──────────────────────────────
  * VERIFIED directly: with the seed paths above, `opencode serve` in an isolated
  * home creates a session in ~0.2s and Kimi returns the pinned reply (containing
  * the sentinel), persisted to the isolated opencode.db, in ~10s. So the auth
  * seeding, HOME/XDG isolation, warm-cache sharing, and the live model path are
  * all correct and the T2 invariants are satisfiable.
  *
- * DEV-0001 (the cold-serve health-probe wedge) was the SOLE blocker to driving
- * that same turn THROUGH the freshell fresh-agent adapter (POST /api/tabs +
- * send-keys). It is now stepped around here by an `OPENCODE_CMD` warm-proxy
- * (`opencode-warm-proxy.ts`) that starts the real `opencode serve` on a private
- * inner port, waits for its health, then opens an L4 passthrough on freshell's
- * port — so freshell's own un-timed probe succeeds immediately, with ZERO source
- * mutation (the PORT, not this baseline, fixes the probe itself). The proxy + its
- * inner serve inherit this run's ownership sentinel and are reaped normally. With
- * the warm-proxy the full turn completes: durable `ses_…` (turnAccepted), reply
- * persisted (secondary corroboration), send-keys returns status=idle (primary
- * idle edge). `t2-opencode-kimi.test.ts` now FAILS LOUDLY (never silently skips)
- * whenever the gate is on but the turn does not accept or complete.
+ * The contract uses the server's normal cold-start provider path. A missing
+ * provider binary or credential is reported by the explicit opt-in gate; once
+ * enabled, failures are loud and bounded.
  *
  * SAFETY: only ever reaps processes carrying THIS run's ownership sentinel
  * (`FRESHELL_PROBE_SENTINEL=<sentinelPath>`, inherited by the server and every
@@ -70,8 +61,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { startExternalServer, type ExternalServerHandle, type OracleTarget } from './external-server.js'
-import { writeWarmProxyShim } from './opencode-warm-proxy.js'
+import { startExternalServer, type ExternalServerHandle } from './external-server.js'
 import { WsCaptureClient } from './ws-capture-client.js'
 import {
   type T2Observation,
@@ -94,7 +84,7 @@ const CAPTURE_TEXT_CAP = 4000
  * DETERMINISM GATE for the T2 DB snapshot (fixes the T2-opencode structural flake).
  * After the sentinel reply text lands in a `part` row (~0.5s), the third-party
  * `opencode serve` binary commits the assistant MESSAGE row a few seconds later
- * (the committed original baseline settled at ~+5.5s with dbMessageCount=2). The
+ * (the provider's message row may settle a few seconds after the part row). The
  * harness must WAIT for that durable steady state before snapshotting the DB, or it
  * reads dbMessageCount/dbHasAssistantMessage at a NON-DETERMINISTIC instant
  * (msgs=1/false before the row commits vs 2/true after). 15s is ~3x the observed
@@ -108,16 +98,6 @@ function trace(enabled: boolean, startedAt: number, msg: string): void {
   if (!enabled) return
   // eslint-disable-next-line no-console
   console.error(`[t2-live +${Date.now() - startedAt}ms] ${msg}`)
-}
-
-/** Best-effort: last `n` lines of a text file (warm-proxy diagnostics only). */
-async function tailFile(filePath: string, n: number): Promise<string> {
-  try {
-    const txt = await fsp.readFile(filePath, 'utf8')
-    return txt.split('\n').slice(-n).join('\n')
-  } catch {
-    return '(no warm-proxy log)'
-  }
 }
 
 // ── auth path resolution + availability gate ─────────────────────────────────
@@ -411,10 +391,7 @@ function dbFactsAtSteadyState(f: DbFacts): boolean {
  * facts and whether the steady state was actually reached (false ⇒ the caller must
  * FAIL LOUD rather than snapshot a non-deterministic partial state).
  *
- * The `opencode serve` binary that writes this DB is IDENTICAL for the node original
- * and the rust port, so this only changes WHEN the harness reads the DB — never any
- * server/port behavior. Called from the shared driver, so the original-side capture
- * and the rust-side capture wait identically and read the SAME settled DB state.
+ * This only changes WHEN the harness reads the DB — never server behavior.
  */
 async function waitForDbSteadyState(
   dbPath: string,
@@ -491,20 +468,6 @@ export interface RunT2Options {
   turnTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr. */
   verbose?: boolean
-  /**
-   * Which server to drive: the node original (`'node'`, default) or the Rust port
-   * (`'rust'`). The SAME driver produces the T2Observation for both, so the oracle's
-   * original-vs-rust comparison is a true same-driver / different-SUT differential.
-   */
-  target?: OracleTarget
-  /**
-   * Whether to front the `opencode serve` with the DEV-0001 warm-proxy. Defaults to
-   * TRUE for the node original (which needs it to step around the cold-serve
-   * health-probe wedge) and FALSE for the Rust port, which carries the DEV-0001 fix
-   * natively and COLD-STARTS the serve clean — the fingerprint the T2-rust equivalence
-   * test asserts (`usedWarmProxy === false`).
-   */
-  warmProxy?: boolean
 }
 
 export interface T2TeardownFacts {
@@ -515,13 +478,6 @@ export interface T2TeardownFacts {
 
 export interface T2Run {
   handle: ExternalServerHandle
-  /** Which server was driven ('node' original or 'rust' port). */
-  target: OracleTarget
-  /**
-   * Whether the DEV-0001 warm-proxy fronted the serve. FALSE for the Rust port —
-   * the cold-start-clean fingerprint the T2-rust equivalence test asserts.
-   */
-  usedWarmProxy: boolean
   /** Isolated project cwd created for this run (removed on teardown). */
   cwd: string
   /** Empty temp XDG_CONFIG_HOME pinned for opencode config isolation (removed on teardown). */
@@ -555,7 +511,7 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
   const xdgConfigHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-xdgcfg-'))
   await fsp.mkdir(path.join(xdgConfigHome, 'opencode'), { recursive: true })
 
-  // SHARE the user's regenerable model/package CACHE (~1 GB of provider SDKs +
+  // Share the user's regenerable model/package cache (~1 GB of provider SDKs +
   // the models.dev registry). This is NOT session data: sharing it read-mostly
   // keeps the first live turn from re-downloading/re-installing ~1 GB into a
   // cold cache (which blew past a 170s budget in an earlier run). Sessions /
@@ -565,12 +521,8 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
   const ownsCwd = !options.cwd
   const cwd = options.cwd ?? (await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-project-')))
 
-  const target: OracleTarget = options.target ?? 'node'
-  // The node original needs the DEV-0001 warm-proxy; the Rust port cold-starts clean.
-  const useWarmProxy = options.warmProxy ?? target === 'node'
-
-  // Both targets spawn the REAL `opencode serve` (the node original via the warm-proxy
-  // passthrough; the Rust port directly, `OPENCODE_CMD` unset). Resolve it up front.
+  // Resolve the real provider binary up front; the Rust server launches it
+  // directly under the isolated HOME.
   const realOpencode = resolveOpencodeBinary()
   if (!realOpencode) {
     if (ownsCwd) await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {})
@@ -578,52 +530,27 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
     throw new Error('opencode binary not resolvable on PATH (required for the T2 serve)')
   }
 
-  // Warm-proxy (NODE ONLY): freshell honors OPENCODE_CMD as its serve command and invokes
-  // it as `<cmd> serve --hostname H --port P`. We point it at a shim that warms the real
-  // serve past DEV-0001's cold-accept race with ZERO source mutation (opencode-warm-proxy.ts).
-  // The Rust port carries the DEV-0001 fix natively, so it gets NO OPENCODE_CMD and
-  // cold-starts the serve directly — the observable fingerprint the T2-rust test asserts.
-  let proxyDir: string | null = null
-  let proxyLogPath = ''
-  let warmProxyCmd: string | null = null
-  if (useWarmProxy) {
-    proxyDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-t2-proxy-'))
-    proxyLogPath = path.join(proxyDir, 'warm-proxy.log')
-    warmProxyCmd = await writeWarmProxyShim(proxyDir)
-  }
-
   const rmOwnedTemps = async () => {
     await fsp.rm(xdgConfigHome, { recursive: true, force: true }).catch(() => {})
-    if (proxyDir) await fsp.rm(proxyDir, { recursive: true, force: true }).catch(() => {})
     if (ownsCwd) await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {})
   }
 
   trace(
     traceOn,
     startedAt,
-    `booting isolated ${target} server + seeding opencode auth ` +
-      `(warm-proxy: ${warmProxyCmd ?? 'none — cold-start'})…`,
+    'booting isolated Rust server + seeding opencode auth…',
   )
   let seededDbPath = ''
   let handle: ExternalServerHandle
   try {
     handle = await startExternalServer({
-      target,
       provider: 'oracle-t2-opencode',
       startTimeoutMs: 90_000,
       verbose: options.verbose ?? false,
       env: {
         XDG_CONFIG_HOME: xdgConfigHome,
         XDG_CACHE_HOME: xdgCacheHome,
-        // Warm-proxy wiring (node original only). Omitted for the Rust cold-start so its
-        // ServeConfig command defaults to the real `opencode` binary.
-        ...(useWarmProxy && warmProxyCmd
-          ? {
-              OPENCODE_CMD: warmProxyCmd,
-              FRESHELL_T2_REAL_OPENCODE: realOpencode,
-              FRESHELL_T2_PROXY_LOG: proxyLogPath,
-            }
-          : {}),
+        OPENCODE_CMD: realOpencode,
       },
       setupHome: async (homeDir) => {
         const { dbPath } = await seedOpencodeAuthIntoHome(homeDir)
@@ -721,7 +648,7 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
     observation.initialSessionId = created.json.data.sessionId ?? null
     trace(traceOn, startedAt, `tab created: pane=${paneId} placeholder=${observation.initialSessionId}; firing 1 live turn…`)
 
-    // 2. FIRE the live turn. With the warm-proxy the serve is health-ready, so the
+    // 2. FIRE the live turn. The server's provider path is health-ready, so the
     //    fresh-agent send drives the turn and BLOCKS server-side until the session
     //    goes idle (the completion edge). We fire now so steps 3-4 can watch the
     //    durable session + reply materialize mid-turn, then AWAIT the idle edge in
@@ -776,8 +703,7 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
       trace(traceOn, startedAt, `durable session: ${durableId} (+${Date.now() - tTurn}ms)`)
     } else {
       const dbExists = await pathExists(seededDbPath)
-      const proxyTail = await tailFile(proxyLogPath, 12)
-      trace(traceOn, startedAt, `NO durable session after 60s. dbExists=${dbExists} newest=${dbExists ? newestSessionId(seededDbPath) : 'n/a'} sendOutcome=[${sendOutcome}]\n--- warm-proxy.log tail ---\n${proxyTail}`)
+      trace(traceOn, startedAt, `NO durable session after 60s. dbExists=${dbExists} newest=${dbExists ? newestSessionId(seededDbPath) : 'n/a'} sendOutcome=[${sendOutcome}]`)
     }
 
     // 4. SECONDARY corroboration: wait for the assistant reply (with the sentinel)
@@ -794,8 +720,7 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
       //     assistant MESSAGE row, so snapshotting here would read dbMessageCount /
       //     dbHasAssistantMessage at a non-deterministic instant (the T2-opencode
       //     flake: msgs=1/false vs 2/true). Wait, bounded, for the DURABLE STEADY
-      //     STATE (message row committed) before snapshotting, so both the node
-      //     original and the rust port read the SAME settled DB. Only gated when the
+      //     STATE (message row committed) before snapshotting. Only gated when the
       //     sentinel actually landed — a missing reply is a separate, already-asserted
       //     turn-completion failure and must NOT be masked by (or wait out) this gate.
       let facts = replyFacts
@@ -893,5 +818,5 @@ export async function runOpencodeKimiT2(options: RunT2Options = {}): Promise<T2R
     return facts
   }
 
-  return { handle, target, usedWarmProxy: useWarmProxy, cwd, xdgConfigHome, xdgCacheHome, observation, teardown }
+  return { handle, cwd, xdgConfigHome, xdgCacheHome, observation, teardown }
 }

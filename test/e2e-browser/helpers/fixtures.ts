@@ -1,8 +1,8 @@
 import { test as base, type Page } from '@playwright/test'
-import { type TestServerInfo } from './test-server.js'
+import { type E2eServerInfo } from './server-fixture-support.js'
 import { TestHarness } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
-import { createE2eServerHandle, type E2eServerHandle, type E2eServerKind } from './external-target.js'
+import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
 import {
   installRecoveryOfferAutoDeclineOnContext,
   type RecoveryOfferHandling,
@@ -62,7 +62,7 @@ async function selectShellFromPicker(page: Page): Promise<void> {
  * - freshellPage: A page pre-navigated to Freshell with harness ready
  */
 export const test = base.extend<{
-  serverInfo: TestServerInfo
+  serverInfo: E2eServerInfo
   harness: TestHarness
   terminal: TerminalHelper
   freshellPage: Page
@@ -80,30 +80,18 @@ export const test = base.extend<{
   // extended type to a degraded map, hiding genuine option keys from
   // test.use). Type-level correction; the fixture object below is unchanged.
   testServer: E2eServerHandle
-  // HARNESS-02 -- a worker-scoped Playwright PROJECT OPTION selecting which
-  // real server implementation `testServer` should boot: the legacy Node
-  // server or the owned Rust binary. Projects set this via `use:
-  // { e2eServerKind: 'rust' }` (see playwright.config.ts's `rust-chromium`
-  // project); every other project (and any caller that doesn't set it)
-  // inherits the 'legacy' default below, so this is a NO-OP for existing
-  // projects/specs.
-  e2eServerKind: E2eServerKind
 }>({
-  e2eServerKind: ['legacy', { option: true, scope: 'worker' }],
-
   recoveryOfferHandling: ['auto-decline', { option: true }],
 
-  // RESTORE-01 — on rust legs, every page of the default context carries the
+  // RESTORE-01 — every page of the default context carries the
   // recovery-offer auto-decline watcher (the harness answering a designed
-  // offer like a user; see recovery-offer.ts header). Legacy legs install
   // NOTHING (the route is absent there — byte-identical behavior). The
   // built-in `context` is overridden, so spec-authored
   // `browser.newContext()` pages bypass it; those specs adopt
   // `installRecoveryOfferAutoDeclineOnContext` directly (multi-client,
-  // tabs-client-retire, project-colors-matrix) or opt out via
   // `recoveryOfferHandling: 'manual'` (panel-owning specs).
-  context: async ({ context, e2eServerKind, recoveryOfferHandling }, use) => {
-    if (e2eServerKind === 'rust' && recoveryOfferHandling === 'auto-decline') {
+  context: async ({ context, recoveryOfferHandling }, use) => {
+    if (recoveryOfferHandling === 'auto-decline') {
       installRecoveryOfferAutoDeclineOnContext(context)
     }
     await use(context)
@@ -114,11 +102,9 @@ export const test = base.extend<{
   //
   // Seam (T3 oracle): when FRESHELL_E2E_TARGET_URL is set, createE2eServerHandle
   // returns a handle that points at an already-running EXTERNAL server (e.g. the
-  // Rust port) instead of spawning a fresh local TestServer. When it is unset,
-  // `e2eServerKind` (HARNESS-02) picks 'legacy' (a normal TestServer -- behavior
-  // identical to before) or 'rust' (an owned RustServer) per Playwright project.
-  testServer: [async ({ e2eServerKind }, use) => {
-    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+  // Rust port) instead of spawning a fresh local owned RustServer.
+  testServer: [async ({}, use) => {
+    const server = await createE2eServerHandle(process.env)
     await server.start()
     await use(server)
     await server.stop()

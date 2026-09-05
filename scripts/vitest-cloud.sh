@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vitest-cloud.sh — Cloud Run Jobs wrapper for Vitest unit/server tests.
+# vitest-cloud.sh — Cloud Run Jobs wrapper for the retained Vitest tests.
 #
 # Usage:
 #   scripts/vitest-cloud.sh [subcommand] [flags] [vitest-args...]
@@ -24,7 +24,7 @@
 #   --local-build     Build locally with Docker instead of Cloud Build
 #   --shards=N        Number of parallel Cloud Run tasks (default: 4)
 #   --timeout=DURATION Cloud Run task timeout (default: 30m)
-#   --config=default|server|all  Which vitest configs to run (default: all)
+#   --config=default|all         Which retained Vitest config(s) to run
 #   --account=EMAIL   GCP account pin (highest precedence; default: none —
 #                     FRESHELL_GCP_ACCOUNT env, then the gcloud-robot identity
 #                     ladder, then ambient gcloud)
@@ -95,7 +95,7 @@ if command -v gcloud &>/dev/null; then
   fi
 fi
 
-DEFAULT_CONFIGS="config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts"
+DEFAULT_CONFIGS="config/vitest/vitest.config.ts"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -161,7 +161,7 @@ Flags:
   --local-build     Build locally with Docker instead of Cloud Build
   --shards=N        Number of parallel Cloud Run tasks (default: 4)
   --timeout=DURATION Cloud Run task timeout (default: 30m)
-  --config=default|server|all  Which vitest configs to run (default: all)
+  --config=default|all         Which retained Vitest config(s) to run
   --account=EMAIL   GCP account pin (highest precedence; default: none)
   --project-id=ID   GCP project (default: misc-puttering-project)
   --region=REGION   GCP region (default: us-west1)
@@ -188,7 +188,7 @@ remain in Cloud Logging afterwards.
 Examples:
   scripts/vitest-cloud.sh run --local test/unit/lib/pane-utils.test.ts
   scripts/vitest-cloud.sh run --cloud --shards=4
-  scripts/vitest-cloud.sh run --cloud --config=default --shards=2
+  scripts/vitest-cloud.sh run --cloud --config=all --shards=2
   scripts/vitest-cloud.sh build
   scripts/vitest-cloud.sh help
 EOF
@@ -323,7 +323,7 @@ cmd_run() {
   local local_build_flag=false
   local shards=4
   local timeout="30m"
-  local config_selector="all"
+  local config_selector="default"
   local -a vt_args=()
 
   while [[ $# -gt 0 ]]; do
@@ -382,14 +382,15 @@ cmd_run() {
       configs="config/vitest/vitest.config.ts"
       ;;
     server)
-      configs="config/vitest/vitest.server.config.ts"
+      echo "[vitest-cloud] ERROR: the retired Node server config is unavailable; use npm run test:server for the Rust cargo lane." >&2
+      exit 2
       ;;
     all)
       configs="$DEFAULT_CONFIGS"
       ;;
     *)
-      echo "[vitest-cloud] Unknown --config value: $config_selector (expected default|server|all)"
-      exit 1
+      echo "[vitest-cloud] Unknown --config value: $config_selector (expected default or all)" >&2
+      exit 2
       ;;
   esac
 
@@ -410,7 +411,7 @@ cmd_run() {
     local exit_code=0
     for config in $configs; do
       echo "[vitest-cloud] Running vitest: $config ${vt_args[*]-}"
-      npx vitest run --passWithNoTests --config "$config" "${vt_args[@]+"${vt_args[@]}"}" || exit_code=$?
+      npx vitest run --config "$config" "${vt_args[@]+"${vt_args[@]}"}" || exit_code=$?
     done
     exit "$exit_code"
   fi

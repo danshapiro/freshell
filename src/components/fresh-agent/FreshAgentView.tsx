@@ -502,12 +502,6 @@ function readCodexFork(value: unknown): { parentThreadId?: string } | undefined 
   }
 }
 
-function composeOutgoingText(text: string, attachmentPaths: string[]): string {
-  if (attachmentPaths.length === 0) return text
-  const list = attachmentPaths.map((path) => `- ${path}`).join('\n')
-  return `${text ? `${text}\n\n` : ''}Attached files (read them from disk):\n${list}`
-}
-
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false
   return Boolean(target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
@@ -2528,29 +2522,6 @@ export function FreshAgentView({
     }
   }, [pendingApprovalsFromSnapshot, sendFreshAgentMessage])
 
-  /** `!command` shell escape: run via the extras endpoint, then hand the
-   * command + output to the agent as explicit user-provided context. */
-  const runShellCommand = useCallback((command: string) => {
-    const current = paneContentRef.current
-    void Promise
-      .resolve(api.post<{ output: string; exitCode: number | null; truncated: boolean }>(
-        '/api/fresh-agent/exec',
-        { command, cwd: current.initialCwd },
-      ))
-      .then((result) => {
-        const status = result.exitCode === 0 ? '' : ` (exit ${result.exitCode})`
-        const body = `I ran \`${command}\`${status} in ${current.initialCwd ?? 'the home directory'}. Output:\n\`\`\`\n${result.output || '(no output)'}\n\`\`\``
-        if (isBusy) {
-          setQueuedMessages((queue) => [...queue, body])
-        } else {
-          sendUserText(body)
-        }
-      })
-      .catch((error: unknown) => {
-        setNotice(error instanceof Error ? `Shell command failed: ${error.message}` : 'Shell command failed')
-      })
-  }, [isBusy, sendUserText])
-
   /** Rewind the working tree to the checkpoint taken when a user turn was
    * sent. Conversation history is untouched — this is the code half of
    * rewind; fork-from-turn covers the conversation half. */
@@ -2782,8 +2753,6 @@ export function FreshAgentView({
               ))}
               <FreshAgentDiffPanel
                 diffs={diffs}
-                cwd={paneContent.initialCwd}
-                onComment={(text) => composerRef.current?.insertText(text)}
               />
             </div>
             <FreshAgentTranscript
@@ -2863,8 +2832,6 @@ export function FreshAgentView({
               }
               storageKey={`fresh-agent-draft:${paneContent.sessionType}:${paneContent.sessionId ?? paneContent.createRequestId}`}
               historyKey={`fresh-agent-prompt-history:${paneContent.sessionType}`}
-              cwd={paneContent.initialCwd}
-              provider={paneContent.provider}
               thinking={isBusy}
               queuedMessages={queuedMessages}
               onCancelQueued={(index) => {
@@ -2884,18 +2851,16 @@ export function FreshAgentView({
                   ? REDO_CODEX_UNSUPPORTED_NOTICE
                   : rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider),
               )}
-              onShellCommand={runShellCommand}
-              onSend={(text, attachmentPaths) => {
+              onSend={(text) => {
                 dispatch(dismissTabGreen(tabId))
                 if (!paneContent.sessionId || sessionEnded) return
                 if (!canSend && !isBusy) return
-                const outgoing = composeOutgoingText(text, attachmentPaths)
-                if (!outgoing) return
+                if (!text) return
                 if (isBusy) {
-                  setQueuedMessages((queue) => [...queue, outgoing])
+                  setQueuedMessages((queue) => [...queue, text])
                   return
                 }
-                sendUserText(outgoing)
+                sendUserText(text)
               }}
             />
             <FreshAgentModelDialog
@@ -2947,7 +2912,6 @@ export function FreshAgentView({
     pendingCreateFailure,
     queuedMessages,
     rewindToTurn,
-    runShellCommand,
     sessionEnded,
     sessionErrorMessage,
     startNewConversation,

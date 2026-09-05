@@ -12,7 +12,7 @@
 //   To run the full turn:
 //     FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 ANTHROPIC_API_KEY=... \
 //       npm run test:vitest -- run test/integration/real/amplifier-launch-smoke.test.ts \
-//       --config config/vitest/vitest.server.config.ts
+//       --config config/vitest/vitest.config.ts
 //
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'

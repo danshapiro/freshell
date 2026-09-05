@@ -1,31 +1,24 @@
-# Docker Extension Test
+# Docker Rust Server Example
 
-Demonstrates that server extensions work when freshell runs inside Docker.
+Demonstrates running the Rust Freshell server in Docker. Historical server
+extension files are not launched or proxied by the Rust server.
 
-## The Problem
+## Scope
 
-Server extensions spawn processes on dynamically allocated ports inside the
-container. Docker only exposes explicitly mapped ports, so the browser can't
-reach those dynamic ports directly.
-
-## The Solution
-
-Freshell proxies all server extension requests through its own port via
-`/api/proxy/http/:port/`. The browser only needs to reach port 3001 (freshell),
-and freshell internally proxies HTTP and WebSocket traffic to the extension's
-port inside the container.
+The container exposes the Rust Freshell server on port 3001. It does not
+include the retired Node extension process manager or the old
+`/api/proxy/http/:port/` route. Run any separate service yourself and publish
+its port explicitly if you need to access it.
 
 ## Try It
 
 ```bash
 # From the freshell repo root:
 docker build -t freshell-docker-test -f examples/docker/Dockerfile .
-docker run --rm -p 3001:3001 freshell-docker-test
+# Use a private random value of at least 16 characters; do not commit it.
+docker run --rm -e AUTH_TOKEN=replace-with-a-long-random-token -p 3001:3001 freshell-docker-test
 ```
 
-Open the URL printed to stdout. The pane picker will show:
-- **Status Dashboard** — HTTP server extension (auto-refreshing system stats)
-- **Live Counter** — WebSocket server extension (shared real-time counter)
-- **Notepad** — Client extension (static HTML, no server)
-
-All three work despite only port 3001 being exposed.
+Open the URL printed to stdout. The pane picker contains the Rust-supported
+panes; the historical client/server extension manifests are not working pane
+types in this server.

@@ -17,16 +17,15 @@ const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
 
 /**
- * Dedicated config for the equivalence oracle's LIVE conformance tests
+ * Dedicated config for the Rust oracle's live conformance tests
  * (`test/unit/port/oracle/**`).
  *
  * Unlike the fast contract-freeze drift guard (config/vitest/vitest.port.config.ts),
- * these tests boot a REAL external freshell server process via
+ * these tests boot a real external Rust server via
  * `port/oracle/harness/external-server.ts`, so:
- *   - NO globalSetup: the harness ensures `dist/server/index.js` is built and
- *     boots/reaps its own isolated server. We must NOT trigger the server
- *     global-setup dist rebuild here.
- *   - node environment, generous 120s timeout for cold boot + first build.
+ *   - NO globalSetup: the harness builds the worktree's release binary and
+ *     boots/reaps its own isolated server.
+ *   - Node test environment, generous 120s timeout for cold boot + first build.
  *   - single-fork / no file parallelism so spawned ports & pids never contend.
  *
  * NOT wired into the shared test-coordinator/full-suite — run explicitly via

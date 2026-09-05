@@ -1,26 +1,29 @@
 #!/usr/bin/env tsx
 
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { resolveNpmCommand } from './testing/coordinator-upstream.js'
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const repoRoot = resolve(__dirname, '..')
-const require = createRequire(import.meta.url)
-const vitestEntrypoint = require.resolve('vitest/vitest.mjs')
-const defaultVitestConfig = 'config/vitest/vitest.config.ts'
-const serverVitestConfig = 'config/vitest/vitest.server.config.ts'
-const electronVitestConfig = 'config/vitest/vitest.electron.config.ts'
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
+const PROJECT_ROOT = resolve(SCRIPT_DIR, '..')
+const REQUIRE = createRequire(resolve(PROJECT_ROOT, 'package.json'))
+const VITEST_ENTRYPOINT = REQUIRE.resolve('vitest/vitest.mjs')
+const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
+const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
+const ELECTRON_RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.electron-runtime.config.ts'
 
 export type StandardTestMode = 'desktop' | 'aggressive'
-export type SuiteName = 'client' | 'server' | 'electron'
+export type SuiteName = 'client' | 'source-runtime' | 'rust' | 'electron' | 'electron-runtime'
 export type RunPriority = 'normal' | 'background'
 
 export interface StandardTestRun {
   name: SuiteName
+  runner: 'vitest' | 'npm'
   configPath?: string
+  script?: 'test:source-runtime' | 'test:rust'
   maxWorkers?: string
   priority: RunPriority
 }
@@ -39,7 +42,7 @@ interface CreatePlanInput {
 
 interface DesktopWorkerPlan {
   clientWorkers: string
-  serverWorkers: string
+  rustWorkers: string
 }
 
 interface VitestArgsInput {
@@ -64,43 +67,30 @@ function log(level: 'info' | 'warn' | 'error', msg: string, fields: Record<strin
 export function resolveDesktopWorkerPlan(cpuCount: number): DesktopWorkerPlan {
   const safeCpuCount = Number.isFinite(cpuCount) ? Math.max(2, Math.floor(cpuCount)) : 4
   const totalWorkers = Math.min(8, Math.max(4, Math.floor(safeCpuCount / 4)))
-  const serverWorkers = totalWorkers >= 8 ? 3 : 2
-  const clientWorkers = Math.max(2, totalWorkers - serverWorkers)
+  const rustWorkers = totalWorkers >= 8 ? 3 : 2
+  const clientWorkers = Math.max(2, totalWorkers - rustWorkers)
   return {
     clientWorkers: String(clientWorkers),
-    serverWorkers: String(serverWorkers),
+    rustWorkers: String(rustWorkers),
   }
 }
 
 export function resolvePriorityValue(priority: RunPriority, platform: NodeJS.Platform = process.platform): number {
-  if (priority === 'normal') {
-    return 0
-  }
-  return platform === 'win32'
-    ? osConstants.priority.PRIORITY_BELOW_NORMAL
-    : 10
+  if (priority === 'normal') return 0
+  return platform === 'win32' ? osConstants.priority.PRIORITY_BELOW_NORMAL : 10
 }
 
-export function buildVitestArgs({
-  configPath,
-  maxWorkers,
-  forwardedArgs,
-}: VitestArgsInput): string[] {
-  const args = ['run', '--passWithNoTests']
-  if (configPath) {
-    args.push('--config', configPath)
-  }
-  if (maxWorkers) {
-    args.push('--maxWorkers', maxWorkers)
-  }
+export function buildVitestArgs({ configPath, maxWorkers, forwardedArgs }: VitestArgsInput): string[] {
+  const args = ['run']
+  if (configPath) args.push('--config', configPath)
+  if (maxWorkers) args.push('--maxWorkers', maxWorkers)
   return [...args, ...forwardedArgs]
 }
 
 function classifySuitePath(token: string): SuiteName | null {
-  if (token.startsWith('-')) {
-    return null
-  }
+  if (token.startsWith('-')) return null
   const normalizedToken = token.replace(/\\/g, '/')
+
   if (
     normalizedToken.startsWith('test/unit/electron/')
     || normalizedToken.includes('/test/unit/electron/')
@@ -108,26 +98,30 @@ function classifySuitePath(token: string): SuiteName | null {
     return 'electron'
   }
   if (
+    normalizedToken.startsWith('test/integration/tooling/')
+    || normalizedToken.includes('/test/integration/tooling/')
+  ) {
+    return 'source-runtime'
+  }
+  if (
+    normalizedToken.startsWith('test/integration/electron/')
+    || normalizedToken.includes('/test/integration/electron/')
+  ) {
+    return 'electron-runtime'
+  }
+  if (
     normalizedToken.startsWith('test/server/')
     || normalizedToken.startsWith('test/unit/server/')
     || normalizedToken.startsWith('test/integration/server/')
-    || normalizedToken.startsWith('test/integration/real/')
+    || normalizedToken.startsWith('crates/')
     || normalizedToken.includes('/test/server/')
     || normalizedToken.includes('/test/unit/server/')
     || normalizedToken.includes('/test/integration/server/')
-    || normalizedToken.includes('/test/integration/real/')
-    || normalizedToken.endsWith('/test/integration/session-repair.test.ts')
-    || normalizedToken.endsWith('/test/integration/session-search-e2e.test.ts')
-    || normalizedToken.endsWith('/test/integration/extension-system.test.ts')
-    || normalizedToken === 'test/integration/session-repair.test.ts'
-    || normalizedToken === 'test/integration/session-search-e2e.test.ts'
-    || normalizedToken === 'test/integration/extension-system.test.ts'
+    || normalizedToken.includes('/crates/')
   ) {
-    return 'server'
+    return 'rust'
   }
-  if (normalizedToken.startsWith('test/') || normalizedToken.includes('/test/')) {
-    return 'client'
-  }
+  if (normalizedToken.startsWith('test/') || normalizedToken.includes('/test/')) return 'client'
   return null
 }
 
@@ -135,14 +129,55 @@ function detectRequestedSuites(forwardedArgs: string[]): SuiteName[] | null {
   const suites = new Set<SuiteName>()
   for (const token of forwardedArgs) {
     const suite = classifySuitePath(token)
-    if (suite) {
-      suites.add(suite)
-    }
+    if (suite) suites.add(suite)
   }
-  if (suites.size === 0) {
-    return null
+  if (suites.size === 0) return null
+  return ['client', 'source-runtime', 'rust', 'electron', 'electron-runtime']
+    .filter((suite): suite is SuiteName => suites.has(suite))
+}
+
+function buildRuns(
+  mode: StandardTestMode,
+  workers: DesktopWorkerPlan,
+  includeElectronRuntime: boolean,
+): StandardTestRun[] {
+  const priority: RunPriority = mode === 'aggressive' ? 'normal' : 'background'
+  const runs: StandardTestRun[] = [
+    {
+      name: 'client',
+      runner: 'vitest',
+      configPath: DEFAULT_VITEST_CONFIG,
+      maxWorkers: mode === 'aggressive' ? '50%' : workers.clientWorkers,
+      priority,
+    },
+    {
+      name: 'source-runtime',
+      runner: 'npm',
+      script: 'test:source-runtime',
+      priority,
+    },
+    {
+      name: 'rust',
+      runner: 'npm',
+      script: 'test:rust',
+      priority,
+    },
+    {
+      name: 'electron',
+      runner: 'vitest',
+      configPath: ELECTRON_VITEST_CONFIG,
+      priority,
+    },
+  ]
+  if (includeElectronRuntime) {
+    runs.push({
+      name: 'electron-runtime',
+      runner: 'vitest',
+      configPath: ELECTRON_RUNTIME_VITEST_CONFIG,
+      priority,
+    })
   }
-  return ['client', 'server', 'electron'].filter((suite): suite is SuiteName => suites.has(suite))
+  return runs
 }
 
 export function createStandardTestPlan({
@@ -153,43 +188,196 @@ export function createStandardTestPlan({
 }: CreatePlanInput): StandardTestPlan {
   const resolvedMode = mode ?? (ci ? 'aggressive' : 'desktop')
   const requestedSuites = detectRequestedSuites(forwardedArgs)
+  const workers = resolveDesktopWorkerPlan(cpuCount)
+  const runs = buildRuns(resolvedMode, workers, requestedSuites?.includes('electron-runtime') ?? false)
+  const selectedRuns = requestedSuites
+    ? runs.filter((run) => requestedSuites.includes(run.name))
+    : runs
 
-  if (resolvedMode === 'aggressive') {
-    const aggressiveRuns: StandardTestRun[] = [
-      { name: 'client', configPath: defaultVitestConfig, maxWorkers: '50%', priority: 'normal' },
-      { name: 'server', configPath: serverVitestConfig, maxWorkers: '50%', priority: 'normal' },
-      { name: 'electron', configPath: electronVitestConfig, priority: 'normal' },
-    ]
-    return {
-      mode: resolvedMode,
-      stages: [filterRuns(aggressiveRuns, requestedSuites)],
+  // Each phase owns its prerequisites and artifacts. The source-runtime
+  // wrapper begins with npm run prebuild, so the broad check/verify path keeps
+  // the same live-server build guard as a direct source-runtime invocation.
+  // Keeping the phases in order also prevents a source-runtime build and Cargo
+  // from racing over the same target/dist directories while retaining one
+  // coordinator gate for the full suite.
+  return {
+    mode: resolvedMode,
+    stages: selectedRuns.map((run) => [run]),
+  }
+}
+
+function applyPriority(run: StandardTestRun, child: ChildProcess): void {
+  if (!child.pid || run.priority === 'normal') return
+  try {
+    setPriority(child.pid, resolvePriorityValue(run.priority))
+  } catch (error) {
+    log('warn', 'Failed to lower test runner priority', {
+      suite: run.name,
+      pid: child.pid,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
+  let command: string
+  let args: string[]
+  if (run.runner === 'vitest') {
+    command = process.execPath
+    args = [VITEST_ENTRYPOINT, ...buildVitestArgs({
+      configPath: run.configPath,
+      maxWorkers: run.maxWorkers,
+      forwardedArgs,
+    })]
+  } else {
+    args = ['run', run.script!]
+    if (run.name === 'source-runtime' && forwardedArgs.length > 0) args.push('--', ...forwardedArgs)
+    const npm = resolveNpmCommand(args)
+    command = npm.command
+    args = npm.args
+  }
+
+  log('info', 'Starting test phase', {
+    suite: run.name,
+    runner: run.runner,
+    priority: run.priority,
+    args,
+  })
+  const child = spawn(command, args, {
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    stdio: 'inherit',
+    windowsHide: true,
+  })
+  applyPriority(run, child)
+  return child
+}
+
+async function runStage(stage: StandardTestRun[], forwardedArgs: string[]): Promise<void> {
+  if (stage.length === 0) return
+
+  await new Promise<void>((resolveStage, rejectStage) => {
+    const children = stage.map((run) => ({ run, child: startRun(run, forwardedArgs) }))
+    let finished = 0
+    let settled = false
+
+    const terminateOthers = (originSuite: SuiteName): void => {
+      for (const entry of children) {
+        if (entry.run.name === originSuite) continue
+        if (entry.child.exitCode === null && !entry.child.killed) entry.child.kill('SIGTERM')
+      }
+    }
+
+    for (const entry of children) {
+      entry.child.once('error', (error) => {
+        if (settled) return
+        settled = true
+        terminateOthers(entry.run.name)
+        rejectStage(error)
+      })
+
+      entry.child.once('exit', (code, signal) => {
+        const exitCode = code ?? (signal ? 1 : 0)
+        log(exitCode === 0 ? 'info' : 'error', 'Test phase exited', {
+          suite: entry.run.name,
+          code: exitCode,
+          signal,
+        })
+        if (settled) return
+        if (exitCode !== 0) {
+          settled = true
+          terminateOthers(entry.run.name)
+          rejectStage(new Error(`${entry.run.name} phase exited with code ${exitCode}`))
+          return
+        }
+        finished += 1
+        if (finished === children.length) {
+          settled = true
+          resolveStage()
+        }
+      })
+    }
+  })
+}
+
+function selectedSuites(forwardedArgs: string[]): Set<SuiteName> | null {
+  const requested = detectRequestedSuites(forwardedArgs)
+  return requested ? new Set(requested) : null
+}
+
+export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  const { mode, forwardedArgs } = parseCliArgs(argv)
+  const requested = selectedSuites(forwardedArgs)
+
+  // Cloud Vitest owns only the retained default client/tooling lane. The
+  // source-runtime and Cargo phases still run locally because they need the
+  // built Rust artifact and a real process filesystem.
+  if (process.env.FRESHELL_VITEST_BACKEND === 'cloud' && (!requested || requested.has('client'))) {
+    const hasGitDependentArgs = forwardedArgs.some((arg) => arg === '--changed' || arg.startsWith('--changed='))
+    if (hasGitDependentArgs) {
+      log('warn', 'Git-dependent selectors detected; running all phases locally', { forwardedArgs })
+    } else {
+      const cloudScript = process.env.FRESHELL_VITEST_CLOUD_SCRIPT || resolve(PROJECT_ROOT, 'scripts/vitest-cloud.sh')
+      log('info', 'Dispatching default Vitest phase to cloud', { cloudScript, forwardedArgs })
+      try {
+        execFileSync(cloudScript, ['run', '--cloud', '--config=default', ...forwardedArgs], {
+          stdio: 'inherit',
+          cwd: PROJECT_ROOT,
+          env: process.env,
+        })
+      } catch {
+        return 1
+      }
+
+      const plan = createStandardTestPlan({
+        availableParallelism: availableParallelism(),
+        ci: process.env.CI === 'true' || process.env.CI === '1',
+        mode,
+        forwardedArgs,
+      })
+      const localStages = plan.stages.filter((entry) => entry[0]?.name !== 'client')
+      log('info', 'Cloud default phase complete; running local phases', {
+        phases: localStages.map((stage) => stage[0]?.name).filter((name): name is SuiteName => Boolean(name)),
+      })
+      try {
+        for (const stage of localStages) {
+          await runStage(stage, forwardedArgs)
+        }
+        return 0
+      } catch (error) {
+        log('error', 'Standard test run failed', { error: error instanceof Error ? error.message : String(error) })
+        return 1
+      }
     }
   }
 
-  const workers = resolveDesktopWorkerPlan(cpuCount)
-  const initialStage = filterRuns([
-    { name: 'client', configPath: defaultVitestConfig, maxWorkers: workers.clientWorkers, priority: 'background' },
-    { name: 'server', configPath: serverVitestConfig, maxWorkers: workers.serverWorkers, priority: 'background' },
-  ], requestedSuites)
-  const electronStage = filterRuns([
-    { name: 'electron', configPath: electronVitestConfig, priority: 'background' },
-  ], requestedSuites)
+  const plan = createStandardTestPlan({
+    availableParallelism: availableParallelism(),
+    ci: process.env.CI === 'true' || process.env.CI === '1',
+    mode,
+    forwardedArgs,
+  })
+  log('info', 'Resolved standard test plan', {
+    mode: plan.mode,
+    availableParallelism: availableParallelism(),
+    stages: plan.stages,
+    forwardedArgs,
+  })
 
-  const stages = [initialStage, electronStage].filter((stage) => stage.length > 0)
-  return { mode: resolvedMode, stages }
-}
-
-function filterRuns(runs: StandardTestRun[], requestedSuites: SuiteName[] | null): StandardTestRun[] {
-  if (!requestedSuites) {
-    return runs
+  try {
+    for (const stage of plan.stages) await runStage(stage, forwardedArgs)
+    return 0
+  } catch (error) {
+    log('error', 'Standard test run failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return 1
   }
-  return runs.filter((run) => requestedSuites.includes(run.name))
 }
 
 function parseCliArgs(argv: string[]): { mode?: StandardTestMode; forwardedArgs: string[] } {
   const forwardedArgs: string[] = []
   let mode: StandardTestMode | undefined
-
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--mode') {
@@ -209,191 +397,10 @@ function parseCliArgs(argv: string[]): { mode?: StandardTestMode; forwardedArgs:
     }
     forwardedArgs.push(arg)
   }
-
   return { mode, forwardedArgs }
 }
 
-function applyPriority(run: StandardTestRun, child: ChildProcess): void {
-  if (!child.pid || run.priority === 'normal') {
-    return
-  }
-  try {
-    setPriority(child.pid, resolvePriorityValue(run.priority))
-  } catch (error) {
-    log('warn', 'Failed to lower test runner priority', {
-      suite: run.name,
-      pid: child.pid,
-      error: error instanceof Error ? error.message : String(error),
-    })
-  }
-}
-
-function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
-  const args = buildVitestArgs({
-    configPath: run.configPath,
-    maxWorkers: run.maxWorkers,
-    forwardedArgs,
-  })
-  log('info', 'Starting test suite', {
-    suite: run.name,
-    priority: run.priority,
-    args,
-  })
-  const child = spawn(process.execPath, [vitestEntrypoint, ...args], {
-    cwd: repoRoot,
-    env: process.env,
-    stdio: 'inherit',
-  })
-  applyPriority(run, child)
-  return child
-}
-
-async function runStage(stage: StandardTestRun[], forwardedArgs: string[]): Promise<void> {
-  if (stage.length === 0) {
-    return
-  }
-
-  await new Promise<void>((resolveStage, rejectStage) => {
-    const children = stage.map((run) => ({
-      run,
-      child: startRun(run, forwardedArgs),
-    }))
-    let finished = 0
-    let settled = false
-
-    const terminateOthers = (originSuite: SuiteName): void => {
-      for (const entry of children) {
-        if (entry.run.name === originSuite) {
-          continue
-        }
-        if (entry.child.exitCode === null && !entry.child.killed) {
-          entry.child.kill('SIGTERM')
-        }
-      }
-    }
-
-    for (const entry of children) {
-      entry.child.once('error', (error) => {
-        if (settled) {
-          return
-        }
-        settled = true
-        terminateOthers(entry.run.name)
-        rejectStage(error)
-      })
-
-      entry.child.once('exit', (code, signal) => {
-        const exitCode = code ?? (signal ? 1 : 0)
-        log(exitCode === 0 ? 'info' : 'error', 'Test suite exited', {
-          suite: entry.run.name,
-          code: exitCode,
-          signal,
-        })
-
-        if (settled) {
-          return
-        }
-        if (exitCode !== 0) {
-          settled = true
-          terminateOthers(entry.run.name)
-          rejectStage(new Error(`${entry.run.name} suite exited with code ${exitCode}`))
-          return
-        }
-
-        finished += 1
-        if (finished === children.length) {
-          settled = true
-          resolveStage()
-        }
-      })
-    }
-  })
-}
-
-export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
-  const { mode, forwardedArgs } = parseCliArgs(argv)
-
-  // Cloud dispatch: when FRESHELL_VITEST_BACKEND=cloud, run client+server suites
-  // in the cloud via vitest-cloud.sh, then run the electron suite locally.
-  // Git-dependent selectors like --changed require a .git directory (excluded
-  // from the Docker image), so fall back to local execution when detected.
-  if (process.env.FRESHELL_VITEST_BACKEND === 'cloud') {
-    const hasGitDependentArgs = forwardedArgs.some(
-      (arg) => arg.startsWith('--changed') || arg === '--changed'
-    )
-    if (hasGitDependentArgs) {
-      log('warn', 'Git-dependent selectors detected, falling back to local execution', {
-        forwardedArgs,
-      })
-    } else {
-      const cloudScript = process.env.FRESHELL_VITEST_CLOUD_SCRIPT
-        || resolve(repoRoot, 'scripts/vitest-cloud.sh')
-
-      log('info', 'Dispatching client+server suites to cloud vitest', {
-        cloudScript,
-        forwardedArgs,
-      })
-
-      try {
-        execFileSync(cloudScript, ['run', ...forwardedArgs], {
-          stdio: 'inherit',
-          cwd: repoRoot,
-        })
-      } catch {
-        process.exitCode = 1
-        return 1
-      }
-
-      // Run the electron suite locally (needs a display + native modules).
-      const electronArgs = buildVitestArgs({
-        configPath: electronVitestConfig,
-        forwardedArgs,
-      })
-      log('info', 'Running electron suite locally after cloud dispatch', {
-        args: electronArgs,
-      })
-      try {
-        execFileSync(process.execPath, [vitestEntrypoint, ...electronArgs], {
-          stdio: 'inherit',
-          cwd: repoRoot,
-          env: process.env,
-        })
-      } catch {
-        process.exitCode = 1
-        return 1
-      }
-      return 0
-    }
-  }
-
-  const plan = createStandardTestPlan({
-    availableParallelism: availableParallelism(),
-    ci: process.env.CI === 'true' || process.env.CI === '1',
-    mode,
-    forwardedArgs,
-  })
-
-  log('info', 'Resolved standard test plan', {
-    mode: plan.mode,
-    availableParallelism: availableParallelism(),
-    stages: plan.stages,
-    forwardedArgs,
-  })
-
-  try {
-    for (const stage of plan.stages) {
-      await runStage(stage, forwardedArgs)
-    }
-    return 0
-  } catch (error) {
-    log('error', 'Standard test run failed', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return 1
-  }
-}
-
-if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'))) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then((code) => {
     process.exitCode = code
   })
