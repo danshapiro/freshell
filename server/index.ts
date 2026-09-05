@@ -1,6 +1,6 @@
+import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists and migrates legacy anchors
+import './env-load.js' // Loads .env (at the bootstrap anchor) before any other module's top-level env readers evaluate
 import { createFreshAgentExtrasRouter } from './fresh-agent-extras-router.js'
-import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
-import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -230,10 +230,15 @@ async function main() {
     },
     getShellTaskStatus: async () => startupState.snapshot().tasks,
     getPerfLogging: () => perfConfig.enabled,
+    getConfigDir: () => getFreshellConfigDir(),
     getConfigFallback: async () => {
       const readError = configStore.getLastReadError()
       if (!readError) return undefined
-      return { reason: readError, backupExists: await configStore.backupExists() }
+      return {
+        reason: readError,
+        backupExists: await configStore.backupExists(),
+        backupPath: configStore.getBackupPath(),
+      }
     },
   }))
   app.use('/api', createClientLogsRouter())
@@ -422,7 +427,11 @@ async function main() {
         const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
         const readError = configStore.getLastReadError()
         const configFallback = readError
-          ? { reason: readError, backupExists: await configStore.backupExists() }
+          ? {
+              reason: readError,
+              backupExists: await configStore.backupExists(),
+              backupPath: configStore.getBackupPath(),
+            }
           : undefined
         return {
           settings: currentSettings,

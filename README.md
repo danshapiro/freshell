@@ -57,6 +57,100 @@ Node.js 18+ (20+ recommended) and platform build tools for native modules (`wind
 
 > **Note:** On native Windows, terminals default to WSL. Set `WINDOWS_SHELL=cmd` or `WINDOWS_SHELL=powershell` to use a native Windows shell instead.
 
+## Desktop profiles (multiple instances)
+
+The desktop app normally runs one instance with one configuration. **Profiles**
+let you run multiple independent desktop clients on the same machine at the
+same time — for example one connected to your work server and one to a
+personal server.
+
+Each named profile gets its own:
+
+- settings, window state, and logs (`~/.freshell-<id>/`; the default profile
+  keeps using `~/.freshell/`)
+- Electron storage dir (`…/Freshell-<id>` in packaged builds,
+  `freshell-<id>` in dev/unpackaged runs), so cookies and localStorage never
+  mix
+- single-instance lock: launching the same profile twice focuses the running
+  window; different profiles run side by side
+
+### Defining profiles
+
+Create `~/.freshell/profiles.json`:
+
+```json
+{
+  "profiles": [
+    { "id": "work", "label": "Work" },
+    { "id": "home" }
+  ]
+}
+```
+
+Rules: `id` is lowercase letters/digits/dashes starting with a letter or digit
+(max 32 chars); `default` and `profile-picker` are reserved (the first means
+the original un-namespaced environment; the second is the picker launcher's
+own storage dir); `label` is optional display text.
+
+When at least one named profile is defined, launching the app without a
+profile shows a picker (the default profile is always listed first; the built-
+in default counts, so one named profile in the file already means "more than
+one configured"). The picker is a small launcher: whichever profile you pick,
+the app relaunches itself pinned to it — you'll see a quick restart, then the
+app continues in the chosen profile. Pin a launch to a profile with
+`--profile=<id>` or `FRESHELL_PROFILE=<id>`; named ids do not have to be
+listed in `profiles.json` — an unlisted id simply starts with a fresh
+configuration.
+
+### Notes and limitations
+
+- Global hotkey: the first instance to register an accelerator keeps it;
+  later instances log a warning (`global_hotkey_registration_failed`) and have
+  no hotkey. Give each profile a distinct hotkey in its own settings.
+- App-bound servers: each profile spawns its own server pinned to that
+  profile's config dir (`FRESHELL_CONFIG_DIR`) and port — a named profile
+  never adopts another profile's already-running local server; choose a
+  distinct port per profile. Once named profiles exist (listed in
+  `profiles.json`, used from the command line, or previously run — including
+  a stray `~/.freshell-<id>` backup dir, which shape-checks by name), the same
+  applies to the **Default** profile: it no longer auto-attaches to a
+  discovered local server, and if its configured port is held by a neighbor,
+  Freshell bumps to the next free port and saves that port into the profile's
+  settings (visible in the setup summary). An app-bound profile that finds
+  its OWN config dir's server already resident attaches to it instead of
+  double-spawning.
+- Daemon services (`freshell.service`, `com.freshell.server`,
+  "Freshell Server" task) are machine-global single instances — daemon mode is
+  available only on the **Default** profile; named profiles fall back to the
+  chooser instead.
+- Silent-install provisioning (`desktop.provision`) applies to the default
+  profile only.
+- Auto-update relaunches the app without `--profile`: after an update, the
+  picker shows again (pick your profile back).
+- Installing/upgrading on Windows terminates all running Freshell instances.
+- Relaunching while a profile is running: on Linux/Windows, a launch without a
+  flag shows the picker again and choosing the running profile focuses its
+  window; launching with the same `--profile` as a running instance focuses
+  that window (the new process quits). On macOS, relaunching from Finder or
+  the Dock while ANY Freshell instance is running just activates the running
+  instance (the OS enforces this) and never shows the picker — use
+  `--profile=` flags or `FRESHELL_PROFILE` from a terminal, or Quit before
+  relaunching to get the picker. Two simultaneous flag-less launches race for
+  the picker's launcher slot: the first shows the picker; the second quietly
+  exits and brings the existing picker forward.
+- Daemon-service caveat for the Node server: the shipped daemon templates have
+  always contained an (until now inert) `FRESHELL_CONFIG_DIR` environment
+  line; starting with this release the Node server honors it. If you
+  hand-generated a daemon unit from those templates with a non-default config
+  directory, the value now takes effect at next start (state relocates to that
+  directory): remove the line from your unit, or move your existing
+  `~/.freshell` contents into the directory it names. Units using the default
+  `~/.freshell` path are unaffected — and if your service's working directory
+  is not the config dir (systemd user units default to `$HOME`), the server
+  copies an existing `.env` from the old location into the config dir rather
+  than rotating your token. Rust-server installs never read this
+  variable.
+
 ## Usage
 
 ```bash

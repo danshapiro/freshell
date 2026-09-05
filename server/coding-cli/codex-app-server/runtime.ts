@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import fsp from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
+import { getFreshellConfigDir } from '../../freshell-home.js'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from '../codex-managed-config.js'
 import { deregisterCodexChild, registerCodexChild } from '../codex-child-registry.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
@@ -223,7 +223,10 @@ const DEFAULT_TERMINATE_GRACE_MS = 1_000
 const OWNERSHIP_SCHEMA_VERSION = 1
 const LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP = 100
 const LAUNCH_DIAGNOSTIC_METADATA_RECORD_MAX_BYTES = 16 * 1024
-export const DEFAULT_CODEX_SIDECAR_METADATA_DIR = path.join(os.homedir(), '.freshell', 'codex-sidecars')
+export function defaultCodexSidecarMetadataDir(): string {
+  return process.env.FRESHELL_CODEX_SIDECAR_DIR
+    || path.join(getFreshellConfigDir(), 'codex-sidecars')
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -354,8 +357,7 @@ export async function collectCodexAppServerProcessDiagnostics(): Promise<CodexAp
 }
 
 function defaultMetadataDir(): string {
-  return process.env.FRESHELL_CODEX_SIDECAR_DIR
-    || DEFAULT_CODEX_SIDECAR_METADATA_DIR
+  return defaultCodexSidecarMetadataDir()
 }
 
 function normalizeLaunchCwd(cwd: string | undefined): string | undefined {

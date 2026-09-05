@@ -512,6 +512,9 @@
         "backupExists": {
           "type": "boolean"
         },
+        "backupPath": {
+          "type": "string"
+        },
         "reason": {
           "enum": [
             "PARSE_ERROR",

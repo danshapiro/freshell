@@ -818,6 +818,26 @@ describe('App Component - WS Notifications', () => {
       expect(screen.queryByText(/Config file was invalid/)).not.toBeInTheDocument()
     })
   })
+
+  it('shows the server-reported profile backup path in the config fallback warning', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'config.fallback',
+      reason: 'PARSE_ERROR',
+      backupExists: true,
+      backupPath: '/home/u/.freshell-work/config.backup.json',
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/Backup found at \/home\/u\/\.freshell-work\/config\.backup\.json\./)).toBeInTheDocument()
+      expect(screen.queryByText(/Backup found at ~\/\.freshell\/config\.backup\.json\./)).not.toBeInTheDocument()
+    })
+  })
 })
 
 describe('App Component - Mobile Sidebar', () => {
