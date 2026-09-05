@@ -1106,6 +1106,10 @@ export function buildSpawnSpec(
   // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs
   // - PORT/AUTH_TOKEN/ALLOWED_ORIGINS: server-specific vars that cause port conflicts
   //   and leak credentials into child processes
+  // - FRESHELL_CONFIG_DIR: the server's profile config dir, server-internal;
+  //   leaking it into PTYs would re-point nested CLI/test runs at it
+  // - FRESHELL_PROFILE: the desktop profile selector; leaking it would pin
+  //   nested Freshell launches to this profile and bypass the picker
   // - NODE_ENV/npm_lifecycle_script: server's production env leaks into child shells,
   //   breaking tools like React test-utils that check NODE_ENV
   const {
@@ -1117,6 +1121,8 @@ export function buildSpawnSpec(
     PORT: _port,
     AUTH_TOKEN: _authToken,
     ALLOWED_ORIGINS: _allowedOrigins,
+    FRESHELL_CONFIG_DIR: _freshellConfigDir,
+    FRESHELL_PROFILE: _freshellProfile,
     NODE_ENV: _nodeEnv,
     npm_lifecycle_script: _npmLifecycleScript,
     OPENCODE_SERVER_USERNAME: _opencodeServerUsername,

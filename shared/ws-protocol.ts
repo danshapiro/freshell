@@ -1185,6 +1185,8 @@ export type ConfigFallbackMessage = {
   type: 'config.fallback'
   reason: 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR' | 'ENOENT'
   backupExists: boolean
+  /** Profile-aware backup path the banner should point at. */
+  backupPath?: string
 }
 
 // -- Tabs sync --

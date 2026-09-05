@@ -1,4 +1,6 @@
 import path from 'path'
+import fsp from 'fs/promises'
+import { DEFAULT_PROFILE_ID } from './profile.js'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
 import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
@@ -56,12 +58,37 @@ export interface StartupContext {
    * skips discovery and policy and performs exactly this action.
    */
   forcedLaunch?: ForcedLaunch
+  /** Active profile id; named profiles own their app-bound server (see
+   *  launch-policy.ts). Defaults to DEFAULT_PROFILE_ID. */
+  profileId?: string
+  /**
+   * Canonical server-ownership gate for this boot: true for every named
+   * profile AND for the default profile once any named profile exists in the
+   * registry (multi-profile installs treat Default as one more tenant). Owned
+   * boots skip discovery-based auto-connect (never adopt a neighbor server)
+   * and auto-bump a busy port on app-bound starts. entry.ts computes this at
+   * module top. When absent, the fallback is "named profile only", for older
+   * call sites.
+   */
+  ownsServer?: boolean
+  /** Port availability probe (entry.ts wires the production check). When
+   *  provided AND this boot owns its server AND app-bound, a busy
+   *  desktopConfig.port is first probed for SAME-PROFILE identity (see
+   *  fetchServerInstanceId) and reused when the resident server belongs to
+   *  this config dir; otherwise auto-bumped to the next free port (and
+   *  persisted). */
+  isPortAvailable?: (port: number) => Promise<boolean>
+  /** Fetch the unauthenticated /api/health payload's instanceId (entry wires
+   *  http). Used to distinguish "my own config dir's server" from a neighbor. */
+  fetchServerInstanceId?: (url: string) => Promise<string | undefined>
+  /** Persist a changed default port for named profiles (config-dir scoped). */
+  patchDesktopConfig?: (patch: { port?: number }) => Promise<unknown>
 }
 
 export type StartupResult =
   | { type: 'wizard' }
   | { type: 'chooser'; candidates: LaunchServerCandidate[]; reason: string }
-  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; updateCheckTimer: ReturnType<typeof setTimeout> }
+  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; attached?: boolean; updateCheckTimer: ReturnType<typeof setTimeout> }
 
 async function defaultDiscoverLaunchCandidates(ctx: StartupContext): Promise<LaunchServerCandidate[]> {
   const urls = buildLocalProbeUrls(ctx.desktopConfig)
@@ -201,7 +228,7 @@ async function loadMainWindow(
   window.on('resize', saveState)
   window.on('move', saveState)
 
-  ctx.hotkeyManager.register(ctx.desktopConfig.globalHotkey, () => {
+  const hotkeyRegistered = ctx.hotkeyManager.register(ctx.desktopConfig.globalHotkey, () => {
     if (window.isVisible() && window.isFocused()) {
       window.hide()
     } else {
@@ -209,6 +236,13 @@ async function loadMainWindow(
       window.focus()
     }
   })
+  if (!hotkeyRegistered) {
+    ctx.mainProcessLogger?.log({
+      severity: 'warn',
+      event: 'global_hotkey_registration_failed',
+      accelerator: ctx.desktopConfig.globalHotkey,
+    })
+  }
 
   try {
     ctx.createTray()
@@ -255,6 +289,9 @@ async function startAppBoundServer(ctx: StartupContext, port: number): Promise<s
       port,
       envFile: path.join(ctx.configDir, '.env'),
       configDir: ctx.configDir,
+      // Same pinning contract as the production branch below — dev spawns of
+      // named profiles must not fall back to the default config dir.
+      pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID,
     })
     return 'http://localhost:5173'
   }
@@ -274,6 +311,7 @@ async function startAppBoundServer(ctx: StartupContext, port: number): Promise<s
     port,
     envFile: path.join(ctx.configDir, '.env'),
     configDir: ctx.configDir,
+    pinProfileConfigDir: ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID,
   })
   return `http://localhost:${port}`
 }
@@ -297,6 +335,20 @@ async function executeForcedLaunch(ctx: StartupContext, forced: ForcedLaunch): P
   return loadMainWindow(ctx, serverUrl, authToken)
 }
 
+/**
+ * Read the server instance-id file for this config dir. The (Node) server
+ * anchors `<configDir>/instance-id`; a missing/corrupt file just means the
+ * resident server cannot be proven ours.
+ */
+async function readInstanceIdFile(configDir: string): Promise<string | undefined> {
+  try {
+    const raw = await fsp.readFile(path.join(configDir, 'instance-id'), 'utf-8')
+    return raw.trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
 export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   const { desktopConfig, port } = ctx
 
@@ -308,8 +360,22 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     return executeForcedLaunch(ctx, ctx.forcedLaunch)
   }
 
+  // One canonical ownership decision for the whole boot: three consumers below
+  // read it (discovery skip, launch policy, port auto-bump).
+  const ownsServerNow =
+    ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)
+
   const discoverCandidates = ctx.discoverLaunchCandidates ?? (() => defaultDiscoverLaunchCandidates(ctx))
-  const candidates = await discoverCandidates()
+  // A named profile's app-bound/daemon boot owns its server; discovery is
+  // skipped entirely so a neighbor profile's server is never surfaced.
+  // Owning boots skip the discovery probe UNLESS the user opted into
+  // always-ask: an always-ask boot shows the chooser with the real candidate
+  // list (never auto-connects — chooseLaunchAction checks ownsServer first).
+  const skipDiscovery =
+    ownsServerNow &&
+    !desktopConfig.alwaysAskOnLaunch &&
+    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
+  const candidates = skipDiscovery ? [] : await discoverCandidates()
   const savedRemoteReachable = desktopConfig.serverMode === 'remote' && !!desktopConfig.remoteUrl
     ? await checkRemoteReachable(ctx, desktopConfig.remoteUrl)
     : false
@@ -321,6 +387,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     candidates,
     savedRemoteReachable,
     savedRemoteAuthenticated,
+    ownsServer: ownsServerNow,
   })
 
   if (launchAction.type === 'show-setup') {
@@ -341,8 +408,23 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
 
   let serverUrl: string
 
+  // True when startup adopted an already-running resident server that proved
+  // it owns this profile's config dir (tray status reads it as "running").
+  let attachedToOwnResidentServer = false
   switch (desktopConfig.serverMode) {
     case 'daemon': {
+      if (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID) {
+        // Daemon mode is machine-global per README: profiles share one daemon,
+        // and its port is the install-time default-profile port, NOT the named
+        // profile's (possibly auto-bumped) one. Rather than deriving a fragile
+        // port, refuse daemon mode on named profiles and let the user pick.
+        ctx.mainProcessLogger?.log({
+          severity: 'warn',
+          event: 'named_profile_daemon_unsupported',
+          profileId: ctx.profileId,
+        })
+        return { type: 'chooser', candidates, reason: 'manual-choice' }
+      }
       const status = await ctx.daemonManager.status()
       if (!status.installed) {
         throw new Error('Daemon service is not installed. Please re-run setup to configure the daemon.')
@@ -354,7 +436,87 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
       break
     }
     case 'app-bound': {
-      serverUrl = await startAppBoundServer(ctx, port)
+      let launchPort = port
+      let attachedOwnServer = false
+      if (ownsServerNow && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
+        // The profile's configured port is already held. Before bumping, check
+        // whether the resident server BELONGS to this profile (it anchors its
+        // identity at <configDir>/instance-id): a restarted/crashed-orphaned
+        // app-bound server of THIS profile, or the self-hosted server over the
+        // same state dir, must get attached — bumping would double-spawn over
+        // the same state.
+        const candidateUrl = `http://localhost:${port}`
+        const localInstanceId = await readInstanceIdFile(ctx.configDir)
+        const residentId = ctx.fetchServerInstanceId
+          ? await ctx.fetchServerInstanceId(candidateUrl)
+          : undefined
+        const residentIsOurs =
+          residentId !== undefined && localInstanceId !== undefined && residentId === localInstanceId
+
+        if (residentIsOurs) {
+          ctx.mainProcessLogger?.log({
+            severity: 'info',
+            event: 'profile_attached_own_server',
+            profileId: ctx.profileId,
+            port,
+          })
+          attachedOwnServer = true
+          attachedToOwnResidentServer = true
+        } else {
+          // The resident server is NOT ours: bump to the next free port rather
+          // than spawning a doomed server whose health check would succeed
+          // against the OTHER instance (/api/health is unauthenticated).
+          let chosen = -1
+          for (let candidate = port + 1; candidate <= Math.min(port + 200, 65535); candidate++) {
+            if (await ctx.isPortAvailable(candidate)) {
+              chosen = candidate
+              break
+            }
+          }
+          if (chosen !== -1) {
+            launchPort = chosen
+            ctx.mainProcessLogger?.log({
+              severity: 'info',
+              event: 'profile_port_reassigned',
+              profileId: ctx.profileId,
+              from: port,
+              to: chosen,
+            })
+            try {
+              await ctx.patchDesktopConfig?.({ port: chosen })
+            } catch (err) {
+              ctx.mainProcessLogger?.log({
+                severity: 'warn',
+                event: 'profile_port_persist_failed',
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+          } else {
+            // Never land on the knowably-busy port: the unauthenticated
+            // /api/health on the NEIGHBOR's server would satisfy the health
+            // probe and the window would load the wrong identity. Leave the
+            // decision to the user instead of spawning into a black hole.
+            ctx.mainProcessLogger?.log({
+              severity: 'warn',
+              event: 'profile_port_scan_exhausted',
+              profileId: ctx.profileId,
+              port,
+            })
+            return { type: 'chooser', candidates, reason: 'manual-choice' }
+          }
+        }
+      }
+      if (launchPort !== port) {
+        // Keep the in-memory desktopConfig in step so other consumers
+        // (e.g. the chooser's getCurrentPort) see the effective port.
+        desktopConfig.port = launchPort
+      }
+      if (attachedOwnServer) {
+        // Reuse — never spawn a second server over this profile's state dir.
+        serverUrl = `http://localhost:${launchPort}`
+      } else {
+        serverUrl = await startAppBoundServer(ctx, launchPort)
+      }
       break
     }
     case 'remote': {
@@ -374,8 +536,13 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   if (desktopConfig.serverMode === 'remote') {
     authToken = desktopConfig.remoteToken
   } else if (ctx.readEnvToken) {
+    // App-bound and daemon mode anchor the token at THIS boot's config dir —
+    // daemon mode is machine-global and only reachable from the default
+    // profile (the named-daemon path returns before this point).
     authToken = await ctx.readEnvToken(path.join(ctx.configDir, '.env'))
   }
 
-  return loadMainWindow(ctx, serverUrl, authToken)
+  const mainResult = await loadMainWindow(ctx, serverUrl, authToken)
+  if (attachedToOwnResidentServer) mainResult.attached = true
+  return mainResult
 }

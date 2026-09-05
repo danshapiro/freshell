@@ -35,8 +35,10 @@ describe('Preload API', () => {
     const keys = Object.keys(exposedApi).sort()
     expect(keys).toEqual([
       'chooseLaunchOption',
+      'chooseProfile',
       'completeSetup',
       'getLaunchOptions',
+      'getProfiles',
       'getServerMode',
       'getServerStatus',
       'installUpdate',

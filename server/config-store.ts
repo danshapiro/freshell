@@ -233,7 +233,7 @@ function logConfigFallback(error: ConfigReadError, details: { err?: unknown; fil
   }
   logger.warn(
     { backupPath: backupFile, error },
-    'Config fallback in effect; restore backup with: mv ~/.freshell/config.backup.json ~/.freshell/config.json'
+    `Config fallback in effect; restore backup with: mv "${backupFile}" "${configPath()}"`
   )
 }
 
@@ -313,6 +313,11 @@ export class ConfigStore {
     } catch {
       return false
     }
+  }
+
+  /** Effective backup path for this profile (config-dir aware). */
+  getBackupPath(): string {
+    return backupPath()
   }
 
   private async loadInternal(options: { persistNormalizedConfig: boolean }): Promise<UserConfig> {

@@ -81,10 +81,12 @@ const serverExt: ClientExtensionEntry = {
 function renderExtensionsView(options: {
   extensions?: ClientExtensionEntry[]
   settings?: Record<string, unknown>
+  serverConfigDir?: string | null
 } = {}) {
-  const { extensions = [claudeExt, codexExt], settings = {} } = options
+  const { extensions = [claudeExt, codexExt], settings = {}, serverConfigDir } = options
   const store = createSettingsViewStore({
     settings: settings as any,
+    settingsState: { serverConfigDir: serverConfigDir ?? null },
     extraPreloadedState: {
       extensions: { entries: extensions },
     },
@@ -265,6 +267,18 @@ describe('ExtensionsView', () => {
       renderExtensionsView({ extensions: [] })
 
       expect(screen.getByText('No extensions installed')).toBeInTheDocument()
+    })
+
+    it('defaults the install hint to ~/.freshell/extensions/ when the server config dir is unknown', () => {
+      renderExtensionsView({ extensions: [] })
+
+      expect(screen.getByText('~/.freshell/extensions/')).toBeInTheDocument()
+    })
+
+    it('points the install hint at the server-reported profile config dir', () => {
+      renderExtensionsView({ extensions: [], serverConfigDir: '/home/u/.freshell-work' })
+
+      expect(screen.getByText('/home/u/.freshell-work/extensions/')).toBeInTheDocument()
     })
   })
 })
