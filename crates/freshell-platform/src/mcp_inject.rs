@@ -102,6 +102,18 @@ pub trait McpRuntime {
             args: self.server_command_args()?,
         })
     }
+
+    fn is_windows_host(&self) -> bool {
+        false
+    }
+
+    fn convert_to_unix_path(&self, _windows_path: &str) -> Result<String, McpInjectError> {
+        Err(McpInjectError::new("WSL path conversion is unavailable."))
+    }
+
+    fn wsl_env(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The live runtime (see the module-level U1 decision).
@@ -123,6 +135,34 @@ impl McpRuntime for RealMcpRuntime {
 
     fn convert_to_windows_path(&self, linux_path: &str) -> String {
         convert_to_windows_path_live(linux_path)
+    }
+
+    fn is_windows_host(&self) -> bool {
+        cfg!(windows)
+    }
+
+    fn convert_to_unix_path(&self, windows_path: &str) -> Result<String, McpInjectError> {
+        let program = std::env::var("WSL_EXE").unwrap_or_else(|_| "wsl.exe".to_string());
+        let mut args = Vec::new();
+        if let Ok(distro) = std::env::var("WSL_DISTRO") {
+            if !distro.is_empty() {
+                args.extend(["-d".to_string(), distro]);
+            }
+        }
+        args.extend(["--exec", "wslpath", "-u", windows_path].map(str::to_string));
+        run_path_conversion(
+            &program,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .ok_or_else(|| {
+            McpInjectError::new(format!(
+                "Unable to convert MCP path for WSL: {windows_path}"
+            ))
+        })
+    }
+
+    fn wsl_env(&self) -> Option<String> {
+        std::env::var("WSLENV").ok()
     }
 
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
@@ -157,28 +197,80 @@ impl McpRuntime for RealMcpRuntime {
                 args: vec![McpServerArg::Path(built.to_string_lossy().into_owned())],
             });
         }
-        // `require.resolve('tsx')` resolves the package export "." →
-        // `./dist/loader.mjs` (rev 2 pin vs node_modules/tsx/package.json).
-        let tsx = repo_root.join("node_modules/tsx/dist/loader.mjs");
-        if !tsx.is_file() {
-            return Err(McpInjectError::new(
-                "Unable to resolve MCP dependency \"tsx\". Ensure project dependencies are installed.",
-            ));
-        }
-        Ok(McpServerCommand {
-            command: McpServerArg::Literal("node".to_string()),
-            args: vec![
-                McpServerArg::Literal("--import".to_string()),
-                McpServerArg::Path(tsx.to_string_lossy().into_owned()),
-                McpServerArg::Path(
-                    repo_root
-                        .join("tools/freshell-mcp/server.ts")
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-            ],
-        })
+        let search_path = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default();
+        source_mcp_server_command(&repo_root, self.is_windows_host(), &search_path)
     }
+}
+
+fn mcp_loader_spec(loader: &Path) -> String {
+    // A UNC server is the file URL authority, not part of its pathname.
+    // Reuse the existing path encoder only for the share-relative pathname.
+    let normalized = loader.to_string_lossy().replace('\\', "/");
+    if let Some((server, path)) = normalized
+        .strip_prefix("//")
+        .and_then(|unc| unc.split_once('/'))
+    {
+        let pathname = format!("/{path}");
+        let encoded = crate::opencode_plugin::plugin_file_spec(Path::new(&pathname));
+        let encoded_path = encoded
+            .strip_prefix("file://")
+            .expect("file URL has a scheme");
+        return format!("file://{server}{encoded_path}");
+    }
+    crate::opencode_plugin::plugin_file_spec(loader)
+}
+
+fn source_mcp_server_command(
+    repo_root: &Path,
+    is_windows_host: bool,
+    search_path: &[PathBuf],
+) -> Result<McpServerCommand, McpInjectError> {
+    let tsx = repo_root.join("node_modules/tsx/dist/loader.mjs");
+    if !tsx.is_file() {
+        return Err(McpInjectError::new(
+            "Unable to resolve MCP dependency \"tsx\". Ensure project dependencies are installed.",
+        ));
+    }
+    // tsx includes a platform-specific esbuild binary. A Windows checkout's
+    // loader must run under Windows Node even when the provider lives in WSL.
+    let command = if is_windows_host {
+        let executable = search_path
+            .iter()
+            .map(|directory| directory.join("node.exe"))
+            .find(|candidate| candidate.is_file())
+            .ok_or_else(|| {
+                McpInjectError::new(
+                    "Unable to find Windows node.exe on PATH for the MCP TypeScript loader.",
+                )
+            })?;
+        let executable = std::path::absolute(executable)
+            .map_err(|error| McpInjectError::new(error.to_string()))?;
+        McpServerArg::Path(executable.to_string_lossy().into_owned())
+    } else {
+        McpServerArg::Literal("node".to_string())
+    };
+    // Node's ESM --import accepts Windows absolute imports as file URLs, not
+    // bare drive paths. This URL must survive provider-side path conversion.
+    let loader = if is_windows_host {
+        McpServerArg::Literal(mcp_loader_spec(&tsx))
+    } else {
+        McpServerArg::Path(tsx.to_string_lossy().into_owned())
+    };
+    Ok(McpServerCommand {
+        command,
+        args: vec![
+            McpServerArg::Literal("--import".to_string()),
+            loader,
+            McpServerArg::Path(
+                repo_root
+                    .join("tools/freshell-mcp/server.ts")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ],
+    })
 }
 
 /// `findRepoRoot` (`cw:21-32`): walk up (max 5) looking for a `package.json`
@@ -232,25 +324,28 @@ fn join_reader_until<T>(
 }
 
 fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> String {
+    run_path_conversion(program, &["-w", linux_path]).unwrap_or_else(|| linux_path.to_string())
+}
+
+fn run_path_conversion(program: &str, args: &[&str]) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     let child = Command::new(program)
-        .arg("-w")
-        .arg(linux_path)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn();
     let Ok(mut child) = child else {
-        return linux_path.to_string();
+        return None;
     };
 
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return linux_path.to_string();
+        return None;
     };
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
@@ -265,31 +360,65 @@ fn convert_to_windows_path_with_command(program: &str, linux_path: &str) -> Stri
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = join_reader_until(reader, deadline);
-                return linux_path.to_string();
+                return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = join_reader_until(reader, deadline);
-                return linux_path.to_string();
+                return None;
             }
         }
     };
     let Some(Ok(output)) = join_reader_until(reader, deadline) else {
-        return linux_path.to_string();
+        return None;
     };
 
     if status.success() {
         let converted = String::from_utf8_lossy(&output).trim().to_string();
         if converted.is_empty() {
-            linux_path.to_string()
+            None
         } else {
-            converted
+            Some(converted)
         }
     } else {
-        linux_path.to_string()
+        None
     }
+}
+
+fn provider_path(
+    rt: &dyn McpRuntime,
+    target: ProviderTarget,
+    value: &str,
+) -> Result<String, McpInjectError> {
+    if target == ProviderTarget::Unix && rt.is_windows_host() {
+        rt.convert_to_unix_path(value)
+    } else if target == ProviderTarget::Windows && rt.is_wsl_environment() {
+        Ok(rt.convert_to_windows_path(value))
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn mcp_wsl_env(existing: Option<String>) -> String {
+    const CONTEXT: [&str; 4] = [
+        "FRESHELL_URL",
+        "FRESHELL_TOKEN",
+        "FRESHELL_TAB_ID",
+        "FRESHELL_PANE_ID",
+    ];
+    let mut entries = existing
+        .as_deref()
+        .unwrap_or_default()
+        .split(':')
+        .filter(|entry| {
+            !entry.is_empty() && !CONTEXT.contains(&entry.split('/').next().unwrap_or_default())
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    entries.extend(CONTEXT.map(str::to_string));
+    entries.join(":")
 }
 
 /// Render a complete MCP command for a provider target. This is the canonical
@@ -298,16 +427,38 @@ pub fn build_mcp_server_command(
     rt: &dyn McpRuntime,
     target: ProviderTarget,
 ) -> Result<(String, Vec<String>), McpInjectError> {
-    let needs_win_paths = target == ProviderTarget::Windows && rt.is_wsl_environment();
     let command = rt.server_command()?;
-    let convert = |arg: McpServerArg| match arg {
-        McpServerArg::Literal(value) => value,
-        McpServerArg::Path(value) if needs_win_paths => rt.convert_to_windows_path(&value),
-        McpServerArg::Path(value) => value,
+    // A packaged Windows Node remains a Windows process even when a WSL
+    // provider launches it. Translate only the executable for Linux exec;
+    // Node's own arguments must stay Windows paths. WSLENV carries endpoint,
+    // auth, and pane context across that second process boundary.
+    if target == ProviderTarget::Unix && rt.is_windows_host() {
+        if let McpServerArg::Path(executable) = &command.command {
+            if executable.as_bytes().get(1) == Some(&b':') || executable.starts_with("\\\\") {
+                let mut args = vec![
+                    format!("WSLENV={}", mcp_wsl_env(rt.wsl_env())),
+                    rt.convert_to_unix_path(executable)?,
+                ];
+                args.extend(command.args.into_iter().map(|arg| match arg {
+                    McpServerArg::Literal(value) | McpServerArg::Path(value) => value,
+                }));
+                return Ok(("env".to_string(), args));
+            }
+        }
+    }
+    let convert = |arg: McpServerArg| -> Result<String, McpInjectError> {
+        match arg {
+            McpServerArg::Literal(value) => Ok(value),
+            McpServerArg::Path(value) => provider_path(rt, target, &value),
+        }
     };
     Ok((
-        convert(command.command),
-        command.args.into_iter().map(convert).collect(),
+        convert(command.command)?,
+        command
+            .args
+            .into_iter()
+            .map(convert)
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -392,11 +543,9 @@ fn write_mcp_config_file(
             }
         }
     });
-    write_json_0600(&file_path, &config)?;
     let path_str = file_path.to_string_lossy().into_owned();
-    if target == ProviderTarget::Windows && rt.is_wsl_environment() {
-        return Ok(rt.convert_to_windows_path(&path_str));
-    }
+    let path_str = provider_path(rt, target, &path_str)?;
+    write_json_0600(&file_path, &config)?;
     Ok(path_str)
 }
 
@@ -637,7 +786,7 @@ pub fn generate_mcp_injection(
     cwd: Option<&str>,
     target: ProviderTarget,
 ) -> Result<McpInjection, McpInjectError> {
-    match mode {
+    let mut injection = match mode {
         "claude" => {
             let file_path = write_mcp_config_file(rt, terminal_id, target)?;
             Ok(McpInjection {
@@ -666,8 +815,20 @@ pub fn generate_mcp_injection(
             })
         }
         "opencode" => opencode_inject(rt, cwd, target),
-        _ => Ok(McpInjection::default()),
+        _ => return Ok(McpInjection::default()),
+    }?;
+    if target == ProviderTarget::Unix && rt.is_windows_host() {
+        // wsl.exe does not automatically forward arbitrary Windows environment
+        // variables. Pass context and any provider-specific config selectors
+        // into the WSL provider; selectors are already translated above.
+        let mut shared = mcp_wsl_env(rt.wsl_env());
+        for name in injection.env.keys() {
+            shared.push(':');
+            shared.push_str(name);
+        }
+        injection.env.insert("WSLENV".to_string(), shared);
     }
+    Ok(injection)
 }
 
 /// `cleanupMcpConfig` (`cw:429-448`): best-effort tmp-file unlink (claude/

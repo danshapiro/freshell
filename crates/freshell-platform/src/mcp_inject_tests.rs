@@ -72,6 +72,240 @@ fn fake_rt(tmp: &Path, wsl: bool) -> FakeRt {
     }
 }
 
+struct WindowsPackagedRt {
+    tmp: PathBuf,
+    command: McpServerArg,
+    conversion_fails: bool,
+}
+
+impl McpRuntime for WindowsPackagedRt {
+    fn tmp_dir(&self) -> PathBuf {
+        self.tmp.clone()
+    }
+    fn is_wsl_environment(&self) -> bool {
+        false
+    }
+    fn is_windows_host(&self) -> bool {
+        true
+    }
+    fn convert_to_windows_path(&self, path: &str) -> String {
+        path.to_string()
+    }
+    fn convert_to_unix_path(&self, path: &str) -> Result<String, McpInjectError> {
+        if self.conversion_fails {
+            return Err(McpInjectError::new("WSL conversion failed"));
+        }
+        if path.starts_with("C:\\") {
+            Ok(path.replace("C:\\", "/mnt/c/").replace('\\', "/"))
+        } else {
+            Ok(format!("/wsl{path}"))
+        }
+    }
+    fn wsl_env(&self) -> Option<String> {
+        Some("USERPROFILE/p:FRESHELL_TOKEN/u".to_string())
+    }
+    fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
+        Ok(vec![McpServerArg::Path(
+            "C:\\Freshell Runtime\\tools\\server.js".to_string(),
+        )])
+    }
+    fn server_command(&self) -> Result<McpServerCommand, McpInjectError> {
+        Ok(McpServerCommand {
+            command: self.command.clone(),
+            args: self.server_command_args()?,
+        })
+    }
+}
+
+#[test]
+fn windows_packaged_mcp_runs_from_wsl_without_translating_windows_node_arguments() {
+    let scratch = Scratch::new("windows-packaged-wsl");
+    let rt = WindowsPackagedRt {
+        tmp: scratch.path().to_path_buf(),
+        command: McpServerArg::Path("C:\\Freshell Runtime\\node.exe".to_string()),
+        conversion_fails: false,
+    };
+    let (command, args) = build_mcp_server_command(&rt, ProviderTarget::Unix).unwrap();
+    assert_eq!(command, "env");
+    assert_eq!(
+        args,
+        vec![
+            "WSLENV=USERPROFILE/p:FRESHELL_URL:FRESHELL_TOKEN:FRESHELL_TAB_ID:FRESHELL_PANE_ID",
+            "/mnt/c/Freshell Runtime/node.exe",
+            "C:\\Freshell Runtime\\tools\\server.js",
+        ]
+    );
+
+    let (native_command, native_args) =
+        build_mcp_server_command(&rt, ProviderTarget::Windows).unwrap();
+    assert_eq!(native_command, "C:\\Freshell Runtime\\node.exe");
+    assert_eq!(native_args, vec!["C:\\Freshell Runtime\\tools\\server.js"]);
+}
+
+#[test]
+fn windows_built_mcp_using_unix_node_translates_its_script_path() {
+    let scratch = Scratch::new("windows-source-wsl");
+    let rt = WindowsPackagedRt {
+        tmp: scratch.path().to_path_buf(),
+        command: McpServerArg::Literal("node".to_string()),
+        conversion_fails: false,
+    };
+    assert_eq!(
+        build_mcp_server_command(&rt, ProviderTarget::Unix).unwrap(),
+        (
+            "node".to_string(),
+            vec!["/mnt/c/Freshell Runtime/tools/server.js".to_string()],
+        )
+    );
+}
+
+#[test]
+fn source_mcp_uses_native_windows_node_for_host_installed_tsx() {
+    let scratch = Scratch::new("windows-source-native-node");
+    let loader = scratch.path().join("node_modules/tsx/dist/loader.mjs");
+    std::fs::create_dir_all(loader.parent().unwrap()).unwrap();
+    std::fs::write(&loader, "export {};").unwrap();
+    let node_dir = scratch.path().join("Windows Node Runtime");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let native_node = node_dir.join("node.exe");
+    std::fs::write(&native_node, "native Windows node fixture").unwrap();
+
+    let selected = source_mcp_server_command(scratch.path(), true, &[node_dir]).unwrap();
+    assert_eq!(
+        selected.command,
+        McpServerArg::Path(native_node.to_string_lossy().into_owned())
+    );
+    assert_eq!(
+        selected.args,
+        vec![
+            McpServerArg::Literal("--import".to_string()),
+            McpServerArg::Literal(crate::opencode_plugin::plugin_file_spec(&loader)),
+            McpServerArg::Path(
+                scratch
+                    .path()
+                    .join("tools/freshell-mcp/server.ts")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn windows_unc_mcp_loader_urls_keep_the_server_as_the_authority() {
+    for (path, expected) in [
+        (
+            r"\\server\share\repo\loader.mjs",
+            "file://server/share/repo/loader.mjs",
+        ),
+        (
+            r"\\server\share\My Project #1\loader.mjs",
+            "file://server/share/My%20Project%20%231/loader.mjs",
+        ),
+        (
+            "//server/share/repo/loader.mjs",
+            "file://server/share/repo/loader.mjs",
+        ),
+    ] {
+        assert_eq!(mcp_loader_spec(Path::new(path)), expected);
+    }
+}
+
+#[test]
+fn local_mcp_loader_urls_preserve_drive_and_posix_paths() {
+    for (path, expected) in [
+        (
+            r"C:\Program Files\Freshell\loader.mjs",
+            "file:///C:/Program%20Files/Freshell/loader.mjs",
+        ),
+        (
+            "/tmp/My Project #1/loader.mjs",
+            "file:///tmp/My%20Project%20%231/loader.mjs",
+        ),
+    ] {
+        assert_eq!(mcp_loader_spec(Path::new(path)), expected);
+    }
+}
+
+#[test]
+fn windows_source_mcp_refuses_to_mix_unix_node_with_windows_dependencies() {
+    let scratch = Scratch::new("windows-source-no-native-node");
+    let loader = scratch.path().join("node_modules/tsx/dist/loader.mjs");
+    std::fs::create_dir_all(loader.parent().unwrap()).unwrap();
+    std::fs::write(loader, "export {};").unwrap();
+    assert!(source_mcp_server_command(scratch.path(), true, &[]).is_err());
+    assert_eq!(
+        source_mcp_server_command(scratch.path(), false, &[])
+            .unwrap()
+            .command,
+        McpServerArg::Literal("node".to_string())
+    );
+}
+
+#[test]
+fn windows_to_wsl_mcp_refuses_failed_path_conversion() {
+    let scratch = Scratch::new("windows-wsl-conversion-error");
+    let rt = WindowsPackagedRt {
+        tmp: scratch.path().to_path_buf(),
+        command: McpServerArg::Path("C:\\Freshell Runtime\\node.exe".to_string()),
+        conversion_fails: true,
+    };
+    assert!(build_mcp_server_command(&rt, ProviderTarget::Unix).is_err());
+}
+
+#[test]
+fn windows_to_wsl_json_providers_receive_readable_config_paths_and_packaged_commands() {
+    let scratch = Scratch::new("windows-wsl-json-providers");
+    let rt = WindowsPackagedRt {
+        tmp: scratch.path().to_path_buf(),
+        command: McpServerArg::Path("C:\\Freshell Runtime\\node.exe".to_string()),
+        conversion_fails: false,
+    };
+    for mode in ["claude", "gemini", "kimi"] {
+        let injection =
+            generate_mcp_injection(&rt, mode, mode, None, ProviderTarget::Unix).unwrap();
+        let native_path = tmp_file_path(&rt, mode);
+        let expected_path = rt
+            .convert_to_unix_path(native_path.to_str().unwrap())
+            .unwrap();
+        let provider_path = if mode == "gemini" {
+            &injection.env["GEMINI_CLI_SYSTEM_DEFAULTS_PATH"]
+        } else {
+            &injection.args[1]
+        };
+        assert_eq!(
+            provider_path, &expected_path,
+            "{mode} must read its config inside WSL"
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(native_path).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["freshell"]["command"], "env");
+        assert_eq!(
+            config["mcpServers"]["freshell"]["args"][1],
+            "/mnt/c/Freshell Runtime/node.exe"
+        );
+        assert_eq!(
+            config["mcpServers"]["freshell"]["args"][2],
+            "C:\\Freshell Runtime\\tools\\server.js"
+        );
+        let forwarded = injection.env["WSLENV"].split(':').collect::<Vec<_>>();
+        for name in [
+            "FRESHELL_URL",
+            "FRESHELL_TOKEN",
+            "FRESHELL_TAB_ID",
+            "FRESHELL_PANE_ID",
+        ] {
+            assert!(
+                forwarded.contains(&name),
+                "{mode} must receive {name} from the Windows server"
+            );
+        }
+        if mode == "gemini" {
+            assert!(forwarded.contains(&"GEMINI_CLI_SYSTEM_DEFAULTS_PATH"));
+        }
+    }
+}
+
 #[cfg(unix)]
 fn conversion_script(scratch: &Scratch, name: &str, contents: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -249,27 +483,19 @@ fn codex_unix_target_on_wsl_keeps_host_paths() {
     );
 }
 
-/// G-W1's injection half — native-Windows host + `target='unix'` (the WSL
-/// branch): NO conversion gate fires (`isWslEnvironment()` false), so the
-/// HOST-FORM (Windows) paths ride into the unix-target args verbatim —
-/// faithful reference wart (spec §2.6).
+/// Codex's inline TOML must carry paths its WSL-side Node can read.
 #[test]
-fn g_w1_native_windows_host_unix_target_keeps_windows_paths() {
+fn codex_native_windows_host_unix_target_uses_wsl_script_paths() {
     let scratch = Scratch::new("gw1");
-    let rt = FakeRt {
+    let rt = WindowsPackagedRt {
         tmp: scratch.path().to_path_buf(),
-        wsl: false, // native Windows host: isWslEnvironment() is false
-        args: vec![
-            McpServerArg::Literal("--import".to_string()),
-            McpServerArg::Path("C:\\repo\\node_modules\\tsx\\dist\\loader.mjs".to_string()),
-            McpServerArg::Path("C:\\repo\\server\\mcp\\server.ts".to_string()),
-        ],
+        command: McpServerArg::Literal("node".to_string()),
+        conversion_fails: false,
     };
     let inj = generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
     assert_eq!(
         inj.args[3],
-        "mcp_servers.freshell.args=[\"C:\\\\repo\\\\node_modules\\\\tsx\\\\dist\\\\loader.mjs\", \"C:\\\\repo\\\\server\\\\mcp\\\\server.ts\"]"
-            .replace("args=[\"C", "args=[\"--import\", \"C")
+        "mcp_servers.freshell.args=[\"/mnt/c/Freshell Runtime/tools/server.js\"]"
     );
 }
 
