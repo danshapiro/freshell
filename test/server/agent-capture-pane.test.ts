@@ -89,10 +89,38 @@ describe('GET /api/panes/:id/capture', () => {
     }))
     const res = await request(app).get('/api/panes/pane-legacy-agent/capture')
     expect(res.status).toBe(422)
-    expect(res.body).toMatchObject({
+    expect(res.body).toEqual({
       status: 'error',
-      message: expect.stringContaining('pane kind "fresh-agent"'),
+      message: 'pane kind "fresh-agent" does not support capture-pane; use screenshot-pane',
     })
+  })
+
+  it('keeps the 500 mapping for fresh-agent history resolution failures other than RESTORE_NOT_FOUND', async () => {
+    const app = express()
+    app.use(express.json())
+    app.use('/api', createAgentApiRouter({
+      layoutStore: {
+        resolvePaneToTerminal: () => undefined,
+        getPaneSnapshot: () => ({
+          kind: 'fresh-agent',
+          paneContent: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionId: '22222222-2222-4222-8222-222222222222',
+          },
+        }),
+      } as any,
+      registry,
+      freshAgentRuntimeManager: {
+        getSnapshot: async () => {
+          throw new ClaudeFreshAgentHistoryResolutionError('RESTORE_DIVERGED', 'history diverged')
+        },
+      } as any,
+    }))
+    const res = await request(app).get('/api/panes/pane-diverged-agent/capture')
+    expect(res.status).toBe(500)
+    expect(res.body).toMatchObject({ status: 'error', message: expect.stringContaining('history diverged') })
   })
 
   it('keeps the existing status mapping for other fresh-agent capture failures', async () => {
