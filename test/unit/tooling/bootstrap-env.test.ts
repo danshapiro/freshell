@@ -74,6 +74,15 @@ describe('ensureAuthTokenFile', () => {
     expect(env).toEqual({ AUTH_TOKEN: 'environment-token', PORT: '3456' })
   })
 
+  it('lets Rust load a saved token when the caller exports an empty AUTH_TOKEN', async () => {
+    const envPath = await createTempEnvPath()
+    await writeFile(envPath, 'AUTH_TOKEN=existing-saved-auth-token\n')
+    const env: NodeJS.ProcessEnv = { AUTH_TOKEN: '' }
+
+    expect(ensureAuthTokenFile({ env, envPath })).toEqual({ created: false, source: 'file' })
+    expect(Object.hasOwn(env, 'AUTH_TOKEN')).toBe(false)
+  })
+
   it('keeps existing dotenv values when adding a missing token', async () => {
     const envPath = await createTempEnvPath()
     await writeFile(envPath, 'PORT=3456\nCUSTOM=value\n', { mode: 0o600 })

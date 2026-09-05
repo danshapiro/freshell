@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import path from 'node:path'
+import { parseEnv } from 'node:util'
 
 export type AuthTokenBootstrapResult = {
   created: boolean
@@ -26,20 +27,17 @@ function normalizeAuthTokenValue(rawValue: string): string {
 
 function parseAuthToken(contents: string): string | undefined {
   for (const line of contents.split(/\r?\n/)) {
-    const match = line.match(/^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*?)\s*$/)
-    if (!match) continue
-
-    const value = normalizeAuthTokenValue(match[1])
-    if (value.length > 0 && value !== AUTH_TOKEN_PLACEHOLDER) return value
+    if (!/^[ \t]*(?:export[ \t]+)?AUTH_TOKEN[ \t]*=/.test(line)) continue
+    const value = parseEnv(line).AUTH_TOKEN?.trim()
+    // dotenvy keeps the first assignment, including an empty one. Looking
+    // for a later usable token would disagree with the server on restart.
+    return value && value !== AUTH_TOKEN_PLACEHOLDER ? value : undefined
   }
   return undefined
 }
 
-function hasPlaceholderAuthToken(contents: string): boolean {
-  return contents.split(/\r?\n/).some((line) => {
-    const match = line.match(/^\s*(?:export\s+)?AUTH_TOKEN\s*=\s*(.*?)\s*$/)
-    return match !== null && normalizeAuthTokenValue(match[1]) === AUTH_TOKEN_PLACEHOLDER
-  })
+function hasAuthTokenAssignment(contents: string): boolean {
+  return /^[ \t]*(?:export[ \t]+)?AUTH_TOKEN[ \t]*=/m.test(contents)
 }
 
 function readExistingEnv(envPath: string): string | undefined {
@@ -85,10 +83,15 @@ function appendAtomically(envPath: string, contents: string): void {
   }
 }
 
-function replacePlaceholderAtomically(envPath: string, existing: string, token: string): void {
+function replaceUnsetTokenAtomically(envPath: string, existing: string, token: string): void {
   const replacement = existing.replace(
-    /^([ \t]*(?:export[ \t]+)?AUTH_TOKEN[ \t]*=[ \t]*)(?:"replace-with-a-long-random-token"|'replace-with-a-long-random-token'|replace-with-a-long-random-token)([ \t]*)(?=\r?$)/gm,
-    `$1${token}$2`,
+    /^([ \t]*(?:export[ \t]+)?AUTH_TOKEN[ \t]*=[ \t]*)([^\r\n]*)/gm,
+    (assignment: string, prefix: string, rawValue: string) => {
+      const value = parseEnv(assignment).AUTH_TOKEN?.trim()
+      if (value && value !== AUTH_TOKEN_PLACEHOLDER) return assignment
+      const comment = rawValue.match(/(?:^|[ \t]+)(#.*)$/)?.[1]
+      return `${prefix}${token}${comment ? ` ${comment}` : ''}`
+    },
   )
   const temporaryPath = `${envPath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`
   let descriptor: number | undefined
@@ -135,7 +138,9 @@ export function ensureAuthTokenFile(options: AuthTokenBootstrapOptions = {}): Au
   if (environmentToken && environmentToken !== AUTH_TOKEN_PLACEHOLDER) {
     return { created: false, source: 'environment' }
   }
-  if (environmentToken === AUTH_TOKEN_PLACEHOLDER) delete env.AUTH_TOKEN
+  // dotenvy never overrides a present environment key, even when it is empty.
+  // Remove unusable values so a saved file token remains loadable by Rust.
+  delete env.AUTH_TOKEN
 
   let existing = readExistingEnv(envPath)
   if (existing !== undefined && parseAuthToken(existing)) {
@@ -163,8 +168,8 @@ export function ensureAuthTokenFile(options: AuthTokenBootstrapOptions = {}): Au
     }
   }
 
-  if (hasPlaceholderAuthToken(existing)) {
-    replacePlaceholderAtomically(envPath, existing, token)
+  if (hasAuthTokenAssignment(existing)) {
+    replaceUnsetTokenAtomically(envPath, existing, token)
   } else if (!parseAuthToken(existing)) {
     // O_APPEND makes this one write indivisible with respect to other
     // starters and avoids replacing a file that already contains settings.

@@ -4,6 +4,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { resolveNpmCommand } from './coordinator-upstream.js'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '../..')
@@ -14,18 +15,15 @@ function log(severity: 'info' | 'error', event: string, fields: Record<string, u
   stream.write(`${JSON.stringify({ severity, event, timestamp: new Date().toISOString(), ...fields })}\n`)
 }
 
-function npmCommand(): string {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm'
-}
-
-export function buildSourceRuntimePhases(npm = npmCommand()): Array<{ command: string; args: string[] }> {
+export function buildSourceRuntimePhases(npm?: string): Array<{ command: string; args: string[] }> {
+  const runNpm = (args: string[]) => npm ? { command: npm, args } : resolveNpmCommand(args)
   return [
     // build:client/build:tools write the artifacts served by Freshell. Run the
     // shared guard first so a direct source-runtime invocation is safe on a
     // normal checkout with the production Rust server running.
-    { command: npm, args: ['run', 'prebuild'] },
-    { command: npm, args: ['run', 'build:client'] },
-    { command: npm, args: ['run', 'build:tools'] },
+    runNpm(['run', 'prebuild']),
+    runNpm(['run', 'build:client']),
+    runNpm(['run', 'build:tools']),
     { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
   ]
 }

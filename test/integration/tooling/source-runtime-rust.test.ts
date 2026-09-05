@@ -1,12 +1,14 @@
 // @vitest-environment node
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
+import { ensureAuthTokenFile } from '../../../scripts/bootstrap-env.js'
+import { resolveNpmCommand } from '../../../scripts/testing/coordinator-upstream.js'
 import {
   findReleaseServerPid,
   readProcessSnapshot,
@@ -14,7 +16,6 @@ import {
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(TEST_DIR, '../../..')
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 let child: ChildProcess | undefined
 let homeDir: string | undefined
@@ -93,11 +94,51 @@ afterEach(async () => {
 })
 
 describe('source runtime', () => {
+  it.each([
+    'AUTH_TOKEN=\n',
+    'AUTH_TOKEN=""\n',
+    'AUTH_TOKEN=replace-with-a-long-random-token # choose a token\n',
+  ])('preserves working authentication across restarts after bootstrapping %j', async (assignment) => {
+    homeDir = await mkdtemp(path.join(os.tmpdir(), 'freshell-source-auth-'))
+    const envPath = path.join(homeDir, '.env')
+    await writeFile(envPath, assignment)
+    const port = await findFreePort()
+    const token = `bootstrap-runtime-${process.pid}`
+    const binary = path.join(PROJECT_ROOT, 'target/release', `freshell-server${process.platform === 'win32' ? '.exe' : ''}`)
+
+    for (let launch = 0; launch < 2; launch += 1) {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        AUTH_TOKEN: undefined,
+        PORT: String(port),
+        HOME: homeDir,
+        USERPROFILE: homeDir,
+        FRESHELL_HOME: homeDir,
+        FRESHELL_BIND_HOST: '127.0.0.1',
+      }
+      ensureAuthTokenFile({ env, envPath, generateToken: () => token })
+      child = spawn(binary, [], { cwd: homeDir, env, stdio: 'ignore' })
+      ownedRustPid = child.pid
+
+      await waitForHealth(`http://127.0.0.1:${port}`, 5_000)
+      const response = await fetch(`http://127.0.0.1:${port}/api/server-info`, {
+        headers: { 'x-auth-token': token },
+      })
+      expect(response.ok).toBe(true)
+
+      child.kill('SIGTERM')
+      await waitForExit(child)
+      child = undefined
+      ownedRustPid = undefined
+    }
+  })
+
   it('starts the release Rust binary through npm start and serves the built SPA', async () => {
     homeDir = await mkdtemp(path.join(os.tmpdir(), 'freshell-source-runtime-'))
     const port = await findFreePort()
     const token = `source-runtime-${process.pid}`
-    child = spawn(npmCommand, ['start'], {
+    const npm = resolveNpmCommand(['start'])
+    child = spawn(npm.command, npm.args, {
       cwd: PROJECT_ROOT,
       env: {
         ...process.env,

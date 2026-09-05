@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { resolveNpmCommand } from './testing/coordinator-upstream.js'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = resolve(SCRIPT_DIR, '..')
@@ -218,10 +219,6 @@ function applyPriority(run: StandardTestRun, child: ChildProcess): void {
   }
 }
 
-function resolveNpmCommand(): string {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm'
-}
-
 function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
   let command: string
   let args: string[]
@@ -233,9 +230,11 @@ function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
       forwardedArgs,
     })]
   } else {
-    command = resolveNpmCommand()
     args = ['run', run.script!]
     if (run.name === 'source-runtime' && forwardedArgs.length > 0) args.push('--', ...forwardedArgs)
+    const npm = resolveNpmCommand(args)
+    command = npm.command
+    args = npm.args
   }
 
   log('info', 'Starting test phase', {
