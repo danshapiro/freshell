@@ -1,5 +1,5 @@
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Loader2, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Loader2, Redo2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
@@ -719,6 +719,10 @@ type TurnActionProps = {
   canFork: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  /** kata 1wxv: the per-turn "undo to here" affordance (decision 3). */
+  canRollback?: boolean
+  rollbackBusy?: boolean
+  onRollbackToTurn?: (turnId: string) => void
   onTurnContextMenu?: (event: React.MouseEvent, turn: FreshAgentTurn) => void
   /** Coarse-pointer path: open the bottom action sheet for this turn. */
   onOpenActions?: (turn: FreshAgentTurn) => void
@@ -794,7 +798,10 @@ function FreshAgentTurnArticle({
       <FreshAgentTurnActions
         turn={actionTurn}
         canFork={actions.canFork}
+        canRollback={actions.canRollback}
+        rollbackBusy={actions.rollbackBusy}
         onForkFromTurn={actions.onForkFromTurn}
+        onRollbackToTurn={actions.onRollbackToTurn}
         onRewindToTurn={actions.onRewindToTurn}
         onOpenActions={actions.onOpenActions}
       />
@@ -869,6 +876,20 @@ export type FreshAgentTranscriptProps = {
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  /** kata 1wxv: rollback affordances on live turns feed TurnActionProps; the
+   * marker bucket + its per-row redo feed the rolled-back section (decision 6). */
+  canRollback?: boolean
+  rollbackBusy?: boolean
+  onRollbackToTurn?: (turnId: string) => void
+  rolledBackTurns?: FreshAgentTurn[]
+  canRedo?: boolean
+  onRedoToTurn?: (turnId: string) => void
+  /** Delta-r1 F6: the SERVER-AUTHORED per-marker redo gate (`rollback.redoableTurnIds`
+   * from the snapshot — the exact turn ids at the ends of the redoable steps of the
+   * CURRENT epoch). Absent (a legacy server surface) or canRedo:false ⇒ no marker
+   * offers the affordance: frozen prior-epoch markers are NOT redoable (providers
+   * only restore the current epoch's tail). */
+  redoableTurnIds?: readonly string[]
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -882,6 +903,13 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
+  canRollback = false,
+  rollbackBusy = false,
+  onRollbackToTurn,
+  rolledBackTurns = [],
+  canRedo = false,
+  onRedoToTurn,
+  redoableTurnIds,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
@@ -890,6 +918,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
   const coarsePointer = useCoarsePointer()
+  // F6: the per-marker redo gate set — membership-tested per user marker row.
+  const redoableTurnIdSet = useMemo(
+    () => (redoableTurnIds ? new Set(redoableTurnIds) : null),
+    [redoableTurnIds],
+  )
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
     showThinking,
@@ -975,9 +1008,12 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     canFork,
     onForkFromTurn,
     onRewindToTurn,
+    canRollback,
+    rollbackBusy,
+    onRollbackToTurn,
     onTurnContextMenu: coarsePointer ? undefined : handleTurnContextMenu,
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
-  }), [canFork, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn])
+  }), [canFork, canRollback, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn, onRollbackToTurn, rollbackBusy])
 
   useImperativeHandle(ref, () => ({
     scrollByLine: (direction) => {
@@ -1070,7 +1106,36 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
             className="fresh-agent-activity-caption my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground"
           >
             {tailCaption.text}
-          </div>
+          </div>        ) : null}
+        {rolledBackTurns.length > 0 ? (
+          <section aria-label="Rolled back turns" className="mx-2 mt-2 rounded-md border border-dashed border-border/60 bg-muted/30 p-2 opacity-80">
+            <p className="px-1 pb-1 text-xs font-medium text-muted-foreground">
+              Rolled back ({rolledBackTurns.filter((t) => t.role === 'user').length}) — gone from the conversation; kept in history.
+              {/* r2/r3: the count is rollback STEPS (user-role marker groups), not raw marker rows —
+                  one undone turn-step contributes a user row AND an assistant row. This is exactly
+                  the user-step count the server's rollback.undoneDepth computes (r3 correction 5):
+                  same bucket, same rule, never entries.len(). */}
+            </p>
+            {rolledBackTurns.map((turn, index) => (
+              <div key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`} className="flex items-start justify-between gap-2 rounded px-1 py-1">
+                <div className="min-w-0">
+                  <span className="mr-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">rolled back</span>
+                  <span className="text-sm text-muted-foreground">{turn.summary || turnPlainText(turn)}</span>
+                </div>
+                {canRedo && onRedoToTurn && turn.role === 'user' && redoableTurnIdSet?.has(turn.turnId ?? turn.id) ? (
+                  <button
+                    type="button"
+                    onClick={() => onRedoToTurn(turn.turnId ?? turn.id)}
+                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    aria-label="Redo to here"
+                    title={`Restore this turn and the rolled-back turns before it (“${turn.summary.slice(0, 60)}”)`}
+                  >
+                    <Redo2 className="h-3 w-3" />
+                  </button>
+                ) : null}
+              </div>
+            ))}
+          </section>
         ) : null}
       </div>
       {glomTarget ? (
@@ -1088,14 +1153,17 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
       <FreshAgentTurnContextMenu
         state={contextMenu}
         canFork={canFork}
+        canRollback={canRollback}
+        rollbackBusy={rollbackBusy}
         onForkFromTurn={onForkFromTurn}
+        onRollbackToTurn={onRollbackToTurn}
         onRewindToTurn={onRewindToTurn}
         onClose={() => setContextMenu(null)}
       />
       {sheetTurn ? (
         <FreshAgentActionSheet
           title={turnPlainText(sheetTurn).slice(0, 80) || getTurnLabel(sheetTurn, agentLabel)}
-          items={buildTurnActionItems(sheetTurn, { canFork, onForkFromTurn, onRewindToTurn })}
+          items={buildTurnActionItems(sheetTurn, { canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn })}
           onClose={() => setSheetTurn(null)}
         />
       ) : null}

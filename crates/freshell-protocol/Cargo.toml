@@ -1,7 +1,7 @@
 [package]
 name = "freshell-protocol"
 version = "0.1.0"
-description = "Generated Rust wire types for the frozen freshell WebSocket protocol (WS_PROTOCOL_VERSION = 7). Serialization only, no logic. Shared by the Rust server and the equivalence oracle."
+description = "Generated Rust wire types for the frozen freshell WebSocket protocol (WS_PROTOCOL_VERSION = 8). Serialization only, no logic. Shared by the Rust server and the equivalence oracle."
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true

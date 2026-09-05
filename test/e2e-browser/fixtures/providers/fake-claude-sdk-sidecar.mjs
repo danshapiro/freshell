@@ -8,7 +8,14 @@
 //
 // Wire protocol (mirrors crates/freshell-claude-sidecar/index.mjs and the
 // realism notes in fixtures/fake-claude-sidecar.mjs):
-//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId}
+//   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId,
+//         resumeSessionAt,forkSession,resumeDropsTurn}
+//        (kata 1wxv fork-at-point: forkSession:true + resumeSessionId + resumeSessionAt
+//        mints a NEW durable cliSessionId and writes the parent's transcript PREFIX
+//        through the addressed uuid verbatim; a resumeDropsTurn guard that is NOT the
+//        raw-chain successor of the resume point refuses with the SDK-documented
+//        "Resume rejected by --resume-drops-turn:" prefix — NO init, NO durable session;
+//        plain resume keeps the same-id behavior)
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
 //        {"type":"permission.respond",sessionId,requestId,decision}
 //        {"type":"question.respond",sessionId,requestId,answers}
@@ -126,10 +133,20 @@ function transcriptPath(cliSessionId, cwd) {
   return path.join(claudeHome(), 'projects', mangleCwd(cwd), `${cliSessionId}.jsonl`)
 }
 
+// kata 1wxv Task 7 (fork-at-point): the rollback resume math runs over the RAW
+// parentUuid chain, so every appended transcript line now carries a real
+// uuid + parentUuid backbone, chained per cliSessionId (the real CLI's shape).
+const lastUuidBySession = new Map()
+
 /** Append one transcript line in parse_transcript_turns' accepted shape. */
 function appendTranscript(cliSessionId, cwd, role, text) {
+  const parentUuid = lastUuidBySession.get(cliSessionId) ?? null
+  const uuid = randomUUID()
+  lastUuidBySession.set(cliSessionId, uuid)
   const line = {
     type: role,
+    uuid,
+    parentUuid,
     timestamp: new Date().toISOString(),
     cwd: cwd ?? process.cwd(),
     message: { role, content: [{ type: 'text', text }] },
@@ -282,16 +299,65 @@ async function handleInput(line) {
     createCounter += 1
     const sessionId = `${provider}-fake-${process.pid}-${createCounter}`
     activeSessionId = sessionId
-    const cliSessionId = msg.resumeSessionId ?? program.sessionId ?? randomUUID()
+    // kata 1wxv Task 7 (fork-at-point, s2rk correction): a `forkSession:true`
+    // create mints a NEW durable cliSessionId — real `claude --fork-session`
+    // NEVER reuses the parent's id; plain resume keeps the same-id behavior.
+    const forking = msg.forkSession === true
+    const cliSessionId = forking
+      ? randomUUID()
+      : (msg.resumeSessionId ?? program.sessionId ?? randomUUID())
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, { cliSessionId, cwd, pending: 0, pendingEntries: [] })
     // A durable transcript EXISTS from create on (the reload-while-pending
     // snapshot route reads it before any turn completes) — touch, no bogus row.
     const transcript = transcriptPath(cliSessionId, cwd)
     fs.mkdirSync(path.dirname(transcript), { recursive: true })
-    fs.closeSync(fs.openSync(transcript, 'a'))
-    // created FIRST — a real consumer discards anything earlier.
-    emit({ type: 'created', requestId: msg.requestId, sessionId })
+    if (forking && msg.resumeSessionId) {
+      // created FIRST — a real consumer discards anything earlier. The
+      // resumeDropsTurn refusal watch runs BEFORE any durable state moves:
+      // the guard must name the RAW-chain successor of the resume point (the
+      // SDK-armed discard guard); anything else refuses with the SDK's
+      // documented prefix and NO sdk.session.init / durable session is ever
+      // minted (freshell retries ONCE with the guard omitted).
+      emit({ type: 'created', requestId: msg.requestId, sessionId })
+      const parentPath = transcriptPath(msg.resumeSessionId, cwd)
+      const parentLines = fs.existsSync(parentPath)
+        ? fs.readFileSync(parentPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+        : []
+      const cut = typeof msg.resumeSessionAt === 'string'
+        ? parentLines.findIndex((l) => l.uuid === msg.resumeSessionAt)
+        : parentLines.length - 1
+      if (typeof msg.resumeDropsTurn === 'string') {
+        const successor = cut >= 0 ? (parentLines[cut + 1]?.uuid ?? null) : null
+        if (msg.resumeDropsTurn !== successor) {
+          emit({
+            type: 'sdk.error',
+            sessionId,
+            message: `Resume rejected by --resume-drops-turn: ${msg.resumeDropsTurn} is not the raw-chain successor of the resume point (drop-guard mismatch)`,
+          })
+          return
+        }
+      }
+      // The child file is the parent's transcript PREFIX through
+      // resumeSessionAt, uuids preserved verbatim (a real fork keeps original
+      // message ids), so freshell's transcript readers see a real durable
+      // JSONL; the chain cursor seeds onto the fork point's uuid.
+      const prefix = parentLines.slice(0, cut < 0 ? undefined : cut + 1)
+      const lastPrefixUuid = prefix.length > 0 ? prefix[prefix.length - 1]?.uuid : null
+      fs.writeFileSync(transcript, prefix.map((l) => JSON.stringify(l)).join('\n') + (prefix.length ? '\n' : ''))
+      if (typeof lastPrefixUuid === 'string') lastUuidBySession.set(cliSessionId, lastPrefixUuid)
+    } else {
+      fs.closeSync(fs.openSync(transcript, 'a'))
+      // created FIRST — a real consumer discards anything earlier.
+      emit({ type: 'created', requestId: msg.requestId, sessionId })
+      // A plain resume CONTINUES the parent's chain: seed the uuid cursor from
+      // the transcript tail so the next appended line's parentUuid is right.
+      if (typeof msg.resumeSessionId === 'string' && fs.existsSync(transcript)) {
+        const lines = fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean)
+        const last = lines.length > 0 ? JSON.parse(lines[lines.length - 1]) : null
+        if (typeof last?.uuid === 'string') lastUuidBySession.set(cliSessionId, last.uuid)
+      }
+    }
     const emitted = await engine.handleMessage(msg)
     if (emitted.has('crash')) return
     if (!emitted.has('session')) {
@@ -344,11 +410,34 @@ async function handleInput(line) {
       }
       st.pending = 0
     }
+    // kata 1wxv ep4 (roll-back quiesce protocol): every interrupt now yields
+    // the settled receipt after `query.interrupt()` resolves — nothing was in
+    // flight here, matching the real sidecar's 'no in-flight SDK query'
+    // answer. This must precede any of the frames below in stream order (the
+    // consumer folds the receipt only after provably-earlier evidence).
+    emit({
+      type: 'sdk.interrupt_settled',
+      sessionId: msg.sessionId,
+      ok: false,
+      message: 'no in-flight SDK query',
+    })
     const emitted = await engine.handleMessage(msg)
     if (emitted.has('crash')) return
     if (!emitted.has('activity') && !emitted.has('marker')) {
       await engine.emitEvent('activity', { status: 'idle' }, 'msg:interrupt:idle')
     }
+  } else if (msg.type === 'rollback.quiesce') {
+    // kata 1wxv ep4-r3: rollback's pre-teardown quiesce probe. This faker has
+    // no SDK-input queue — every sent turn settles immediately on the drive
+    // side — so the answer is always all-clear with a probeId echo.
+    emit({
+      type: 'sdk.rollback.quiesced',
+      sessionId: msg.sessionId,
+      probeId: msg.probeId ?? null,
+      cancelledQueue: 0,
+      inFlightTurn: false,
+      handedCompactLikely: false,
+    })
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }

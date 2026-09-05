@@ -123,6 +123,132 @@ export const CodexActivityUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+// ──────────────────────────────────────────────────────────────
+// Host Stats (hoststats.* — additive, WS_PROTOCOL_VERSION unchanged)
+//
+// Degraded-section rule (frozen): a section that times out, throws, or is
+// unsupported on the current platform returns its FULL shape with
+// available:false and zero/empty/null/[] for every other field — never a
+// bare {available:false} (per-section fields stay schema-required).
+// ──────────────────────────────────────────────────────────────
+
+const Avail = { available: z.boolean() }
+
+export const HostStatsMachineSchema = z.object({
+  cores: z.number().int().positive(),
+  memTotalBytes: z.number().nonnegative(),
+  platform: z.string(),                          // process.platform value
+  wsl: z.boolean(),
+  kernel: z.string().nullable(),                 // uname release; null on darwin fallback
+  hostname: z.string().nullable(),
+  // capability snapshot, computed once at service start (cheap dir listings/probes):
+  psi: z.boolean(),                              // /proc/pressure readable
+  cgroup: z.enum(['v1', 'v2', 'none']),
+  thermalCount: z.number().int().nonnegative(),
+  batteryPresent: z.boolean(),
+  gpu: z.literal('none'),                        // GPU detection out of scope; chip renders 'n/a' truthfully
+})
+
+export type HostStatsMachine = z.infer<typeof HostStatsMachineSchema>
+
+export const HostStatsLiveSchema = z.object({
+  machine: HostStatsMachineSchema,
+  cpu: z.object({
+    ...Avail, usagePct: z.number().min(0).max(100),
+    stealPct: z.number().min(0).max(100).nullable(),
+    perCorePct: z.array(z.number().min(0).max(100)),
+    freqMHz: z.number().nonnegative().nullable(),
+  }),
+  load: z.object({ ...Avail, load1: z.number(), load5: z.number(), load15: z.number(), cores: z.number().int().positive() }),
+  memory: z.object({
+    ...Avail, source: z.enum(['host', 'cgroup', 'processes']),
+    totalBytes: z.number().nonnegative(), usedBytes: z.number().nonnegative(), availableBytes: z.number().nonnegative(),
+    cgroupLimitBytes: z.number().nonnegative().nullable(),
+    swapTotalBytes: z.number().nonnegative().nullable(), swapUsedBytes: z.number().nonnegative().nullable(),
+  }),
+  paging: z.object({
+    ...Avail, swapInKbps: z.number().nonnegative(), swapOutKbps: z.number().nonnegative(),
+    majFaultsPerSec: z.number().nonnegative(), oomKillsDelta: z.number().int().nonnegative(), oomKillsTotal: z.number().int().nonnegative(),
+  }),
+  psi: z.object({
+    ...Avail,
+    cpuSome10: z.number().nullable(), memSome10: z.number().nullable(), memFull10: z.number().nullable(),
+    ioSome10: z.number().nullable(), ioFull10: z.number().nullable(),
+  }),
+  diskIo: z.object({
+    ...Avail, readBps: z.number().nonnegative(), writeBps: z.number().nonnegative(),
+    utilPct: z.number().min(0).max(100).nullable(), weightedAwaitMs: z.number().nonnegative().nullable(),
+  }),
+  network: z.object({
+    ...Avail, rxBps: z.number().nonnegative(), txBps: z.number().nonnegative(),
+    rxErrorsTotal: z.number().int().nonnegative(), txErrorsTotal: z.number().int().nonnegative(),
+    rxDroppedTotal: z.number().int().nonnegative(), txDroppedTotal: z.number().int().nonnegative(),
+    rxErrorsDelta: z.number().int().nonnegative(), txErrorsDelta: z.number().int().nonnegative(),      // last-tick deltas — server keeps prev tick
+    rxDroppedDelta: z.number().int().nonnegative(), txDroppedDelta: z.number().int().nonnegative(),
+  }),
+  limits: z.object({
+    ...Avail, fdsUsed: z.number().int().nonnegative().nullable(), fdsMax: z.number().int().nonnegative().nullable(),
+    pidsUsed: z.number().int().nonnegative().nullable(), pidsMax: z.number().int().nonnegative().nullable(),
+    timeWait: z.number().int().nonnegative().nullable(), ephemeralPorts: z.number().int().nonnegative().nullable(),
+  }),
+  freshell: z.object({
+    ...Avail, source: z.enum(['node', 'rust']),
+    ptysRunning: z.number().int().nonnegative(), ptysMax: z.number().int().nonnegative(),
+    wsClients: z.number().int().nonnegative(), wsClientsMax: z.number().int().nonnegative(),
+    eventLoopLagP99Ms: z.number().nonnegative().nullable(),   // rust: scheduler drift p99; null when unmeasurable
+    rssBytes: z.number().nonnegative().nullable(), uptimeSec: z.number().nonnegative(),
+  }),
+})
+
+export type HostStatsLive = z.infer<typeof HostStatsLiveSchema>
+
+export const HostStatsManualSchema = z.object({
+  topProcesses: z.object({
+    ...Avail, dwellMs: z.number().int().nonnegative(),
+    list: z.array(z.object({
+      pid: z.number().int().positive(), name: z.string(), cpuPct: z.number().min(0), rssBytes: z.number().nonnegative(),
+      state: z.string(),                                   // single-char kernel state, or platform word
+    })),
+  }),
+  processHealth: z.object({ ...Avail, zombies: z.number().int().nonnegative(), dState: z.number().int().nonnegative(), total: z.number().int().nonnegative() }),
+  inotify: z.object({
+    ...Avail, instances: z.number().int().nonnegative().nullable(), watches: z.number().int().nonnegative().nullable(),
+    maxUserWatches: z.number().int().nonnegative().nullable(), maxUserInstances: z.number().int().nonnegative().nullable(),
+  }),
+  disks: z.object({
+    ...Avail, list: z.array(z.object({
+      mount: z.string(), totalBytes: z.number().nonnegative(), freeBytes: z.number().nonnegative(), usedPct: z.number().min(0).max(100),
+      inodesTotal: z.number().nonnegative().nullable(), inodesFree: z.number().nonnegative().nullable(),
+    })),
+  }),
+  thermals: z.object({
+    ...Avail, zones: z.array(z.object({ label: z.string(), celsius: z.number() })),
+    battery: z.object({ pct: z.number().min(0).max(100), status: z.string() }).nullable(),
+  }),
+  sectionErrors: z.record(z.string(), z.string()),        // section key -> short error string when budget/read failed
+})
+
+export type HostStatsManual = z.infer<typeof HostStatsManualSchema>
+
+export const HostStatsSnapshotSchema = z.object({
+  type: z.literal('hoststats.snapshot'),
+  at: z.number().int().nonnegative(),          // server wall clock ms (epoch)
+  live: HostStatsLiveSchema,
+  manualAt: z.number().int().nonnegative().nullable(),  // last on-request refresh time; null = never
+  manual: HostStatsManualSchema.nullable(),             // present when manualAt set
+})
+export type HostStatsSnapshotMessage = z.infer<typeof HostStatsSnapshotSchema>
+
+export const HostStatsRefreshResponseSchema = z.object({
+  type: z.literal('hoststats.refresh.response'),
+  requestId: z.string().min(1),
+  ok: z.boolean(),
+  at: z.number().int().nonnegative().optional(),
+  manual: HostStatsManualSchema.optional(),
+  error: z.string().optional(),
+})
+export type HostStatsRefreshResponseMessage = z.infer<typeof HostStatsRefreshResponseSchema>
+
 export const OpencodeActivityRecordSchema = z.object({
   terminalId: z.string().min(1),
   sessionId: z.string().optional(),
@@ -437,6 +563,19 @@ export const AmplifierActivityListSchema = z.object({
   requestId: z.string().min(1),
 })
 
+export const HostStatsSubscribeSchema = z.object({
+  type: z.literal('hoststats.subscribe'),
+}).strict()
+
+export const HostStatsUnsubscribeSchema = z.object({
+  type: z.literal('hoststats.unsubscribe'),
+}).strict()
+
+export const HostStatsRefreshSchema = z.object({
+  type: z.literal('hoststats.refresh'),
+  requestId: z.string().min(1),
+}).strict()
+
 export const UiLayoutSyncSchema = z.object({
   type: z.literal('ui.layout.sync'),
   tabs: z.array(z.object({
@@ -574,6 +713,27 @@ export const FreshAgentForkSchema = z.object({
   input: z.record(z.string(), z.unknown()).optional(),
 })
 
+const freshAgentRollbackShape = {
+  requestId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
+  mode: z.enum(['step', 'toTurn']).optional(),
+  turnId: z.string().min(1).optional(),
+} as const
+
+/** kata 1wxv: conversation rollback. mode absent => 'step'. turnId required by the SERVER for 'toTurn'. */
+export const FreshAgentUndoSchema = z.object({
+  type: z.literal('freshAgent.undo'),
+  ...freshAgentRollbackShape,
+})
+
+export const FreshAgentRedoSchema = z.object({
+  type: z.literal('freshAgent.redo'),
+  ...freshAgentRollbackShape,
+})
+
 export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
@@ -584,6 +744,8 @@ export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
+  FreshAgentUndoSchema,
+  FreshAgentRedoSchema,
 ])
 
 export type FreshAgentClientMessage = z.infer<typeof FreshAgentClientMessageSchema>
@@ -688,6 +850,9 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   OpencodeActivityListSchema,
   ClaudeActivityListSchema,
   AmplifierActivityListSchema,
+  HostStatsSubscribeSchema,
+  HostStatsUnsubscribeSchema,
+  HostStatsRefreshSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
   FreshAgentCreateSchema,
@@ -699,6 +864,8 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
+  FreshAgentUndoSchema,
+  FreshAgentRedoSchema,
 ])
 
 export type ClientMessage = z.infer<typeof ClientMessageSchema>
@@ -1130,6 +1297,8 @@ export type ServerMessage =
   | PaneReconcileResultMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage
+  | HostStatsSnapshotMessage
+  | HostStatsRefreshResponseMessage
   | OpencodeActivityListResponseMessage
   | OpencodeActivityUpdatedMessage
   | ClaudeActivityListResponseMessage

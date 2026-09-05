@@ -44,6 +44,9 @@ serde = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 # Ownership id minting for the sidecar env tag (randomUUID() in serve-manager.ts:204).
 uuid = { version = "1", features = ["v4"] }
+# Structured warn for launch-config decisions (delta-r1 F3's malformed inline-config
+# replacement notice): this crate only emits events, it never installs a subscriber.
+tracing = "0.1"
 # Real HTTP client (fetchFn) + SSE byte stream, gated behind `real-transport`. The
 # serve sidecar is always loopback plain-HTTP, so TLS/proxy/http3 default features are
 # disabled to keep the dependency tree (and Cargo.lock) lean — only `stream` (for the
@@ -60,3 +63,6 @@ libc = { version = "0.2", optional = true }
 # the same discipline tests/serve_health_bounded.rs relies on with real sleeps; unlike
 # that integration test these in-file tests advance the mock clock instantly.
 tokio = { version = "1", features = ["test-util"] }
+# F3 test facility: a capturing `Layer` + `tracing::subscriber::set_default` so the
+# malformed-inline-config warning is assertable (the freshell-codex/DIAG-01 idiom).
+tracing-subscriber = "0.3"

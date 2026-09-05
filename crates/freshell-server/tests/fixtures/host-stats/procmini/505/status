@@ -1,0 +1,9 @@
+Name:	zomb
+Umask:	0022
+State:	Z (zombie)
+Tgid:	505
+Pid:	505
+PPid:	1
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+Threads:	1

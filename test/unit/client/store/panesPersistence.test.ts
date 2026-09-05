@@ -28,6 +28,7 @@ import {
   resetPersistedLayoutCacheForTests,
 } from '../../../../src/store/persistMiddleware'
 import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
+import { isWellFormedPaneTree } from '../../../../src/store/paneTreeValidation'
 
 describe('Panes Persistence Integration', () => {
   beforeEach(() => {
@@ -530,6 +531,59 @@ describe('Panes Persistence Integration', () => {
     const restored = (restoredLayout as any).content
     expect(restored.kind).toBe('terminal')
     expect(restored.crashTrace).toEqual({ exitCode: 1, resumedAtMs: 1_753_760_220_000 })
+  })
+
+  it('round-trips a host-stats leaf: {kind:"host-stats"} normalizes bare and survives reload validation', () => {
+    const store1 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store1.dispatch(addTab({ mode: 'shell' }))
+    const tabId = store1.getState().tabs.tabs[0].id
+    store1.dispatch(initLayout({ tabId, content: { kind: 'host-stats' } as any }))
+
+    // normalize: the bare shape stays exactly {kind:'host-stats'} (no minted
+    // lifecycle fields), and the derived pane title is the fixed label.
+    const createdLayout = store1.getState().panes.layouts[tabId] as any
+    expect(createdLayout.type).toBe('leaf')
+    expect(createdLayout.content).toEqual({ kind: 'host-stats' })
+    const createdPaneId = createdLayout.id
+    expect(store1.getState().panes.paneTitles[tabId][createdPaneId]).toBe('Host Stats')
+
+    vi.runAllTimers()
+
+    // The raw persisted bytes carry exactly the bare content.
+    const rawLayout = JSON.parse(localStorage.getItem('freshell.layout.v3')!)
+    expect(rawLayout.panes.layouts[tabId].content).toEqual({ kind: 'host-stats' })
+    // Tree-validation round-trip: the persisted leaf must pass the reload gate
+    // (a missing isPaneContentShape case silently DROPS the pane on reload).
+    expect(isWellFormedPaneTree(rawLayout.panes.layouts[tabId])).toBe(true)
+
+    const persistedTabs = loadPersistedTabs()
+    const persistedPanes = loadPersistedPanes()
+
+    const store2 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    if (persistedTabs?.tabs) {
+      store2.dispatch(hydrateTabs(persistedTabs.tabs))
+    }
+    if (persistedPanes) {
+      store2.dispatch(hydratePanes(persistedPanes))
+    }
+
+    const restoredLayout = store2.getState().panes.layouts[tabId] as any
+    expect(restoredLayout).toBeDefined()
+    expect(restoredLayout.type).toBe('leaf')
+    expect(restoredLayout.content).toEqual({ kind: 'host-stats' })
   })
 
   it('flushes pending writes on visibility change', () => {

@@ -3,7 +3,7 @@
 //! written durably at identity events with atomic temp+rename
 //! (`crate::tabs_persist::atomic_write_durable`).
 //!
-//! Two row types with different keys and different rights:
+//! Three row types with different keys and different rights:
 //!
 //! * **Binding rows** — durable identity facts, keyed on the server-minted
 //!   `sessionRef` (provider, sessionId), with `terminalId` as a secondary
@@ -16,6 +16,11 @@
 //!   exists pre-identity). NEVER promoted, never joined (G1): resolution
 //!   writes a fresh binding row FIRST, then deletes the marker. Layout:
 //!   `pending/<enc(terminalId)>.json`.
+//! * **Rollback rows** (kata 1wxv) — fresh-agent conversation-rollback state,
+//!   keyed `(provider, sessionId)`. Payload-OPAQUE to the ledger:
+//!   `freshell_freshagent::rollback_record` owns the schema (the version gate
+//!   lives in that crate's sink layer). Layout:
+//!   `rollback/<enc(provider)>/<enc(sessionId)>.json`.
 //!
 //! Deliberately NOT stored: scrollback (own store, P2.19), transcripts
 //! (provider-owned), layout (client-owned). NOT keyed on `createRequestId`
@@ -192,6 +197,8 @@ struct LedgerIndex {
     bindings: std::collections::HashMap<(String, String), BindingRow>,
     /// terminal_id -> marker.
     pending: std::collections::HashMap<String, PendingMarker>,
+    /// (provider, session_id) -> rollback payload (kata 1wxv), OPAQUE JSON.
+    rollback: std::collections::HashMap<(String, String), serde_json::Value>,
 }
 
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
@@ -310,6 +317,19 @@ impl PaneLedger {
             .join(format!("{}.json", encode_segment(session_id)))
     }
 
+    /// Rollback rows (kata 1wxv) — fresh-agent conversation-rollback state keyed
+    /// (provider, sessionId): `rollback/<enc(provider)>/<enc(sessionId)>.json`.
+    /// Payload-OPAQUE to the ledger: freshell_freshagent::rollback_record owns the schema.
+    fn rollback_dir(root: &Path) -> PathBuf {
+        root.join("rollback")
+    }
+
+    fn rollback_path(root: &Path, provider: &str, session_id: &str) -> PathBuf {
+        Self::rollback_dir(root)
+            .join(encode_segment(provider))
+            .join(format!("{}.json", encode_segment(session_id)))
+    }
+
     /// The ONE directory scan — construction-time only (V1.md).
     fn load_index(root: &Path) -> LedgerIndex {
         let mut index = LedgerIndex::default();
@@ -342,6 +362,39 @@ impl PaneLedger {
                 if let Ok(marker) = load_row::<PendingMarker>(&path) {
                     if marker.ledger_version == LEDGER_VERSION {
                         index.pending.insert(marker.terminal_id.clone(), marker);
+                    }
+                }
+            }
+        }
+        // Rollback subtree (kata 1wxv): the payload is OPAQUE (`Value`), so the
+        // (provider, sessionId) key comes from the PATH — decoded with the
+        // inverse of `encode_segment`. JSON-unparsable rows are skipped here
+        // silently; the boot scan quarantines them loudly (fail per-row).
+        if let Ok(providers) = std::fs::read_dir(Self::rollback_dir(root)) {
+            for provider in providers.flatten() {
+                let Some(provider_name) = provider.file_name().to_str().and_then(decode_segment)
+                else {
+                    continue;
+                };
+                let Ok(files) = std::fs::read_dir(provider.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(session_id) = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(decode_segment)
+                    else {
+                        continue;
+                    };
+                    if let Ok(value) = load_row::<serde_json::Value>(&path) {
+                        index
+                            .rollback
+                            .insert((provider_name.clone(), session_id), value);
                     }
                 }
             }
@@ -881,6 +934,77 @@ impl PaneLedger {
         self.guard().pending.values().cloned().collect()
     }
 
+    /// kata 1wxv: durable rollback-record write (payload OPAQUE — the
+    /// `freshell_freshagent::rollback_record` schema). File FIRST, then the
+    /// write-through index — in the same locked section, so readers never see
+    /// index-ahead-of-disk (the `write_binding` discipline). Callers AWAIT
+    /// this BEFORE mutating provider history (durable-BEFORE-mutation; a
+    /// pre-write failure refuses the rollback and the provider is untouched).
+    ///
+    /// DELTA-R1 F4 (disabled-mode honesty): a DISABLED ledger must NOT answer
+    /// `Ok(())` here — production enters disabled mode when home resolution
+    /// fails or another server holds the store lock, and a false "durable"
+    /// answer would let providers destructively mutate conversation history
+    /// with NO surviving rollback markers. This is the ONE lane that refuses
+    /// loudly (the provider handlers map `Err` to `INTERNAL_ERROR` +
+    /// `LEDGER_WRITE_REFUSAL_COPY` with zero provider traffic; the
+    /// binding/pending identity lanes keep their silent no-op policy).
+    pub fn record_rollback_row(
+        &self,
+        provider: &str,
+        session_id: &str,
+        payload: &serde_json::Value,
+        _now_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Err(std::io::Error::other(format!(
+                "pane ledger DISABLED (no durable root) — refusing to record the rollback row \
+                 for ({provider}, {session_id}): durable-BEFORE-mutation cannot be satisfied"
+            )));
+        };
+        let mut index = self.guard();
+        let dest = Self::rollback_path(root, provider, session_id);
+        write_row_atomic(&dest, payload)?;
+        index.rollback.insert(
+            (provider.to_string(), session_id.to_string()),
+            payload.clone(),
+        );
+        Ok(())
+    }
+
+    /// kata 1wxv: rollback-record read. Memory-only against the write-through
+    /// index (V1.md read policy), loaded ONCE at construction.
+    pub fn load_rollback_row(&self, provider: &str, session_id: &str) -> Option<serde_json::Value> {
+        self.root.as_ref()?;
+        self.guard()
+            .rollback
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()
+    }
+
+    /// kata 1wxv Task 4: rollback-row delete — used ONLY by the claude fork
+    /// adoption's re-key (the row MOVES old→new inside the same awaited batch
+    /// as the binding write: copy under the new id, then drop the old so no
+    /// stale row can describe the superseded conversation). A missing
+    /// row/file is a silent no-op. File removal first, then the write-through
+    /// index — in the same locked section as every other ledger mutation.
+    pub fn delete_rollback_row(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let dest = Self::rollback_path(root, provider, session_id);
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        index
+            .rollback
+            .remove(&(provider.to_string(), session_id.to_string()));
+        Ok(())
+    }
+
     /// Rows quarantined by this process's boot scan — the Phase-3 verdict
     /// surfacing (`ledger_quarantined` breadcrumb) reads this.
     pub fn quarantined_rows(&self) -> Vec<QuarantinedRow> {
@@ -951,6 +1075,28 @@ pub(crate) async fn ledger_resolve_identity(
     .await
     .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
     surface_write_failure(state, terminal_id, result);
+}
+
+/// The inverse of [`encode_segment`], used by the construction-time scan to
+/// rebuild an opaque row's (provider, sessionId) key from its path. Returns
+/// `None` on a malformed escape or non-UTF-8 bytes (such a path is skipped;
+/// per-row corruption handling lives in the boot scan).
+fn decode_segment(encoded: &str) -> Option<String> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = encoded.get(i + 1..i + 3)?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Path-segment encoding: `[A-Za-z0-9._-]` pass through, everything else

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use freshell_opencode::serve::{
     Endpoint, EventSink, EventSource, EventStreamHandle, PortAllocator, ProcessSpawner,
-    ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpRequest, ServeHttpResponse,
-    ServeProcess, SpawnRequest,
+    ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError, ServeHttpRequest,
+    ServeHttpResponse, ServeProcess, SpawnRequest,
 };
 
 // ── injected fakes ───────────────────────────────────────────────────────────────
@@ -61,7 +61,9 @@ impl ServeHttp for FakeHttp {
         &'a self,
         req: ServeHttpRequest,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a,
+        >,
     > {
         if req.url.contains("/global/health") {
             let n = self.health_calls.fetch_add(1, Ordering::SeqCst) + 1;

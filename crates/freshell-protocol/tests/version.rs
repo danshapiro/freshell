@@ -2,7 +2,7 @@
 //!
 //! The Rust constant must equal the version pinned in every committed contract
 //! artifact and in `shared/ws-version.ts`. This is the compile-time half of the
-//! T0 gate ("`WS_PROTOCOL_VERSION == 7`").
+//! T0 gate ("`WS_PROTOCOL_VERSION == 8`").
 
 use std::path::PathBuf;
 
@@ -22,8 +22,8 @@ fn read_json(rel: &str) -> serde_json::Value {
 }
 
 #[test]
-fn rust_const_is_seven() {
-    assert_eq!(WS_PROTOCOL_VERSION, 7);
+fn rust_const_is_eight() {
+    assert_eq!(WS_PROTOCOL_VERSION, 8);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn matches_outbound_schema_bundle() {
 #[test]
 fn matches_shared_ws_version_ts() {
     // `shared/ws-version.ts` is the TypeScript authoring source:
-    //   export const WS_PROTOCOL_VERSION = 7 as const
+    //   export const WS_PROTOCOL_VERSION = 8 as const
     let text = std::fs::read_to_string(repo_path("shared/ws-version.ts"))
         .expect("read shared/ws-version.ts");
     let after_eq = text

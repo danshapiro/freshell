@@ -147,7 +147,11 @@ pub async fn probe_enabled_model_catalog(
     let url = format!("{base_url}/config/providers");
     let req = ServeHttpRequest::get(url.clone()).with_timeout(config.request_timeout);
     let res = match tokio::time::timeout(config.request_timeout, deps.http.request(req)).await {
-        Ok(result) => result.map_err(ServeError::Transport)?,
+        Ok(result) => result.map_err(|e| match e {
+            // ep1-r3 F2: keep the delivery truth lossless through the catalog probe.
+            crate::ServeHttpError::Undelivered(s) => ServeError::Undelivered(s),
+            crate::ServeHttpError::Ambiguous(s) => ServeError::Transport(s),
+        })?,
         Err(_) => {
             return Err(ServeError::RequestTimeout {
                 method: "GET".to_string(),
@@ -438,7 +442,7 @@ async fn wait_for_catalog_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::{Endpoint, ServeHttpResponse};
+    use crate::serve::{Endpoint, ServeHttpError, ServeHttpResponse};
     use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -491,8 +495,8 @@ mod tests {
 
     #[derive(Default)]
     struct ScriptedHttpState {
-        health: VecDeque<Result<ServeHttpResponse, String>>,
-        providers: VecDeque<Result<ServeHttpResponse, String>>,
+        health: VecDeque<Result<ServeHttpResponse, ServeHttpError>>,
+        providers: VecDeque<Result<ServeHttpResponse, ServeHttpError>>,
         requests: Vec<String>,
     }
 
@@ -502,10 +506,10 @@ mod tests {
     }
 
     impl ScriptedHttp {
-        fn push_health(&self, r: Result<ServeHttpResponse, String>) {
+        fn push_health(&self, r: Result<ServeHttpResponse, ServeHttpError>) {
             self.state.lock().unwrap().health.push_back(r);
         }
-        fn push_providers(&self, r: Result<ServeHttpResponse, String>) {
+        fn push_providers(&self, r: Result<ServeHttpResponse, ServeHttpError>) {
             self.state.lock().unwrap().providers.push_back(r);
         }
         fn requests(&self) -> Vec<String> {
@@ -517,7 +521,7 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> crate::serve::BoxFuture<'a, Result<ServeHttpResponse, String>> {
+        ) -> crate::serve::BoxFuture<'a, Result<ServeHttpResponse, ServeHttpError>> {
             let url = req.url.clone();
             let next = {
                 let mut state = self.state.lock().unwrap();
@@ -531,7 +535,11 @@ mod tests {
                 }
             };
             Box::pin(async move {
-                next.unwrap_or_else(|| Err(format!("no scripted response for {url}")))
+                next.unwrap_or_else(|| {
+                    Err(crate::ServeHttpError::Ambiguous(format!(
+                        "no scripted response for {url}"
+                    )))
+                })
             })
         }
     }
@@ -547,7 +555,7 @@ mod tests {
         }
     }
 
-    fn js_status_ok(body: Value) -> Result<ServeHttpResponse, String> {
+    fn js_status_ok(body: Value) -> Result<ServeHttpResponse, ServeHttpError> {
         Ok(ServeHttpResponse::new(
             200,
             serde_json::to_vec(&body).unwrap(),
@@ -689,7 +697,9 @@ mod tests {
         // Health polls that always fail (transport-side, e.g. connection refused);
         // under paused time the loop burns through the deadline instantly.
         for _ in 0..256 {
-            http.push_health(Err("connection refused".to_string()));
+            http.push_health(Err(crate::ServeHttpError::Ambiguous(
+                "connection refused".to_string(),
+            )));
         }
 
         let err =
@@ -724,7 +734,9 @@ mod tests {
     async fn probe_retries_health_until_healthy() {
         let spawner = Arc::new(FakeSpawner::default());
         let http = Arc::new(ScriptedHttp::default());
-        http.push_health(Err("connection refused".to_string()));
+        http.push_health(Err(crate::ServeHttpError::Ambiguous(
+            "connection refused".to_string(),
+        )));
         http.push_health(Ok(ServeHttpResponse::new(503, b"{}".to_vec())));
         http.push_health(js_status_ok(json!({ "healthy": true })));
         http.push_providers(js_status_ok(json!({ "providers": {}, "default": {} })));

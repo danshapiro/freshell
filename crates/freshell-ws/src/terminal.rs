@@ -81,6 +81,14 @@ mod terminal_launch_prep_tests;
 /// The write half of a split axum WebSocket.
 pub(crate) type WsSink = SplitSink<WebSocket, Message>;
 
+/// Task 9: per-connection `hoststats.refresh` floor (legacy parity:
+/// `ws-handler.ts` `HOST_STATS_REFRESH_MIN_INTERVAL_MS`, default 1000).
+const HOST_STATS_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_millis(1000);
+/// Task 9: the cooperative per-section budget handed to the collector on
+/// `hoststats.refresh` (legacy parity: `HostStatsService.sectionBudgetMs`,
+/// default 2000).
+const HOST_STATS_REFRESH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2000);
+
 /// Serialize + send one server→client message. Returns `false` if the socket is
 /// closed/errored (the caller then tears the connection down).
 pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
@@ -330,6 +338,12 @@ async fn run_loop(
         (state.term09.catastrophic_stall_ms / 4).max(10),
     ));
 
+    // Task 9 (host-pressure pane): THIS connection's last `hoststats.refresh`
+    // stamp — the per-connection 1s floor (legacy parity:
+    // `ClientState.hostStatsLastRefreshAt`, `ws-handler.ts:3330-3336`). Fresh
+    // on every (re)connect, exactly like `create_limiter` above.
+    let mut host_stats_last_refresh_at: Option<std::time::Instant> = None;
+
     // Whether the broadcast bus is still open (guards the select branch so a closed
     // bus can never busy-loop). The bus outlives every connection in practice.
     let mut bus_open = true;
@@ -402,6 +416,7 @@ async fn run_loop(
                             pane_reconcile_fresh_agent_v1,
                             &mut create_limiter,
                             &create_cancel_rx,
+                            &mut host_stats_last_refresh_at,
                         )
                         .await
                         {
@@ -587,6 +602,17 @@ async fn run_loop(
     // it (amplifier watch reduction): the demand-driven subagent rescan cadence
     // stops when the last interested connection leaves.
     state.subagent_interest.remove(conn_id);
+    // Task 9 (host-pressure pane): this connection's `hoststats.subscribe`
+    // interest is gone with it; when the LAST watcher leaves, the collector's
+    // cadence JoinHandles are aborted (zero-cost idle) via the trait callback
+    // (`ws-handler.ts:1297-1298` teardown parity).
+    if state.host_stats.interest.remove(conn_id)
+        == crate::host_stats_interest::InterestTransition::BecameIdle
+    {
+        if let Some(collector) = &state.host_stats.collector {
+            collector.set_active(false);
+        }
+    }
     // Multi-client layout store: this connection's mirrored layout snapshot is
     // gone with it (its pane/tab ids are client-local and unreachable now);
     // the primary falls back to the most recently synced remaining client.
@@ -629,6 +655,8 @@ async fn handle_client_text(
     pane_reconcile_fresh_agent_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
     create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    // Task 9: per-connection hoststats.refresh floor stamp (see run_loop).
+    host_stats_last_refresh_at: &mut Option<std::time::Instant>,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -1179,6 +1207,116 @@ async fn handle_client_text(
             }
             true
         }
+        // kata 1wxv Task 1: `freshAgent.undo`/`freshAgent.redo` land contract-first —
+        // each provider leg (Tasks 2-4) replaces its refusal cell with a real
+        // dispatch (which answers on the requesting connection via `conn_sink`,
+        // same shape as the fork arms).
+        ClientMessage::FreshAgentUndo(m) => {
+            // Task 2: the codex x undo cell is REAL DISPATCH now — the codex
+            // undo leg (`thread/revert`) answers the ack/error on the
+            // requesting connection and broadcasts `session.rolledBack`.
+            // Detached task, same shape as the fork arms (the rollback RPC
+            // chain never blocks the select loop).
+            if is_codex_provider(m.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_codex
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_undo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else if is_opencode_provider(m.provider) {
+                // Task 3: opencode x undo is REAL DISPATCH (revert/unrevert in
+                // `FreshOpencodeState::handle_rollback`), same fork-arm shape.
+                let fresh_opencode = state.fresh_opencode.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_opencode
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_undo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else if m.provider == freshell_protocol::AgentProvider::Claude {
+                // Task 4: claude x undo is REAL DISPATCH — fork-at-point emulation
+                // in `FreshClaudeState::handle_rollback` (kill + recreate with
+                // resume+resumeSessionAt+forkSession, adopt through
+                // sdk.session.init). Covers BOTH freshclaude and kilroy session
+                // types (provider `claude`); same fork-arm shape.
+                let fresh_claude = state.fresh_claude.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_claude
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_undo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else {
+                conn_sink(rollback_refusal_frame(
+                    &freshell_freshagent::RollbackRequest::from_undo(m),
+                    "Undo is",
+                ));
+            }
+            true
+        }
+        // Codex x redo stays refused PERMANENTLY (decision 5 — codex history
+        // revert is destructive; there is no redo primitive); Task 3 made
+        // opencode x redo REAL DISPATCH (re-revert/unrevert); Task 4 makes claude
+        // x redo REAL DISPATCH (re-fork at a later point from the retained
+        // original, tip+LCP validated).
+        ClientMessage::FreshAgentRedo(m) => {
+            if is_opencode_provider(m.provider) {
+                let fresh_opencode = state.fresh_opencode.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_opencode
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_redo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else if m.provider == freshell_protocol::AgentProvider::Claude {
+                // Task 4: claude x redo is REAL DISPATCH — see the undo arm above.
+                let fresh_claude = state.fresh_claude.clone();
+                let conn_sink = conn_sink.clone();
+                tokio::spawn(
+                    async move {
+                        fresh_claude
+                            .handle_rollback(
+                                freshell_freshagent::RollbackRequest::from_redo(m),
+                                conn_sink,
+                            )
+                            .await
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            } else {
+                conn_sink(rollback_refusal_frame(
+                    &freshell_freshagent::RollbackRequest::from_redo(m),
+                    "Redo is",
+                ));
+            }
+            true
+        }
         // `ui.screenshot.result` (`ui-commands.ts:51`): the capable UI's reply to a
         // `screenshot.capture` command. Route it to the broker, waking the awaiting
         // `POST /api/screenshots` handler (`ws-handler.ts:1916`). Late duplicates for
@@ -1222,6 +1360,117 @@ async fn handle_client_text(
                 .subagent_interest
                 .set(conn_id, prefs.include_subagents);
             true
+        }
+        // Task 9 (host-pressure pane) — `hoststats.subscribe`. Idempotent; the
+        // 0->1 interest edge starts the collector cadence; the CURRENT cached
+        // snapshot goes back to THIS connection immediately (Node
+        // `setHostStatsSubscribed` + `sendHostStatsSnapshot`, ws-handler.ts
+        // :3309-3325 — including the idempotent re-send). No collector (unit
+        // tests): interest is recorded, no snapshot is sent (Node early-return
+        // when `this.hostStats` is unset).
+        ClientMessage::HostStatsSubscribe => {
+            let transition = state
+                .host_stats
+                .interest
+                .set(conn_id, Some(std::sync::Arc::clone(conn_sink)));
+            if transition == crate::host_stats_interest::InterestTransition::BecameActive {
+                if let Some(collector) = &state.host_stats.collector {
+                    collector.set_active(true);
+                }
+            }
+            if let Some(collector) = &state.host_stats.collector {
+                return send(
+                    ws_tx,
+                    &ServerMessage::HostStatsSnapshot(Box::new(collector.snapshot())),
+                )
+                .await;
+            }
+            true
+        }
+        // `hoststats.unsubscribe` — the 1->0 edge stops the cadence (zero-cost
+        // idle). No reply frame (Node parity).
+        ClientMessage::HostStatsUnsubscribe => {
+            let transition = state.host_stats.interest.remove(conn_id);
+            if transition == crate::host_stats_interest::InterestTransition::BecameIdle {
+                if let Some(collector) = &state.host_stats.collector {
+                    collector.set_active(false);
+                }
+            }
+            true
+        }
+        // `hoststats.refresh` — on-request manual data. No collector: explicit
+        // refusal (Node's 'host stats unavailable'). Per-connection 1s floor:
+        // a repeat <1s after THIS connection's last stamped refresh rejects
+        // with `rate_limited` WITHOUT invoking the collector (legacy parity:
+        // `ws-handler.ts:3330-3336`); the stamp is consumed only past the
+        // floor, BEFORE invoking (a failed invoke still holds the slot).
+        ClientMessage::HostStatsRefresh(request) => {
+            let Some(collector) = &state.host_stats.collector else {
+                return send(
+                    ws_tx,
+                    &ServerMessage::HostStatsRefreshResponse(
+                        freshell_protocol::HostStatsRefreshResponse {
+                            request_id: request.request_id.clone(),
+                            ok: false,
+                            at: None,
+                            manual: None,
+                            error: Some("host stats unavailable".to_string()),
+                        },
+                    ),
+                )
+                .await;
+            };
+            let now = std::time::Instant::now();
+            if let Some(last) = *host_stats_last_refresh_at {
+                if now.duration_since(last) < HOST_STATS_REFRESH_FLOOR {
+                    return send(
+                        ws_tx,
+                        &ServerMessage::HostStatsRefreshResponse(
+                            freshell_protocol::HostStatsRefreshResponse {
+                                request_id: request.request_id.clone(),
+                                ok: false,
+                                at: None,
+                                manual: None,
+                                error: Some("rate_limited".to_string()),
+                            },
+                        ),
+                    )
+                    .await;
+                }
+            }
+            *host_stats_last_refresh_at = Some(now);
+            match collector.refresh(HOST_STATS_REFRESH_DEADLINE).await {
+                Ok(ok) => {
+                    send(
+                        ws_tx,
+                        &ServerMessage::HostStatsRefreshResponse(
+                            freshell_protocol::HostStatsRefreshResponse {
+                                request_id: request.request_id.clone(),
+                                ok: true,
+                                at: Some(ok.at),
+                                manual: Some(ok.manual),
+                                error: None,
+                            },
+                        ),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send(
+                        ws_tx,
+                        &ServerMessage::HostStatsRefreshResponse(
+                            freshell_protocol::HostStatsRefreshResponse {
+                                request_id: request.request_id.clone(),
+                                ok: false,
+                                at: None,
+                                manual: None,
+                                error: Some(error),
+                            },
+                        ),
+                    )
+                    .await
+                }
+            }
         }
         // Application-level liveness ping (legacy parity: `ws-handler.ts:1832-1835`
         // -- `if (m.type === 'ping') { this.send(ws, { type: 'pong', timestamp:
@@ -4956,6 +5205,33 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
     }))
 }
 
+/// kata 1wxv Task 1 refusal: every provider x op rollback cell is answered ON
+/// THE REQUESTING CONNECTION until the provider legs (Tasks 2-4) replace the
+/// cells with real dispatch; codex x redo and amplifier x op stay refused
+/// forever. Stamped `rollback:true` + `requestId` so the client shows the
+/// notice channel, not the pane error surface. Wording is the refusal-table
+/// parity text (`"Undo is not supported for <sessionType>"`, same
+/// `"<Op> is not supported for <sessionType>"` shape as the fork/compact cells).
+fn rollback_refusal_frame(
+    op: &freshell_freshagent::RollbackRequest,
+    wording: &str,
+) -> ServerMessage {
+    tracing::warn!(
+        provider = agent_provider_wire(op.provider),
+        session_id = %op.session_id,
+        session_type = session_type_wire(op.session_type),
+        "fresh-agent rollback frame hits an unsupported provider x op cell; answering freshAgent.error UNSUPPORTED_CAPABILITY"
+    );
+    freshell_freshagent::rollback_error_frame(
+        op,
+        "UNSUPPORTED_CAPABILITY",
+        &format!(
+            "{wording} not supported for {}",
+            session_type_wire(op.session_type)
+        ),
+    )
+}
+
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
 /// reply. `unchanged` when the geometry already matches.
 fn handle_resize(resize: TerminalResize, state: &WsState) {
@@ -5126,6 +5402,12 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
 /// the prior swallow behavior until a later PR adds their handlers.
 fn is_codex_provider(provider: freshell_protocol::AgentProvider) -> bool {
     matches!(provider, freshell_protocol::AgentProvider::Codex)
+}
+
+/// Whether a `freshAgent.undo`/`freshAgent.redo` frame should route to the opencode
+/// handler (kata 1wxv Task 3).
+fn is_opencode_provider(provider: freshell_protocol::AgentProvider) -> bool {
+    matches!(provider, freshell_protocol::AgentProvider::Opencode)
 }
 
 // ── tabs.sync.* (ws-handler.ts:3058-3145) ────────────────────────────────────
@@ -6047,6 +6329,7 @@ mod terminals_changed_tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -6285,6 +6568,7 @@ mod terminal_meta_created_tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: std::sync::Arc::new(Vec::new()),
@@ -6877,6 +7161,7 @@ mod pane_reconcile_gate_tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -6906,6 +7191,7 @@ mod pane_reconcile_gate_tests {
         let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
         let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
         let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
 
         let keep_open = handle_client_text(
             r#"{"type":"pane.reconcile.request","reconcileId":"r1","panes":[{"paneKey":"tab-1:pane-1","kind":"terminal","mode":"shell","createRequestId":"cr-1"}]}"#,
@@ -6918,6 +7204,7 @@ mod pane_reconcile_gate_tests {
             false,
             &mut create_limiter,
             &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
         )
         .await;
         assert!(
@@ -6940,6 +7227,7 @@ mod pane_reconcile_gate_tests {
             false,
             &mut create_limiter,
             &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
         )
         .await;
         assert!(pong_ok);
@@ -6954,5 +7242,493 @@ mod pane_reconcile_gate_tests {
 
         let pong = next_text_frame(&mut client).await;
         assert_eq!(pong["type"], "pong");
+    }
+}
+
+/// Task 9 (host-pressure pane): the `hoststats.subscribe` / `.unsubscribe` /
+/// `.refresh` dispatch arms. A REAL loopback websocket pair (same scaffold as
+/// `pane_reconcile_gate_tests`) drives `handle_client_text`'s real
+/// serialization + send path; the collector is a fake implementing the
+/// freshell-server-owned trait (dependency direction is frozen — freshell-ws
+/// can never import the concrete collector).
+#[cfg(test)]
+mod host_stats_dispatch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use freshell_protocol::{
+        HostStatsCpu, HostStatsDiskIo, HostStatsFreshell, HostStatsInotify, HostStatsLimits,
+        HostStatsLive, HostStatsLoad, HostStatsMachine, HostStatsManual, HostStatsMemory,
+        HostStatsNetwork, HostStatsPaging, HostStatsProcessHealth, HostStatsPsi, HostStatsSnapshot,
+        HostStatsThermals, HostStatsTopProcesses,
+    };
+
+    use crate::host_stats_collector::{
+        HostStatsCollector, HostStatsRefreshFuture, HostStatsRefreshOk, WsHostStatsState,
+    };
+    use crate::host_stats_interest::HostStatsInterestRegistry;
+
+    fn canned_snapshot() -> HostStatsSnapshot {
+        HostStatsSnapshot {
+            at: 111,
+            live: HostStatsLive {
+                machine: HostStatsMachine {
+                    cores: 4,
+                    mem_total_bytes: 1024,
+                    platform: "linux".to_string(),
+                    wsl: false,
+                    kernel: None,
+                    hostname: None,
+                    psi: false,
+                    cgroup: "none".to_string(),
+                    thermal_count: 0,
+                    battery_present: false,
+                    gpu: "none".to_string(),
+                },
+                cpu: HostStatsCpu {
+                    available: true,
+                    usage_pct: 0.0,
+                    steal_pct: None,
+                    per_core_pct: vec![0.0; 4],
+                    freq_m_hz: None,
+                },
+                load: HostStatsLoad {
+                    available: true,
+                    load1: 0.0,
+                    load5: 0.0,
+                    load15: 0.0,
+                    cores: 4,
+                },
+                memory: HostStatsMemory {
+                    available: false,
+                    source: "host".to_string(),
+                    total_bytes: 0,
+                    used_bytes: 0,
+                    available_bytes: 0,
+                    cgroup_limit_bytes: None,
+                    swap_total_bytes: None,
+                    swap_used_bytes: None,
+                },
+                paging: HostStatsPaging {
+                    available: false,
+                    swap_in_kbps: 0.0,
+                    swap_out_kbps: 0.0,
+                    maj_faults_per_sec: 0.0,
+                    oom_kills_delta: 0,
+                    oom_kills_total: 0,
+                },
+                psi: HostStatsPsi {
+                    available: false,
+                    cpu_some10: None,
+                    mem_some10: None,
+                    mem_full10: None,
+                    io_some10: None,
+                    io_full10: None,
+                },
+                disk_io: HostStatsDiskIo {
+                    available: false,
+                    read_bps: 0.0,
+                    write_bps: 0.0,
+                    util_pct: None,
+                    weighted_await_ms: None,
+                },
+                network: HostStatsNetwork {
+                    available: false,
+                    rx_bps: 0.0,
+                    tx_bps: 0.0,
+                    rx_errors_total: 0,
+                    tx_errors_total: 0,
+                    rx_dropped_total: 0,
+                    tx_dropped_total: 0,
+                    rx_errors_delta: 0,
+                    tx_errors_delta: 0,
+                    rx_dropped_delta: 0,
+                    tx_dropped_delta: 0,
+                },
+                limits: HostStatsLimits {
+                    available: false,
+                    fds_used: None,
+                    fds_max: None,
+                    pids_used: None,
+                    pids_max: None,
+                    time_wait: None,
+                    ephemeral_ports: None,
+                },
+                freshell: HostStatsFreshell {
+                    available: true,
+                    source: "rust".to_string(),
+                    ptys_running: 0,
+                    ptys_max: 0,
+                    ws_clients: 0,
+                    ws_clients_max: 0,
+                    event_loop_lag_p99_ms: None,
+                    rss_bytes: None,
+                    uptime_sec: 0.0,
+                },
+            },
+            manual_at: Some(222),
+            manual: Some(HostStatsManual {
+                top_processes: HostStatsTopProcesses {
+                    available: false,
+                    dwell_ms: 0,
+                    list: Vec::new(),
+                },
+                process_health: HostStatsProcessHealth {
+                    available: false,
+                    zombies: 0,
+                    d_state: 0,
+                    total: 0,
+                },
+                inotify: HostStatsInotify {
+                    available: false,
+                    instances: None,
+                    watches: None,
+                    max_user_watches: None,
+                    max_user_instances: None,
+                },
+                disks: freshell_protocol::HostStatsDisks {
+                    available: false,
+                    list: Vec::new(),
+                },
+                thermals: HostStatsThermals {
+                    available: false,
+                    zones: Vec::new(),
+                    battery: None,
+                },
+                section_errors: Default::default(),
+            }),
+        }
+    }
+
+    struct FakeCollector {
+        refresh_calls: Arc<AtomicUsize>,
+        set_active_calls: Arc<StdMutex<Vec<bool>>>,
+    }
+
+    impl HostStatsCollector for FakeCollector {
+        fn snapshot(&self) -> HostStatsSnapshot {
+            canned_snapshot()
+        }
+        fn refresh(&self, _deadline: Duration) -> HostStatsRefreshFuture<'_> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(HostStatsRefreshOk {
+                    at: 333,
+                    manual: canned_snapshot().manual.unwrap(),
+                })
+            })
+        }
+        fn set_active(&self, active: bool) {
+            self.set_active_calls.lock().unwrap().push(active);
+        }
+    }
+
+    /// Same REAL loopback pair scaffold as `pane_reconcile_gate_tests`: the
+    /// upgrade handler parks forever; the listener task dies with the test
+    /// runtime.
+    type TestClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn loopback_sink_and_client() -> (WsSink, TestClient) {
+        let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
+        let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
+        let router = axum::Router::new().route(
+            "/ws",
+            axum::routing::any(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+                let sink_tx = std::sync::Arc::clone(&sink_tx);
+                async move {
+                    upgrade.on_upgrade(move |socket| async move {
+                        let (sink, _read) = socket.split();
+                        if let Some(tx) = sink_tx.lock().await.take() {
+                            let _ = tx.send(sink);
+                        }
+                        std::future::pending::<()>().await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("loopback local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect to scratch server");
+        let sink = sink_rx
+            .await
+            .expect("upgrade handler delivered the write half");
+        (sink, client)
+    }
+
+    async fn next_text_frame(client: &mut TestClient) -> serde_json::Value {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("frame within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                serde_json::from_str(&text).expect("json frame")
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    fn state_with_host_stats(host_stats: WsHostStatsState) -> WsState {
+        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-1111".to_string()),
+            boot_id: Arc::new("boot-2222".to_string()),
+            settings: Arc::new(crate::test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
+            host_stats,
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_stats_subscribe_snapshot_and_set_active_edges() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let interest = HostStatsInterestRegistry::default();
+        let fake = Arc::new(FakeCollector {
+            refresh_calls: Arc::new(AtomicUsize::new(0)),
+            set_active_calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let state = state_with_host_stats(WsHostStatsState {
+            interest: interest.clone(),
+            collector: Some(fake.clone()),
+        });
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+
+        // subscribe: 0->1 edge drives set_active(true) ONCE and the current
+        // snapshot is sent immediately Node `sendHostStatsSnapshot` parity,
+        // including idempotent re-subscribe (no double edge, re-sent frame).
+        for round in 0..2 {
+            let ok = handle_client_text(
+                r#"{"type":"hoststats.subscribe"}"#,
+                &mut ws_tx,
+                &state,
+                1,
+                &conn_sink,
+                false,
+                false,
+                false,
+                &mut create_limiter,
+                &create_cancel_rx,
+                &mut host_stats_last_refresh_at,
+            )
+            .await;
+            assert!(ok);
+            let frame = next_text_frame(&mut client).await;
+            assert_eq!(frame["type"], "hoststats.snapshot", "round {round}");
+            assert_eq!(frame["at"], 111);
+            assert_eq!(frame["manualAt"], 222);
+            assert_eq!(
+                fake.set_active_calls.lock().unwrap().clone(),
+                vec![true],
+                "re-subscribe must not double-fire the 0->1 edge (round {round})"
+            );
+        }
+        assert!(state.host_stats.interest.any());
+        assert_eq!(state.host_stats.interest.count(), 1);
+
+        // unsubscribe: 1->0 edge drives set_active(false) ONCE; no reply
+        // frame (Node parity) — proven by the followed ping answering pong.
+        let ok = handle_client_text(
+            r#"{"type":"hoststats.unsubscribe"}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+        )
+        .await;
+        assert!(ok);
+        assert!(!state.host_stats.interest.any());
+        assert_eq!(
+            fake.set_active_calls.lock().unwrap().clone(),
+            vec![true, false]
+        );
+        let pong_ok = handle_client_text(
+            r#"{"type":"ping"}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+        )
+        .await;
+        assert!(pong_ok);
+        let pong = next_text_frame(&mut client).await;
+        assert_eq!(pong["type"], "pong", "unsubscribe itself sends no frame");
+    }
+
+    #[tokio::test]
+    async fn host_stats_refresh_per_connection_floor_rate_limits_without_invoking_collector() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let interest = HostStatsInterestRegistry::default();
+        let fake = Arc::new(FakeCollector {
+            refresh_calls: Arc::new(AtomicUsize::new(0)),
+            set_active_calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let state = state_with_host_stats(WsHostStatsState {
+            interest: interest.clone(),
+            collector: Some(fake.clone()),
+        });
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+
+        // First refresh passes the floor and invokes the collector.
+        let ok = handle_client_text(
+            r#"{"type":"hoststats.refresh","requestId":"r1"}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+        )
+        .await;
+        assert!(ok);
+        let first = next_text_frame(&mut client).await;
+        assert_eq!(first["type"], "hoststats.refresh.response");
+        assert_eq!(first["requestId"], "r1");
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["at"], 333);
+        assert!(first["manual"].is_object());
+        assert_eq!(fake.refresh_calls.load(Ordering::SeqCst), 1);
+
+        // Second refresh <1s later is rejected by the PER-CONNECTION floor
+        // WITHOUT invoking the collector (the service single-flight/cooldown
+        // is downstream and never reached).
+        let ok = handle_client_text(
+            r#"{"type":"hoststats.refresh","requestId":"r2"}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+        )
+        .await;
+        assert!(ok);
+        let second = next_text_frame(&mut client).await;
+        assert_eq!(second["type"], "hoststats.refresh.response");
+        assert_eq!(second["requestId"], "r2");
+        assert_eq!(second["ok"], false);
+        assert_eq!(second["error"], "rate_limited");
+        // zod `.optional()` discipline: at/manual are ABSENT on the reject,
+        // never explicit null.
+        assert!(second.get("at").is_none());
+        assert!(second.get("manual").is_none());
+        assert_eq!(
+            fake.refresh_calls.load(Ordering::SeqCst),
+            1,
+            "the rate-limited repeat never reaches the collector"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_stats_refresh_without_collector_reports_unavailable() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let state = state_with_host_stats(WsHostStatsState::default());
+        let conn_sink: FrameSink = std::sync::Arc::new(|_| {});
+        let mut create_limiter = crate::create_limit::CreateRateLimiter::new(8, 60_000);
+        let (_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
+        let mut host_stats_last_refresh_at = None;
+
+        let ok = handle_client_text(
+            r#"{"type":"hoststats.refresh","requestId":"r9"}"#,
+            &mut ws_tx,
+            &state,
+            1,
+            &conn_sink,
+            false,
+            false,
+            false,
+            &mut create_limiter,
+            &create_cancel_rx,
+            &mut host_stats_last_refresh_at,
+        )
+        .await;
+        assert!(ok);
+        let frame = next_text_frame(&mut client).await;
+        assert_eq!(frame["type"], "hoststats.refresh.response");
+        assert_eq!(frame["requestId"], "r9");
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "host stats unavailable");
+        // A rejected refresh must NOT claim the floor slot (Node stamps only
+        // after passing the floor, with a live service).
+        assert!(host_stats_last_refresh_at.is_none());
     }
 }

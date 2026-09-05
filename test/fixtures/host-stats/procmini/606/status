@@ -1,0 +1,12 @@
+Name:	nginx
+Umask:	0022
+State:	R (running)
+Tgid:	606
+Pid:	606
+PPid:	1
+Uid:	0	0	0	0
+Gid:	0	0	0	0
+VmPeak:	  150000 kB
+VmSize:	  146484 kB
+VmRSS:	   23456 kB
+Threads:	4

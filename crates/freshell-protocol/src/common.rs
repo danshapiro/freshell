@@ -2,7 +2,7 @@
 //! server→client message families.
 //!
 //! Faithfully models the frozen contract (`port/contract/*.schema.json`,
-//! `WS_PROTOCOL_VERSION = 7`). Modeling conventions:
+//! `WS_PROTOCOL_VERSION = 8`). Modeling conventions:
 //!
 //! * All numeric wire fields are integers on the real wire, so they are typed
 //!   `i64` (a few version discriminants are `u32`). Using `f64` would corrupt

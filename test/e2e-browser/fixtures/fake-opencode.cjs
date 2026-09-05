@@ -87,7 +87,7 @@ function ensureSchema(db) {
         time_updated integer NOT NULL,
         data text NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS part (
+    CREATE TABLE IF NOT EXISTS part (
         id text PRIMARY KEY,
         message_id text NOT NULL,
         session_id text NOT NULL,
@@ -95,7 +95,29 @@ function ensureSchema(db) {
         time_updated integer NOT NULL,
         data text NOT NULL
       );
+      -- kata 1wxv delta-r1 F6: message ids must NEVER repeat within a session,
+      -- even after a native revert-tail deletion (real opencode mints a fresh id
+      -- per message; a countMessages+1 scheme re-mints a deleted id when a
+      -- resend lands behind it, which collides frozen marker rows with the new
+      -- epoch's rows in the rollback ledger). Persistent per-session counter.
+      CREATE TABLE IF NOT EXISTS message_seq (
+        session_id text PRIMARY KEY,
+        next integer NOT NULL
+      );
     `)
+}
+
+/** Mint the next message sequence for a session — persistent across revert-tail
+ * deletions (unlike COUNT(*)+1). */
+function nextMessageSequence(db, sessionId) {
+  const row = db.prepare('SELECT next FROM message_seq WHERE session_id = ?').get(sessionId)
+  if (!row) {
+    db.prepare('INSERT INTO message_seq (session_id, next) VALUES (?, ?)').run(sessionId, 3)
+    return 1
+  }
+  const next = Number(row.next)
+  db.prepare('UPDATE message_seq SET next = ? WHERE session_id = ?').run(next + 2, sessionId)
+  return next
 }
 
 function sessionModel() {
@@ -128,11 +150,6 @@ function insertSession(db, input) {
       input.createdAt,
       input.updatedAt,
     )
-}
-
-function countMessages(db, sessionId) {
-  const row = db.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(sessionId)
-  return Number(row?.count ?? 0)
 }
 
 function sessionRow(db, sessionId) {
@@ -214,7 +231,7 @@ function seedRunDatabase(input) {
   try {
     ensureSchema(db)
     const existing = db.prepare('SELECT time_created FROM session WHERE id = ?').get(input.sessionId)
-    const sequence = countMessages(db, input.sessionId) + 1
+    const sequence = nextMessageSequence(db, input.sessionId)
     const userTime = Date.now()
     const assistantTime = userTime + 1
     insertSession(db, {
@@ -565,7 +582,50 @@ function readSessionInfo(session) {
     title: session.title,
     parentID: session.parent_id ?? undefined,
     model: parseJsonText(session.model),
+    // kata 1wxv (VERIFIED wire shape, load-bearing correction item 2): the
+    // rollback pointer is TOP-LEVEL `revert = {messageID, ...}` — NEVER
+    // `info.revert` — and the key is omitted entirely when no rollback is
+    // active.
+    ...(session.revert ? { revert: parseJsonText(session.revert) } : {}),
     time: { created: session.time_created, updated: session.time_updated },
+  }
+}
+
+// kata 1wxv (verified opencode 1.18.21 semantics, LBC-2): any later
+// send/command natively DELETES the reverted tail rows (at-or-after the
+// INCLUSIVE boundary) AND clears the revert pointer — a new submission
+// supersedes the tail (decision 5's belt under freshell's destroyed bit).
+function clearRevertAndDeleteTail(sessionId) {
+  const db = openDatabase()
+  try {
+    ensureSchema(db)
+    const session = sessionRow(db, sessionId)
+    if (!session) return
+    let pointer = null
+    if (session.revert) {
+      try {
+        pointer = JSON.parse(session.revert)?.messageID ?? null
+      } catch {
+        pointer = null
+      }
+    }
+    if (pointer) {
+      const rows = db
+        .prepare('SELECT id FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC')
+        .all(sessionId)
+      const cut = rows.findIndex((row) => row.id === pointer)
+      if (cut !== -1) {
+        const deletePart = db.prepare('DELETE FROM part WHERE session_id = ? AND message_id = ?')
+        const deleteMessage = db.prepare('DELETE FROM message WHERE session_id = ? AND id = ?')
+        for (const row of rows.slice(cut)) {
+          deletePart.run(sessionId, row.id)
+          deleteMessage.run(sessionId, row.id)
+        }
+      }
+    }
+    db.prepare('UPDATE session SET revert = NULL WHERE id = ?').run(sessionId)
+  } finally {
+    db.close()
   }
 }
 
@@ -575,7 +635,7 @@ function appendPromptMessages(input) {
     ensureSchema(db)
     const existing = sessionRow(db, input.sessionId)
     if (!existing) return undefined
-    const sequence = countMessages(db, input.sessionId) + 1
+    const sequence = nextMessageSequence(db, input.sessionId)
     const userTime = Date.now()
     const assistantTime = userTime + 1
     const promptText = input.parts
@@ -780,6 +840,9 @@ const server = http.createServer(async (req, res) => {
         routeDirectory: directory,
         directory: session.directory,
       })
+      // kata 1wxv: a new submission supersedes the reverted tail — the pointer
+      // clears and the tail rows are deleted BEFORE the turn simulation.
+      clearRevertAndDeleteTail(sessionId)
       const appended = appendPromptMessages({ sessionId, parts })
       if (!appended) {
         emitSessionIdle(sessionId, {
@@ -789,6 +852,17 @@ const server = http.createServer(async (req, res) => {
         })
         sendJson(res, 404, { error: 'session not found', sessionId })
         return
+      }
+      // kata 1wxv Task 7 (patch-turn fixture): with FAKE_OPENCODE_PATCH_TURN=N,
+      // the turn-N simulation writes/modifies <session.directory>/patch-target.txt,
+      // so the rollback spec reverts a PATCH-CARRYING turn and proves the
+      // working tree stays byte-identical (conversation-only rollback).
+      const patchTurn = Number.parseInt(process.env.FAKE_OPENCODE_PATCH_TURN ?? '', 10)
+      const userSeq = Number(/^msg_.+_(\d+)_user$/.exec(appended.userMessageId)?.[1])
+      if (Number.isInteger(patchTurn) && patchTurn > 0 && (userSeq + 1) / 2 === patchTurn) {
+        const patchPath = path.join(session.directory, 'patch-target.txt')
+        fs.writeFileSync(patchPath, `fake patch from turn ${patchTurn} (${appended.userMessageId})\n`)
+        appendAudit({ event: 'patch_turn_written', sessionId, path: patchPath, turn: patchTurn })
       }
       appendAudit({
         event: 'prompt_async',
@@ -919,6 +993,18 @@ const server = http.createServer(async (req, res) => {
           })
         }
         forkDb.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(now + forkSeq + 1, childSessionId)
+        // Focused ep3-r1 F3: the copy loop mints `msg_<child>_<1..forkSeq>_*`
+        // ids WITHOUT touching the child's persistent `message_seq` row, so the
+        // first prompt to the fork minted sequence 1/2 and `INSERT OR REPLACE`
+        // OVERWROTE the copied first turn. Seed the child's counter past the
+        // copied tail (`nextMessageSequence` returns `next` then stores
+        // `next + 2`, so `forkSeq + 1` is the first free user sequence) — the
+        // fixture's forked history then appends exactly like real OpenCode.
+        if (forkSeq > 0) {
+          forkDb
+            .prepare('INSERT OR REPLACE INTO message_seq (session_id, next) VALUES (?, ?)')
+            .run(childSessionId, forkSeq + 1)
+        }
       } finally {
         forkDb.close()
       }
@@ -928,11 +1014,81 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    if (action === 'revert' && req.method === 'POST') {
+      // kata 1wxv: opencode's POST /session/:id/revert {messageID} —
+      // message-targeted. VERIFIED semantics (LBC-2): the boundary is
+      // INCLUSIVE of the named message; an ASSISTANT target normalizes to its
+      // parent USER message; an UNKNOWN id is a silent 200 no-op (the pointer
+      // provably does not move — freshell's post-verify triad depends on it).
+      // The message LIST keeps serving the reverted tail UNFLAGGED (freshell
+      // computes the active prefix itself); only a later send/command deletes
+      // the tail rows (clearRevertAndDeleteTail).
+      const body = parseJsonText(await readRequestBody(req)) || {}
+      const requestedId = typeof body.messageID === 'string' ? body.messageID : undefined
+      const revertDb = openDatabase()
+      try {
+        ensureSchema(revertDb)
+        let resolvedId = null
+        if (requestedId) {
+          const rows = revertDb
+            .prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC')
+            .all(sessionId)
+          const targetIdx = rows.findIndex((row) => row.id === requestedId)
+          if (targetIdx !== -1) {
+            let target = rows[targetIdx]
+            if (parseJsonText(target.data)?.role === 'assistant') {
+              for (let i = targetIdx - 1; i >= 0; i -= 1) {
+                if (parseJsonText(rows[i].data)?.role === 'user') {
+                  target = rows[i]
+                  break
+                }
+              }
+            }
+            resolvedId = target.id
+          }
+        }
+        if (resolvedId) {
+          revertDb
+            .prepare('UPDATE session SET revert = ? WHERE id = ?')
+            .run(JSON.stringify({ messageID: resolvedId }), sessionId)
+        }
+        appendAudit({
+          event: 'reverted',
+          sessionId,
+          messageID: requestedId ?? null,
+          resolvedMessageID: resolvedId,
+        })
+        sendJson(res, 200, true)
+      } finally {
+        revertDb.close()
+      }
+      return
+    }
+
+    if (action === 'unrevert' && req.method === 'POST') {
+      // kata 1wxv: POST /session/:id/unrevert — all-or-nothing restore: the
+      // pointer clears; the tail rows stay listed (they never hid).
+      const unrevertDb = openDatabase()
+      try {
+        ensureSchema(unrevertDb)
+        unrevertDb.prepare('UPDATE session SET revert = NULL WHERE id = ?').run(sessionId)
+        appendAudit({ event: 'unreverted', sessionId })
+        sendJson(res, 200, true)
+      } finally {
+        unrevertDb.close()
+      }
+      return
+    }
+
     if (action === 'summarize' && req.method === 'POST') {
       // AGENT-04 e2e: opencode's `POST /session/:id/summarize` {providerID,
       // modelID} — the compact RPC. Busy → response → idle, the same SSE
       // lifecycle the prompt arm has (the Rust handle_compact awaits the idle
       // edge, so the idle edge is mandatory realism, not decoration).
+      // kata 1wxv: a summarize is a "command" in the verified decision-5
+      // sense — it supersedes (deletes) the reverted tail and clears the
+      // pointer, exactly like a send.
+      clearRevertAndDeleteTail(sessionId)
       const body = parseJsonText(await readRequestBody(req)) || {}
       appendAudit({
         event: 'summarize',

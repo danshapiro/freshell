@@ -6,6 +6,7 @@ import {
   FIELD_FAMILIES,
   type TranscriptMessage,
 } from '../../../port/oracle/harness/normalize.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 /**
  * Unit spec for the equivalence oracle's transcript normalization layer.
@@ -55,7 +56,7 @@ function handshakeLike(v: {
   data: string
 }): TranscriptMessage[] {
   return [
-    outbound({ type: 'hello', token: v.token, protocolVersion: 7 }),
+    outbound({ type: 'hello', token: v.token, protocolVersion: WS_PROTOCOL_VERSION }),
     inbound({ type: 'ready', timestamp: v.ts, serverInstanceId: v.serverInstanceId, bootId: v.bootId }),
     inbound({ type: 'perf.logging', enabled: true }),
     inbound({
@@ -247,7 +248,7 @@ describe('normalize (e) — deterministic contract fields are untouched', () => 
   it('type / protocolVersion / enum / boolean / fixed literal survive verbatim', () => {
     const original = {
       type: 'test.deterministic',
-      protocolVersion: 7,
+      protocolVersion: WS_PROTOCOL_VERSION,
       code: 'RESTORE_UNAVAILABLE',
       reason: 'invalid_legacy_restore_target',
       status: 'running',

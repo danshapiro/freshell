@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ComponentType, SVGProps } from 'react'
-import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
+import { Terminal, Globe, FileText, LayoutGrid, Gauge } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -14,7 +14,7 @@ import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { FreshAgentSessionType } from '@shared/fresh-agent'
 
-export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | FreshAgentProviderName | FreshAgentSessionType | CodingCliProviderName | `ext:${string}`
+export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | 'host-stats' | FreshAgentProviderName | FreshAgentSessionType | CodingCliProviderName | `ext:${string}`
 
 type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
 
@@ -39,6 +39,10 @@ const nonShellOptions: PickerOption[] = [
   { type: 'editor', label: 'Editor', icon: FileText, shortcut: 'E' },
   { type: 'browser', label: 'Browser', icon: Globe, shortcut: 'B' },
 ]
+
+// Host pressure dashboard (plan-pane-types §3c): the server-derived flag
+// already encodes platform support; the platform clause is belt-and-braces.
+const hostStatsOption: PickerOption = { type: 'host-stats', label: 'Host Stats', icon: Gauge, shortcut: 'H' }
 
 const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
@@ -136,8 +140,16 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
         shortcut: ext.picker?.shortcut ?? '',
       }))
 
-    // Order: fresh-agent clients (before), CLIs, fresh-agent clients (after), Editor, Browser, Shell(s), Extensions
-    return [...freshAgentOptionsBeforeCli, ...cliOptions, ...freshAgentOptionsAfterCli, ...nonShellOptions, ...shellOptions, ...extensionOptions]
+    // Host Stats: gated on the server-advertised capability flag (which is
+    // false on win32) plus a direct platform clause; inserted before the
+    // non-shell options. First-match-wins shortcut dispatch accepts an 'H'
+    // collision with an H-named extension as cosmetic.
+    const hostStatsOptions = featureFlags.hostStatsAvailable === true && platform !== 'win32'
+      ? [hostStatsOption]
+      : []
+
+    // Order: fresh-agent clients (before), CLIs, fresh-agent clients (after), Host Stats, Editor, Browser, Shell(s), Extensions
+    return [...freshAgentOptionsBeforeCli, ...cliOptions, ...freshAgentOptionsAfterCli, ...hostStatsOptions, ...nonShellOptions, ...shellOptions, ...extensionOptions]
   }, [platform, availableClis, featureFlags, enabledProviders, disabledExtensions, freshClientsEnabled, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)

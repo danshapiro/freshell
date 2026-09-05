@@ -60,6 +60,8 @@ function isPaneContentShape(content: unknown): boolean {
         && (content.viewMode === 'source' || content.viewMode === 'preview')
     case 'picker':
       return true
+    case 'host-stats':
+      return true
     case 'fresh-agent': {
       const sessionType = isFreshAgentSessionType(content.sessionType) ? content.sessionType : undefined
       const runtimeProvider = sessionType ? resolveFreshAgentRuntimeProvider(sessionType) : undefined

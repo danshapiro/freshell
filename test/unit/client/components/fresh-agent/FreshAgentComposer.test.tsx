@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { FreshAgentComposer } from '@/components/fresh-agent/FreshAgentComposer'
+import { createRef } from 'react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { FreshAgentComposer, type FreshAgentComposerHandle } from '@/components/fresh-agent/FreshAgentComposer'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 const apiGet = vi.fn()
@@ -485,6 +486,113 @@ describe('FreshAgentComposer', () => {
       fireEvent.click(browse)
       fireEvent.click(screen.getByRole('menuitem', { name: /\/compact/ }))
       expect(onCommand).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('rollback refill + reserved slash names (kata 1wxv)', () => {
+    const UNDO_COMMAND: FreshAgentSlashCommand = {
+      name: 'undo',
+      description: 'Roll back the last turn (conversation only — files stay as they are)',
+      action: 'undo',
+    }
+    const REDO_COMMAND: FreshAgentSlashCommand = {
+      name: 'redo',
+      description: 'Restore the last rolled-back turn',
+      action: 'redo',
+    }
+
+    it('replaceText overwrites the box (decision 4: replace, never append) and focuses', async () => {
+      const ref = createRef<FreshAgentComposerHandle>()
+      render(<FreshAgentComposer ref={ref} storageKey="t-rb" onSend={() => {}} />)
+      act(() => { ref.current?.insertText('old draft') })
+      expect(getInput().value).toBe('old draft')
+
+      act(() => { ref.current?.replaceText('removed prompt') })
+
+      const textarea = getInput()
+      expect(textarea.value).toBe('removed prompt')
+      expect(window.sessionStorage.getItem('t-rb')).toBe('removed prompt')
+      await waitFor(() => {
+        expect(document.activeElement).toBe(textarea)
+        expect(textarea.selectionStart).toBe('removed prompt'.length)
+        expect(textarea.selectionEnd).toBe('removed prompt'.length)
+      })
+    })
+
+    // r3 correction 8: the composer's submit path intercepts RESERVED rollback names
+    // BEFORE catalog resolution, so a capability-filtered-out command never falls
+    // through to onSend (a typed /redo on freshcodex never reaches the model as text).
+    it('typed /redo unresolvable against the catalog calls onReservedRollbackCommand and NEVER onSend', () => {
+      const onSend = vi.fn()
+      const onCommand = vi.fn()
+      const onReservedRollbackCommand = vi.fn()
+      // freshcodex-shaped catalog: /undo present, /redo deliberately omitted
+      // (capability-filtered in shared/fresh-agent-slash-commands.ts, Task 1).
+      render(
+        <FreshAgentComposer
+          commands={{ action: [...COMMANDS, UNDO_COMMAND], session: [] }}
+          onCommand={onCommand}
+          onSend={onSend}
+          onReservedRollbackCommand={onReservedRollbackCommand}
+          historyKey="fresh-agent-prompt-history:reserved-seam"
+        />,
+      )
+
+      // The keyboard path: the open (but empty) slash menu consumes Enter, so the
+      // intercept must fire from the menu's no-selection branch too.
+      fireEvent.change(getInput(), { target: { value: '/redo' } })
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+
+      expect(onReservedRollbackCommand).toHaveBeenCalledTimes(1)
+      expect(onReservedRollbackCommand).toHaveBeenCalledWith('redo')
+      expect(onCommand).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      // The box is cleared and the text pushed to history exactly like a resolved command.
+      expect(getInput().value).toBe('')
+      const history = JSON.parse(window.localStorage.getItem('fresh-agent-prompt-history:reserved-seam') ?? '[]')
+      expect(history[0]).toBe('/redo')
+    })
+
+    it('typed /undo unresolvable against the catalog intercepts on the submit path too', () => {
+      const onSend = vi.fn()
+      const onReservedRollbackCommand = vi.fn()
+      render(
+        <FreshAgentComposer
+          commands={{ action: COMMANDS, session: [] }}
+          onSend={onSend}
+          onReservedRollbackCommand={onReservedRollbackCommand}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/undo' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+      expect(onReservedRollbackCommand).toHaveBeenCalledTimes(1)
+      expect(onReservedRollbackCommand).toHaveBeenCalledWith('undo')
+      expect(onSend).not.toHaveBeenCalled()
+      expect(getInput().value).toBe('')
+    })
+
+    it('typed /redo resolvable against the catalog still dispatches the normal command path', () => {
+      const onSend = vi.fn()
+      const onCommand = vi.fn()
+      const onReservedRollbackCommand = vi.fn()
+      // freshopencode-shaped catalog: /undo AND /redo both resolve.
+      render(
+        <FreshAgentComposer
+          commands={{ action: [...COMMANDS, UNDO_COMMAND, REDO_COMMAND], session: [] }}
+          onCommand={onCommand}
+          onSend={onSend}
+          onReservedRollbackCommand={onReservedRollbackCommand}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/redo' } })
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+
+      expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({ name: 'redo' }), '')
+      expect(onReservedRollbackCommand).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
     })
   })
 })

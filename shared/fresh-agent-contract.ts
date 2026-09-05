@@ -20,6 +20,10 @@ export const FreshAgentCapabilitiesSchema = z.object({
   worktrees: z.boolean().optional(),
   diffs: z.boolean().optional(),
   childThreads: z.boolean().optional(),
+  // kata 1wxv: conversation rollback capability stamps. Absent on legacy
+  // (TS) servers — the client treats absent as false.
+  undo: z.boolean().optional(),
+  redo: z.boolean().optional(),
 }).strict()
 
 export const FreshAgentTokenUsageSchema = z.object({
@@ -177,6 +181,9 @@ export const FreshAgentTurnSchema = z.object({
   // client treats unknown provenance as authored (conservative).
   summaryKind: z.enum(['echo', 'authored']).optional(),
   items: z.array(FreshAgentTranscriptItemSchema),
+  // kata 1wxv: stamped on turns surfaced in the snapshot's rolledBackTurns
+  // marker bucket (decision 6 — marked in durable history, gone live).
+  rolledBack: z.boolean().optional(),
 }).strict()
 
 export const FreshAgentPendingApprovalSchema = z.object({
@@ -259,6 +266,20 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   diffs: z.array(FreshAgentDiffSummarySchema).default([]),
   childThreads: z.array(FreshAgentChildThreadSchema).default([]),
   turns: z.array(FreshAgentTurnSchema).default([]),
+  // kata 1wxv: the rolled-back marker bucket (each turn stamped
+  // `rolledBack:true`) + redo availability. `turns[]` is always exactly what
+  // the model sees next; the marker bucket is separate.
+  rolledBackTurns: z.array(FreshAgentTurnSchema).optional(),
+  rollback: z.object({
+    canRedo: z.boolean(),
+    undoneDepth: z.number().int().nonnegative(),
+    // Delta-r1 F6: the SERVER-AUTHORED per-marker "Redo to here" gate — the exact
+    // turn ids at the ends of the redoable steps of the CURRENT epoch (the tail of
+    // the marker bucket; frozen prior-epoch markers are never listed). Optional:
+    // legacy servers emit neither this nor the block — absent ⇒ no marker offers
+    // the affordance.
+    redoableTurnIds: z.array(z.string()).optional(),
+  }).strict().optional(),
   extensions: FreshAgentExtensionsSchema.default({}),
   // Provider-advertised session commands. Optional on purpose: absence means
   // the provider has nothing to advertise (freshcodex, Rust port, offline),

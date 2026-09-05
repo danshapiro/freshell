@@ -73,7 +73,8 @@ pub use app_server::{
 };
 pub use durability::{
     default_server_instance_id, extract_session_id_from_filename, is_codex_thread_id,
-    mint_ownership_id, ownership_needle, CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, ownership_needle, read_rollout_history_mode, HistoryMode,
+    CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 pub use events::{
     next_monotonic_turn_complete_at, normalize_codex_thread_status, CodexAdapterEvent, CodexStatus,

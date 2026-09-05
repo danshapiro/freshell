@@ -383,3 +383,140 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 })
+
+describe('fake-claude-sdk-sidecar fork-at-point arm (kata 1wxv e2e fixture)', () => {
+  /** The fixture's transcript dir for a cwd under this test's tmp HOME. */
+  function transcriptFor(cliSessionId: string, cwd: string): string {
+    return path.join(tmp, '.claude', 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'), `${cliSessionId}.jsonl`)
+  }
+
+  /** Drive ORIG through two complete turns so its transcript holds u1/a1/u2/a2. */
+  async function seedTwoTurns(fx: Launched): Promise<{ sessionId: string; cliSessionId: string }> {
+    fx.send({ type: 'create', requestId: 'req-orig', cwd: tmp })
+    const created = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-orig', 'created ORIG')
+    const init = await fx.waitLine(
+      (o) => o.type === 'sdk.session.init' && o.sessionId === created.sessionId,
+      'sdk.session.init ORIG',
+    )
+    fx.send({ type: 'send', sessionId: created.sessionId, text: 'turn one' })
+    await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'turn one completion')
+    fx.send({ type: 'send', sessionId: created.sessionId, text: 'turn two' })
+    await fx.waitLine(
+      (o) => o.type === 'sdk.turn.complete' && fx.stdoutLines().filter((r) => r.type === 'sdk.turn.complete').length >= 2,
+      'turn two completion',
+    )
+    return { sessionId: created.sessionId as string, cliSessionId: init.cliSessionId as string }
+  }
+
+  it('forkSession create mints a fresh cliSessionId and seeds the transcript prefix (s2rk correction)', async () => {
+    const fx = launch({ rules: [] })
+    try {
+      const { cliSessionId: ORIG } = await seedTwoTurns(fx)
+      const parentLines = readJsonl(transcriptFor(ORIG, tmp))
+      expect(parentLines.map((l) => l.type)).toEqual(['user', 'assistant', 'user', 'assistant'])
+      // Every chain line carries a uuid + parentUuid backbone (the rollback
+      // resume math runs over the RAW parentUuid chain).
+      expect(parentLines.every((l) => typeof l.uuid === 'string' && l.uuid.length > 0)).toBe(true)
+      expect(parentLines[0].parentUuid ?? null).toBe(null)
+      expect(parentLines[1].parentUuid).toBe(parentLines[0].uuid)
+      expect(parentLines[2].parentUuid).toBe(parentLines[1].uuid)
+
+      // Fork at a1 (keep through-and-including a1); the resumeDropsTurn guard
+      // is the RAW-chain successor of the resume point (u2).
+      fx.send({
+        type: 'create',
+        requestId: 'req-fork',
+        cwd: tmp,
+        resumeSessionId: ORIG,
+        resumeSessionAt: parentLines[1].uuid,
+        forkSession: true,
+        resumeDropsTurn: parentLines[2].uuid,
+      })
+      const forkCreated = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-fork', 'created fork')
+      const forkInit = await fx.waitLine(
+        (o) => o.type === 'sdk.session.init' && o.sessionId === forkCreated.sessionId,
+        'sdk.session.init fork',
+      )
+      const CHILD = forkInit.cliSessionId as string
+      expect(CHILD, 'real claude --fork-session mints a NEW durable id').not.toBe(ORIG)
+      expect(CHILD).toMatch(/^[0-9a-f-]{36}$/)
+
+      // The child file is the parent's transcript PREFIX through a1, uuids
+      // preserved verbatim (fork prefix retention) — visible to freshell's
+      // transcript readers as a real durable JSONL.
+      const childLines = readJsonl(transcriptFor(CHILD, tmp))
+      expect(childLines).toEqual(parentLines.slice(0, 2))
+
+      // A follow-up plain-resume create still keeps ORIG (no same-id divergence
+      // regression on the non-fork arm).
+      fx.send({ type: 'create', requestId: 'req-plain', cwd: tmp, resumeSessionId: ORIG })
+      const plainCreated = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-plain', 'created plain resume')
+      const plainInit = await fx.waitLine(
+        (o) => o.type === 'sdk.session.init' && o.sessionId === plainCreated.sessionId,
+        'sdk.session.init plain resume',
+      )
+      expect(plainInit.cliSessionId).toBe(ORIG)
+    } finally {
+      await fx.stop()
+    }
+  })
+
+  it('forkSession=false resume keeps the existing same-cliSessionId behavior', async () => {
+    const fx = launch({ rules: [] })
+    try {
+      const { cliSessionId: ORIG } = await seedTwoTurns(fx)
+      fx.send({ type: 'create', requestId: 'req-resume', cwd: tmp, resumeSessionId: ORIG })
+      const created = await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-resume', 'created resume')
+      const init = await fx.waitLine(
+        (o) => o.type === 'sdk.session.init' && o.sessionId === created.sessionId,
+        'sdk.session.init resume',
+      )
+      expect(init.cliSessionId).toBe(ORIG)
+      // The untouched original transcript is never rewritten by a plain resume.
+      expect(readJsonl(transcriptFor(ORIG, tmp)).map((l) => l.type)).toEqual([
+        'user',
+        'assistant',
+        'user',
+        'assistant',
+      ])
+    } finally {
+      await fx.stop()
+    }
+  })
+
+  it('a resumeDropsTurn guard that is NOT the raw-chain successor of the resume point refuses with the SDK prefix', async () => {
+    const fx = launch({ rules: [] })
+    try {
+      const { cliSessionId: ORIG } = await seedTwoTurns(fx)
+      const parentLines = readJsonl(transcriptFor(ORIG, tmp))
+      // Fork at u1: the successor is a1; a guard naming anything else is the
+      // SDK's refused-completion contract (freshell retries once guard-less).
+      fx.send({
+        type: 'create',
+        requestId: 'req-refused',
+        cwd: tmp,
+        resumeSessionId: ORIG,
+        resumeSessionAt: parentLines[0].uuid,
+        forkSession: true,
+        resumeDropsTurn: parentLines[3].uuid, // a2 — NOT the successor of u1
+      })
+      // The bridge placeholder `created` still lands (the real sidecar emits it
+      // immediately, before the SDK query runs — crates/freshell-claude-sidecar/
+      // index.mjs:278); the refusal surfaces on the wire AFTER it.
+      await fx.waitLine((o) => o.type === 'created' && o.requestId === 'req-refused', 'created refused fork')
+      const refusal = await fx.waitLine(
+        (o) => typeof o?.message === 'string' && o.message.startsWith('Resume rejected by --resume-drops-turn:'),
+        'resume-drops-turn refusal line',
+      )
+      expect(refusal.message).toContain(parentLines[3].uuid)
+      // The refused fork must never mint a DURABLE session: the only
+      // sdk.session.init on the whole wire is ORIG's own (from seedTwoTurns).
+      expect(
+        fx.stdoutLines().filter((o) => o.type === 'sdk.session.init'),
+        'no sdk.session.init ever lands for a refused fork',
+      ).toHaveLength(1)
+    } finally {
+      await fx.stop()
+    }
+  })
+})

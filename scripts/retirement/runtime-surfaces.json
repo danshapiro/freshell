@@ -505,6 +505,12 @@
       "listener": "assertion-only"
     },
     {
+      "id": "assertion-test-fake-opencode-fixture",
+      "path": "test/unit/provider-fixtures/fake-opencode-fixture.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
       "id": "assertion-test-electron-port-check",
       "path": "test/unit/electron/port-check.test.ts",
       "role": "test-listener-assertion",

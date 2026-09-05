@@ -1,10 +1,11 @@
-//! Server → client messages (`ServerMessage`, 53 discriminants).
+//! Server → client messages (`ServerMessage`, 55 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::common::{
     AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
@@ -65,6 +66,10 @@ pub enum ServerMessage {
     FreshAgentSendAccepted(FreshAgentSendAccepted),
     #[serde(rename = "freshAgent.session.materialized")]
     FreshAgentSessionMaterialized(FreshAgentSessionMaterialized),
+    #[serde(rename = "hoststats.refresh.response")]
+    HostStatsRefreshResponse(HostStatsRefreshResponse),
+    #[serde(rename = "hoststats.snapshot")]
+    HostStatsSnapshot(Box<HostStatsSnapshot>),
     #[serde(rename = "opencode.activity.list.response")]
     OpencodeActivityListResponse(OpencodeActivityListResponse),
     #[serde(rename = "opencode.activity.updated")]
@@ -138,7 +143,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 55] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -159,6 +164,8 @@ pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
     "freshAgent.killed",
     "freshAgent.send.accepted",
     "freshAgent.session.materialized",
+    "hoststats.refresh.response",
+    "hoststats.snapshot",
     "opencode.activity.list.response",
     "opencode.activity.updated",
     "pane.reconcile.result",
@@ -1147,4 +1154,267 @@ pub struct UiCommand {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+}
+
+// --- hoststats.* -----------------------------------------------------------
+//
+// Shape authority: the zod schemas in `shared/ws-protocol.ts`
+// (`HostStats*Schema`). Serde discipline: zod `.nullable()` (required-but-may
+// -be-null) fields map to `Option<T>` that ALWAYS serialize (null allowed);
+// zod `.optional()` (may-be-absent) fields map to `Option<T>` PLUS
+// `#[serde(skip_serializing_if = "Option::is_none", default)]` — never
+// serialized as explicit null. Pinned by `tests/hoststats_shape.rs`.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsMachine {
+    pub cores: u64,
+    pub mem_total_bytes: u64,
+    pub platform: String,
+    pub wsl: bool,
+    pub kernel: Option<String>,
+    pub hostname: Option<String>,
+    pub psi: bool,
+    pub cgroup: String,
+    pub thermal_count: u64,
+    pub battery_present: bool,
+    pub gpu: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsCpu {
+    pub available: bool,
+    pub usage_pct: f64,
+    pub steal_pct: Option<f64>,
+    pub per_core_pct: Vec<f64>,
+    pub freq_m_hz: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsLoad {
+    pub available: bool,
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    pub cores: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsMemory {
+    pub available: bool,
+    pub source: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub cgroup_limit_bytes: Option<u64>,
+    pub swap_total_bytes: Option<u64>,
+    pub swap_used_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsPaging {
+    pub available: bool,
+    pub swap_in_kbps: f64,
+    pub swap_out_kbps: f64,
+    pub maj_faults_per_sec: f64,
+    pub oom_kills_delta: u64,
+    pub oom_kills_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsPsi {
+    pub available: bool,
+    pub cpu_some10: Option<f64>,
+    pub mem_some10: Option<f64>,
+    pub mem_full10: Option<f64>,
+    pub io_some10: Option<f64>,
+    pub io_full10: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsDiskIo {
+    pub available: bool,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub util_pct: Option<f64>,
+    pub weighted_await_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsNetwork {
+    pub available: bool,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    pub rx_errors_total: u64,
+    pub tx_errors_total: u64,
+    pub rx_dropped_total: u64,
+    pub tx_dropped_total: u64,
+    pub rx_errors_delta: u64,
+    pub tx_errors_delta: u64,
+    pub rx_dropped_delta: u64,
+    pub tx_dropped_delta: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsLimits {
+    pub available: bool,
+    pub fds_used: Option<u64>,
+    pub fds_max: Option<u64>,
+    pub pids_used: Option<u64>,
+    pub pids_max: Option<u64>,
+    pub time_wait: Option<u64>,
+    pub ephemeral_ports: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsFreshell {
+    pub available: bool,
+    pub source: String,
+    pub ptys_running: u64,
+    pub ptys_max: u64,
+    pub ws_clients: u64,
+    pub ws_clients_max: u64,
+    pub event_loop_lag_p99_ms: Option<f64>,
+    pub rss_bytes: Option<u64>,
+    pub uptime_sec: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsLive {
+    pub machine: HostStatsMachine,
+    pub cpu: HostStatsCpu,
+    pub load: HostStatsLoad,
+    pub memory: HostStatsMemory,
+    pub paging: HostStatsPaging,
+    pub psi: HostStatsPsi,
+    pub disk_io: HostStatsDiskIo,
+    pub network: HostStatsNetwork,
+    pub limits: HostStatsLimits,
+    pub freshell: HostStatsFreshell,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsTopProcess {
+    pub pid: u64,
+    pub name: String,
+    pub cpu_pct: f64,
+    pub rss_bytes: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsTopProcesses {
+    pub available: bool,
+    pub dwell_ms: u64,
+    pub list: Vec<HostStatsTopProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsProcessHealth {
+    pub available: bool,
+    pub zombies: u64,
+    pub d_state: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsInotify {
+    pub available: bool,
+    pub instances: Option<u64>,
+    pub watches: Option<u64>,
+    pub max_user_watches: Option<u64>,
+    pub max_user_instances: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsDisk {
+    pub mount: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub used_pct: f64,
+    pub inodes_total: Option<u64>,
+    pub inodes_free: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsDisks {
+    pub available: bool,
+    pub list: Vec<HostStatsDisk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsThermalZone {
+    pub label: String,
+    pub celsius: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsBattery {
+    pub pct: f64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsThermals {
+    pub available: bool,
+    pub zones: Vec<HostStatsThermalZone>,
+    pub battery: Option<HostStatsBattery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsManual {
+    pub top_processes: HostStatsTopProcesses,
+    pub process_health: HostStatsProcessHealth,
+    pub inotify: HostStatsInotify,
+    pub disks: HostStatsDisks,
+    pub thermals: HostStatsThermals,
+    pub section_errors: HashMap<String, String>,
+}
+
+/// `HostStatsSnapshotSchema` (`shared/ws-protocol.ts`).
+/// `manual_at`/`manual` are zod `.nullable()` (required, may be null) — they
+/// serialize explicitly as `null`, never skipped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsSnapshot {
+    pub at: u64,
+    pub live: HostStatsLive,
+    pub manual_at: Option<u64>,
+    pub manual: Option<HostStatsManual>,
+}
+
+/// `HostStatsRefreshResponseSchema` (`shared/ws-protocol.ts`).
+/// `at`/`manual`/`error` are zod `.optional()` (may be absent) — they are
+/// omitted from the wire when `None`, never serialized as explicit null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsRefreshResponse {
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub manual: Option<HostStatsManual>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
 }

@@ -10,6 +10,7 @@ import connectionReducer from '@/store/connectionSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
+import hostStatsReducer from '@/store/hostStatsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -62,6 +63,7 @@ vi.mock('lucide-react', () => ({
   Code: ({ className }: { className?: string }) => <svg data-testid="code-icon" className={className} />,
   FileText: ({ className }: { className?: string }) => <svg data-testid="file-text-icon" className={className} />,
   LayoutGrid: ({ className }: { className?: string }) => <svg data-testid="layout-grid-icon" className={className} />,
+  Gauge: ({ className }: { className?: string }) => <svg data-testid="gauge-icon" className={className} />,
   Maximize2: ({ className }: { className?: string }) => <svg data-testid="maximize-icon" className={className} />,
   Minimize2: ({ className }: { className?: string }) => <svg data-testid="minimize-icon" className={className} />,
   Pencil: ({ className }: { className?: string }) => <svg data-testid="pencil-icon" className={className} />,
@@ -137,6 +139,7 @@ function createStore(
       terminalMeta: terminalMetaReducer,
       turnCompletion: turnCompletionReducer,
       extensions: extensionsReducer,
+      hostStats: hostStatsReducer,
     },
     preloadedState: {
       panes: {
@@ -542,5 +545,49 @@ describe('createContentForType with ext: prefix', () => {
       const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
       expect(paneContent.kind).toBe('editor')
     })
+  })
+
+  it('creates host-stats content when the host stats option is selected', async () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+      [],
+      {},
+      { status: 'ready', platform: 'linux', featureFlags: { hostStatsAvailable: true } },
+    )
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    const hostStatsButton = document.querySelector('[aria-label="Host Stats"]') as HTMLElement
+    expect(hostStatsButton).not.toBeNull()
+    fireEvent.click(hostStatsButton)
+    fireEvent.transitionEnd(getPickerContainer())
+
+    await waitFor(() => {
+      const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent).toEqual({ kind: 'host-stats' })
+    })
+  })
+
+  it('does not offer host stats when the feature flag is off', () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+      [],
+      {},
+      { status: 'ready', platform: 'linux', featureFlags: {} },
+    )
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    expect(document.querySelector('[aria-label="Host Stats"]')).toBeNull()
   })
 })

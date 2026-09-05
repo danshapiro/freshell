@@ -19,7 +19,7 @@ import {
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
-import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
+import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -76,6 +76,8 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
+import { hostStatsReset, hostStatsSnapshotReceived, hostStatsSubscribedSet, resolveHostStatsRefresh, failHostStatsRefresh } from '@/store/hostStatsSlice'
+import { subscribeHostStats } from '@/lib/host-stats-ws'
 import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -798,6 +800,8 @@ export default function App() {
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
         resetOpencodeActivityOverlay()
+        // The hoststats subscription died with the socket; keep last-known values.
+        dispatch(hostStatsReset())
         dispatch(setStatus('disconnected'))
       }) ?? null
 
@@ -1121,6 +1125,15 @@ export default function App() {
           requestClaudeActivityList()
           requestAmplifierActivityList()
           requestOpencodeActivityList()
+          // hoststats: the old socket's subscription died; keep last live/manual
+          // values and resubscribe iff any Host Stats panes are mounted.
+          dispatch(hostStatsReset())
+          // `?.` mirrors the state.freshAgent?.sessions precedent: App-level
+          // folds run against deliberately partial stores in App unit tests.
+          if ((appStore.getState().hostStats?.mountedPanes ?? 0) > 0) {
+            subscribeHostStats()
+            dispatch(hostStatsSubscribedSet(true))
+          }
           lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
@@ -1453,6 +1466,31 @@ export default function App() {
         }
         if (msg.type === 'extension.server.stopped') {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
+        }
+
+        // hoststats.* frames are server-validated; the client trusts them and
+        // folds without runtime revalidation (shared/ws-protocol.ts header).
+        if (msg.type === 'hoststats.snapshot') {
+          const snapshot = msg as HostStatsSnapshotMessage
+          dispatch(hostStatsSnapshotReceived({
+            at: snapshot.at,
+            live: snapshot.live,
+            manualAt: snapshot.manualAt ?? null,
+            manual: snapshot.manual ?? null,
+          }))
+        }
+        if (msg.type === 'hoststats.refresh.response') {
+          const resp = msg as HostStatsRefreshResponseMessage
+          // Ref-map semantics keyed by requestId; unknown ids are ignored by
+          // the resolve/fail thunks without throwing.
+          const requestId = typeof resp.requestId === 'string' ? resp.requestId : ''
+          if (requestId) {
+            if (resp.ok === true && typeof resp.at === 'number' && resp.manual) {
+              dispatch(resolveHostStatsRefresh({ requestId, at: resp.at, manual: resp.manual }))
+            } else if (resp.ok === false) {
+              dispatch(failHostStatsRefresh({ requestId, error: typeof resp.error === 'string' ? resp.error : 'refresh failed' }))
+            }
+          }
         }
 
         handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)

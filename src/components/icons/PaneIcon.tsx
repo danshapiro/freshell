@@ -1,4 +1,4 @@
-import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
+import { Terminal, Globe, FileText, LayoutGrid, Gauge } from 'lucide-react'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
@@ -37,6 +37,10 @@ export default function PaneIcon({ content, className }: PaneIconProps) {
   if (content.kind === 'extension') {
     // V1: LayoutGrid fallback. Future: load SVG from iconUrl
     return <LayoutGrid className={className} />
+  }
+
+  if (content.kind === 'host-stats') {
+    return <Gauge className={className} />
   }
 
   // Picker

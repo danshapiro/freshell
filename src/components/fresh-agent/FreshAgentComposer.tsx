@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { RUST_BASELINE_UNAVAILABLE } from '@/lib/rust-baseline-unavailable'
+import { RESERVED_ROLLBACK_SLASH_NAMES } from '@shared/fresh-agent-slash-commands'
 
 type FreshAgentComposerProps = {
   disabled?: boolean
@@ -33,6 +34,13 @@ type FreshAgentComposerProps = {
   canInterrupt?: boolean
   commands?: FreshAgentSlashCommandMenu
   onCommand?: (command: FreshAgentSlashCommand, args: string) => void
+  /**
+   * kata 1wxv (r3 correction 8): reserved rollback names (`/undo`, `/redo`) that
+   * fail catalog resolution are intercepted on the submit path BEFORE they can
+   * fall through to onSend — the view routes the direction to the pinned
+   * capability notice. The text never reaches the model.
+   */
+  onReservedRollbackCommand?: (direction: 'undo' | 'redo') => void
   focusOnReady?: boolean
   thinking?: boolean
 }
@@ -41,6 +49,8 @@ export type FreshAgentComposerHandle = {
   focus: () => void
   insertText: (text: string) => void
   appendText: (text: string) => void
+  /** kata 1wxv decision 4: refill = OVERWRITE the current contents, focus, caret to end. */
+  replaceText: (text: string) => void
 }
 
 /**
@@ -133,6 +143,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   canInterrupt = false,
   commands = EMPTY_SLASH_COMMAND_MENU,
   onCommand,
+  onReservedRollbackCommand,
   placeholder,
   focusOnReady = false,
   thinking = false,
@@ -166,6 +177,18 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       if (disabled) return
       setText((current) => `${current}${value}`)
       requestAnimationFrame(() => textareaRef.current?.focus())
+    },
+    // Rollback refill (decision 4): the removed prompt comes back as an
+    // OVERWRITE — never an append — with focus + caret at end for immediate
+    // editing. The existing persist effect syncs sessionStorage.
+    replaceText: (value: string) => {
+      setText(value)
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (!el) return
+        el.focus()
+        el.setSelectionRange(el.value.length, el.value.length)
+      })
     },
   }), [disabled])
 
@@ -313,6 +336,23 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     return true
   }, [commands, executeCommand])
 
+  // kata 1wxv (r3 correction 8): `/undo` and `/redo` are RESERVED names for every
+  // fresh-agent provider. A typed reserved name the capability-filtered catalog
+  // cannot resolve (freshcodex `/redo`; any capability-false pane) is intercepted
+  // HERE — pre-catalog-resolution, before any onSend fallthrough — so it never
+  // reaches the model as text. Exactly like a resolved command, the text is
+  // pushed to history and the box cleared; the view owns the notice copy.
+  const tryReservedRollbackCommand = useCallback((trimmed: string): boolean => {
+    const parsed = parseSlashCommand(trimmed)
+    if (!parsed) return false
+    if (!(RESERVED_ROLLBACK_SLASH_NAMES as readonly string[]).includes(parsed.name)) return false
+    onReservedRollbackCommand?.(parsed.name as 'undo' | 'redo')
+    pushHistory(trimmed)
+    setText('')
+    closeMenu()
+    return true
+  }, [closeMenu, onReservedRollbackCommand, pushHistory])
+
   // Selecting a provider session row inserts the canonical `/name ` text via
   // the same setText typing uses, closes the menu, and refocuses the input.
   // It NEVER dispatches (onCommand) and NEVER sends (onSend) — the following
@@ -345,11 +385,12 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     }
     if (!trimmed) return
     if (trimmed.startsWith('/') && executeSlashText(trimmed)) return
+    if (trimmed.startsWith('/') && tryReservedRollbackCommand(trimmed)) return
     onSend?.(trimmed)
     if (trimmed) pushHistory(trimmed)
     setText('')
     closeMenu()
-  }, [closeMenu, disabled, executeSlashText, isShellInput, onSend, pushHistory, text])
+  }, [closeMenu, disabled, executeSlashText, isShellInput, onSend, pushHistory, text, tryReservedRollbackCommand])
 
   const recallHistory = useCallback((direction: 1 | -1): boolean => {
     const history = historyRef.current
@@ -403,6 +444,11 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
         } else {
           executeCommand(selected.command)
         }
+      } else if (menuMode === 'chat') {
+        // The open (but empty) slash menu consumes Enter, so a typed reserved
+        // rollback name with no catalog resolution (freshcodex /redo) must be
+        // intercepted here too — sendText would never see the keyboard path.
+        tryReservedRollbackCommand(text.trim())
       }
       return true
     }
@@ -431,6 +477,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     menuLength,
     menuMode,
     text,
+    tryReservedRollbackCommand,
     visibleRows,
   ])
 

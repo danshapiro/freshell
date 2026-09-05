@@ -48,6 +48,19 @@ import {
 } from '@shared/fresh-agent-slash-commands'
 import { FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE } from '@shared/fresh-agent-models'
 import {
+  asRollbackAck,
+  buildRollbackFrame,
+  gateRollbackCommand,
+  isRollbackErrorEvent,
+  REDO_CODEX_UNSUPPORTED_NOTICE,
+  REDO_DESTROYED_NOTICE,
+  ROLLBACK_BUSY_REDO_NOTICE,
+  ROLLBACK_BUSY_UNDO_NOTICE,
+  UNDO_REFILL_NOTICE,
+  rollbackUnsupportedNotice,
+} from '@/lib/fresh-agent-rollback'
+import { registerFreshAgentPaneActions } from '@/lib/pane-action-registry'
+import {
   freshAgentContextSessionId,
   guardContextUsageTokenSummary,
 } from '@/lib/fresh-agent-context-usage'
@@ -98,6 +111,12 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   // A provider-cancelled question must also re-drive the snapshot, so the card clears
   // even if the freshAgent.question.cancelled fold races (fresh-eyes round-3 F3).
   'freshAgent.question.cancelled',
+  // kata 1wxv: rollback converges through the invalidating snapshot — the marker
+  // bucket, the active prefix, and rollback{canRedo,undoneDepth} all ride it.
+  'freshAgent.session.rolledBack',
+  'freshAgent.session.redone',
+  'freshAgent.rolledBack', // the requesting pane's ack also refetches
+  'freshAgent.redone',
 ])
 const log = createLogger('FreshAgentView')
 // Context usage validity window for the strip meter: at 60s the strip triggers
@@ -1254,6 +1273,32 @@ export function FreshAgentView({
     })
   }, [sendFreshAgentMessage])
 
+  // kata 1wxv: rollback requests mint a requestId so the requesting-sink ack
+  // (composer refill) and any rollback-flagged refusal route back to THIS pane;
+  // sibling clients converge through the session.rolledBack broadcast instead.
+  const pendingRollbackRef = useRef<Map<string, { direction: 'undo' | 'redo' }>>(new Map())
+  // Busy mirror for the advisory rollback gate: isBusy is derived far below the
+  // slash-command callback, so the gate reads the ref (same idiom as
+  // agentSessionStatusRef above) — always the current render's value at call time.
+  const isBusyRef = useRef(false)
+  const sendRollback = useCallback((direction: 'undo' | 'redo', mode: 'step' | 'toTurn', turnId?: string) => {
+    const current = paneContentRef.current
+    if (!current.sessionId) return
+    const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+    const requestId = nanoid()
+    pendingRollbackRef.current.set(requestId, { direction })
+    sendFreshAgentMessage(buildRollbackFrame({
+      direction,
+      requestId,
+      sessionId: current.sessionId,
+      sessionType: current.sessionType,
+      provider: current.provider,
+      ...(cwd ? { cwd } : {}),
+      mode,
+      ...(turnId ? { turnId } : {}),
+    }))
+  }, [sendFreshAgentMessage])
+
   const runSlashCommand = useCallback((command: FreshAgentSlashCommand, args: string) => {
     const current = paneContentRef.current
     if (command.action === 'new') {
@@ -1281,8 +1326,38 @@ export function FreshAgentView({
     }
     if (command.action === 'fork') {
       sendFork()
+      return
     }
-  }, [sendFork, sendFreshAgentMessage, startNewConversation])
+    // kata 1wxv: /undo and /redo handle CATALOG-RESOLVED commands (the menu pick and
+    // the typed name that resolves against the capability-filtered catalog). The
+    // RESERVED-NAME interception for capability-filtered-out names (freshcodex /redo)
+    // lives in the COMPOSER's submit path instead (r3 correction 8): runSlashCommand
+    // only ever sees catalog-resolved commands, so a filtered-out /redo could never
+    // reach here — it would fall through to onSend as model text.
+    if (command.action === 'undo' || command.action === 'redo') {
+      const direction = command.action
+      if (!current.sessionId) return
+      const rollbackSnapshot = snapshotRef.current
+      // The client gate is ADVISORY — the server's BUSY_TURN/refusal frames are the
+      // authority and render their server-supplied message verbatim on the banner.
+      const gate = gateRollbackCommand({
+        direction,
+        provider: current.provider,
+        providerLabel: descriptor?.label ?? current.provider,
+        capabilityUndo: rollbackSnapshot?.capabilities?.undo,
+        capabilityRedo: rollbackSnapshot?.capabilities?.redo,
+        canRedo: rollbackSnapshot?.rollback?.canRedo,
+        isBusy: isBusyRef.current,
+        hasRolledBackTurns: (rollbackSnapshot?.rolledBackTurns?.length ?? 0) > 0,
+      })
+      if (gate.kind === 'reject') {
+        setNotice(gate.notice)
+        return
+      }
+      sendRollback(direction, 'step')
+      return
+    }
+  }, [descriptor?.label, sendFork, sendFreshAgentMessage, sendRollback, startNewConversation])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -1836,6 +1911,37 @@ export function FreshAgentView({
       ) {
         requestSnapshotRefresh('event')
       }
+      // kata 1wxv: the requesting-sink ack drives the composer refill; rollback
+      // refusals render their server-pinned message verbatim. Both match on the
+      // pane-minted requestId, so foreign panes' rollback traffic never routes here.
+      if (message.type === 'freshAgent.event') {
+        const ack = asRollbackAck(message.event)
+        if (ack && pendingRollbackRef.current.has(ack.requestId)) {
+          const pending = pendingRollbackRef.current.get(ack.requestId)
+          pendingRollbackRef.current.delete(ack.requestId)
+          if (ack.kind === 'freshAgent.rolledBack' && pending?.direction === 'undo') {
+            setLocalEcho(null) // a pending optimistic echo must not survive a rollback
+            if (typeof ack.removedPromptText === 'string') {
+              composerRef.current?.replaceText(ack.removedPromptText) // decision 4: overwrite refill
+              setNotice(UNDO_REFILL_NOTICE)
+            }
+          }
+          // A redone ack leaves the composer alone — the server kept prompt truth.
+        } else if (
+          isRollbackErrorEvent(message.event)
+          && typeof (message.event as { requestId?: unknown }).requestId === 'string'
+          && pendingRollbackRef.current.has((message.event as { requestId: string }).requestId)
+        ) {
+          pendingRollbackRef.current.delete((message.event as { requestId: string }).requestId)
+          // The server's supplied message is PINNED SERVER-SIDE and rendered VERBATIM —
+          // BUSY_TURN carries ROLLBACK_BUSY_MESSAGE; REDO_UNAVAILABLE carries the
+          // destroyed / empty / claude moved-tip copy; capability failures carry their
+          // exact copy (CODEX_LEGACY_THREAD_COPY / old-CLI copies / parity text). The
+          // client NEVER substitutes client-side guess copy for a supplied message.
+          const supplied = (message.event as { message?: unknown }).message
+          setNotice(typeof supplied === 'string' ? supplied : rollbackUnsupportedNotice(descriptor?.label ?? paneContentRef.current.provider))
+        }
+      }
       if (
         message.type === 'freshAgent.forked'
         && message.requestId === paneContent.createRequestId
@@ -1875,7 +1981,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, resendPendingMessage, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, resendPendingMessage, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -2248,6 +2354,24 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
+  isBusyRef.current = isBusy
+  // kata 1wxv: snapshot-stamped rollback capabilities drive every client affordance
+  // (per-turn icon, slash/menus, the pre-flight gate). Legacy servers emit neither
+  // key, so absent is false; codex v1 is undo-only (redo stamps false server-side).
+  const canRollback = snapshot?.capabilities?.undo === true
+  const canRedoNow = snapshot?.capabilities?.redo === true && snapshot?.rollback?.canRedo === true
+  // Pane context-menu registration: "Undo last turn"/"Redo last turn" ride the
+  // pane-action registry; both still run the advisory gates at commit time.
+  useEffect(() => registerFreshAgentPaneActions(paneId, {
+    undo: () => sendRollback('undo', 'step'),
+    redo: () => sendRollback('redo', 'step'),
+    canUndo: canRollback && !isBusy && Boolean(snapshot?.sessionId ?? paneContent.sessionId),
+    canRedo: canRedoNow && !isBusy,
+    // Capability stamps drive menu ROW PRESENCE: codex stamps redo:false
+    // server-side, so its menu never offers a dead "Redo last turn" row.
+    undoSupported: canRollback,
+    redoSupported: snapshot?.capabilities?.redo === true,
+  }), [paneId, sendRollback, canRollback, canRedoNow, isBusy, snapshot?.sessionId, snapshot?.capabilities?.redo, paneContent.sessionId])
   // Task 14: SESSION_RESERVED is a transient reservation the view re-drives
   // through -- never surfaced as a pane-level error banner.
   const sessionErrorMessage = (agentSession as { lastError?: string; lastErrorCode?: string } | undefined)?.lastErrorCode === 'SESSION_RESERVED'
@@ -2644,12 +2768,42 @@ export function FreshAgentView({
                   } as FreshAgentTurn]
                 : turns}
               canFork={canFork}
+              canRollback={canRollback}
+              rollbackBusy={isBusy}
+              rolledBackTurns={snapshot?.rolledBackTurns ?? []}
+              canRedo={canRedoNow}
+              redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
               agentLabel={descriptor?.label}
               showThinking={effectiveShowThinking}
               showTools={effectiveShowTools}
               showTimecodes={effectiveShowTimecodes}
               isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
+              onRollbackToTurn={(turnId) => {
+                // The busy pre-flight gate picks copy by DIRECTION (decision 7)…
+                if (isBusy) {
+                  setNotice(ROLLBACK_BUSY_UNDO_NOTICE)
+                  return
+                }
+                // …and a capability-false provider gets an explicit refusal (decision 8:
+                // no confirmations, explicit rejections, tooltips name the step).
+                if (canRollback) {
+                  sendRollback('undo', 'toTurn', turnId)
+                  return
+                }
+                setNotice(rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider))
+              }}
+              onRedoToTurn={(turnId) => {
+                if (isBusy) {
+                  setNotice(ROLLBACK_BUSY_REDO_NOTICE)
+                  return
+                }
+                if (canRedoNow) {
+                  sendRollback('redo', 'toTurn', turnId)
+                  return
+                }
+                setNotice(REDO_DESTROYED_NOTICE)
+              }}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
             />
             {/* Every fresh-agent pane gets the strip (unknown state included):
@@ -2687,6 +2841,16 @@ export function FreshAgentView({
               onInterrupt={sendInterrupt}
               commands={slashCommands}
               onCommand={runSlashCommand}
+              onReservedRollbackCommand={(direction) => setNotice(
+                // kata 1wxv (r3 correction 8): typed reserved names that failed catalog
+                // resolution land here. Codex /redo gets its pinned undo-only copy; any
+                // other capability-false provider gets the parity notice. The wire-side
+                // codex×redo refusal stays as backstop; gateRollbackCommand's codex
+                // branch covers catalog-resolved and non-composer callers.
+                direction === 'redo' && paneContent.provider === 'codex'
+                  ? REDO_CODEX_UNSUPPORTED_NOTICE
+                  : rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider),
+              )}
               onSend={(text) => {
                 dispatch(dismissTabGreen(tabId))
                 if (!paneContent.sessionId || sessionEnded) return
@@ -2725,6 +2889,9 @@ export function FreshAgentView({
     contextUsage,
     descriptor?.icon,
     descriptor?.label,
+    freshOpenCodeRouteCwd,
+    canRedoNow,
+    canRollback,
     effectiveStatus,
     effectiveShowThinking,
     effectiveShowTimecodes,
@@ -2750,6 +2917,7 @@ export function FreshAgentView({
     startNewConversation,
     runSlashCommand,
     sendFork,
+    sendRollback,
     sendUserText,
     snapshot,
     slashCommands,

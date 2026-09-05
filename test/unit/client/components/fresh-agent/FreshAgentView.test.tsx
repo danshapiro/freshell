@@ -16,6 +16,14 @@ import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { ApiError } from '@/lib/api'
 import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
+import {
+  ROLLBACK_BUSY_REDO_NOTICE,
+  ROLLBACK_BUSY_UNDO_NOTICE,
+  REDO_CODEX_UNSUPPORTED_NOTICE,
+  UNDO_REFILL_NOTICE,
+  rollbackUnsupportedNotice,
+} from '@/lib/fresh-agent-rollback'
+import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -6353,6 +6361,563 @@ describe('FreshAgentView /model slash command', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Model catalog unavailable — try again')
     expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
+  })
+})
+
+describe('/undo + /redo dispatch (kata 1wxv)', () => {
+  function rollbackCapableSnapshot(overrides: Record<string, unknown> = {}) {
+    return {
+      status: 'idle',
+      summary: 'rollback capable',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'rolled prompt', items: [{ id: 'u9-i', kind: 'text', text: 'rolled prompt' }], rolledBack: true },
+      ],
+      turns: [
+        { id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] },
+        { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'first answer', items: [{ id: 'a1-i', kind: 'text', text: 'first answer' }] },
+      ],
+      ...overrides,
+    }
+  }
+
+  function initOpencodePane(store: ReturnType<typeof createStore>, { sessionId = 'ses_rollback', status = 'idle' } = {}) {
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-rollback',
+        sessionId,
+        initialCwd: '/repo/route-aware',
+        status,
+      },
+    }))
+  }
+
+  function getComposer() {
+    return screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  }
+
+  it('/undo sends the frozen freshAgent.undo frame when idle and capable', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.keyDown(getComposer(), { key: 'Enter' })
+
+    // The frame goes out; the model NEVER receives '/undo' as text.
+    expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame).toMatchObject({
+      type: 'freshAgent.undo',
+      sessionId: 'ses_rollback',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      mode: 'step',
+      cwd: '/repo/route-aware',
+    })
+    expect(frame?.requestId).toEqual(expect.any(String))
+  })
+
+  it('/undo mid-turn writes nothing and shows the direction-aware busy UNDO notice verbatim', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({ status: 'running' }))
+    initOpencodePane(store, { status: 'running' })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.undo')).toEqual([])
+    expect(screen.getByText(ROLLBACK_BUSY_UNDO_NOTICE)).toBeInTheDocument()
+  })
+
+  it('/redo mid-turn writes nothing and shows the direction-aware busy REDO notice verbatim', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({ status: 'running' }))
+    initOpencodePane(store, { status: 'running' })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/redo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.redo')).toEqual([])
+    expect(screen.getByText(ROLLBACK_BUSY_REDO_NOTICE)).toBeInTheDocument()
+  })
+
+  it('typed /undo on a capability-false pane rolls to the pinned unsupported notice and sends nothing', async () => {
+    const store = createStore()
+    // No undo/redo stamps: a legacy server (or capability-false provider) surface.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'legacy caps',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        { id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] },
+        { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'first answer', items: [{ id: 'a1-i', kind: 'text', text: 'first answer' }] },
+      ],
+    })
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.undo')).toEqual([])
+    expect(screen.getByText(rollbackUnsupportedNotice('Freshopencode'))).toBeInTheDocument()
+  })
+
+  it('the freshcodex slash menu offers /undo but NEVER a /redo entry (codex is undo-only)', async () => {
+    const store = createStore()
+    // The freshcodex server shape: undo stamped (paginated thread), redo never.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-rb-codex-menu',
+        sessionId: 'thread-rb-codex-menu',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
+    // The snapshot's turn text rendering IS the proof the capability stamps landed
+    // (the transcript reads the committed snapshot state), so the menu consult is
+    // deterministic without retries.
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.getByRole('menuitem', { name: /\/undo/ })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+  })
+
+  it('delta-r1 F7: the slash menu hides /undo and /redo on a capability-false (legacy) snapshot, keeping only capability-free rows', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'legacy caps',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{ id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] }],
+    })
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first prompt')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.queryByRole('menuitem', { name: /\/undo/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+    // Capability-free rows stay (the menu itself is alive).
+    expect(screen.getByRole('menuitem', { name: /\/compact/ })).toBeInTheDocument()
+  })
+
+  it('delta-r1 F7: before capability discovery (no snapshot yet), the slash menu offers neither /undo nor /redo', async () => {
+    const store = createStore()
+    // The snapshot promise never resolves during this check — the pre-discovery state.
+    let resolveSnapshot: ((value: unknown) => void) | undefined
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(() => new Promise((resolve) => { resolveSnapshot = resolve }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.queryByRole('menuitem', { name: /\/undo/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+    resolveSnapshot?.(rollbackCapableSnapshot())
+  })
+
+  it('delta-r1 F6: the view passes the snapshot redoableTurnIds through to the marker section (frozen markers hidden, current-epoch marker enabled)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({
+      rolledBackTurns: [
+        { id: 'u8', turnId: 'u8', role: 'user', summary: 'frozen marker', items: [{ id: 'u8-i', kind: 'text', text: 'frozen marker' }], rolledBack: true },
+        { id: 'a8', turnId: 'a8', role: 'assistant', summary: 'frozen answer', items: [{ id: 'a8-i', kind: 'text', text: 'frozen answer' }], rolledBack: true },
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'current marker', items: [{ id: 'u9-i', kind: 'text', text: 'current marker' }], rolledBack: true },
+      ],
+      rollback: { canRedo: true, undoneDepth: 2, redoableTurnIds: ['u9'] },
+    }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('frozen marker')).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    const buttons = Array.from(section.querySelectorAll('button[aria-label="Redo to here"]'))
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0].closest('div.flex.items-start')?.textContent).toContain('current marker')
+  })
+
+  it('delta-r1 F6 legacy: a rollback block WITHOUT redoableTurnIds offers no per-marker redo', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({
+      rollback: { canRedo: true, undoneDepth: 1 },
+    }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('rolled prompt')).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    expect(section.querySelectorAll('button[aria-label="Redo to here"]')).toHaveLength(0)
+  })
+
+  it('typed /redo on a freshcodex pane hits the composer RESERVED seam: pinned codex notice, NEVER a send (r3 correction 8)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-rb-codex',
+        sessionId: 'thread-rb-codex',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/redo' } })
+    fireEvent.keyDown(getComposer(), { key: 'Enter' })
+
+    // The composer's pre-catalog-resolution seam intercepts the reserved name: the
+    // pinned codex notice shows, and the text NEVER reaches the model or the wire.
+    expect(screen.getByText(REDO_CODEX_UNSUPPORTED_NOTICE)).toBeInTheDocument()
+    expect(sentFreshAgentMessages('freshAgent.redo')).toEqual([])
+    expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
+    expect(getComposer().value).toBe('')
+    // …but the typed text is pushed to prompt history exactly like a resolved command.
+    expect(JSON.parse(window.localStorage.getItem('fresh-agent-prompt-history:freshcodex') ?? '[]')).toContain('/redo')
+  })
+
+  it('a rolledBack ack refills the composer with the removed prompt (overwrite, never append) + refill notice', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    expect(onMessage).toBeTypeOf('function')
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The user keeps typing while the rollback is in flight — the refill OVERWRITES.
+    fireEvent.change(getComposer(), { target: { value: 'stale draft' } })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_rollback',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.rolledBack',
+          requestId: String(frame?.requestId),
+          sessionId: 'ses_rollback',
+          direction: 'undo',
+          mode: 'step',
+          removedPromptText: 'the removed prompt',
+          removedTurnIds: ['u1', 'a1'],
+          canRedo: true,
+        },
+      })
+    })
+
+    await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
+    expect(screen.getByText(UNDO_REFILL_NOTICE)).toBeInTheDocument()
+    // a11y: the refilled composer regains focus for immediate editing.
+    await waitFor(() => expect(document.activeElement).toBe(getComposer()))
+  })
+
+  it('a redone ack leaves the composer contents alone (the server kept prompt truth)', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/redo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.redo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    fireEvent.change(getComposer(), { target: { value: 'keep this draft' } })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_rollback',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.redone',
+          requestId: String(frame?.requestId),
+          sessionId: 'ses_rollback',
+          direction: 'redo',
+          restoredThroughTurnId: 'u9',
+          canRedo: false,
+        },
+      })
+    })
+
+    // No refill, no refill notice — a redo restores turns, not composer text.
+    await waitFor(() => expect(getComposer().value).toBe('keep this draft'))
+    expect(screen.queryByText(UNDO_REFILL_NOTICE)).not.toBeInTheDocument()
+  })
+
+  it('a rollback-flagged error renders the server-supplied message VERBATIM on the notice banner', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The server-pinned copy (e.g. the claude moved-tip refusal) renders VERBATIM —
+    // the client NEVER substitutes its own guess copy for a supplied message.
+    const serverCopy = 'Redo is no longer available — the original conversation’s history changed since the undo.'
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_rollback',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.error',
+          sessionId: 'ses_rollback',
+          code: 'REDO_UNAVAILABLE',
+          rollback: true,
+          requestId: String(frame?.requestId),
+          message: serverCopy,
+        },
+      })
+    })
+
+    expect(screen.getByText(serverCopy)).toBeInTheDocument()
+  })
+
+  it('a re-delivered rolledBack ack with the SAME requestId NEVER re-refills the composer (consume-once per requestId)', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The SAME ack frame delivered twice (ws redundancy / reconnect replays can
+    // re-deliver); the pending-rollback dedupe list consumes exactly once per
+    // requestId, so the refill effect fires exactly once.
+    const ackFrame = {
+      type: 'freshAgent.event',
+      sessionId: 'ses_rollback',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.rolledBack',
+        requestId: String(frame?.requestId),
+        sessionId: 'ses_rollback',
+        direction: 'undo',
+        mode: 'step',
+        removedPromptText: 'the removed prompt',
+        removedTurnIds: ['u1', 'a1'],
+        canRedo: true,
+      },
+    }
+    act(() => {
+      onMessage?.(ackFrame)
+    })
+    await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
+
+    // A user edit after the refill must survive the replayed ack — a second
+    // refill would clobber it with 'the removed prompt' again.
+    fireEvent.change(getComposer(), { target: { value: 'post-refill edit' } })
+    act(() => {
+      onMessage?.(ackFrame)
+    })
+
+    expect(getComposer().value).toBe('post-refill edit')
+  })
+
+  it('a freshcodex pane stamps undo-only rollback capabilities on the pane-action registry (NEVER redo)', async () => {
+    // The server stamps undo:true / redo:false for freshcodex — the registry must
+    // never carry a redo capability for the context menu to offer.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex rollback caps',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      rollback: { canRedo: false, undoneDepth: 0 },
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-caps-codex',
+        sessionId: 'thread-caps-codex',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const actions = getFreshAgentPaneActions('pane-1')
+      expect(actions?.undoSupported).toBe(true)
+      expect(actions?.redoSupported).toBe(false)
+      expect(actions?.canUndo).toBe(true)
+    })
+  })
+
+  it('a freshclaude pane with canRedo stamps both rollback capabilities on the pane-action registry (the menu row is offered, enabled)', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Claude rollback caps',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [],
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-caps-claude',
+        sessionId: CLAUDE_THREAD_ID,
+        status: 'connected',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const actions = getFreshAgentPaneActions('pane-1')
+      expect(actions?.undoSupported).toBe(true)
+      expect(actions?.redoSupported).toBe(true)
+      expect(actions?.canRedo).toBe(true)
+    })
   })
 })
 

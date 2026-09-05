@@ -14,7 +14,8 @@ use serde_json::json;
 
 use freshell_codex::{
     new_channel_transport, to_codex_reasoning_effort, ClientFrame, CodexAdapterEvent,
-    CodexAppServerClient, CodexNotification, CodexSubscription, StartThreadParams, StartTurnParams,
+    CodexAppServerClient, CodexNotification, CodexSubscription, HistoryMode, StartThreadParams,
+    StartTurnParams,
 };
 
 const THREAD_ID: &str = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
@@ -47,6 +48,7 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
                     model: Some("gpt-5.3-codex-spark".to_string()),
                     sandbox: Some("workspace-write".to_string()),
                     approval_policy: Some("never".to_string()),
+                    history_mode: None,
                 })
                 .await
                 .expect("thread/start");
@@ -227,6 +229,76 @@ async fn rpc_error_on_turn_start_surfaces_to_the_caller() {
         result.is_err(),
         "an RPC error on turn/start propagates: {result:?}"
     );
+}
+
+// ── kata 1wxv Task 2: codex conversation rollback (thread/revert; undo-only) ──
+
+/// `thread/revert` (codex 0.149.0, EXPERIMENTAL): the in-place, same-thread-id
+/// destructive history rollback, `{threadId, beforeTurnId}` on the wire
+/// (keep-prefix-BEFORE-the-turn semantics, LB-1).
+#[tokio::test]
+async fn thread_revert_uses_the_experimental_wire_shape() {
+    let (transport, peer) = new_channel_transport();
+    let (client, _notifs) = CodexAppServerClient::connect(transport);
+    let call = tokio::spawn(async move { client.revert_thread("thr-1", "turn-9").await });
+    drive_handshake(&peer).await;
+    let (id, method, params) = peer.expect_request().await;
+    assert_eq!(method, "thread/revert");
+    assert_eq!(
+        params,
+        serde_json::json!({ "threadId": "thr-1", "beforeTurnId": "turn-9" })
+    );
+    peer.respond(&id, serde_json::json!({}));
+    call.await.expect("join").expect("thread/revert ok");
+}
+
+/// Every thread freshell STARTS adopts `historyMode:"paginated"` on the wire
+/// (LBC-1: `thread/revert` refuses legacy threads), while `thread/resume`
+/// takes NO mode param (the durable rollout meta carries it).
+#[tokio::test]
+async fn thread_start_sets_paginated_history_mode_and_resume_never_sends_it() {
+    // thread/start × paginated:
+    let (transport, peer) = new_channel_transport();
+    let (client, _notifs) = CodexAppServerClient::connect(transport);
+    let call = tokio::spawn(async move {
+        client
+            .start_thread(StartThreadParams {
+                history_mode: Some(HistoryMode::Paginated),
+                ..StartThreadParams::default()
+            })
+            .await
+    });
+    drive_handshake(&peer).await;
+    let (start_id, method, params) = peer.expect_request().await;
+    assert_eq!(method, "thread/start");
+    assert_eq!(params["historyMode"], json!("paginated"));
+    peer.respond(&start_id, json!({ "thread": { "id": THREAD_ID } }));
+    call.await.expect("join").expect("thread/start");
+
+    // thread/resume NEVER carries a mode param, even when the params struct is
+    // populated with one (the provider schema has no such resume field).
+    let (transport, peer) = new_channel_transport();
+    let (client, _notifs) = CodexAppServerClient::connect(transport);
+    let call = tokio::spawn(async move {
+        client
+            .resume_thread(
+                THREAD_ID,
+                StartThreadParams {
+                    history_mode: Some(HistoryMode::Paginated),
+                    ..StartThreadParams::default()
+                },
+            )
+            .await
+    });
+    drive_handshake(&peer).await;
+    let (resume_id, method, params) = peer.expect_request().await;
+    assert_eq!(method, "thread/resume");
+    assert!(
+        params.get("historyMode").is_none(),
+        "thread/resume takes no mode param: {params}"
+    );
+    peer.respond(&resume_id, json!({ "thread": { "id": THREAD_ID } }));
+    call.await.expect("join").expect("thread/resume");
 }
 
 /// The client→server request framing is exactly `{ id, method, params }` with no `jsonrpc`

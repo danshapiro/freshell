@@ -2,8 +2,17 @@
 //! crate through this trait; `freshell-server` implements it over the pane
 //! ledger (this crate must not depend on `freshell-ws`, where the ledger
 //! lives — the dependency edge runs the other way).
+//!
+//! Kata 1wxv: the bridge also carries the durable rollback record
+//! (`record_rollback`/`load_rollback`) — the provider handlers AWAIT the write
+//! BEFORE mutating provider history (durable-BEFORE-mutation; a pre-write
+//! failure refuses the rollback with `LEDGER_WRITE_REFUSAL_COPY`).
 
 use std::sync::Arc;
+
+use crate::rollback_record::RollbackRecord;
+#[cfg(test)]
+use crate::rollback_record::ROLLBACK_RECORD_VERSION;
 
 /// Resume-invocation record (campaign plan §4.2): exactly what the
 /// provider-native resume command needs.
@@ -57,6 +66,34 @@ pub trait PaneIdentitySink: Send + Sync {
     /// silently with defaults, never a false alarm. `load_settings` is
     /// unchanged — it returns None for lineage-only rows.
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool;
+    /// kata 1wxv decision 10's durable record: the post-op rollback record,
+    /// computed from pre-mutation reads and AWAITED BEFORE the provider
+    /// mutation runs (durable-BEFORE-mutation). Same awaited-write
+    /// discipline as `record_binding`. Delta-r1 F4: a DISABLED ledger answers
+    /// `Err` here (never a false durable `Ok`), which the provider lanes map
+    /// to the rollback refusal — the rollback never mutates provider history on
+    /// this leg.
+    fn record_rollback(
+        &self,
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> SinkWrite;
+    /// The stored rollback record. Memory-fast + sync (the write-through
+    /// index). A row stored with a `version` other than
+    /// [`ROLLBACK_RECORD_VERSION`] answers `None` — never silently
+    /// reinterpreted (the pane-ledger LEDGER_VERSION discipline). Focused
+    /// ep1-r1 F3: implementations reading STORED BYTES route through
+    /// [`RollbackRecord::from_stored_payload`], so handlers see the uniform
+    /// already-migrated record (the legacy epochless union freezes — keyed on
+    /// the absence of epoch keys, indifferent to the destroy bit; the disk row
+    /// is never lazily rewritten).
+    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord>;
+    /// Delete the rollback row (kata 1wxv task 4 review M3): a compensation
+    /// whose pre-op state was ABSENT restores "nothing was here" by DELETE —
+    /// never by writing a fabricated empty record. Idempotent: deleting an
+    /// absent row succeeds (the ledger's `delete_rollback_row` discipline).
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite;
     /// Task 3 lineage lookup: resolve a CREATE requestId to the durable
     /// session id recorded on the newest matching binding row (the pane-ledger
     /// `lookup_by_create_request_id` rule: Bound or GcExpired, newest by
@@ -87,6 +124,15 @@ pub(crate) struct FakeIdentitySink {
     /// bindings never enter (and a blank rewrite removes the key, matching
     /// the ledger's full-snapshot replace).
     pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// (provider, sessionId) -> stored rollback record (kata 1wxv).
+    pub rollbacks: std::sync::Mutex<std::collections::HashMap<(String, String), RollbackRecord>>,
+    /// Focused ep1-r4 F2: (provider, sessionId) -> a row seeded as RAW STORED
+    /// BYTES (a pre-epoch-fields legacy payload). `load_rollback` routes these
+    /// through [`RollbackRecord::from_stored_payload`] exactly like the real
+    /// `LedgerIdentitySink`'s read of stored bytes, so handler tests drive the
+    /// in-memory migration itself, never a hand-stamped typed record.
+    pub legacy_rollback_payloads:
+        std::sync::Mutex<std::collections::HashMap<(String, String), serde_json::Value>>,
     /// When true, write futures resolve to Err — for failure-surfacing tests.
     pub fail_writes: std::sync::atomic::AtomicBool,
 }
@@ -129,6 +175,30 @@ impl FakeIdentitySink {
             .lock()
             .unwrap()
             .insert((provider.into(), session_id.into()));
+    }
+    /// Arm the write-failure knob (kata 1wxv refusal-path tests).
+    #[allow(dead_code)] // used by the kata 1wxv provider-leg failure tests (Tasks 2-4)
+    pub fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Focused ep1-r4 F2: seed the rollback row as RAW STORED BYTES (the legacy
+    /// pre-epoch payload shape), replacing any typed seed — `load_rollback` then
+    /// runs the real read path's migration ([`RollbackRecord::from_stored_payload`])
+    /// over them.
+    #[allow(dead_code)] // used by the kata 1wxv focused ep1-r4 F2 tests
+    pub fn seed_rollback_payload(
+        &self,
+        provider: &str,
+        session_id: &str,
+        payload: serde_json::Value,
+    ) {
+        let key = (provider.into(), session_id.into());
+        self.rollbacks.lock().unwrap().remove(&key);
+        self.legacy_rollback_payloads
+            .lock()
+            .unwrap()
+            .insert(key, payload);
     }
     fn write_result(&self) -> SinkWrite {
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
@@ -173,6 +243,26 @@ impl PaneIdentitySink for FakeIdentitySink {
                 self.recorded.lock().unwrap().remove(&key);
                 self.settings.lock().unwrap().remove(&key);
             }
+            // kata 1wxv Task 4 (claude rollback adoption): the rollback-row re-key
+            // old→new rides the SAME awaited batch as the binding write — mirrors
+            // `freshell-server`'s LedgerIdentitySink (scoped to the claude fork
+            // adoption; codex's crash-respawn supersession must NOT move a marker
+            // bucket to a memory-less thread).
+            if upsert.provider == "claude" {
+                if let Some(old_id) = upsert.supersedes.as_deref() {
+                    if old_id != upsert.session_id {
+                        let mut rollbacks = self.rollbacks.lock().unwrap();
+                        if let Some(record) =
+                            rollbacks.remove(&(upsert.provider.clone(), old_id.to_string()))
+                        {
+                            rollbacks.insert(
+                                (upsert.provider.clone(), upsert.session_id.clone()),
+                                record,
+                            );
+                        }
+                    }
+                }
+            }
             self.bindings.lock().unwrap().push(upsert);
         }
         self.write_result()
@@ -189,6 +279,54 @@ impl PaneIdentitySink for FakeIdentitySink {
             .lock()
             .unwrap()
             .contains(&(provider.into(), session_id.into()))
+    }
+    fn record_rollback(
+        &self,
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.rollbacks
+                .lock()
+                .unwrap()
+                .insert((provider.into(), session_id.into()), record);
+            // A real write supersedes any seeded raw-bytes row (the handler's
+            // post-op record carries EXPLICIT epoch keys from here on).
+            self.legacy_rollback_payloads
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
+        }
+        self.write_result()
+    }
+    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
+        let key = (provider.into(), session_id.into());
+        if let Some(record) = self.rollbacks.lock().unwrap().get(&key) {
+            return (record.version == ROLLBACK_RECORD_VERSION).then(|| record.clone());
+        }
+        // Focused ep1-r4 F2: a seeded raw-bytes row reads through the REAL
+        // migration reader — never a hand-stamped typed record.
+        let payload = self
+            .legacy_rollback_payloads
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned();
+        payload.and_then(RollbackRecord::from_stored_payload)
+    }
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.rollbacks
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
+            self.legacy_rollback_payloads
+                .lock()
+                .unwrap()
+                .remove(&(provider.into(), session_id.into()));
+        }
+        self.write_result()
     }
     fn lookup_by_create_request_id(
         &self,
@@ -332,6 +470,49 @@ mod tests {
                 .await
                 .is_err(),
             "failure must surface as Err, never be swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_sink_records_and_loads_rollback() {
+        let fake = std::sync::Arc::new(FakeIdentitySink::default());
+        let mut record = crate::rollback_record::RollbackRecord::empty(10);
+        record.push_entry(
+            crate::rollback_record::RollbackEntry {
+                removed_turns: vec![serde_json::json!({"id": "t1"})],
+                prompt_text: "p1".into(),
+                at_ms: 11,
+                epoch: 0,
+            },
+            12,
+        );
+        fake.record_rollback("opencode", "ses_1", record.clone())
+            .await
+            .expect("write ok");
+        assert_eq!(fake.load_rollback("opencode", "ses_1"), Some(record));
+        assert!(fake.load_rollback("opencode", "nope").is_none());
+    }
+
+    /// A stored row whose version mismatches the schema reads as None — never
+    /// reinterpreted across a future schema bump (the version gate is the only
+    /// eviction of stale-shape rows).
+    #[tokio::test]
+    async fn fake_sink_load_rollback_version_gate_returns_none() {
+        let fake = std::sync::Arc::new(FakeIdentitySink::default());
+        let record = crate::rollback_record::RollbackRecord::empty(10);
+        fake.record_rollback("opencode", "ses_v0", record)
+            .await
+            .expect("write ok");
+        {
+            let mut rows = fake.rollbacks.lock().unwrap();
+            rows.get_mut(&("opencode".to_string(), "ses_v0".to_string()))
+                .expect("row present")
+                .version = 0;
+        }
+        assert_eq!(
+            fake.load_rollback("opencode", "ses_v0"),
+            None,
+            "a version-mismatched row reads as absent, not partial"
         );
     }
 }

@@ -92,6 +92,52 @@ fn disabled_ledger_is_a_silent_noop() {
     assert!(ledger.list_bindings().is_empty());
 }
 
+/// kata 1wxv delta-r1 F4 (disabled-mode honesty, durable-BEFORE-mutation): the
+/// ONE write the disabled ledger must REFUSE is the rollback-record row — a
+/// false "durable" answer would let providers destructively mutate history with
+/// no surviving markers. Every OTHER write keeps its silent no-op policy (the
+/// binding/pending identity lanes degrade gracefully).
+#[test]
+fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
+    let ledger = PaneLedger::disabled();
+    let payload = serde_json::json!({"version": 1, "entries": []});
+    let err = ledger
+        .record_rollback_row("claude", "sid", &payload, 1)
+        .expect_err("a disabled ledger must never report a rollback 'durable' write as Ok");
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert!(
+        err.to_string().contains("ledger DISABLED"),
+        "the error names the disabled mode: {err}"
+    );
+    // Nothing was insta-indexed either.
+    assert!(
+        ledger.load_rollback_row("claude", "sid").is_none(),
+        "a refused write lands nowhere"
+    );
+    // The other lanes keep their existing disabled policy (silent no-op).
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "claude",
+            session_id: "sid",
+            mode: "freshclaude",
+            cwd: None,
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            now_ms: 1,
+        })
+        .expect("binding writes keep their silent-no-op policy on a disabled ledger");
+    ledger
+        .record_pending("ph", "freshclaude", None, 1)
+        .expect("pending writes keep their silent-no-op policy on a disabled ledger");
+    ledger
+        .delete_rollback_row("claude", "sid")
+        .expect("a delete of a row that cannot exist stays a no-op");
+}
+
 #[test]
 fn writes_are_atomic_sibling_temp_plus_rename() {
     // After a successful write no *.tmp-* residue remains, and the row file
@@ -1153,4 +1199,50 @@ fn session_missing_serde_round_trips() {
     // Test deserialization
     let deserialized: RetiredReason = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(deserialized, RetiredReason::SessionMissing);
+}
+
+/// kata 1wxv Task 4: the claude fork-adoption re-key MOVES the rollback row
+/// old→new — copy under the new id lands durably, and the old id's row is gone
+/// from BOTH the on-disk file and the write-through index (a surviving stale
+/// row would let the superseded id keep describing rollback state it no longer
+/// owns).
+#[test]
+fn rollback_row_rekey_move_drops_the_old_durably() {
+    let root = temp_root("rollback-rekey");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let payload_a = serde_json::json!({"version": 1, "entries": []});
+    ledger
+        .record_rollback_row("claude", "old-id", &payload_a, 1)
+        .expect("seed write");
+    let payload_old = ledger
+        .load_rollback_row("claude", "old-id")
+        .expect("seeded");
+    // The re-key move: copy under the new id, then delete the old.
+    ledger
+        .record_rollback_row("claude", "new-id", &payload_old, 2)
+        .expect("copy");
+    ledger
+        .delete_rollback_row("claude", "old-id")
+        .expect("delete old");
+    assert!(
+        ledger.load_rollback_row("claude", "old-id").is_none(),
+        "the old row is out of the write-through index"
+    );
+    assert_eq!(
+        ledger.load_rollback_row("claude", "new-id"),
+        Some(payload_a),
+        "the moved row reads identically under the new id"
+    );
+    // A FRESH ledger over the same root proves the delete is durable (not index-only).
+    let ledger2 = PaneLedger::new(Some(root.clone()));
+    assert!(
+        ledger2.load_rollback_row("claude", "old-id").is_none(),
+        "the old row's FILE is gone"
+    );
+    assert!(ledger2.load_rollback_row("claude", "new-id").is_some());
+    // A missing row/file is a silent no-op (never an error).
+    ledger
+        .delete_rollback_row("claude", "never-existed")
+        .expect("no-op delete");
+    std::fs::remove_dir_all(&root).ok();
 }

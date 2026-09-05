@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Check, Copy, GitFork, History, MoreHorizontal } from 'lucide-react'
+import { Check, Copy, GitFork, History, MoreHorizontal, Undo2 } from 'lucide-react'
 import { copyText } from '@/lib/clipboard'
 import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { stripSystemReminders } from './FreshAgentItemCard'
@@ -17,8 +17,15 @@ export function turnPlainText(turn: FreshAgentTurn): string {
 
 export type TurnActionCallbacks = {
   canFork: boolean
+  /** kata 1wxv: snapshot-stamped `capabilities.undo` — absent/false hides the icon. */
+  canRollback?: boolean
+  /** Mid-turn: the advisory pre-flight gate disables the affordance (decision 7). */
+  rollbackBusy?: boolean
+  canRedo?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  onRollbackToTurn?: (turnId: string) => void
+  onRedoToTurn?: (turnId: string) => void
 }
 
 /**
@@ -35,6 +42,15 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
       label: 'Fork conversation from here',
       disabled: !callbacks.canFork || !callbacks.onForkFromTurn,
       run: () => callbacks.onForkFromTurn?.(turn.turnId ?? turn.id),
+    },
+    {
+      // kata 1wxv decision 3: "undo to here" — one N-step rollback to just before
+      // this user turn. Conversation-only, so deliberately NOT marked `destructive`
+      // (the file-rewind sibling owns that flag). Redo rows for the rolled-back
+      // bucket are built by the transcript section, not here.
+      label: 'Undo to here',
+      disabled: callbacks.canRollback !== true || callbacks.rollbackBusy === true || !callbacks.onRollbackToTurn || turn.role !== 'user',
+      run: () => callbacks.onRollbackToTurn?.(turn.turnId ?? turn.id),
     },
     {
       label: 'Rewind code to here',
@@ -55,7 +71,10 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
 export function FreshAgentTurnActions({
   turn,
   canFork,
+  canRollback,
+  rollbackBusy,
   onForkFromTurn,
+  onRollbackToTurn,
   onRewindToTurn,
   onOpenActions,
 }: TurnActionCallbacks & {
@@ -100,6 +119,18 @@ export function FreshAgentTurnActions({
             <GitFork className="h-3 w-3" />
           </button>
         ) : null}
+        {canRollback && onRollbackToTurn && turn.role === 'user' ? (
+          <button
+            type="button"
+            onClick={() => onRollbackToTurn(turn.turnId ?? turn.id)}
+            disabled={rollbackBusy === true}
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label="Undo to here"
+            title={`Roll back this turn and everything after “${turn.summary.slice(0, 60)}” — conversation only; files stay as they are`}
+          >
+            <Undo2 className="h-3 w-3" />
+          </button>
+        ) : null}
         {canRewind ? (
           <button
             type="button"
@@ -138,7 +169,10 @@ type ContextMenuState = { x: number; y: number; turn: FreshAgentTurn } | null
 export function FreshAgentTurnContextMenu({
   state,
   canFork,
+  canRollback,
+  rollbackBusy,
   onForkFromTurn,
+  onRollbackToTurn,
   onRewindToTurn,
   onClose,
 }: TurnActionCallbacks & {
@@ -158,7 +192,7 @@ export function FreshAgentTurnContextMenu({
 
   if (!state) return null
 
-  const items = buildTurnActionItems(state.turn, { canFork, onForkFromTurn, onRewindToTurn })
+  const items = buildTurnActionItems(state.turn, { canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn })
 
   return (
     <div

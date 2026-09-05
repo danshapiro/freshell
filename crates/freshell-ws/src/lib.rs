@@ -4,7 +4,7 @@
 //! A faithful port of the **handshake path** of `server/ws-handler.ts`:
 //!
 //! * mount `/ws` (an axum WebSocket upgrade — tokio-tungstenite-backed);
-//! * read the first `hello`, validate `protocolVersion == 7` **first**, then the
+//! * read the first `hello`, validate `protocolVersion == 8` **first**, then the
 //!   token with a **constant-time** compare (mirrors `auth.ts#timingSafeCompare`
 //!   and the `ws-handler.ts` ordering: version check precedes auth);
 //! * on success emit, IN ORDER, exactly what the original sends on a clean
@@ -47,6 +47,8 @@ pub mod create_dedupe;
 pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
+pub mod host_stats_collector;
+pub mod host_stats_interest;
 pub mod identity;
 pub mod invariants;
 pub mod opencode_association;
@@ -247,6 +249,13 @@ pub struct WsState {
     /// amplifier subagent rescan cadence (`freshell-server`, Task 9) runs while
     /// `any()` is true. See [`crate::subagent_interest`].
     pub subagent_interest: crate::subagent_interest::SubagentInterestRegistry,
+    /// HOST-PRESSURE PANE (Task 9, `docs/plans/2026-08-25-host-pressure-pane.md`):
+    /// per-connection `hoststats.subscribe` interest + the injected concrete
+    /// collector (`Arc<dyn HostStatsCollector>`, freshell-server). Bundled as
+    /// ONE sub-struct so the ~35 `WsState { ... }` literals across crates
+    /// gain exactly one `host_stats: Default::default()` arm each (the plan's
+    /// >~6-site sweep rule). See [`crate::host_stats_collector`].
+    pub host_stats: crate::host_stats_collector::WsHostStatsState,
     /// The handler-scoped monotonic `terminals.changed` revision counter
     /// (`ws-handler.ts:566` `terminalsRevision`). SHARED with the REST
     /// `/api/terminals` PATCH/DELETE broadcasts (`terminals::TerminalsState`),
@@ -618,7 +627,7 @@ pub enum HelloOutcome {
     Accept,
     /// Not a `hello` frame, or unparseable — the original closes NOT_AUTHENTICATED.
     NotHello,
-    /// `protocolVersion != 7` — checked BEFORE the token (matches ws-handler.ts).
+    /// `protocolVersion != 8` — checked BEFORE the token (matches ws-handler.ts).
     ProtocolMismatch,
     /// Bad/missing token (constant-time compared).
     BadToken,
@@ -913,6 +922,7 @@ mod tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -963,14 +973,14 @@ mod tests {
         );
 
         // Right version, wrong token.
-        let v = json!({ "type": "hello", "protocolVersion": 7, "token": "nope" });
+        let v = json!({ "type": "hello", "protocolVersion": 8, "token": "nope" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::BadToken
         );
 
         // Right version, right token.
-        let v = json!({ "type": "hello", "protocolVersion": 7, "token": "s3cr3t-token-abcdef" });
+        let v = json!({ "type": "hello", "protocolVersion": 8, "token": "s3cr3t-token-abcdef" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::Accept

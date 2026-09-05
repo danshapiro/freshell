@@ -44,6 +44,144 @@ pub fn default_server_instance_id() -> String {
         .unwrap_or_else(|_| format!("srv-{}", std::process::id()))
 }
 
+// ── history mode (kata 1wxv Task 2, LBC-1) ─────────────────────────────────
+
+/// The codex thread history mode. `thread/revert` (0.149.0 conversation
+/// rollback) REFUSES legacy threads, so rollback capability is gated on the
+/// thread being [`HistoryMode::Paginated`]. There is deliberately no `Legacy`
+/// variant: "not paginated" (missing/unparseable durable meta, an explicit
+/// `"legacy"` value) reads as `Option<HistoryMode>::None` at every consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryMode {
+    Paginated,
+}
+
+impl HistoryMode {
+    /// The `thread/start` wire value (`historyMode`).
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            HistoryMode::Paginated => "paginated",
+        }
+    }
+
+    /// Parse the rollout `session_meta.payload.history_mode` value. Only the
+    /// exact durable `"paginated"` string upgrades a thread; anything else
+    /// (missing key, non-string, unknown value) stays legacy.
+    fn from_meta_value(value: Option<&serde_json::Value>) -> Option<HistoryMode> {
+        match value.and_then(serde_json::Value::as_str) {
+            Some("paginated") => Some(HistoryMode::Paginated),
+            _ => None,
+        }
+    }
+}
+
+/// The `<CODEX_HOME|~/.codex>/sessions` root (same resolution as
+/// `defaultCodexHome()`, `providers/codex.ts:25-27`). `None` when neither
+/// `CODEX_HOME` nor `HOME` is set — there is no rollout tree to read.
+fn codex_sessions_root() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("CODEX_HOME") {
+        if !v.is_empty() {
+            return Some(std::path::PathBuf::from(v).join("sessions"));
+        }
+    }
+    let home = std::env::var("HOME").ok().filter(|v| !v.is_empty())?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".codex")
+            .join("sessions"),
+    )
+}
+
+/// The first line of `path`, trimmed. Rollout session_meta is ALWAYS line 0
+/// (the rollout writer emits it first; a file still in codex's
+/// create→session_meta git-info gap has no readable first line yet and
+/// answers `None`).
+fn first_line(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file).take(1024 * 1024);
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let trimmed = first.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Parse a rollout `session_meta` first line into its payload. `None` for any
+/// line that is not a `{"type":"session_meta","payload":{…}}` record.
+fn session_meta_payload(line: &str) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    value.get("payload").cloned()
+}
+
+/// Locate the rollout owned by `thread_id` under `sessions_root`. The filename
+/// containment is a cheap PREFILTER; ownership is proven by the first line
+/// being a `session_meta` whose `payload.id`/`payload.session_id` equals the
+/// thread id — substring matching alone is unsafe (rollouts embed foreign
+/// uuids as fork/resume lineage; the codex_reconcile walk in freshell-ws uses
+/// the same proof). Bounded recursive walk: the tree is
+/// `sessions/YYYY/MM/DD/rollout-*.jsonl` (flat `<id>.jsonl` in tests).
+fn locate_rollout(sessions_root: &Path, thread_id: &str) -> Option<std::path::PathBuf> {
+    fn owns(path: &Path, thread_id: &str) -> bool {
+        let Some(first) = first_line(path) else {
+            return false;
+        };
+        let Some(payload) = session_meta_payload(&first) else {
+            return false;
+        };
+        payload.get("id").and_then(serde_json::Value::as_str) == Some(thread_id)
+            || payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(thread_id)
+    }
+    fn walk(dir: &Path, thread_id: &str, depth: u8, hit: &mut Option<std::path::PathBuf>) {
+        if depth > 5 || hit.is_some() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if hit.is_some() {
+                return;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, thread_id, depth + 1, hit);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".jsonl") && n.contains(thread_id))
+                .unwrap_or(false)
+                && owns(&path, thread_id)
+            {
+                *hit = Some(path);
+            }
+        }
+    }
+    let mut hit = None;
+    walk(sessions_root, thread_id, 0, &mut hit);
+    hit
+}
+
+/// The thread's DURABLE history mode, read from its rollout's persisted
+/// `session_meta.history_mode` (kata 1wxv Task 2, r3: validator-C proved the
+/// mode persists there, and `thread/resume` takes no mode param — the durable
+/// rollout meta is the ONLY source of truth; the app-server exposes no live
+/// read-back). `Some(Paginated)` only when the meta says so; a missing rollout,
+/// a missing/unparseable mode, or an IO/parse failure all answer `None` ⇒
+/// legacy (capability never over-advertised: `undo:false`).
+pub fn read_rollout_history_mode(thread_id: &str) -> Option<HistoryMode> {
+    let root = codex_sessions_root()?;
+    let path = locate_rollout(&root, thread_id)?;
+    let line = first_line(&path)?;
+    let payload = session_meta_payload(&line)?;
+    HistoryMode::from_meta_value(payload.get("history_mode"))
+}
+
 /// `extractSessionIdFromFilename(filePath)` (`providers/codex.ts:417-421`): the UUID embedded
 /// in a `rollout-<ts>-<threadId>.jsonl` basename, else the basename (minus `.jsonl`) verbatim.
 pub fn extract_session_id_from_filename(file_path: &str) -> String {
@@ -156,5 +294,117 @@ mod tests {
             let id = default_server_instance_id();
             assert!(id.starts_with("srv-"), "got {id}");
         }
+    }
+
+    // ── history mode (kata 1wxv Task 2) ────────────────────────────────────
+
+    fn write_rollout(root: &Path, dir: &str, name: &str, payload: &str) {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).expect("sessions dir");
+        std::fs::write(
+            dir.join(name),
+            format!("{{\"timestamp\":\"2026-08-23T00:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{{payload}}}}}\n"),
+        )
+        .expect("write rollout");
+    }
+
+    #[test]
+    fn history_mode_wire_and_meta_parse() {
+        assert_eq!(HistoryMode::Paginated.wire_name(), "paginated");
+        assert_eq!(
+            HistoryMode::from_meta_value(Some(&serde_json::json!("paginated"))),
+            Some(HistoryMode::Paginated)
+        );
+        // Missing key, wrong type, unknown value, explicit legacy → all legacy (None).
+        assert_eq!(HistoryMode::from_meta_value(None), None);
+        assert_eq!(
+            HistoryMode::from_meta_value(Some(&serde_json::json!(42))),
+            None
+        );
+        assert_eq!(
+            HistoryMode::from_meta_value(Some(&serde_json::json!("legacy"))),
+            None
+        );
+        assert_eq!(
+            HistoryMode::from_meta_value(Some(&serde_json::json!("Paginated"))),
+            None,
+            "the durable value is matched exactly (no case laundering)"
+        );
+    }
+
+    #[test]
+    fn locate_rollout_proves_ownership_by_the_session_meta_first_line() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let tid = "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e";
+        // The owned rollout, nested in the dated tree.
+        write_rollout(
+            root.path(),
+            "2026/08/23",
+            &format!("rollout-2026-08-23T00-00-00-{tid}.jsonl"),
+            &format!("\"id\":\"{tid}\",\"history_mode\":\"paginated\""),
+        );
+        // A FOREIGN rollout whose filename embeds the searched id via lineage —
+        // the prefilter hits, the ownership proof must reject it.
+        write_rollout(
+            root.path(),
+            "2026/08/23",
+            "rollout-2026-08-23T01-00-00-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl",
+            &format!(
+                "\"id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"forked_from_id\":\"{tid}\""
+            ),
+        );
+        // A filename-match decoy whose session_meta names a DIFFERENT id (the
+        // documented-unsafe substring case): a copy of tid's rollout under a
+        // mangled name.
+        write_rollout(
+            root.path(),
+            "",
+            &format!("flat-{tid}.jsonl"),
+            "\"id\":\"ffffffff-0000-4111-8222-333333333333\"",
+        );
+
+        // The walk must find SOME owned file (the dated-tree one) even though the
+        // flat foreign decoy exists at the root...
+        let hit = locate_rollout(root.path(), tid).expect("owned rollout found");
+        assert!(
+            hit.to_string_lossy().contains("2026/08/23"),
+            "the dated-tree owned rollout wins: {hit:?}"
+        );
+        // ...and must skip both decoys when the owned one is absent.
+        std::fs::remove_file(&hit).expect("remove owned");
+        assert_eq!(locate_rollout(root.path(), tid), None);
+    }
+
+    #[test]
+    fn read_rollout_history_mode_parses_the_meta_of_an_explicit_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let tid = "thr-paged";
+        write_rollout(
+            root.path(),
+            "2026/08/23",
+            "rollout-2026-08-23T00-00-00-thr-paged.jsonl",
+            "\"id\":\"thr-paged\",\"history_mode\":\"paginated\"",
+        );
+        let hit = locate_rollout(root.path(), tid).expect("found");
+        let line = first_line(&hit).expect("first line");
+        let payload = session_meta_payload(&line).expect("payload");
+        assert_eq!(
+            HistoryMode::from_meta_value(payload.get("history_mode")),
+            Some(HistoryMode::Paginated)
+        );
+        write_rollout(
+            root.path(),
+            "2026/08/24",
+            "rollout-2026-08-24T00-00-00-thr-legacy.jsonl",
+            "\"id\":\"thr-legacy\"",
+        );
+        let hit = locate_rollout(root.path(), "thr-legacy").expect("found");
+        let line = first_line(&hit).expect("first line");
+        let payload = session_meta_payload(&line).expect("payload");
+        assert_eq!(
+            HistoryMode::from_meta_value(payload.get("history_mode")),
+            None,
+            "a missing durable mode stamps legacy (undo:false)"
+        );
     }
 }

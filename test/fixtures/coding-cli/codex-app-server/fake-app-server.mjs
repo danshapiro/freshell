@@ -358,6 +358,28 @@ function successResult(method, params) {
     // called after this result is sent — mirrors the real server's ordering).
     return {}
   }
+  if (method === 'thread/revert') {
+    // kata 1wxv arm (codex 0.149.0 EXPERIMENTAL): thread/revert {threadId,
+    // beforeTurnId} — IN-PLACE, same-thread-id destructive history rollback.
+    // The recorded turns become the prefix STRICTLY BEFORE beforeTurnId (an
+    // accidental-empty prefix is LEGAL: it empties the thread). An unknown
+    // beforeTurnId (findIndex -1) leaves the history unchanged, mirroring the
+    // fork arm's silent-leniency. Loose `{}` result (fork's parse discipline);
+    // the `thread/reverted` notification broadcast rides the post-result seam
+    // in the message handler.
+    const threadId = params?.threadId
+    if (behavior.recordTurns) {
+      const turns = loadRecordedTurns(threadId)
+      const before = typeof params?.beforeTurnId === 'string' ? params.beforeTurnId : null
+      const cut = before ? turns.findIndex((turn) => turn?.id === before) : -1
+      if (cut !== -1) {
+        const kept = turns.slice(0, cut)
+        recordedTurnsByThread.set(threadId, kept)
+        persistRecordedTurns(threadId, kept)
+      }
+    }
+    return {}
+  }
   if (method === 'thread/archive' || method === 'thread/unarchive') {
     return {}
   }
@@ -460,6 +482,10 @@ if (behavior.spawnNativeChild) {
 const wss = new WebSocketServer({ host, port })
 const watches = new Map()
 const activeThreadIds = new Set()
+// kata 1wxv (LBC-1): thread/revert is paginated-only. Threads THIS process
+// started with historyMode:"paginated" on thread/start land here; any other
+// thread answers thread/revert with the VERIFIED -32600 refusal.
+const paginatedThreadIds = new Set()
 let forkCounter = 0
 
 function broadcastNotification(method, params) {
@@ -709,6 +735,24 @@ wss.on('connection', (socket) => {
       }
     }
 
+    // kata 1wxv (LBC-1, VERIFIED): thread/revert refuses a legacy-mode thread —
+    // only a thread THIS process started with historyMode:"paginated" may be
+    // reverted. Threads freshell starts always set the mode (Task 2), so this
+    // refusal exercises only the pre-feature legacy back-catalog.
+    if (
+      method === 'thread/revert'
+      && !paginatedThreadIds.has(String(message.params?.threadId ?? ''))
+    ) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32600,
+          message: 'thread/revert only supports paginated threads',
+        },
+      }))
+      return
+    }
+
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
@@ -762,8 +806,21 @@ wss.on('connection', (socket) => {
       if (method === 'thread/start') {
         const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
         activeThreadIds.add(thread.id)
+        // kata 1wxv (LBC-1): threads started paginated are the only threads
+        // thread/revert accepts (the refusal gate above consults this set).
+        if (message.params?.historyMode === 'paginated') {
+          paginatedThreadIds.add(thread.id)
+        }
         broadcastNotification('thread/started', {
           thread,
+        })
+      }
+      if (method === 'thread/revert') {
+        // kata 1wxv: the real app-server announces an applied revert to every
+        // connected client (the result above already answered the requester).
+        broadcastNotification('thread/reverted', {
+          threadId: message.params?.threadId,
+          beforeTurnId: message.params?.beforeTurnId,
         })
       }
       if (method === 'thread/resume') {

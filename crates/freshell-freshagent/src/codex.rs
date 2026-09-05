@@ -62,9 +62,10 @@ use freshell_codex::launch_plan::codex_sidecar_spawn_spec;
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
-    CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
-    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    normalize_freshcodex_model, read_rollout_history_mode, to_codex_reasoning_effort,
+    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
+    CodexSubscription, HistoryMode, StartThreadParams, StartTurnParams, ThreadForkParams,
+    CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
@@ -175,6 +176,14 @@ pub struct FreshCodexState {
     /// round-3). The RAII guard releases on every terminal leg (success, refusal,
     /// and the post-archive containment alike).
     fork_in_flight: crate::InFlightRegistry,
+    /// Per-thread rollback single-flight (kata 1wxv Task 2, r2 lock discipline):
+    /// [`Self::handle_rollback`] acquires BEFORE the session's `turn_lock` (lock
+    /// order: rollback_in_flight FIRST, then the turn lock — never the reverse).
+    /// [`Self::handle_send`] NEVER acquires or consults this registry: while a
+    /// rollback holds the turn lock, a send simply waits on the turn lock, then
+    /// proceeds and destroys redo ("send waits, rollback wins, then destroys") —
+    /// no circular wait, no deadlock.
+    rollback_in_flight: crate::InFlightRegistry,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -205,6 +214,49 @@ struct CodexSession {
     /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
     /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
+    /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
+    /// `turn/started` — a posting window exists where `active_turn` is still
+    /// notification-driven NONE while the compact turn is already running
+    /// provider-side. `handle_compact` SETS this under the session `turn_lock`
+    /// (the handle_send busy-truth discipline) and the notification consumer
+    /// CLEARS it at the compact turn's `turn/completed` (any status — a failed
+    /// compact ends the turn too). `handle_rollback`'s busy gate reads
+    /// `active_turn.is_some() || compact_in_flight` so a post-RPC/pre-turn-started
+    /// rollback can never force-interrupt the compact.
+    compact_in_flight: Arc<AtomicBool>,
+    /// Focused-review ep1-r3 F4 (compact completion-id OWNERSHIP): the compact
+    /// turn's id, captured from its `turn/started` — i.e. the FIRST `turn/started`
+    /// observed while [`Self::compact_in_flight`] is armed with no id captured yet
+    /// (provider FIFO: the compact was submitted before any later send, so its
+    /// start surfaces first). [`reduce_notification`] clears `compact_in_flight`
+    /// ONLY at the `turn/completed` whose params turn id MATCHES this id; a
+    /// completion carrying a DIFFERENT id (the documented probed sequence lands a
+    /// DELAYED PRIOR-turn completion inside the armed-clear-pending window, before
+    /// the compact's own `turn/started`) never clears it. `None` while armed ==
+    /// armed-clear-pending (the compact's start hasn't surfaced). Reset to `None`
+    /// by `handle_compact` at every arm and by the (submit-call-owned) RPC-failure
+    /// clear path, so ownership belongs to exactly one compact operation.
+    compact_turn_id: Arc<StdMutex<Option<String>>>,
+    /// Kata 1wxv Task 2 (LBC-1, r3): the thread's DURABLE history mode.
+    /// `Some(Paginated)` for threads freshell STARTED (we SET
+    /// `historyMode:"paginated"` on `thread/start`); resumed/adopted/forked
+    /// threads take the mode parsed from the rollout's persisted
+    /// `session_meta.history_mode` (`read_rollout_history_mode` — `thread/resume`
+    /// carries no mode param, so the durable meta is the only source of truth;
+    /// the app-server has no live read-back). `None` only when that durable
+    /// meta is missing/unparseable ⇒ legacy ⇒ capability stamps `undo:false`.
+    /// Kata 1wxv Task 5 consumes it (`build_codex_snapshot_json`'s
+    /// `capabilities.undo` stamp, read by [`FreshCodexState::get_snapshot`]).
+    history_mode: Option<HistoryMode>,
+    /// The per-session async turn lock (kata 1wxv Task 2, r2 serialization
+    /// discipline): [`FreshCodexState::handle_rollback`] holds it across the
+    /// WHOLE handler (busy-check → reads → revert → record write → reply);
+    /// [`FreshCodexState::handle_send`] holds it across the `turn/start` write
+    /// and the busy-truth set (closing the check-then-set window against the
+    /// rollback busy gate). Rollback-vs-rollback additionally single-flights on
+    /// `rollback_in_flight`, acquired FIRST (never the reverse order).
+    turn_lock: Arc<TokioMutex<()>>,
     /// The notification-consumer task (aborted on shutdown/kill).
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
@@ -311,6 +363,7 @@ impl FreshCodexState {
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
+            rollback_in_flight: crate::InFlightRegistry::new(),
         }
     }
 
@@ -654,6 +707,9 @@ impl FreshCodexState {
                 model: Some(model.clone()),
                 sandbox: sandbox.clone(),
                 approval_policy: permission_mode.clone(),
+                // LBC-1 (kata 1wxv Task 2): every thread freshell STARTS adopts
+                // `historyMode:"paginated"` (thread/revert refuses legacy threads).
+                history_mode: Some(HistoryMode::Paginated),
             })
             .await;
         let thread_id = match started {
@@ -681,6 +737,8 @@ impl FreshCodexState {
             sandbox,
             permission_mode,
             None,
+            // Threads freshell starts are paginated (we SET the mode at start).
+            Some(HistoryMode::Paginated),
         )
         .await;
     }
@@ -756,6 +814,9 @@ impl FreshCodexState {
                     model: Some(model.clone()),
                     sandbox: sandbox.clone(),
                     approval_policy: permission_mode.clone(),
+                    // thread/resume takes NO mode param (the durable rollout meta
+                    // carries the history mode).
+                    history_mode: None,
                 },
             )
             .await;
@@ -808,6 +869,18 @@ impl FreshCodexState {
         let thread_id = resume_session_id;
         self.clear_dead_thread(&thread_id).await;
 
+        // Kata 1wxv Task 2 (r3): the durable rollout meta is the ONE source of
+        // truth for the resumed thread's history mode (thread/resume takes no
+        // mode param) — only a missing/unparseable meta stamps legacy.
+        let history_mode = match read_rollout_history_mode(&thread_id) {
+            Some(mode) => Some(mode),
+            None => {
+                tracing::debug!(session = %thread_id,
+                    "freshagent.codex.history_mode_unreadable_on_resume: stamping legacy");
+                None
+            }
+        };
+
         self.finish_create(
             request_id,
             thread_id,
@@ -821,6 +894,7 @@ impl FreshCodexState {
             sandbox,
             permission_mode,
             lease_guard,
+            history_mode,
         )
         .await;
     }
@@ -846,6 +920,9 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // Kata 1wxv Task 2: the thread's durable history mode — `Some(Paginated)`
+        // for threads freshell started, the rollout-meta parse for resumes.
+        history_mode: Option<HistoryMode>,
     ) {
         // Task 12 EVICTION GUARD: on base this tail REPLACED a live incumbent under the
         // same threadId -- orphaning the winner's sidecar and stealing its binding
@@ -889,11 +966,15 @@ impl FreshCodexState {
         // cannot possibly observe an event that fired before it existed). The unbounded
         // `notifs` channel buffers whatever arrives in the meantime -- nothing is lost,
         // only its delivery to the consumer is deferred.
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
             thread_id.clone(),
             active_turn.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
             Some(created_rx),
         );
 
@@ -922,6 +1003,10 @@ impl FreshCodexState {
                 sandbox: sandbox.clone(),
                 permission_mode: permission_mode.clone(),
                 active_turn,
+                compact_in_flight,
+                compact_turn_id,
+                history_mode,
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -1124,15 +1209,49 @@ impl FreshCodexState {
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
                     s.active_turn.clone(),
+                    s.turn_lock.clone(),
                 )
             })
         };
-        let Some((client, model, effort, turn_cwd, sandbox, permission_mode, active_turn)) =
-            looked_up
+        let Some((
+            client,
+            model,
+            effort,
+            turn_cwd,
+            sandbox,
+            permission_mode,
+            active_turn,
+            turn_lock,
+        )) = looked_up
         else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
+
+        // Kata 1wxv Task 2 (r2 serialization discipline): take the session's
+        // async turn lock and hold it from here across the `turn/start` write
+        // AND the active-turn set — the check-then-set window against
+        // `handle_rollback`'s busy gate (a rollback holding this lock observes
+        // either no-turn or a fully-registered in-flight turn, never the "turn
+        // starting but not yet tracked" intermediate). `handle_send` NEVER
+        // acquires or consults `rollback_in_flight`: while a rollback holds
+        // this lock, the send simply waits, then proceeds and destroys redo
+        // ("send waits, rollback wins, then destroys").
+        let _turn = turn_lock.lock().await;
+
+        // Decision 5 (codex/opencode/claude share this helper): any new
+        // submission permanently destroys redo. AWAITED before the turn goes
+        // out; a ledger write failure is logged but never blocks the send.
+        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+            &self.identity_sink(),
+            PROVIDER,
+            &session_id,
+            now_ms(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
+        }
 
         // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
         let model = normalize_freshcodex_model(Some(&model));
@@ -1267,10 +1386,25 @@ impl FreshCodexState {
     /// (`thread/status/changed{active}` → `turn/started` → items/token-usage →
     /// `thread/status/changed{idle}` → `turn/completed{turn.status:'completed'}`; NO
     /// `thread/compacted` notification exists in the success flow, so no new
-    /// `CodexStatus` is needed). Concurrency gate: a BEST-EFFORT refusal while a turn
-    /// is tracked active (`active_turn` set) — a concurrent send or a rapid second
-    /// Compact click can slip past it, in which case the app-server's rejection is
-    /// the backstop (surfaced as `CODEX_COMPACT_FAILED`). Every failure path is LOUD
+    /// `CodexStatus` is needed). Concurrency gate (kata 1wxv Task 2 review M1):
+    /// the refusal-while-active gate AND the `compact_thread` RPC run UNDER the
+    /// session `turn_lock` (the `handle_send`/`handle_rollback` discipline) — a
+    /// rollback holding this lock makes a racing compact WAIT, so
+    /// `thread/revert` can never land inside the compact RPC's check-then-set
+    /// window (the provider revert would force-interrupt a compact turn the
+    /// busy gate never saw). `thread/compact/start`'s `Record<string, never>`
+    /// answer carries no turn id, and the probed 0.147.0 order returns the RPC
+    /// BEFORE `turn/started` — so compact's busy TRUTH pairs the notification-
+    /// written `active_turn` with the explicit `compact_in_flight` bit SET under
+    /// the turn lock below and cleared at the compact turn's `turn/completed`
+    /// ([`reduce_notification`]) — delta-r1 F2; the rollback busy gate reads
+    /// both. The
+    /// active-turn refusal remains, and a rapid second Compact click is refused
+    /// server-side with the rollback `BUSY_TURN` copy while the first compact's
+    /// window marker is armed (focused ep1-r2 F3 — the failure-clear of that
+    /// marker then belongs to the call that armed it alone); the app-server's
+    /// rejection stays the backstop for a genuinely failed RPC (surfaced as
+    /// `CODEX_COMPACT_FAILED`). Every failure path is LOUD
     /// via the nested `freshAgent.error` banner envelope (a request-less top-level
     /// `error` frame never reaches the frozen client's pane surface).
     ///
@@ -1325,16 +1459,33 @@ impl FreshCodexState {
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .map(|s| (s.client.clone(), s.active_turn.clone()))
+            guard.get(&session_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.turn_lock.clone(),
+                    s.compact_in_flight.clone(),
+                    s.compact_turn_id.clone(),
+                )
+            })
         };
-        let Some((client, active_turn)) = looked_up else {
+        let Some((client, active_turn, turn_lock, compact_in_flight, compact_turn_id)) = looked_up
+        else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
             // lost-session leg, never silence.
             self.broadcast(&lost_session_frame(&session_id));
             return;
         };
+
+        // Kata 1wxv Task 2 review M1: take the session's async turn lock and
+        // hold it across the busy gate AND the `thread/compact/start` RPC (the
+        // [`Self::handle_send`] discipline) — a rollback holding this lock makes
+        // a racing compact WAIT, so `thread/revert` can never land inside the
+        // compact RPC's check-then-set window (the provider revert would
+        // force-interrupt a compact turn the busy gate never saw). Compact
+        // never acquires or consults `rollback_in_flight`: it simply waits on
+        // the lock, mirroring send.
+        let _turn = turn_lock.lock().await;
 
         if active_turn.lock().expect("active_turn mutex").is_some() {
             self.emit_fresh_agent_error(
@@ -1347,9 +1498,405 @@ impl FreshCodexState {
             return;
         }
 
+        // Focused-review ep1-r2 F3 (compact ownership): a SECOND compact
+        // landing while compact-1's window marker is armed (its RPC answered,
+        // its `turn/started` not yet surfaced) is REFUSED with the rollback
+        // `BUSY_TURN` copy. The precheck MUST read the window bit: the pre-F3
+        // gate examined only `active_turn`, so the rapid second compact entered
+        // the RPC — and a REJECTED second RPC's failure-clear below then wiped
+        // the FIRST compact's busy truth, letting a queued rollback land
+        // `thread/revert` mid-compact. Refusal BEFORE arming restores
+        // ownership: the failure-clear can now only ever run for the call that
+        // armed the bit.
+        if compact_in_flight.load(Ordering::SeqCst) {
+            self.emit_fresh_agent_error(
+                &session_id,
+                "BUSY_TURN",
+                crate::rollback_record::ROLLBACK_BUSY_MESSAGE,
+            );
+            return;
+        }
+
+        // Delta-r1 F2: mark the compact-window busy truth UNDER the turn lock,
+        // BEFORE the RPC — the `thread/compact/start` answer arrives BEFORE any
+        // `turn/started` notification (the probed 0.147.0 order), and
+        // `active_turn` alone leaves that post-RPC window uncovered. The bit
+        // clears when the compact turn's OWN `turn/completed` (any status) flows
+        // through `reduce_notification` — ep1-r3 F4: ID-MATCHED against
+        // `compact_turn_id` (captured at the compact's `turn/started`), so a
+        // delayed PRIOR-turn completion can never clear another compact's window.
+        // The ownership id resets HERE (armed-clear-pending) at every arm, and a
+        // FAILED RPC means no compact turn ever starts — clear what we set (the
+        // submit call owns the failure path; fail-closed, never wedges the gate).
+        *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+        compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
+            // Focused ep4-r6 (codex.rs:1530, F4 at round 5): ONLY an
+            // explicit JSON-RPC rejection proves the compact never started
+            // → the marker clears. Transport means a WS write/flush
+            // failure — which tells nothing about whether the server
+            // received the frame — and every other class is the
+            // ambiguous-post-send shape; all stay fail-closed: the compact
+            // turn's own notifications own the retirement (a never-
+            // starting compact wedges conservatively, never silently).
+            if matches!(&err, CodexAppServerError::Rpc { .. }) {
+                compact_in_flight.store(false, Ordering::SeqCst);
+                *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+            }
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
+    }
+
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 2; codex undo-only) ─
+
+    /// Handle a `freshAgent.undo` (or a misplaced `freshAgent.redo`) for codex:
+    /// `thread/revert` is the in-place, same-thread-id DESTRUCTIVE history
+    /// rollback (keep the prefix strictly BEFORE the boundary turn; an empty
+    /// prefix — reverting before the first turn — LEGALLY empties the thread).
+    /// Codex has NO redo primitive (decision 5): a redo is refused
+    /// permanently, the wire-level refusal cell stays forever, and the stored
+    /// record's `can_redo` bit is always false.
+    ///
+    /// Ordering (durable-BEFORE-mutation + the r2 serialization discipline):
+    ///   1. the permanent redo refusal and the request-shape validation;
+    ///   2. `ensure_session_alive` (the same arms as [`Self::handle_fork`]) —
+    ///      a crash-stale session transparently respawns first;
+    ///   3. `rollback_in_flight` single-flight, acquired FIRST, then the
+    ///      session's `turn_lock`, held across the WHOLE rest of this handler
+    ///      (busy-check → pre-revert read → ledger pre-write → revert →
+    ///      broadcast/reply). `handle_send` never touches `rollback_in_flight`;
+    ///      it waits behind this lock, then proceeds and destroys redo — no
+    ///      circular wait exists;
+    ///   4. the busy gate (`active_turn` set ⇒ `BUSY_TURN`) is the SOLE
+    ///      mid-turn protection — the provider revert FORCE-INTERRUPTS
+    ///      (validator extra-1), so a gate hole is silent corruption, and no
+    ///      RPC at all leaves this handler for a refused attempt;
+    ///   5. the PRE-REVERT capture (`thread/read{includeTurns:true}`, with the
+    ///      zero-turn include-turns fallback `get_snapshot` already uses) pins
+    ///      the removed tail before the destructive RPC destroys it;
+    ///   6. the ledger record pre-write is AWAITED BEFORE the mutation — a
+    ///      pre-write failure refuses with `INTERNAL_ERROR` +
+    ///      `LEDGER_WRITE_REFUSAL_COPY` and the provider history is NEVER
+    ///      mutated; a provider failure AFTER a successful pre-write is
+    ///      compensated ONLY on explicit RPC-rejection legs (the provider
+    ///      ANSWERED with a JSON-RPC error ⇒ provably unmoved — the pre-op
+    ///      record is restored before the refusal is answered); transport legs
+    ///      (Timeout/Closed/Transport ⇒ the provider may have applied) KEEP
+    ///      the post-op ledger and answer `INTERNAL_ERROR` +
+    ///      `CODEX_UNCERTAIN_ROLLBACK_COPY` (review M3 — a compensating
+    ///      rewrite would erase markers for a possibly-applied revert).
+    ///
+    /// Record semantics (r3 UNION rule): `entries` accumulates the union of
+    /// EVERY epoch's rolled-back turns (codex's revert DESTROYS the tail
+    /// natively, so the ledger is the markers' only durable home — decision
+    /// 6); a new undo landing while `redo_destroyed` was set starts a NEW
+    /// epoch that clears ONLY that bit (the record's redo fields then describe
+    /// the new chain; codex has no chain root). Marker rows are never dropped.
+    /// A rollback NEVER chimes: the broadcast is `freshAgent.session.rolledBack`
+    /// with `revokeAttention:true`, never a `turn.complete`.
+    pub async fn handle_rollback(
+        &self,
+        op: crate::rollback_record::RollbackRequest,
+        reply_sink: FrameSink,
+    ) {
+        use crate::rollback_record::*;
+
+        // Decision 5: undo-only. (The WS refusal cell also answers codex redo
+        // permanently; this belt covers a directly-dispatched frame.)
+        if op.direction == RollbackDirection::Redo {
+            reply_sink(rollback_error_frame(
+                &op,
+                "UNSUPPORTED_CAPABILITY",
+                "Redo is not supported for freshcodex (codex history revert is destructive; there is no redo primitive).",
+            ));
+            return;
+        }
+        // `turnId` absent on a toTurn frame is a server-side validation error
+        // (never a zod refinement — the frozen contract keeps bare objects).
+        if op.mode == RollbackModeReq::ToTurn && op.turn_id.is_none() {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_ROLLBACK_TARGET",
+                "undo toTurn requires a turnId",
+            ));
+            return;
+        }
+
+        // ensure-alive parity with handle_fork (the same arms): a crash-stale
+        // sidecar transparently respawns; genuinely lost sessions answer the
+        // client's recovery-engaging INVALID_SESSION_ID shape.
+        let thread_id = match self.ensure_session_alive(&op.session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
+                op.session_id.clone()
+            }
+            Ok(EnsureAliveOutcome::Respawned { new_session_id }) => new_session_id,
+            Err(EnsureAliveError::NotFound) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INVALID_SESSION_ID",
+                    &format!("codex session {} not found", op.session_id),
+                ));
+                return;
+            }
+            Err(EnsureAliveError::RespawnFailed(err)) => {
+                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+        };
+
+        // Rollback-vs-rollback single-flight (lock order: FIRST, before the
+        // turn lock — never the reverse).
+        let Some(_guard) = self.rollback_in_flight.try_acquire(&thread_id) else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INTERNAL_ERROR",
+                &format!("rollback already in progress for {thread_id}"),
+            ));
+            return;
+        };
+
+        let (client, active_turn, turn_lock, compact_in_flight) = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&thread_id) {
+                Some(s) => (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.turn_lock.clone(),
+                    s.compact_in_flight.clone(),
+                ),
+                None => {
+                    // TOCTOU: a kill can land between ensure-alive and this lookup.
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INVALID_SESSION_ID",
+                        &format!("codex session {thread_id} not found"),
+                    ));
+                    return;
+                }
+            }
+        };
+        // Held for the REST of this handler. Busy truth is written by
+        // handle_send UNDER this same lock across the turn/start write (the
+        // check-then-set window is closed): observed idle here means no send is
+        // in flight, and no send can start until this handler releases.
+        let _turn = turn_lock.lock().await;
+        // Delta-r1 F2: the busy gate ALSO reads the compact-window truth — a
+        // `thread/compact/start` whose RPC answered but whose turn/started
+        // notification has not surfaced is mid-turn provider-side; a rollback
+        // here would force-interrupt the compact.
+        if active_turn.lock().expect("active_turn mutex").is_some()
+            || compact_in_flight.load(Ordering::SeqCst)
+        {
+            // Zero RPCs leave this handler on the refused path — the busy gate
+            // is the SOLE mid-turn protection (the provider revert would
+            // force-interrupt).
+            reply_sink(rollback_error_frame(
+                &op,
+                "BUSY_TURN",
+                ROLLBACK_BUSY_MESSAGE,
+            ));
+            return;
+        }
+
+        // PRE-REVERT capture — thread/revert destroys the removed tail, so the
+        // ack's removedPromptText and the ledger markers come from this read.
+        let read = match client.read_thread(&thread_id, true).await {
+            Ok(v) => v,
+            Err(err) if is_codex_include_turns_unavailable(&err) => {
+                // LBC-1: a ZERO-TURN paginated thread answers -32601
+                // "list_turns is not supported yet" until its first turn
+                // commits — the same include-turns fallback get_snapshot uses.
+                match client.read_thread(&thread_id, false).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "INTERNAL_ERROR",
+                            &err.to_string(),
+                        ));
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    &err.to_string(),
+                ));
+                return;
+            }
+        };
+        let raw_turns = read
+            .get("thread")
+            .and_then(|t| t.get("turns"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (before_turn_id, removed) =
+            match resolve_codex_boundary(&raw_turns, op.mode, op.turn_id.as_deref()) {
+                Ok(v) => v,
+                Err(CodexRollbackError::NothingToUndo) => {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "NOTHING_TO_UNDO",
+                        UNDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                }
+                Err(CodexRollbackError::TargetNotFound) => {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INVALID_ROLLBACK_TARGET",
+                        &format!("turn {:?} is not in this thread's history", op.turn_id),
+                    ));
+                    return;
+                }
+            };
+        let removed_ids: Vec<String> = removed
+            .iter()
+            .filter_map(|t| {
+                t.get("turnId")
+                    .or_else(|| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        // The composer-refill payload: the FIRST removed USER display turn's text.
+        let prompt = removed
+            .iter()
+            .find(|t| t.get("role").and_then(Value::as_str) == Some("user"))
+            .map(codex_turn_plain_text)
+            .unwrap_or_default();
+
+        // Durable record FIRST (durable-BEFORE-mutation): the post-op record is
+        // computed from the PRE-revert read, then AWAITED. A failed write
+        // refuses the rollback — provider history is never mutated.
+        let now = now_ms();
+        let previous = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, &thread_id));
+        // The epoch state AT LOAD (before the bit clears) selects the marker
+        // splice semantics below.
+        let starts_new_epoch = previous.as_ref().map(|p| p.redo_destroyed).unwrap_or(false);
+        let mut record = match previous.clone() {
+            Some(p) => p,
+            None => RollbackRecord::empty(now),
+        };
+        // Review Minor-3 + delta-r1 F8: the marker bucket is CONVERSATION order
+        // on every lane (the plan :165 union rule wins over the :166 codex
+        // append bullet), ordered by LITERAL epoch bookkeeping — positions never
+        // read timestamps:
+        // - a NEW epoch (redo_destroyed was set at load) bumps `current_epoch`
+        //   FIRST — every existing entry freezes with its own epoch value —
+        //   then the new entry lands behind them;
+        // - otherwise (same epoch) the new entry splices BEFORE the existing
+        //   same-epoch entries (each undo removes an EARLIER-in-conversation
+        //   step, so the current-epoch block reads t1..tn ascending).
+        // Only the redo-capable chain state resets across the boundary —
+        // `entries` is NEVER cleared (the r3 union accumulates); the revision
+        // floor is restamped by the set_can_redo below.
+        if starts_new_epoch {
+            record.redo_destroyed = false;
+            record.begin_new_epoch();
+        }
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: removed,
+                prompt_text: prompt.clone(),
+                at_ms: now,
+                epoch: record.current_epoch,
+            },
+            now,
+        );
+        record.set_can_redo(false, now); // codex is undo-only (decision 5)
+        if let Some(sink) = self.identity_sink() {
+            if let Err(e) = sink.record_rollback(PROVIDER, &thread_id, record).await {
+                tracing::warn!(error = %e, session = %thread_id, "freshagent.codex.rollback_pre_write_failed");
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    LEDGER_WRITE_REFUSAL_COPY,
+                ));
+                return;
+            }
+        }
+
+        if let Err(err) = client.revert_thread(&thread_id, &before_turn_id).await {
+            if matches!(&err, CodexAppServerError::Rpc { .. }) {
+                // An explicit JSON-RPC error ANSWER means the provider PROVABLY
+                // rejected the revert (unmoved): restore the pre-op record
+                // FIRST (the ledger must not describe a rollback the provider
+                // rejected), then answer.
+                if let Some(sink) = self.identity_sink() {
+                    let restore = previous.unwrap_or_else(|| RollbackRecord::empty(now));
+                    if let Err(e) = sink.record_rollback(PROVIDER, &thread_id, restore).await {
+                        tracing::warn!(error = %e, session = %thread_id, "freshagent.codex.rollback_compensate_failed");
+                    }
+                }
+                if is_codex_revert_legacy_refusal(&err) {
+                    // LBC-1 belt: a pre-feature LEGACY thread (the durable
+                    // history_mode stamp already advertises undo:false; if we get
+                    // here anyway, the refusal carries the known-legacy copy).
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "UNSUPPORTED_CAPABILITY",
+                        CODEX_LEGACY_THREAD_COPY,
+                    ));
+                } else if is_codex_revert_unknown_method(&err) {
+                    // The CLI predates thread/revert (unknown-method / -32601).
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "UNSUPPORTED_CAPABILITY",
+                        CODEX_OLD_CLI_COPY,
+                    ));
+                } else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INTERNAL_ERROR",
+                        &err.to_string(),
+                    ));
+                }
+            } else {
+                // Review M3 — transport legs (Timeout/Closed/Transport): the
+                // provider may ALREADY have applied the revert, so NEVER
+                // compensate (erasing markers for a possibly-applied mutation
+                // would falsify the ledger). KEEP the post-op record and answer
+                // INTERNAL_ERROR with the uncertain-state copy.
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    CODEX_UNCERTAIN_ROLLBACK_COPY,
+                ));
+            }
+            return;
+        }
+
+        // Converge siblings + revoke attention (decisions 6/10). The broadcast
+        // carries NO prompt text (other devices' composers are untouched), and
+        // a rollback NEVER chimes (no freshAgent.turn.complete).
+        self.broadcast(&rollback_broadcast_frame(
+            &op,
+            &thread_id,
+            &removed_ids,
+            false,
+        ));
+        reply_sink(rollback_ack_frame(
+            &op,
+            &thread_id,
+            Some(&prompt),
+            &removed_ids,
+            false,
+            None,
+        ));
     }
 
     // ── freshAgent.fork (WS, AGENT-07) ───────────────────────────────────────
@@ -1621,6 +2168,7 @@ impl FreshCodexState {
                     model: Some(eff_model.clone()),
                     sandbox: parent_sandbox.clone(),
                     approval_policy: parent_permission_mode.clone(),
+                    history_mode: None, // resume carries no mode param
                 },
             )
             .await;
@@ -1659,7 +2207,9 @@ impl FreshCodexState {
         }
 
         // Register the child on its OWN sidecar (the shared registration tail, the
-        // ensure_session_resumable shape), inheriting the parent's settings.
+        // ensure_session_resumable shape), inheriting the parent's settings. The
+        // child rollout's durable session_meta is the history-mode SoT (kata 1wxv
+        // Task 2): a paginated parent's child stays rollback-capable.
         self.register_live_session(
             &child_id,
             child_client,
@@ -1671,6 +2221,7 @@ impl FreshCodexState {
             eff_cwd.clone(),
             parent_sandbox.clone(),
             parent_permission_mode.clone(),
+            read_rollout_history_mode(&child_id),
         )
         .await;
 
@@ -2136,6 +2687,7 @@ impl FreshCodexState {
                     model: resume_model,
                     sandbox: sandbox.clone(),
                     approval_policy: permission_mode.clone(),
+                    history_mode: None, // resume carries no mode param
                 },
             )
             .await;
@@ -2155,6 +2707,7 @@ impl FreshCodexState {
                             model: None,
                             sandbox: None,
                             approval_policy: None,
+                            history_mode: None, // resume carries no mode param
                         },
                     )
                     .await
@@ -2224,8 +2777,16 @@ impl FreshCodexState {
         }
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, session_id.to_string(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            session_id.to_string(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2255,6 +2816,14 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    compact_in_flight,
+                    compact_turn_id,
+                    // Kata 1wxv Task 2 (r3): the durable rollout meta is the SoT
+                    // for the mode across crash-recovery resume (undo capability
+                    // survives rehydration for a paginated thread; only a
+                    // missing/unparseable meta stamps legacy).
+                    history_mode: read_rollout_history_mode(session_id),
+                    turn_lock: Arc::new(TokioMutex::new(())),
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -2343,6 +2912,9 @@ impl FreshCodexState {
                 model: Some(model.clone()),
                 sandbox: sandbox.clone(),
                 approval_policy: permission_mode.clone(),
+                // LBC-1 (kata 1wxv Task 2): every thread freshell STARTS adopts
+                // `historyMode:"paginated"`.
+                history_mode: Some(HistoryMode::Paginated),
             })
             .await;
         let new_thread_id = match started {
@@ -2361,8 +2933,16 @@ impl FreshCodexState {
         };
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, new_thread_id.clone(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            new_thread_id.clone(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2387,6 +2967,10 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    compact_in_flight,
+                    compact_turn_id,
+                    history_mode: Some(HistoryMode::Paginated),
+                    turn_lock: Arc::new(TokioMutex::new(())),
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -2589,8 +3173,17 @@ impl FreshCodexState {
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        compact_in_flight: Arc<AtomicBool>,
+        compact_turn_id: Arc<StdMutex<Option<String>>>,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, None)
+        self.spawn_consumer_after(
+            notifs,
+            thread_id,
+            active_turn,
+            compact_in_flight,
+            compact_turn_id,
+            None,
+        )
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -2607,6 +3200,8 @@ impl FreshCodexState {
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        compact_in_flight: Arc<AtomicBool>,
+        compact_turn_id: Arc<StdMutex<Option<String>>>,
         gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
@@ -2616,7 +3211,13 @@ impl FreshCodexState {
             }
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
-                let events = reduce_notification(&mut subscription, notification, &active_turn);
+                let events = reduce_notification(
+                    &mut subscription,
+                    notification,
+                    &active_turn,
+                    &compact_in_flight,
+                    &compact_turn_id,
+                );
                 for event in events {
                     // DIAG-01: the positive turn-complete chime only -- session_id
                     // alone, never the turn's text/response content.
@@ -2662,8 +3263,28 @@ impl FreshCodexState {
                 .map_err(CodexSnapshotError::AppServer)?,
             Err(err) => return Err(CodexSnapshotError::AppServer(err)),
         };
-        build_codex_snapshot_json(thread_id, &raw, active_turn_present)
-            .map_err(CodexSnapshotError::Protocol)
+        // Kata 1wxv Task 5: the capability stamp is SESSION-SCOPED by the
+        // recorded DURABLE history mode (correction item 1, r3 — never live-probed
+        // per snapshot; the app-server exposes no mode read-back). A session the
+        // sessions map can't name (TOCTOU kill between resume and this read)
+        // reads as legacy: `undo:false`, never over-advertised.
+        let history_mode = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .and_then(|s| s.history_mode);
+        let rollback = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, thread_id));
+        build_codex_snapshot_json(
+            thread_id,
+            &raw,
+            active_turn_present,
+            history_mode,
+            rollback.as_ref(),
+        )
+        .map_err(CodexSnapshotError::Protocol)
     }
 
     /// Resolve the live client + active-turn bit for `thread_id`, via
@@ -2919,6 +3540,7 @@ impl FreshCodexState {
                     model: rec.model.clone(),
                     sandbox: rec.sandbox.clone(),
                     approval_policy: rec.permission_mode.clone(),
+                    history_mode: None, // resume carries no mode param
                 },
             )
             .await;
@@ -2989,6 +3611,9 @@ impl FreshCodexState {
                 cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
                 rec.sandbox.clone(),
                 rec.permission_mode.clone(),
+                // Kata 1wxv Task 2 (r3): the durable rollout meta carries the
+                // mode across resume (only a missing/unparseable meta ⇒ legacy).
+                read_rollout_history_mode(thread_id),
             )
             .await;
 
@@ -3056,10 +3681,21 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        // Kata 1wxv Task 2: the thread's durable history mode (the rollout-meta
+        // parse the resume/fork callers perform post-RPC).
+        history_mode: Option<HistoryMode>,
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -3080,6 +3716,10 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 active_turn: active_turn.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                history_mode,
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -3139,6 +3779,11 @@ impl FreshCodexState {
                 sandbox: None,
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(active_turn)),
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
+                // This fixture models a thread freshell started (paginated).
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -3187,6 +3832,11 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
     let message = err.to_string();
     message.contains("includeTurns is unavailable before first user message")
         || message.contains("not materialized yet")
+        // LBC-1 (kata 1wxv Task 2): a ZERO-TURN PAGINATED thread answers
+        // -32601 "list_turns is not supported yet" on read/includeTurns +
+        // turns/list until its first turn commits — the same "no committed
+        // turns yet" fallback case this helper exists for.
+        || message.contains("list_turns is not supported yet")
 }
 
 /// The reference has no dedicated "is this genuinely a missing thread" check for
@@ -3616,6 +4266,11 @@ fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
     _active_turn_present: bool,
+    // Kata 1wxv Task 5: the session's DURABLE history mode (the capability stamp
+    // source) and the durable rollback record (the marker bucket + redo bit +
+    // revision floor; `None` when the session never rolled back).
+    history_mode: Option<HistoryMode>,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
 ) -> Result<Value, String> {
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
     let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
@@ -3667,7 +4322,8 @@ fn build_codex_snapshot_json(
         })
         .collect();
 
-    Ok(json!({
+    let undo_capable = history_mode == Some(HistoryMode::Paginated);
+    let mut snapshot = json!({
         "sessionType": SESSION_TYPE,
         "provider": PROVIDER,
         "threadId": thread_id,
@@ -3683,6 +4339,14 @@ fn build_codex_snapshot_json(
             "worktrees": false,
             "diffs": false,
             "childThreads": false,
+            // Kata 1wxv Task 5: SESSION-SCOPED stamps (correction item 1, r3) —
+            // undo iff the thread's durable history mode is paginated; codex
+            // redo is permanently unavailable (revert is destructive; there is
+            // no redo primitive). Absent updatable older servers emit neither
+            // key; a legacy/unknown mode stamps undo:false here — never a
+            // hard-coded true.
+            "undo": undo_capable,
+            "redo": false,
         },
         "tokenUsage": {
             "inputTokens": 0,
@@ -3697,7 +4361,25 @@ fn build_codex_snapshot_json(
         "childThreads": [],
         "turns": turns,
         "extensions": { "codex": {} },
-    }))
+    });
+    if let Some(record) = rollback {
+        // The marker bucket is LEDGER-SOURCED: `thread/revert` destroys the
+        // provider tail, so only the r3 entries union can satisfy decision 6's
+        // "persist marked". The stored `can_redo` bit is the only source (codex
+        // stamps it false at every write). The record also doubles as the
+        // revision floor: a stale `updatedAt` (or the include-turns-fallback
+        // read) never lets the client's monotonic watermark drop the
+        // post-rollback snapshot.
+        let basis = snapshot["revision"].as_i64().unwrap_or(0);
+        let floored = crate::rollback_record::stamp_rollback_snapshot(
+            &mut snapshot,
+            basis,
+            record,
+            record.can_redo(),
+        );
+        snapshot["revision"] = json!(floored);
+    }
+    Ok(snapshot)
 }
 
 /// One raw codex turn's items, grouped into contiguous same-role rows -- the intermediate
@@ -3919,10 +4601,23 @@ fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
 /// the legacy `activeTurnByThread` clear points onto `active_turn` (adapter.ts:901,913,1101-1103
 /// — leaving running/starting, a turn completing, or the thread closing all clear it;
 /// `turn/started` SETS it too, as a fallback alongside `handle_send`'s direct set).
+/// Delta-r1 F2: a turn/completed arm ALSO clears the session's compact-window
+/// busy truth (`compact_in_flight`) — the compact turn ends there (any status).
+/// Focused-review ep1-r3 F4 (completion-id OWNERSHIP): the clear is KEYED —
+/// `compact_in_flight` clears ONLY at the `turn/completed` whose params turn id
+/// matches `compact_turn_id` (captured at the compact's own `turn/started`:
+/// the FIRST start observed while armed-clear-pending — provider FIFO puts the
+/// compact's start before any later send's). A `turn/completed` carrying a
+/// DIFFERENT id (a DELAYED PRIOR-turn completion can land inside the
+/// armed-clear-pending window — the probed sequence emits `thread/status:idle`
+/// BEFORE that stale completion) NEVER clears the window, and neither does a
+/// completion arriving with no id captured yet.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
     active_turn: &Arc<StdMutex<Option<String>>>,
+    compact_in_flight: &Arc<AtomicBool>,
+    compact_turn_id: &Arc<StdMutex<Option<String>>>,
 ) -> Vec<CodexAdapterEvent> {
     match notification {
         CodexNotification::ThreadStarted { thread } => {
@@ -3938,11 +4633,21 @@ fn reduce_notification(
                 .collect()
         }
         CodexNotification::ThreadStatusChanged { thread_id, status } => {
-            // adapter.ts:898-903 — unconditional clear (harmless if unset) once the thread
-            // leaves running/starting, regardless of whether TurnStarted ever fired.
+            // adapter.ts:898-903 — clear (harmless if unset) once the thread
+            // leaves running/starting, regardless of whether TurnStarted ever
+            // fired. ep3-r4 F2: while a compact window is armed, the
+            // thread-level idle is the COMPACT LIFECYCLE's documented
+            // punctuation (it lands between the compact's turn/started and its
+            // turn/completed) — it must never clear `active_turn`, which a
+            // submission accepted inside the window has already installed for
+            // its own newer turn; the id-matched completion arm owns every
+            // retirement inside the window.
             if thread_id == subscription.session_id() {
                 let normalized = normalize_codex_thread_status(&status);
-                if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
+                if normalized != CodexStatus::Running
+                    && normalized != CodexStatus::Starting
+                    && !compact_in_flight.load(Ordering::SeqCst)
+                {
                     clear_active_turn(active_turn);
                 }
             }
@@ -3952,9 +4657,41 @@ fn reduce_notification(
                 .collect()
         }
         CodexNotification::TurnCompleted(event) => {
-            // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
+            // The compact-window ownership block below owns `compact_in_flight`;
+            // `active_turn` retires ONLY when the completing turn IS the active
+            // one (the ids match). Unconditional was WRONG (ep2-r4): the compact's
+            // own delayed `turn/completed` lands AFTER the thread went idle —
+            // and a send submitted in that idle window installed ITS own active
+            // turn; clearing unconditionally erased the newer turn's busy truth
+            // while it was still running (the rollback gate then observed
+            // false||false and admitted a mid-turn thread/revert that
+            // force-interrupts the newer turn). A completion carrying NO id can
+            // never retire anything (fail-closed).
             if event.thread_id == subscription.session_id() {
-                clear_active_turn(active_turn);
+                let mut active = active_turn.lock().expect("active_turn mutex");
+                if event.turn_id.as_deref().is_some()
+                    && active.as_deref() == event.turn_id.as_deref()
+                {
+                    *active = None;
+                }
+                // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
+                // window ends HERE — but ONLY on the `turn/completed` whose params
+                // turn id MATCHES the captured `compact_turn_id` (any status — a
+                // failed compact completes the same way). A completion carrying a
+                // DIFFERENT id inside the armed window (a delayed PRIOR-turn
+                // completion — the probed sequence lands one between
+                // `thread/status:idle` and the compact's own `turn/started`) and a
+                // completion while no id is captured yet BOTH leave the window
+                // armed: the compact's own completion never landed, so the
+                // pre-start/post-RPC rollback window stays closed.
+                let mut owned_turn_id = compact_turn_id.lock().expect("compact_turn_id mutex");
+                if compact_in_flight.load(Ordering::SeqCst)
+                    && owned_turn_id.is_some()
+                    && event.turn_id.as_deref() == owned_turn_id.as_deref()
+                {
+                    compact_in_flight.store(false, Ordering::SeqCst);
+                    *owned_turn_id = None;
+                }
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -3963,6 +4700,16 @@ fn reduce_notification(
                 subscription.set_active_turn(turn_id.clone());
                 if event.thread_id == subscription.session_id() {
                     *active_turn.lock().expect("active_turn mutex") = Some(turn_id.clone());
+                    // ep1-r3 F4: capture the compact turn's OWNERSHIP id — the FIRST
+                    // turn/started observed while the compact window is armed with
+                    // no id captured (provider FIFO: the compact was submitted
+                    // before any later send, so its start surfaces first).
+                    if compact_in_flight.load(Ordering::SeqCst) {
+                        let mut owned = compact_turn_id.lock().expect("compact_turn_id mutex");
+                        if owned.is_none() {
+                            *owned = Some(turn_id.clone());
+                        }
+                    }
                 }
             }
             Vec::new()
@@ -4095,6 +4842,110 @@ fn strip_codex_row_suffix(turn_id: &str) -> &str {
     } else {
         turn_id
     }
+}
+
+/// Why a codex rollback boundary could not be resolved (kata 1wxv Task 2).
+enum CodexRollbackError {
+    /// Step on an empty history (`NOTHING_TO_UNDO`). Codex's empty-prefix
+    /// toTurn is LEGAL (reverting before the first turn empties the thread),
+    /// so there is NO first-turn refusal case here.
+    NothingToUndo,
+    /// A toTurn target id missing from (or unresolvable against) the raw
+    /// turns (`INVALID_ROLLBACK_TARGET`).
+    TargetNotFound,
+}
+
+/// The codex rollback target math (kata decisions 2/3): `raw_turns` from
+/// `thread/read{includeTurns:true}`. Step = the LAST raw turn; toTurn = the raw
+/// turn whose id equals the display id's stripped form
+/// ([`strip_codex_row_suffix`]). Returns the `beforeTurnId` wire value plus
+/// the removed DISPLAY turns: the [`build_codex_turn_json`] projections of raw
+/// turns `[boundary..]` (the exact `FreshAgentTurn` JSON the snapshot would
+/// have shown), which the ledger records as the marker payload.
+fn resolve_codex_boundary(
+    raw_turns: &[Value],
+    mode: crate::rollback_record::RollbackModeReq,
+    turn_id: Option<&str>,
+) -> Result<(String, Vec<Value>), CodexRollbackError> {
+    let idx = match mode {
+        crate::rollback_record::RollbackModeReq::Step => raw_turns
+            .len()
+            .checked_sub(1)
+            .ok_or(CodexRollbackError::NothingToUndo)?,
+        crate::rollback_record::RollbackModeReq::ToTurn => {
+            let target = strip_codex_row_suffix(turn_id.ok_or(CodexRollbackError::TargetNotFound)?);
+            raw_turns
+                .iter()
+                .position(|t| t.get("id").and_then(Value::as_str) == Some(target))
+                .ok_or(CodexRollbackError::TargetNotFound)?
+        }
+    };
+    let before_turn_id = raw_turns[idx]
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or(CodexRollbackError::TargetNotFound)?
+        .to_string();
+    let mut removed = Vec::new();
+    for raw in &raw_turns[idx..] {
+        removed
+            .extend(build_codex_turn_json(raw, 0).map_err(|_| CodexRollbackError::TargetNotFound)?);
+    }
+    Ok((before_turn_id, removed))
+}
+
+/// Plain text of one display turn — the composer-refill payload: the
+/// `text`-kind items' texts joined; the turn `summary` as fallback.
+fn codex_turn_plain_text(turn: &Value) -> String {
+    let joined = turn["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|i| i["kind"] == "text")
+                .filter_map(|i| i["text"].as_str())
+                .collect::<Vec<&str>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default();
+    if joined.is_empty() {
+        turn["summary"].as_str().unwrap_or("").to_string()
+    } else {
+        joined
+    }
+}
+
+/// Server `INTERNAL_ERROR` copy for a codex `thread/revert` whose outcome is
+/// UNCERTAIN (transport legs — Timeout/Closed/Transport: the provider may
+/// ALREADY have applied the mutation). The post-op ledger is KEPT (never
+/// compensated — erasing markers for a possibly-applied revert would falsify
+/// the ledger) and the pane is told the two histories may disagree until the
+/// next refresh. Explicit RPC-rejection legs instead compensate (the provider
+/// ANSWERED, so the revert provably did not apply).
+const CODEX_UNCERTAIN_ROLLBACK_COPY: &str =
+    "Undo state could not be confirmed — conversation and undo history may disagree until the next refresh.";
+
+/// LBC-1: a pre-feature LEGACY thread — `thread/revert` answered
+/// `-32600 "…only supports paginated threads"`. Structured on the RPC code
+/// when available (the `RpcError` display also embeds the `[-32600]` tag, so
+/// the string fallback keeps non-Rpc carriers covered).
+fn is_codex_revert_legacy_refusal(err: &CodexAppServerError) -> bool {
+    match err {
+        CodexAppServerError::Rpc { error, .. } => {
+            error.code == -32600 && error.message.contains("only supports paginated threads")
+        }
+        _ => {
+            err.to_string().contains("-32600")
+                && err.to_string().contains("only supports paginated threads")
+        }
+    }
+}
+
+/// The sidecar predates `thread/revert`: unknown-method/`-32601` (or the
+/// method-missing shape an app-server <0.149 emits for the method name).
+fn is_codex_revert_unknown_method(err: &CodexAppServerError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("-32601") || msg.contains("method not found")
 }
 
 // ── PATCH /api/settings (fresh-clients enable toggle) ────────────────────────
@@ -4237,6 +5088,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::identity_sink::PaneIdentitySink;
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
@@ -4719,6 +5571,21 @@ pub(crate) mod tests {
         (st, rx)
     }
 
+    /// `state_with_bus` + a wired in-memory identity sink (kata 1wxv Tasks 2-4):
+    /// the rollback handlers AWAIT durable rollback-record writes BEFORE any
+    /// provider mutation, so their tests need the fake ledger surface
+    /// (`record_rollback`/`load_rollback`, `set_fail_writes`).
+    fn state_with_sink() -> (
+        FreshCodexState,
+        tokio::sync::broadcast::Receiver<String>,
+        std::sync::Arc<crate::identity_sink::FakeIdentitySink>,
+    ) {
+        let (st, rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        (st, rx, fake)
+    }
+
     /// Insert a `CodexSession` directly (bypassing the real sidecar spawn `handle_create`
     /// requires) so `handle_interrupt`/`handle_kill` can be exercised against a scripted
     /// [`freshell_codex::ChannelPeer`] / a real-but-harmless child process.
@@ -4753,6 +5620,11 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
+                // These fixtures model threads freshell started (paginated).
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -4786,7 +5658,15 @@ pub(crate) mod tests {
         child: tokio::process::Child,
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
-        let consumer = state.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
+        let consumer = state.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let watcher = spawn_exit_watcher(
@@ -4808,6 +5688,11 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                compact_in_flight,
+                compact_turn_id,
+                // These fixtures model threads freshell started (paginated).
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -5085,6 +5970,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// Drain every buffered bus frame (ep1-r3 F4 test-sync discipline: sync
+    /// points must wait on the NEXT frame the consumer produces for the event
+    /// just emitted, never a RESIDUAL one — earlier notifications keep their
+    /// snapshots/chimes in the receiver until read).
+    fn drain_wire(wire: &mut tokio::sync::broadcast::Receiver<String>) {
+        loop {
+            match wire.try_recv() {
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// Await the session's NEXT idle `freshAgent.session.snapshot` on the bus —
+    /// the deterministic "the consumer ran the notification just emitted" edge.
+    async fn await_next_idle_snapshot(
+        wire: &mut tokio::sync::broadcast::Receiver<String>,
+        thread_id: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "the expected completion never flowed");
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == thread_id
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break;
+            }
+        }
+    }
+
     /// Insert a live, IDLE fake codex session whose notification consumer is the REAL
     /// one ([`FreshCodexState::spawn_consumer`]), returning the scripted server end of
     /// the channel plus a fresh bus receiver.
@@ -5097,6 +6019,36 @@ pub(crate) mod tests {
     ) {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
+        let rx = insert_fake_session_with_real_consumer(
+            st,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            &format!("codex-sidecar-test-compact-{thread_id}"),
+        )
+        .await;
+        (peer, rx)
+    }
+
+    /// [`insert_idle_compact_session`] with a short client request timeout, so
+    /// an unanswered RPC resolves as `CodexAppServerError::Timeout` inside the
+    /// test's budget (the ep4-r5 fail-closed window: the request frame provably
+    /// left, but the answer never came).
+    async fn insert_idle_compact_session_with_timeout(
+        st: &FreshCodexState,
+        thread_id: &str,
+        request_timeout_ms: u64,
+    ) -> (
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect_with_timeout(
+            transport,
+            Duration::from_millis(request_timeout_ms),
+        );
         let rx = insert_fake_session_with_real_consumer(
             st,
             thread_id,
@@ -5158,6 +6110,688 @@ pub(crate) mod tests {
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1", "status": turn_status } }),
+        );
+    }
+
+    /// Focused-review ep1-r2 F3: `compact_in_flight` has OPERATION OWNERSHIP.
+    /// Compact-1's `thread/compact/start` answers BEFORE any `turn/started`
+    /// surfaces (the probed 0.147.0 order), leaving the busy truth carried by
+    /// the explicit window bit. A rapid SECOND compact in that window must be
+    /// REFUSED with the rollback `BUSY_TURN` copy (the refusal copy the viewer
+    /// mirrors) — BEFORE any RPC: it never arms, so no failure path of the
+    /// second call can clear compact-1's marker (the pre-F3 precheck ignored
+    /// the bit; a rejected second RPC's failure-clear wiped the FIRST compact's
+    /// busy truth, and a queued rollback could then `thread/revert` mid-compact).
+    #[tokio::test]
+    async fn a_second_compact_in_the_answered_but_unstarted_window_is_refused_busy_turn() {
+        let (st, mut rx) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cdbl").await;
+
+        let compact_1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // The provider answers IMMEDIATELY; the notification stream stays
+        // SILENT (no turn/started yet) — the exact post-RPC/pre-turn-started
+        // window, with the busy truth carried by compact-1's window bit alone.
+        peer.respond(&compact_id, json!({}));
+        compact_1.await.expect("compact-1 task");
+
+        // Compact-2 in the window: REFUSED BUSY_TURN with ZERO RPCs reaching
+        // the app-server (the red shape instead issues a second
+        // thread/compact/start — surface it for a loud failure).
+        let compact_2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        tokio::select! {
+            raw = rx.recv() => {
+                let frame: Value = serde_json::from_str(&raw.expect("a refusal frame")).unwrap();
+                assert_eq!(frame["event"]["type"], json!("freshAgent.error"), "{frame}");
+                assert_eq!(
+                    frame["event"]["code"],
+                    json!("BUSY_TURN"),
+                    "the second compact mirrors the rollback refusal code: {frame}"
+                );
+                assert_eq!(
+                    frame["event"]["message"],
+                    json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE),
+                    "the viewer sees the rollback refusal copy: {frame}"
+                );
+            }
+            req = peer.expect_request() => {
+                panic!("the refused compact must issue NO RPC — it never reaches a failure path that could clear compact-1's marker (got {req:?})")
+            }
+        }
+        compact_2.await.expect("compact-2 task settles");
+
+        // Exactly ONE revert-capable busy tracker remains (compact-1's window
+        // bit, unreverted): a rollback through the window still refuses
+        // BUSY_TURN with zero provider traffic.
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cdbl", "rb-cdbl", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(
+                method, "thread/read",
+                "the ONLY RPC a not-refused rollback may issue in this drive"
+            );
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cdbl", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "compact-1's marker survived compact-2 — the window still refuses: {frames:?}"
+        );
+
+        // The marker ends ONLY at compact-1's own turn/completed: after the
+        // probed notification sequence a third compact is accepted (the tracker
+        // cleared legitimately and re-arms).
+        emit_compact_notification_sequence(&peer, "thread-cdbl", "completed");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cleared = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the compact turn's completion frames never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break false;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == "thread-cdbl"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break true;
+            }
+        };
+        assert!(
+            cleared,
+            "an idle session.snapshot proves the clear edge ran"
+        );
+
+        let compact_3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        let (compact3_id, method, _p) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/compact/start",
+            "the tracker lifecycle is intact — a post-completion compact runs"
+        );
+        peer.respond(&compact3_id, json!({}));
+        compact_3.await.expect("compact-3 task");
+    }
+
+    /// Focused-review ep1-r3 F4 (codex completion-id OWNERSHIP): the compact
+    /// window (`compact_in_flight`) may be cleared ONLY by the `turn/completed`
+    /// whose params turn id MATCHES the compact's own ownership id (captured
+    /// at the compact's `turn/started`). The probed real sequence interleaves
+    /// a DELAYED PRIOR turn completion inside the armed-clear-pending window:
+    ///
+    ///   thread/status:idle → compact armed (RPC answered, no turn/started yet)
+    ///   → turn/completed{prior id} (stale) → turn/started{compact id}
+    ///   → turn/completed{compact id}.
+    ///
+    /// The stale completion must never clear the window (a rollback admitted
+    /// there would force-interrupt the still-unstarted compaction — the exact
+    /// pre-start window delta-r1 F2 armed the bit for); a rollback attempt
+    /// between the stale and the matching completion stays BUSY_TURN; the gate
+    /// releases EXACTLY at the id-matched completion.
+    #[tokio::test]
+    async fn a_stale_prior_completion_never_clears_the_compact_window_and_only_the_matching_completion_does(
+    ) {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cstale").await;
+
+        // The prior turn's lifecycle ended provider-side: thread/status:idle is
+        // observed BEFORE its delayed completion (the documented probe).
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cstale", "status": { "type": "idle" } }),
+        );
+
+        // Arm the compact: its RPC answers immediately; the notification stream
+        // stays SILENT (no turn/started yet) — the armed-clear-pending window.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cstale")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+
+        // The STALE prior-turn completion lands mid-window (drain first: the
+        // test-start `thread/status:idle` snapshot and every earlier frame are
+        // RESIDUAL — then emit, then await THIS emission's consumer edge).
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-prior-9", "status": "completed" } }),
+        );
+        // ... and provably flows through the consumer BEFORE the probe (the
+        // NEXT idle session.snapshot is the deterministic consumer sync idiom).
+        await_next_idle_snapshot(&mut wire, "thread-cstale").await;
+
+        // A rollback attempt inside the armed-clear-pending window stays
+        // BUSY_TURN (answer any RPC the drive issues so the shape is
+        // deterministic either way: the red shape reaches thread/read and
+        // lands NOTHING_TO_UNDO — the defect).
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-1", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 1");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "F4: a completion with a DIFFERENT id inside the armed-clear-pending window never clears it"
+        );
+
+        // The compact's OWN lifecycle begins (captures the ownership turn id);
+        // a mid-window rollback STILL refuses (the window holds through the
+        // started edge — its own completion hasn't landed).
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-compact-1" } }),
+        );
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-2", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "the armed-but-incomplete compact window still refuses after turn/started"
+        );
+
+        // The id-MATCHED completion releases the gate (same drain discipline:
+        // the earlier completions' chime/snapshot leftovers are residual).
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-compact-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cstale").await;
+        let (sink2, captured2) = capturing_sink();
+        let rollback_driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-3", None), sink2)
+                    .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver2.await.expect("rollback task 3");
+        assert!(
+            saw_read,
+            "the busy gate reopened at the id-matched completion"
+        );
+        assert_eq!(
+            captured_frames(&captured2)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the matching completion released the gate"
+        );
+    }
+
+    /// Focused-review ep2-r4 (codex completion reaches past the compact into a
+    /// NEWER turn): the documented provider order reports `thread/status:idle`
+    /// (clearing `active_turn`, composer sendable) BEFORE the compact's delayed
+    /// `turn/completed`; a submission inside that window installs its own active
+    /// turn. The compact's own completion then ran the session-wide UNCONDITIONAL
+    /// active-turn clear — erasing the newer send's busy truth: the rollback
+    /// gate read false||false exactly while the new turn was in flight, and a
+    /// `thread/revert` admitted there FORCE-INTERRUPTS that turn. The completion
+    /// now clears `active_turn` ONLY when the completed id MATCHES the active
+    /// turn's id; the compact-window clear keeps its own ownership rule.
+    ///
+    ///   thread/status:idle → compact armed (RPC answered) → turn/started{id-c}
+    ///   → NEW SEND (turn/start → id-new) → turn/completed{id-c} (the compact's
+    ///   OWN completion — clears ONLY the compact window) — the gate must stay
+    ///   BUSY on the newer turn → turn/completed{id-new} releases it EXACTLY.
+    #[tokio::test]
+    async fn a_compact_completion_inside_a_newer_turns_window_clears_only_the_compact_window() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cnewer").await;
+
+        // The prior turn ended: idle is observed BEFORE its delayed completion.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cnewer", "status": { "type": "idle" } }),
+        );
+
+        // Arm the compact: the RPC answers immediately; ownership id lands with
+        // its turn/started.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cnewer")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1" } }),
+        );
+
+        // INSIDE the compact window: a new submission installs its own active
+        // turn (the initialized connection means turn/start is the next RPC).
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cnewer".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cnewer".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-9" } }));
+        send_driver.await.expect("send task");
+
+        // The compact's OWN delayed completion lands NOW: clears the compact
+        // window (ownership match) — and MUST leave the newer send's
+        // `active_turn` untouched. The rollback gate stays BUSY on it.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cnewer", "rb-cnewer-1", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cnewer", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "ep2-r4: the compact's completion never reaches past its own window — the newer turn still owns the gate"
+        );
+
+        // The newer turn's OWN completion releases the gate exactly here.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-new-9", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cnewer", "rb-cnewer-2", None), sink)
+                    .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cnewer", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert!(
+            saw_read,
+            "the newer turn's own completion reopened the gate"
+        );
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the newer turn's own completion released the gate"
+        );
+    }
+
+    /// Focused-review ep3-r4 F2 (the compact window's thread-level idle must
+    /// never erase a NEWER turn's busy truth): the documented compact event
+    /// sequence carries `thread/status:changed{type:idle}` BETWEEN the
+    /// compact's `turn/started` and its `turn/completed`; a submission accepted
+    /// inside the window installs its own active turn (whose turn/started can
+    /// land before that idle) — and the status arm UNCONDITIONALLY cleared
+    /// `active_turn`, so the compact's id-matched completion then retired only
+    /// the compact bits: both rollback-gate inputs read false mid-new-turn and
+    /// a `thread/revert` admitted there force-interrupts the newer turn. The
+    /// thread-level idle is the compact lifecycle's own punctuation while the
+    /// window is armed — it must not touch `active_turn` (the id-matched
+    /// completion owns retirements inside the window).
+    #[tokio::test]
+    async fn the_compact_windows_thread_level_idle_keeps_the_newer_turns_busy_truth() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cidle").await;
+
+        // Arm the compact: RPC answers; the compact's own turn starts.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cidle")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-compact-7" } }),
+        );
+
+        // A submission inside the window installs its own active turn BEFORE
+        // the compact window's thread-level idle lands.
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cidle".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cidle".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "newer turn".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-1" } }));
+        send_driver.await.expect("send task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-new-1" } }),
+        );
+
+        // The compact window's documented thread-level idle lands NOW — it is
+        // the compact lifecycle's punctuation, NOT the newer turn's end: the
+        // newer turn's busy truth must survive it.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cidle", "status": { "type": "idle" } }),
+        );
+        // ...and the compact's own completion retires exactly the compact bits.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-compact-7", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cidle").await;
+
+        // The rollback gate MUST refuse: the newer turn is still running and
+        // owns the busy truth.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thread-cidle", "rb-cidle-1", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "ep3-r4 F2: the compact window's idle never erases the newer turn's busy truth: {frames:?}"
+        );
+
+        // The newer turn's own completion then retires it EXACTLY — the gate
+        // opens (NOTHING_TO_UNDO — prowl through the empty durable ledger).
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-new-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cidle").await;
+        // The status snapshot broadcast precedes the reduce-notification's
+        // applied clearing by a consumer poll — poll the gate inputs until the
+        // newer turn's completion has landed (id-matched retirement).
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let active_turn = {
+                    let guard = st.sessions.lock().await;
+                    guard
+                        .get("thread-cidle")
+                        .expect("session")
+                        .active_turn
+                        .clone()
+                };
+                if active_turn.lock().expect("active_turn mutex").is_none() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "the newer turn's own completion retires the gate input"
+        );
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cidle", "rb-cidle-2", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cidle", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the newer turn's own completion releases the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_in_the_compact_answered_but_turn_unstarted_window_is_refused_busy_turn() {
+        // Delta-r1 F2: `thread/compact/start` answers BEFORE the compact turn's
+        // notification lifecycle (`turn/started`) surfaces — the REAL 0.147.0
+        // sequence has the RPC return first. In that post-RPC/pre-turn-started
+        // window `active_turn` is still notification-driven EMPTY, so the busy
+        // gate needs the session's `compact_in_flight` bit (SET under the turn
+        // lock at compact start, cleared by the compact's turn/completed).
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cwin").await;
+
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cwin")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // The provider answers the RPC IMMEDIATELY; the notification stream stays
+        // SILENT (no turn/started yet) — the exact probed window.
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+
+        // A rollback in the window must refuse BUSY_TURN — answer any RPC it DOES
+        // issue so the drive is deterministic in both shapes (a red run shows the
+        // rollback reaching thread/read and landing NOTHING_TO_UNDO; a green run
+        // shows no RPC at all — the refusal leg issues ZERO provider traffic).
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cwin", "rb-cwin", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(
+                method, "thread/read",
+                "the ONLY RPC a not-refused rollback may issue in this drive"
+            );
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cwin", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "the post-RPC/pre-turn-started window must still refuse: {frames:?}"
+        );
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE)
+        );
+
+        // The window CLOSES at the compact's own turn/completed: after the probed
+        // notification sequence, a follow-up rollback is NOT busy-refused (it
+        // reaches thread/read and lands its true verdict on the empty thread).
+        // The `wire` receiver is the session's bus: waiting for the completion
+        // frames here proves the consumer already ran the clear edge (the FIX-1
+        // test's deterministic sync idiom).
+        emit_compact_notification_sequence(&peer, "thread-cwin", "completed");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cleared = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the compact turn's completion frames never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break false;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == "thread-cwin"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break true;
+            }
+        };
+        assert!(
+            cleared,
+            "an idle session.snapshot frame proves the clear edge ran"
+        );
+
+        let (sink2, captured2) = capturing_sink();
+        let rollback_driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cwin", "rb-cwin-2", None), sink2)
+                    .await;
+            })
+        };
+        let (read_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/read", "the busy gate reopened");
+        peer.respond(
+            &read_id,
+            json!({ "thread": { "id": "thread-cwin", "turns": [] } }),
+        );
+        rollback_driver2.await.expect("rollback task 2");
+        let frames2 = captured_frames(&captured2);
+        assert_eq!(
+            frames2[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "after turn/completed the gate reopened: {frames2:?}"
         );
     }
 
@@ -5384,6 +7018,81 @@ pub(crate) mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an RPC failure must not fabricate a completion"
+        );
+
+        // ep4-r5: an EXPLICIT rejection is proof the compact never started —
+        // the busy marker cleared, so a retried compact reaches a fresh RPC
+        // (as opposed to the timeout class, which refuses locally).
+        let driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-ce")).await;
+            })
+        };
+        let (id2, method2, _p2) = peer.expect_request().await;
+        assert_eq!(
+            method2, "thread/compact/start",
+            "an explicit rejection re-opens the gate for a retry"
+        );
+        peer.respond_error(&id2, -32600, "compact rejected again");
+        driver2.await.expect("compact task 2");
+    }
+
+    /// Focused-review ep4-r4 (Minor-1, codex.rs:1530): a compact RPC that
+    /// TIMES OUT crossed the wire with an ambiguous lifecycle — the app server
+    /// may still start the compact — so the busy marker must STAY armed: a
+    /// second compact is refused LOCALLY (no second RPC may reach the peer),
+    /// and the rollback gate would stay closed with it. Clearing the marker on
+    /// timeout (the pre-fix shape) re-arms a second compact -> a live provider
+    /// compaction folded by... exactly the torn-owner hazard ep1-r2 F3 closed.
+    #[tokio::test]
+    async fn handle_compact_rpc_timeout_keeps_the_busy_marker_fail_closed() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session_with_timeout(&st, "thread-cto", 50).await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cto")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // Never answer: the client's request timeout fires (50ms).
+        driver
+            .await
+            .expect("the compact handler resolves on the timeout");
+
+        // The loud error envelope arrived; the busy marker must OUTLIVE it.
+        loop {
+            let raw = rx.recv().await.expect("the bus stays open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+                break;
+            }
+        }
+
+        // A second compact must be refused WITHOUT another RPC — proof the
+        // timed-out window still owns the gate.
+        st.handle_compact(compact_msg("thread-cto")).await;
+        loop {
+            let raw = rx.recv().await.expect("the bus stays open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                assert_eq!(
+                    frame["event"]["code"], "BUSY_TURN",
+                    "the second compact refused through the (surviving) busy marker: {frame}"
+                );
+                break;
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), peer.expect_request())
+                .await
+                .is_err(),
+            "ep4-r4: the refused second compact NEVER reaches the app server"
         );
     }
 
@@ -6292,6 +8001,1403 @@ pub(crate) mod tests {
             st.sessions.lock().await.contains_key("thread-1"),
             "the session stays mapped after an unrequested exit"
         );
+    }
+
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 2) ────────────────
+
+    fn undo_msg(
+        session_id: &str,
+        request_id: &str,
+        turn_id: Option<&str>,
+    ) -> crate::rollback_record::RollbackRequest {
+        crate::rollback_record::RollbackRequest {
+            direction: crate::rollback_record::RollbackDirection::Undo,
+            mode: if turn_id.is_some() {
+                crate::rollback_record::RollbackModeReq::ToTurn
+            } else {
+                crate::rollback_record::RollbackModeReq::Step
+            },
+            turn_id: turn_id.map(str::to_string),
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: freshell_protocol::AgentProvider::Codex,
+            request_id: request_id.to_string(),
+            cwd: None,
+        }
+    }
+
+    /// Two raw completed turns; the item JSON mirrors the exact raw-turn shape
+    /// the `build_codex_turn_json` projection tests pin in this file (a
+    /// userMessage content-part item + an agentMessage text item per turn).
+    fn two_turn_thread_read(thread_id: &str) -> Value {
+        json!({ "thread": { "id": thread_id, "turns": [
+            { "id": "turn-1", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t1-u", "content": [{ "type": "text", "text": "first prompt" }] },
+                { "type": "agentMessage", "id": "t1-a", "text": "first answer" },
+            ]},
+            { "id": "turn-2", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t2-u", "content": [{ "type": "text", "text": "second prompt" }] },
+                { "type": "agentMessage", "id": "t2-a", "text": "second answer" },
+            ]},
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_step_reverts_the_last_turn_and_answers_with_the_removed_prompt() {
+        let (st, mut rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-1",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-1", "rb-1", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+
+        // Pre-revert capture happens BEFORE the destructive RPC (thread/revert
+        // destroys the removed tail — the ack/broadcast/ledger data comes from
+        // this read).
+        let (read_id, method, read_params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert_eq!(read_params["threadId"], json!("thr-undo-1"));
+        assert_eq!(read_params["includeTurns"], json!(true));
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-1"));
+        let (revert_id, method2, revert_params) = peer.expect_request().await;
+        assert_eq!(method2, "thread/revert");
+        assert_eq!(
+            revert_params,
+            json!({ "threadId": "thr-undo-1", "beforeTurnId": "turn-2" })
+        );
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+
+        let frames = captured_frames(&captured);
+        assert_eq!(
+            frames.len(),
+            1,
+            "one ack on the requesting sink: {frames:?}"
+        );
+        let frame = &frames[0];
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["event"]["type"], "freshAgent.rolledBack");
+        assert_eq!(frame["event"]["requestId"], json!("rb-1"));
+        assert_eq!(frame["event"]["direction"], json!("undo"));
+        assert_eq!(frame["event"]["mode"], json!("step"));
+        assert_eq!(frame["event"]["removedPromptText"], json!("second prompt"));
+        let removed = frame["event"]["removedTurnIds"]
+            .as_array()
+            .expect("ids array");
+        assert_eq!(
+            removed.len(),
+            2,
+            "the raw turn splits into user+assistant display rows"
+        );
+        assert!(
+            removed
+                .iter()
+                .all(|id| id.as_str().unwrap_or_default().starts_with("turn-2")),
+            "split-row ids carry the raw prefix: {removed:?}"
+        );
+        assert_eq!(
+            frame["event"]["canRedo"],
+            json!(false),
+            "codex is undo-only (decision 5)"
+        );
+
+        // The broadcast converges siblings + revokes attention; NEVER a
+        // turn.complete (a rollback never chimes).
+        let mut saw_rolledback = false;
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("broadcast frame json");
+            assert_ne!(
+                v["event"]["type"],
+                json!("freshAgent.turn.complete"),
+                "rollback never chimes"
+            );
+            if v["event"]["type"] == json!("freshAgent.session.rolledBack") {
+                saw_rolledback = true;
+                assert_eq!(v["event"]["sessionId"], json!("thr-undo-1"));
+                assert_eq!(v["event"]["revokeAttention"], json!(true));
+                assert_eq!(v["event"]["canRedo"], json!(false));
+                assert!(
+                    v["event"]["removedPromptText"].is_null(),
+                    "the broadcast never carries the prompt (other devices' composers are untouched)"
+                );
+            }
+        }
+        assert!(
+            saw_rolledback,
+            "the broadcast bus carried session.rolledBack"
+        );
+
+        // The durable record: codex is append-only entries; the stored can_redo
+        // bit is always false.
+        let record = fake
+            .load_rollback("codex", "thr-undo-1")
+            .expect("rollback record written");
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].prompt_text, "second prompt");
+        assert!(!record.can_redo());
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_record_write_failure_refuses_and_never_reverts() {
+        // Durable-BEFORE-mutation: a failed record pre-write REFUSES the
+        // rollback (INTERNAL_ERROR + LEDGER_WRITE_REFUSAL_COPY) and the
+        // provider history is NEVER mutated.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-nowrite",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-nowrite",
+        )
+        .await;
+        fake.set_fail_writes(true);
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-nowrite", "rb-6", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, method, _params) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/read",
+            "pre-mutation reads are still allowed"
+        );
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-nowrite"));
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::LEDGER_WRITE_REFUSAL_COPY)
+        );
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no thread/revert is issued once the record cannot be saved"
+        );
+        assert!(
+            fake.load_rollback("codex", "thr-undo-nowrite").is_none(),
+            "a refused rollback leaves no record"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_to_turn_strips_the_row_suffix_and_removes_the_tail() {
+        // `turn-1:row-0` (a display-row id) names the RAW turn `turn-1`;
+        // reverting before it removes BOTH raw turns.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-2",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-2",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-2", "rb-2", Some("turn-1:row-0")), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-2"));
+        let (revert_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        assert_eq!(
+            params["beforeTurnId"],
+            json!("turn-1"),
+            "the :row-N suffix is stripped to the raw provider turn id"
+        );
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        let removed = frames[0]["event"]["removedTurnIds"]
+            .as_array()
+            .expect("ids")
+            .len();
+        assert_eq!(removed, 4, "both raw turns -> four display rows");
+        assert_eq!(
+            frames[0]["event"]["removedPromptText"],
+            json!("first prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_mid_turn_is_busy_without_touching_the_sidecar() {
+        // The busy gate (active_turn + rollback_in_flight) is the SOLE mid-turn
+        // protection: the provider revert FORCE-INTERRUPTS (validator extra-1),
+        // so a gate hole is silent corruption — this test must prove ZERO RPCs
+        // (not even turn/interrupt) reach the sidecar for the refused attempt.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-busy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-live".to_string()))),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-busy",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thr-undo-busy", "rb-3", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("BUSY_TURN"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE)
+        );
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(frames[0]["event"]["requestId"], json!("rb-3"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a mid-turn rollback issues ZERO RPCs (no thread/revert, no turn/interrupt)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_is_refused_codex_is_undo_only() {
+        // Decision 5: codex history revert is destructive — there is NO redo
+        // primitive, permanently (the wire-level refusal cell stays forever;
+        // this handler-level check is the belt).
+        let (st, _rx, fake) = state_with_sink();
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_msg("thr-anything", "rb-4", None);
+        op.direction = crate::rollback_record::RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!("Redo is not supported for freshcodex (codex history revert is destructive; there is no redo primitive).")
+        );
+        assert!(
+            fake.rollbacks.lock().unwrap().is_empty(),
+            "a refused redo writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_empty_history_says_nothing_to_undo_and_never_reverts() {
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-empty",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-empty",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-empty", "rb-5", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &read_id,
+            json!({ "thread": { "id": "thr-undo-empty", "turns": [] } }),
+        );
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("NOTHING_TO_UNDO"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::UNDO_EMPTY_MESSAGE)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no thread/revert on empty history"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_zero_turn_paginated_read_falls_back_and_says_nothing_to_undo() {
+        // LBC-1 regression pin: a paginated thread with ZERO committed turns
+        // answers -32601 "list_turns is not supported yet" to
+        // read/includeTurns:true + turns/list until the first turn commits. The
+        // same fallback get_snapshot uses covers the rollback pre-read: retry
+        // includeTurns:false, then NOTHING_TO_UNDO — never a spurious
+        // INTERNAL_ERROR, never a revert RPC.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-zero",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-zero",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-zero", "rb-zero", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert_eq!(params["includeTurns"], json!(true));
+        peer.respond_error(&read_id, -32601, "list_turns is not supported yet");
+        let (retry_id, method2, params2) = peer.expect_request().await;
+        assert_eq!(method2, "thread/read", "the include-turns fallback retries");
+        assert_eq!(params2["includeTurns"], json!(false));
+        peer.respond(&retry_id, json!({ "thread": { "id": "thr-undo-zero" } }));
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("NOTHING_TO_UNDO"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no thread/revert fires for a zero-turn thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_legacy_thread_refusal_maps_the_copy_and_compensates_the_record() {
+        // -32600 "only supports paginated threads" (a pre-feature LEGACY thread,
+        // LBC-1) ⇒ UNSUPPORTED_CAPABILITY + CODEX_LEGACY_THREAD_COPY. The ledger
+        // was pre-written before the mutation attempt, so the provably-rejected
+        // revert triggers the COMPENSATING rewrite of the pre-op record.
+        let (st, _rx, fake) = state_with_sink();
+        let prior = {
+            let mut r = crate::rollback_record::RollbackRecord::empty(10);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t0" })],
+                    prompt_text: "prior".into(),
+                    at_ms: 11,
+                    epoch: 0,
+                },
+                12,
+            );
+            r
+        };
+        fake.record_rollback("codex", "thr-undo-legacy", prior.clone())
+            .await
+            .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-legacy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-legacy",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-legacy", "rb-legacy", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-legacy"));
+        let (revert_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        peer.respond_error(
+            &revert_id,
+            -32600,
+            "thread/revert only supports paginated threads",
+        );
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::CODEX_LEGACY_THREAD_COPY)
+        );
+        assert_eq!(
+            fake.load_rollback("codex", "thr-undo-legacy"),
+            Some(prior),
+            "the compensating rewrite restored the pre-op record — the ledger \
+             must not describe a rollback the provider PROVABLY rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_old_cli_revert_maps_32601_to_unsupported_capability() {
+        // A codex CLI that predates `thread/revert` (unknown-method/-32601)
+        // maps to UNSUPPORTED_CAPABILITY + CODEX_OLD_CLI_COPY (never an
+        // uncontextualized INTERNAL_ERROR).
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-oldcli",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-oldcli",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-oldcli", "rb-oldcli", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-oldcli"));
+        let (revert_id, _m, _p) = peer.expect_request().await;
+        peer.respond_error(&revert_id, -32601, "Method not found: thread/revert");
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::CODEX_OLD_CLI_COPY)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_unknown_session_answers_invalid_session_id() {
+        // Task 2 review N2: the unknown-session prologue — a rollback against a
+        // never-registered thread id answers the recovery-engaging
+        // INVALID_SESSION_ID shape on the REQUESTING sink (op-keyed,
+        // `rollback:true`), with zero sidecar contact.
+        let (st, _rx, _fake) = state_with_sink();
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thr-never-seen", "rb-unknown", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one refusal frame: {frames:?}");
+        let frame = &frames[0];
+        assert_eq!(frame["type"], json!("freshAgent.event"));
+        assert_eq!(frame["provider"], json!("codex"));
+        assert_eq!(frame["sessionType"], json!("freshcodex"));
+        assert_eq!(frame["sessionId"], json!("thr-never-seen"));
+        assert_eq!(frame["event"]["type"], json!("freshAgent.error"));
+        assert_eq!(frame["event"]["code"], json!("INVALID_SESSION_ID"));
+        assert_eq!(
+            frame["event"]["message"],
+            json!("codex session thr-never-seen not found")
+        );
+        assert_eq!(frame["event"]["rollback"], json!(true));
+        assert_eq!(frame["event"]["requestId"], json!("rb-unknown"));
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_rpc_error_rejection_compensates_the_pre_op_record() {
+        // Task 2 review M3 (rpc leg): an explicit JSON-RPC error ANSWER is a
+        // provable rejection — the provider provably did NOT apply the revert —
+        // so the pre-written record IS compensated back to the pre-op record
+        // before the refusal is answered.
+        let (st, _rx, fake) = state_with_sink();
+        let prior = {
+            let mut r = crate::rollback_record::RollbackRecord::empty(10);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t0" })],
+                    prompt_text: "prior".into(),
+                    at_ms: 11,
+                    epoch: 0,
+                },
+                12,
+            );
+            r
+        };
+        fake.record_rollback("codex", "thr-undo-rpcerr", prior.clone())
+            .await
+            .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-rpcerr",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-rpcerr",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-rpcerr", "rb-rpcerr", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-rpcerr"));
+        let (revert_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        // A plain JSON-RPC error (neither the legacy-thread nor the
+        // unknown-method shape): the provider ANSWERED — provably unmoved.
+        peer.respond_error(&revert_id, -32000, "revert exploded");
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert!(
+            frames[0]["event"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("revert exploded"),
+            "a generic rpc rejection surfaces the raw error: {frames:?}"
+        );
+        assert_eq!(
+            fake.load_rollback("codex", "thr-undo-rpcerr"),
+            Some(prior),
+            "the compensating rewrite restored the pre-op record — an explicit \
+             rpc error is a PROVABLE rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_transport_error_keeps_the_ledger_and_reports_uncertain_state() {
+        // Task 2 review M3 (transport leg): on a transport-class failure
+        // (Timeout/Closed/Transport — the peer vanishes mid-RPC) the provider
+        // may ALREADY have applied the revert, so the post-op ledger is KEPT
+        // (a compensating rewrite would erase markers for a history the
+        // provider actually truncated) and the refusal answers INTERNAL_ERROR
+        // with the uncertain-state copy.
+        let (st, _rx, fake) = state_with_sink();
+        let prior_entry_count = 1usize;
+        fake.record_rollback("codex", "thr-undo-transport", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(10);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t0" })],
+                    prompt_text: "prior".into(),
+                    at_ms: 11,
+                    epoch: 0,
+                },
+                12,
+            );
+            r
+        })
+        .await
+        .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-transport",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-transport",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-transport", "rb-transport", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-transport"));
+        let (_revert_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        // The connection dies with the revert UNSERVED — a `Closed` transport
+        // leg; the provider may have applied the mutation before dying.
+        peer.disconnect();
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(CODEX_UNCERTAIN_ROLLBACK_COPY)
+        );
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        let record = fake
+            .load_rollback("codex", "thr-undo-transport")
+            .expect("the post-op ledger record is KEPT");
+        assert_eq!(
+            record.entries.len(),
+            prior_entry_count + 1,
+            "no compensating rewrite after a possibly-applied mutation — the \
+             new marker stays"
+        );
+        let prompts: Vec<&str> = record
+            .entries
+            .iter()
+            .map(|e| e.prompt_text.as_str())
+            .collect();
+        assert!(
+            prompts.contains(&"second prompt"),
+            "the ledger still describes the rollback the provider may have applied: {prompts:?}"
+        );
+        assert!(
+            prompts.contains(&"prior"),
+            "the prior marker survives in the kept union: {prompts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_send_permanently_destroys_redo() {
+        // Decision 5: any new submission permanently destroys redo; decision 6:
+        // the markers survive.
+        let (st, _rx, fake) = state_with_sink();
+        fake.record_rollback("codex", "thr-send-destroy", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(1);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t9" })],
+                    prompt_text: "p".into(),
+                    at_ms: 2,
+                    epoch: 0,
+                },
+                3,
+            );
+            r
+        })
+        .await
+        .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-send-destroy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-send-destroy",
+        )
+        .await;
+        // Drive a real send (the scripted initialize + turn/start rig the
+        // existing handle_send drives use).
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-destroy".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-send-destroy".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-1" } }));
+        driver.await.expect("send task");
+        let record = fake
+            .load_rollback("codex", "thr-send-destroy")
+            .expect("record survives");
+        assert!(
+            record.redo_destroyed,
+            "any new submission permanently destroys redo (decision 5)"
+        );
+        assert!(!record.can_redo(), "destroy clears the stored can_redo bit");
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "markers survive the destroy (decision 6)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_after_a_destroyed_redo_starts_a_new_epoch_but_keeps_all_markers() {
+        // r3 epoch rule: a new UNDO landing while `redo_destroyed` is set starts
+        // a NEW epoch that clears ONLY the redo-capable chain state
+        // (`redo_destroyed` clears — the record's redo fields now describe the
+        // NEW chain; the prior chain's redo stays permanently dead). `entries`
+        // is the UNION of every epoch's markers and is NEVER dropped.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-epoch",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-epoch",
+        )
+        .await;
+        fake.record_rollback("codex", "thr-epoch", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(1);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "old-epoch" })],
+                    prompt_text: "old".into(),
+                    at_ms: 2,
+                    epoch: 0,
+                },
+                3,
+            );
+            r.destroy_redo(4);
+            r
+        })
+        .await
+        .expect("seed");
+        let (sink, _captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-epoch", "rb-epoch", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-epoch"));
+        let (revert_id, _m2, _p2) = peer.expect_request().await;
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+        let record = fake.load_rollback("codex", "thr-epoch").expect("record");
+        assert!(
+            !record.redo_destroyed,
+            "the redo state now describes the NEW chain (the prior chain's redo stays dead)"
+        );
+        assert!(
+            !record.can_redo(),
+            "codex canRedo is always false (undo-only)"
+        );
+        assert_eq!(
+            record.entries.len(),
+            2,
+            "r3: the UNION of every epoch's markers — entries are never dropped"
+        );
+        assert_eq!(record.entries[0].prompt_text, "old");
+        assert_eq!(record.entries[1].prompt_text, "second prompt");
+        // Delta-r1 F8 case (a): the load-time destroy bit opened a NEW epoch —
+        // the frozen prior entry KEEPS its own epoch (0), the new op pushed with
+        // the bumped counter (1).
+        assert_eq!(record.current_epoch, 1);
+        assert_eq!(
+            record.entries[0].epoch, 0,
+            "frozen entries keep their epochs"
+        );
+        assert_eq!(
+            record.entries[1].epoch, 1,
+            "the new op records the bumped (current) epoch"
+        );
+    }
+
+    /// One remaining completed turn — the post-revert read shape after the
+    /// two-turn fixture's tail is gone.
+    fn one_turn_thread_read(thread_id: &str) -> Value {
+        json!({ "thread": { "id": thread_id, "turns": [
+            { "id": "turn-1", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t1-u", "content": [{ "type": "text", "text": "first prompt" }] },
+                { "type": "agentMessage", "id": "t1-a", "text": "first answer" },
+            ]},
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_double_undo_within_one_epoch_keeps_the_marker_bucket_in_conversation_order(
+    ) {
+        // Whole-branch review Minor-3: the codex marker bucket is CONVERSATION
+        // order (the plan :165 union rule wins over the codex bullet at :166).
+        // Two sequential undos inside ONE epoch (no submission between) remove
+        // turn-2 then turn-1; the second op's entry is spliced BEFORE the
+        // first's, so the bucket reads [turn-1 markers…, turn-2 markers…]
+        // ascending — the opencode rebuild / claude splice parity.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-order",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-order",
+        )
+        .await;
+
+        // First undo: the two-turn thread loses turn-2 ("second prompt").
+        let (sink1, cap1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-order", "rb-o1", None), sink1)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, m1, _p1) = peer.expect_request().await;
+        assert_eq!(m1, "thread/read");
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-order"));
+        let (revert_id, m2, p2) = peer.expect_request().await;
+        assert_eq!(m2, "thread/revert");
+        assert_eq!(p2["beforeTurnId"], json!("turn-2"));
+        peer.respond(&revert_id, json!({}));
+        driver1.await.expect("first rollback task");
+        assert_eq!(
+            captured_frames(&cap1).len(),
+            1,
+            "the ack plane is untouched by the ordering change"
+        );
+
+        // Second undo, SAME epoch (redo_destroyed never set): the thread now
+        // reads as one turn, so the step removes turn-1 ("first prompt").
+        let (sink2, _cap2) = capturing_sink();
+        let driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-order", "rb-o2", None), sink2)
+                    .await;
+            })
+        };
+        let (read_id2, m3, _p3) = peer.expect_request().await;
+        assert_eq!(m3, "thread/read");
+        peer.respond(&read_id2, one_turn_thread_read("thr-undo-order"));
+        let (revert_id2, m4, p4) = peer.expect_request().await;
+        assert_eq!(m4, "thread/revert");
+        assert_eq!(p4["beforeTurnId"], json!("turn-1"));
+        peer.respond(&revert_id2, json!({}));
+        driver2.await.expect("second rollback task");
+
+        let record = fake
+            .load_rollback("codex", "thr-undo-order")
+            .expect("record");
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| e.prompt_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first prompt", "second prompt"],
+            "the second undo's entry splices BEFORE the first's — sequential undos within one \
+             epoch read t1..tn ascending"
+        );
+        let bucket_ids: Vec<String> = record
+            .entries
+            .iter()
+            .flat_map(|e| e.removed_turns.iter())
+            .filter_map(|t| {
+                t.get("turnId")
+                    .or_else(|| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            bucket_ids.len(),
+            4,
+            "each removed step is a user+assistant row pair: {bucket_ids:?}"
+        );
+        assert!(
+            bucket_ids[..2].iter().all(|id| id.starts_with("turn-1"))
+                && bucket_ids[2..].iter().all(|id| id.starts_with("turn-2")),
+            "the flattened marker bucket reads [t1_markers…, t2_markers…]: {bucket_ids:?}"
+        );
+    }
+
+    /// An N-raw-turn `thread/read` body: turn ids `turn-{i}` for i in
+    /// [first, first+count), each a user+agent pair with text `prompt {i}` /
+    /// `answer {i}`.
+    fn codex_thread_read_span(thread_id: &str, first: usize, count: usize) -> Value {
+        let turns: Vec<Value> = (first..first + count)
+            .map(|i| {
+                json!({ "id": format!("turn-{i}"), "status": "completed", "items": [
+                    { "type": "userMessage", "id": format!("t{i}-u"), "content": [{ "type": "text", "text": format!("prompt {i}") }] },
+                    { "type": "agentMessage", "id": format!("t{i}-a"), "text": format!("answer {i}") },
+                ]})
+            })
+            .collect();
+        json!({ "thread": { "id": thread_id, "turns": turns } })
+    }
+
+    /// The next REAL request on the scripted peer, answering the client's
+    /// lazy initialize/initialized handshake transparently (the first RPC any
+    /// drive issues triggers it; `client.ts:777-778`).
+    async fn expect_codex_request_handshake_aware(
+        peer: &freshell_codex::ChannelPeer,
+    ) -> (freshell_codex::RequestId, String, serde_json::Value) {
+        loop {
+            let (id, method, params) = peer.expect_request().await;
+            if method == "initialize" {
+                peer.respond(
+                    &id,
+                    json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+                );
+                let _ = peer.expect_notification().await; // initialized
+                continue;
+            }
+            return (id, method, params);
+        }
+    }
+
+    /// Drive one step-undo op: handle_rollback → thread/read (answered with
+    /// `read_body`) → thread/revert (answered ok).
+    async fn drive_codex_undo(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        thread_id: &str,
+        request_id: &str,
+        read_body: Value,
+    ) {
+        let (sink, _captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            let thread_id = thread_id.to_string();
+            let request_id = request_id.to_string();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg(&thread_id, &request_id, None), sink)
+                    .await;
+            })
+        };
+        let (read_id, method, _p) = expect_codex_request_handshake_aware(peer).await;
+        assert_eq!(method, "thread/read");
+        peer.respond(&read_id, read_body);
+        let (revert_id, method2, _p2) = expect_codex_request_handshake_aware(peer).await;
+        assert_eq!(method2, "thread/revert");
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+    }
+
+    /// Wait until the session's active-turn tracker CLEARS (the real
+    /// consumer's turn/completed clear edge), bounded.
+    async fn await_codex_active_turn_clear(st: &FreshCodexState, thread_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let active_turn = {
+                let guard = st.sessions.lock().await;
+                guard.get(thread_id).expect("session").active_turn.clone()
+            };
+            let clear = active_turn.lock().expect("active_turn mutex").is_none();
+            if clear {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "active_turn never cleared (the turn/completed consumer edge did not land)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending(
+    ) {
+        // Delta-r1 F8's codified multi-epoch case: undo → send (decision 5
+        // destroy) → undo → undo ⇒ the marker bucket is the FIRST epoch's
+        // frozen prefix, then the NEW epoch's entries in conversation order
+        // ascending — literal bookkeeping only, positions never read at_ms.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thr-f8",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-f8",
+        )
+        .await;
+
+        // Undo #1 (epoch 0): the four-turn thread loses turn-4.
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-1",
+            codex_thread_read_span("thr-f8", 1, 4),
+        )
+        .await;
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        assert_eq!(record.current_epoch, 0);
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].epoch, 0);
+        assert_eq!(record.entries[0].prompt_text, "prompt 4");
+
+        // A submission in between destroys redo (decision 5) — the epoch
+        // boundary marker. The send is driven start→completed through the REAL
+        // consumer so the active-turn tracker clears before the next undo.
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-f8-send".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-f8".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "prompt 5".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_start_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_start_id, json!({ "turn": { "id": "turn-5" } }));
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thr-f8", "turn": { "id": "turn-5", "status": "completed" } }),
+        );
+        send_driver.await.expect("send task");
+        await_codex_active_turn_clear(&st, "thr-f8").await;
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        assert!(
+            record.redo_destroyed,
+            "submitting after the undo retired redo (decision 5)"
+        );
+
+        // Undo #2: the destroy bit at load opens EPOCH 1 (turn-3 rolls back).
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-2",
+            codex_thread_read_span("thr-f8", 1, 3),
+        )
+        .await;
+        // Undo #3, SAME epoch: turn-2 rolls back and splices BEFORE the
+        // epoch-1 prior entry (conversation order ascending).
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-3",
+            codex_thread_read_span("thr-f8", 1, 2),
+        )
+        .await;
+
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        let shape: Vec<(u32, &str)> = record
+            .entries
+            .iter()
+            .map(|e| (e.epoch, e.prompt_text.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(0, "prompt 4"), (1, "prompt 2"), (1, "prompt 3")],
+            "first epoch's frozen prefix, then the new epoch ascending — literal epoch bookkeeping, never timestamps"
+        );
+        assert_eq!(record.current_epoch, 1);
+        assert!(
+            !record.redo_destroyed,
+            "the new epoch cleared only the redo chain state"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_send_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
+        // r2 serialization discipline: ONE per-session async turn lock, held
+        // across the WHOLE rollback handler. handle_send takes the same lock
+        // (never touching rollback_in_flight) — "send waits, rollback wins,
+        // then destroys". While thread/revert is parked UNSERVED, the racing
+        // send must not reach the sidecar at all; after the revert resolves,
+        // the send's turn/start follows and the final record carries
+        // redo_destroyed.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-race",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-race",
+        )
+        .await;
+        let (sink, _captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-race", "rb-race", None), sink)
+                    .await;
+            })
+        };
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-race".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-race".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "the submission that must wait".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            answer_initialize(&peer).await;
+            let (read_id, method, _p) = peer.expect_request().await;
+            assert_eq!(method, "thread/read");
+            peer.respond(&read_id, two_turn_thread_read("thr-race"));
+            let (revert_id, method2, _p) = peer.expect_request().await;
+            assert_eq!(method2, "thread/revert");
+            // The revert is mid-flight holding the turn lock: the racing send
+            // (spawned above, immediately runnable) must NOT have reached the
+            // sidecar — no turn/start frame exists yet.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), peer.next_frame())
+                    .await
+                    .is_err(),
+                "the send waits on the turn lock while the rollback holds it"
+            );
+            peer.respond(&revert_id, json!({}));
+            let (turn_id, method3, params3) = peer.expect_request().await;
+            assert_eq!(
+                method3, "turn/start",
+                "thread/revert lands strictly BEFORE the waiting send's turn/start"
+            );
+            assert_eq!(params3["threadId"], json!("thr-race"));
+            peer.respond(&turn_id, json!({ "turn": { "id": "turn-race-1" } }));
+            rollback_driver.await.expect("rollback task");
+            send_driver.await.expect("send task");
+        })
+        .await;
+        joined.expect("no deadlock: send + rollback both complete within the budget");
+        let record = fake
+            .load_rollback("codex", "thr-race")
+            .expect("a record exists");
+        assert_eq!(record.entries.len(), 1, "the rollback wrote its marker");
+        assert!(
+            record.redo_destroyed,
+            "send waits, rollback wins, then destroys"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_compact_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
+        // Task 2 review M1: `handle_compact` holds the session turn lock across
+        // its busy gate AND the `thread/compact/start` RPC (the `handle_send`
+        // discipline), so a rollback holding the lock makes a racing compact
+        // WAIT — `thread/revert` lands strictly BEFORE `thread/compact/start`,
+        // and the revert can never force-interrupt a compact turn the busy
+        // gate never saw.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-crace",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-crace",
+        )
+        .await;
+        let (sink, _captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-crace", "rb-crace", None), sink)
+                    .await;
+            })
+        };
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thr-crace")).await;
+            })
+        };
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            answer_initialize(&peer).await;
+            let (read_id, method, _p) = peer.expect_request().await;
+            assert_eq!(method, "thread/read");
+            peer.respond(&read_id, two_turn_thread_read("thr-crace"));
+            let (revert_id, method2, _p) = peer.expect_request().await;
+            assert_eq!(method2, "thread/revert");
+            // The revert is mid-flight holding the turn lock: the racing
+            // compact must NOT have reached the sidecar — no
+            // thread/compact/start frame exists yet.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), peer.next_frame())
+                    .await
+                    .is_err(),
+                "the compact waits on the turn lock while the rollback holds it"
+            );
+            peer.respond(&revert_id, json!({}));
+            let (compact_id, method3, params3) = peer.expect_request().await;
+            assert_eq!(
+                method3, "thread/compact/start",
+                "thread/revert lands strictly BEFORE the waiting compact's RPC"
+            );
+            assert_eq!(params3["threadId"], json!("thr-crace"));
+            peer.respond(&compact_id, json!({}));
+            rollback_driver.await.expect("rollback task");
+            compact_driver.await.expect("compact task");
+        })
+        .await;
+        joined.expect("no deadlock: compact + rollback both complete within the budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_parses_the_rollouts_durable_history_mode() {
+        // r3 durability: thread/resume takes no mode param; the rollout's
+        // persisted `session_meta.history_mode` is the durable source of truth
+        // (validator-C proved the mode persists there). A paginated thread
+        // keeps undo capability across normal session rehydration; ONLY a
+        // missing/unparseable durable mode stamps legacy (undo:false).
+        let _guard = ENV_LOCK.lock().await;
+        let codex_home = std::env::var("CODEX_HOME").expect("isolated CODEX_HOME");
+        for (case, thread_id, meta_line, expected) in [
+            (
+                "paginated",
+                "thr-hist-paged",
+                Some(
+                    r#"{"timestamp":"2026-08-23T00:00:00.000Z","type":"session_meta","payload":{"id":"thr-hist-paged","cwd":"/w","history_mode":"paginated"}}"#,
+                ),
+                Some(freshell_codex::HistoryMode::Paginated),
+            ),
+            (
+                "missing",
+                "thr-hist-missing",
+                Some(
+                    r#"{"timestamp":"2026-08-23T00:00:00.000Z","type":"session_meta","payload":{"id":"thr-hist-missing","cwd":"/w"}}"#,
+                ),
+                None,
+            ),
+            (
+                "unparseable",
+                "thr-hist-bad",
+                Some(
+                    r#"{"timestamp":"2026-08-23T00:00:00.000Z","type":"session_meta","payload":{"id":"thr-hist-bad","cwd":"/w","history_mode":42}}"#,
+                ),
+                None,
+            ),
+            ("absent", "thr-hist-absent", None, None),
+        ] {
+            // A durable rollout whose session_meta carries the named mode (or
+            // none at all — the "no rollout file" sub-case), written into the
+            // isolated CODEX_HOME the ENV_LOCK guard installed.
+            if let Some(line) = meta_line {
+                let dir = std::path::Path::new(&codex_home)
+                    .join("sessions")
+                    .join("2026")
+                    .join("08")
+                    .join("23");
+                std::fs::create_dir_all(&dir).expect("sessions dir");
+                std::fs::write(
+                    dir.join(format!("rollout-2026-08-23T00-00-00-{thread_id}.jsonl")),
+                    format!("{line}\n"),
+                )
+                .expect("write fake rollout");
+            }
+            configure_fake_codex_cmd("{}");
+            let (st, mut rx) = state_with_bus();
+            st.handle_create(FreshAgentCreate {
+                request_id: format!("req-{case}"),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: Some(thread_id.to_string()),
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+            })
+            .await;
+            let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                    if frame["type"] == "freshAgent.created"
+                        || frame["type"] == "freshAgent.create.failed"
+                    {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("the fake app-server responds within the budget");
+            assert_eq!(
+                created["type"], "freshAgent.created",
+                "fixture resume-create failed ({case}): {created}"
+            );
+            assert_eq!(created["sessionId"], json!(thread_id));
+            let mode = {
+                let guard = st.sessions.lock().await;
+                guard
+                    .get(thread_id)
+                    .expect("the resumed session registered")
+                    .history_mode
+            };
+            assert_eq!(
+                mode, expected,
+                "{case}: the durable rollout meta is the history-mode source of truth"
+            );
+            st.shutdown().await;
+        }
     }
 
     // -- freshAgent.attach (PR-4) --
@@ -10168,6 +13274,187 @@ pub(crate) mod tests {
         assert_eq!(
             turns[1]["items"][0]["text"],
             json!("Codex completed this turn without recording an assistant response.")
+        );
+    }
+
+    // ── kata 1wxv Task 5: snapshot rollback surfacing (codex) ─────────────────
+    //
+    // The capability stamp is SESSION-SCOPED by the DURABLE history mode
+    // (correction item 1, r3): `undo` ⟺ `Some(Paginated)`; legacy AND unknown
+    // (`None` — a missing/unparseable durable mode) stamp `undo:false`. `redo`
+    // is permanently false (codex revert is destructive; there is no redo
+    // primitive). The marker bucket comes from the LEDGER record (the r3
+    // entries union) — `thread/revert` destroys the tail, so there is no
+    // provider-side projection to recompute marker content from.
+
+    fn codex_raw_thread_updated_at_7() -> Value {
+        json!({
+            "thread": {
+                "id": "thread-9",
+                "preview": "",
+                "updatedAt": 7,
+                "status": { "type": "idle" },
+                "turns": [{
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "type": "userMessage",
+                        "id": "u-1",
+                        "content": [{ "type": "text", "text": "earlier" }],
+                    }],
+                }],
+            }
+        })
+    }
+
+    /// One ledger record whose entries union is a single op over the USER-role
+    /// display turn `turn-9` (last op at ms 100 — the revision floor).
+    fn codex_rollback_record_with_turn_9() -> crate::rollback_record::RollbackRecord {
+        use crate::rollback_record::*;
+        let mut record = RollbackRecord::empty(50);
+        record.push_entry(
+            RollbackEntry {
+                removed_turns: vec![json!({
+                    "id": "turn-9",
+                    "turnId": "turn-9",
+                    "ordinal": 1,
+                    "source": "durable",
+                    "role": "user",
+                    "summary": "later",
+                    "items": [{ "id": "turn-9:item-0", "kind": "text", "text": "later" }],
+                })],
+                prompt_text: "later".into(),
+                at_ms: 90,
+                epoch: 0,
+            },
+            100,
+        );
+        record
+    }
+
+    #[test]
+    fn codex_snapshot_stamps_paginated_capabilities_the_marker_bucket_and_the_revision_floor() {
+        let record = codex_rollback_record_with_turn_9();
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            Some(&record),
+        )
+        .expect("snapshot builds");
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "undoneDepth is the USER-role step count of the bucket (never entries.len()); F6: codex is undo-only ⇒ NO marker is ever redoable"
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(bucket[0]["rolledBack"], json!(true));
+        assert_eq!(bucket[0]["turnId"], json!("turn-9"));
+        assert_eq!(
+            snap["revision"],
+            json!(100),
+            "the record's lastOpAtMs is the revision floor (basis 7 loses)"
+        );
+    }
+
+    #[test]
+    fn codex_snapshot_stamps_legacy_and_unknown_history_undo_false() {
+        // `None` == a legacy thread OR an unparseable durable mode — the stamp is
+        // session-scoped and NEVER hard-coded true.
+        let record = codex_rollback_record_with_turn_9();
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            None,
+            Some(&record),
+        )
+        .expect("snapshot builds");
+        assert_eq!(snap["capabilities"]["undo"], json!(false));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+        // A record's markers still surface (the capability gate is client-side).
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
+    }
+
+    #[test]
+    fn codex_snapshot_without_a_record_hides_the_rollback_keys() {
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            None,
+        )
+        .expect("snapshot builds");
+        assert!(
+            snap.get("rolledBackTurns").is_none(),
+            "the marker bucket is omitted entirely when nothing was rolled back"
+        );
+        assert!(snap.get("rollback").is_none());
+        assert_eq!(snap["revision"], json!(7), "no floor without a record");
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx, fake) = state_with_sink();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-rollback",
+        )
+        .await;
+        fake.record_rollback("codex", "thread-1", codex_rollback_record_with_turn_9())
+            .await
+            .expect("record write");
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+        };
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        // A STALE provider basis (3) — the rollback op (ms 100) is newer.
+        peer.respond(
+            &id,
+            json!({ "thread": { "id": "thread-1", "status": { "type": "idle" }, "updatedAt": 3, "turns": [] } }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(
+            snapshot["capabilities"]["undo"],
+            json!(true),
+            "the paginated fixture session stamps undo (session-scoped, from the durable history mode record)"
+        );
+        assert_eq!(snapshot["capabilities"]["redo"], json!(false));
+        assert_eq!(
+            snapshot["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] })
+        );
+        assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("turn-9"));
+        assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["revision"],
+            json!(100),
+            "a stale provider basis never beats the record floor (the client monotonic watermark holds)"
         );
     }
 }

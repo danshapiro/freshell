@@ -17,14 +17,14 @@ const params = (required: readonly string[] = [], optional: readonly string[] = 
 
 /** The closed Rust client contract: 33 canonical actions and 14 tmux aliases. */
 export const ACTION_CAPABILITIES: readonly ActionCapability[] = [
-  { action: 'new-tab', aliases: ['new-window', 'new-session'], supported: true, params: params([], ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort']) },
+  { action: 'new-tab', aliases: ['new-window', 'new-session'], supported: true, params: params([], ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort']) },
   { action: 'list-tabs', aliases: ['list-windows'], supported: true, params: noParams },
   { action: 'select-tab', aliases: ['select-window'], supported: true, params: params(['target']) },
   { action: 'kill-tab', aliases: ['kill-window'], supported: true, params: params(['target']) },
   { action: 'rename-tab', aliases: ['rename-window'], supported: true, params: params(['name'], ['target']) },
   { action: 'next-tab', aliases: ['next-window'], supported: true, params: noParams },
   { action: 'prev-tab', aliases: ['previous-window', 'prev-window'], supported: true, params: noParams },
-  { action: 'split-pane', aliases: ['split-window'], supported: true, params: params([], ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef']) },
+  { action: 'split-pane', aliases: ['split-window'], supported: true, params: params([], ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'sessionRef']) },
   { action: 'display', aliases: ['display-message'], supported: true, params: params([], ['target', 'format']) },
   { action: 'screenshot', aliases: ['screenshot-pane', 'screenshot-tab', 'screenshot-view'], supported: true, params: params(['scope'], ['target', 'name']) },
   { action: 'has-tab', supported: true, params: params(['target']) },

@@ -6,6 +6,7 @@ import { nanoid } from 'nanoid'
 import {
   Bot,
   FileCode2,
+  Gauge,
   Globe,
   Square,
   TerminalSquare,
@@ -177,6 +178,9 @@ export function sanitizePaneSnapshot(
       props: (payload.props as Record<string, unknown>) || {},
     }
   }
+  if (snapshot.kind === 'host-stats') {
+    return { kind: 'host-stats' }
+  }
   return { kind: 'picker' }
 }
 
@@ -200,6 +204,7 @@ export function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
   if (kind === 'browser') return Globe
   if (kind === 'editor') return FileCode2
   if (kind === 'fresh-agent') return Bot
+  if (kind === 'host-stats') return Gauge
   return Square
 }
 
@@ -209,6 +214,7 @@ export function paneKindColorClass(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'editor') return 'text-emerald-500'
   if (kind === 'fresh-agent' || kind === 'claude-chat') return 'text-amber-500'
   if (kind === 'extension') return 'text-purple-500'
+  if (kind === 'host-stats') return 'text-cyan-500'
   return 'text-muted-foreground'
 }
 
@@ -218,6 +224,7 @@ export function paneKindLabel(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'editor') return 'Editor'
   if (kind === 'fresh-agent' || kind === 'claude-chat') return 'Agent'
   if (kind === 'extension') return 'Extension'
+  if (kind === 'host-stats') return 'Host Stats'
   return kind
 }
 

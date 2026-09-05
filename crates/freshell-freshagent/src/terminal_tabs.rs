@@ -200,6 +200,21 @@ async fn create_terminal_or_content_tab_with_delivery(
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // `hostStats: true` -> stateless host-stats pane (router.ts `wantsHostStats`
+    // branch before browser): no process, no terminal admission.
+    if body
+        .get("hostStats")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return create_content_tab(
+            &state,
+            name,
+            json!({ "kind": "host-stats" }),
+            restore_key.as_deref(),
+            broadcast,
+        );
+    }
     if let Some(url) = body.get("browser").and_then(Value::as_str) {
         // `devToolsOpen` flows into the frozen client verbatim via
         // `paneContent` (ui-commands.ts `tab.create` -> initLayout), so a
@@ -3177,6 +3192,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["data"]["tabId"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn create_host_stats_tab_attaches_host_stats_pane_content_and_no_terminal() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let (status, body) =
+            post(app(state), "/api/tabs", json!({ "hostStats": true }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data"]["tabId"].as_str().is_some());
+        assert!(body["data"]["paneId"].as_str().is_some());
+        assert!(body["data"].get("terminalId").is_none());
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("tab.create"));
+        assert_eq!(msg["payload"]["paneContent"]["kind"], json!("host-stats"));
     }
 
     // ── GET /api/tabs ────────────────────────────────────────────────────────

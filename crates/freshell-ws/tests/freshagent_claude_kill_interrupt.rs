@@ -85,6 +85,9 @@ rl.on('line', (line) => {
   } else if (msg.type === 'interrupt') {
     const log = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (log) fs.appendFileSync(log, `${msg.sessionId}\n`)
+    // ep4-r1 F1 wire parity: settle the awaited interrupt (the real sidecar
+    // emits this after query.interrupt() resolves).
+    console.log(JSON.stringify({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: true }))
   } else if (msg.type === 'shutdown') {
     process.exit(0)
   }
@@ -199,6 +202,7 @@ async fn spawn_server() -> String {
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),

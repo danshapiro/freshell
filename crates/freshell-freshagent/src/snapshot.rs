@@ -146,7 +146,18 @@ async fn get_snapshot(
         // claude path): overlays populate + gates flip identically, only the stamped
         // `sessionType` differs.
         ("freshclaude", "claude") | ("kilroy", "claude") => {
-            match crate::claude_snapshot::get_claude_snapshot(&session_type, &thread_id).await {
+            // Kata 1wxv Task 5: the durable rollback record rides the disk-built
+            // snapshot (marker bucket + `rollback{canRedo, undoneDepth}` + revision
+            // floor). The record is ledger-sync (memory-fast) and resolves by the
+            // DURABLE id even when no session is live (durable+multi-client truth).
+            let rollback = state.claude.load_rollback_record(&thread_id).await;
+            match crate::claude_snapshot::get_claude_snapshot(
+                &session_type,
+                &thread_id,
+                rollback.as_ref(),
+            )
+            .await
+            {
                 Ok(mut snapshot) => {
                     // Task 3 (reload-while-pending): overlay the session's LIVE pending
                     // approvals/questions and flip the presence-of-pending gates
@@ -224,8 +235,8 @@ mod tests {
     use freshell_codex::CodexAppServerClient;
     use freshell_opencode::{
         Endpoint, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
-        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
-        ServeProcess, SpawnRequest,
+        ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpError, ServeHttpRequest,
+        ServeHttpResponse, ServeProcess, SpawnRequest,
     };
 
     #[test]
@@ -619,6 +630,89 @@ mod tests {
         assert_eq!(value["capabilities"]["questions"], json!(false));
     }
 
+    /// Kata 1wxv Task 5: the claude route SURFACES the durable rollback record —
+    /// the marker bucket (ledger entries union, stamped rolledBack:true) and the
+    /// `rollback{canRedo, undoneDepth}` block — on a DISK-ONLY read (no live
+    /// session needed; durable+multi-client truth per decision 10). The chain
+    /// root's tip is re-read at snapshot time for the canRedo recheck.
+    #[tokio::test]
+    async fn claude_locator_surfaces_the_durable_rollback_record() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("projects").join("-p");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "93939393-9393-4939-8939-939393939393";
+        let current = "94949494-9494-4949-8949-949494949494";
+        let original_text = [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"prompt one"}]}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"t2","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}]}}),
+            json!({"type":"user","uuid":"u2","parentUuid":"a1","timestamp":"t3","message":{"role":"user","content":[{"type":"text","text":"prompt two"}]}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"u2","timestamp":"t4","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}]}}),
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let current_text = original_text.lines().take(2).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.join(format!("{original}.jsonl")), &original_text).unwrap();
+        std::fs::write(dir.join(format!("{current}.jsonl")), &current_text).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        // Seed the ledger: one undo op over [u2, a2] (verbatim display-turn JSON,
+        // as the Task 4 handler records it; `rolledBack` is stamped at READ).
+        let claude = claude_state();
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        claude.set_identity_sink(fake.clone());
+        use crate::identity_sink::PaneIdentitySink;
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.original_session_id = Some(original.to_string());
+        record.original_tip_uuid = Some("a2".to_string());
+        record.push_entry(
+            crate::rollback_record::RollbackEntry {
+                removed_turns: vec![
+                    json!({ "id": "u2", "turnId": "u2", "ordinal": 2, "source": "durable", "role": "user", "summary": "prompt two", "items": [{ "id": "u2-i0", "kind": "text", "text": "prompt two" }] }),
+                    json!({ "id": "a2", "turnId": "a2", "ordinal": 3, "source": "durable", "role": "assistant", "summary": "answer two", "items": [{ "id": "a2-i0", "kind": "text", "text": "answer two" }] }),
+                ],
+                prompt_text: "prompt two".into(),
+                at_ms: 90,
+                epoch: 0,
+            },
+            100,
+        );
+        record.set_can_redo(true, 100);
+        fake.record_rollback("claude", current, record)
+            .await
+            .expect("record write");
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode_state(),
+            claude,
+        );
+        let (status, value) = get_json_with_state(state, "freshclaude", current).await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["capabilities"]["undo"], json!(true));
+        assert_eq!(value["capabilities"]["redo"], json!(true));
+        assert_eq!(
+            value["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["u2"] })
+        );
+        let bucket = value["rolledBackTurns"].as_array().expect("bucket");
+        let ids: Vec<&str> = bucket.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(ids, vec!["u2", "a2"]);
+        assert!(bucket.iter().all(|t| t["rolledBack"] == json!(true)));
+        // The ACTIVE prefix is unaffected by the ledger bucket.
+        let prefix: Vec<&str> = value["turns"]
+            .as_array()
+            .expect("turns")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(prefix, vec!["u1", "a1"]);
+    }
+
     /// Task 3: a live session with NOTHING pending must keep the exact pre-overlay
     /// response shape (fields/values) — reload-while-idle is unchanged, and the golden
     /// FIXTURE (`builder_output_matches_the_golden_snapshot_fixture`) stays untouched.
@@ -645,8 +739,13 @@ mod tests {
         let (status, value) = get_json_with_state(state, "freshclaude", durable).await;
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(status, StatusCode::OK);
-        let mut expected =
-            crate::claude_snapshot::build_claude_snapshot_json("freshclaude", durable, content, 0);
+        let mut expected = crate::claude_snapshot::build_claude_snapshot_json(
+            "freshclaude",
+            durable,
+            content,
+            0,
+            None,
+        );
         // `revision` is transcript-mtime-derived — not the shape under test.
         expected["revision"] = value["revision"].clone();
         assert_eq!(
@@ -773,7 +872,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&self.messages_body).unwrap()

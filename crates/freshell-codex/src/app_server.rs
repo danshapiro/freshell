@@ -132,6 +132,11 @@ pub struct StartThreadParams {
     pub sandbox: Option<String>,
     /// `untrusted` | `on-failure` | `on-request` | `never` (`CodexAskForApprovalSchema`).
     pub approval_policy: Option<String>,
+    /// Kata 1wxv Task 2 (LBC-1): every thread freshell STARTS adopts
+    /// `historyMode:"paginated"` — `thread/revert` refuses legacy threads. Sent
+    /// on `thread/start` ONLY: `thread/resume` takes NO mode param (the durable
+    /// rollout meta carries the mode; see [`crate::durability::read_rollout_history_mode`]).
+    pub history_mode: Option<crate::durability::HistoryMode>,
 }
 
 /// The `thread/start` / `thread/resume` result the adapter reads (`client.ts:181-185`): the
@@ -290,6 +295,11 @@ impl CodexAppServerClient {
         insert_opt_str(&mut wire, "model", params.model);
         insert_opt_str(&mut wire, "sandbox", params.sandbox);
         insert_opt_str(&mut wire, "approvalPolicy", params.approval_policy);
+        if let Some(mode) = params.history_mode {
+            // LBC-1 (kata 1wxv Task 2): threads freshell starts are paginated so
+            // `thread/revert` accepts them.
+            wire.insert("historyMode".to_string(), json!(mode.wire_name()));
+        }
         // client.ts:172-173 — the client's fixed additions.
         wire.insert("experimentalRawEvents".to_string(), json!(false));
         wire.insert("persistExtendedHistory".to_string(), json!(true));
@@ -400,6 +410,27 @@ impl CodexAppServerClient {
     pub async fn unarchive_thread(&self, thread_id: &str) -> Result<(), CodexAppServerError> {
         self.request("thread/unarchive", json!({ "threadId": thread_id }))
             .await?;
+        Ok(())
+    }
+
+    /// `thread/revert` (codex 0.149.0, EXPERIMENTAL; kata 1wxv Task 2) — the
+    /// in-place, same-thread-id conversation rollback: durable history is
+    /// replaced by the prefix strictly BEFORE `before_turn_id` (an empty prefix
+    /// — reverting before the first turn — LEGALLY empties the thread).
+    /// Conversation-only (the provider leaves files to the client) and
+    /// DESTRUCTIVE — there is no native redo, so the caller captures the
+    /// removed tail BEFORE issuing this RPC. Refuses legacy threads with
+    /// `-32600 "thread/revert only supports paginated threads"`.
+    pub async fn revert_thread(
+        &self,
+        thread_id: &str,
+        before_turn_id: &str,
+    ) -> Result<(), CodexAppServerError> {
+        self.request(
+            "thread/revert",
+            json!({ "threadId": thread_id, "beforeTurnId": before_turn_id }),
+        )
+        .await?;
         Ok(())
     }
 

@@ -19,8 +19,8 @@ use std::time::Duration;
 use freshell_opencode::events::parse_serve_event;
 use freshell_opencode::serve::{
     Endpoint, EventSink, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator,
-    ProcessSpawner, ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpRequest,
-    ServeHttpResponse, ServeProcess, SpawnRequest,
+    ProcessSpawner, ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError,
+    ServeHttpRequest, ServeHttpResponse, ServeProcess, SpawnRequest,
 };
 use serde_json::json;
 
@@ -36,7 +36,9 @@ impl ServeHttp for IdleHttp {
         &'a self,
         req: ServeHttpRequest,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a,
+        >,
     > {
         let body = if req.url.contains("/global/health") {
             b"{}".to_vec()

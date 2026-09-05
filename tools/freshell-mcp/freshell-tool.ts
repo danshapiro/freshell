@@ -386,6 +386,7 @@ const HELP_TEXT = [
   '',
   'capture-pane accepts J and e as Rust-compatible no-op parameters.',
   'wait-for requires a literal pattern; stable, exit, and prompt are unavailable.',
+  'Pass hostStats: true on new-tab or split-pane to create a Host Stats pane without spawning a terminal.',
   '',
   '## Playbook',
   'Use literal: true with send-keys for natural-language prompts.',

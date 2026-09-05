@@ -239,9 +239,17 @@ fn required_string(map: &Map<String, Value>, key: &str) -> Option<String> {
 fn turn_event_from_params(params: Option<&Value>) -> Option<CodexTurnEvent> {
     let obj = params?.as_object()?;
     let thread_id = required_string(obj, "threadId")?;
+    // ep1-r3 F4: the turn id lives in BOTH wire shapes — the PROBED real
+    // app-server's inline `turn.id` (fake-app-server.mjs, codex-adapter.test.ts)
+    // and the legacy-lite flat `turnId` (client.test.ts) — prefer the inline
+    // id, fall back to the flat one. (Pre-F4 this read ONLY the flat key, so
+    // real-shape turn events carried NO id and the
+    // `turn/started`-sets-active-turn fallback was dead for the probed shape.)
     let turn_id = obj
-        .get("turnId")
+        .get("turn")
+        .and_then(|t| t.get("id"))
         .and_then(Value::as_str)
+        .or_else(|| obj.get("turnId").and_then(Value::as_str))
         .map(str::to_string);
     Some(CodexTurnEvent {
         thread_id,
@@ -563,6 +571,35 @@ mod tests {
             ),
         );
         assert!(matches!(inline, CodexNotification::TurnCompleted(_)));
+    }
+
+    #[test]
+    fn classifies_turn_events_read_the_inline_turn_id_shape() {
+        // ep1-r3 F4: the PROBED real app-server carries the turn id at
+        // `params.turn.id` (fake-app-server.mjs) — the extractor must read it
+        // (pre-fix ONLY the flat `turnId` key was read, so real-shape turn
+        // events carried no id — and completion-id ownership could never
+        // match). The flat key remains the fallback for the legacy shape.
+        let started = classify_notification(
+            "turn/started",
+            Some(
+                &json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "inProgress" } }),
+            ),
+        );
+        assert!(
+            matches!(started, CodexNotification::TurnStarted(ref e) if e.turn_id.as_deref() == Some("turn-1")),
+            "{started:?}"
+        );
+        let completed = classify_notification(
+            "turn/completed",
+            Some(
+                &json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "completed" } }),
+            ),
+        );
+        assert!(
+            matches!(completed, CodexNotification::TurnCompleted(ref e) if e.turn_id.as_deref() == Some("turn-1")),
+            "{completed:?}"
+        );
     }
 
     #[test]
