@@ -4,7 +4,7 @@
 //! A faithful port of the **handshake path** of `server/ws-handler.ts`:
 //!
 //! * mount `/ws` (an axum WebSocket upgrade — tokio-tungstenite-backed);
-//! * read the first `hello`, validate `protocolVersion == 7` **first**, then the
+//! * read the first `hello`, validate `protocolVersion == 10` **first**, then the
 //!   token with a **constant-time** compare (mirrors `auth.ts#timingSafeCompare`
 //!   and the `ws-handler.ts` ordering: version check precedes auth);
 //! * on success emit, IN ORDER, exactly what the original sends on a clean
@@ -20,6 +20,20 @@
 //! The crate emits the frozen [`freshell_protocol`] server-message types so its
 //! wire bytes are contract-locked.
 
+/// The git commit THIS binary was built from, baked into this crate at
+/// compile time by this crate's `build.rs` (`FRESHELL_WS_BUILD_COMMIT`).
+/// Falls back to the literal `"unknown"` when git was unavailable at build
+/// time (e.g. a source tarball or the Cloud Run image, which builds without
+/// git metadata) -- never a runtime failure. Build provenance is
+/// BUILD-scoped, so this deliberately does NOT ride on `WsState`.
+pub fn ready_build_id() -> Option<String> {
+    Some(
+        option_env!("FRESHELL_WS_BUILD_COMMIT")
+            .unwrap_or("unknown")
+            .to_string(),
+    )
+}
+
 pub mod activity;
 pub mod auto_resume;
 pub mod backpressure;
@@ -33,6 +47,8 @@ pub mod create_dedupe;
 pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
+pub mod host_stats_collector;
+pub mod host_stats_interest;
 pub mod identity;
 pub mod invariants;
 pub mod opencode_association;
@@ -233,6 +249,13 @@ pub struct WsState {
     /// amplifier subagent rescan cadence (`freshell-server`, Task 9) runs while
     /// `any()` is true. See [`crate::subagent_interest`].
     pub subagent_interest: crate::subagent_interest::SubagentInterestRegistry,
+    /// HOST-PRESSURE PANE (Task 9, `docs/plans/2026-08-25-host-pressure-pane.md`):
+    /// per-connection `hoststats.subscribe` interest + the injected concrete
+    /// collector (`Arc<dyn HostStatsCollector>`, freshell-server). Bundled as
+    /// ONE sub-struct so the ~35 `WsState { ... }` literals across crates
+    /// gain exactly one `host_stats: Default::default()` arm each (the plan's
+    /// >~6-site sweep rule). See [`crate::host_stats_collector`].
+    pub host_stats: crate::host_stats_collector::WsHostStatsState,
     /// The handler-scoped monotonic `terminals.changed` revision counter
     /// (`ws-handler.ts:566` `terminalsRevision`). SHARED with the REST
     /// `/api/terminals` PATCH/DELETE broadcasts (`terminals::TerminalsState`),
@@ -511,14 +534,17 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false).await
+    build_handshake_with_capabilities(state, false, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
 /// `hello.capabilities.paneReconcileV1` (reconciliation design §4.2): the
 /// `ready.capabilities` advertisement is emitted **only when the client's
-/// `hello` opted in** — today's frozen client doesn't, so the emitted
-/// handshake stays byte-for-byte identical to the pinned clean-boot shape.
+/// `hello` opted in** — today's frozen client doesn't, so that field stays
+/// omitted for it (frozen-client inertness). The handshake overall is no
+/// longer byte-for-byte identical to the pinned clean-boot shape: `ready`
+/// now always stamps `buildId`, an additive change old clients ignore as
+/// an unknown field.
 ///
 /// CFG-12: `settings.updated` resolves [`WsState::handshake_settings`] — the
 /// LIVE tree — fresh on every call (one call per `/ws` connection), matching
@@ -530,6 +556,7 @@ pub async fn build_handshake_with_capabilities(
     state: &WsState,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    terminal_interest_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
@@ -537,12 +564,15 @@ pub async fn build_handshake_with_capabilities(
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
-            capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1).then_some(
-                freshell_protocol::ReadyCapabilities {
+            build_id: ready_build_id(),
+            capabilities: (pane_reconcile_v1
+                || pane_reconcile_fresh_agent_v1
+                || terminal_interest_v1)
+                .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
-                },
-            ),
+                    terminal_interest_v1: terminal_interest_v1.then_some(true),
+                }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.handshake_settings.read().await.clone(),
@@ -600,7 +630,7 @@ pub enum HelloOutcome {
     Accept,
     /// Not a `hello` frame, or unparseable — the original closes NOT_AUTHENTICATED.
     NotHello,
-    /// `protocolVersion != 7` — checked BEFORE the token (matches ws-handler.ts).
+    /// `protocolVersion != 10` — checked BEFORE the token (matches ws-handler.ts).
     ProtocolMismatch,
     /// Bad/missing token (constant-time compared).
     BadToken,
@@ -755,12 +785,22 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let terminal_interest_v1 = value
+        .get("capabilities")
+        .and_then(|caps| caps.get("terminalInterestV1"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
-    for msg in
-        build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
-            .await
+    for msg in build_handshake_with_capabilities(
+        &state,
+        pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
+        terminal_interest_v1,
+    )
+    .await
     {
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
@@ -789,6 +829,24 @@ async fn handle_socket(
         .and_then(|c| c.get("uiScreenshotV1"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    // D8 (restore-open-sessions-only): the connection's client identity rides
+    // the `hello` frame as additive optional top-level fields (older clients
+    // omit them; an absent hello identity simply leaves ledger rows
+    // unstamped). Read from the raw payload exactly like the capability bools
+    // above; `tabs.sync.push` frames refresh it inside the serve loop.
+    let conn_identity = terminal::ConnectionIdentity {
+        device_id: value
+            .get("deviceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        client_instance_id: value
+            .get("clientInstanceId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
     // Handshake done: serve the terminal.* shell path (and fan out broadcast-bus
     // frames) until the client closes.
     terminal::run(
@@ -800,6 +858,8 @@ async fn handle_socket(
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         origin_kind,
+        conn_identity,
+        terminal_interest_v1,
     )
     .await;
 }
@@ -861,60 +921,66 @@ async fn send_error(
 }
 
 #[cfg(test)]
+pub(crate) fn test_ws_state() -> WsState {
+    let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+    WsState {
+        pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+        layout: Default::default(),
+        identity: crate::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-1111".to_string()),
+        boot_id: Arc::new("boot-2222".to_string()),
+        settings: Arc::new(test_settings()),
+        handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
+        ),
+        registry: freshell_terminal::TerminalRegistry::new(),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        tabs: crate::tabs::TabsRegistry::new(),
+        screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(Vec::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: crate::backpressure::Term09Config::default(),
+        create_protect: crate::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     fn state() -> WsState {
-        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
-        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
-        WsState {
-            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
-            layout: Default::default(),
-            identity: crate::identity::TerminalIdentityRegistry::new(),
-            terminal_meta: Default::default(),
-            auth_token: Arc::clone(&auth_token),
-            server_instance_id: Arc::new("srv-1111".to_string()),
-            boot_id: Arc::new("boot-2222".to_string()),
-            settings: Arc::new(test_settings()),
-            handshake_settings: Arc::new(tokio::sync::RwLock::new(test_settings())),
-            broadcast_tx: Arc::clone(&broadcast_tx),
-            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
-            auto_resume_cancels: Default::default(),
-            fresh_codex: freshell_freshagent::FreshCodexState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-                serde_json::json!({ "freshAgent": { "enabled": false } }),
-            ),
-            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-                freshell_freshagent::FreshAgentState::new(auth_token, Arc::clone(&broadcast_tx)),
-            ),
-            registry: freshell_terminal::TerminalRegistry::new(),
-            shutdown: Arc::new(tokio::sync::Notify::new()),
-            tabs: crate::tabs::TabsRegistry::new(),
-            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
-            subagent_interest: Default::default(),
-            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            cli_commands: Arc::new(Vec::new()),
-            ping_interval_ms: 30_000,
-            hello_timeout_ms: 5_000,
-            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
-            ws_max_payload_bytes: 16 * 1024 * 1024,
-            term09: crate::backpressure::Term09Config::default(),
-            create_protect: crate::create_limit::CreateProtectConfig::default(),
-            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
-            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
-            config_fallback: None,
-            opencode_locator: None,
-            codex_locator: None,
-            activity: None,
-            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
-            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
-            fresh_agent_respawn_counts: Default::default(),
-        }
+        test_ws_state()
     }
 
     #[test]
@@ -945,14 +1011,14 @@ mod tests {
         );
 
         // Right version, wrong token.
-        let v = json!({ "type": "hello", "protocolVersion": 7, "token": "nope" });
+        let v = json!({ "type": "hello", "protocolVersion": WS_PROTOCOL_VERSION, "token": "nope" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::BadToken
         );
 
         // Right version, right token.
-        let v = json!({ "type": "hello", "protocolVersion": 7, "token": "s3cr3t-token-abcdef" });
+        let v = json!({ "type": "hello", "protocolVersion": WS_PROTOCOL_VERSION, "token": "s3cr3t-token-abcdef" });
         assert_eq!(
             evaluate_hello(&v, "s3cr3t-token-abcdef"),
             HelloOutcome::Accept
@@ -973,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false).await;
+        let negotiated = build_handshake_with_capabilities(&s, true, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -987,7 +1053,7 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false).await;
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }
@@ -1023,6 +1089,26 @@ mod tests {
         assert_eq!(wire[3]["bootId"], wire[0]["bootId"]);
         assert_eq!(wire[3]["terminals"], json!([]));
         assert_eq!(wire[3]["terminalMeta"], json!([]));
+    }
+
+    /// The handshake `ready` stamps the build identity baked into THIS crate
+    /// by its `build.rs` (`FRESHELL_WS_BUILD_COMMIT`, the git commit the
+    /// binary was built from) so the browser client can detect a client/
+    /// server build mismatch and reload once. Never absent on the wire from
+    /// a real server: the baked value is always `Some` (sha or `"unknown"`).
+    #[tokio::test]
+    async fn handshake_ready_stamps_build_id() {
+        let msgs = build_handshake(&state()).await;
+        let ready = serde_json::to_value(&msgs[0]).unwrap();
+        assert!(
+            ready.get("buildId").is_some(),
+            "ready must stamp buildId: {ready}"
+        );
+        let build_id = ready["buildId"].as_str().expect("buildId is a string");
+        assert!(
+            !build_id.is_empty(),
+            "buildId must be non-empty: {build_id}"
+        );
     }
 
     /// GAP1 (CFG-03 checklist follow-up) RED/GREEN target: when boot fell

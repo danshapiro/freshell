@@ -51,6 +51,8 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
     onMessage: mockOnMessage,
+    // Interest is transient and negotiated; this suite does not exercise it.
+    sendTerminalInterest: vi.fn(() => false),
     onReconnect: mockOnReconnect,
     connect: mockConnect,
     setHelloExtensionProvider: vi.fn(),
@@ -814,6 +816,26 @@ describe('App Component - WS Notifications', () => {
 
     await waitFor(() => {
       expect(screen.queryByText(/Config file was invalid/)).not.toBeInTheDocument()
+    })
+  })
+
+  it('shows the server-reported profile backup path in the config fallback warning', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'config.fallback',
+      reason: 'PARSE_ERROR',
+      backupExists: true,
+      backupPath: '/home/u/.freshell-work/config.backup.json',
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/Backup found at \/home\/u\/\.freshell-work\/config\.backup\.json\./)).toBeInTheDocument()
+      expect(screen.queryByText(/Backup found at ~\/\.freshell\/config\.backup\.json\./)).not.toBeInTheDocument()
     })
   })
 })

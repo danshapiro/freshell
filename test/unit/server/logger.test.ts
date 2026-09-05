@@ -652,3 +652,45 @@ describe("logger", () => {
     })
   })
 })
+
+describe("FRESHELL_CONFIG_DIR routing (app-bound profiles)", () => {
+  it(
+    "routes default log paths through FRESHELL_CONFIG_DIR when no overrides are set",
+    async () => {
+      const { resolveDebugLogPath, resolveSessionLifecycleLogPath, resolveFreshAgentObservabilityLogPath } =
+        await import("../../../server/logger")
+      const env = { FRESHELL_CONFIG_DIR: "/tmp/fx-work" } as NodeJS.ProcessEnv
+      const base = path.join("/tmp/fx-work", "logs")
+      expect(resolveDebugLogPath(env)!).toContain(base)
+      expect(resolveSessionLifecycleLogPath(env)!).toContain(base)
+      expect(resolveFreshAgentObservabilityLogPath(env)!).toContain(base)
+    },
+    15000,
+  )
+
+  it(
+    "keeps FRESHELL_LOG_DIR precedence over FRESHELL_CONFIG_DIR",
+    async () => {
+      const { resolveDebugLogPath } = await import("../../../server/logger")
+      const env = {
+        FRESHELL_CONFIG_DIR: "/tmp/fx-work",
+        FRESHELL_LOG_DIR: "/tmp/fx-logs",
+      } as NodeJS.ProcessEnv
+      const resolved = resolveDebugLogPath(env)!
+      expect(resolved.startsWith(path.resolve("/tmp/fx-logs"))).toBe(true)
+      expect(resolved).not.toContain("/tmp/fx-work")
+    },
+    15000,
+  )
+
+  it(
+    "an explicit homeDir argument keeps its legacy meaning (no config-dir change)",
+    async () => {
+      const { resolveDebugLogPath } = await import("../../../server/logger")
+      const env = { FRESHELL_CONFIG_DIR: "/tmp/fx-work" } as NodeJS.ProcessEnv
+      const resolved = resolveDebugLogPath(env, "/tmp/fx-home")!
+      expect(resolved).toContain(path.join(path.resolve("/tmp/fx-home"), ".freshell", "logs"))
+    },
+    15000,
+  )
+})

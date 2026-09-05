@@ -5,6 +5,7 @@ import * as fsp from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { FreshAgentRuntimeProviderSchema, FreshAgentSessionTypeSchema } from '../shared/fresh-agent-contract.js'
+import { getFreshellConfigDir } from './freshell-home.js'
 import type { FreshAgentCreateRequest, FreshAgentSendResult, FreshAgentSessionLocator } from './fresh-agent/runtime-adapter.js'
 
 const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
@@ -18,7 +19,7 @@ function sanitizeFilename(name: string): string {
 }
 
 function attachmentsDir(): string {
-  return path.join(os.homedir(), '.freshell', 'attachments')
+  return path.join(getFreshellConfigDir(), 'attachments')
 }
 
 type ExecResult = { output: string; exitCode: number | null; truncated: boolean }
@@ -74,7 +75,7 @@ const CHECKPOINT_IDENTITY = ['-c', 'user.name=freshell', '-c', 'user.email=check
 
 function checkpointGitDir(cwd: string): string {
   const digest = createHash('sha1').update(path.resolve(cwd)).digest('hex').slice(0, 16)
-  return path.join(os.homedir(), '.freshell', 'checkpoints', `${digest}.git`)
+  return path.join(getFreshellConfigDir(), 'checkpoints', `${digest}.git`)
 }
 
 function runGit(args: string[], options: { cwd?: string } = {}): Promise<string> {

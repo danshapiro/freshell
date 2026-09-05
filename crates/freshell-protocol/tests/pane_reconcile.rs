@@ -4,7 +4,9 @@
 //! Additive protocol surface only: `pane.reconcile.request` (client→server),
 //! `pane.reconcile.result` (server→client), the `paneReconcileV1` capability on
 //! `hello` + its advertisement on `ready`, and the two reconcile error codes.
-//! `protocolVersion` stays 7 (§4.5 / fence "No protocolVersion bump").
+//! `protocolVersion` is read from `freshell_protocol::WS_PROTOCOL_VERSION` (the
+//! §4.5 "No protocolVersion bump" fence held at v7 until kata 1wxv bumped the
+//! wire to v8 with the rollback frames).
 
 use freshell_protocol::{
     ClientMessage, ErrorCode, PaneReconcileResult, PaneVerdict, ReadyCapabilities,
@@ -18,7 +20,7 @@ use serde_json::json;
 fn hello_capabilities_parse_pane_reconcile_v1() {
     let wire = json!({
         "type": "hello",
-        "protocolVersion": 7,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
         "token": "t",
         "capabilities": { "paneReconcileV1": true }
     });
@@ -38,7 +40,7 @@ fn hello_capabilities_omit_pane_reconcile_v1_when_absent() {
     // invent the field (skip_serializing_if).
     let wire = json!({
         "type": "hello",
-        "protocolVersion": 7,
+        "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
         "token": "t",
         "capabilities": { "terminalOutputBatchV1": true }
     });
@@ -57,6 +59,7 @@ fn ready_capabilities_field_is_omitted_when_none() {
         timestamp: "2026-07-22T00:00:00.000Z".to_string(),
         boot_id: Some("boot-1".to_string()),
         server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
         capabilities: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
@@ -72,9 +75,11 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
         timestamp: "2026-07-22T00:00:00.000Z".to_string(),
         boot_id: Some("boot-1".to_string()),
         server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
         capabilities: Some(ReadyCapabilities {
             pane_reconcile_v1: Some(true),
             pane_reconcile_fresh_agent_v1: None,
+            terminal_interest_v1: None,
         }),
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");

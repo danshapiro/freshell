@@ -63,6 +63,7 @@ export type FreshAgentClaudeSnapshot = {
   }
   settings: {
     model?: string
+    effort?: string
     permissionMode?: string
     plugins: string[]
   }
@@ -80,6 +81,7 @@ export type FreshAgentClaudeSnapshot = {
   turns: FreshAgentNormalizedTurn[]
   extensions: {
     claude: {
+      statusFromLiveState?: boolean
       historySessionId?: string
       liveSessionId?: string
       cliSessionId?: string
@@ -236,6 +238,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     },
     settings: {
       ...(input.liveSession?.model ? { model: input.liveSession.model } : {}),
+      ...(input.liveSession?.effort ? { effort: input.liveSession.effort } : {}),
       ...(input.liveSession?.permissionMode ? { permissionMode: input.liveSession.permissionMode } : {}),
       plugins: input.liveSession?.plugins ? [...input.liveSession.plugins] : [],
     },
@@ -251,6 +254,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     turns,
     extensions: {
       claude: {
+        statusFromLiveState: input.liveSession !== undefined,
         historySessionId: input.resolved.timelineSessionId,
         liveSessionId: input.resolved.liveSessionId,
         cliSessionId: input.liveSession?.cliSessionId,

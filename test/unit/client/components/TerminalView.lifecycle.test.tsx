@@ -3,7 +3,7 @@ import { act, render, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
-import panesReducer, { removeLayout, requestPaneRefresh } from '@/store/panesSlice'
+import panesReducer, { removeLayout, requestPaneRefresh, setPaneCloseError } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
@@ -52,6 +52,8 @@ const restoreMocks = vi.hoisted(() => ({
   clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
+  armRecoveredLiveTerminalTarget: vi.fn(),
+  consumeRecoveredLiveTerminalTarget: vi.fn((): string | undefined => undefined),
 }))
 
 const runtimeMocks = vi.hoisted(() => ({
@@ -90,6 +92,8 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: restoreMocks.clearTerminalRestoreRequestId,
   consumeTerminalFreshRecoveryRequest: restoreMocks.consumeTerminalFreshRecoveryRequest,
   addTerminalFreshRecoveryRequestId: restoreMocks.addTerminalFreshRecoveryRequestId,
+  armRecoveredLiveTerminalTarget: restoreMocks.armRecoveredLiveTerminalTarget,
+  consumeRecoveredLiveTerminalTarget: restoreMocks.consumeRecoveredLiveTerminalTarget,
 }))
 
 vi.mock('lucide-react', () => ({
@@ -375,6 +379,9 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    restoreMocks.armRecoveredLiveTerminalTarget.mockReset()
+    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReset()
+    restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue(undefined)
     resetEnsureExtensionsRegistryCacheForTests()
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
@@ -3405,6 +3412,114 @@ describe('TerminalView lifecycle updates', () => {
     })
   })
 
+  // Focused-episode-6 round 5 (Finding F1): the restore offer's LIVE terminal
+  // panes reattach to the still-running server terminal — the plan arms a
+  // one-shot createRequestId→terminalId target, and the lifecycle consults it
+  // BEFORE it would dispatch terminal.create (a live pane is never recreated
+  // as a second process; the same fold the D7-refusal revival uses,
+  // `applyReattachToLiveTerminal`, points the pane at its original terminal).
+  describe('recovered live-terminal reattach (restore-offer arming, round 5 F1)', () => {
+    function setupRecoveredLivePane() {
+      const tabId = 'tab-recovered-live'
+      const paneId = 'pane-recovered-live'
+
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-recovered-live',
+        status: 'creating',
+        mode: 'shell',
+        shell: 'system',
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'shell',
+              status: 'creating',
+              title: 'Shell',
+              titleSetByUser: false,
+              createRequestId: 'req-recovered-live',
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: createSettingsState(),
+          connection: { status: 'connected', error: null },
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>
+      )
+
+      return { store, tabId, paneId }
+    }
+
+    it('reattaches to the armed live terminal and NEVER dispatches a create', async () => {
+      restoreMocks.consumeRecoveredLiveTerminalTarget.mockReturnValue('t-still-running')
+
+      const { store, tabId } = setupRecoveredLivePane()
+
+      // The reattach fold lands instead of any create: the pane gains the
+      // still-running terminal handle with status running, createRequestId
+      // preserved (council rule 2).
+      const reattached = getLeafTerminalContent(store, tabId)
+      expect(reattached.terminalId).toBe('t-still-running')
+      expect(reattached.status).toBe('running')
+      expect(reattached.createRequestId).toBe('req-recovered-live')
+      expect(
+        wsMocks.send.mock.calls.map(([msg]) => msg).filter((msg) => msg?.type === 'terminal.create'),
+        'a recovered live pane must never dispatch terminal.create (that would spawn a duplicate)',
+      ).toHaveLength(0)
+
+      // The epoch bump re-fires the lifecycle effect into the attach path.
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls
+            .map(([msg]) => msg)
+            .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 't-still-running'),
+        ).toHaveLength(1)
+      })
+
+      const term = terminalInstances[0]
+      expectTerminalWriteContaining(term, 'Reconnected to the still-running session.')
+
+      // One-shot arming: exactly one consult — the fold's epoch bump re-fires
+      // the effect, but by then the pane owns a terminal handle and the
+      // create branch (and its consult) never runs again.
+      expect(restoreMocks.consumeRecoveredLiveTerminalTarget).toHaveBeenCalledTimes(1)
+    })
+
+    it('a pane with no armed target sends its create exactly as before (the fallback is untouched)', async () => {
+      const { store, tabId, paneId } = setupRecoveredLivePane()
+
+      await waitFor(() => {
+        expect(
+          wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create'),
+        ).toHaveLength(1)
+      })
+      // The consult ran (before the create) and found nothing armed.
+      expect(restoreMocks.consumeRecoveredLiveTerminalTarget).toHaveBeenCalledWith(tabId, paneId)
+      expect(getLeafTerminalContent(store, tabId).terminalId).toBeUndefined()
+    })
+  })
+
   it('does not reconnect after terminal.exit when INVALID_TERMINAL_ID is received', async () => {
     // This test verifies the fix for the runaway terminal creation loop:
     // 1. Terminal exits normally (e.g., Claude fails to resume)
@@ -3506,6 +3621,80 @@ describe('TerminalView lifecycle updates', () => {
     // Verify user-facing feedback was shown
     const term = terminalInstances[0]
     expectTerminalWriteContaining(term, 'Terminal exited')
+  })
+
+  it('writes an in-pane notice when the correlated terminal close reports a durable-close failure', async () => {
+    // Focused-episode-6 round 2 (Findings 6+7): a terminal.killed answer
+    // with success:false means the server could NOT record the close durably
+    // and left the terminal running — the close flow kept the pane for
+    // exactly this case, and the pane's own surface (the xterm notice, the
+    // input.blocked convention) explains why the close did not happen.
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-close-fail',
+      status: 'running',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.killed',
+        requestId: 'req-kill-close-fail',
+        terminalId: 'term-close-fail',
+        success: false,
+        error: 'the terminal close could not be recorded durably; the terminal was left running',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expectTerminalWriteContaining(term, '[Close failed] the terminal close could not be recorded durably')
+  })
+
+  it('renders a close-gate failure (closeError) as the in-pane [Close failed] notice and clears it (delta-r7-r3, F2)', async () => {
+    // Focused-episode-7 round 2 (Finding F2): when the close gate leaves the
+    // pane standing (unacknowledged/failed durable close), the pane's own
+    // error chrome — the xterm notice, the input.blocked convention —
+    // explains why the close did not happen.
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-close-gate',
+      status: 'running',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      store.dispatch(setPaneCloseError({
+        tabId,
+        paneId,
+        error: 'the pane close could not be recorded durably; the pane was left open',
+      }))
+    })
+
+    const term = terminalInstances[0]
+    await waitFor(() => {
+      expectTerminalWriteContaining(term, '[Close failed] the pane close could not be recorded durably')
+    })
+    expect(getLeafTerminalContent(store, tabId).closeError).toBeUndefined()
   })
 
   it('shows feedback when Codex input is blocked by the restore identity gate', async () => {

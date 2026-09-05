@@ -64,6 +64,9 @@ function normalizeWindowsFirewallPorts(ports: Iterable<number>): number[] {
 }
 
 function getManagedWindowsPortsPath(): string {
+  // Deliberate machine-global: firewall port bookkeeping is keyed per machine
+  // in one shared state file (`~/.freshell`, honoring FRESHELL_HOME only — NOT
+  // FRESHELL_CONFIG_DIR — two profiles must not split port bookkeeping).
   const root = process.env.FRESHELL_HOME
     ? path.resolve(process.env.FRESHELL_HOME)
     : path.join(os.homedir(), '.freshell')

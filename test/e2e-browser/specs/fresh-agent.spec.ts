@@ -293,6 +293,37 @@ async function seedIndexedClaudeContextUsage(
 }
 
 test.describe('Fresh Agent', () => {
+  test('preserves queued follow-ups after exit and lets users review and cancel them', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000099'
+    await stubFreshclaudeThread(page, sessionId)
+    await installFreshclaudeStripPane(page, sessionId)
+    const input = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(input).toBeEnabled()
+    const setStatus = async (status: 'running' | 'exited') => page.evaluate(({ sessionId, status }) => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'freshAgent/setSessionStatus',
+        payload: { sessionId, sessionType: 'freshclaude', provider: 'claude', status },
+      })
+    }, { sessionId, status })
+    await setStatus('running')
+    await input.fill('Review the first change')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await input.fill('Review the second change')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    const queued = page.getByRole('status', { name: 'Queued messages' })
+    await expect(queued).toHaveText('2 queued')
+    await setStatus('exited')
+    await expect(input).toBeDisabled()
+    await expect(queued).toHaveText('2 queued')
+    await page.getByRole('button', { name: 'Show queued messages' }).click()
+    await expect(page.getByText('Review the second change', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Remove queued message 2' }).click()
+    await expect(queued).toHaveText('1 queued')
+    await expect(page.getByText('Review the first change', { exact: true })).toBeVisible()
+    await expect(page.getByText('Review the second change', { exact: true })).toHaveCount(0)
+  })
+
   test('shows the session status strip in the unknown state (chip + muted context lug, no meter)', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     await stubFreshclaudeThread(page, '63333000-0000-4333-8333-000000000001')

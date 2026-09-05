@@ -1,6 +1,6 @@
+import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists and migrates legacy anchors
+import './env-load.js' // Loads .env (at the bootstrap anchor) before any other module's top-level env readers evaluate
 import { createFreshAgentExtrasRouter } from './fresh-agent-extras-router.js'
-import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
-import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -18,6 +18,7 @@ import { AI_CONFIG } from './ai-prompts.js'
 import { getFreshellConfigDir } from './freshell-home.js'
 import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
+import { HostStatsService } from './host-stats/service.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
@@ -229,10 +230,15 @@ async function main() {
     },
     getShellTaskStatus: async () => startupState.snapshot().tasks,
     getPerfLogging: () => perfConfig.enabled,
+    getConfigDir: () => getFreshellConfigDir(),
     getConfigFallback: async () => {
       const readError = configStore.getLastReadError()
       if (!readError) return undefined
-      return { reason: readError, backupExists: await configStore.backupExists() }
+      return {
+        reason: readError,
+        backupExists: await configStore.backupExists(),
+        backupPath: configStore.getBackupPath(),
+      }
     },
   }))
   app.use('/api', createClientLogsRouter())
@@ -403,6 +409,11 @@ async function main() {
     ]),
   })
   const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
+  // Host pressure service: constructed provider-less (sources need the handler, which
+  // needs the service) and wired via setSources after wsHandler exists below.
+  const hostStats = new HostStatsService()
+  // Same source as the handler's readWsHandlerConfig maxConnections (ws-handler.ts).
+  const wsHandlerMaxConnections = Number(process.env.MAX_CONNECTIONS || 50)
   const wsHandler = new WsHandler(
     server,
     registry,
@@ -416,7 +427,11 @@ async function main() {
         const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
         const readError = configStore.getLastReadError()
         const configFallback = readError
-          ? { reason: readError, backupExists: await configStore.backupExists() }
+          ? {
+              reason: readError,
+              backupExists: await configStore.backupExists(),
+              backupPath: configStore.getBackupPath(),
+            }
           : undefined
         return {
           settings: currentSettings,
@@ -439,8 +454,13 @@ async function main() {
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
       opencodeLatestTurnCompletionsProvider: () => opencodeActivity.tracker.listLatestCompletions(),
+      hostStats,
     },
   )
+  hostStats.setSources({
+    getPtyCounts: () => ({ running: registry.getDiagnosticCounts().terminals.running, max: registry.getMaxTerminals() }),
+    getWsClientCounts: () => ({ clients: wsHandler.connectionCount(), max: wsHandlerMaxConnections }),
+  })
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
   const isCompiledBuild = __dirname.endsWith(path.join('dist', 'server'))
@@ -1261,6 +1281,7 @@ async function main() {
 
     // 3. Stop any coalesced sessions publish timers
     sessionsSync.shutdown()
+    hostStats.stop()
 
     // 4. Gracefully shut down terminals and planner-owned Codex app-server sidecars.
     try {

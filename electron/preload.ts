@@ -25,6 +25,9 @@ export type LaunchChoiceResult =
   | { ok: true }
   | { ok: false; error: string }
 
+export type ProfileChoiceResult = { ok: true } | { ok: false; error: string }
+export interface PickerProfileEntry { id: string; label: string }
+
 export interface FreshellDesktopApi {
   platform: string
   isElectron: boolean
@@ -37,6 +40,8 @@ export interface FreshellDesktopApi {
   completeSetup: (config: WizardSetupConfig) => Promise<void>
   getLaunchOptions: () => Promise<any>
   chooseLaunchOption: (choice: LaunchChoice) => Promise<LaunchChoiceResult>
+  getProfiles: () => Promise<PickerProfileEntry[]>
+  chooseProfile: (id: string) => Promise<ProfileChoiceResult>
   openExternal: (url: string) => Promise<void>
 }
 
@@ -65,6 +70,8 @@ export function registerPreloadApi(
     completeSetup: (config: WizardSetupConfig) => ipcRenderer.invoke('complete-setup', config),
     getLaunchOptions: () => ipcRenderer.invoke('get-launch-options'),
     chooseLaunchOption: (choice: LaunchChoice) => ipcRenderer.invoke('choose-launch-option', choice),
+    getProfiles: () => ipcRenderer.invoke('get-profiles'),
+    chooseProfile: (id: string) => ipcRenderer.invoke('choose-profile', id),
     openExternal: (url: string) => ipcRenderer.invoke('open-external-url', url),
   }
 
