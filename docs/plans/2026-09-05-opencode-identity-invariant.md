@@ -22,7 +22,7 @@ Fix the defect confirmed by the investigation of GitHub issue danshapiro/freshel
 
 **Goal:** `terminal_identity_unresolved` never fires for an opencode terminal pane while no correlatable session row exists for it (the #702 false-fire), and still fires when candidate evidence existed but no identity ever bound.
 
-**Architecture:** One re-gate across two crates. `freshell-sessions`' `OpencodeLocator` gains a per-terminal *candidate-evidence latch* (first ms an evaluated correlation window observed ≥1 in-window cwd-confirmed row) exposed as `identity_resolvable_since(terminal_id)`. `freshell-ws`'s `warn_unresolved_terminal_identities` replaces the create-age gate for `mode == "opencode"` rows with an evidence-age gate when a locator is available (no evidence ⇒ nothing resolvable ⇒ no alarm; evidence older than the grace ⇒ alarm), and keeps today's create-age tripwire when the locator is unavailable. Non-opencode modes are byte-identical in behavior. A scoped end-to-end pin lands on the existing never-submitted negative-control pane in `opencode-terminal-restore-rust.spec.ts`.
+**Architecture:** One re-gate across two crates. `freshell-sessions`' `OpencodeLocator` gains a per-terminal *candidate-evidence latch* (first ms an evaluated correlation window observed ≥1 in-window cwd-confirmed row) exposed as `identity_resolvable_since(terminal_id)`. `freshell-ws`'s `warn_unresolved_terminal_identities` replaces the create-age gate for `mode == "opencode"` rows with an evidence-age gate when a locator is available (no evidence ⇒ nothing resolvable ⇒ no alarm; evidence older than the grace ⇒ alarm), and keeps today's create-age tripwire when the locator is unavailable. Non-opencode modes are byte-identical in behavior. A scoped end-to-end pin lands on the existing never-submitted negative-control pane in `opencode-terminal-restore-rust.spec.ts`. Known, accepted residual (recorded in the load-bearing ledger): a session row materializing AFTER a closed Enter window with no later Enter and a silently-lost TUI signal leaves neither evidence nor a bind — unreachable in practice because the rebind plugin polls `route.current` every 1s (production evidence: it bound both incident panes within ~1s of row creation) and a dead plugin is caught by the sibling `opencode_rebind_heartbeat_missing` alarm.
 
 **Tech Stack:** Rust workspace (`freshell-sessions`, `freshell-ws`), rusqlite-seeded temp-DB unit tests (existing in-file patterns), Playwright e2e (`rust-chromium` project, fake-opencode fixture).
 
@@ -36,7 +36,7 @@ Fix the defect confirmed by the investigation of GitHub issue danshapiro/freshel
 - Non-opencode invariant behavior must not change; the existing five `invariants.rs` tests plus the e2e absence pins (`compound-restart-rust.spec.ts`, `codex-terminal-bounce-rust.spec.ts`, `amplifier-restore-rust.spec.ts`) are the guard rail.
 - TDD per repo rule: red test first, observe the intended failure, minimal implementation, green, refactor while green. For NEW Rust API surface, the RED observation is a compile failure (test references a not-yet-existing method); state that explicitly when observing it.
 - Focused test commands only during tasks: `cargo test -p freshell-sessions ...`, `cargo test -p freshell-ws ...`. The broad coordinated npm suite (`npm run check`) runs once at the end via the run-level gate, NOT inside tasks. On THIS host, any vitest run must be prefixed `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy` (ambient proxy env leaks Node's EnvHttpProxyAgent experimental warning into spawned CLI children's stderr and fails two unrelated suites — pre-existing host issue, reproduction receipts in run-state.md).
-- E2E specs involved here are in `CLOUD_SKIP_SPECS`; run them with `npm run test:e2e:local -- ...` (never cloud). First e2e run pays a one-time `cargo build --release -p freshell-server` inside the harness.
+- Run the involved e2e specs with `npm run test:e2e:local -- ...`. `opencode-terminal-restore-rust`, `codex-terminal-bounce-rust`, and `amplifier-restore-rust` are in `CLOUD_SKIP_SPECS` — local runs are their ONLY coverage; `compound-restart-rust` and `opencode-rebind-rust` additionally run under the cloud backend, which this run does not exercise. First e2e run pays a one-time `cargo build --release -p freshell-server` inside the harness.
 - Commits use the repo's conventional style (see `git log`); never alter git identity config; no PR.
 - `docs/plans/` files are historical — never edit an old plan doc. No `AGENTS.md`/`README.md`/`docs/index.html` change is needed (internal observability + test-only change; AGENTS.md does not name this invariant).
 
@@ -282,7 +282,7 @@ git commit -m "feat(freshell-sessions): opencode locator candidate-evidence latc
 ### Task 2: Re-gate the invariant on locator evidence for opencode rows
 
 **Files:**
-- Modify: `crates/freshell-ws/src/invariants.rs` (doc header, `IDENTITY_RESOLUTION_GRACE_MS` comment, `spawn_identity_invariant_sweep` :48-63, `warn_unresolved_terminal_identities` :65-102, tests :217-386)
+- Modify: `crates/freshell-ws/src/invariants.rs` (doc header, `IDENTITY_RESOLUTION_GRACE_MS` comment, `spawn_identity_invariant_sweep` :48-63, `warn_unresolved_terminal_identities` :65-102, tests :217-387)
 
 **Interfaces:**
 - Consumes: `freshell_sessions::opencode_locator::OpencodeLocator::identity_resolvable_since` (Task 1); `WsState.opencode_locator` (already a field; the sweep's `spawn_identity_invariant_sweep(state, interval)` call site in `crates/freshell-server/src/main.rs:1383` needs NO change).
@@ -364,7 +364,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
         // The production shape: create+arm, NO submit, spawn window closes empty.
         assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 10_000));
-        let _ = locator.tick(10_000 + 2_500);
+        let _ = locator.tick(10_000 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 500);
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
@@ -405,7 +405,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         assert!(locator.note_submit("t-ev", 100));
         insert_opencode_session(&db, "ses_a", "/proj", 150);
         insert_opencode_session(&db, "ses_b", "/proj", 160); // ambiguous refusal
-        let evidence_at = 100 + 2_001;
+        let evidence_at = 100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
@@ -442,7 +442,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         assert!(locator.note_submit("t-ev", 100));
         insert_opencode_session(&db, "ses_a", "/proj", 150);
         insert_opencode_session(&db, "ses_b", "/proj", 160);
-        let evidence_at = 100 + 2_001;
+        let evidence_at = 100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
@@ -475,7 +475,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
         assert!(locator.note_submit("t-bound", 100));
         insert_opencode_session(&db, "ses_a", "/proj", 150);
         insert_opencode_session(&db, "ses_b", "/proj", 160);
-        let evidence_at = 100 + 2_001;
+        let evidence_at = 100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
@@ -538,7 +538,7 @@ In `crates/freshell-ws/src/invariants.rs` `mod tests`:
 
 Run: `cargo test -p freshell-ws invariants:: -- --nocapture`
 
-Expected: FAIL — compile error on the new sixth parameter (and `identity_resolvable_since` would be absent if Task 1 were skipped; it must not be). NEW-SIGNATURE red: intended failure is the missing gate, not a setup accident. Note: `opencode_pane_warns_on_create_age_when_locator_unavailable` would also fail behaviorally today if expressed against the old signature — keep it in this batch anyway.
+Expected: FAIL — compile error on the new sixth parameter (Task 1's `identity_resolvable_since` must already exist; do not start this task before Task 1 is green and committed). NEW-SIGNATURE red: intended failure is the missing gate, not a setup accident.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -687,16 +687,7 @@ async function readServerLogs(logsDir: string): Promise<string> {
 }
 ```
 
-(b) Anchor the restore-ready timestamp. Immediately after the post-restart ready gate (the `await expect(async () => { ... getWsReadyState ... }).toPass({ timeout: 30_000 })` block, currently :295-298), add:
-
-```ts
-        // Wall-clock anchor for the issue-702 pin below: the restored fresh
-        // pane's terminal is respawned by the reconnect this gate observes,
-        // so the identity invariant's 10s grace for it expires ~10s from now.
-        const restoreReadyAt = Date.now()
-```
-
-(c) At the end of the test body (after the final `expect.poll(... 'opencode> ' ...)` block, currently :365-370), before the closing braces of the inner `try`:
+(b) At the end of the test body (after the final `expect.poll(... 'opencode> ' ...)` block, currently :365-370), before the closing braces of the inner `try`:
 
 ```ts
         // -------------------------------------------------------------
@@ -705,15 +696,15 @@ async function readServerLogs(logsDir: string): Promise<string> {
         // pane is answer-triggered (opencode writes its `session` row lazily
         // at the first prompt), so this pane has NOTHING resolvable to
         // correlate; the old create-age gate warned at +10s regardless —
-        // 12/12 panes in one day of production logs. The restored fresh pane
-        // was respawned at `restoreReadyAt`; wait out the invariant's 10s
-        // grace plus sweep margin, then scope the absence pin to THIS
-        // restored terminal id so pre-restart history and the other
-        // (submitted) pane cannot pollute it.
+        // 12/12 panes in one day of production logs. The restored fresh
+        // pane's terminal was created no later than the moment the client
+        // learned its id above, so a fixed 12s wait from here provably
+        // outlasts the invariant's 10s grace plus one 2s sweep — regardless
+        // of how long the earlier polls happened to take. Then scope the
+        // absence pin to THIS restored terminal id so pre-restart history
+        // and the other (submitted) pane cannot pollute it.
         // -------------------------------------------------------------
-        const invariantDeadlineAt = restoreReadyAt + 12_000
-        const remainingMs = invariantDeadlineAt - Date.now()
-        if (remainingMs > 0) await page.waitForTimeout(remainingMs)
+        await page.waitForTimeout(12_000)
         const serverLogs = await readServerLogs(info.logsDir)
         const unresolvedForRestoredPane = serverLogs
           .split('\n')
@@ -722,22 +713,31 @@ async function readServerLogs(logsDir: string): Promise<string> {
         expect(unresolvedForRestoredPane).toEqual([])
 ```
 
+(c) Save the pin as a patch and return the tree to committed HEAD — the RED observation in Step 2 temporarily reverts the crate fix, which requires a clean tree:
+
+```bash
+git diff -- test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts > /tmp/702-pin.patch
+git checkout -- test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
+test -s /tmp/702-pin.patch   # non-empty
+```
+
 - [ ] **Step 2: Run the spec and verify the intended failure (RED)**
 
-The fix from Tasks 1-2 is already committed, so observe RED by temporarily reverting the crate changes in-place, running the spec, then restoring. Commands:
+The fix from Tasks 1-2 is already committed, so observe RED against temporarily reverted crates with the pin re-applied:
 
 ```bash
 git revert --no-commit HEAD~1 HEAD          # reverses Task 2 then Task 1, worktree-only
-cargo build --release -p freshell-server    # e2e harness needs the reversed build
+git apply /tmp/702-pin.patch                # pin now sits atop base-behavior crates
+cargo build --release -p freshell-server    # e2e harness runs the worktree-built binary
 npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
 ```
 
-Expected: FAIL — the pin's final assertion finds a `terminal_identity_unresolved` line carrying the restored never-submitted terminal id (base behavior fires at +10s create-age). If the spec fails for any OTHER reason first (fixture drift), fix the spec edit, not the assertion's target.
+Expected: FAIL — the pin's final assertion name-checks one or more `terminal_identity_unresolved` log lines carrying the restored never-submitted terminal id (base behavior fires at +10s create-age). A failure for any OTHER reason is spec-authoring drift: fix the pin mechanics before proceeding; do not weaken the assertion's target.
 
-Then restore:
+Restore the committed fix afterwards:
 
 ```bash
-git reset --hard HEAD                       # restores the committed Tasks 1-2 (untracked node_modules/target untouched)
+git reset --hard HEAD                       # removes the revert AND the re-applied pin patch
 ```
 
 - [ ] **Step 3: No production implementation needed**
@@ -747,6 +747,7 @@ The pin is test-only; Tasks 1-2 are the production behavior.
 - [ ] **Step 4: Run the spec GREEN**
 
 ```bash
+git apply /tmp/702-pin.patch
 cargo build --release -p freshell-server
 npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
 ```
@@ -817,5 +818,5 @@ Expected: clean worktree (all work committed in Tasks 1-3). Nothing to commit.
 ## Run-level verification (owned by the executing stage, not a plan task)
 
 1. Full coordinated suite once on final HEAD: `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy npm run check` (host proxy-env workaround; pass criterion: green excluding the two pre-existing proxy-pollution suites documented in the baseline ledger — update-flow and visible-first-audit-gate must pass under the clean-env prefix).
-2. The four e2e specs above already ran on the local backend in Task 3; they are in CLOUD_SKIP_SPECS, so local runs ARE the required coverage.
+2. The four e2e specs above already ran on the local backend in Task 3. The three CLOUD_SKIP_SPECS members among them (`opencode-terminal-restore-rust`, `codex-terminal-bounce-rust`, `amplifier-restore-rust`) are covered ONLY by these local runs; `compound-restart-rust` and `opencode-rebind-rust` also exist in cloud e2e when a cloud e2e run happens, which this run does not perform (no PR).
 3. Evidence for the recap: issue timeline re-verified unnecessary; the e2e pin + unit lattice are the durable proof.
