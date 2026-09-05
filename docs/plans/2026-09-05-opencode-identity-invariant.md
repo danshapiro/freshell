@@ -1234,7 +1234,7 @@ test -s /tmp/702-pin.patch   # non-empty
 The fix from Tasks 1-2 is already committed, so observe RED against worktree files with the Task-2 fix temporarily unapplied and the pin re-applied — still a pure `git apply` patch-pair (no revert, no reset, no checkout; HEAD stays at the fixed branch tip throughout):
 
 ```bash
-git show f0ce358c6 --format= > /tmp/702-fix.patch   # pure diff of the Task-2 fix
+git show <task2-fix-sha> --format= > /tmp/702-fix.patch   # pure diff of the Task-2 fix; use the ledger-recorded Task 2 ending commit (was f0ce358c6 at execution) — later commits can shift context lines, so re-generate per run
 git apply -R /tmp/702-fix.patch               # base behavior restored in the worktree files; HEAD untouched
 git apply /tmp/702-pin.patch                  # pin now sits atop base-behavior crates
 cargo build --release -p freshell-server    # e2e harness runs the worktree-built binary
