@@ -50,8 +50,9 @@ const CLOUD_SKIP_SPECS = [
   'pane-activity-indicator.spec.ts',
   // Environment-sensitive: timing-sensitive localStorage persistence
   'rest-tab-persistence.spec.ts',
-  // Rust-only: asserts e2eServerKind === 'rust' but runs under chromium
-  // project (not in RUST_ONLY_SPECS — pre-existing config gap)
+  // Rust-only: asserts e2eServerKind === 'rust'; runs only under the
+  // rust-chromium project (registered in RUST_ONLY_SPECS). Skipped in cloud
+  // pending cloud validation of this rust-only lane.
   'term28-path-shadow-rust.spec.ts',
   // Environment-sensitive: page lifecycle (pagehide/unload) timing differs
   // in cloud containers; passes locally but flakes in cloud
