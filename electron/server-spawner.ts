@@ -17,7 +17,11 @@ export interface ServerSpawnerOptions {
   spawn: ServerSpawnMode
   port: number
   envFile: string      // path to .env
-  configDir: string    // ~/.freshell
+  configDir: string    // ~/.freshell (or the active profile's config dir)
+  /** When true, pin FRESHELL_CONFIG_DIR=configDir in the spawned server env.
+   *  Set for named profiles only — the default profile keeps legacy
+   *  FRESHELL_HOME resolution. */
+  pinProfileConfigDir?: boolean
   healthCheckTimeoutMs?: number  // override for tests
 }
 
@@ -33,6 +37,27 @@ export interface ServerSpawner {
 
   /** The child process PID, if running. */
   pid(): number | undefined
+}
+
+/** Environment for a spawned server: inherits ours, pinned to the spawn port.
+ * AUTH_TOKEN and any inherited FRESHELL_CONFIG_DIR are always DROPPED: the
+ * spawned server's bootstrap drives `<cwd>/.env` (bootstrap anchors it), and
+ * dotenv never overrides an exported value — inheriting either would desync
+ * the server from the renderer's token/config. The optional third argument
+ * pins FRESHELL_CONFIG_DIR — used for named-profile app-bound servers only;
+ * omitted for the default profile so server-side FRESHELL_HOME resolution
+ * keeps its legacy precedence. */
+export function buildSpawnEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  port: number,
+  configDir?: string,
+): Record<string, string> {
+  const { AUTH_TOKEN: _a, FRESHELL_CONFIG_DIR: _c, ...rest } = baseEnv as Record<string, string>
+  const out: Record<string, string> = { ...rest, PORT: String(port) }
+  if (configDir !== undefined) {
+    out.FRESHELL_CONFIG_DIR = configDir
+  }
+  return out
 }
 
 export function createServerSpawner(): ServerSpawner {
@@ -92,10 +117,7 @@ export function createServerSpawner(): ServerSpawner {
 
       let cmd: string
       let args: string[]
-      const env: Record<string, string> = {
-        ...process.env as Record<string, string>,
-        PORT: String(port),
-      }
+      const env = buildSpawnEnv(process.env, port, options.pinProfileConfigDir ? configDir : undefined)
 
       if (spawnMode.mode === 'production') {
         cmd = spawnMode.nodeBinary

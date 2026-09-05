@@ -21,6 +21,13 @@ export interface ChooseLaunchActionOptions {
   candidates: LaunchServerCandidate[]
   savedRemoteReachable: boolean
   savedRemoteAuthenticated?: boolean
+  /**
+   * True when the booting profile owns its own server: always for named
+   * profiles, and also for the DEFAULT profile once any named profile is
+   * installed (a machine with several profiles treats Default as just another
+   * tenant — it must never attach to a neighbor's server either).
+   */
+  ownsServer?: boolean
 }
 
 export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAction {
@@ -58,6 +65,19 @@ export function chooseLaunchAction(options: ChooseLaunchActionOptions): LaunchAc
     }
 
     return { type: 'show-chooser', candidates, reason: 'saved-remote-unreachable' }
+  }
+
+  // Owning-boot override. Runs AFTER remote-mode handling on purpose: a saved
+  // remote URL is a per-profile intent that stays valid even against an empty
+  // candidate list. For every other owning boot: app-bound/daemon start their
+  // own server; remote-without-a-URL goes to the manual chooser — NEVER to a
+  // discovery-derived auto-connect, which would attach a neighbor profile's
+  // server with a token resolved from the wrong config dir.
+  if (options.ownsServer) {
+    if (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon') {
+      return { type: 'start-local' }
+    }
+    return { type: 'show-chooser', candidates, reason: 'manual-choice' }
   }
 
   if (candidates.length > 1) {

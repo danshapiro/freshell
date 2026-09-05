@@ -32,6 +32,11 @@ describe('Tray', () => {
     }
   })
 
+  it('uses a profile-aware tooltip when provided', () => {
+    createTray(MockTray, mockMenu, '/path/to/icon.png', options, { tooltip: 'Freshell (work)' })
+    expect(mockTrayInstance.setToolTip).toHaveBeenCalledWith('Freshell (work)')
+  })
+
   it('creates tray with icon', () => {
     createTray(MockTray, mockMenu, '/path/to/icon.png', options)
     expect(MockTray).toHaveBeenCalledWith('/path/to/icon.png')

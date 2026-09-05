@@ -50,7 +50,7 @@ export default function WorkspaceSettings({
           >
             <option value="recency">Recency</option>
             <option value="recency-pinned">Recency (tabs first)</option>
-            <option value="activity">Activity (tabs first)</option>
+            <option value="activity">Activity (status first)</option>
             <option value="project">Project</option>
           </select>
         </SettingsRow>

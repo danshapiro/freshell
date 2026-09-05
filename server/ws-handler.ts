@@ -512,6 +512,8 @@ type HandshakeSnapshot = {
   configFallback?: {
     reason: ConfigReadError
     backupExists: boolean
+    /** Profile-aware backup path the client banner should point at. */
+    backupPath?: string
   }
 }
 

@@ -272,6 +272,8 @@ export function ExtensionsManager({ className, includeCli = true }: ExtensionsMa
   const items = useAppSelector(selectManagedItems)
   const disabledList = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? [])
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
+  const serverConfigDir = useAppSelector((s) => s.settings?.serverConfigDir ?? null)
+  const extensionsDirHint = `${serverConfigDir ?? '~/.freshell'}/extensions/`
 
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set())
   const [cwdDrafts, setCwdDrafts] = useState<Record<string, string>>({})
@@ -414,7 +416,7 @@ export function ExtensionsManager({ className, includeCli = true }: ExtensionsMa
           <p className="text-lg font-medium">No extensions installed</p>
           {includeCli && (
             <p className="text-sm mt-1">
-              Drop a directory with a <code className="rounded bg-muted px-1 py-0.5 text-xs">freshell.json</code> into <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.freshell/extensions/</code> and restart.
+              Drop a directory with a <code className="rounded bg-muted px-1 py-0.5 text-xs">freshell.json</code> into <code className="rounded bg-muted px-1 py-0.5 text-xs">{extensionsDirHint}</code> and restart.
             </p>
           )}
         </div>

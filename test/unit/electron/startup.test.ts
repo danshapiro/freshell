@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
+import fsp from 'fs/promises'
+import os from 'os'
 import path from 'path'
 import { runStartup, type StartupContext, type BrowserWindowLike } from '../../../electron/startup.js'
 import type { DesktopConfig } from '../../../electron/types.js'
@@ -132,6 +134,31 @@ describe('runStartup', () => {
   })
 
   describe('daemon mode', () => {
+    it('daemon mode is unsupported for named profiles (manual chooser, never a foreign .env token)', async () => {
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'daemon',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+      })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('chooser')
+      if (result.type === 'chooser') {
+        expect(result.reason).toBe('manual-choice')
+      }
+      // The daemon was NOT started for a named profile.
+      expect(ctx.daemonManager.start).not.toHaveBeenCalled()
+    })
+
     it('does not start daemon if already running', async () => {
       const ctx = createDefaultContext({
         desktopConfig: {
@@ -201,6 +228,202 @@ describe('runStartup', () => {
   })
 
   describe('app-bound mode', () => {
+    it('a named app-bound profile ignores discovered local servers and spawns its own', async () => {
+      const ctx = createDefaultContext({
+        isDev: false,
+        resourcesPath: '/app/resources',
+        discoverLaunchCandidates: vi.fn().mockResolvedValue([{
+          id: 'http://localhost:3057',
+          url: 'http://localhost:3057',
+          origin: 'port-scan',
+          ownership: 'detected-local',
+          label: 'http://localhost:3057',
+          ready: true,
+          requiresAuth: true,
+          token: 'someone-elses-token',
+        }]) as unknown as () => Promise<never[]>,
+      })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+
+      const result = await runStartup(ctx)
+
+      // Own server spawned at this profile's config port (3001 in the default
+      // fixture); the resident 3057 candidate must NOT be adopted.
+      expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+    })
+
+    it('attaches to its OWN running server instead of bumping (instance-id match)', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-cfg-'))
+      await fsp.writeFile(path.join(configDir, 'instance-id'), 'srv-own-123'
+      )
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.configDir = configDir
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(false) // 3001 busy
+      ctx.fetchServerInstanceId = vi.fn().mockResolvedValue('srv-own-123')
+      const patchDesktopConfig = vi.fn()
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
+      await fsp.rm(configDir, { recursive: true, force: true })
+    })
+
+    it('bumps when the resident server instance-id does NOT match this config dir', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-cfg-'))
+      await fsp.writeFile(path.join(configDir, 'instance-id'), 'srv-own-123')
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.configDir = configDir
+      ctx.isPortAvailable = vi.fn(async (p: number) => p !== 3001) // 3001 busy
+      ctx.fetchServerInstanceId = vi.fn().mockResolvedValue('srv-foreign-zzz')
+      const patchDesktopConfig = vi.fn().mockResolvedValue({})
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      expect(patchDesktopConfig).toHaveBeenCalledWith({ port: 3002 })
+      await fsp.rm(configDir, { recursive: true, force: true })
+    })
+
+    it('bumps when no instance-id file exists (fresh profile config dir)', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-cfg-'))
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.configDir = configDir
+      ctx.isPortAvailable = vi.fn(async (p: number) => p !== 3001)
+      ctx.fetchServerInstanceId = vi.fn().mockResolvedValue('srv-anything')
+      ctx.patchDesktopConfig = vi.fn().mockResolvedValue({})
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      await fsp.rm(configDir, { recursive: true, force: true })
+    })
+
+    it('auto-bumps a busy port for a named profile and persists the choice', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      const busyPorts = new Set([3001])
+      ctx.isPortAvailable = vi.fn(async (p: number) => !busyPorts.has(p))
+      const patchDesktopConfig = vi.fn().mockResolvedValue({})
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(startArgs.port).toBe(3002)
+      expect(patchDesktopConfig).toHaveBeenCalledWith({ port: 3002 })
+    })
+
+    it('a named profile keeps its configured port when it is free (no persistence churn)', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ;(ctx as { profileId?: string }).profileId = 'work'
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(true)
+      const patchDesktopConfig = vi.fn()
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
+    })
+
+    it('the default profile in a single-profile install keeps legacy behavior when its port is busy (no auto-bump)', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(false)
+      const patchDesktopConfig = vi.fn()
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      expect(patchDesktopConfig).not.toHaveBeenCalled()
+    })
+
+    it('port-scan exhaustion falls back to the manual chooser (never hijacks a neighbor server)', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      ctx.ownsServer = true
+      ctx.isPortAvailable = vi.fn().mockResolvedValue(false) // every candidate busy
+      const result = await runStartup(ctx)
+      expect(result.type).toBe('chooser')
+      if (result.type === 'chooser') {
+        expect(result.reason).toBe('manual-choice')
+      }
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+    })
+
+    it('always-ask owning boots reach a chooser (policy blocks any auto-connect)', async () => {
+      const ctx = createDefaultContext({
+        isDev: false,
+        resourcesPath: '/app/resources',
+        desktopConfig: {
+          serverMode: 'app-bound',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: true,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+      })
+      ctx.ownsServer = true
+
+      const result = await runStartup(ctx)
+      expect(result.type).toBe('chooser')
+      if (result.type === 'chooser') {
+        expect(result.reason).toBe('always-ask')
+        expect(result.candidates).toEqual([])
+      }
+    })
+
+    it('the default profile in a multi-profile install is auto-bumped off a neighbor-held port', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
+      // No profileId — this IS the default boot — but the registry named
+      // profiles, so entry passes ownsServer=true: Default must not adopt a
+      // neighbor's server and must not keep a taken port either.
+      ctx.ownsServer = true
+      ctx.isPortAvailable = vi.fn(async (p: number) => p !== 3001)
+      const patchDesktopConfig = vi.fn().mockResolvedValue({})
+      ctx.patchDesktopConfig = patchDesktopConfig
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3002')
+      }
+      expect(patchDesktopConfig).toHaveBeenCalledWith({ port: 3002 })
+    })
+
     it('spawns server in production mode with paths from resourcesPath', async () => {
       const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
       const result = await runStartup(ctx)
@@ -776,6 +999,27 @@ describe('runStartup', () => {
   })
 
   describe('hotkey quake-style toggle', () => {
+    it('logs a warning when the global hotkey registration fails', async () => {
+      const ctx = createDefaultContext()
+      // createDefaultContext() does not provide mainProcessLogger — attach one and
+      // keep a direct mock reference (the optional-chain in production code means
+      // "no logger" is legal, so the test must supply one explicitly).
+      const mainProcessLogger = { log: vi.fn() }
+      ;(ctx as { mainProcessLogger?: { log: ReturnType<typeof vi.fn> } }).mainProcessLogger = mainProcessLogger
+      ;(ctx.hotkeyManager.register as ReturnType<typeof vi.fn>).mockReturnValue(false)
+
+      const result = await runStartup(ctx)
+
+      expect(result.type).toBe('main')
+      expect(mainProcessLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          severity: 'warn',
+          event: 'global_hotkey_registration_failed',
+          accelerator: ctx.desktopConfig.globalHotkey,
+        }),
+      )
+    })
+
     it('shows and focuses window when hidden', async () => {
       const mockWindow = createMockWindow()
       const ctx = createDefaultContext({

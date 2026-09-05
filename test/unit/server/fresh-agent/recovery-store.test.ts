@@ -119,3 +119,22 @@ describe('FreshAgentRecoveryStore', () => {
     })
   })
 })
+
+describe('default path + FRESHELL_CONFIG_DIR', () => {
+  it('persists to <configDir>/fresh-agent-recovery.json when no filePath is given', async () => {
+    const configDir = await mkdtemp(path.join(tmpdir(), 'fx-config-dir-'))
+    const original = { ...process.env }
+    process.env.FRESHELL_CONFIG_DIR = configDir
+    try {
+      const store = new FreshAgentRecoveryStore()
+      await store.recordInterrupt('ses_scoped')
+      const expected = path.join(configDir, 'fresh-agent-recovery.json')
+      const persisted = JSON.parse(await readFile(expected, 'utf8'))
+      expect(persisted.interrupts.ses_scoped).toBeTypeOf('number')
+    } finally {
+      process.env = original
+      const { rm } = await import('node:fs/promises')
+      await rm(configDir, { recursive: true, force: true })
+    }
+  })
+})
