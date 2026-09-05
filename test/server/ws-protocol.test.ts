@@ -1338,6 +1338,134 @@ describe('ws protocol', () => {
     await close()
   })
 
+  it('drops a stale replayed cwd on restore and falls back to a live default', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const requestId = 'req-opencode-restore-stale-cwd'
+    const staleCwd = '/tmp/freshell-e2e-deleted-home-that-does-not-exist'
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'opencode',
+      restore: true,
+      sessionRef: { provider: 'opencode', sessionId: 'ses_root_stale_cwd_restore' },
+      cwd: staleCwd,
+    }))
+
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+    expect(created.type).toBe('terminal.created')
+
+    expect(registry.createCalls[0].cwd).toBeUndefined()
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ requestId, staleCwd }),
+      expect.stringContaining('replay cwd no longer exists'),
+    )
+
+    await close()
+  })
+
+  it('drops a stale replayed cwd on fresh-after-restore-unavailable recovery', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const requestId = 'req-shell-fresh-recovery-stale-cwd'
+    const staleCwd = '/tmp/freshell-e2e-deleted-home-that-does-not-exist'
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'shell',
+      recoveryIntent: 'fresh_after_restore_unavailable',
+      cwd: staleCwd,
+    }))
+
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+    expect(created.type).toBe('terminal.created')
+    expect(registry.createCalls[0].cwd).toBeUndefined()
+
+    await close()
+  })
+
+  it('preserves a live replayed cwd on restore without warning', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const requestId = 'req-opencode-restore-live-cwd'
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'opencode',
+      restore: true,
+      sessionRef: { provider: 'opencode', sessionId: 'ses_root_live_cwd_restore' },
+      cwd: '/',
+    }))
+
+    await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+    expect(registry.createCalls[0].cwd).toBe('/')
+    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ requestId }),
+      expect.anything(),
+    )
+
+    await close()
+  })
+
+  it('passes a missing cwd through unchanged for interactive creates (deliberate-error path preserved)', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const requestId = 'req-opencode-interactive-missing-cwd'
+    const missingCwd = '/tmp/freshell-e2e-deleted-home-that-does-not-exist'
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'opencode',
+      cwd: missingCwd,
+    }))
+
+    await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+    // FakeRegistry does not run MCP injection; the assertion pins that the
+    // handler did NOT apply the replay fallback to an interactive create.
+    expect(registry.createCalls[0].cwd).toBe(missingCwd)
+
+    await close()
+  })
+
+  it('does not record a dropped stale replayed cwd into recent directories', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const staleCwd = '/tmp/freshell-e2e-deleted-home-that-does-not-exist'
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId: 'req-opencode-restore-stale-cwd-recents',
+      mode: 'opencode',
+      restore: true,
+      sessionRef: { provider: 'opencode', sessionId: 'ses_root_stale_cwd_recents' },
+      cwd: staleCwd,
+    }))
+
+    await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === 'req-opencode-restore-stale-cwd-recents',
+      5000,
+    )
+    expect(mockConfigStore.pushRecentDirectory).not.toHaveBeenCalled()
+
+    await close()
+  })
+
   // Helper to collect messages until a condition is met
   function collectUntil(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 1000): Promise<any[]> {
     return new Promise((resolve, reject) => {

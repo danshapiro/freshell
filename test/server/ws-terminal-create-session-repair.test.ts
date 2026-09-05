@@ -1309,13 +1309,16 @@ describe('terminal.create session repair wait', () => {
 
       const requestId = `req-${mode}-fresh-recovery`
       const createdPromise = waitForCreated(ws, requestId)
+      // Live directory: replayed (recovery) creates now drop a persisted cwd
+      // that no longer exists, so the pass-through assertion needs a real path.
+      const liveCwd = process.cwd()
 
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode,
         recoveryIntent: 'fresh_after_restore_unavailable',
-        cwd: '/repo/project',
+        cwd: liveCwd,
       }))
 
       const created = await createdPromise
@@ -1324,7 +1327,7 @@ describe('terminal.create session repair wait', () => {
       expect(registry.records.size).toBe(1)
       expect(registry.lastCreateOpts).toMatchObject({
         mode,
-        cwd: '/repo/project',
+        cwd: liveCwd,
       })
       if (mode === 'claude') {
         expect(registry.lastCreateOpts?.resumeSessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)

@@ -441,6 +441,19 @@ process.stdin.on('data', (data) => {
 
 const eventClients = new Set()
 const sessionStatuses = new Map()
+// Once-only latch: armed only by the FAKE_OPENCODE_BUSY_AT_LAUNCH seeding
+// below, so the connect-time root idle frame in emitSessionEvents cannot be
+// triggered by any other busy source (e.g. an in-flight prompt turn).
+let busyAtLaunchPending = false
+
+// kata ywwf: optionally emulate real opencode's launch-time busy root so
+// suites that associate without sending a prompt can satisfy the ownership
+// reducer's busy→idle edge. Off by default; serve-lane specs rely on the
+// idle-until-prompt model introduced in 5dda73743.
+if (process.env.FAKE_OPENCODE_BUSY_AT_LAUNCH === '1') {
+  sessionStatuses.set(rootSessionId, 'busy')
+  busyAtLaunchPending = true
+}
 
 function sendJson(res, statusCode, body, headers = {}) {
   res.writeHead(statusCode, { 'content-type': 'application/json', ...headers })
@@ -691,6 +704,14 @@ function emitSessionEvents(res) {
       sessionID: childSessionId,
     },
   })}\n\n`)
+  if (busyAtLaunchPending) {
+    busyAtLaunchPending = false
+    sessionStatuses.set(rootSessionId, 'idle')
+    res.write(`data: ${JSON.stringify({
+      type: 'session.idle',
+      properties: { sessionID: rootSessionId },
+    })}\n\n`)
+  }
 }
 
 function scheduleSessionEvents(res) {
