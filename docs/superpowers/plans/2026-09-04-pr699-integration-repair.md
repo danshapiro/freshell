@@ -94,11 +94,13 @@ At execution setup, `origin/main` is `1463021212246c631ab943adf0dfa70d5a3d22e2`.
 
 ### Task A: Integrate current main without restoring retired behavior
 
-- [ ] Merge the pinned main commit in this worktree and resolve the 21 mapped conflicts by behavior, not whole-file replacement. Keep retired Node implementations and their implementation-specific tests deleted. Keep incoming standalone Claude sidecar tests at `test/unit/claude-sidecar/`; repair their four relative crate imports.
-- [ ] Preserve both the unavailable shell-command notice and main's expandable queue controls. Preserve the complete one-at-a-time outgoing-turn lifecycle while adapting the composer callback to plain text; do not restore attachments or `/api/fresh-agent/exec`.
-- [ ] Keep negotiated `terminalInterestV1` and `terminal.interest`. The retained combined inventory is 34 inbound / 55 outbound / 89 total at protocol v8. Regenerate contracts with the supported generator; do not hand-maintain generated schemas.
-- [ ] Keep incoming provider/browser scenarios using PR699's owned Rust fixture API. Change the new sidebar spec from the removed `TestServerInfo` to `E2eServerInfo`. Remove only newly reintroduced unsupported attachment claims from README/mock documentation.
-- [ ] Run typechecks, protocol/port tests, retained sidecar tests, FreshAgent Composer/View/control tests, terminal-interest tests, and sidebar tests. Preserve failing receipts; correct merge regressions with targeted behavioral coverage. Commit the integration checkpoint and obtain its independent task review.
+- [x] Merge the pinned main commit in this worktree and resolve the 21 mapped conflicts by behavior, not whole-file replacement. Keep retired Node implementations and their implementation-specific tests deleted. Keep incoming standalone Claude sidecar tests at `test/unit/claude-sidecar/`; repair their four relative crate imports.
+- [x] Preserve both the unavailable shell-command notice and main's expandable queue controls. Preserve the complete one-at-a-time outgoing-turn lifecycle while adapting the composer callback to plain text; do not restore attachments or `/api/fresh-agent/exec`.
+- [x] Keep negotiated `terminalInterestV1` and `terminal.interest`. The retained combined inventory is 34 inbound / 55 outbound / 89 total at protocol v8. Regenerate contracts with the supported generator; do not hand-maintain generated schemas.
+- [x] Keep incoming provider/browser scenarios using PR699's owned Rust fixture API. Change the new sidebar spec from the removed `TestServerInfo` to `E2eServerInfo`. Remove only newly reintroduced unsupported attachment claims from README/mock documentation.
+- [x] Run typechecks, protocol/port tests, retained sidecar tests, FreshAgent Composer/View/control tests, terminal-interest tests, and sidebar tests. Preserve failing receipts; correct merge regressions with targeted behavioral coverage. Commit the integration checkpoint and obtain its independent task review.
+
+Task A receipt: integration commit `c2fba7bb904c5bafac6dd355c9950406588e955c`; independent requirements PASS and code-quality APPROVED, no findings. Complete evidence and the disclosed host-test safety deviation are recorded in `/home/dan/code/freshell/.git/worktrees/retire-node-server-v2/usual-sdd/pr699-integration-repair/task-001-review.md`. The valid sandbox sidecar run passed all 41 tests; broader execution remains pending.
 
 ### Task B: Preserve installed Claude runtime and model discovery
 
