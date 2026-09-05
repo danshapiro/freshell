@@ -1000,25 +1000,6 @@ pub fn spawn_auto_resume_hub(
     spawn_hub_with_driver(WsAutoResumeDriver { state }, rx, HubConfig::from_env())
 }
 
-/// [`spawn_auto_resume_hub`] with an explicit backoff schedule. The
-/// integration-test harness uses this to inject tiny delays: the harness is
-/// in-process, so a `FRESHELL_AUTO_RESUME_DELAYS_MS` env write would leak
-/// across parallel tests in the same binary.
-pub fn spawn_auto_resume_hub_with_delays(
-    state: crate::WsState,
-    rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
-    delays: Vec<u64>,
-) -> tokio::task::JoinHandle<()> {
-    spawn_hub_with_driver(
-        WsAutoResumeDriver { state },
-        rx,
-        HubConfig {
-            delays,
-            ..HubConfig::from_env()
-        },
-    )
-}
-
 /// [`spawn_auto_resume_hub`] with explicit backoff AND identity-grace
 /// schedules. The harness injects tiny values: it is in-process, so env
 /// writes would leak across parallel tests in one binary.
