@@ -23,14 +23,4 @@ export default defineConfig({
       '@electron': path.resolve(projectRoot, './electron'),
     },
   },
-  css: {
-    postcss: {
-      plugins: [
-        (await import('tailwindcss')).default({
-          config: path.resolve(projectRoot, 'config/tailwind/tailwind.config.wizard.js'),
-        }),
-        (await import('autoprefixer')).default,
-      ],
-    },
-  },
 })

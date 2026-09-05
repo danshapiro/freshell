@@ -426,12 +426,12 @@ export function migrateLegacyEnvFile(
   if (envPath === cwdEnvPath) return false
   if (deps.existsSync(envPath)) return false
   if (!deps.existsSync(cwdEnvPath)) return false
-  // Never copy an unrelated dotfile: the legacy path is only a Freshell .env
-  // when it carries AUTH_TOKEN. (A WorkingDirectory-less systemd user unit
-  // previously loaded ANY found `$HOME/.env`, and we mirror that location —
-  // but we don't DUPLICATE its secrets into the config dir.)
+  // Never copy an unrelated dotfile: the legacy path only counts as a
+  // Freshell .env when it declares AUTH_TOKEN SOMEWHERE (the files
+  // ensureEnvFile writes all begin with a comment line, so the /m flag is
+  // load-bearing — anchored-at-start passes the wrong-fixture test otherwise).
   try {
-    if (!/^\s*AUTH_TOKEN=\S+/.test(deps.readFileSync(cwdEnvPath))) return false
+    if (!/^\s*AUTH_TOKEN=\S+/m.test(deps.readFileSync(cwdEnvPath))) return false
   } catch {
     return false
   }

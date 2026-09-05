@@ -360,6 +360,10 @@ function createRecoverableEntryWindow(
 /** True during the wizard flow; prevents app.quit() on window-all-closed. */
 let wizardPhase = true
 
+// True when startup adopted an already-running resident server that proves it
+// owns this profile's config dir (tray/status surfaces read it as running).
+let attachedToOwnResidentServer = false
+
 /**
  * An explicit chooser selection to honor on the next main() pass. Set by the
  * choose-launch-option handler before it restarts the launch flow, consumed
@@ -545,7 +549,6 @@ async function main(): Promise<void> {
       // Unauthenticated /api/health only; failure => indistinct (caller treats
       // as foreign — safer to bump than to misidentify a neighbor as ours).
       return new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(undefined), 10_000)
         const req = http.get(`${url}/api/health`, { timeout: 8_000 }, (res) => {
           const chunks: Buffer[] = []
           res.on('data', (chunk: Buffer) => chunks.push(chunk))
@@ -558,15 +561,11 @@ async function main(): Promise<void> {
               resolve(undefined)
             }
           })
-          res.on('error', () => {
-            clearTimeout(timer)
-            resolve(undefined)
-          })
+          res.on('error', () => { clearTimeout(timer); resolve(undefined) })
         })
-        req.on('error', () => {
-          clearTimeout(timer)
-          resolve(undefined)
-        })
+        req.on('timeout', () => { req.destroy(); clearTimeout(timer); resolve(undefined) })
+        req.on('error', () => { clearTimeout(timer); resolve(undefined) })
+        const timer = setTimeout(() => { req.destroy(); resolve(undefined) }, 10_000)
       })
     },
     platform: process.platform,
@@ -682,7 +681,7 @@ async function main(): Promise<void> {
           },
           getServerStatus: async () => {
             return {
-              running: serverSpawner.isRunning(),
+              running: serverSpawner.isRunning() || attachedToOwnResidentServer,
               mode: desktopConfig.serverMode,
             }
           },
@@ -797,6 +796,7 @@ async function main(): Promise<void> {
 
   // Run startup sequence
   const result = await runStartup(ctx)
+  if (result.type === 'main' && result.attached) attachedToOwnResidentServer = true
 
   if (result.type === 'wizard') {
     // Show the setup wizard
@@ -854,7 +854,7 @@ async function main(): Promise<void> {
   ipcMain.handle('get-server-mode', () => desktopConfig.serverMode)
 
   ipcMain.handle('get-server-status', async () => ({
-    running: serverSpawner.isRunning(),
+    running: serverSpawner.isRunning() || attachedToOwnResidentServer,
     mode: desktopConfig.serverMode,
   }))
 

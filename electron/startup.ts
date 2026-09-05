@@ -88,7 +88,7 @@ export interface StartupContext {
 export type StartupResult =
   | { type: 'wizard' }
   | { type: 'chooser'; candidates: LaunchServerCandidate[]; reason: string }
-  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; updateCheckTimer: ReturnType<typeof setTimeout> }
+  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; attached?: boolean; updateCheckTimer: ReturnType<typeof setTimeout> }
 
 async function defaultDiscoverLaunchCandidates(ctx: StartupContext): Promise<LaunchServerCandidate[]> {
   const urls = buildLocalProbeUrls(ctx.desktopConfig)
@@ -408,6 +408,9 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
 
   let serverUrl: string
 
+  // True when startup adopted an already-running resident server that proved
+  // it owns this profile's config dir (tray status reads it as "running").
+  let attachedToOwnResidentServer = false
   switch (desktopConfig.serverMode) {
     case 'daemon': {
       if (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID) {
@@ -458,6 +461,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
             port,
           })
           attachedOwnServer = true
+          attachedToOwnResidentServer = true
         } else {
           // The resident server is NOT ours: bump to the next free port rather
           // than spawning a doomed server whose health check would succeed
@@ -538,5 +542,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     authToken = await ctx.readEnvToken(path.join(ctx.configDir, '.env'))
   }
 
-  return loadMainWindow(ctx, serverUrl, authToken)
+  const mainResult = await loadMainWindow(ctx, serverUrl, authToken)
+  if (attachedToOwnResidentServer) mainResult.attached = true
+  return mainResult
 }

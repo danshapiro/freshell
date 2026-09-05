@@ -111,11 +111,14 @@ configuration.
   profile's config dir (`FRESHELL_CONFIG_DIR`) and port — a named profile
   never adopts another profile's already-running local server; choose a
   distinct port per profile. Once named profiles exist (listed in
-  `profiles.json`, used from the command line, or previously run), the same
+  `profiles.json`, used from the command line, or previously run — including
+  a stray `~/.freshell-<id>` backup dir, which shape-checks by name), the same
   applies to the **Default** profile: it no longer auto-attaches to a
-  discovered local server, and if its configured port is held by a neighbor
-  profile, Freshell bumps to the next free port and saves that port into the
-  profile's settings (visible in the setup summary).
+  discovered local server, and if its configured port is held by a neighbor,
+  Freshell bumps to the next free port and saves that port into the profile's
+  settings (visible in the setup summary). An app-bound profile that finds
+  its OWN config dir's server already resident attaches to it instead of
+  double-spawning.
 - Daemon services (`freshell.service`, `com.freshell.server`,
   "Freshell Server" task) are machine-global single instances — daemon mode is
   available only on the **Default** profile; named profiles fall back to the
