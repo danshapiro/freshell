@@ -44,9 +44,19 @@ const aliasNotices: Partial<Record<string, string>> = {
   'new-session': 'new-session maps to new-tab in Freshell (creates a new tab). Use split-pane to create a pane in the current tab.',
 }
 
+// The shared CLI/MCP reference uses API parameter names. Accept those names
+// alongside established CLI spellings for every command.
+const flagAliases: Readonly<Record<string, readonly string[]>> = {
+  'session-ref': ['sessionRef'],
+  resume: ['resumeSessionId'],
+  other: ['with'],
+}
+
 const getFlag = (flags: Flags, ...names: string[]) => {
   for (const name of names) {
-    if (flags[name] !== undefined) return flags[name]
+    for (const key of [name, ...(flagAliases[name] ?? [])]) {
+      if (flags[key] !== undefined) return flags[key]
+    }
   }
   return undefined
 }
@@ -150,6 +160,23 @@ function promoteResumeFlag(
     return { rejected: true }
   }
   return { rejected: false, sessionRef: { provider: mode, sessionId: resumeSessionId } }
+}
+
+function parseResizeSizes(raw: string | boolean | undefined): [number, number] | undefined {
+  if (raw === undefined) return undefined
+  const message = '--sizes must be a JSON array containing two numbers from 1 to 99, such as [25,75].'
+  let value: unknown
+  try {
+    value = typeof raw === 'string' ? JSON.parse(raw) : undefined
+  } catch {
+    throw new Error(message)
+  }
+  if (!Array.isArray(value) || value.length !== 2 || value.some((size) => (
+    typeof size !== 'number' || !Number.isFinite(size) || size < 1 || size > 99
+  ))) {
+    throw new Error(message)
+  }
+  return [value[0], value[1]]
 }
 
 async function fetchTabs(client: ReturnType<typeof createHttpClient>): Promise<{ tabs: TabSummary[]; activeTabId?: string | null }> {
@@ -404,22 +431,23 @@ async function main() {
   switch (command) {
     case 'new-tab': {
       const name = (getFlag(flags, 'n', 'name', 'title') as string | undefined) || undefined
+      const agent = getFlag(flags, 'agent') as string | undefined
       const mode = isTruthy(getFlag(flags, 'claude')) ? 'claude'
         : isTruthy(getFlag(flags, 'codex')) ? 'codex'
-          : (getFlag(flags, 'mode') as string | undefined) || 'shell'
+          : (getFlag(flags, 'mode') as string | undefined) || (agent ? undefined : 'shell')
       const shell = getFlag(flags, 'shell') as string | undefined
       const cwd = getFlag(flags, 'cwd') as string | undefined
       const browser = getFlag(flags, 'browser') as string | undefined
       const editor = getFlag(flags, 'editor') as string | undefined
-      const agent = getFlag(flags, 'agent') as string | undefined
       const model = getFlag(flags, 'model') as string | undefined
       const effort = getFlag(flags, 'effort') as string | undefined
       const resumeSessionId = getFlag(flags, 'resume') as string | undefined
-      const sessionRefResult = resolveSessionRefFlag(mode, getFlag(flags, 'session-ref'))
+      const resumeProvider = mode ?? agent
+      const sessionRefResult = resolveSessionRefFlag(resumeProvider, getFlag(flags, 'session-ref'))
       const prompt = getFlag(flags, 'prompt') as string | undefined
-      if (rejectRawCodexResume(mode, resumeSessionId)) return
+      if (rejectRawCodexResume(resumeProvider, resumeSessionId)) return
       if (sessionRefResult.rejected) return
-      const promoted = promoteResumeFlag(mode, resumeSessionId, sessionRefResult.sessionRef)
+      const promoted = promoteResumeFlag(resumeProvider, resumeSessionId, sessionRefResult.sessionRef)
       if (promoted.rejected) return
 
       const res = await client.post('/api/tabs', {
@@ -626,6 +654,7 @@ async function main() {
       const target = (getFlag(flags, 't', 'target', 'pane') as string | undefined) || args[0]
       const x = getFlag(flags, 'x') as string | undefined
       const y = getFlag(flags, 'y') as string | undefined
+      const sizes = parseResizeSizes(getFlag(flags, 'sizes'))
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
         writeError(resolved.message || 'pane not found')
@@ -636,6 +665,7 @@ async function main() {
         tabId: resolved.tab?.id,
         x: x ? Number(x) : undefined,
         y: y ? Number(y) : undefined,
+        ...(sizes ? { sizes } : {}),
       })
       writeJson(res)
       return
@@ -694,7 +724,8 @@ async function main() {
       const literal = isTruthy(getFlag(flags, 'l', 'literal'))
       const sessionRefResult = resolveSessionRefFlag(undefined, getFlag(flags, 'session-ref'))
       if (sessionRefResult.rejected) return
-      const keyArgs = parsedSendKeys.keyArgs
+      const keys = getFlag(flags, 'keys')
+      const keyArgs = typeof keys === 'string' ? [keys] : parsedSendKeys.keyArgs
       if (!target) {
         const resolved = await resolvePaneTarget(client, undefined)
         target = resolved.pane?.id

@@ -21,6 +21,7 @@ const FLAGS_ALLOWING_DASH_PREFIX_VALUES = new Set([
   't',
   'tab',
   'target',
+  'with',
 ])
 
 const COMMAND_FLAG_KEYS_ALLOWING_DASH_PREFIX_VALUES: Partial<Record<string, Set<string>>> = {
@@ -28,7 +29,7 @@ const COMMAND_FLAG_KEYS_ALLOWING_DASH_PREFIX_VALUES: Partial<Record<string, Set<
   attach: new Set(['p']),
   // send-keys can take a pane id positionally, and nanoid-generated pane ids can
   // start with "-". Keep its real flags recognized while allowing positional ids.
-  'send-keys': new Set(['l', 'literal', 'pane', 't', 'target']),
+  'send-keys': new Set(['l', 'literal', 'pane', 't', 'target', 'keys', 'session-ref', 'sessionRef']),
   // rename commands accept generated tab/pane ids positionally or via flags, and
   // those ids come from nanoid(), which can start with "-".
   'rename-pane': new Set(['n', 'name', 'pane', 't', 'target', 'title']),

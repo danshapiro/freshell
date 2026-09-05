@@ -499,6 +499,12 @@
       "listener": "assertion-only"
     },
     {
+      "id": "assertion-test-cli-retained-flags",
+      "path": "test/unit/cli/retained-flags.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
       "id": "assertion-test-electron-port-check",
       "path": "test/unit/electron/port-check.test.ts",
       "role": "test-listener-assertion",

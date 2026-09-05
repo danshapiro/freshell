@@ -138,9 +138,26 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       expect(panes.status).toBe('ok')
       expect(panes.data.panes.map((pane) => pane.id)).toEqual(expect.arrayContaining([paneId, split.data.paneId]))
 
+      const resized = await runCliJson<ActionResult<{ tabId: string }>>(
+        serverInfo.baseUrl, serverInfo.token, ['resize-pane', '--target', paneId, '--sizes', '[65,35]'],
+      )
+      expect(resized.status).toBe('ok')
+      await expect.poll(async () => {
+        const response = await page.request.get(`${serverInfo.baseUrl}/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`, {
+          headers: { 'x-auth-token': serverInfo.token },
+        })
+        expect(response.ok()).toBe(true)
+        const snapshot = await response.json() as ActionResult<{ layouts: Record<string, { sizes: number[] }> }>
+        return snapshot.data.layouts[tabId]?.sizes
+      }).toEqual([65, 35])
+      const swapped = await runCliJson<ActionResult<unknown>>(
+        serverInfo.baseUrl, serverInfo.token, ['swap-pane', '--target', paneId, '--with', split.data.paneId],
+      )
+      expect(swapped.status).toBe('ok')
+
       const marker = `CLI-RUST-MARKER-${randomUUID()}`
       const sent = await runCliJson<ActionResult<{ terminalId: string }>>(
-        serverInfo.baseUrl, serverInfo.token, ['send-keys', '--target', paneId, '-l', `echo ${marker}\r`],
+        serverInfo.baseUrl, serverInfo.token, ['send-keys', '--target', paneId, '-l', '--keys', `echo ${marker}\r`],
       )
       expect(sent.status).toBe('ok')
       const waited = await runCliJson<ActionResult<{ matched: boolean }>>(
