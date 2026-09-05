@@ -35,7 +35,7 @@ function InertRegion({ hidden, style, children, paneId }: {
       data-stable-pane-id={paneId}
       aria-hidden={hidden || undefined}
       className="absolute min-w-0 min-h-0"
-      style={{ ...style, visibility: hidden ? 'hidden' : undefined, pointerEvents: hidden ? 'none' : 'auto' }}
+      style={{ ...style, visibility: hidden ? 'hidden' : undefined, opacity: hidden ? 0 : undefined, pointerEvents: hidden ? 'none' : 'auto' }}
     >
       {children}
     </div>

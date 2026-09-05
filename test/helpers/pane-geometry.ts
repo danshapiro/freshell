@@ -13,7 +13,7 @@
  * install their own finer harness like StablePaneLayout.test.tsx does; this
  * one is deliberately uniform.
  */
-import { vi } from 'vitest'
+import { vi, type MockInstance } from 'vitest'
 import { act } from '@testing-library/react'
 
 export type InstalledPaneGeometry = {
@@ -30,7 +30,7 @@ export function installPaneGeometry(box = { width: 1000, height: 600 }): Install
   // wipe plain vi.fn() mockReturnValue registrations belonging to the host
   // suite's own fixtures (restored to undefined-returning), breaking later
   // tests in the same file.
-  const spies = [
+  const spies: MockInstance[] = [
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
       const r = { left: 0, top: 0, width: box.width, height: box.height }
       return { ...r, x: r.left, y: r.top, right: r.left + r.width, bottom: r.top + r.height, toJSON: () => r } as DOMRect
@@ -39,6 +39,7 @@ export function installPaneGeometry(box = { width: 1000, height: 600 }): Install
   for (const [property, value] of [['clientWidth', box.width], ['offsetWidth', box.width], ['clientHeight', box.height], ['offsetHeight', box.height]] as const) {
     spies.push(vi.spyOn(HTMLElement.prototype, property, 'get').mockReturnValue(value))
   }
+  const originalResizeObserver = (globalThis as { ResizeObserver?: unknown }).ResizeObserver
   vi.stubGlobal('ResizeObserver', class {
     entry: ObserverEntry
     constructor(callback: ResizeObserverCallback) {
@@ -61,7 +62,13 @@ export function installPaneGeometry(box = { width: 1000, height: 600 }): Install
     },
     restore: () => {
       for (const spy of spies) spy.mockRestore()
-      vi.unstubAllGlobals()
+      // Undo exactly OUR global stub: vi.unstubAllGlobals() would also clear
+      // globals the host suite stubbed in beforeAll (or anywhere else).
+      if (originalResizeObserver === undefined) {
+        delete (globalThis as { ResizeObserver?: unknown }).ResizeObserver
+      } else {
+        ;(globalThis as { ResizeObserver?: unknown }).ResizeObserver = originalResizeObserver
+      }
     },
   }
 }

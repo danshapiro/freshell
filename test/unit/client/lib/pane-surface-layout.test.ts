@@ -37,7 +37,8 @@ describe('pane surface layout',()=>{
   it('keeps an existing surface when measurement temporarily disappears',()=>{
     const first=reconcileSurfaceMeasurements({},['a'],new Map([['a',rect]]))
     const hidden=reconcileSurfaceMeasurements(first,['a'],new Map())
-    expect(hidden.a.rect).toBe(first.a.rect);expect(hidden.a.measurable).toBe(false)
+    expect(hidden.a.rect).toBe(first.a.rect)
+    expect(hidden.a.measurable).toBe(false)
     expect(reconcileSurfaceMeasurements(hidden,['a'],new Map([['a',rect]])).a.measurable).toBe(true)
   })
   it('does not render-loop on unchanged measurements or leak closed entries',()=>{
@@ -48,6 +49,8 @@ describe('pane surface layout',()=>{
   it('never guesses an initial terminal size and handles arbitrary ID strings',()=>{
     expect(Object.keys(reconcileSurfaceMeasurements({},['a'],new Map()))).toEqual([])
     const next=reconcileSurfaceMeasurements({},['__proto__'],new Map([['__proto__',rect]]))
-    expect(Object.getPrototypeOf(next)).toBeNull();expect(next.__proto__.measurable).toBe(true)
+    expect(Object.getPrototypeOf(next)).toBeNull()
+    expect(next.__proto__.measurable).toBe(true)
   })
 })
+

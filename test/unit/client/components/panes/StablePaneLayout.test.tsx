@@ -55,15 +55,19 @@ function notifyResize() {
 function surface(id: string) { return screen.getByTestId(`pane-${id}`).closest('[data-stable-pane-id]') as HTMLElement }
 
 beforeEach(() => {
-  observed.mounts.clear(); observed.disposals.clear(); observed.dispatch.mockClear()
-  rootRect=rect(1000); observers=[]
+  observed.mounts.clear()
+  observed.disposals.clear()
+  observed.dispatch.mockClear()
+  rootRect=rect(1000)
+  observers=[]
   rectangles=new Map([
     ['pane:a',rect()],['pane:b',rect(500,500)],['pane:c',rect(200,100)],
     ['divider:s',rect(12,488)],['split:s',rect(1000)],
     ['divider:outer',rect(12,200)],['split:outer',rect(1000)],
   ])
   vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function(this: HTMLElement) {
-    const r=box(this);return { ...r, x:r.left,y:r.top,right:r.left+r.width,bottom:r.top+r.height,toJSON:()=>r } as DOMRect
+    const r=box(this)
+    return { ...r, x:r.left,y:r.top,right:r.left+r.width,bottom:r.top+r.height,toJSON:()=>r } as DOMRect
   })
   for (const [property,axis] of [['clientWidth','width'],['offsetWidth','width'],['clientHeight','height'],['offsetHeight','height']] as const) {
     vi.spyOn(HTMLElement.prototype,property,'get').mockImplementation(function(this: HTMLElement) { return box(this)[axis] })
@@ -78,37 +82,50 @@ afterEach(() => { cleanup();vi.restoreAllMocks();vi.unstubAllGlobals() })
 
 describe('stable pane ownership', () => {
   it('keeps a pane and its draft when a leaf is wrapped in a split and collapsed again', () => {
-    const a=leaf('a');const {rerender}=render(<StablePaneLayout tabId="tab" layout={a} />)
-    const input=screen.getByLabelText('Input a');fireEvent.change(input,{target:{value:'unsent work'}})
+    const a=leaf('a')
+    const {rerender}=render(<StablePaneLayout tabId="tab" layout={a} />)
+    const input=screen.getByLabelText('Input a')
+    fireEvent.change(input,{target:{value:'unsent work'}})
     const original=surface('a')
     rerender(<StablePaneLayout tabId="tab" layout={split('s',a,leaf('b'))} />)
-    expect(surface('a')).toBe(original);expect(screen.getByLabelText('Input a')).toBe(input)
+    expect(surface('a')).toBe(original)
+    expect(screen.getByLabelText('Input a')).toBe(input)
     rerender(<StablePaneLayout tabId="tab" layout={a} />)
-    expect(observed.mounts.get('a')).toBe(1);expect(observed.disposals.get('a')??0).toBe(0)
+    expect(observed.mounts.get('a')).toBe(1)
+    expect(observed.disposals.get('a')??0).toBe(0)
     expect((input as HTMLTextAreaElement).value).toBe('unsent work')
     expect(observed.disposals.get('b')).toBe(1)
   })
   it('retains all surfaces through nested ancestry changes', () => {
-    const a=leaf('a'),b=leaf('b');const {rerender}=render(<StablePaneLayout tabId="tab" layout={split('s',a,b)} />)
+    const a=leaf('a'),b=leaf('b')
+    const {rerender}=render(<StablePaneLayout tabId="tab" layout={split('s',a,b)} />)
     const original=surface('a')
     rerender(<StablePaneLayout tabId="tab" layout={split('outer',leaf('c'),split('s',a,b))} />)
-    expect(surface('a')).toBe(original);expect(observed.mounts.get('a')).toBe(1)
+    expect(surface('a')).toBe(original)
+    expect(observed.mounts.get('a')).toBe(1)
   })
   it('zoom hides and inerts siblings/dividers without unmounting them', () => {
-    const layout=split('s',leaf('a'),leaf('b'));const {rerender}=render(<StablePaneLayout tabId="tab" layout={layout} />)
+    const layout=split('s',leaf('a'),leaf('b'))
+    const {rerender}=render(<StablePaneLayout tabId="tab" layout={layout} />)
     const a=surface('a'), b=surface('b')
     for(let i=0;i<20;i++) {
       rerender(<StablePaneLayout tabId="tab" layout={layout} zoomedPaneId="a" />)
-      expect(surface('b')).toBe(b);expect(b.inert).toBe(true);expect(b.getAttribute('aria-hidden')).toBe('true')
-      expect(a.style.width).toBe('100%');expect(screen.getByRole('separator',{hidden:true}).closest('[aria-hidden="true"]')).not.toBeNull()
+      expect(surface('b')).toBe(b)
+      expect(b.inert).toBe(true)
+      expect(b.getAttribute('aria-hidden')).toBe('true')
+      expect(a.style.width).toBe('100%')
+      expect(screen.getByRole('separator',{hidden:true}).closest('[aria-hidden="true"]')).not.toBeNull()
       rerender(<StablePaneLayout tabId="tab" layout={layout} />)
     }
-    expect(surface('a')).toBe(a);expect(b.inert).toBe(false);expect(observed.mounts.get('b')).toBe(1)
+    expect(surface('a')).toBe(a)
+    expect(b.inert).toBe(false)
+    expect(observed.mounts.get('b')).toBe(1)
     expect(observed.disposals.size).toBe(0)
   })
   it('stale zoom IDs leave both panes and the separator usable', () => {
     render(<StablePaneLayout tabId="tab" layout={split('s',leaf('a'),leaf('b'))} zoomedPaneId="missing" />)
-    expect(surface('a').inert).toBe(false);expect(surface('b').inert).toBe(false)
+    expect(surface('a').inert).toBe(false)
+    expect(surface('b').inert).toBe(false)
     expect(screen.getByRole('separator')).toBeTruthy()
   })
   it('keeps the normal pane-divider-pane keyboard and reading order', () => {
@@ -118,30 +135,46 @@ describe('stable pane ownership', () => {
     expect(container.querySelectorAll('[data-pane-geometry-tree] [tabindex]').length).toBe(0)
   })
   it('updates content in place without caching an obsolete terminal ID', () => {
-    const a=leaf('a');const {rerender}=render(<StablePaneLayout tabId="tab" layout={a} />)
-    const old=surface('a');const content={...a.content,terminalId:'replacement-terminal'}
+    const a=leaf('a')
+    const {rerender}=render(<StablePaneLayout tabId="tab" layout={a} />)
+    const old=surface('a')
+    const content={...a.content,terminalId:'replacement-terminal'}
     rerender(<StablePaneLayout tabId="tab" layout={{...a,content}} />)
-    expect(surface('a')).toBe(old);expect(screen.getByText('replacement-terminal')).toBeTruthy()
+    expect(surface('a')).toBe(old)
+    expect(screen.getByText('replacement-terminal')).toBeTruthy()
     expect(observed.mounts.get('a')).toBe(1)
   })
   it('keeps measured surfaces while geometry is unavailable, then restores their visibility', () => {
     const {unmount}=render(<StablePaneLayout tabId="tab" layout={leaf('a')} />)
-    const a=surface('a');rootRect=rect(0,0,0);notifyResize()
-    expect(surface('a')).toBe(a);expect(a.inert).toBe(true)
-    rootRect=rect(1000);notifyResize();expect(a.inert).toBe(false)
-    unmount();expect(observed.disposals.get('a')).toBe(1)
+    const a=surface('a')
+    rootRect=rect(0,0,0)
+    notifyResize()
+    expect(surface('a')).toBe(a)
+    expect(a.inert).toBe(true)
+    rootRect=rect(1000)
+    notifyResize()
+    expect(a.inert).toBe(false)
+    unmount()
+    expect(observed.disposals.get('a')).toBe(1)
     expect(observers.every(o=>o.disconnected)).toBe(true)
   })
   it('does not construct a new surface at guessed zero-sized initial geometry', () => {
-    rootRect=rect(0,0,0);render(<StablePaneLayout tabId="tab" layout={leaf('a')} />)
+    rootRect=rect(0,0,0)
+    render(<StablePaneLayout tabId="tab" layout={leaf('a')} />)
     expect(observed.mounts.size).toBe(0)
-    rootRect=rect(1000);notifyResize();expect(observed.mounts.get('a')).toBe(1)
+    rootRect=rect(1000)
+    notifyResize()
+    expect(observed.mounts.get('a')).toBe(1)
   })
   it('hidden tab surfaces remain mounted and become usable again', () => {
-    const layout=leaf('a');const {rerender}=render(<StablePaneLayout tabId="tab" layout={layout} />)
-    const a=surface('a');rerender(<StablePaneLayout tabId="tab" layout={layout} hidden />)
-    expect(a.inert).toBe(true);rerender(<StablePaneLayout tabId="tab" layout={layout} />)
-    expect(surface('a')).toBe(a);expect(observed.mounts.get('a')).toBe(1)
+    const layout=leaf('a')
+    const {rerender}=render(<StablePaneLayout tabId="tab" layout={layout} />)
+    const a=surface('a')
+    rerender(<StablePaneLayout tabId="tab" layout={layout} hidden />)
+    expect(a.inert).toBe(true)
+    rerender(<StablePaneLayout tabId="tab" layout={layout} />)
+    expect(surface('a')).toBe(a)
+    expect(observed.mounts.get('a')).toBe(1)
   })
   it('does not introduce additional mounts after StrictMode initialization', () => {
     const layout=split('s',leaf('a'),leaf('b'))
@@ -157,7 +190,8 @@ describe('stable pane ownership', () => {
     expect(observed.dispatch).toHaveBeenCalledWith({type:'panes/resizePanes',payload:{tabId:'tab',splitId:'s',sizes:[51,49]}})
   })
   it('resolves the replacement geometry element after wrapping an existing split', () => {
-    const a=leaf('a'), b=leaf('b');const layout=split('s',a,b)
+    const a=leaf('a'), b=leaf('b')
+    const layout=split('s',a,b)
     const {container,rerender}=render(<StablePaneLayout tabId="tab" layout={layout} />)
     const oldGeometry=container.querySelector('[data-pane-geometry-split="s"]')
     // The mocked rectangle remains exactly the same. The new layout commit
@@ -176,9 +210,12 @@ describe('stable pane ownership', () => {
   it('repeated no-op measurements do not recreate surfaces', () => {
     render(<StablePaneLayout tabId="tab" layout={leaf('a')} />)
     for(let i=0;i<50;i++) notifyResize()
-    expect(observed.mounts.get('a')).toBe(1);expect(observed.disposals.size).toBe(0)
+    expect(observed.mounts.get('a')).toBe(1)
+    expect(observed.disposals.size).toBe(0)
   })
 
+
+})
 
 describe('stable divider resizing', () => {
   it('a real mouse drag on the stable divider resizes through the shared hook', () => {
@@ -211,12 +248,7 @@ describe('stable divider resizing', () => {
     expect(last.type).toBe('panes/resizePanes')
     expect(last.payload.sizes[0]).toBeGreaterThan(50)
   })
-})
 
-})
-
-
-describe('stable divider resizing', () => {
   it('refuses to resize from an unreadable or zero-area container', () => {
     const layout = split('s', leaf('a'), leaf('b'))
     render(<StablePaneLayout tabId="tab" layout={layout} />)
@@ -235,3 +267,4 @@ describe('stable divider resizing', () => {
     }
   })
 })
+

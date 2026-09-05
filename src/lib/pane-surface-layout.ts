@@ -93,12 +93,12 @@ function sameRect(a: SurfaceRect, b: SurfaceRect): boolean {
  */
 export function reconcileSurfaceMeasurements(
   previous: SurfaceMeasurements,
-  paneIds: readonly string[],
+  surfaceKeys: readonly string[],
   measured: ReadonlyMap<string, SurfaceRect>,
 ): SurfaceMeasurements {
   const next: Record<string, MeasuredSurface> = Object.create(null)
   let changed = false
-  for (const id of paneIds) {
+  for (const id of surfaceKeys) {
     const rect = measured.get(id)
     const old = Object.hasOwn(previous, id) ? previous[id] : undefined
     if (isUsableSurfaceRect(rect)) {
