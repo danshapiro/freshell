@@ -308,6 +308,7 @@ mod tests {
             tabs: crate::tabs::TabsRegistry::new(),
             screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: StdArc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: StdArc::new(Vec::new()),
@@ -609,7 +610,14 @@ mod tests {
         // module, not the WS handler).
         state
             .pane_ledger
-            .record_pending("t1", "codex", Some("/tmp"), now_ms())
+            .record_pending(
+                "t1",
+                "codex",
+                Some("/tmp"),
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                now_ms(),
+            )
             .unwrap();
 
         // Enter-anchored window needs the submit; the first-submit
@@ -769,6 +777,7 @@ mod tests {
                 permission_mode: None,
                 effort: None,
                 supersedes: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: now_ms(),
             })
             .expect("seed fresh-agent ledger row");

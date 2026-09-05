@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, act } from '@testing-library/react'
+import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
@@ -231,9 +231,21 @@ describe('DeadSessionPanel + ReconcileWarmingBanner', () => {
       paneIds: ['p1', 'p2'],
     })
     await userEvent.click(screen.getByRole('button', { name: /close pane/i }))
-    const root = store.getState().panes.layouts['tab-1'] as any
-    expect(root.type).toBe('leaf')
-    expect(root.id).toBe('p2')
+    // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close gate
+    // awaits the correlated pane.closed.result before the layout loses the
+    // pane — answer every pane.closed with success (the healthy-server shape).
+    for (const frame of [...sentFrames]) {
+      if (frame?.type === 'pane.closed' && frame.createRequestId) {
+        for (const cb of [...messageHandlers]) {
+          cb({ type: 'pane.closed.result', createRequestId: frame.createRequestId, success: true })
+        }
+      }
+    }
+    await waitFor(() => {
+      const root = store.getState().panes.layouts['tab-1'] as any
+      expect(root.type).toBe('leaf')
+      expect(root.id).toBe('p2')
+    })
     expect(store.getState().panes.deadSessionAdjudication).toHaveLength(0)
   })
 

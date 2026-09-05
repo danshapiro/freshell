@@ -188,7 +188,20 @@ pub(crate) async fn split_pane(
         Err(_) => return approx_json(Value::Null, "pane split requested; not applied"),
     };
 
-    let new_content = if let Some(url) = body.get("browser").and_then(Value::as_str) {
+    let new_content = if body
+        .get("hostStats")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        // Stateless cheap content kind (router.ts `wantsHostStats` split branch).
+        let content = json!({ "kind": "host-stats" });
+        state
+            .content_panes
+            .lock()
+            .expect("content_panes mutex")
+            .insert(new_pane_id.clone(), content.clone());
+        content
+    } else if let Some(url) = body.get("browser").and_then(Value::as_str) {
         let content = json!({
             "kind": "browser",
             "url": url,

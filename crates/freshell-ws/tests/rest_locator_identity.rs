@@ -118,6 +118,7 @@ async fn spawn_merged_server(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::clone(&cli_commands),
@@ -377,6 +378,12 @@ async fn rest_created_opencode_pane_binds_identity_row_and_ledger() {
         .expect("Bound ledger row");
     assert_eq!(binding.live_terminal_id.as_deref(), Some(tid.as_str()));
     assert_eq!(binding.state, RowState::Bound);
+    // Delta-r3 Finding 2 pin: the headless REST marker carries NO spawn-time
+    // provenance, so this resolution still ends UNATTRIBUTED — the D8
+    // judgment never offers a headless-origin session.
+    assert_eq!(binding.client_instance_id, None);
+    assert_eq!(binding.device_id, None);
+    assert_eq!(binding.tab_key, None);
     // resolve_pending consumed the create-time marker (binding-first order).
     assert!(
         h.ledger.pending_for_terminal(&tid).is_none(),
@@ -477,6 +484,12 @@ async fn rest_created_codex_pane_binds_identity_row_and_ledger() {
     let binding = h.ledger.load_binding("codex", T).expect("Bound ledger row");
     assert_eq!(binding.live_terminal_id.as_deref(), Some(tid.as_str()));
     assert_eq!(binding.state, RowState::Bound);
+    // Delta-r3 Finding 2 pin: the headless REST marker carries NO spawn-time
+    // provenance, so this resolution still ends UNATTRIBUTED — the D8
+    // judgment never offers a headless-origin session.
+    assert_eq!(binding.client_instance_id, None);
+    assert_eq!(binding.device_id, None);
+    assert_eq!(binding.tab_key, None);
     assert!(
         h.ledger.pending_for_terminal(&tid).is_none(),
         "resolve_pending consumed the pending marker"

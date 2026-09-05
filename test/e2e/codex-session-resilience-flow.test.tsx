@@ -43,6 +43,11 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: vi.fn(),
   consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
   addTerminalFreshRecoveryRequestId: vi.fn(),
+  // Batch-6 arm/consume pair (restore offer live-reattach): a full-module
+  // mock must carry every export TerminalView imports, or the create path
+  // throws inside the mock and vitest reports an unhandled rejection.
+  armRecoveredLiveTerminalTarget: vi.fn(),
+  consumeRecoveredLiveTerminalTarget: vi.fn(() => undefined),
 }))
 
 vi.mock('lucide-react', () => ({

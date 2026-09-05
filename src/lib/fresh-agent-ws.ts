@@ -4,8 +4,10 @@ import type { SessionRef } from '@shared/session-contract'
 import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
+import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
+import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import {
   addAssistantMessage,
   addPermissionRequest,
@@ -74,6 +76,42 @@ type FreshAgentClientMessage =
 
 interface FreshAgentMessageSink {
   send: (msg: unknown) => void
+}
+
+/**
+ * Delta-r6-r2 (focused-episode-6 round 1, Finding 5): the kill answer's
+ * `success` field is load-bearing. The server's durable close FAILED
+ * (`success:false`) — every provider then leaves the LIVE session untouched
+ * (the close was never recorded; a `Bound` row beside an unacknowledged
+ * close stays self-consistent and retryable). Folding the session away as
+ * closed would let the browser proceed as though the kill landed — leaving
+ * a live Bound server session that recreates exactly the stale recovery
+ * candidate the restore-exactness campaign exists to prevent. So a failed
+ * kill is NOT a close: keep the session record and surface the failure on
+ * the pane's ordinary session-error surface (the pane's error banner reads
+ * `lastError`/`lastErrorCode`), logged structured. `success` absent (the
+ * legacy wire shape) means the old unconditional-close server — current
+ * behavior.
+ */
+function foldFreshAgentKilled(
+  dispatch: AppDispatch,
+  locator: { sessionId: string; sessionType: FreshAgentSessionType; provider: FreshAgentRuntimeProvider },
+  success: boolean | undefined,
+): void {
+  if (success === false) {
+    log.warn('freshAgent.killed reported success:false — the close was not durably recorded; the session may still be running on the server', {
+      sessionId: locator.sessionId,
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+    })
+    dispatch(sessionError({
+      ...locator,
+      code: 'KILL_FAILED',
+      message: KILL_FAILED_MESSAGE, // one copy for both writers (see kill-ack.ts)
+    }))
+    return
+  }
+  dispatch(removeSession(locator))
 }
 
 type FreshAgentEventMessage = {
@@ -174,11 +212,11 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.killed': {
       const killed = msg as FreshAgentKilledMessage
-      dispatch(removeSession({
+      foldFreshAgentKilled(dispatch, {
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
         provider: killed.provider,
-      }))
+      }, killed.success)
       return true
     }
     case 'freshAgent.event':
@@ -300,6 +338,23 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         usage: event.usage as { input_tokens?: number; output_tokens?: number } | undefined,
       }))
       return true
+    case 'freshAgent.rolledBack':
+    case 'freshAgent.redone':
+      // kata 1wxv requesting-sink ack: consumed by the initiating pane's own ws
+      // subscriber (FreshAgentView — composer refill + refill notice). Redux state
+      // rehydrates from the snapshot these events invalidate; nothing to write here.
+      return true
+    case 'freshAgent.session.rolledBack': {
+      // Decision 10: an undone done is not done — revoke green/attention on EVERY
+      // device (the initiating pane included). Never touches recordTurnComplete.
+      // The thunk is pane-scoped: tab-level green re-derives as the OR over the
+      // tab's REMAINING panes (r3 correction 7).
+      dispatch(revokeFreshAgentAttention(`${locator.provider}:${sessionId}`))
+      return true
+    }
+    case 'freshAgent.session.redone':
+      // Sibling-convergence broadcast; the invalidating snapshot carries the state.
+      return true
     case 'freshAgent.permission.request': {
       const tool = event.tool as { name?: string; input?: Record<string, unknown> } | undefined
       dispatch(addPermissionRequest({
@@ -343,6 +398,11 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     case 'freshAgent.error':
       if (event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
+      } else if (event.rollback === true) {
+        // kata 1wxv: rollback rejections route to the initiating pane's notice
+        // banner via the view's own ws subscriber (matched on requestId) —
+        // never the pane error surface.
+        return true
       } else {
         dispatch(sessionError({
           ...locator,
@@ -352,7 +412,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     case 'freshAgent.killed':
-      dispatch(removeSession(locator))
+      foldFreshAgentKilled(dispatch, locator, event.success as boolean | undefined)
       return true
     default:
       return false

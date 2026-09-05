@@ -2360,3 +2360,28 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     })
   })
 })
+
+describe('defaultCodexSidecarMetadataDir + FRESHELL_CONFIG_DIR', () => {
+  it('resolves the sidecar metadata dir from FRESHELL_CONFIG_DIR at call time', async () => {
+    const { defaultCodexSidecarMetadataDir } = await import(
+      '../../../../../server/coding-cli/codex-app-server/runtime.js'
+    )
+    const original = { ...process.env }
+    try {
+      delete process.env.FRESHELL_CODEX_SIDECAR_DIR
+      process.env.FRESHELL_CONFIG_DIR = '/tmp/fx-work'
+      expect(defaultCodexSidecarMetadataDir()).toBe(path.join('/tmp/fx-work', 'codex-sidecars'))
+
+      // The dedicated override keeps precedence over the config dir.
+      process.env.FRESHELL_CODEX_SIDECAR_DIR = '/tmp/fx-sidecars'
+      expect(defaultCodexSidecarMetadataDir()).toBe('/tmp/fx-sidecars')
+
+      // With neither override set, the default is the host homedir default.
+      delete process.env.FRESHELL_CONFIG_DIR
+      delete process.env.FRESHELL_CODEX_SIDECAR_DIR
+      expect(defaultCodexSidecarMetadataDir()).toBe(path.join(os.homedir(), '.freshell', 'codex-sidecars'))
+    } finally {
+      process.env = original
+    }
+  })
+})

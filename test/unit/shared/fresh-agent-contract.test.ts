@@ -3,12 +3,14 @@ import { describe, expect, it } from 'vitest'
 import {
   FRESH_AGENT_CONTRACT_SCHEMA_NAMES,
   FreshAgentActionResultSchema,
+  FreshAgentCapabilitiesSchema,
   FreshAgentContractErrorSchema,
   FreshAgentRequestIdSchema,
   FreshAgentSessionCommandSchema,
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
+  FreshAgentTurnSchema,
 } from '../../../shared/fresh-agent-contract.js'
 import {
   claudeContractSnapshot,
@@ -107,5 +109,72 @@ describe('fresh-agent shared contract schemas', () => {
       provider: 'codex',
       threadId: 'thread-codex-1',
     }).code).toBe('FRESH_AGENT_CONTRACT_PARSE_FAILED')
+  })
+})
+
+describe('rollback surface (kata 1wxv)', () => {
+  it('capabilities accept optional undo/redo keys and stay strict', () => {
+    const parsed = FreshAgentCapabilitiesSchema.safeParse({
+      send: true, interrupt: true, approvals: false, questions: false, fork: false, undo: true, redo: false,
+    })
+    expect(parsed.success).toBe(true)
+    expect(parsed.data?.undo).toBe(true)
+    expect(parsed.data?.redo).toBe(false)
+  })
+  it('capabilities without the new keys still parse (legacy TS server never emits them)', () => {
+    expect(FreshAgentCapabilitiesSchema.safeParse({
+      send: true, interrupt: true, approvals: false, questions: false, fork: false,
+    }).success).toBe(true)
+  })
+  it('a turn may carry rolledBack', () => {
+    const parsed = FreshAgentTurnSchema.safeParse({
+      id: 't1', turnId: 't1', summary: 's', items: [{ id: 'i1', kind: 'text', text: 'hi' }], rolledBack: true,
+    })
+    expect(parsed.success).toBe(true)
+  })
+  it('snapshot accepts rolledBackTurns + the inline rollback block', () => {
+    const turn = { id: 't2', turnId: 't2', summary: 'gone', items: [], rolledBack: true }
+    const parsed = FreshAgentSnapshotSchema.safeParse({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
+      revision: 3, status: 'idle',
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true, undo: true, redo: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      turns: [], rolledBackTurns: [turn], rollback: { canRedo: true, undoneDepth: 1 },
+      extensions: {},
+    })
+    expect(parsed.success).toBe(true)
+  })
+  it('delta-r1 F6: the rollback block accepts the optional redoableTurnIds gate set, and the block stays strict', () => {
+    const base = {
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
+      revision: 3, status: 'idle' as const,
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true, undo: true, redo: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      turns: [] as unknown[], extensions: {},
+    }
+    // The pre-F6 surface (no key) still parses — legacy harmlessness.
+    expect(FreshAgentSnapshotSchema.safeParse({
+      ...base, rollback: { canRedo: true, undoneDepth: 1 },
+    }).success).toBe(true)
+    // The F6 server shape parses; the set is exactly a string array.
+    const withGate = FreshAgentSnapshotSchema.safeParse({
+      ...base, rollback: { canRedo: true, undoneDepth: 1, redoableTurnIds: ['t2'] },
+    })
+    expect(withGate.success).toBe(true)
+    expect(withGate.data?.rollback?.redoableTurnIds).toEqual(['t2'])
+    // Strictness holds inside the block: undeclared keys reject.
+    expect(FreshAgentSnapshotSchema.safeParse({
+      ...base, rollback: { canRedo: true, undoneDepth: 1, redoableTurnIdsTypo: ['t2'] },
+    }).success).toBe(false)
+  })
+  it('snapshot remains strict against undeclared keys', () => {
+    const parsed = FreshAgentSnapshotSchema.safeParse({
+      sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_1',
+      revision: 3, status: 'idle',
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      turns: [], extensions: {}, rollbackTypo: {},
+    })
+    expect(parsed.success).toBe(false)
   })
 })

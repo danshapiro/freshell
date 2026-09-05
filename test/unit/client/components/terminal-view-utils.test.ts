@@ -170,6 +170,62 @@ describe('terminal-view-utils', () => {
       attachRequestId: 'attach-1',
       priority: 'foreground',
       expectedSessionRef: { provider: 'codex', sessionId: 'thread-2' },
+      createRequestId: 'req-5',
+    })
+  })
+
+  it('the attach carries the attaching pane\'s createRequestId and tabId (delta-r7-r2 F3 — the server re-stamps the row\'s pane identity on attach)', () => {
+    const content: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-reattach',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      sessionRef: { provider: 'claude', sessionId: 'sess-reattach' },
+    }
+    expect(buildTerminalAttachMessage({
+      content,
+      terminalId: 'term-live',
+      tabId: 'tab-9',
+      intent: 'viewport_hydrate',
+      cols: 100,
+      rows: 30,
+      sinceSeq: 0,
+      attachRequestId: 'attach-9',
+      priority: 'foreground',
+    })).toEqual({
+      type: 'terminal.attach',
+      terminalId: 'term-live',
+      intent: 'viewport_hydrate',
+      cols: 100,
+      rows: 30,
+      sinceSeq: 0,
+      attachRequestId: 'attach-9',
+      priority: 'foreground',
+      expectedSessionRef: { provider: 'claude', sessionId: 'sess-reattach' },
+      createRequestId: 'req-reattach',
+      tabId: 'tab-9',
+    })
+    // A content-less attach (no pane identity in scope — never produced by the
+    // pane lifecycle) carries neither key.
+    expect(buildTerminalAttachMessage({
+      content: undefined,
+      terminalId: 'term-live',
+      intent: 'keepalive_delta',
+      cols: 80,
+      rows: 24,
+      sinceSeq: 12,
+      attachRequestId: 'attach-10',
+      priority: 'background',
+    })).toEqual({
+      type: 'terminal.attach',
+      terminalId: 'term-live',
+      intent: 'keepalive_delta',
+      cols: 80,
+      rows: 24,
+      sinceSeq: 12,
+      attachRequestId: 'attach-10',
+      priority: 'background',
     })
   })
 

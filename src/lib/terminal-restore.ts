@@ -100,3 +100,45 @@ export function addTerminalFreshRecoveryRequestId(
   clearTerminalRestoreRequestId(requestId)
   freshRecoveryRequestIds.set(requestId, intent)
 }
+
+// Focused-episode-6 round 5 (Finding F1) — the restore offer's LIVE terminal
+// panes: a live pane is a genuinely-open session still running server-side, so
+// accepting the offer puts the pane back IN ITS TAB by reattaching to the
+// still-running terminal — never by spawning a second process (Rust ignores
+// the terminal.create `liveTerminal` hint, so the reattach target rides this
+// client-side arm instead). The plan records the snapshot's
+// `payload.liveTerminal.terminalId` (whose liveness the inventory asserted
+// from its OWN current registry), and TerminalView's lifecycle consults the
+// arm BEFORE it would dispatch a create.
+//
+// SEMANTICS: one-shot consume (get + delete), deliberately UNLIKE
+// `consumeTerminalRestoreRequestId`'s non-destructive peek above. The
+// consult's fold is a local dispatch (no socket needed) that sets the pane's
+// live terminal handle synchronously, so the create branch — the only
+// consult site — never runs again for that pane. Any later recovery that
+// clears the handle (a died-before-attach target heals through the
+// INVALID_TERMINAL_ID reconnect) re-enters through the fresh-recovery path,
+// never re-arming this target. A server reconcile verdict naming the pane
+// always wins: the consult runs only after the pre-verdict wait releases.
+//
+// KEY: `tabId:paneId` — NOT createRequestId. restoreLayout normalization
+// re-mints terminal createRequestIds but preserves pane node ids, so the
+// plan (pre-normalization) and the mounted pane (post-normalization) share
+// exactly one stable key. Nanoid pane ids + the tabId prefix make the key
+// unique across tabs.
+const recoveredLiveTerminalTargets = new Map<string, string>()
+
+function recoveredLiveTerminalKey(tabId: string, paneId: string): string {
+  return `${tabId}:${paneId}`
+}
+
+export function armRecoveredLiveTerminalTarget(tabId: string, paneId: string, terminalId: string): void {
+  recoveredLiveTerminalTargets.set(recoveredLiveTerminalKey(tabId, paneId), terminalId)
+}
+
+export function consumeRecoveredLiveTerminalTarget(tabId: string, paneId: string): string | undefined {
+  const key = recoveredLiveTerminalKey(tabId, paneId)
+  const terminalId = recoveredLiveTerminalTargets.get(key)
+  if (terminalId !== undefined) recoveredLiveTerminalTargets.delete(key)
+  return terminalId
+}

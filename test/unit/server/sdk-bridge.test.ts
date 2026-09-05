@@ -7,6 +7,7 @@ const mockMessages: any[] = []
 let mockCanUseTool: any = undefined
 let mockAbortController: AbortController | undefined
 let mockQueryOptions: any = undefined
+let mockLiveQuery: any
 /** Set to an Error to make the mock generator throw after yielding all messages */
 let mockStreamError: Error | null = null
 /** Set to a rejecting promise to simulate interrupt failure */
@@ -92,6 +93,8 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     ;(gen as any).streamInput = vi.fn()
     ;(gen as any).setPermissionMode = vi.fn().mockResolvedValue(undefined)
     ;(gen as any).setModel = vi.fn().mockResolvedValue(undefined)
+    ;(gen as any).applyFlagSettings = vi.fn().mockResolvedValue({})
+    mockLiveQuery = gen
     ;(gen as any).supportedModels = vi.fn(async () => {
       mockSupportedModelsCallCount += 1
       if (mockSupportedModelsError) {
@@ -436,6 +439,7 @@ describe('SdkBridge', () => {
       mockMessages.push({
         type: 'result',
         subtype: 'error_during_execution',
+        errors: ['The provider could not complete the request.'],
         duration_ms: 1000,
         is_error: true,
         num_turns: 1,
@@ -451,6 +455,7 @@ describe('SdkBridge', () => {
 
       expect(received.find(m => m.type === 'sdk.result')).toBeDefined()
       expect(received.find(m => m.type === 'sdk.turn.complete')).toBeUndefined()
+      expect(received.find(m => m.type === 'sdk.error')?.message).toBe('The provider could not complete the request.')
     })
 
     it('translates stream_event with parent_tool_use_id', async () => {
@@ -790,12 +795,6 @@ describe('SdkBridge', () => {
       bridge.respondPermission(session.sessionId, permMsg.requestId, { behavior: 'allow', updatedInput: { command: 'rm -rf /' } })
       const result = await canUseToolPromise
       expect(result.behavior).toBe('allow')
-    })
-
-    it('does not pass allowDangerouslySkipPermissions to SDK query', async () => {
-      mockKeepStreamOpen = true
-      await bridge.createSession({ cwd: '/tmp', permissionMode: 'bypassPermissions' })
-      expect(mockQueryOptions?.allowDangerouslySkipPermissions).toBeUndefined()
     })
 
     it('auto-allows AskUserQuestion with malformed (non-array) questions input', async () => {
@@ -1361,6 +1360,58 @@ describe('SdkBridge', () => {
       } finally {
         if (origToken !== undefined) process.env.AUTH_TOKEN = origToken
       }
+    })
+  })
+
+  describe('configureSession', () => {
+    it('awaits live model, permission, and effort changes and records effective settings', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ model: 'opus', effort: 'high', permissionMode: 'default' })
+      await bridge.configureSession(session.sessionId, { model: 'sonnet', effort: 'low', permissionMode: 'plan' })
+      expect(mockLiveQuery.setModel).toHaveBeenCalledWith('sonnet')
+      expect(mockLiveQuery.setPermissionMode).toHaveBeenCalledWith('plan')
+      expect(mockLiveQuery.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: 'low' })
+      expect(bridge.getSession(session.sessionId)).toMatchObject({ model: 'sonnet', effort: 'low', permissionMode: 'plan' })
+    })
+
+    it('opts in to later bypass selection without starting in bypass and rejects changing settings after a send', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ model: 'opus', permissionMode: 'default' })
+      expect(mockQueryOptions.permissionMode).toBe('default')
+      expect(mockQueryOptions.allowDangerouslySkipPermissions).toBe(true)
+      await bridge.configureSession(session.sessionId, { permissionMode: 'bypassPermissions' })
+      expect(mockLiveQuery.setPermissionMode).toHaveBeenCalledWith('bypassPermissions')
+      bridge.sendUserMessage(session.sessionId, 'first')
+      await expect(bridge.configureSession(session.sessionId, { model: 'sonnet' })).rejects.toThrow(/current turn/i)
+    })
+
+    it('preserves same-model effort but clears it on a model switch without effort', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ model: 'opus', effort: 'max' })
+      await bridge.configureSession(session.sessionId, { model: 'opus' })
+      expect(mockLiveQuery.applyFlagSettings).not.toHaveBeenCalled()
+      await bridge.configureSession(session.sessionId, { model: 'haiku' })
+      expect(mockLiveQuery.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: null })
+      expect(bridge.getSession(session.sessionId)?.effort).toBeUndefined()
+    })
+
+    it('keeps a submitted turn busy when provider initialization arrives after send', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ model: 'opus' })
+      bridge.sendUserMessage(session.sessionId, 'first')
+      pushLiveSdkMessage({ type: 'system', subtype: 'init', session_id: 'durable', model: 'opus', tools: [] })
+      await vi.waitFor(() => expect(bridge.getSession(session.sessionId)?.cliSessionId).toBe('durable'))
+      expect(bridge.getSession(session.sessionId)?.status).toBe('running')
+      await expect(bridge.configureSession(session.sessionId, { model: 'sonnet' })).rejects.toThrow(/current turn/i)
+    })
+
+    it('does not record a rejected model change and rejects changing the conversation directory', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/repo', model: 'opus', effort: 'high' })
+      mockLiveQuery.setModel.mockRejectedValueOnce(new Error('Model unavailable'))
+      await expect(bridge.configureSession(session.sessionId, { model: 'missing' })).rejects.toThrow('Model unavailable')
+      expect(bridge.getSession(session.sessionId)?.model).toBe('opus')
+      await expect(bridge.configureSession(session.sessionId, { cwd: '/elsewhere' })).rejects.toThrow(/new conversation/i)
     })
   })
 

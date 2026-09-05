@@ -16,6 +16,7 @@ import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
+import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import {
   resolveReopenPaneSessionTarget,
@@ -812,6 +813,26 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       const layout = paneLayouts[target.tabId]
       const paneContent = layout ? findPaneContent(layout, target.paneId) : null
       items.push(...buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx))
+    }
+
+    // kata 1wxv: conversation rollback entry point (alongside the /undo /redo slash
+    // commands and the per-turn undo-to-here icon). Rows appear only for the
+    // capabilities the pane stamped — codex is undo-only, so its menu NEVER
+    // renders a dead "Redo last turn" row; with neither capability the section
+    // (separator included) is omitted entirely. Within a shown row, canUndo/
+    // canRedo gate enabled state (busy, no live session, nothing to redo yet).
+    if (target.paneId) {
+      const freshAgentActions = getFreshAgentPaneActions(target.paneId)
+      const rollbackItems: MenuItem[] = []
+      if (freshAgentActions?.undoSupported === true) {
+        rollbackItems.push({ type: 'item', id: 'fresh-agent-undo', label: 'Undo last turn', disabled: !freshAgentActions.canUndo, onSelect: () => freshAgentActions.undo() })
+      }
+      if (freshAgentActions?.redoSupported === true) {
+        rollbackItems.push({ type: 'item', id: 'fresh-agent-redo', label: 'Redo last turn', disabled: !freshAgentActions.canRedo, onSelect: () => freshAgentActions.redo() })
+      }
+      if (rollbackItems.length > 0) {
+        items.push({ type: 'separator', id: 'fc-rollback-sep' }, ...rollbackItems)
+      }
     }
 
     const sessionId = target.sessionId

@@ -1,10 +1,11 @@
-//! Server → client messages (`ServerMessage`, 58 discriminants).
+//! Server → client messages (`ServerMessage`, 63 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::common::{
     AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
@@ -75,6 +76,10 @@ pub enum ServerMessage {
     FreshAgentSendAccepted(FreshAgentSendAccepted),
     #[serde(rename = "freshAgent.session.materialized")]
     FreshAgentSessionMaterialized(FreshAgentSessionMaterialized),
+    #[serde(rename = "hoststats.refresh.response")]
+    HostStatsRefreshResponse(HostStatsRefreshResponse),
+    #[serde(rename = "hoststats.snapshot")]
+    HostStatsSnapshot(Box<HostStatsSnapshot>),
     #[serde(rename = "opencode.activity.list.response")]
     OpencodeActivityListResponse(OpencodeActivityListResponse),
     #[serde(rename = "opencode.activity.updated")]
@@ -118,6 +123,27 @@ pub enum ServerMessage {
     TerminalInputBlocked(TerminalInputBlocked),
     #[serde(rename = "terminal.inventory")]
     TerminalInventory(TerminalInventory),
+    // Additive (delta-r6-r3, focused-episode-6 round 2): the correlated
+    // `terminal.kill` answer — see [`TerminalKilled`].
+    #[serde(rename = "terminal.killed")]
+    TerminalKilled(TerminalKilled),
+    // Additive (delta-r7-r3, focused-episode-7 round 2): the correlated
+    // `pane.closed` answer — see [`PaneClosedResult`]. Introduced WITH the
+    // protocol version bump 8 → 9 (the client now depends on the answer —
+    // see `shared/ws-version.ts`).
+    #[serde(rename = "pane.closed.result")]
+    PaneClosedResult(PaneClosedResult),
+    // Additive (focused-episode-7 round 3, Finding F1): the correlated
+    // `panes.closed` batch answer — see [`PanesClosedResult`]. Introduced
+    // WITH the protocol version bump 9 → 10.
+    #[serde(rename = "panes.closed.result")]
+    PanesClosedResult(PanesClosedResult),
+    // Additive (focused-episode-7 round 5, Finding F3): the correlated
+    // `pane.opened` answer — see [`PaneOpenedResult`]. NO version bump: the
+    // client never awaits it (the bounded non-blocking listen degrades to
+    // the per-ready sweep's healing on a predated server).
+    #[serde(rename = "pane.opened.result")]
+    PaneOpenedResult(PaneOpenedResult),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
     #[serde(rename = "terminal.modes.sync")]
@@ -148,7 +174,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 58] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -174,9 +200,14 @@ pub const SERVER_MESSAGE_TYPES: [&str; 58] = [
     "freshAgent.killed",
     "freshAgent.send.accepted",
     "freshAgent.session.materialized",
+    "hoststats.refresh.response",
+    "hoststats.snapshot",
     "opencode.activity.list.response",
     "opencode.activity.updated",
+    "pane.closed.result",
+    "pane.opened.result",
     "pane.reconcile.result",
+    "panes.closed.result",
     "perf.logging",
     "pong",
     "ready",
@@ -194,6 +225,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 58] = [
     "terminal.idle",
     "terminal.input.blocked",
     "terminal.inventory",
+    "terminal.killed",
     "terminal.meta.updated",
     "terminal.modes.sync",
     "terminal.output",
@@ -361,6 +393,80 @@ pub enum ScrollInputPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalIdOnly {
     pub terminal_id: String,
+}
+
+/// The correlated `terminal.kill` answer (delta-r6-r3 / focused-episode-6
+/// round 2): sent only when the kill carried `requestId`. `success: false`
+/// (with `error`) = the durable close failed and the terminal was left
+/// untouched — the closing client must not drop the pane; `success: true`
+/// covers the already-gone terminal too (the close envelope was still
+/// written — a missing registry entry is not a close failure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalKilled {
+    pub request_id: String,
+    pub terminal_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `pane.closed` answer (delta-r7-round-3, focused-episode-7
+/// round 2, Finding F2): sent once per `pane.closed`, AFTER the durable
+/// pane-close journal write resolved, so the closing client can await the
+/// evidence's durability before dropping the pane (the kill lane's
+/// close-ack rule). Correlated by the pane identity itself — the close is
+/// keyed by `createRequestId` end to end, so no separate request id exists.
+/// `terminalId` echoes the message's when present (absent on the
+/// in-flight-create close shape). `success: false` (with `error`) means the
+/// durable record could NOT be written — the pane must stay open and the
+/// failure must surface on it; a persisted-despite-reported-error record
+/// still answers `success: true` (the evidence IS durable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneClosedResult {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `panes.closed` answer (focused-episode-7 round 3, Finding
+/// F1): sent ONCE per batch close, AFTER the ONE durable batch envelope
+/// write resolved, so the closing client can await the whole tab's close
+/// evidence before dropping the tab. Correlated by the close op's own
+/// `requestId` (the batch answers the op, not a pane — terminal.kill's
+/// precedent; a cross-device retry of the same tab is an idempotent
+/// re-journal). `success: false` (with `error`) means NOTHING of the set is
+/// durable — the client keeps the whole tab and shows the failure on every
+/// gated pane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosedResult {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `pane.opened` answer (focused-episode-7 round 5, Finding
+/// F3): sent once per `pane.opened`, AFTER the durable consume/re-assert
+/// resolved — correlated by the pane identity (the re-assertion is keyed by
+/// `createRequestId` end to end, the `pane.closed.result` precedent).
+/// `success: false` (with `error`) means the consume could NOT be journaled
+/// durably: the standing close record is untouched (fail loud, never
+/// pretend), the client marks the pane and retries on its next sweep tick.
+/// Additive, no version bump — the client never awaits this answer (see
+/// `shared/ws-version.ts`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneOpenedResult {
+    pub create_request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Payloads carrying only `{ name }` (extension.server.starting / stopped).
@@ -787,6 +893,8 @@ pub struct ReadyCapabilities {
     /// omitted from the wire entirely otherwise (frozen-client inertness).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_interest_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -797,6 +905,12 @@ pub struct Ready {
     pub boot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_instance_id: Option<String>,
+    /// The git commit this server binary was built from (`"unknown"`
+    /// fallback), stamped so the browser client can detect a client/server
+    /// build mismatch and reload once. Omitted from the wire entirely when
+    /// `None` (frozen-client inertness — same rule as `boot_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
     /// Reconciliation-handshake advertisement (§4.2): `Some` only when the
     /// client's `hello` opted in via `capabilities.paneReconcileV1`. A client
     /// must not send `pane.reconcile.request` unless the `ready` it just
@@ -1198,4 +1312,267 @@ pub struct UiCommand {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+}
+
+// --- hoststats.* -----------------------------------------------------------
+//
+// Shape authority: the zod schemas in `shared/ws-protocol.ts`
+// (`HostStats*Schema`). Serde discipline: zod `.nullable()` (required-but-may
+// -be-null) fields map to `Option<T>` that ALWAYS serialize (null allowed);
+// zod `.optional()` (may-be-absent) fields map to `Option<T>` PLUS
+// `#[serde(skip_serializing_if = "Option::is_none", default)]` — never
+// serialized as explicit null. Pinned by `tests/hoststats_shape.rs`.
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsMachine {
+    pub cores: u64,
+    pub mem_total_bytes: u64,
+    pub platform: String,
+    pub wsl: bool,
+    pub kernel: Option<String>,
+    pub hostname: Option<String>,
+    pub psi: bool,
+    pub cgroup: String,
+    pub thermal_count: u64,
+    pub battery_present: bool,
+    pub gpu: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsCpu {
+    pub available: bool,
+    pub usage_pct: f64,
+    pub steal_pct: Option<f64>,
+    pub per_core_pct: Vec<f64>,
+    pub freq_m_hz: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsLoad {
+    pub available: bool,
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    pub cores: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsMemory {
+    pub available: bool,
+    pub source: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub cgroup_limit_bytes: Option<u64>,
+    pub swap_total_bytes: Option<u64>,
+    pub swap_used_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsPaging {
+    pub available: bool,
+    pub swap_in_kbps: f64,
+    pub swap_out_kbps: f64,
+    pub maj_faults_per_sec: f64,
+    pub oom_kills_delta: u64,
+    pub oom_kills_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsPsi {
+    pub available: bool,
+    pub cpu_some10: Option<f64>,
+    pub mem_some10: Option<f64>,
+    pub mem_full10: Option<f64>,
+    pub io_some10: Option<f64>,
+    pub io_full10: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsDiskIo {
+    pub available: bool,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    pub util_pct: Option<f64>,
+    pub weighted_await_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsNetwork {
+    pub available: bool,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    pub rx_errors_total: u64,
+    pub tx_errors_total: u64,
+    pub rx_dropped_total: u64,
+    pub tx_dropped_total: u64,
+    pub rx_errors_delta: u64,
+    pub tx_errors_delta: u64,
+    pub rx_dropped_delta: u64,
+    pub tx_dropped_delta: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsLimits {
+    pub available: bool,
+    pub fds_used: Option<u64>,
+    pub fds_max: Option<u64>,
+    pub pids_used: Option<u64>,
+    pub pids_max: Option<u64>,
+    pub time_wait: Option<u64>,
+    pub ephemeral_ports: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsFreshell {
+    pub available: bool,
+    pub source: String,
+    pub ptys_running: u64,
+    pub ptys_max: u64,
+    pub ws_clients: u64,
+    pub ws_clients_max: u64,
+    pub event_loop_lag_p99_ms: Option<f64>,
+    pub rss_bytes: Option<u64>,
+    pub uptime_sec: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsLive {
+    pub machine: HostStatsMachine,
+    pub cpu: HostStatsCpu,
+    pub load: HostStatsLoad,
+    pub memory: HostStatsMemory,
+    pub paging: HostStatsPaging,
+    pub psi: HostStatsPsi,
+    pub disk_io: HostStatsDiskIo,
+    pub network: HostStatsNetwork,
+    pub limits: HostStatsLimits,
+    pub freshell: HostStatsFreshell,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsTopProcess {
+    pub pid: u64,
+    pub name: String,
+    pub cpu_pct: f64,
+    pub rss_bytes: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsTopProcesses {
+    pub available: bool,
+    pub dwell_ms: u64,
+    pub list: Vec<HostStatsTopProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsProcessHealth {
+    pub available: bool,
+    pub zombies: u64,
+    pub d_state: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsInotify {
+    pub available: bool,
+    pub instances: Option<u64>,
+    pub watches: Option<u64>,
+    pub max_user_watches: Option<u64>,
+    pub max_user_instances: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsDisk {
+    pub mount: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub used_pct: f64,
+    pub inodes_total: Option<u64>,
+    pub inodes_free: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsDisks {
+    pub available: bool,
+    pub list: Vec<HostStatsDisk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsThermalZone {
+    pub label: String,
+    pub celsius: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsBattery {
+    pub pct: f64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsThermals {
+    pub available: bool,
+    pub zones: Vec<HostStatsThermalZone>,
+    pub battery: Option<HostStatsBattery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsManual {
+    pub top_processes: HostStatsTopProcesses,
+    pub process_health: HostStatsProcessHealth,
+    pub inotify: HostStatsInotify,
+    pub disks: HostStatsDisks,
+    pub thermals: HostStatsThermals,
+    pub section_errors: HashMap<String, String>,
+}
+
+/// `HostStatsSnapshotSchema` (`shared/ws-protocol.ts`).
+/// `manual_at`/`manual` are zod `.nullable()` (required, may be null) — they
+/// serialize explicitly as `null`, never skipped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsSnapshot {
+    pub at: u64,
+    pub live: HostStatsLive,
+    pub manual_at: Option<u64>,
+    pub manual: Option<HostStatsManual>,
+}
+
+/// `HostStatsRefreshResponseSchema` (`shared/ws-protocol.ts`).
+/// `at`/`manual`/`error` are zod `.optional()` (may be absent) — they are
+/// omitted from the wire when `None`, never serialized as explicit null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatsRefreshResponse {
+    pub request_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub manual: Option<HostStatsManual>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
 }

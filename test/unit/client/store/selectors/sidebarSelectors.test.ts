@@ -67,6 +67,8 @@ function createSelectorState(options: {
   appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
   sessionActivity?: Record<string, number>
   tabRecency?: { paneLastInputAt: Record<string, number> }
+  claudeActivityByTerminalId?: Record<string, unknown>
+  remoteOpen?: any[]
 } = {}) {
   const projects = options.projects ?? []
   return {
@@ -108,6 +110,12 @@ function createSelectorState(options: {
     },
     tabRecency: options.tabRecency ?? {
       paneLastInputAt: {},
+    },
+    claudeActivity: {
+      byTerminalId: options.claudeActivityByTerminalId ?? {},
+    },
+    tabRegistry: {
+      remoteOpen: options.remoteOpen ?? [],
     },
   } as any
 }
@@ -1193,6 +1201,124 @@ describe('sidebarSelectors', () => {
       })
     })
 
+    describe('activity mode with status tiers', () => {
+      it('orders local-busy above local-open above remote-busy above remote-open above grey, regardless of recency', () => {
+        const items = [
+          createSessionItem({ id: 'grey-new', sessionId: 'grey-new', timestamp: 9000 }),
+          createSessionItem({ id: 'remote-open', sessionId: 'remote-open', timestamp: 8000 }),
+          createSessionItem({ id: 'remote-busy', sessionId: 'remote-busy', timestamp: 7000 }),
+          createSessionItem({ id: 'local-open', sessionId: 'local-open', timestamp: 6000, hasTab: true }),
+          createSessionItem({ id: 'local-busy', sessionId: 'local-busy', timestamp: 5000, hasTab: true }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          statusTiers: {
+            'claude:local-busy': 'local-busy',
+            'claude:local-open': 'local-open',
+            'claude:remote-busy': 'remote-busy',
+            'claude:remote-open': 'remote-open',
+          },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual([
+          'local-busy',
+          'local-open',
+          'remote-busy',
+          'remote-open',
+          'grey-new',
+        ])
+      })
+
+      it('breaks tier ties by activity recency (ratchetedActivity ?? timestamp) descending', () => {
+        const items = [
+          createSessionItem({ id: 'open-old', sessionId: 'open-old', timestamp: 1000, hasTab: true }),
+          createSessionItem({ id: 'open-new', sessionId: 'open-new', timestamp: 2000, hasTab: true }),
+          createSessionItem({ id: 'busy-old', sessionId: 'busy-old', timestamp: 500, hasTab: true }),
+          createSessionItem({ id: 'busy-ratcheted', sessionId: 'busy-ratcheted', timestamp: 100, hasTab: true, ratchetedActivity: 4000 }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          statusTiers: {
+            'claude:open-old': 'local-open',
+            'claude:open-new': 'local-open',
+            'claude:busy-old': 'local-busy',
+            'claude:busy-ratcheted': 'local-busy',
+          },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['busy-ratcheted', 'busy-old', 'open-new', 'open-old'])
+      })
+
+      it('floats ratchet-touched grey items above untouched greys regardless of raw timestamps', () => {
+        // Grey tier keeps the legacy withoutTabs comparator: a session touched
+        // on transition to grey (a ratchet write) sits at the very top of the
+        // grey tier even when an untouched grey has a newer raw timestamp.
+        const items = [
+          createSessionItem({ id: 'grey-touched', sessionId: 'grey-touched', timestamp: 100, ratchetedActivity: 5000 }),
+          createSessionItem({ id: 'grey-plain', sessionId: 'grey-plain', timestamp: 5500 }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', { statusTiers: {} })
+
+        expect(sorted.map((i) => i.id)).toEqual(['grey-touched', 'grey-plain'])
+      })
+
+      it('treats a locally-open item absent from the tier map as grey (the selector owns the mapping)', () => {
+        const items = [
+          createSessionItem({ id: 'grey', sessionId: 'grey', timestamp: 9000 }),
+          createSessionItem({ id: 'unmapped-open', sessionId: 'unmapped-open', timestamp: 8000, hasTab: true }),
+          createSessionItem({ id: 'remote-open', sessionId: 'remote-open', timestamp: 7000 }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          statusTiers: { 'claude:remote-open': 'remote-open' },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['remote-open', 'grey', 'unmapped-open'])
+      })
+
+      it('ignores status tiers in non-activity sort modes', () => {
+        const items = [
+          createSessionItem({ id: 'grey-new', sessionId: 'grey-new', timestamp: 9000 }),
+          createSessionItem({ id: 'local-busy', sessionId: 'local-busy', timestamp: 1000, hasTab: true }),
+        ]
+        const statusTiers = { 'claude:local-busy': 'local-busy' as const }
+
+        expect(sortSessionItems(items, 'recency', { statusTiers }).map((i) => i.id))
+          .toEqual(['grey-new', 'local-busy'])
+        expect(sortSessionItems(items, 'recency-pinned', { statusTiers }).map((i) => i.id))
+          .toEqual(['local-busy', 'grey-new'])
+      })
+
+      it('ignores status tiers while search pinning is disabled', () => {
+        const items = [
+          createSessionItem({ id: 'grey-new', sessionId: 'grey-new', timestamp: 9000 }),
+          createSessionItem({ id: 'local-busy', sessionId: 'local-busy', timestamp: 1000, hasTab: true }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          disableTabPinning: true,
+          statusTiers: { 'claude:local-busy': 'local-busy' },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['grey-new', 'local-busy'])
+      })
+
+      it('keeps archived sessions at the bottom, tiered among themselves', () => {
+        const items = [
+          createSessionItem({ id: 'active-grey', sessionId: 'active-grey', timestamp: 9000 }),
+          createSessionItem({ id: 'archived-busy', sessionId: 'archived-busy', timestamp: 100, archived: true }),
+          createSessionItem({ id: 'archived-grey', sessionId: 'archived-grey', timestamp: 8000, archived: true }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', {
+          statusTiers: { 'claude:archived-busy': 'remote-busy' },
+        })
+
+        expect(sorted.map((i) => i.id)).toEqual(['active-grey', 'archived-busy', 'archived-grey'])
+      })
+    })
+
     describe('project mode', () => {
       it('sorts by project path alphabetically', () => {
         const items = [
@@ -1223,6 +1349,135 @@ describe('sidebarSelectors', () => {
         expect(activityReversed.map((i) => i.sessionId)).toEqual(['aaa', 'bbb', 'ccc'])
         expect(recencyReversed.map((i) => i.sessionId)).toEqual(['aaa', 'bbb', 'ccc'])
       })
+    })
+  })
+
+  describe('makeSelectSortedSessionItems status tiers (default activity mode)', () => {
+    function makeBusyClaudeTab(sessionId: string, terminalId: string) {
+      const sessionRef = { provider: 'claude' as const, sessionId }
+      const tab = {
+        id: `tab-${sessionId}`,
+        mode: 'claude',
+        resumeSessionId: sessionId,
+        sessionRef,
+        createdAt: 1_000,
+      }
+      const layout = {
+        type: 'leaf',
+        id: `pane-${sessionId}`,
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          status: 'running',
+          terminalId,
+          createRequestId: `req-${sessionId}`,
+          sessionRef,
+        },
+      }
+      return { tab, layout, terminalId }
+    }
+
+    function makeRemoteOpenRecord(sessionId: string, busy: boolean) {
+      const key = `claude:${sessionId}`
+      return {
+        tabKey: `device-b:tab-${sessionId}`,
+        tabId: `tab-${sessionId}`,
+        serverInstanceId: 'srv-test',
+        deviceId: 'device-b',
+        deviceLabel: 'device-b',
+        tabName: 'freshell',
+        status: 'open',
+        revision: 1,
+        createdAt: 1,
+        updatedAt: 2,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: `pane-remote-${sessionId}`,
+          kind: 'terminal',
+          payload: {
+            sessionKeys: [key],
+            ...(busy ? { busySessionKeys: [key] } : {}),
+          },
+        }],
+      }
+    }
+
+    function makeTierProjects(sessionIds: string[], lastActivityAt: number): ProjectGroup[] {
+      return [{
+        projectPath: '/repo/server',
+        sessions: sessionIds.map((sessionId) => ({
+          provider: 'claude' as const,
+          sessionId,
+          projectPath: '/repo/server',
+          lastActivityAt,
+          title: sessionId,
+        })),
+      }]
+    }
+
+    it('orders local-busy → local-open → remote-busy → remote-open → grey, beating recency', () => {
+      const busy = makeBusyClaudeTab('s-busy', 'term-busy')
+      const openFallback = createFallbackTab('tab-open', 's-open', 'Open Session', '/repo/server', 'claude')
+      const selectSortedItems = makeSelectSortedSessionItems()
+
+      const items = selectSortedItems(createSelectorState({
+        // Recency is INVERTED on purpose: grey newest, so only tiering can
+        // produce the expected order.
+        projects: makeTierProjects(['s-grey', 's-remote-open', 's-remote-busy', 's-open', 's-busy'], 9_000),
+        tabs: [busy.tab, openFallback.tab],
+        panes: {
+          layouts: { [busy.tab.id]: busy.layout, [openFallback.tab.id]: openFallback.layout },
+          activePane: {},
+          paneTitles: {},
+        },
+        claudeActivityByTerminalId: {
+          'term-busy': { terminalId: 'term-busy', phase: 'busy', updatedAt: 1 },
+        },
+        remoteOpen: [
+          makeRemoteOpenRecord('s-remote-busy', true),
+          makeRemoteOpenRecord('s-remote-open', false),
+        ],
+      }), [], '')
+
+      expect(items.map((item) => item.sessionId)).toEqual([
+        's-busy',
+        's-open',
+        's-remote-busy',
+        's-remote-open',
+        's-grey',
+      ])
+    })
+
+    it('folds grey-transition touches (updateSessionActivity ratchet) into grey-tier ordering', () => {
+      const selectSortedItems = makeSelectSortedSessionItems()
+
+      const items = selectSortedItems(createSelectorState({
+        projects: makeTierProjects(['s-grey-plain', 's-grey-touched'], 9_000),
+        sessionActivity: { 'claude:s-grey-touched': 9_500 },
+      }), [], '')
+
+      expect(items.map((item) => item.sessionId)).toEqual(['s-grey-touched', 's-grey-plain'])
+    })
+
+    it('keeps recency-pinned mode tier-blind', () => {
+      const selectSortedItems = makeSelectSortedSessionItems()
+
+      // recency-pinned: no tabs anywhere → pure timestamp order; the
+      // remote-busy push must NOT lift its row.
+      const items = selectSortedItems(createSelectorState({
+        projects: [{
+          projectPath: '/repo/server',
+          sessions: [
+            { provider: 'claude' as const, sessionId: 's-grey-new', projectPath: '/repo/server', lastActivityAt: 9_000, title: 'new' },
+            { provider: 'claude' as const, sessionId: 's-remote-busy', projectPath: '/repo/server', lastActivityAt: 1_000, title: 'busy' },
+          ],
+        }],
+        sortMode: 'recency-pinned',
+        remoteOpen: [makeRemoteOpenRecord('s-remote-busy', true)],
+      }), [], '')
+
+      expect(items.map((item) => item.sessionId)).toEqual(['s-grey-new', 's-remote-busy'])
     })
   })
 })

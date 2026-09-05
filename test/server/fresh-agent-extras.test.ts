@@ -276,5 +276,49 @@ describe('fresh-agent extras router', () => {
         .send({ cwd: dir, id: 'not-a-sha!' })
         .expect(400)
     })
+
+    it('stores checkpoint shadow repos under FRESHELL_CONFIG_DIR when set', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-config-dir-'))
+      createdPaths.push(configDir)
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fresh-ckpt-scoped-'))
+      createdPaths.push(dir)
+      const original = process.env.FRESHELL_CONFIG_DIR
+      process.env.FRESHELL_CONFIG_DIR = configDir
+      try {
+        const app = makeApp()
+        await fsp.writeFile(path.join(dir, 'x.txt'), 'payload\n')
+        const res1 = await request(app)
+          .post('/api/fresh-agent/checkpoints')
+          .send({ cwd: dir })
+          .expect(200)
+        expect(res1.body.id).toBeTruthy()
+        const ckptsRoot = path.join(configDir, 'checkpoints')
+        expect((await fsp.readdir(ckptsRoot)).length).toBeGreaterThan(0)
+      } finally {
+        if (original === undefined) delete process.env.FRESHELL_CONFIG_DIR
+        else process.env.FRESHELL_CONFIG_DIR = original
+      }
+    })
+  })
+
+  describe('attachments under FRESHELL_CONFIG_DIR', () => {
+    it('routes attachment storage into <configDir>/attachments', async () => {
+      const configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fx-config-dir-'))
+      createdPaths.push(configDir)
+      const original = process.env.FRESHELL_CONFIG_DIR
+      process.env.FRESHELL_CONFIG_DIR = configDir
+      try {
+        const res = await request(makeApp())
+          .post('/api/fresh-agent/attachments')
+          .query({ name: 'profile-scoped.txt' })
+          .set('Content-Type', 'application/octet-stream')
+          .send(Buffer.from('hello'))
+          .expect(200)
+        expect(path.dirname(res.body.path)).toBe(path.join(configDir, 'attachments'))
+      } finally {
+        if (original === undefined) delete process.env.FRESHELL_CONFIG_DIR
+        else process.env.FRESHELL_CONFIG_DIR = original
+      }
+    })
   })
 })
