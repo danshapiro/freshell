@@ -18,4 +18,11 @@ describe('buildSpawnEnv', () => {
     expect(buildSpawnEnv({ FRESHELL_CONFIG_DIR: '/elsewhere' }, 3001, CONFIG_DIR).FRESHELL_CONFIG_DIR)
       .toBe(CONFIG_DIR)
   })
+
+  it('drops an inherited AUTH_TOKEN so the spawned server reads its own profile .env', () => {
+    // The renderer's token comes from <configDir>/.env; a shell-exported
+    // AUTH_TOKEN must not let the server diverge from it.
+    const env = buildSpawnEnv({ AUTH_TOKEN: 'exported' }, 3001, CONFIG_DIR)
+    expect(env.AUTH_TOKEN).toBeUndefined()
+  })
 })

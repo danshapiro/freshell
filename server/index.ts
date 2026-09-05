@@ -230,10 +230,15 @@ async function main() {
     },
     getShellTaskStatus: async () => startupState.snapshot().tasks,
     getPerfLogging: () => perfConfig.enabled,
+    getConfigDir: () => getFreshellConfigDir(),
     getConfigFallback: async () => {
       const readError = configStore.getLastReadError()
       if (!readError) return undefined
-      return { reason: readError, backupExists: await configStore.backupExists() }
+      return {
+        reason: readError,
+        backupExists: await configStore.backupExists(),
+        backupPath: configStore.getBackupPath(),
+      }
     },
   }))
   app.use('/api', createClientLogsRouter())
@@ -422,7 +427,11 @@ async function main() {
         const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
         const readError = configStore.getLastReadError()
         const configFallback = readError
-          ? { reason: readError, backupExists: await configStore.backupExists() }
+          ? {
+              reason: readError,
+              backupExists: await configStore.backupExists(),
+              backupPath: configStore.getBackupPath(),
+            }
           : undefined
         return {
           settings: currentSettings,

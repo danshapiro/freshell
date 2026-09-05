@@ -78,6 +78,9 @@ export interface SettingsState {
   settings: ResolvedSettings
   loaded: boolean
   lastSavedAt?: number
+  /** Effective server config dir (~/.freshell or the named profile's dir), as
+   *  reported by bootstrap. Null until the bootstrap payload arrives. */
+  serverConfigDir: string | null
 }
 
 const initialLocalSettings = loadInitialLocalSettings()
@@ -87,6 +90,7 @@ const initialState: SettingsState = {
   localSettings: initialLocalSettings,
   settings: resolveSettings(defaultServerSettings, initialLocalSettings),
   loaded: false,
+  serverConfigDir: null,
 }
 
 export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>): AppSettings {
@@ -127,6 +131,9 @@ export const settingsSlice = createSlice({
     markSaved: (state) => {
       state.lastSavedAt = Date.now()
     },
+    setServerConfigDir: (state, action: PayloadAction<string | null>) => {
+      state.serverConfigDir = action.payload
+    },
   },
 })
 
@@ -136,6 +143,7 @@ export const {
   updateSettingsLocal,
   previewServerSettingsPatch,
   markSaved,
+  setServerConfigDir,
 } = settingsSlice.actions
 
 export default settingsSlice.reducer

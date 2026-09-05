@@ -315,6 +315,11 @@ export class ConfigStore {
     }
   }
 
+  /** Effective backup path for this profile (config-dir aware). */
+  getBackupPath(): string {
+    return backupPath()
+  }
+
   private async loadInternal(options: { persistNormalizedConfig: boolean }): Promise<UserConfig> {
     if (this.cache) return this.cache
     await ensureConfigTmpCleanup()

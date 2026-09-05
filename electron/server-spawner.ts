@@ -36,14 +36,19 @@ export interface ServerSpawner {
 }
 
 /** Environment for a spawned server: inherits ours, pinned to the spawn port
- * and to THIS process's Freshell config dir (profile-aware). */
+ * and to THIS process's Freshell config dir (profile-aware). AUTH_TOKEN is
+ * deliberately DROPPED: the spawned server's bootstrap guarantees a
+ * `<configDir>/.env` with AUTH_TOKEN, and dotenv never overrides an exported
+ * value — inheriting one would desync the server from the renderer's token
+ * (which is read from that same profile .env). */
 export function buildSpawnEnv(
   baseEnv: NodeJS.ProcessEnv,
   port: number,
   configDir: string,
 ): Record<string, string> {
+  const { AUTH_TOKEN: _droppedAuthToken, ...rest } = baseEnv as Record<string, string>
   return {
-    ...(baseEnv as Record<string, string>),
+    ...rest,
     PORT: String(port),
     FRESHELL_CONFIG_DIR: configDir,
   }
