@@ -1221,31 +1221,33 @@ async function readServerLogs(logsDir: string): Promise<string> {
         expect(unresolvedForRestoredPane).toEqual([])
 ```
 
-(c) Save the pin as a patch and return the tree to committed HEAD — the RED observation in Step 2 temporarily reverts the crate fix, which requires a clean tree:
+(c) Save the pin as a patch and unapply it, returning the tree to committed HEAD — the RED observation in Step 2 needs the tree at base crate behavior. The whole dance is a pure `git apply` patch-pair: NO revert command, NO reset, NO checkout — HEAD never moves and no destructive git op is used at any point (repo etiquette forbids destructive git ops):
 
 ```bash
 git diff -- test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts > /tmp/702-pin.patch
-git checkout -- test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
+git apply -R /tmp/702-pin.patch               # pin unapplied: tree clean; HEAD untouched
 test -s /tmp/702-pin.patch   # non-empty
 ```
 
 - [ ] **Step 2: Run the spec and verify the intended failure (RED)**
 
-The fix from Tasks 1-2 is already committed, so observe RED against temporarily reverted crates with the pin re-applied:
+The fix from Tasks 1-2 is already committed, so observe RED against worktree files with the Task-2 fix temporarily unapplied and the pin re-applied — still a pure `git apply` patch-pair (no revert, no reset, no checkout; HEAD stays at the fixed branch tip throughout):
 
 ```bash
-git revert --no-commit HEAD~1 HEAD          # reverses Task 2 then Task 1, worktree-only
-git apply /tmp/702-pin.patch                # pin now sits atop base-behavior crates
+git show f0ce358c6 --format= > /tmp/702-fix.patch   # pure diff of the Task-2 fix
+git apply -R /tmp/702-fix.patch               # base behavior restored in the worktree files; HEAD untouched
+git apply /tmp/702-pin.patch                  # pin now sits atop base-behavior crates
 cargo build --release -p freshell-server    # e2e harness runs the worktree-built binary
 npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
 ```
 
 Expected: FAIL — the pin's final assertion name-checks one or more `terminal_identity_unresolved` log lines carrying the restored never-submitted terminal id (base behavior fires at +10s create-age). A failure for any OTHER reason is spec-authoring drift: fix the pin mechanics before proceeding; do not weaken the assertion's target.
 
-Restore the committed fix afterwards:
+Restore the committed fix afterwards, IN ORDER (unapply the pin first, then reapply the fix onto the clean tree):
 
 ```bash
-git reset --hard HEAD                       # removes the revert AND the re-applied pin patch
+git apply -R /tmp/702-pin.patch               # pin removed; tree at the unapplied-fix state
+git apply /tmp/702-fix.patch                  # Task-2 fix restored: tree back to committed HEAD
 ```
 
 - [ ] **Step 3: No production implementation needed**
