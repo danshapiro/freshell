@@ -952,11 +952,34 @@ impl FreshOpencodeState {
     }
 
     /// Snapshot of every live fresh-opencode session key (placeholder AND
-    /// durable `ses_*` ids — the `sessions` map mirrors both). Consumers that
-    /// cannot await per-id checks (e.g. the invariant sweep's spawn_blocking
-    /// pass) take this snapshot first.
+    /// durable `ses_*` ids — the `sessions` map mirrors both). A consumer
+    /// that can await should prefer per-id [`FreshOpencodeState::has_live_session`]
+    /// checks against CURRENT state: a snapshot taken earlier is stale the
+    /// moment `handle_send` keys a new session mid-window — delta repair 2
+    /// moved the identity-invariant sweep's probe off its pre-read snapshot
+    /// to a post-read `has_live_session` for exactly that reason.
     pub async fn live_session_ids(&self) -> std::collections::HashSet<String> {
         self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Test-only seeding route for cross-crate consumers (freshell-ws's
+    /// identity-invariant probe-phase tests): insert the smallest possible
+    /// live session record under exactly this key, mirroring the direct-map
+    /// seeding the in-crate unit tests use
+    /// (`live_session_ids_snapshots_every_session_map_key`). Real sessions
+    /// enter the map through `handle_create` / `handle_send` — production
+    /// code must never call this.
+    #[doc(hidden)]
+    pub async fn insert_live_session_for_test(&self, session_id: &str) {
+        self.sessions.lock().await.insert(
+            session_id.to_string(),
+            Arc::new(TokioMutex::new(OpencodeSession::new(
+                session_id.to_string(),
+                None,
+                None,
+                None,
+            ))),
+        );
     }
 
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
@@ -3950,6 +3973,26 @@ mod tests {
                 "ses_live".to_string(),
             ]),
             "the snapshot carries exactly the live keys (placeholder AND durable)"
+        );
+    }
+
+    /// The cross-crate test seeding route (delta repair 2): freshell-ws's
+    /// identity-invariant probe-phase tests need a live sessions-map entry
+    /// WITHOUT driving a real `opencode serve` (the finding's exact case is
+    /// "live in the sessions map, NOT yet ledgered").
+    #[tokio::test]
+    async fn insert_live_session_for_test_keys_the_sessions_map() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        assert!(!st.has_live_session("ses_testlive").await);
+        st.insert_live_session_for_test("ses_testlive").await;
+
+        assert!(st.has_live_session("ses_testlive").await);
+        assert!(
+            st.live_session_ids().await.contains("ses_testlive"),
+            "the seeded key is visible to both liveness probes"
         );
     }
 

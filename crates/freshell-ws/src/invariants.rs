@@ -25,9 +25,13 @@
 //! on opencode rows. The evidence comes from either the locator's
 //! candidate-evidence latch (an evaluated correlation window that ended
 //! ambiguous/contested) or, for ever-submitted panes past the create-age
-//! grace, the alarm-time `probe_resolvable` read (the late-row /
-//! swallowed-DB-error hole). A fresh opencode pane with neither has nothing
-//! resolvable and is never alarmed.
+//! grace, the sweep's async probe phase (the late-row / swallowed-DB-error
+//! hole): the pure warn pass QUEUES such panes, and the phase runs the
+//! locator's bounded candidate read and then applies every availability
+//! exclusion against CURRENT async state — `fresh_opencode.has_live_session`
+//! included, consulted AFTER the read precisely because a live-set snapshot
+//! taken BEFORE the read is stale by probe time (delta repair 2). A fresh
+//! opencode pane with neither has nothing resolvable and is never alarmed.
 //!
 //! The sibling alarm (a `ui.command tab.create` for a session-provider mode
 //! carrying neither `sessionRef` nor `resumeSessionId`) fires at the single
@@ -51,11 +55,22 @@ use crate::identity::TerminalIdentityRegistry;
 /// alarm is pure noise (danshapiro/freshell#702 — 12/12 real panes fired the
 /// old gate). For opencode rows the grace therefore runs from the locator's
 /// first CANDIDATE EVIDENCE (`identity_resolvable_since`), whether it came
-/// from an evaluated correlation window or from the alarm-time
-/// `probe_resolvable` read for ever-submitted panes (the late-row /
-/// swallowed-DB-error hole): the moment an in-cwd correlatable row provably
-/// existed yet never bound. When the locator is unavailable at boot,
-/// opencode keeps the create-age tripwire so a broken topology still alarms.
+/// from an evaluated correlation window or from the sweep's async probe
+/// phase for ever-submitted panes (the late-row / swallowed-DB-error hole):
+/// the moment an in-cwd correlatable row provably existed yet never bound.
+/// The phase's ORDERING is load-bearing (delta repair 2): the locator's
+/// bounded DB read runs FIRST, then every availability exclusion —
+/// identity registry (retired-inclusive), fresh-agent ledger rows, and
+/// `fresh_opencode.has_live_session` — is applied against CURRENT async
+/// state, never against a pre-read snapshot (a materializing fresh-opencode
+/// session keys the live sessions map BEFORE its awaited ledger write, and
+/// the opencode serve row exists before both, so a pre-read snapshot blinds
+/// the probe to exactly the sessions it must exclude — the focused-round-2
+/// finding). The accepted residual is the microseconds-scale interleave in
+/// which the serve-side row exists but `handle_send` has not keyed the
+/// live map (or ledgered) yet — nothing local can see that session yet at
+/// any check ordering. When the locator is unavailable at boot, opencode
+/// keeps the create-age tripwire so a broken topology still alarms.
 /// A rarer residual is deliberate: a fresh opencode pane that never ARMS
 /// (create carried no resolvable cwd) neither latches nor probes, so it
 /// stays alarm-silent while the locator is present — no row can ever be
@@ -70,6 +85,17 @@ pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 = 10_000;
 /// deleted amplifier locator sweep, kata qmpk). Spawned UNCONDITIONALLY at
 /// boot — the old home only ran `if amplifier_locator.is_some()`, so a
 /// missing provider home silently disabled the alarm for every provider.
+///
+/// Per tick: the PURE warn pass (no SQLite reads; the registry walk runs on
+/// the blocking pool, the `drain_and_associate` precedent) returns the
+/// updated warned-set plus the "probe-wanted" queue — opencode panes past
+/// the create-age grace with no latched evidence. The sweep then runs
+/// [`opencode_probe_phase`] in the SAME tick, BEFORE the next ticker, so
+/// the phase's availability exclusions (including the awaited
+/// `fresh_opencode.has_live_session`) consult CURRENT live state AFTER the
+/// locator's DB read — a pre-pass live snapshot is stale by probe time
+/// (delta repair 2: `handle_send` materialization keys the live sessions
+/// map mid-tick).
 pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time::Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -77,75 +103,76 @@ pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time
         let mut identity_warned = std::collections::HashSet::new();
         loop {
             ticker.tick().await;
-            // Live fresh-opencode session ids, snapshotted ONCE per tick from
-            // the OUTER state, off the blocking pool (finding 1 of delta round
-            // 3): `handle_send` materialization keys the sessions map BEFORE
-            // its awaited ledger write, so the probe's ledger-row exclusion
-            // alone has a gap — the snapshot is the only gap-covering guard.
-            // The map lock is a tokio Mutex; never take it inside the
-            // blocking closure.
-            let live_fresh = state.fresh_opencode.live_session_ids().await;
-            let state = state.clone(); // WsState: Clone; Arc-backed fields
+            let pass_state = state.clone(); // WsState: Clone; Arc-backed fields
             let mut warned = std::mem::take(&mut identity_warned);
-            // The pass can issue ONE bounded SQLite read per rare
-            // submitted-but-unbound opencode row (the probe), so it runs on
-            // the blocking pool (the `drain_and_associate` precedent,
-            // opencode_association.rs).
-            identity_warned = match tokio::task::spawn_blocking(move || {
-                warn_unresolved_terminal_identities(
-                    &state.registry.identity_probe_rows(),
-                    &state.identity,
+            let (warned_back, probe_wanted) = match tokio::task::spawn_blocking(move || {
+                let wanted = warn_unresolved_terminal_identities(
+                    &pass_state.registry.identity_probe_rows(),
+                    &pass_state.identity,
                     &mut warned,
                     crate::terminal::now_ms(),
-                    state.opencode_locator.as_deref(),
-                    &state.pane_ledger,
-                    &live_fresh,
+                    pass_state.opencode_locator.as_deref(),
                 );
-                warned
+                (warned, wanted)
             })
             .await
             {
-                Ok(warned) => warned,
+                Ok(outcome) => outcome,
                 Err(join_error) => {
                     // A pass panicked — a bug, not a routine condition. Skip
-                    // the cycle and continue with a FRESH warned set (bounded
-                    // re-warn noise beats silently losing the sweep; mirrors
-                    // the locator tick panic handling).
+                    // the WHOLE cycle (warn pass AND probe phase — the pass's
+                    // outputs are kept atomic) and continue with a FRESH
+                    // warned set (bounded re-warn noise beats silently losing
+                    // the sweep; mirrors the locator tick panic handling).
+                    // The dropped probe-wanted vec is simply re-collected
+                    // next cycle.
                     tracing::warn!(
                         error = %join_error,
                         "identity_invariant_sweep_pass_panicked: skip this cycle; warned-set reset \
-                         (terminals may re-warn once)"
+                         (terminals may re-warn once) and probe-wanted dropped (re-collected next \
+                         cycle)"
                     );
-                    std::collections::HashSet::new()
+                    (std::collections::HashSet::new(), Vec::new())
                 }
             };
+            identity_warned = warned_back;
+            if !probe_wanted.is_empty() {
+                opencode_probe_phase(&state, probe_wanted).await;
+            }
         }
     });
 }
 
 /// One sweep pass: WARN (once per terminal, tracked in `warned`) for every
 /// RUNNING non-shell terminal whose identity is past its provider's overdue
-/// window with no resolvable identity in either identity home. Exited
-/// terminals are skipped (their identity story is over); shell terminals
-/// never carry session identity by design. opencode rows are gated on
-/// locator RESOLVABILITY evidence (see the grace-constant doc): window-latch
-/// first, probe fallback for the late-row/DB-error hole (plan-review R1);
-/// a pane with neither has nothing resolvable and is never alarmed
-/// (issue #702). The probe's `is_unavailable` predicate keeps sessions
-/// already claimed by any live-or-retired terminal, sessions live in the
-/// fresh-opencode `sessions` map (the per-tick `live_session_ids` snapshot —
-/// it is keyed BEFORE the awaited materialization ledger write, so the
-/// ledger-row exclusion alone cannot cover that gap), and fresh-agent ledger
-/// rows from ever counting as evidence.
+/// window with no resolvable identity in either identity home, and return
+/// the "probe-wanted" queue — opencode terminals past the create-age grace
+/// with NO latched resolvability evidence. Exited terminals are skipped
+/// (their identity story is over); shell terminals never carry session
+/// identity by design. opencode rows are gated on locator RESOLVABILITY
+/// evidence (see the grace-constant doc): window-latch first, probe queue
+/// for the late-row/DB-error hole (plan-review R1); a pane with neither has
+/// nothing resolvable and is never alarmed (issue #702).
+///
+/// A PURE DECISION function again (delta repair 2): it performs NO SQLite
+/// reads and never latches evidence — both moved to the sweep's async
+/// [`opencode_probe_phase`], which applies the availability exclusions
+/// (identity registry retired-inclusive, fresh-agent pane-ledger rows, and
+/// LIVE fresh-opencode sessions via `has_live_session`) against CURRENT
+/// state AFTER the locator's bounded read. The previous in-line probe ran
+/// its live-session check against a snapshot captured BEFORE the read —
+/// blind to a fresh-opencode session that materialized in between (the
+/// focused-round-2 finding).
 pub(crate) fn warn_unresolved_terminal_identities(
     rows: &[IdentityProbeRow],
     identity: &TerminalIdentityRegistry,
     warned: &mut HashSet<String>,
     now_ms: i64,
     opencode_locator: Option<&freshell_sessions::opencode_locator::OpencodeLocator>,
-    pane_ledger: &crate::pane_ledger::PaneLedger,
-    live_fresh_sessions: &HashSet<String>,
-) {
+) -> Vec<String> {
+    // The probe-wanted queue (opencode latch-miss panes past the create-age
+    // grace), in row order; consumed by `opencode_probe_phase`.
+    let mut probe_wanted = Vec::new();
     for row in rows {
         if row.mode == "shell"
             || row.status != TerminalRunStatus::Running
@@ -159,32 +186,20 @@ pub(crate) fn warn_unresolved_terminal_identities(
         }
         let overdue_ms = match row.mode.as_str() {
             "opencode" => match opencode_locator {
-                Some(locator) => {
-                    let latched = locator.identity_resolvable_since(&row.terminal_id);
-                    let since = match latched {
-                        Some(t) => Some(t),
-                        // Latch miss: probe only once the pane is past the
-                        // create-age grace (R2 finding 2 — young panes are the
-                        // binding lanes' business; never probe them).
-                        None if now_ms - row.created_at > IDENTITY_RESOLUTION_GRACE_MS => locator
-                            .probe_resolvable(&row.terminal_id, now_ms, &|session_id| {
-                                live_fresh_sessions.contains(session_id)
-                                    || identity
-                                        .find_by_session_including_retired("opencode", session_id)
-                                        .is_some()
-                                    || pane_ledger
-                                        .lookup_by_session("opencode", session_id)
-                                        .is_some_and(|r| {
-                                            r.row.pane_kind.as_deref() == Some("fresh-agent")
-                                        })
-                            }),
-                        None => None,
-                    };
-                    match since {
-                        Some(since_ms) => now_ms - since_ms,
-                        None => continue, // nothing resolvable exists for this pane
+                Some(locator) => match locator.identity_resolvable_since(&row.terminal_id) {
+                    Some(since_ms) => now_ms - since_ms,
+                    // Latch-miss: nothing resolvable is known for this pane.
+                    // Once it is past the create-age grace (R2 finding 2 —
+                    // young panes are the binding lanes' business; never
+                    // probe them), queue it for the sweep's async probe
+                    // phase; never warn inline.
+                    None => {
+                        if now_ms - row.created_at > IDENTITY_RESOLUTION_GRACE_MS {
+                            probe_wanted.push(row.terminal_id.clone());
+                        }
+                        continue;
                     }
-                }
+                },
                 None => now_ms - row.created_at,
             },
             _ => now_ms - row.created_at,
@@ -202,6 +217,76 @@ pub(crate) fn warn_unresolved_terminal_identities(
              session identity after the locator window; its panes cannot be matched to a \
              session (sidebar grey / duplicate tabs / no restore identity)"
         );
+    }
+    probe_wanted
+}
+
+/// The async probe phase of the opencode identity gate (delta repair 2),
+/// run by the sweep in the SAME tick as the warn pass that queued
+/// `probe_wanted`. Per terminal: the locator's bounded
+/// [`freshell_sessions::opencode_locator::OpencodeLocator::probe_candidates`]
+/// read runs on the blocking pool (the `drain_and_associate` precedent; a
+/// panicking probe task is a bug, warn-logged as
+/// `identity_invariant_probe_panicked` and skipped for this cycle), then
+/// EVERY candidate is filtered through the full availability exclusion set
+/// against CURRENT async state: the identity registry (retired-inclusive),
+/// fresh-agent pane-ledger rows, and
+/// `state.fresh_opencode.has_live_session(&sid).await` — the last one
+/// reading the live sessions map AFTER the DB read by construction, so a
+/// fresh-opencode session that materialized mid-tick (its `ses_*` row
+/// visible to the read, its ledger write still pending) is excluded by its
+/// live-map key — the exact gap a pre-read snapshot could not close. Any
+/// surviving candidate means an unbound correlatable row provably exists:
+/// latch the pane's resolvable evidence via
+/// [`freshell_sessions::opencode_locator::OpencodeLocator::note_resolvable_evidence`]
+/// (first-evidence-wins; dropped when the pane disarmed mid-flight).
+pub(crate) async fn opencode_probe_phase(state: &crate::WsState, probe_wanted: Vec<String>) {
+    let Some(locator) = state.opencode_locator.clone() else {
+        return;
+    };
+    for terminal_id in probe_wanted {
+        let probe_locator = std::sync::Arc::clone(&locator);
+        let probe_terminal_id = terminal_id.clone();
+        let candidates = match tokio::task::spawn_blocking(move || {
+            probe_locator.probe_candidates(&probe_terminal_id)
+        })
+        .await
+        {
+            Ok(candidates) => candidates,
+            Err(join_error) => {
+                tracing::warn!(
+                    error = %join_error,
+                    terminal_id = %terminal_id,
+                    "identity_invariant_probe_panicked: probe task panicked, skipping this \
+                     terminal this cycle (re-queued next tick)"
+                );
+                continue;
+            }
+        };
+        // `None`: unarmed / never submitted / throttled / disarmed mid-probe
+        // (zero reads for the first three) — nothing to do for this pane.
+        let Some(candidates) = candidates else {
+            continue;
+        };
+        let mut any_resolvable = false;
+        for session_id in candidates {
+            let excluded = state
+                .identity
+                .find_by_session_including_retired("opencode", &session_id)
+                .is_some()
+                || state
+                    .pane_ledger
+                    .lookup_by_session("opencode", &session_id)
+                    .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
+                || state.fresh_opencode.has_live_session(&session_id).await;
+            if !excluded {
+                any_resolvable = true;
+                break;
+            }
+        }
+        if any_resolvable {
+            locator.note_resolvable_evidence(&terminal_id, crate::terminal::now_ms());
+        }
     }
 }
 
@@ -420,7 +505,6 @@ mod tests {
     fn warns_once_per_unresolved_non_shell_terminal_past_the_grace_window() {
         let (events, _guard) = capture::capture();
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-lost",
@@ -431,26 +515,21 @@ mod tests {
         )];
         let now = 1_000 + IDENTITY_RESOLUTION_GRACE_MS + 1;
 
-        warn_unresolved_terminal_identities(
-            &rows,
-            &identity,
-            &mut warned,
-            now,
-            None,
-            &ledger,
-            &HashSet::new(),
-        );
+        let wanted =
+            super::warn_unresolved_terminal_identities(&rows, &identity, &mut warned, now, None);
         // Bounded: a second sweep must NOT warn again for the same terminal.
-        warn_unresolved_terminal_identities(
+        let wanted_again = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             now + 5_000,
             None,
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(
+            wanted.is_empty() && wanted_again.is_empty(),
+            "the probe-wanted queue is opencode-only"
+        );
         let warnings = unresolved_warnings(&events.lock().unwrap());
         assert_eq!(warnings.len(), 1, "exactly one warn per terminal");
         assert_eq!(
@@ -467,7 +546,6 @@ mod tests {
     fn never_warns_inside_the_grace_window() {
         let (events, _guard) = capture::capture();
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-young",
@@ -477,16 +555,15 @@ mod tests {
             None,
         )];
 
-        warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             1_000 + IDENTITY_RESOLUTION_GRACE_MS,
             None,
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty());
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
     }
 
@@ -494,23 +571,21 @@ mod tests {
     fn never_warns_for_shell_or_exited_terminals() {
         let (events, _guard) = capture::capture();
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![
             row("t-shell", "shell", TerminalRunStatus::Running, 0, None),
             row("t-gone", "amplifier", TerminalRunStatus::Exited, 0, None),
         ];
 
-        warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             i64::MAX,
             None,
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty());
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
     }
 
@@ -548,7 +623,6 @@ mod tests {
         let (events, _guard) = capture::capture();
         let identity = TerminalIdentityRegistry::new();
         identity.upsert("t-identity", Some("amplifier"), Some("sess-1"), None, 1);
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![
             // Resolved via the WS identity registry.
@@ -570,27 +644,29 @@ mod tests {
             ),
         ];
 
-        warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             i64::MAX,
             None,
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty());
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
     }
 
     #[test]
-    fn opencode_pane_idle_beyond_the_create_age_grace_is_not_unresolved() {
+    fn opencode_pane_past_create_age_grace_without_evidence_requests_a_probe() {
         // danshapiro/freshell#702: a fresh opencode pane whose user has not
         // submitted a prompt has NO session row anywhere (opencode creates it
         // lazily at first prompt) -- nothing is resolvable, and the old
         // create-age gate false-fired on 100% of real usage (61s+ to first
         // prompt in the incident timeline). With a live locator holding no
-        // candidate evidence, age alone must never warn.
+        // candidate evidence, age alone must never warn -- the pass only
+        // QUEUES the pane for the sweep's async probe phase (which then
+        // finds no candidates for a never-submitted pane, so nothing ever
+        // latches and no later pass warns either).
         let (events, _guard) = capture::capture();
         let home = unique_opencode_home("idle");
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
@@ -599,7 +675,6 @@ mod tests {
         let _ =
             locator.tick(10_000 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 500);
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-idle",
@@ -609,21 +684,24 @@ mod tests {
             None,
         )];
 
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             10_000 + 61_000, // +61s: the incident's first-prompt delay
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
         );
 
         assert!(
             unresolved_warnings(&events.lock().unwrap()).is_empty(),
-            "no evidence == nothing resolvable == no alarm (#702)"
+            "no evidence == nothing resolvable == no inline warn (#702)"
         );
         assert!(warned.is_empty());
+        assert_eq!(
+            wanted,
+            vec!["t-idle".to_string()],
+            "past the create-age grace the sweep's probe phase must take a look"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -646,20 +724,21 @@ mod tests {
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row("t-ev", "opencode", TerminalRunStatus::Running, 0, None)];
 
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             evidence_at + IDENTITY_RESOLUTION_GRACE_MS + 1,
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(
+            wanted.is_empty(),
+            "a pane with latched evidence is never queued for probing"
+        );
         let warnings = unresolved_warnings(&events.lock().unwrap());
         assert_eq!(warnings.len(), 1, "resolvable-but-unbound must warn");
         assert_eq!(
@@ -686,20 +765,18 @@ mod tests {
         assert!(locator.tick(evidence_at).is_empty());
 
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row("t-ev", "opencode", TerminalRunStatus::Running, 0, None)];
 
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             evidence_at + IDENTITY_RESOLUTION_GRACE_MS, // boundary: not yet overdue
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty());
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -723,7 +800,6 @@ mod tests {
 
         let identity = TerminalIdentityRegistry::new();
         identity.upsert("t-bound", Some("opencode"), Some("ses_a"), Some("/proj"), 1);
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-bound",
@@ -733,16 +809,15 @@ mod tests {
             None,
         )];
 
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             i64::MAX,
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty());
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -754,7 +829,6 @@ mod tests {
         // topology itself is broken and must stay loud.
         let (events, _guard) = capture::capture();
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-noloc",
@@ -764,16 +838,15 @@ mod tests {
             None,
         )];
 
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             i64::MAX,
             None,
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty(), "no locator, no probe phase");
         let warnings = unresolved_warnings(&events.lock().unwrap());
         assert_eq!(warnings.len(), 1);
     }
@@ -785,7 +858,6 @@ mod tests {
         let home = unique_opencode_home("resume-skip");
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-resume",
@@ -795,30 +867,30 @@ mod tests {
             Some("ses_existing"),
         )];
 
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             i64::MAX,
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
         );
 
+        assert!(wanted.is_empty());
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn opencode_probe_closes_the_late_row_and_db_error_hole() {
+    fn opencode_latch_miss_past_the_create_age_grace_requests_a_probe() {
         // Plan-review R1 hole: the pane DID submit; its Enter-anchored window
         // closed empty; the row then landed LATE (or the window's read hit a
         // transient DB error that query_candidates swallows to empty) and the
         // TUI signal was lost (the rebind plugin marks `lastEmitted` BEFORE
         // its possibly-throwing write, so a lost signal never retries). The
-        // probe must find the row per se: first pass past the create-age
-        // grace LATCHES evidence (too fresh to warn); once the evidence ages
-        // past the grace the alarm fires.
+        // pass is a pure decision again (delta repair 2): it must NOT read
+        // the DB or latch inline — it queues the pane for the sweep's async
+        // probe phase (covered end-to-end in
+        // `probe_phase_closes_the_late_row_hole_and_the_next_pass_warns`).
         let (events, _guard) = capture::capture();
         let home = unique_opencode_home("late-row-hole");
         let db = seed_opencode_db(&home);
@@ -828,9 +900,9 @@ mod tests {
         let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(window_closed).is_empty(), "window saw nothing");
         insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
+        let scans_before = locator.db_scan_count();
 
         let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-late",
@@ -841,29 +913,230 @@ mod tests {
         )];
 
         let probe_at = 10_000 + 61_000;
-        super::warn_unresolved_terminal_identities(
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
             probe_at,
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
         );
+
+        assert_eq!(wanted, vec!["t-late".to_string()]);
         assert!(
             unresolved_warnings(&events.lock().unwrap()).is_empty(),
-            "evidence JUST latched: inside the grace, no warn yet"
+            "nothing latched yet: no warn"
         );
-        assert_eq!(locator.identity_resolvable_since("t-late"), Some(probe_at));
+        assert_eq!(
+            locator.identity_resolvable_since("t-late"),
+            None,
+            "the pure pass never latches — latching is the probe phase's write"
+        );
+        assert_eq!(
+            locator.db_scan_count(),
+            scans_before,
+            "the pure pass never reads the DB"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
-        super::warn_unresolved_terminal_identities(
+    #[test]
+    fn opencode_probe_not_wanted_before_the_create_age_boundary() {
+        // Plan-review R2, finding 2: a pane still inside the create-age
+        // grace is the binding lanes' business; never queue a probe for it
+        // (evidence arrives via the window latch instead).
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("young-no-probe");
+        let db = seed_opencode_db(&home);
+        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        assert!(locator.arm("t-young", "opencode", true, None, Some("/proj"), 10_000));
+        assert!(locator.note_submit("t-young", 10_100));
+        let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(window_closed).is_empty());
+        insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
+        let scans_before = locator.db_scan_count();
+
+        let identity = TerminalIdentityRegistry::new();
+        let mut warned = HashSet::new();
+        let rows = vec![row(
+            "t-young",
+            "opencode",
+            TerminalRunStatus::Running,
+            10_000,
+            None,
+        )];
+
+        // Exactly AT the create-age boundary: not yet `> grace`, so no probe.
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &identity,
             &mut warned,
-            probe_at + IDENTITY_RESOLUTION_GRACE_MS + 1,
+            10_000 + IDENTITY_RESOLUTION_GRACE_MS,
             Some(&locator),
-            &ledger,
-            &HashSet::new(),
+        );
+
+        assert!(wanted.is_empty());
+        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-young"), None);
+        assert_eq!(
+            locator.db_scan_count(),
+            scans_before,
+            "inside the create-age grace the sweep must not probe the DB"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── The async probe phase (delta repair 2) ─────────────────────────
+    //
+    // These tests drive `opencode_probe_phase` directly against a full
+    // `WsState` (fixtures mirror `opencode_association.rs`'s
+    // `state_with_locator*` patterns). The phase's ordering guarantee: the
+    // locator's bounded DB read runs first, then EVERY availability
+    // exclusion is applied against CURRENT async state — the identity
+    // registry (retired-inclusive), the fresh-agent pane-ledger rows, and
+    // `fresh_opencode.has_live_session(...).await`, the last one AFTER the
+    // read by construction, which is what closes the stale-snapshot hole.
+
+    /// Full-`WsState` fixture with a real opencode locator rooted at
+    /// `data_home` (mirrors `opencode_association.rs`'s `state_with_locator`,
+    /// minus the broadcast receiver these tests never consume).
+    fn state_with_locator(data_home: std::path::PathBuf) -> crate::WsState {
+        let auth_token = std::sync::Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        crate::WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            identity: TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
+            auth_token: std::sync::Arc::clone(&auth_token),
+            server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
+            boot_id: std::sync::Arc::new("boot-2222".to_string()),
+            settings: std::sync::Arc::new(crate::test_settings()),
+            handshake_settings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::test_settings(),
+            )),
+            broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                std::sync::Arc::clone(&auth_token),
+                std::sync::Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(std::sync::Arc::clone(
+                &broadcast_tx,
+            )),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(
+                    auth_token,
+                    std::sync::Arc::clone(&broadcast_tx),
+                ),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new(),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(broadcast_tx),
+            subagent_interest: Default::default(),
+            host_stats: Default::default(),
+            terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: std::sync::Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: std::sync::Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: Some(std::sync::Arc::new(
+                freshell_sessions::opencode_locator::OpencodeLocator::new(data_home),
+            )),
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+        }
+    }
+
+    /// Sibling of `state_with_locator` with a REAL (enabled) pane ledger
+    /// rooted at `ledger_dir` (mirrors
+    /// `opencode_association.rs::state_with_locator_and_ledger`).
+    fn state_with_locator_and_ledger(
+        data_home: std::path::PathBuf,
+        ledger_dir: &std::path::Path,
+    ) -> crate::WsState {
+        let mut state = state_with_locator(data_home);
+        state.pane_ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::new(Some(
+            ledger_dir.to_path_buf(),
+        )));
+        state
+    }
+
+    #[tokio::test]
+    async fn probe_phase_closes_the_late_row_hole_and_the_next_pass_warns() {
+        // Plan-review R1 hole, end-to-end through the new boundary (delta
+        // repair 2): the pane DID submit; its Enter-anchored window closed
+        // empty; the row landed LATE (or the window's read hit a transient
+        // DB error that query_candidates swallows to empty) and the TUI
+        // signal was lost. The pure pass requests the probe; the phase
+        // latches evidence; once the evidence ages past the grace the
+        // alarm fires exactly once.
+        let (events, _guard) = capture::capture();
+        let home = unique_opencode_home("phase-late-row");
+        let db = seed_opencode_db(&home);
+        let state = state_with_locator(home.clone());
+        let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
+        assert!(locator.arm("t-late", "opencode", true, None, Some("/proj"), 10_000));
+        assert!(locator.note_submit("t-late", 10_100));
+        let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
+        assert!(locator.tick(window_closed).is_empty(), "window saw nothing");
+        insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
+
+        let mut warned = HashSet::new();
+        let rows = vec![row(
+            "t-late",
+            "opencode",
+            TerminalRunStatus::Running,
+            10_000,
+            None,
+        )];
+
+        let probe_at = 10_000 + 61_000;
+        let wanted = super::warn_unresolved_terminal_identities(
+            &rows,
+            &state.identity,
+            &mut warned,
+            probe_at,
+            state.opencode_locator.as_deref(),
+        );
+        assert_eq!(wanted, vec!["t-late".to_string()]);
+        assert!(
+            unresolved_warnings(&events.lock().unwrap()).is_empty(),
+            "nothing latched yet: no warn"
+        );
+        assert_eq!(locator.identity_resolvable_since("t-late"), None);
+
+        // The async probe phase latches the late, surviving row (checked
+        // against CURRENT live/ledger/identity state AFTER the DB read).
+        super::opencode_probe_phase(&state, wanted).await;
+        let latched = locator
+            .identity_resolvable_since("t-late")
+            .expect("the phase latches the surviving late row as evidence");
+
+        // Once that evidence ages past the grace, the alarm fires exactly once.
+        let wanted_after = super::warn_unresolved_terminal_identities(
+            &rows,
+            &state.identity,
+            &mut warned,
+            latched + IDENTITY_RESOLUTION_GRACE_MS + 1,
+            state.opencode_locator.as_deref(),
+        );
+        assert!(
+            wanted_after.is_empty(),
+            "a latched pane is never re-queued for probing"
         );
         let warnings = unresolved_warnings(&events.lock().unwrap());
         assert_eq!(
@@ -878,69 +1151,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn opencode_probe_waits_for_the_create_age_grace_before_reading() {
-        // Plan-review R2, finding 2: a pane still inside the create-age
-        // grace never triggers the probe's DB read — rows that young are the
-        // binding lanes' business; evidence arrives via the window latch.
+    #[tokio::test]
+    async fn probe_phase_latches_nothing_for_an_idle_never_submitted_pane() {
+        // The #702 false-fire class: a fresh pane whose user has not
+        // submitted a prompt has NO session row anywhere (opencode writes it
+        // lazily at first prompt). Even with a FOREIGN row sitting in the
+        // pane's cwd, the phase never yields a probe candidate for the idle
+        // pane, so nothing ever latches and no pass ever warns.
         let (events, _guard) = capture::capture();
-        let home = unique_opencode_home("young-no-probe");
+        let home = unique_opencode_home("phase-idle-foreign-row");
         let db = seed_opencode_db(&home);
-        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
-        assert!(locator.arm("t-young", "opencode", true, None, Some("/proj"), 10_000));
-        assert!(locator.note_submit("t-young", 10_100));
-        let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
-        assert!(locator.tick(window_closed).is_empty());
-        insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
-        let scans_before = locator.db_scan_count();
-
-        let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
-        let mut warned = HashSet::new();
-        let rows = vec![row(
-            "t-young",
-            "opencode",
-            TerminalRunStatus::Running,
-            10_000,
-            None,
-        )];
-
-        // Exactly AT the create-age boundary: not yet `> grace`, so no probe.
-        super::warn_unresolved_terminal_identities(
-            &rows,
-            &identity,
-            &mut warned,
-            10_000 + IDENTITY_RESOLUTION_GRACE_MS,
-            Some(&locator),
-            &ledger,
-            &HashSet::new(),
-        );
-
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-young"), None);
-        assert_eq!(
-            locator.db_scan_count(),
-            scans_before,
-            "inside the create-age grace the sweep must not probe the DB"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn opencode_idle_pane_stays_silent_with_a_foreign_row_in_cwd() {
-        // Never-submitted pane; somebody ELSE's unclaimed row exists in the
-        // same cwd. The probe's never-submitted short-circuit runs BEFORE
-        // any read: an idle pane has no session of its own, so nothing may
-        // be attributed to it -- no evidence, no alarm, no DB read.
-        let (events, _guard) = capture::capture();
-        let home = unique_opencode_home("idle-foreign-row");
-        let db = seed_opencode_db(&home);
-        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        let state = state_with_locator(home.clone());
+        let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
         assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 0));
         insert_opencode_session(&db, "ses_foreign", "/proj", 5_000);
 
-        let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
         let mut warned = HashSet::new();
         let rows = vec![row(
             "t-idle",
@@ -949,85 +1174,84 @@ mod tests {
             0,
             None,
         )];
-
-        super::warn_unresolved_terminal_identities(
+        let scans_before = locator.db_scan_count();
+        let wanted = super::warn_unresolved_terminal_identities(
             &rows,
-            &identity,
+            &state.identity,
             &mut warned,
             i64::MAX,
-            Some(&locator),
-            &ledger,
-            &HashSet::new(),
+            state.opencode_locator.as_deref(),
         );
-
+        assert_eq!(
+            wanted,
+            vec!["t-idle".to_string()],
+            "past the create-age grace the pass keeps queueing the look"
+        );
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
+
+        super::opencode_probe_phase(&state, wanted).await;
+
+        assert_eq!(
+            locator.identity_resolvable_since("t-idle"),
+            None,
+            "never-submitted panes never yield candidates"
+        );
+        assert_eq!(
+            locator.db_scan_count(),
+            scans_before,
+            "the idle pane's probe performed no DB read"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn opencode_probe_never_latches_a_session_claimed_by_another_terminal() {
-        // Two panes share a cwd; the row already belongs to the sibling.
-        // The ws-side claim exclusion (identity registry, retired-inclusive)
-        // must keep the probe from inventing evidence for this pane.
-        let (events, _guard) = capture::capture();
-        let home = unique_opencode_home("claimed-row");
+    #[tokio::test]
+    async fn probe_phase_excludes_a_row_claimed_by_another_terminal() {
+        // Two panes share a cwd; the row already belongs to the sibling. The
+        // identity-registry claim exclusion (retired-inclusive) must keep the
+        // phase from inventing evidence for this pane.
+        let home = unique_opencode_home("phase-claimed-row");
         let db = seed_opencode_db(&home);
-        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        let state = state_with_locator(home.clone());
+        let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
         assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
         assert!(locator.note_submit("t-pending", 100));
         insert_opencode_session(&db, "ses_sibling", "/proj", 150);
 
-        let identity = TerminalIdentityRegistry::new();
-        identity.upsert(
+        state.identity.upsert(
             "t-sibling",
             Some("opencode"),
             Some("ses_sibling"),
             Some("/proj"),
             1,
         );
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
-        let mut warned = HashSet::new();
-        let rows = vec![row(
-            "t-pending",
-            "opencode",
-            TerminalRunStatus::Running,
-            0,
+
+        super::opencode_probe_phase(&state, vec!["t-pending".to_string()]).await;
+
+        assert_eq!(
+            locator.identity_resolvable_since("t-pending"),
             None,
-        )];
-
-        super::warn_unresolved_terminal_identities(
-            &rows,
-            &identity,
-            &mut warned,
-            i64::MAX,
-            Some(&locator),
-            &ledger,
-            &HashSet::new(),
+            "a row claimed by another terminal is not this pane's evidence"
         );
-
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-pending"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn opencode_probe_never_latches_a_freshagent_session() {
+    #[tokio::test]
+    async fn probe_phase_excludes_a_fresh_agent_ledger_row() {
         // fresh-agent `opencode serve` rows land in the same opencode.db;
         // the kind:fresh-agent ledger row excludes them (mirrors the
         // association guards' `freshagent_ledger_row` refusal).
-        let (events, _guard) = capture::capture();
-        let home = unique_opencode_home("freshagent-row");
-        let ledger_home = unique_opencode_home("freshagent-ledger");
+        let home = unique_opencode_home("phase-freshagent-row");
+        let ledger_home = unique_opencode_home("phase-freshagent-ledger");
         let db = seed_opencode_db(&home);
-        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        std::fs::create_dir_all(&ledger_home).unwrap();
+        let state = state_with_locator_and_ledger(home.clone(), &ledger_home);
+        let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
         assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
         assert!(locator.note_submit("t-pending", 100));
         insert_opencode_session(&db, "ses_freshagent", "/proj", 150);
 
-        std::fs::create_dir_all(&ledger_home).unwrap();
-        let ledger = crate::pane_ledger::PaneLedger::new(Some(ledger_home.clone()));
-        ledger
+        state
+            .pane_ledger
             .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
                 provider: "opencode",
                 session_id: "ses_freshagent",
@@ -1043,75 +1267,50 @@ mod tests {
             })
             .expect("seed fresh-agent ledger row");
 
-        let identity = TerminalIdentityRegistry::new();
-        let mut warned = HashSet::new();
-        let rows = vec![row(
-            "t-pending",
-            "opencode",
-            TerminalRunStatus::Running,
-            0,
+        super::opencode_probe_phase(&state, vec!["t-pending".to_string()]).await;
+
+        assert_eq!(
+            locator.identity_resolvable_since("t-pending"),
             None,
-        )];
-
-        super::warn_unresolved_terminal_identities(
-            &rows,
-            &identity,
-            &mut warned,
-            i64::MAX,
-            Some(&locator),
-            &ledger,
-            &HashSet::new(),
+            "a fresh-agent ledger row is excluded from evidence"
         );
-
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-pending"), None);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ledger_home);
     }
 
-    #[test]
-    fn opencode_probe_never_latches_a_live_freshagent_session() {
-        // Delta-review round 3, finding 1: `handle_send` materialization keys
-        // the fresh-opencode sessions map BEFORE the awaited `record_binding_row`
-        // ledger write (and the opencode serve DB row exists before both), so
-        // the ledger-row exclusion alone has a GAP — a probe running in it
-        // would latch the fresh-agent row as false resolvability evidence and
-        // fire exactly the WARN this run is fixing. The sweep's per-tick live
-        // session-id snapshot is the only guarantee that covers that gap; a
-        // live fresh-agent row must be refused even with an EMPTY ledger.
-        let (events, _guard) = capture::capture();
-        let home = unique_opencode_home("live-freshagent-row");
+    #[tokio::test]
+    async fn probe_phase_excludes_a_live_fresh_agent_session_without_a_ledger_row() {
+        // DELTA REPAIR 2 — the finding's exact case: `handle_send`
+        // materialization keys the fresh-opencode sessions map BEFORE the
+        // awaited `record_binding_row` ledger write (and the opencode serve
+        // DB row exists before both), so a probe that consults live state
+        // captured BEFORE its DB read (the delta-repair-1 per-tick snapshot)
+        // misses a session materialized in between and latches its row as
+        // false resolvability evidence — the exact spurious WARN this run is
+        // fixing. The phase checks live state AFTER the DB read, so the
+        // just-materialized session is excluded even though the ledger is
+        // still EMPTY (the gap shape, modeled here by the disabled ledger).
+        let home = unique_opencode_home("phase-live-freshagent-row");
         let db = seed_opencode_db(&home);
-        let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
+        let state = state_with_locator(home.clone()); // disabled ledger == the gap
+        let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
         assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
         assert!(locator.note_submit("t-pending", 100));
         insert_opencode_session(&db, "ses_freshlive", "/proj", 150);
 
-        let identity = TerminalIdentityRegistry::new();
-        let ledger = crate::pane_ledger::PaneLedger::disabled();
-        let mut warned = HashSet::new();
-        let mut live = HashSet::new();
-        live.insert("ses_freshlive".to_string());
-        let rows = vec![row(
-            "t-pending",
-            "opencode",
-            TerminalRunStatus::Running,
-            0,
+        // The live map is keyed (materialization landed); no ledger row yet.
+        state
+            .fresh_opencode
+            .insert_live_session_for_test("ses_freshlive")
+            .await;
+
+        super::opencode_probe_phase(&state, vec!["t-pending".to_string()]).await;
+
+        assert_eq!(
+            locator.identity_resolvable_since("t-pending"),
             None,
-        )];
-
-        super::warn_unresolved_terminal_identities(
-            &rows,
-            &identity,
-            &mut warned,
-            i64::MAX,
-            Some(&locator),
-            &ledger,
-            &live,
+            "a LIVE fresh-agent session (checked post-read) is never this pane's evidence"
         );
-
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-pending"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 }
