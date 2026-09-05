@@ -26,8 +26,10 @@
 //! candidate-evidence latch (an evaluated correlation window that ended
 //! ambiguous/contested) or, for ever-submitted panes past the create-age
 //! grace, the sweep's async probe phase (the late-row / swallowed-DB-error
-//! hole): the pure warn pass QUEUES such panes, and the phase runs the
-//! locator's bounded candidate read and then applies every availability
+//! hole): the pure warn pass QUEUES such panes (via the locator's
+//! `probe_eligible` gate — a never-submitted pane is never queued, delta
+//! repair 4), and the phase runs the locator's bounded candidate read and
+//! then applies every availability
 //! exclusion against CURRENT async state — `fresh_opencode.has_live_session`
 //! included (as the phase's injected per-candidate live check, delta repair
 //! 3), consulted AFTER the read precisely because a live-set snapshot taken
@@ -90,8 +92,10 @@ pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 = 10_000;
 /// Per tick: the PURE warn pass (no SQLite reads; the registry walk runs on
 /// the blocking pool, the `drain_and_associate` precedent) returns the
 /// updated warned-set plus the "probe-wanted" queue — opencode panes past
-/// the create-age grace with no latched evidence. The sweep then runs
-/// [`opencode_probe_phase`] in the SAME tick, BEFORE the next ticker, so
+/// the create-age grace with no latched evidence that are probe-eligible
+/// (`OpencodeLocator::probe_eligible`: armed, ever-submitted, unthrottled —
+/// a never-submitted pane is never queued, delta repair 4). The sweep then
+/// runs [`opencode_probe_phase`] in the SAME tick, BEFORE the next ticker, so
 /// the phase's availability exclusions (including the awaited
 /// `fresh_opencode.has_live_session`) consult CURRENT live state AFTER the
 /// locator's DB read — a pre-pass live snapshot is stale by probe time
@@ -156,10 +160,13 @@ pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time
 /// RUNNING non-shell terminal whose identity is past its provider's overdue
 /// window with no resolvable identity in either identity home, and return
 /// the "probe-wanted" queue — opencode terminals past the create-age grace
-/// with NO latched resolvability evidence. Exited terminals are skipped
-/// (their identity story is over); shell terminals never carry session
-/// identity by design. opencode rows are gated on locator RESOLVABILITY
-/// evidence (see the grace-constant doc): window-latch first, probe queue
+/// with NO latched resolvability evidence that are probe-eligible
+/// (`OpencodeLocator::probe_eligible`: armed, ever-submitted, unthrottled —
+/// a never-submitted idle pane is never queued, delta repair 4). Exited
+/// terminals are skipped (their identity story is over); shell terminals
+/// never carry session identity by design. opencode rows are gated on
+/// locator RESOLVABILITY evidence (see the grace-constant doc): window-latch
+/// first, probe queue
 /// for the late-row/DB-error hole (plan-review R1); a pane with neither has
 /// nothing resolvable and is never alarmed (issue #702).
 ///
@@ -201,9 +208,14 @@ pub(crate) fn warn_unresolved_terminal_identities(
                     // Once it is past the create-age grace (R2 finding 2 —
                     // young panes are the binding lanes' business; never
                     // probe them), queue it for the sweep's async probe
-                    // phase; never warn inline.
+                    // phase — but only when the pane is probe-eligible
+                    // (delta repair 4: armed, unlatched, ever-submitted,
+                    // unthrottled), so a never-submitted idle pane never
+                    // enters the queue at all; never warn inline.
                     None => {
-                        if now_ms - row.created_at > IDENTITY_RESOLUTION_GRACE_MS {
+                        if now_ms - row.created_at > IDENTITY_RESOLUTION_GRACE_MS
+                            && locator.probe_eligible(&row.terminal_id, now_ms)
+                        {
                             probe_wanted.push(row.terminal_id.clone());
                         }
                         continue;
@@ -683,16 +695,17 @@ mod tests {
     }
 
     #[test]
-    fn opencode_pane_past_create_age_grace_without_evidence_requests_a_probe() {
-        // danshapiro/freshell#702: a fresh opencode pane whose user has not
-        // submitted a prompt has NO session row anywhere (opencode creates it
-        // lazily at first prompt) -- nothing is resolvable, and the old
-        // create-age gate false-fired on 100% of real usage (61s+ to first
-        // prompt in the incident timeline). With a live locator holding no
-        // candidate evidence, age alone must never warn -- the pass only
-        // QUEUES the pane for the sweep's async probe phase (which then
-        // finds no candidates for a never-submitted pane, so nothing ever
-        // latches and no later pass warns either).
+    fn opencode_idle_pane_past_create_age_grace_stays_silent_and_unqueued() {
+        // danshapiro/freshell#702, delta repair 4: a fresh opencode pane
+        // whose user has not submitted a prompt has NO session row anywhere
+        // (opencode creates it lazily at first prompt) -- nothing is
+        // resolvable, and the old create-age gate false-fired on 100% of
+        // real usage (61s+ to first prompt in the incident timeline). With a
+        // live locator holding no candidate evidence, age alone must never
+        // warn -- AND the pane must never enter the probe-wanted queue
+        // (`probe_eligible`: never-submitted panes can yield no candidates,
+        // so queuing them was a per-sweep spawn_blocking round-trip that
+        // could only ever return None).
         let (events, _guard) = capture::capture();
         let home = unique_opencode_home("idle");
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
@@ -710,24 +723,30 @@ mod tests {
             None,
         )];
 
-        let wanted = super::warn_unresolved_terminal_identities(
-            &rows,
-            &identity,
-            &mut warned,
-            10_000 + 61_000, // +61s: the incident's first-prompt delay
-            Some(&locator),
-        );
+        // The every-sweep shape (the defect was queueing EVERY 2s sweep
+        // forever): two consecutive passes, both silent and empty-handed.
+        for now in [10_000 + 61_000, 10_000 + 63_000] {
+            // +61s in the incident timeline: first prompt arrived long past
+            // the grace on real panes.
+            let wanted = super::warn_unresolved_terminal_identities(
+                &rows,
+                &identity,
+                &mut warned,
+                now,
+                Some(&locator),
+            );
+            assert!(
+                wanted.is_empty(),
+                "a never-submitted pane is never queued for probing; wanted: {wanted:?}"
+            );
+        }
 
         assert!(
             unresolved_warnings(&events.lock().unwrap()).is_empty(),
-            "no evidence == nothing resolvable == no inline warn (#702)"
+            "no evidence == nothing resolvable == no warn (#702)"
         );
         assert!(warned.is_empty());
-        assert_eq!(
-            wanted,
-            vec!["t-idle".to_string()],
-            "past the create-age grace the sweep's probe phase must take a look"
-        );
+        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1023,7 +1042,9 @@ mod tests {
     // construction, which is what closes the stale-snapshot hole. The live
     // check is INJECTED (delta repair 3) so its call ORDER and per-
     // candidate currency are exercisable without touching
-    // `FreshOpencodeState` internals.
+    // `FreshOpencodeState` internals. The first (sync) test pins the queue
+    // GATE instead (delta repair 4): a never-submitted pane never even
+    // REACHES the phase.
 
     /// Full-`WsState` fixture with a real opencode locator rooted at
     /// `data_home` (mirrors `opencode_association.rs`'s `state_with_locator`,
@@ -1197,13 +1218,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[tokio::test]
-    async fn probe_phase_latches_nothing_for_an_idle_never_submitted_pane() {
-        // The #702 false-fire class: a fresh pane whose user has not
-        // submitted a prompt has NO session row anywhere (opencode writes it
-        // lazily at first prompt). Even with a FOREIGN row sitting in the
-        // pane's cwd, the phase never yields a probe candidate for the idle
-        // pane, so nothing ever latches and no pass ever warns.
+    #[test]
+    fn idle_never_submitted_pane_is_never_queued_for_probing() {
+        // Delta repair 4 — the queue-shape pin for the #702 false-fire
+        // class. A fresh pane whose user has not submitted a prompt has NO
+        // session row anywhere (opencode writes it lazily at first prompt).
+        // Even with a FOREIGN row sitting in the pane's cwd, nothing is
+        // attributable to the idle pane — so the pass must keep it OUT of
+        // the probe-wanted queue entirely: queuing it cost a per-sweep
+        // spawn_blocking round-trip forever while `probe_candidates` could
+        // only ever answer None. The idle pane being ABSENT from the queue
+        // is the stronger statement of the old "the phase latches nothing"
+        // pin: it never even reaches the phase.
         let (events, _guard) = capture::capture();
         let home = unique_opencode_home("phase-idle-foreign-row");
         let db = seed_opencode_db(&home);
@@ -1220,7 +1246,6 @@ mod tests {
             0,
             None,
         )];
-        let scans_before = locator.db_scan_count();
         let wanted = super::warn_unresolved_terminal_identities(
             &rows,
             &state.identity,
@@ -1228,26 +1253,13 @@ mod tests {
             i64::MAX,
             state.opencode_locator.as_deref(),
         );
-        assert_eq!(
-            wanted,
-            vec!["t-idle".to_string()],
-            "past the create-age grace the pass keeps queueing the look"
+
+        assert!(
+            wanted.is_empty(),
+            "a never-submitted pane is never queued for probing; wanted: {wanted:?}"
         );
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-
-        let mut live_check = production_live_check(&state);
-        super::opencode_probe_phase(&state, wanted, &mut live_check).await;
-
-        assert_eq!(
-            locator.identity_resolvable_since("t-idle"),
-            None,
-            "never-submitted panes never yield candidates"
-        );
-        assert_eq!(
-            locator.db_scan_count(),
-            scans_before,
-            "the idle pane's probe performed no DB read"
-        );
+        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

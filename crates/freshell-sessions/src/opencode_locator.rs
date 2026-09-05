@@ -241,6 +241,37 @@ impl OpencodeLocator {
             .flatten()
     }
 
+    /// The invariant sweep's queue-skip predicate (danshapiro/freshell#702,
+    /// delta repair 4): whether an opencode row past the create-age grace
+    /// should be QUEUED for the sweep's probe phase at all — armed AND no
+    /// latched resolvable evidence AND ever-submitted
+    /// (`first_submit_ms.is_some()`) AND outside the [`PROBE_THROTTLE_MS`]
+    /// window since the last probe. ONE mutex lock, no I/O. The armed /
+    /// ever-submitted / throttle guards mirror
+    /// [`OpencodeLocator::probe_candidates`]' own (defense in depth — it
+    /// still answers `None` with zero DB reads for the same classes even if
+    /// a caller queues one anyway); the no-latched-evidence leg is the
+    /// sweep's queueing rule (only latch-miss panes are ever queued). The
+    /// predicate exists so a pane that can never yield candidates — the
+    /// #702 idle never-submitted class — is never queued at all, sparing a
+    /// per-sweep `spawn_blocking` round-trip that would only return `None`.
+    pub fn probe_eligible(&self, terminal_id: &str, now_ms: i64) -> bool {
+        let inner = self.lock();
+        let Some(armed) = inner.armed.get(terminal_id) else {
+            return false;
+        };
+        if inner.resolvable_evidence_ms.contains_key(terminal_id) {
+            return false;
+        }
+        if armed.first_submit_ms.is_none() {
+            return false;
+        }
+        inner
+            .last_probe_ms
+            .get(terminal_id)
+            .is_none_or(|t| now_ms - t >= PROBE_THROTTLE_MS)
+    }
+
     /// The READ half of the late-row probe (danshapiro/freshell#702, delta
     /// repair 2): for an ARMED terminal that has ever submitted, at most ONE
     /// bounded `list_sessions_since(arm_ms − pre_epsilon)` read per
@@ -1503,6 +1534,53 @@ mod tests {
             "re-probe within the throttle interval performs no DB read"
         );
         assert_eq!(locator.identity_resolvable_since("t1"), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- 19. probe_eligible: the invariant sweep's queue-skip predicate
+    // (issue #702, delta repair 4). Pure in-memory (one lock, no I/O);
+    // mirrors the probe's armed/ever-submitted/throttle guards (plus the
+    // sweep's latch-miss rule) so a pane that can never yield candidates is
+    // never queued for probing at all. --
+
+    #[test]
+    fn probe_eligible_tracks_the_probe_guards() {
+        let home = unique_temp_dir("probe-eligible");
+        open_seed_db(&home);
+        let locator = OpencodeLocator::new(home.clone());
+
+        // Never armed => not eligible.
+        assert!(!locator.probe_eligible("never-armed", 50_000));
+
+        assert!(locator.arm("t1", "opencode", true, None, Some("/proj"), 0));
+
+        // Fresh arm, never submitted (the #702 idle class): NOT eligible —
+        // the pane has no session of its own, so the sweep must never queue
+        // it for a probe.
+        assert!(!locator.probe_eligible("t1", 50_000));
+
+        // Submitted and never probed (=> not throttled): eligible.
+        assert!(locator.note_submit("t1", 100));
+        assert!(locator.probe_eligible("t1", 50_000));
+
+        // A probe read stamps the wall-clock throttle inside
+        // `probe_candidates` (the one locator entry point that runs on real
+        // time): within the throttle window the pane is not eligible again;
+        // past it, it is.
+        assert_eq!(locator.probe_candidates("t1"), Some(Vec::new()));
+        let wall_now = wall_now_ms();
+        assert!(!locator.probe_eligible("t1", wall_now));
+        assert!(locator.probe_eligible("t1", wall_now + PROBE_THROTTLE_MS + 1));
+
+        // Latched evidence (here via the ws phase's explicit note; a window
+        // refusal latches identically): the gate already has its answer, so
+        // the pane must never be queued for another probe.
+        assert_eq!(locator.note_resolvable_evidence("t1", 60_000), Some(60_000));
+        assert!(!locator.probe_eligible("t1", wall_now + PROBE_THROTTLE_MS + 1));
+
+        // Disarmed (pane gone): not eligible.
+        locator.disarm("t1");
+        assert!(!locator.probe_eligible("t1", wall_now + PROBE_THROTTLE_MS + 1));
         let _ = std::fs::remove_dir_all(&home);
     }
 }
