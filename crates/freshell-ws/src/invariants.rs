@@ -29,8 +29,9 @@
 //! hole): the pure warn pass QUEUES such panes, and the phase runs the
 //! locator's bounded candidate read and then applies every availability
 //! exclusion against CURRENT async state — `fresh_opencode.has_live_session`
-//! included, consulted AFTER the read precisely because a live-set snapshot
-//! taken BEFORE the read is stale by probe time (delta repair 2). A fresh
+//! included (as the phase's injected per-candidate live check, delta repair
+//! 3), consulted AFTER the read precisely because a live-set snapshot taken
+//! BEFORE the read is stale by probe time (delta repair 2). A fresh
 //! opencode pane with neither has nothing resolvable and is never alarmed.
 //!
 //! The sibling alarm (a `ui.command tab.create` for a session-provider mode
@@ -137,7 +138,15 @@ pub fn spawn_identity_invariant_sweep(state: crate::WsState, interval: std::time
             };
             identity_warned = warned_back;
             if !probe_wanted.is_empty() {
-                opencode_probe_phase(&state, probe_wanted).await;
+                // Production wiring of the phase's injected per-candidate
+                // live check (delta repair 3): delegate to
+                // `fresh_opencode.has_live_session` — awaited per candidate
+                // AFTER the phase's DB read, against CURRENT live state.
+                let fresh_opencode = &state.fresh_opencode;
+                let mut live_check = move |session_id: String| async move {
+                    fresh_opencode.has_live_session(&session_id).await
+                };
+                opencode_probe_phase(&state, probe_wanted, &mut live_check).await;
             }
         }
     });
@@ -221,8 +230,8 @@ pub(crate) fn warn_unresolved_terminal_identities(
     probe_wanted
 }
 
-/// The async probe phase of the opencode identity gate (delta repair 2),
-/// run by the sweep in the SAME tick as the warn pass that queued
+/// The async probe phase of the opencode identity gate (delta repairs 2
+/// and 3), run by the sweep in the SAME tick as the warn pass that queued
 /// `probe_wanted`. Per terminal: the locator's bounded
 /// [`freshell_sessions::opencode_locator::OpencodeLocator::probe_candidates`]
 /// read runs on the blocking pool (the `drain_and_associate` precedent; a
@@ -230,17 +239,28 @@ pub(crate) fn warn_unresolved_terminal_identities(
 /// `identity_invariant_probe_panicked` and skipped for this cycle), then
 /// EVERY candidate is filtered through the full availability exclusion set
 /// against CURRENT async state: the identity registry (retired-inclusive),
-/// fresh-agent pane-ledger rows, and
-/// `state.fresh_opencode.has_live_session(&sid).await` — the last one
-/// reading the live sessions map AFTER the DB read by construction, so a
+/// fresh-agent pane-ledger rows, and the injected per-candidate
+/// `live_check` — awaited AFTER the DB read, once per candidate, so a
 /// fresh-opencode session that materialized mid-tick (its `ses_*` row
 /// visible to the read, its ledger write still pending) is excluded by its
-/// live-map key — the exact gap a pre-read snapshot could not close. Any
-/// surviving candidate means an unbound correlatable row provably exists:
-/// latch the pane's resolvable evidence via
+/// live-map key — the exact gap a pre-read snapshot could not close.
+/// Production wires `live_check` to
+/// `state.fresh_opencode.has_live_session(...)`; the parameter is INJECTED
+/// (delta repair 3) so the phase's check-per-candidate-after-the-read
+/// ORDER is a contractual, test-exercisable property of the phase itself,
+/// not an incidental detail of how it reached live state. Any surviving
+/// candidate means an unbound correlatable row provably exists: latch the
+/// pane's resolvable evidence via
 /// [`freshell_sessions::opencode_locator::OpencodeLocator::note_resolvable_evidence`]
 /// (first-evidence-wins; dropped when the pane disarmed mid-flight).
-pub(crate) async fn opencode_probe_phase(state: &crate::WsState, probe_wanted: Vec<String>) {
+pub(crate) async fn opencode_probe_phase<F, Fut>(
+    state: &crate::WsState,
+    probe_wanted: Vec<String>,
+    live_check: &mut F,
+) where
+    F: FnMut(String) -> Fut + Send,
+    Fut: std::future::Future<Output = bool> + Send,
+{
     let Some(locator) = state.opencode_locator.clone() else {
         return;
     };
@@ -270,6 +290,12 @@ pub(crate) async fn opencode_probe_phase(state: &crate::WsState, probe_wanted: V
         };
         let mut any_resolvable = false;
         for session_id in candidates {
+            // ORDER IS LOAD-BEARING (delta repair 3): every exclusion runs
+            // against state visible AFTER `probe_candidates` returned, and
+            // the live check is consulted per candidate — never a pre-read
+            // live-set snapshot (a `handle_send` materialization between a
+            // snapshot and this loop is invisible to the snapshot but seen
+            // here).
             let excluded = state
                 .identity
                 .find_by_session_including_retired("opencode", &session_id)
@@ -278,7 +304,7 @@ pub(crate) async fn opencode_probe_phase(state: &crate::WsState, probe_wanted: V
                     .pane_ledger
                     .lookup_by_session("opencode", &session_id)
                     .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
-                || state.fresh_opencode.has_live_session(&session_id).await;
+                || live_check(session_id.clone()).await;
             if !excluded {
                 any_resolvable = true;
                 break;
@@ -985,7 +1011,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ── The async probe phase (delta repair 2) ─────────────────────────
+    // ── The async probe phase (delta repairs 2 and 3) ──────────────────
     //
     // These tests drive `opencode_probe_phase` directly against a full
     // `WsState` (fixtures mirror `opencode_association.rs`'s
@@ -993,8 +1019,11 @@ mod tests {
     // locator's bounded DB read runs first, then EVERY availability
     // exclusion is applied against CURRENT async state — the identity
     // registry (retired-inclusive), the fresh-agent pane-ledger rows, and
-    // `fresh_opencode.has_live_session(...).await`, the last one AFTER the
-    // read by construction, which is what closes the stale-snapshot hole.
+    // the per-candidate live check, the last one AFTER the read by
+    // construction, which is what closes the stale-snapshot hole. The live
+    // check is INJECTED (delta repair 3) so its call ORDER and per-
+    // candidate currency are exercisable without touching
+    // `FreshOpencodeState` internals.
 
     /// Full-`WsState` fixture with a real opencode locator rooted at
     /// `data_home` (mirrors `opencode_association.rs`'s `state_with_locator`,
@@ -1075,6 +1104,22 @@ mod tests {
         state
     }
 
+    /// The production live check, constructed from the real fixture state
+    /// exactly as the sweep wires it: per candidate, delegate to
+    /// `state.fresh_opencode.has_live_session(...)`. Boxed so the returned
+    /// closure has a nameable future type.
+    fn production_live_check<'a>(
+        state: &'a crate::WsState,
+    ) -> impl FnMut(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+           + Send
+           + 'a {
+        let fresh_opencode = &state.fresh_opencode;
+        move |session_id: String| {
+            Box::pin(async move { fresh_opencode.has_live_session(&session_id).await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+        }
+    }
+
     #[tokio::test]
     async fn probe_phase_closes_the_late_row_hole_and_the_next_pass_warns() {
         // Plan-review R1 hole, end-to-end through the new boundary (delta
@@ -1121,7 +1166,8 @@ mod tests {
 
         // The async probe phase latches the late, surviving row (checked
         // against CURRENT live/ledger/identity state AFTER the DB read).
-        super::opencode_probe_phase(&state, wanted).await;
+        let mut live_check = production_live_check(&state);
+        super::opencode_probe_phase(&state, wanted, &mut live_check).await;
         let latched = locator
             .identity_resolvable_since("t-late")
             .expect("the phase latches the surviving late row as evidence");
@@ -1189,7 +1235,8 @@ mod tests {
         );
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
 
-        super::opencode_probe_phase(&state, wanted).await;
+        let mut live_check = production_live_check(&state);
+        super::opencode_probe_phase(&state, wanted, &mut live_check).await;
 
         assert_eq!(
             locator.identity_resolvable_since("t-idle"),
@@ -1225,7 +1272,8 @@ mod tests {
             1,
         );
 
-        super::opencode_probe_phase(&state, vec!["t-pending".to_string()]).await;
+        let mut live_check = production_live_check(&state);
+        super::opencode_probe_phase(&state, vec!["t-pending".to_string()], &mut live_check).await;
 
         assert_eq!(
             locator.identity_resolvable_since("t-pending"),
@@ -1267,7 +1315,8 @@ mod tests {
             })
             .expect("seed fresh-agent ledger row");
 
-        super::opencode_probe_phase(&state, vec!["t-pending".to_string()]).await;
+        let mut live_check = production_live_check(&state);
+        super::opencode_probe_phase(&state, vec!["t-pending".to_string()], &mut live_check).await;
 
         assert_eq!(
             locator.identity_resolvable_since("t-pending"),
@@ -1279,37 +1328,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_phase_excludes_a_live_fresh_agent_session_without_a_ledger_row() {
-        // DELTA REPAIR 2 — the finding's exact case: `handle_send`
-        // materialization keys the fresh-opencode sessions map BEFORE the
-        // awaited `record_binding_row` ledger write (and the opencode serve
-        // DB row exists before both), so a probe that consults live state
-        // captured BEFORE its DB read (the delta-repair-1 per-tick snapshot)
-        // misses a session materialized in between and latches its row as
-        // false resolvability evidence — the exact spurious WARN this run is
-        // fixing. The phase checks live state AFTER the DB read, so the
-        // just-materialized session is excluded even though the ledger is
-        // still EMPTY (the gap shape, modeled here by the disabled ledger).
-        let home = unique_opencode_home("phase-live-freshagent-row");
+    async fn probe_phase_checks_each_candidate_against_post_read_live_state() {
+        // DELTA REPAIR 3 — the discriminating form of the round-2 finding.
+        // What this test protects is the phase's CALL ORDER and the
+        // per-candidate CURRENCY of its live check — not any
+        // `FreshOpencodeState` internals (this test never touches a real
+        // fresh-opencode state). The injected gate below models the
+        // `handle_send` materialization timing from first principles:
+        // nothing is live at seed time; the check's FIRST invocation IS
+        // the materialization moment (both seeded rows become live), and
+        // every candidate is reported live at its own check. Under the
+        // correct post-read per-candidate shape, each candidate is
+        // excluded by its own CURRENT check and no evidence latches.
+        // Under the delta-repair-1 regression shape (a live-set snapshot
+        // precomputed BEFORE the DB read, consulted after it) the snapshot
+        // predates the materialization, BOTH candidates survive, and false
+        // evidence latches — this test fails. Verified RED against exactly
+        // that shape in the repair run; the failure was the latched
+        // `identity_resolvable_since`, proving discrimination.
+        let home = unique_opencode_home("phase-live-check-order");
         let db = seed_opencode_db(&home);
-        let state = state_with_locator(home.clone()); // disabled ledger == the gap
+        let state = state_with_locator(home.clone()); // disabled ledger == the gap shape
         let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
         assert!(locator.arm("t-pending", "opencode", true, None, Some("/proj"), 0));
         assert!(locator.note_submit("t-pending", 100));
-        insert_opencode_session(&db, "ses_freshlive", "/proj", 150);
+        // TWO candidates for the same pane: the phase must ask about each.
+        insert_opencode_session(&db, "ses_a", "/proj", 150);
+        insert_opencode_session(&db, "ses_b", "/proj", 160);
 
-        // The live map is keyed (materialization landed); no ledger row yet.
-        state
-            .fresh_opencode
-            .insert_live_session_for_test("ses_freshlive")
-            .await;
+        // The injected gate: invoked per candidate AFTER the DB read. It
+        // does NOT consult any pre-seeded live map — its FIRST call
+        // performs the "session becomes live" side effect (recording both
+        // candidate ids) and reports live for every candidate thereafter,
+        // which a pre-read snapshot can never observe.
+        let mut invocations = 0u32;
+        let mut became_live: Vec<String> = Vec::new();
+        let mut live_check = |session_id: String| {
+            invocations += 1;
+            if became_live.is_empty() {
+                became_live.push("ses_a".to_string());
+                became_live.push("ses_b".to_string());
+            }
+            let live = became_live.contains(&session_id);
+            async move { live }
+        };
 
-        super::opencode_probe_phase(&state, vec!["t-pending".to_string()]).await;
+        super::opencode_probe_phase(&state, vec!["t-pending".to_string()], &mut live_check).await;
 
         assert_eq!(
             locator.identity_resolvable_since("t-pending"),
             None,
-            "a LIVE fresh-agent session (checked post-read) is never this pane's evidence"
+            "each candidate was live at its own post-read check: no evidence may latch"
+        );
+        assert!(
+            invocations >= 2,
+            "each candidate must get its OWN post-read live check; saw {invocations}"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
