@@ -233,7 +233,7 @@ function logConfigFallback(error: ConfigReadError, details: { err?: unknown; fil
   }
   logger.warn(
     { backupPath: backupFile, error },
-    'Config fallback in effect; restore backup with: mv ~/.freshell/config.backup.json ~/.freshell/config.json'
+    `Config fallback in effect; restore backup with: mv ${backupFile} ${configPath()}`
   )
 }
 

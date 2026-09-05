@@ -9,12 +9,16 @@
 
 import { test, expect, _electron as electron, type ElectronApplication } from '@playwright/test'
 import { spawn } from 'child_process'
+import { createRequire } from 'module'
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..')
-const ELECTRON_BIN = path.join(PROJECT_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+// Resolve the Electron binary portably (electron.exe on Windows, the darwin
+// bundle binary on macOS): requiring the `electron` package exports the
+// platform-specific executable path as a string.
+const ELECTRON_BIN = createRequire(import.meta.url)('electron') as string
 
 function createTempHomeWithRegistry(registry: unknown): string {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-e2e-profiles-'))
