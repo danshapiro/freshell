@@ -114,11 +114,13 @@ describe('Electron Rust app-bound startup', () => {
   })
 
   it('resolves packaged Rust resources without Node backend fields', () => {
+    const profileDir = path.resolve('/tmp/freshell profile')
+    const configDir = path.join(profileDir, '.freshell')
     const resources = resolveDesktopRuntimeResources(
       '/opt/Freshell/resources',
       'linux',
       false,
-      '/tmp/freshell profile/.freshell',
+      configDir,
     )
     expect(resources).toEqual({
       serverBinary: path.join('/opt/Freshell/resources', 'bin', 'freshell-server'),
@@ -127,9 +129,9 @@ describe('Electron Rust app-bound startup', () => {
       claudeSidecarEntry: path.join('/opt/Freshell/resources', 'claude-sidecar', 'index.mjs'),
       mcpNodeBinary: path.join('/opt/Freshell/resources', 'node', 'bin', 'node'),
       mcpEntry: path.join('/opt/Freshell/resources', 'mcp', 'server.js'),
-      homeDir: '/tmp/freshell profile',
-      configDir: '/tmp/freshell profile/.freshell',
-      logDir: '/tmp/freshell profile/.freshell/logs',
+      homeDir: profileDir,
+      configDir,
+      logDir: path.join(configDir, 'logs'),
     })
   })
 

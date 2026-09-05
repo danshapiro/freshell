@@ -180,11 +180,13 @@ export function verifyElectronArtifact(
 
   const serverBinary = path.join(root, allowlist.serverBinary)
   checkBinaryFormat(serverBinary, platform)
-  if (platform !== 'win32' && (statSync(serverBinary).mode & 0o111) === 0) {
+  const hostPlatform = options.hostPlatform ?? process.platform
+  // Windows filesystems do not retain POSIX executable bits, including when
+  // inspecting a foreign artifact. Native POSIX artifacts still require them.
+  if (hostPlatform !== 'win32' && platform !== 'win32' && (statSync(serverBinary).mode & 0o111) === 0) {
     throw new Error('Rust server binary is not executable')
   }
 
-  const hostPlatform = options.hostPlatform ?? process.platform
   if (platform !== hostPlatform) {
     return {
       ok: true,

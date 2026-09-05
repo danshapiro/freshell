@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -8,6 +8,8 @@ import {
   resolveDefaultArtifactPath,
   verifyElectronArtifact,
 } from '../../../scripts/verify-electron-artifact.js'
+
+const nativePlatform = process.platform as 'darwin' | 'linux' | 'win32'
 
 function artifactRoot(): string {
   return mkdtempSync(path.join(tmpdir(), 'freshell-electron-artifact-'))
@@ -48,20 +50,21 @@ function writeArtifact(root: string, platform: 'darwin' | 'linux' | 'win32' = 'l
 describe('verify-electron-artifact', () => {
   it('checks required files and runs the native probe in a sanitized empty cwd', () => {
     const root = artifactRoot()
-    const binary = writeArtifact(root)
+    const binary = writeArtifact(root, nativePlatform)
     mkdirSync(path.join(root, 'client', 'assets'), { recursive: true })
     writeFileSync(path.join(root, 'client', 'assets', 'index-hash.js'), 'export {}\n')
     writeFileSync(path.join(root, '.electron-runtime-receipt.json'), '{}\n')
-    const probe = (command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }) => {
+    const probe = vi.fn((command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }) => {
       expect(command).toBe(binary)
       expect(options.cwd).not.toBe(root)
       expect(options.env.AUTH_TOKEN).toBeUndefined()
       expect(Object.keys(options.env).some((key) => key.startsWith('FRESHELL_'))).toBe(false)
       expect(options.timeout).toBeGreaterThan(0)
       return { status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.\n' }
-    }
+    })
 
-    expect(verifyElectronArtifact(root, 'linux', { probe })).toMatchObject({ ok: true, platform: 'linux' })
+    expect(verifyElectronArtifact(root, nativePlatform, { probe })).toMatchObject({ ok: true, platform: nativePlatform, executed: true })
+    expect(probe).toHaveBeenCalledTimes(1)
   })
 
   it('rejects every forbidden backend or native-module path', () => {
@@ -90,9 +93,20 @@ describe('verify-electron-artifact', () => {
 
   it('performs structural checks for a foreign platform without executing it', () => {
     const root = artifactRoot()
-    writeArtifact(root, 'win32')
+    const foreignPlatform = nativePlatform === 'win32' ? 'darwin' : 'win32'
+    writeArtifact(root, foreignPlatform)
     const probe = () => { throw new Error('foreign binary must not execute locally') }
-    expect(verifyElectronArtifact(root, 'win32', { probe })).toMatchObject({ ok: true, executed: false })
+    expect(verifyElectronArtifact(root, foreignPlatform, { probe })).toMatchObject({ ok: true, executed: false })
+  })
+
+  it('does not require POSIX permission bits when inspecting a foreign artifact on Windows', () => {
+    const root = artifactRoot()
+    const binary = writeArtifact(root, 'linux')
+    chmodSync(binary, 0o644)
+    const probe = vi.fn(() => { throw new Error('foreign binary must not execute locally') })
+
+    expect(verifyElectronArtifact(root, 'linux', { hostPlatform: 'win32', probe })).toMatchObject({ ok: true, executed: false })
+    expect(probe).not.toHaveBeenCalled()
   })
 
   it('accepts the macOS icon and Windows NSIS helper in their resource roots', () => {
@@ -105,7 +119,7 @@ describe('verify-electron-artifact', () => {
       writeArtifact(root, platform)
       writeFileSync(path.join(root, file), 'electron-builder resource')
       expect(verifyElectronArtifact(root, platform, {
-        hostPlatform: 'linux',
+        hostPlatform: platform === nativePlatform ? 'linux' : nativePlatform,
         probe: () => { throw new Error('foreign binary must not execute locally') },
       })).toMatchObject({ ok: true, platform, executed: false })
     }
@@ -141,9 +155,15 @@ describe('verify-electron-artifact', () => {
     expect(resolveArtifactPath(explicitPath, 'darwin', 'unsupported-host-architecture')).toBe(explicitPath)
   })
 
-  it('rejects a native probe that listens or returns the wrong authentication failure', () => {
+  it.each([
+    { status: 0, stdout: 'listening', stderr: '' },
+    { status: 1, stdout: '', stderr: 'unrelated startup failure' },
+    { status: 1, stdout: 'listening on port 3001', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' },
+  ])('rejects an invalid native probe result: %j', (result) => {
     const root = artifactRoot()
-    writeArtifact(root)
-    expect(() => verifyElectronArtifact(root, 'linux', { probe: () => ({ status: 0, stdout: 'listening', stderr: '' }) })).toThrow(/authentication|listen|exit with code/i)
+    writeArtifact(root, nativePlatform)
+    const probe = vi.fn(() => result)
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe })).toThrow(/authentication|listen|exit with code/i)
+    expect(probe).toHaveBeenCalledTimes(1)
   })
 })

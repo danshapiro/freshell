@@ -15,14 +15,18 @@ jobs:
         include:
           - os: macos-15-intel
             installer: release/*.dmg
+            runtime: release/mac/Freshell.app/Contents/Resources
           - os: macos-latest
             installer: release/*.dmg
+            runtime: release/mac-arm64/Freshell.app/Contents/Resources
           - os: ubuntu-latest
             installer: |-
               release/*.AppImage
               release/*.deb
+            runtime: release/linux-unpacked/resources
           - os: windows-2022
             installer: release/*.exe
+            runtime: release/win-unpacked/resources
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -66,6 +70,8 @@ jobs:
 
       - name: Checkout-free native runtime acceptance
         run: npm run test:electron:runtime
+        env:
+          FRESHELL_ELECTRON_RUNTIME_DIR: ${{ matrix.runtime }}
 
       - name: Upload verified installer (Unix)
         if: matrix.os != 'windows-2022'

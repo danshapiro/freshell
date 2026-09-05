@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, chmodSync: vi.fn(actual.chmodSync) }
+})
 
 import {
   collectProductionDependencyClosure,
@@ -85,15 +90,16 @@ function createSourceFixture(root: string): {
 
 describe('prepare-electron-runtime staging', () => {
   it('plans the Rust app resources and keeps Node paths limited to sanctioned clients', () => {
+    const runtimeRoot = path.resolve('/tmp/electron-runtime')
     expect(getRuntimeBinaryName('linux')).toBe('freshell-server')
     expect(getRuntimeBinaryName('win32')).toBe('freshell-server.exe')
-    expect(getRuntimePaths('/tmp/electron-runtime', 'win32')).toMatchObject({
-      serverBinary: path.join('/tmp/electron-runtime', 'bin', 'freshell-server.exe'),
-      clientDir: path.join('/tmp/electron-runtime', 'client'),
-      nodeBinary: path.join('/tmp/electron-runtime', 'node', 'bin', 'node.exe'),
-      claudeSidecarEntry: path.join('/tmp/electron-runtime', 'claude-sidecar', 'index.mjs'),
-      mcpEntry: path.join('/tmp/electron-runtime', 'mcp', 'server.js'),
-      nodeClientRuntimeDir: path.join('/tmp/electron-runtime', 'node-client-runtime'),
+    expect(getRuntimePaths(runtimeRoot, 'win32')).toMatchObject({
+      serverBinary: path.join(runtimeRoot, 'bin', 'freshell-server.exe'),
+      clientDir: path.join(runtimeRoot, 'client'),
+      nodeBinary: path.join(runtimeRoot, 'node', 'bin', 'node.exe'),
+      claudeSidecarEntry: path.join(runtimeRoot, 'claude-sidecar', 'index.mjs'),
+      mcpEntry: path.join(runtimeRoot, 'mcp', 'server.js'),
+      nodeClientRuntimeDir: path.join(runtimeRoot, 'node-client-runtime'),
     })
   })
 
@@ -189,8 +195,15 @@ describe('prepare-electron-runtime staging', () => {
       ...fixture,
     })
 
-    expect(statSync(path.join(outputRoot, 'bin', 'freshell-server')).mode & 0o111).not.toBe(0)
-    expect(statSync(path.join(outputRoot, 'node', 'bin', 'node')).mode & 0o111).not.toBe(0)
+    for (const [source, binary] of [
+      [fixture.serverBinary, path.join(outputRoot, 'bin', 'freshell-server')],
+      [fixture.nodeBinary, path.join(outputRoot, 'node', 'bin', 'node')],
+    ]) {
+      // Windows does not retain POSIX executable bits. Verify the permission
+      // operation on every host and its filesystem effect on POSIX hosts.
+      expect(chmodSync).toHaveBeenCalledWith(binary, (statSync(source).mode & 0o777) | 0o111)
+      if (process.platform !== 'win32') expect(statSync(binary).mode & 0o111).not.toBe(0)
+    }
   })
 
   it('uses the locked Node archive URL for each supported target', () => {

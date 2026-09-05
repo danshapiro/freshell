@@ -137,7 +137,7 @@ describe('runStartup', () => {
       expect(norm(startArgs.resources.mcpEntry)).toContain('/app/resources/mcp/server.js')
       expect(startArgs.resources.configDir).toBe('/home/user/.freshell')
       expect(startArgs.resources.homeDir).toBe('/home/user')
-      expect(startArgs.resources.logDir).toBe('/home/user/.freshell/logs')
+      expect(norm(startArgs.resources.logDir)).toBe('/home/user/.freshell/logs')
       expect(result.type).toBe('main')
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')

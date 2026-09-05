@@ -3,6 +3,8 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { createServer } from 'node:net'
 import { randomUUID } from 'node:crypto'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import WebSocket from 'ws'
 import {
   cp,
@@ -15,6 +17,7 @@ import {
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '../../..')
@@ -82,28 +85,32 @@ async function stopOwnedChild(child: ChildProcess | undefined): Promise<void> {
   }
 }
 
-async function waitForJsonLine(
+async function waitForJsonLines(
   child: ChildProcess,
-  predicate: (message: JsonRpcMessage | Record<string, unknown>) => boolean,
+  predicates: Array<(message: JsonRpcMessage | Record<string, unknown>) => boolean>,
   timeoutMs = 10_000,
-): Promise<JsonRpcMessage | Record<string, unknown>> {
+): Promise<Array<JsonRpcMessage | Record<string, unknown>>> {
   if (!child.stdout) throw new Error('child stdout is not piped')
   const readline = createInterface({ input: child.stdout })
   return new Promise((resolve, reject) => {
     let settled = false
+    const messages: Array<JsonRpcMessage | Record<string, unknown> | undefined> = Array.from({ length: predicates.length })
     const timer = setTimeout(() => {
       settled = true
       readline.close()
-      reject(new Error('timed out waiting for JSON line from child'))
+      reject(new Error(`timed out waiting for JSON responses from ${path.basename(child.spawnfile ?? 'child')} (${messages.filter(Boolean).length}/${predicates.length} received)`))
     }, timeoutMs)
     readline.on('line', (line: string) => {
       try {
         const message = JSON.parse(line) as JsonRpcMessage | Record<string, unknown>
-        if (!predicate(message)) return
+        for (const [index, predicate] of predicates.entries()) {
+          if (messages[index] === undefined && predicate(message)) messages[index] = message
+        }
+        if (messages.some((message) => message === undefined)) return
         settled = true
         clearTimeout(timer)
         readline.close()
-        resolve(message)
+        resolve(messages as Array<JsonRpcMessage | Record<string, unknown>>)
       } catch {
         // A malformed stdout line is intentionally ignored here; the timeout
         // below reports the JSON protocol failure without echoing its contents.
@@ -124,6 +131,14 @@ async function waitForJsonLine(
       reject(new Error(`child exited before emitting the expected JSON line (code ${child.exitCode ?? 'unknown'}, signal ${child.signalCode ?? 'unknown'})`))
     })
   })
+}
+
+async function waitForJsonLine(
+  child: ChildProcess,
+  predicate: (message: JsonRpcMessage | Record<string, unknown>) => boolean,
+): Promise<JsonRpcMessage | Record<string, unknown>> {
+  const [message] = await waitForJsonLines(child, [predicate])
+  return message
 }
 
 function waitForWebSocketMessage(
@@ -247,6 +262,18 @@ export function query() {
 }
 
 describe('checkout-free Electron runtime acceptance', () => {
+  it('captures adjacent sidecar replies delivered in one stdout chunk', async () => {
+    const stdout = new PassThrough()
+    const child = Object.assign(new EventEmitter(), { stdout }) as unknown as ChildProcess
+    const responses = waitForJsonLines(child, [
+      (message) => message.type === 'created',
+      (message) => message.type === 'sdk.status',
+    ])
+    stdout.end('{"type":"created"}\n{"type":"sdk.status","status":"idle"}\n')
+
+    expect(await responses).toEqual([{ type: 'created' }, { type: 'sdk.status', status: 'idle' }])
+  })
+
   it('serves Rust/client, runs fake Claude, and speaks MCP JSON-RPC outside the checkout', async () => {
     const staged = runtimeRoot()
     expect(existsSync(staged), 'run npm run prepare:electron-runtime before this lane').toBe(true)
@@ -370,16 +397,21 @@ describe('checkout-free Electron runtime acceptance', () => {
         env: {
           ...process.env,
           NODE_PATH: '',
-          FRESHELL_CLAUDE_SDK_QUERY_MODULE: fakeSdk,
+          FRESHELL_CLAUDE_SDK_QUERY_MODULE: pathToFileURL(fakeSdk).href,
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       })
+      // The sidecar can emit created and idle in one stdout chunk. Subscribe
+      // to both before sending the command so neither response can be lost.
+      const responses = waitForJsonLines(claude, [
+        (message) => message.type === 'created',
+        (message) => message.type === 'sdk.status',
+      ])
       claude.stdin?.write(`${JSON.stringify({ type: 'create', requestId: 'checkout-free-create' })}\n`)
-      const created = await waitForJsonLine(claude, (message) => message.type === 'created')
+      const [created, idle] = await responses
       expect(created).toMatchObject({ type: 'created', requestId: 'checkout-free-create' })
       const sessionId = (created as { sessionId?: string }).sessionId
       expect(sessionId).toEqual(expect.any(String))
-      const idle = await waitForJsonLine(claude, (message) => message.type === 'sdk.status')
       expect(idle).toMatchObject({ type: 'sdk.status', sessionId, status: 'idle' })
       claude.stdin?.write('{"type":"shutdown"}\n')
       await waitForExit(claude)
