@@ -1433,6 +1433,17 @@ mod tests {
         fn retired(&self) -> Vec<String> {
             self.lock().retired.clone()
         }
+        /// Retire-call count for ONE terminal id (delta fix 2) — the
+        /// discriminating pin a `contains` check cannot express when a tail
+        /// retires the same id more than once (pre-recovering retire +
+        /// arm-end retire on the mid-backoff revival path).
+        fn retired_count_for(&self, terminal_id: &str) -> usize {
+            self.lock()
+                .retired
+                .iter()
+                .filter(|t| t == &terminal_id)
+                .count()
+        }
     }
 
     impl AutoResumeDriver for FakeDriver {
@@ -1619,9 +1630,10 @@ mod tests {
             fake.replaced_calls(),
             vec![("t1".into(), "t-new".into(), 1u32)]
         );
-        assert!(
-            fake.retired().contains(&"t1".to_string()),
-            "the arm-end retire covers the mid-sleep revival"
+        assert_eq!(
+            fake.retired_count_for("t1"),
+            2,
+            "pre-recovering retire + arm-end retire"
         );
     }
 

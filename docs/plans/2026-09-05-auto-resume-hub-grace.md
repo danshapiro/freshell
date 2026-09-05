@@ -4,6 +4,8 @@
 > implementer and a specification-plus-quality review after every task. Track
 > progress with the checkbox steps below.
 
+> 2026-09-05: EXECUTED WITH DELTA-REVIEW CHANGES — the landed production code supersedes this plan's code drafts. Delta review r6/r7 changed Task 1's identity-re-retire from `identity_revived`-conditional to unconditional per-iteration-tail (commit b040ee743) — the plan's Step 3(iv) claim "no separate Resume-arm retire is needed" is thereby VOID. Note added post-execution; tasks below are historical.
+
 ## User Request
 
 ### Requested result
@@ -49,7 +51,7 @@ Fix the auto-resume hub "mechanism-B" production defect (kata `kmbs`): under loa
 - Consumes: existing `HubConfig`, `run_hub_body`, `decide`, `AutoResumeDriver`, `FakeDriver` (same-file test module), `parse_delays_env`, `TerminalIdentityRegistry::retire` (identity.rs:205).
 - Produces: `pub(crate) const AUTO_RESUME_DEFAULT_IDENTITY_GRACE_DELAYS_MS: [u64; 2] = [2_500, 2_500]`; `HubConfig { identity_grace_delays: Vec<u64>, .. }`; `pub(crate) fn HubConfig::with_schedules(delays, identity_grace_delays) -> Self`; `pub(crate) fn auto_resume_identity_grace_delays() -> Vec<u64>`; `pub fn spawn_auto_resume_hub_with_schedules(state, rx, delays, identity_grace_delays) -> JoinHandle<()>`; `AutoResumeDriver::retire_identity(&self, terminal_id)`; two tracing info lines `terminal.auto_resume.identity_grace_entered` and `...identity_grace_resolved` (terminal_id field on both).
 
-- [ ] **Step 1: Write the failing behavioral tests** (in `crates/freshell-ws/src/auto_resume.rs` `mod tests`)
+- [x] **Step 1: Write the failing behavioral tests** (in `crates/freshell-ws/src/auto_resume.rs` `mod tests`)
 
 (a) The primary RED test — identity landing mid-grace converts settle into resume (per-step `advance` + `drain`: paused-clock `advance` wakes only timers ALREADY scheduled, so each grace step gets its own advance):
 
@@ -254,13 +256,13 @@ fn identity_grace_env_defaults_and_escape_hatch() {
 }
 ```
 
-- [ ] **Step 2: Run the new tests and verify the intended failures**
+- [x] **Step 2: Run the new tests and verify the intended failures**
 
 Run: `cargo test -p freshell-ws --lib auto_resume::tests`
 
 Expected: FAIL — first at compile (no `HubConfig::with_schedules`, no `identity_grace_delays` field, no `retire_identity` trait method); after the type-level pieces exist but the loop doesn't, (a) fails with empty `recovering_calls` where `attempt 1` is asserted, (d) fails on the cancelled-frames assertion, and (e)'s t2 leg settles immediately rather than after the two advances.
 
-- [ ] **Step 3: Add the minimal production implementation** (all in `crates/freshell-ws/src/auto_resume.rs`)
+- [x] **Step 3: Add the minimal production implementation** (all in `crates/freshell-ws/src/auto_resume.rs`)
 
 (i) After `AUTO_RESUME_DEFAULT_DELAYS_MS`:
 
@@ -402,23 +404,23 @@ pub fn spawn_auto_resume_hub_with_schedules(
 }
 ```
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-ws --lib auto_resume::tests`
 
 Expected: PASS — the four new tests, the restructured four-event test, and every pre-existing module test.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Extract the grace-eligibility predicate into `fn identity_grace_applies(ev: &CrashEvent, sref_absent: bool, cfg: &HubConfig) -> bool` ONLY if the inline block reads cleaner with it; the predicate-order comment must survive either way. No other refactors.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-ws auto_resume` AND `cargo test -p freshell-ws --test auto_resume_e2e`
 
 Expected: PASS (the claude-driven e2e tests carry preallocated identity present before the crash decision — grace never engages for them — and the two `#[should_panic]` ring-pin tests are untouched).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-ws/src/auto_resume.rs
@@ -437,9 +439,9 @@ git commit -m "fix(auto-resume): bounded identity grace replaces one-shot no_res
 - Consumes: Task 1's `spawn_auto_resume_hub_with_schedules` + the `identity_grace_entered` info log; existing `wait_frame_matching`, `connect_and_capture_inventory`; `WsState.identity` (pub `upsert` identity.rs:102, pub retired field :43).
 - Produces: `spawn_server_with_specs_hub_and_state(cli_commands, delays, identity_grace_delays) -> (String, TerminalRegistry, WsState)` in tests/common/mod.rs; e2e-local helpers `crash_once_codex_spec(marker)`, `create_codex_terminal`, `wait_recovered_or_fail_on_exited`, `assert_no_exited_settle_for`, `grace_event_capture`; two new e2e tests.
 
-- [ ] **Step 1: Harness helper (tests/common/mod.rs)** — add `spawn_server_with_specs_hub_and_state` (clone of the existing hub helper's body, hub spawned via `freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(state.clone(), auto_resume_rx, delays, identity_grace_delays)`, returning `(url, registry, state)`); refactor `spawn_server_with_specs_and_auto_resume_hub` to delegate to it with harness-default grace `vec![25, 25]` (drops the returned state) so ALL hub-harness tests exercise the grace path cheaply. Claude-driven tests never engage grace (identity present at decision), so delays stay cheap.
+- [x] **Step 1: Harness helper (tests/common/mod.rs)** — add `spawn_server_with_specs_hub_and_state` (clone of the existing hub helper's body, hub spawned via `freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(state.clone(), auto_resume_rx, delays, identity_grace_delays)`, returning `(url, registry, state)`); refactor `spawn_server_with_specs_and_auto_resume_hub` to delegate to it with harness-default grace `vec![25, 25]` (drops the returned state) so ALL hub-harness tests exercise the grace path cheaply. Claude-driven tests never engage grace (identity present at decision), so delays stay cheap.
 
-- [ ] **Step 2: Write the e2e tests**
+- [x] **Step 2: Write the e2e tests**
 
 Shared scaffolding at the top of auto_resume_e2e.rs:
 
@@ -636,7 +638,7 @@ async fn crash_with_identity_never_arriving_settles_exited_after_grace() {
 }
 ```
 
-- [ ] **Step 3: Verify intended failure shape (vacuity check) + focused run**
+- [x] **Step 3: Verify intended failure shape (vacuity check) + focused run**
 
 The grace-success test cannot go RED in the classic order here (Task 1 already landed the fix), so verify non-vacuity empirically instead: temporarily edit the harness call in THIS test only to pass grace `vec![]`, run the test, expect FAIL (no replaced; an immediate exited settle fails the waiter). Restore `vec![2_000, 2_000]`. Record the vacuity-check output in the task commit message body.
 
@@ -644,23 +646,23 @@ Run: `cargo test -p freshell-ws --test auto_resume_e2e crash_with_identity`
 
 Expected: PASS with the restored schedule.
 
-- [ ] **Step 4: Run the full binary**
+- [x] **Step 4: Run the full binary**
 
 Run: `cargo test -p freshell-ws --test auto_resume_e2e`
 
 Expected: PASS — both new tests plus both pre-existing claude tests and both `#[should_panic]` ring-pin tests.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 None planned beyond keeping the two tests self-contained for readability (repo test style).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-ws --test auto_resume_e2e --test restore_spawn_gate` AND `cargo test -p freshell-ws auto_resume` (lib)
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-ws/tests/auto_resume_e2e.rs crates/freshell-ws/tests/common/mod.rs
@@ -680,13 +682,13 @@ git commit -m "test(auto-resume): e2e pins for identity grace (success-in-grace 
 
 **Interfaces:** none beyond Task 1/2 having landed (the classifier is only safe to delete BECAUSE the defect no longer produces the waived shape).
 
-- [ ] **Step 1: Deletion pre-check (read-only)**
+- [x] **Step 1: Deletion pre-check (read-only)**
 
 Run: `grep -rn "classify-resume-waiver\|classifyResumeWaiver" --exclude-dir=node_modules --exclude-dir=target --exclude-dir=.git --exclude-dir=.worktrees . | grep -v "/docs/plans/"`
 
 Expected: hits ONLY in `scripts/classify-resume-waiver.ts`, `test/unit/scripts/classify-resume-waiver.test.ts`, and the auto_resume_e2e.rs comments. (`docs/plans/` is excluded by design: historical plans may keep the tokens as ORIGINAL narrative — including THIS plan and the flake-hardening plan; the supersede notes explain the removal.)
 
-- [ ] **Step 2: Delete + scrub + supersede notes**
+- [x] **Step 2: Delete + scrub + supersede notes**
 
 ```bash
 git rm scripts/classify-resume-waiver.ts test/unit/scripts/classify-resume-waiver.test.ts
@@ -694,17 +696,17 @@ git rm scripts/classify-resume-waiver.ts test/unit/scripts/classify-resume-waive
 
 Scrub: remove classifier/waiver sentences from the ring's doc comment block in auto_resume_e2e.rs (keep every field enumeration and every assertion). Supersede notes: one line each, dated, referencing kata kmbs and this plan.
 
-- [ ] **Step 3: Verify zero residue + unit lane green**
+- [x] **Step 3: Verify zero residue + unit lane green**
 
 Run: the same grep as Step 1 — expected NO output. Then: `npm run test:vitest -- run test/unit/scripts --config config/vitest/vitest.config.ts` — expected PASS with amplifier-backfill-bundle.test.ts still present and green, and `classify-resume-waiver` absent from its output (note: test/unit/scripts is NOT emptied by the deletion — amplifier-backfill-bundle.test.ts remains).
 
-- [ ] **Step 4: Run impacted-test verification**
+- [x] **Step 4: Run impacted-test verification**
 
 Run: `npm run test:unit` AND `cargo test -p freshell-ws --test auto_resume_e2e`
 
 Expected: PASS (comment-only rust change cannot shift behavior).
 
-- [ ] **Step 5: Commit the task**
+- [x] **Step 5: Commit the task**
 
 ```bash
 git add scripts/classify-resume-waiver.ts test/unit/scripts/classify-resume-waiver.test.ts crates/freshell-ws/tests/auto_resume_e2e.rs docs/plans/2026-09-02-test-flake-hardening.md docs/plans/2026-07-27-agent-crash-resilience.md
@@ -719,7 +721,7 @@ git commit -m "chore(tests): remove waiver classifier — mechanism-B fixed, cer
 
 **Files:** none (receipts under `<logs_dir>/reports/cert/`, untracked)
 
-- [ ] **Step 1: Campaign** — failure counts MUST aggregate; `|| echo` alone would mask ten failures:
+- [x] **Step 1: Campaign** — failure counts MUST aggregate; `|| echo` alone would mask ten failures:
 
 ```bash
 mkdir -p /home/dan/code/freshell/.worktrees/.the-usual-logs/auto-resume-hub-grace/reports/cert
@@ -739,7 +741,7 @@ test -z "$fails"
 
 Expected: ten PASS lines, aggregate `none`, exit 0. Additionally: `grep -l "no_resumable_identity" /home/dan/code/freshell/.worktrees/.the-usual-logs/auto-resume-hub-grace/reports/cert/auto-resume-run-*.log` must exit nonzero with NO output — a passing run prints no settle frames anywhere (the exhaustion test asserts on receipt silently; the string appears only in ring dumps on failure).
 
-- [ ] **Step 2: Campaign report** — write `reports/cert/certification.md` (per-run rows + grep result); append the ledger entry to the run progress ledger.
+- [x] **Step 2: Campaign report** — write `reports/cert/certification.md` (per-run rows + grep result); append the ledger entry to the run progress ledger.
 
 ---
 
