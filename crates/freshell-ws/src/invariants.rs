@@ -56,6 +56,10 @@ use crate::identity::TerminalIdentityRegistry;
 /// swallowed-DB-error hole): the moment an in-cwd correlatable row provably
 /// existed yet never bound. When the locator is unavailable at boot,
 /// opencode keeps the create-age tripwire so a broken topology still alarms.
+/// A rarer residual is deliberate: a fresh opencode pane that never ARMS
+/// (create carried no resolvable cwd) neither latches nor probes, so it
+/// stays alarm-silent while the locator is present — no row can ever be
+/// attributed to it, and the TUI signal lane covers its identity.
 /// (Previously derived from the deleted amplifier locator's
 /// AMPLIFIER_DIR_APPEAR_WINDOW_MS; the alarm also previously rode the
 /// amplifier locator sweep's 150ms ticker and silently never ran when no
