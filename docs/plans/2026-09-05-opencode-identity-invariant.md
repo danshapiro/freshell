@@ -1221,7 +1221,7 @@ async function readServerLogs(logsDir: string): Promise<string> {
         expect(unresolvedForRestoredPane).toEqual([])
 ```
 
-(c) Save the pin as a patch and unapply it, returning the tree to committed HEAD — the RED observation in Step 2 needs the tree at base crate behavior. The whole dance is a pure `git apply` patch-pair: NO revert command, NO reset, NO checkout — HEAD never moves and no destructive git op is used at any point (repo etiquette forbids destructive git ops):
+(c) Save the pin as a patch and unapply it, returning the tree to committed HEAD — the RED observation in Step 2 needs the tree at base crate behavior. The whole dance uses NO revert command, NO reset, NO checkout — HEAD never moves and no destructive git op is used at any point (repo etiquette forbids destructive git ops): the pin moves with `git apply`, and Step 2's gate restoration uses base-content substitution from named revisions:
 
 ```bash
 git diff -- test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts > /tmp/702-pin.patch
@@ -1231,23 +1231,25 @@ test -s /tmp/702-pin.patch   # non-empty
 
 - [ ] **Step 2: Run the spec and verify the intended failure (RED)**
 
-The fix from Tasks 1-2 is already committed, so observe RED against worktree files with the Task-2 fix temporarily unapplied and the pin re-applied — still a pure `git apply` patch-pair (no revert, no reset, no checkout; HEAD stays at the fixed branch tip throughout):
+The fix from Tasks 1-2 is already committed, so observe RED against worktree files with the gate temporarily restored to base content and the pin re-applied. The mechanism that survives ANY later commit touching the same file (focused-round-1 repair: a reverse-applied old-commit patch dies the moment a later commit edits its context lines) is base-content substitution — plain file copies from named revisions, no patch context dependency, no revert/reset/checkout, HEAD never moves:
 
 ```bash
-git show <task2-fix-sha> --format= > /tmp/702-fix.patch   # pure diff of the Task-2 fix; use the ledger-recorded Task 2 ending commit (was f0ce358c6 at execution) — later commits can shift context lines, so re-generate per run
-git apply -R /tmp/702-fix.patch               # base behavior restored in the worktree files; HEAD untouched
-git apply /tmp/702-pin.patch                  # pin now sits atop base-behavior crates
+git show 5b3851322e0ddc60d6c6c10d9b05a27c490ada2e:crates/freshell-ws/src/invariants.rs > /tmp/702-base-invariants.rs
+cp /tmp/702-base-invariants.rs crates/freshell-ws/src/invariants.rs   # base gate behavior in the worktree; HEAD untouched
 cargo build --release -p freshell-server    # e2e harness runs the worktree-built binary
+git apply /tmp/702-pin.patch                  # pin now sits atop base-behavior server
 npm run test:e2e:local -- --project=rust-chromium test/e2e-browser/specs/opencode-terminal-restore-rust.spec.ts
 ```
 
 Expected: FAIL — the pin's final assertion name-checks one or more `terminal_identity_unresolved` log lines carrying the restored never-submitted terminal id (base behavior fires at +10s create-age). A failure for any OTHER reason is spec-authoring drift: fix the pin mechanics before proceeding; do not weaken the assertion's target.
 
-Restore the committed fix afterwards, IN ORDER (unapply the pin first, then reapply the fix onto the clean tree):
+(Only `invariants.rs` needs the substitution: the base version never references the locator's new API, so the current `opencode_locator.rs` sits compatibly dormant. This assumes no later change moved `invariants.rs`'s intra-crate surface — true at authoring; if a future run's build breaks here, re-derive the base substitution the same way.) 
+
+Restore the fixed gate afterwards, IN ORDER (content restore first, then unapply the pin):
 
 ```bash
-git apply -R /tmp/702-pin.patch               # pin removed; tree at the unapplied-fix state
-git apply /tmp/702-fix.patch                  # Task-2 fix restored: tree back to committed HEAD
+git show HEAD:crates/freshell-ws/src/invariants.rs > crates/freshell-ws/src/invariants.rs
+git apply -R /tmp/702-pin.patch
 ```
 
 - [ ] **Step 3: No production implementation needed**
