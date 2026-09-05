@@ -133,8 +133,7 @@ describe('runStartup', () => {
   })
 
   describe('daemon mode', () => {
-    it('a named profile in daemon mode reads the daemon (default-profile) .env for its token', async () => {
-      const mockWindow = createMockWindow()
+    it('daemon mode is unsupported for named profiles (manual chooser, never a foreign .env token)', async () => {
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'daemon',
@@ -146,22 +145,17 @@ describe('runStartup', () => {
           minimizeToTray: true,
           setupCompleted: true,
         },
-        createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
       })
       ;(ctx as { profileId?: string }).profileId = 'work'
-      const readEnvToken = vi.fn().mockResolvedValue('daemon-token')
-      ctx.readEnvToken = readEnvToken
 
       const result = await runStartup(ctx)
 
-      expect(result.type).toBe('main')
-      // The machine daemon anchors its .env at the default config dir
-      // (~/.freshell), never the named profile's dir.
-      expect(readEnvToken).toHaveBeenCalledWith(
-        path.join(os.homedir(), '.freshell', '.env'),
-      )
-      const startSpawnerCalls = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls
-      expect(startSpawnerCalls).toHaveLength(0) // daemon path never spawns
+      expect(result.type).toBe('chooser')
+      if (result.type === 'chooser') {
+        expect(result.reason).toBe('manual-choice')
+      }
+      // The daemon was NOT started for a named profile.
+      expect(ctx.daemonManager.start).not.toHaveBeenCalled()
     })
 
     it('does not start daemon if already running', async () => {

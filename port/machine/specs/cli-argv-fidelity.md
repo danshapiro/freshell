@@ -93,7 +93,7 @@ non-empty string, `terminal-registry.ts:382-385`).
 
 ### 1.2 Env assembly (`buildSpawnSpec`, `terminal-registry.ts:1076-1105`)
 
-- Strip from the parent env: `CLAUDECODE, CI, NO_COLOR, FORCE_COLOR, COLOR, PORT, AUTH_TOKEN, ALLOWED_ORIGINS, NODE_ENV, npm_lifecycle_script, OPENCODE_SERVER_USERNAME, OPENCODE_SERVER_PASSWORD` (`:1083-1097`). Already ported: `spawn.rs:165-178` (`STRIP_ENV`).
+- Strip from the parent env: `CLAUDECODE, CI, NO_COLOR, FORCE_COLOR, COLOR, PORT, AUTH_TOKEN, ALLOWED_ORIGINS, FRESHELL_CONFIG_DIR, FRESHELL_PROFILE, NODE_ENV, npm_lifecycle_script, OPENCODE_SERVER_USERNAME, OPENCODE_SERVER_PASSWORD, FRESHELL_CONFIG_DIR, FRESHELL_PROFILE` (`:1083-1097`). Already ported: `spawn.rs:165-178` (`STRIP_ENV`).
 - Force: `TERM` (fallback `xterm-256color`), `COLORTERM` (fallback `truecolor`), `LANG='en_US.UTF-8'`, `LC_ALL='en_US.UTF-8'` (`:1098-1103`). Already ported: `spawn.rs:759-769`.
 - `envOverrides` = `buildTerminalBaseEnv` (`terminal-registry.ts:1529-1542`, applied at `:1569,1579`):
   - `FRESHELL: '1'`

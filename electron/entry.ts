@@ -73,17 +73,20 @@ const bootShape = resolveBootShape(
 )
 if (bootShape.userDataDir) {
   // Electron's doc contract for app.setPath: the target directory must
-  // exist. Create-first is the documented-correct order. On EACCES/EROFS, fall
-  // back to Electron's default userData rather than dying with no window and
-  // no log line (the logger isn't live this early — console is all we have).
+  // exist. Create-first is the documented-correct order. On failure we CANNOT
+  // continue with default userData (that would share the Default profile's
+  // Chromium store AND instance lock — the exact hazard the namespacing exists
+  // to prevent), so fail loudly instead. The logger isn't live this early.
   try {
     fs.mkdirSync(bootShape.userDataDir, { recursive: true })
     app.setPath('userData', bootShape.userDataDir)
   } catch (err) {
     console.error(
-      `[freshell] could not create profile userData dir ${bootShape.userDataDir}; falling back to the default userData.`,
+      `[freshell] could not create the profile userData dir ${bootShape.userDataDir}; refusing to boot into shared-Default storage.`,
       err instanceof Error ? err.message : String(err),
     )
+    app.exit(1)
+    process.exit(1)
   }
 }
 const activeProfileId = bootShape.profileId

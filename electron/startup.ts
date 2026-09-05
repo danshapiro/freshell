@@ -1,7 +1,5 @@
 import path from 'path'
-import os from 'os'
-import { configDirForProfile, DEFAULT_PROFILE_ID } from './profile.js'
-import { readDesktopConfig } from './desktop-config.js'
+import { DEFAULT_PROFILE_ID } from './profile.js'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
 import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
@@ -338,9 +336,14 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     return { type: 'wizard' }
   }
 
-  if (ctx.forcedLaunch) {
+    if (ctx.forcedLaunch) {
     return executeForcedLaunch(ctx, ctx.forcedLaunch)
   }
+
+  // One canonical ownership decision for the whole boot: three consumers below
+  // read it (discovery skip, launch policy, port auto-bump).
+  const ownsServerNow =
+    ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)
 
   const discoverCandidates = ctx.discoverLaunchCandidates ?? (() => defaultDiscoverLaunchCandidates(ctx))
   // A named profile's app-bound/daemon boot owns its server; discovery is
@@ -349,8 +352,9 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   // always-ask: an always-ask boot shows the chooser with the real candidate
   // list (never auto-connects — chooseLaunchAction checks ownsServer first).
   const skipDiscovery =
-    (ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)) &&
-    !desktopConfig.alwaysAskOnLaunch
+    ownsServerNow &&
+    !desktopConfig.alwaysAskOnLaunch &&
+    (desktopConfig.serverMode === 'app-bound' || desktopConfig.serverMode === 'daemon')
   const candidates = skipDiscovery ? [] : await discoverCandidates()
   const savedRemoteReachable = desktopConfig.serverMode === 'remote' && !!desktopConfig.remoteUrl
     ? await checkRemoteReachable(ctx, desktopConfig.remoteUrl)
@@ -363,8 +367,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     candidates,
     savedRemoteReachable,
     savedRemoteAuthenticated,
-    ownsServer:
-      ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID),
+    ownsServer: ownsServerNow,
   })
 
   if (launchAction.type === 'show-setup') {
@@ -387,6 +390,18 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
 
   switch (desktopConfig.serverMode) {
     case 'daemon': {
+      if (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID) {
+        // Daemon mode is machine-global per README: profiles share one daemon,
+        // and its port is the install-time default-profile port, NOT the named
+        // profile's (possibly auto-bumped) one. Rather than deriving a fragile
+        // port, refuse daemon mode on named profiles and let the user pick.
+        ctx.mainProcessLogger?.log({
+          severity: 'warn',
+          event: 'named_profile_daemon_unsupported',
+          profileId: ctx.profileId,
+        })
+        return { type: 'chooser', candidates, reason: 'manual-choice' }
+      }
       const status = await ctx.daemonManager.status()
       if (!status.installed) {
         throw new Error('Daemon service is not installed. Please re-run setup to configure the daemon.')
@@ -394,24 +409,18 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
       if (!status.running) {
         await ctx.daemonManager.start()
       }
-      // The daemon is machine-global: it serves from the DEFAULT profile's
-      // port, not this profile's (which may have been auto-bumped/persisted).
-      const defaultDesktopConfig = (await readDesktopConfig(configDirForProfile(DEFAULT_PROFILE_ID, os.homedir())))
-      const daemonPort = defaultDesktopConfig?.port ?? port
-      serverUrl = `http://localhost:${daemonPort}`
+      serverUrl = `http://localhost:${port}`
       break
     }
     case 'app-bound': {
-      const ownsServer =
-        ctx.ownsServer ?? (ctx.profileId !== undefined && ctx.profileId !== DEFAULT_PROFILE_ID)
       let launchPort = port
-      if (ownsServer && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
+      if (ownsServerNow && ctx.isPortAvailable && !(await ctx.isPortAvailable(port))) {
         // The profile's configured port is already held (typically by another
         // profile's resident server). Bump to the next free port rather than
         // spawning a doomed server whose health check would succeed against
         // the OTHER instance (/api/health is unauthenticated).
         let chosen = -1
-        for (let candidate = port + 1; candidate < Math.min(port + 200, 65536); candidate++) {
+        for (let candidate = port + 1; candidate <= Math.min(port + 200, 65535); candidate++) {
           if (await ctx.isPortAvailable(candidate)) {
             chosen = candidate
             break
@@ -474,15 +483,10 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   if (desktopConfig.serverMode === 'remote') {
     authToken = desktopConfig.remoteToken
   } else if (ctx.readEnvToken) {
-    // Daemon mode is machine-global (one spotlight instance, one .env): a
-    // named profile booting in daemon mode must read the token from the
-    // DEFAULT config dir (~/.freshell), not its own. App-bound keeps the
-    // profile-scoped dir.
-    const envDir =
-      desktopConfig.serverMode === 'daemon'
-        ? configDirForProfile(DEFAULT_PROFILE_ID, os.homedir())
-        : ctx.configDir
-    authToken = await ctx.readEnvToken(path.join(envDir, '.env'))
+    // App-bound and daemon mode anchor the token at THIS boot's config dir —
+    // daemon mode is machine-global and only reachable from the default
+    // profile (the named-daemon path returns before this point).
+    authToken = await ctx.readEnvToken(path.join(ctx.configDir, '.env'))
   }
 
   return loadMainWindow(ctx, serverUrl, authToken)

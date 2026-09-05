@@ -147,7 +147,7 @@ WSL/Windows-exe paths `procCwd` is often `undefined` and cwd is applied inside t
 ### 2.4 Environment (exact)
 `buildSpawnSpec` `1083-1105`:
 - **Stripped from parent env:** `CLAUDECODE, CI, NO_COLOR, FORCE_COLOR, COLOR, PORT, AUTH_TOKEN,
-  ALLOWED_ORIGINS, NODE_ENV, npm_lifecycle_script, OPENCODE_SERVER_USERNAME, OPENCODE_SERVER_PASSWORD`.
+  ALLOWED_ORIGINS, FRESHELL_CONFIG_DIR, FRESHELL_PROFILE, NODE_ENV, npm_lifecycle_script, OPENCODE_SERVER_USERNAME, OPENCODE_SERVER_PASSWORD, FRESHELL_CONFIG_DIR, FRESHELL_PROFILE`.
 - **Forced overrides (in order):**
   `TERM = process.env.TERM || 'xterm-256color'`, `COLORTERM = process.env.COLORTERM || 'truecolor'`,
   `LANG = 'en_US.UTF-8'`, `LC_ALL = 'en_US.UTF-8'` (`1100-1103`).

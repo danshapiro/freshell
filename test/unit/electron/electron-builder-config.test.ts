@@ -41,6 +41,14 @@ describe('electron-builder Windows config', () => {
     )
   })
 
+  it('packages profile-picker assets as extra resources', () => {
+    const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
+
+    expect(config).toMatch(
+      /extraResources:\n(?:.*\n)*?  - from: dist\/profile-picker\n    to: profile-picker/,
+    )
+  })
+
   it('sets Linux maintainer metadata required by Debian packaging', () => {
     const config = readText(path.join(PROJECT_ROOT, 'config/electron-builder.yml'))
 
