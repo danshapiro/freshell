@@ -112,9 +112,13 @@ for Rust; Playwright for the kata's e2e oracle.
     'RESTORE_DIVERGED'` (`history-service.ts:54-62`). The claude adapter's
     `getSnapshot` throws this error unwrapped with code `RESTORE_NOT_FOUND`
     for any freshclaude/claude pane whose session resolves to
-    `kind: 'missing'` in history or whose history source is unconfigured
+    `kind: 'missing'` in history
     (`server/fresh-agent/adapters/claude/adapter.ts:228-233`,
-    `server/fresh-agent/history/claude/history-service.ts:136-139`).
+    `server/fresh-agent/history/claude/history-service.ts:136-139`). (The
+    distinct unconfigured-history-source sub-case throws a plain `Error` one
+    level up at `adapter.ts:109-112` and keeps its existing 500 mapping;
+    production wiring always configures the source, so no behavior depends on
+    that sub-case.)
   - `agentRouteErrorStatus(error)` (`server/agent-api/router.ts:54-69`) — the
     existing status mapper for every other error.
   - `fail(message)` (`server/agent-api/response.ts:6`).
@@ -248,7 +252,7 @@ to:
 
 Run: `npm run test:vitest -- run test/server/agent-capture-pane.test.ts --config config/vitest/vitest.server.config.ts`
 
-Expected: PASS (all four tests in the file).
+Expected: PASS (all five tests in the file: 3 pre-existing + 2 new).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -371,7 +375,7 @@ immediately after `capture_browser_pane_is_422_use_screenshot_pane`
 deserialization the `layout_store_tests.rs` `sync_from` helper (`:8-10`)
 performs; `freshell_protocol` and `json!` are already in scope in this crate's
 test modules, and `state_with_registry()`/`app()`/`get()` are the existing
-helpers (`:2647`, `:2656`, `:2692`).
+helpers (`:2647`, `:2656`, `:2690`).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -583,7 +587,7 @@ message.
    (`layout_store.rs:208-216`); `get_pane_snapshot` — (`layout_store.rs:656`);
    `update_from_ui` — (`layout_store.rs:235`); test helpers `sync_from`/`leaf`
    — (`layout_store_tests.rs:8-14`), `state_with_registry`/`app`/`get` —
-   (`terminal_tabs.rs:2647/2656/2692`).
+   (`terminal_tabs.rs:2647/2656/2690`).
 4. **Executable tests:** Task 1 Step 2 red state verified against the current
    code path (unmapped error → `agentRouteErrorStatus` → 500 at `router.ts:68`).
    Task 2 Step 2 red state verified against current dispatch (`maybe_capture`
