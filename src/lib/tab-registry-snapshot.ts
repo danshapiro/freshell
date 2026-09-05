@@ -67,6 +67,8 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         extensionName: content.extensionName,
         props: content.props,
       }
+    case 'host-stats':
+      return {}
     case 'picker':
     default:
       return {}

@@ -745,7 +745,7 @@ use crate::identity_sink::{
 };
 use freshell_opencode::{
     Endpoint, EventSource, EventStreamHandle, OpencodeServeManager, PortAllocator, ServeConfig,
-    ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
+    ServeDeps, ServeHttp, ServeHttpError, ServeHttpRequest, ServeHttpResponse,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -805,7 +805,9 @@ impl ServeHttp for ResumeServeHttp {
         &'a self,
         req: ServeHttpRequest,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a,
+        >,
     > {
         if req.url.contains("/global/health") {
             return Box::pin(async move { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });

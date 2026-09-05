@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
+import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -674,5 +675,150 @@ describe('fresh-agent-ws', () => {
     })
     expect(Object.keys(session.pendingQuestions)).toEqual(['question-repeat'])
     expect(session.pendingQuestions['question-repeat'].questions[0].question).toBe('Proceed?')
+  })
+})
+
+describe('rollback folds (kata 1wxv)', () => {
+  it('freshAgent.session.rolledBack revokes attention for the owning pane', () => {
+    const store = configureStore({
+      reducer: {
+        freshAgent: freshAgentReducer,
+        panes: panesReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        panes: emptyPanesState(),
+      },
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-rb',
+      paneId: 'pane-rb',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-rb',
+        sessionId: 'ses_rb_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_rb_1' },
+        status: 'idle',
+      },
+    }))
+    store.dispatch(markTabAttention({ tabId: 'tab-rb' }))
+    store.dispatch(markPaneAttention({ paneId: 'pane-rb' }))
+
+    // Decision 10: an undone done is not done — the broadcast revokes green/attention
+    // on every device, initiating pane included. The pane-scoped thunk handles the
+    // tab-level OR re-derivation (covered in turnCompletionAttention.test.ts).
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'ses_rb_1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.rolledBack',
+        sessionId: 'ses_rb_1',
+        removedTurnIds: ['msg_u2'],
+        canRedo: true,
+        revokeAttention: true,
+      },
+    })).toBe(true)
+
+    expect(store.getState().turnCompletion.attentionByPane['pane-rb']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByTab['tab-rb']).toBeUndefined()
+  })
+
+  it('rollback-flagged errors do not hit the pane error surface, but INVALID_SESSION_ID still marks lost', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'ses_rb_err'
+    const key = `freshopencode:opencode:${sessionId}`
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId,
+        latestTurnId: null,
+        status: 'idle',
+        revision: 1,
+      },
+    })).toBe(true)
+
+    // A rollback-flagged refusal is routed to the initiating pane's own notice banner
+    // (matched on requestId in the view) — NEVER the pane error surface.
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.error',
+        sessionId,
+        code: 'BUSY_TURN',
+        rollback: true,
+        requestId: 'rb-req-1',
+        message: 'Rollback is not supported while a turn is running — queue a steer message or wait for the turn to finish.',
+      },
+    })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].lastError).toBeUndefined()
+    expect(store.getState().freshAgent.sessions[key].lost ?? false).toBe(false)
+
+    // …while a rollback-flagged INVALID_SESSION_ID still engages client recovery.
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.error',
+        sessionId,
+        code: 'INVALID_SESSION_ID',
+        rollback: true,
+        requestId: 'rb-req-2',
+        message: 'Session missing on server',
+      },
+    })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].lost).toBe(true)
+  })
+
+  it('acks + session.redone are consumed without redux writes', () => {
+    const actionTypes: string[] = []
+    const store = createFreshAgentPaneStore(actionTypes)
+    const sessionId = 'ses_rb_quiet'
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: { sessionId, ...event },
+    })
+
+    // Requesting-sink acks are consumed by the initiating pane's own ws subscriber
+    // (composer refill); snapshot invalidation rehydrates redux — no direct writes.
+    expect(sendEvent({
+      type: 'freshAgent.rolledBack',
+      requestId: 'rb-a1',
+      direction: 'undo',
+      mode: 'step',
+      removedPromptText: 'prompt',
+      removedTurnIds: ['msg_u1'],
+      canRedo: true,
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.redone',
+      requestId: 'rb-a2',
+      direction: 'redo',
+      restoredThroughTurnId: 'msg_u2',
+      canRedo: false,
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.session.redone',
+      restoredThroughTurnId: 'msg_u2',
+      canRedo: false,
+    })).toBe(true)
+
+    expect(actionTypes).toEqual([])
   })
 })

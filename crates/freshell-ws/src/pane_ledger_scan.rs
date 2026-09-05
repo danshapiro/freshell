@@ -437,6 +437,20 @@ impl PaneLedger {
         if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
             candidates.extend(files.flatten().map(|f| f.path()));
         }
+        // kata 1wxv: the rollback subtree participates in per-row quarantine.
+        // Its payloads are OPAQUE to the ledger (no ledgerVersion gate, no
+        // typed-parse check) — the schema is owned by
+        // freshell_freshagent::rollback_record and version-gated in that
+        // crate's sink layer — so health here is JSON-parseability, nothing
+        // more.
+        if let Ok(providers) = std::fs::read_dir(Self::rollback_dir(root)) {
+            for provider in providers.flatten() {
+                if let Ok(files) = std::fs::read_dir(provider.path()) {
+                    candidates.extend(files.flatten().map(|f| f.path()));
+                }
+            }
+        }
+        let rollback_root = Self::rollback_dir(root);
         for path in candidates {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.contains(".tmp-") {
@@ -456,6 +470,12 @@ impl PaneLedger {
             let error = match load_row::<serde_json::Value>(&path) {
                 Err(e) => format!("{e}"),
                 Ok(value) => {
+                    if path.starts_with(&rollback_root) {
+                        // Opaque rollback payload: JSON-parse health only (see
+                        // the candidate comment above); a parseable row is
+                        // healthy here regardless of shape.
+                        continue;
+                    }
                     let version = value.get("ledgerVersion").and_then(|v| v.as_u64());
                     if version == Some(u64::from(LEDGER_VERSION)) {
                         // Version ok — but does it parse as its row type?

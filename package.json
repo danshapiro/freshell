@@ -21,7 +21,7 @@
     "prebuild": "tsx scripts/prebuild-guard.ts",
     "build": "npm run typecheck:client && npm run build:client && npm run build:server",
     "build:client": "vite build --config config/vite/vite.config.ts",
-    "build:server": "tsc -p tsconfig.server.json",
+    "build:server": "tsc -p tsconfig.server.json && node scripts/bake-server-build-id.mjs",
     "build:electron": "node -e \"const fs=require('fs');fs.rmSync('dist/electron',{recursive:true,force:true});fs.rmSync('node_modules/.cache/tsconfig.electron.tsbuildinfo',{force:true});fs.rmSync('node_modules/.cache/tsconfig.electron-preload.tsbuildinfo',{force:true})\" && tsc -p tsconfig.electron.json && tsc -p tsconfig.electron-preload.json",
     "build:wizard": "vite build --config config/vite/vite.wizard.config.ts",
     "build:launch-chooser": "vite build --config config/vite/vite.launch-chooser.config.ts",

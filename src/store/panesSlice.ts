@@ -287,6 +287,10 @@ function normalizePaneContent(
   if (input.kind === 'extension') {
     return input  // Extension content passes through unchanged
   }
+  if (input.kind === 'host-stats') {
+    // Stateless pane kind: the bare kind is the whole persisted/runtime shape.
+    return { kind: 'host-stats' }
+  }
   // Editor/picker content passes through unchanged
   return input
 }

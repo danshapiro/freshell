@@ -8,6 +8,7 @@ import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 import type { ReadyCapabilities, ServerMessage, SessionLocator } from '@shared/ws-protocol'
+import type { TerminalInterestSnapshot } from '@/lib/terminal-interest'
 import { createLogger } from '@/lib/client-logger'
 
 const log = createLogger('WsClient')
@@ -159,6 +160,7 @@ export class WsClient {
   // Per-connection: {} until a ready with capabilities arrives on the CURRENT
   // socket; reset on disconnect so a downgraded server is honored.
   private serverCapabilities: NonNullable<ReadyCapabilities> = {}
+  private terminalInterestRevision = 0
 
   // Bumped for every new WebSocket; each socket's handlers capture their
   // generation and no-op once superseded (a late event from an abandoned socket
@@ -260,6 +262,7 @@ export class WsClient {
       // Capture BEFORE the replay block below: the CURRENT socket's ack decides
       // whether the blind in-flight create replay runs.
       this.serverCapabilities = msg.capabilities ?? {}
+      this.terminalInterestRevision = 0
       this.clearReadyTimeout()
       const isReconnect = this.wasConnectedOnce
       this.wasConnectedOnce = true
@@ -503,7 +506,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
           ...helloExtensions,
         })
       }
@@ -875,6 +878,23 @@ export class WsClient {
           queueSize: this.pendingMessages.length,
         }, 'warn')
       }
+    }
+  }
+
+  /** Presentation updates are sent only on the current negotiated socket.
+   * Never put stale interest in the reconnect/reliable-command queue. */
+  sendTerminalInterest(snapshot: TerminalInterestSnapshot): boolean {
+    if (this.intentionalClose || this._state !== 'ready'
+      || this.ws?.readyState !== WebSocket.OPEN
+      || this.serverCapabilities.terminalInterestV1 !== true
+      || this.terminalInterestRevision >= Number.MAX_SAFE_INTEGER) return false
+    const revision = ++this.terminalInterestRevision
+    try {
+      this.sendNow({ type: 'terminal.interest', revision,
+        focusedTerminalId: snapshot.focusedTerminalId, visibleTerminalIds: snapshot.visibleTerminalIds })
+      return true
+    } catch {
+      return false
     }
   }
 

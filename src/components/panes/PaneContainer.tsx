@@ -9,6 +9,7 @@ import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import FreshAgentView from '../fresh-agent/FreshAgentView'
 import ExtensionPane from './ExtensionPane'
+import HostStatsPane from './HostStatsPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
@@ -747,6 +748,8 @@ function PickerWrapper({
           viewMode: 'source',
           wordWrap: true,
         }
+      case 'host-stats':
+        return { kind: 'host-stats' }
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
@@ -886,6 +889,14 @@ function renderContent(
           paneContent={content}
           hidden={hidden}
         />
+      </ErrorBoundary>
+    )
+  }
+
+  if (content.kind === 'host-stats') {
+    return (
+      <ErrorBoundary key={paneId} label="Host Stats">
+        <HostStatsPane tabId={tabId} paneId={paneId} />
       </ErrorBoundary>
     )
   }

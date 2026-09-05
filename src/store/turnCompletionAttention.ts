@@ -62,3 +62,29 @@ export function dismissTabGreen(tabId: string) {
     }
   }
 }
+
+/**
+ * kata 1wxv decision 10: rollback revokes the rolled-back turn's attention/green on
+ * this device. sessionKey is the `provider:sessionId` turn-completion namespace.
+ * PANE-SCOPED (r3 correction 7): clears ONLY the owning pane's attention entry, then
+ * re-derives the TAB flag as the OR over the tab's REMAINING panes — a sibling pane's
+ * attention (an unrelated completion in the same tab) SURVIVES the rollback; the tab is
+ * blanket-cleared only when no remaining pane still holds attention. Never chimes and
+ * never dispatches recordTurnComplete — an undone done is not done.
+ */
+export function revokeFreshAgentAttention(sessionKey: string) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    const hit = selectPaneBySessionKey(getState(), sessionKey)
+    if (!hit) return
+    const { tabId, paneId } = hit
+    const tc = getState().turnCompletion
+    if (tc?.attentionByPane?.[paneId]) dispatch(clearPaneAttention({ paneId }))
+    const layout = getState().panes?.layouts?.[tabId]
+    const anyRemaining = layout
+      ? collectPaneEntries(layout).some((entry) => (
+        entry.paneId !== paneId && getState().turnCompletion.attentionByPane?.[entry.paneId]
+      ))
+      : false
+    if (!anyRemaining && tc?.attentionByTab?.[tabId]) dispatch(clearTabAttention({ tabId }))
+  }
+}

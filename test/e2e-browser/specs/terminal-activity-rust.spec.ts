@@ -72,7 +72,7 @@ class WsCapture {
     this.ws = new WebSocket(wsUrl)
     this.opened = new Promise((resolve, reject) => {
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 7, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
         resolve()
       })
       this.ws.on('error', reject)

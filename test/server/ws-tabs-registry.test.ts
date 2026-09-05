@@ -127,8 +127,8 @@ describe('ws tabs registry protocol', () => {
     delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
   })
 
-  it('uses protocol version 7 and rejects version 6 clients with reload-required mismatch', async () => {
-    expect(WS_PROTOCOL_VERSION).toBe(7)
+  it('uses protocol version 8 and rejects version 7 clients with reload-required mismatch', async () => {
+    expect(WS_PROTOCOL_VERSION).toBe(8)
     await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))

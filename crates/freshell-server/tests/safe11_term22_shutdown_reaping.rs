@@ -309,7 +309,7 @@ async fn shutdown_reaps_terminal_and_codex_sidecar_within_5s() {
         &mut ws,
         &serde_json::json!({
             "type": "hello",
-            "protocolVersion": 7,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
             "token": AUTH_TOKEN,
         }),
     )

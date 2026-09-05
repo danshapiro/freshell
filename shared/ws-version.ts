@@ -1,1 +1,1 @@
-export const WS_PROTOCOL_VERSION = 7 as const
+export const WS_PROTOCOL_VERSION = 8 as const

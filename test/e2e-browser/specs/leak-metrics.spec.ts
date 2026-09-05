@@ -141,7 +141,7 @@ async function killTerminalViaWs(wsUrl: string, token: string, terminalId: strin
       const timer = setTimeout(() => reject(new Error(`no terminal.exit for ${terminalId} within 15s`)), 15_000)
       let attached = false
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'hello', protocolVersion: 7, token }))
+        ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
       })
       ws.on('message', (raw) => {
         let frame: any

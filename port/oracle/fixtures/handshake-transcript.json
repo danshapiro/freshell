@@ -1,7 +1,7 @@
 {
   "note": "Representative handshake snapshot for the oracle DATA-LEVEL mutation suite. Captured once from the ORIGINAL node server via port/oracle/harness. Regenerate with: npx tsx port/oracle/fixtures/generate-handshake-fixture.ts",
   "capturedAt": "2026-07-05T04:20:52.619Z",
-  "wsProtocolVersion": 7,
+  "wsProtocolVersion": 8,
   "serverMessageTypes": [
     "ready",
     "settings.updated",
@@ -12,11 +12,11 @@
     {
       "dir": "out",
       "type": "hello",
-      "raw": "{\"type\":\"hello\",\"token\":\"ad6493f2-bafc-4501-9da8-1be352164d82\",\"protocolVersion\":7}",
+      "raw": "{\"type\":\"hello\",\"token\":\"ad6493f2-bafc-4501-9da8-1be352164d82\",\"protocolVersion\":8}",
       "parsed": {
         "type": "hello",
         "token": "ad6493f2-bafc-4501-9da8-1be352164d82",
-        "protocolVersion": 7
+        "protocolVersion": 8
       }
     },
     {

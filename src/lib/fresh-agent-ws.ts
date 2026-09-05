@@ -6,6 +6,7 @@ import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from 
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
+import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
 import {
   addAssistantMessage,
   addPermissionRequest,
@@ -300,6 +301,23 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         usage: event.usage as { input_tokens?: number; output_tokens?: number } | undefined,
       }))
       return true
+    case 'freshAgent.rolledBack':
+    case 'freshAgent.redone':
+      // kata 1wxv requesting-sink ack: consumed by the initiating pane's own ws
+      // subscriber (FreshAgentView — composer refill + refill notice). Redux state
+      // rehydrates from the snapshot these events invalidate; nothing to write here.
+      return true
+    case 'freshAgent.session.rolledBack': {
+      // Decision 10: an undone done is not done — revoke green/attention on EVERY
+      // device (the initiating pane included). Never touches recordTurnComplete.
+      // The thunk is pane-scoped: tab-level green re-derives as the OR over the
+      // tab's REMAINING panes (r3 correction 7).
+      dispatch(revokeFreshAgentAttention(`${locator.provider}:${sessionId}`))
+      return true
+    }
+    case 'freshAgent.session.redone':
+      // Sibling-convergence broadcast; the invalidating snapshot carries the state.
+      return true
     case 'freshAgent.permission.request': {
       const tool = event.tool as { name?: string; input?: Record<string, unknown> } | undefined
       dispatch(addPermissionRequest({
@@ -343,6 +361,11 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     case 'freshAgent.error':
       if (event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
+      } else if (event.rollback === true) {
+        // kata 1wxv: rollback rejections route to the initiating pane's notice
+        // banner via the view's own ws subscriber (matched on requestId) —
+        // never the pane error surface.
+        return true
       } else {
         dispatch(sessionError({
           ...locator,

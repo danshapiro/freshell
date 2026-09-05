@@ -58,7 +58,7 @@ class SyntheticClient {
     const client = new SyntheticClient(ws)
     client.send({
       type: 'hello',
-      protocolVersion: 7,
+      protocolVersion: 8,
       token: info.token,
     })
     await client.waitFor((f) => f.type === 'ready')

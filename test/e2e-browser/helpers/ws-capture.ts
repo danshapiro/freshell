@@ -18,7 +18,7 @@ export class WsCapture {
         15_000,
       )
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 7, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
       })
       this.ws.on('message', (data) => {
         let frame: WsFrame

@@ -91,7 +91,7 @@ class SyntheticClient {
     const client = new SyntheticClient(ws)
     client.send({
       type: 'hello',
-      protocolVersion: 7,
+      protocolVersion: 8,
       token: info.token,
       capabilities: { paneReconcileV1: true },
     })

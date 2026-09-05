@@ -53,6 +53,12 @@ const CLOUD_SKIP_SPECS = [
   // Rust-only: asserts e2eServerKind === 'rust' but runs under chromium
   // project (not in RUST_ONLY_SPECS — pre-existing config gap)
   'term28-path-shadow-rust.spec.ts',
+  // Server-build mismatch reload: the Cloud Run image builds WITHOUT git
+  // metadata (.dockerignore drops .git), so the Rust bake and the Vite
+  // define are both "unknown" there and the client's compare is inert BY
+  // DESIGN — a mismatched ready can never trigger a reload on that lane.
+  // Coverage lives on the local rust-chromium project.
+  'server-build-mismatch-rust.spec.ts',
   // Environment-sensitive: page lifecycle (pagehide/unload) timing differs
   // in cloud containers; passes locally but flakes in cloud
   'tabs-client-retire.spec.ts',

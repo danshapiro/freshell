@@ -1,0 +1,12 @@
+Name:	my (weird) proc
+Umask:	0022
+State:	D (disk sleep)
+Tgid:	404
+Pid:	404
+PPid:	1
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+VmPeak:	  100000 kB
+VmSize:	   97656 kB
+VmRSS:	    4321 kB
+Threads:	2

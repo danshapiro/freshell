@@ -1,0 +1,12 @@
+Name:	postgres
+Umask:	0022
+State:	S (sleeping)
+Tgid:	303
+Pid:	303
+PPid:	1
+Uid:	999	999	999	999
+Gid:	999	999	999	999
+VmPeak:	  350000 kB
+VmSize:	  292968 kB
+VmRSS:	   88888 kB
+Threads:	4

@@ -4291,6 +4291,10 @@ export class TerminalRegistry extends EventEmitter {
     throwShutdownFailures(failures, 'Codex registry shutdown work failed.')
   }
 
+  getMaxTerminals(): number {
+    return this.maxTerminals
+  }
+
   getDiagnosticCounts(): TerminalRegistryDiagnosticCounts {
     const byMode: TerminalRegistryDiagnosticCounts['terminals']['byMode'] = {}
     let running = 0

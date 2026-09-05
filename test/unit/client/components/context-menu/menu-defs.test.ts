@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
+import { registerFreshAgentPaneActions, type FreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import type { TabsRegistryGroups } from '@/lib/tab-registry-open'
 
@@ -328,6 +329,116 @@ describe('buildMenuItems — fresh-agent context-sensitive items', () => {
     const sessionIdx = items.findIndex(i => i.type === 'item' && i.id === 'fc-copy-session')
     expect(sessionIdx).toBeGreaterThan(0)
     expect(items[sessionIdx - 1]?.type).toBe('separator')
+  })
+})
+
+describe('buildMenuItems — fresh-agent rollback rows (kata 1wxv)', () => {
+  const unregisters: Array<() => void> = []
+  afterEach(() => {
+    let unregister: (() => void) | undefined
+    while ((unregister = unregisters.pop()) !== undefined) unregister()
+  })
+
+  function buildFreshAgentMenu(paneId: string, actions?: FreshAgentPaneActions) {
+    if (actions) unregisters.push(registerFreshAgentPaneActions(paneId, actions))
+    const mockActions = createMockActions()
+    const mockContext = createMockContext(mockActions)
+    const target: ContextTarget = { kind: 'fresh-agent', sessionId: 'sess-1', paneId }
+    return buildMenuItems(target, mockContext)
+  }
+
+  function expectStructurallyIntact(items: ReturnType<typeof buildMenuItems>) {
+    // Hiding rows must never leave orphan separators behind.
+    expect(items[0]?.type).not.toBe('separator')
+    expect(items.at(-1)?.type).not.toBe('separator')
+    for (let i = 1; i < items.length; i += 1) {
+      expect(items[i - 1].type === 'separator' && items[i].type === 'separator').toBe(false)
+    }
+  }
+
+  it('a freshcodex pane menu NEVER renders the "Redo last turn" row (enabled or disabled) — the undo row stands alone after one separator', () => {
+    const items = buildFreshAgentMenu('pane-rb-codex', {
+      undo: vi.fn(),
+      redo: vi.fn(),
+      canUndo: true,
+      canRedo: false,
+      // freshcodex server-side capability stamp: undo only.
+      undoSupported: true,
+      redoSupported: false,
+    })
+    const itemIds = items.filter(i => i.type === 'item').map(i => i.id)
+    expect(itemIds).toContain('fresh-agent-undo')
+    expect(itemIds).not.toContain('fresh-agent-redo')
+    expect(items.find(i => i.type === 'item' && i.label === 'Redo last turn')).toBeUndefined()
+    const undoIdx = items.findIndex(i => i.id === 'fresh-agent-undo')
+    expect(items[undoIdx - 1]).toMatchObject({ type: 'separator', id: 'fc-rollback-sep' })
+    expect(items.filter(i => i.id === 'fc-rollback-sep')).toHaveLength(1)
+    // The undo row itself is shown enabled (no dim stand-ins for the hidden row).
+    expect(items[undoIdx]).toMatchObject({ disabled: false })
+    expectStructurallyIntact(items)
+  })
+
+  it('a freshclaude pane menu shows an enabled "Redo last turn" row beside the undo row when canRedo', () => {
+    const undo = vi.fn()
+    const redo = vi.fn()
+    const items = buildFreshAgentMenu('pane-rb-claude', {
+      undo,
+      redo,
+      canUndo: true,
+      canRedo: true,
+      undoSupported: true,
+      redoSupported: true,
+    })
+    const redoItem = items.find(i => i.type === 'item' && i.id === 'fresh-agent-redo')
+    expect(redoItem).toBeDefined()
+    if (redoItem?.type === 'item') {
+      expect(redoItem.label).toBe('Redo last turn')
+      expect(redoItem.disabled ?? false).toBe(false)
+      redoItem.onSelect()
+      expect(redo).toHaveBeenCalledTimes(1)
+    }
+    expect(items.filter(i => i.type === 'item').map(i => i.id)).toContain('fresh-agent-undo')
+    expectStructurallyIntact(items)
+  })
+
+  it('a redo-capable pane with nothing to redo keeps the row disabled — only capability omission hides the row', () => {
+    const items = buildFreshAgentMenu('pane-rb-idle', {
+      undo: vi.fn(),
+      redo: vi.fn(),
+      canUndo: true,
+      canRedo: false,
+      undoSupported: true,
+      redoSupported: true,
+    })
+    expect(items.find(i => i.type === 'item' && i.id === 'fresh-agent-redo')).toMatchObject({ disabled: true })
+    expectStructurallyIntact(items)
+  })
+
+  it('omits the whole rollback section — separator included — when the pane stamps neither capability', () => {
+    const items = buildFreshAgentMenu('pane-rb-legacy', {
+      undo: vi.fn(),
+      redo: vi.fn(),
+      canUndo: false,
+      canRedo: false,
+      undoSupported: false,
+      redoSupported: false,
+    })
+    const itemIds = items.filter(i => i.type === 'item').map(i => i.id)
+    expect(itemIds).not.toContain('fresh-agent-undo')
+    expect(itemIds).not.toContain('fresh-agent-redo')
+    expect(items.find(i => i.id === 'fc-rollback-sep')).toBeUndefined()
+    // The remainder of the menu stays exactly as before.
+    expect(itemIds).toEqual(['fc-copy', 'fc-select-all', 'fc-copy-session'])
+    expectStructurallyIntact(items)
+  })
+
+  it('an unregistered pane leaves no rollback rows and no orphan separator', () => {
+    const items = buildFreshAgentMenu('pane-rb-unregistered')
+    const itemIds = items.filter(i => i.type === 'item').map(i => i.id)
+    expect(itemIds).not.toContain('fresh-agent-undo')
+    expect(itemIds).not.toContain('fresh-agent-redo')
+    expect(items.find(i => i.id === 'fc-rollback-sep')).toBeUndefined()
+    expectStructurallyIntact(items)
   })
 })
 

@@ -60,6 +60,9 @@ vi.mock('lucide-react', () => ({
   LayoutGrid: ({ className }: { className?: string }) => (
     <svg data-testid="layout-grid-icon" className={className} />
   ),
+  Gauge: ({ className }: { className?: string }) => (
+    <svg data-testid="gauge-icon" className={className} />
+  ),
   Eye: ({ className }: { className?: string }) => (
     <svg data-testid="eye-icon" className={className} />
   ),

@@ -28,6 +28,7 @@
 - **Extension system** — Add new pane types, CLI integrations, and server-side services via manifest-based extensions. Enable and disable from the Extensions management page.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work. Fresh-agent panes carry their context meter in their status strip instead of the header.
+- **Host pressure dashboard pane** — CPU, memory, pressure, and I/O at a glance with near-zero overhead (metrics stream only while you're watching). Linux, WSL, and macOS only — not shown on Windows.
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
 - **AI-powered session titles** — Right-click any session and generate a Gemini-powered title based on conversation content
 - **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
@@ -64,6 +65,12 @@ npm run serve   # Production build and run
 ```
 
 `npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
+
+### Fresh agents
+
+Freshclaude, Freshcodex, and Freshopencode share a chat interface with attachments, tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
+
+You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
 
 ## Stream Deck
 

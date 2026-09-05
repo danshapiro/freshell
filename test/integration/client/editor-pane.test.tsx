@@ -58,6 +58,9 @@ vi.mock('lucide-react', () => ({
   SplitSquareVertical: ({ className }: { className?: string }) => (
     <svg data-testid="split-vertical-icon" className={className} />
   ),
+  Gauge: ({ className }: { className?: string }) => (
+    <svg data-testid="gauge-icon" className={className} />
+  ),
   Globe: ({ className }: { className?: string }) => (
     <svg data-testid="globe-icon" className={className} />
   ),

@@ -10,7 +10,7 @@
 //! This crate is **serialization only, no logic** (ADR Decision 1/5). It is the
 //! shared seam consumed by the future Rust server and the equivalence oracle.
 //! Changing the wire is out of scope; the contract is pinned at
-//! `WS_PROTOCOL_VERSION = 7`.
+//! `WS_PROTOCOL_VERSION = 8`.
 //!
 //! ## Modeling notes
 //!
@@ -34,10 +34,10 @@ pub use settings::*;
 
 /// The frozen WebSocket protocol version. Asserted equal to the committed
 /// contract (`shared/ws-version.ts`, `ws-message-inventory.json`) by the tests.
-pub const WS_PROTOCOL_VERSION: u32 = 7;
+pub const WS_PROTOCOL_VERSION: u32 = 8;
 
 /// Every `type` discriminant the protocol speaks, both directions, sorted.
-/// (31 client→server + 58 server→client = 89.)
+/// (33 client→server + 58 server→client = 91.)
 pub fn all_message_types() -> Vec<&'static str> {
     let mut types: Vec<&'static str> = client_messages::CLIENT_MESSAGE_TYPES
         .iter()
