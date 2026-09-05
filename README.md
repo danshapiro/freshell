@@ -107,8 +107,9 @@ configuration.
   later instances log a warning (`global_hotkey_registration_failed`) and have
   no hotkey. Give each profile a distinct hotkey in its own settings.
 - App-bound servers: each profile spawns its own server pinned to that
-  profile's config dir (`FRESHELL_CONFIG_DIR`); choose a distinct port per
-  profile.
+  profile's config dir (`FRESHELL_CONFIG_DIR`) and port — a named profile
+  never adopts another profile's already-running local server; choose a
+  distinct port per profile.
 - Daemon services (`freshell.service`, `com.freshell.server`,
   "Freshell Server" task) are machine-global single instances — do not use
   daemon mode in two profiles at once.
