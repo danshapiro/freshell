@@ -26,7 +26,7 @@ Fix the auto-resume hub "mechanism-B" production defect (kata `kmbs`): under loa
 
 **Goal:** A fresh-agent pane whose identity legitimately arrives seconds after its generation crashes is auto-resumed instead of permanently dead, and the waiver classifier that existed only to tolerate that defect is deleted along with its certification passes.
 
-**Architecture:** One bounded grace loop inserted at the single decision choke point (`run_hub_body` in `crates/freshell-ws/src/auto_resume.rs`), before the crash-context construction: when the just-queried session-ref is `None` and the arresting settle reason would be `no_resumable_identity`, sleep-and-recheck through a bounded `HubConfig.identity_grace_delays` schedule; identity arriving in grace falls through to the unchanged `decide` path (normal Resume), cancel-during-grace settles loudly, exhaustion settles `no_resumable_identity` exactly as before. The crash-invariant that a dead terminal's identity is retired is restored uniformly at the top of the Resume arm (an upsert un-retires per identity.rs:123, so a grace-resolved identity must be re-retired before spawning the replacement). Classifier removal is a two-file deletion plus a comment scrub and historical-doc supersede notes.
+**Architecture:** One bounded grace loop inserted at the single decision choke point (`run_hub_body` in `crates/freshell-ws/src/auto_resume.rs`), before the crash-context construction: when the just-queried session-ref is `None` and the arresting settle reason would be `no_resumable_identity`, sleep-and-recheck through a bounded `HubConfig.identity_grace_delays` schedule; identity arriving in grace falls through to the unchanged `decide` path (normal Resume), cancel-during-grace settles loudly, exhaustion settles `no_resumable_identity` exactly as before. The crash-invariant that a dead terminal's identity is retired is restored whenever the grace path observed a late revival (an upsert un-retires per identity.rs:123): the hub re-retires the old terminal's identity after the grace block and BEFORE the `decide` match — covering the Resume arm AND every settle tail (flap breaker, respawn cap, retries exhausted) that could otherwise leave the dead terminal in live-only identity lookups. Classifier removal is a two-file deletion plus a comment scrub and historical-doc supersede notes.
 
 **Tech Stack:** Rust 2021 workspace (tokio, axum), cargo; Vitest/TS only for verification of the deletion (no new TS).
 
@@ -176,6 +176,35 @@ async fn cancel_during_grace_settles_cancelled_and_skips_further_rechecks() {
 }
 ```
 
+(f) Review-round-2 pin: a grace-revived identity is re-retired even when the decision is a SETTLE (cap exhausted at decision time):
+
+```rust
+#[tokio::test(start_paused = true)]
+async fn grace_revived_identity_is_re_retired_even_on_settle_outcomes() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let fake = FakeDriver::healthy();
+    fake.set_cap_exhausted(true); // settle, not resume, after revival
+    fake.set_session(None);
+    let cfg = HubConfig::with_schedules(vec![2_000, 10_000], vec![500, 500]);
+    let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+    tx.send(crash("t7", 1, "claude", Some("cr-7"), 5_000)).unwrap();
+    drain().await;
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    drain().await;
+    fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    drain().await;
+    assert!(fake.respawn_calls().is_empty(), "cap was exhausted");
+    assert_eq!(
+        fake.settled_frames(),
+        vec![("t7".to_string(), "respawn_cap_exhausted".to_string(), None)]
+    );
+    // The revived identity did NOT leak into live-only registry lookups:
+    assert!(fake.retired().contains(&"t7".to_string()));
+}
+```
+
 (e) Existing test RESTRUCTURE (review-driven): `cap_exhausted_and_no_identity_and_clean_and_shell_settle_without_respawn` keeps session None through t2's WHOLE grace before restoring Some for t3/t4 — set the cfg grace to `vec![500, 500]`, and after the t2 send advance 500+drain twice (2-step grace), assert t2's settle, THEN `fake.set_session(Some(...))` before the t3/t4 leg. All four final settle-frame assertions unchanged in content (order t1, t2, t3 as today). Do NOT touch the `decide()`-level pin in `missing_identity_settles_exited_immediately` — `decide` still returns `no_resumable_identity`; the grace lives in the loop, not in `decide`.
 
 - [ ] **Step 2: Run the new tests and verify the intended failures**
@@ -225,19 +254,27 @@ pub(crate) fn auto_resume_identity_grace_delays() -> Vec<u64> {
 (iii) `AutoResumeDriver` gains one method; `WsAutoResumeDriver` implements it via `state.identity.retire(terminal_id)` (returns bool, ignore the value — idempotent); `FakeDriver` records into a `retired: Vec<String>` with a `retired()` accessor:
 
 ```rust
-/// Restore the crash invariant: the dead terminal's identity entry is
-/// retired. The exit hook retires before the CrashEvent is sent, but a
-/// grace-resolved identity landed via upsert AFTER the hook — and upsert
-/// un-retires (identity.rs:123) — so the hub re-retires before spawning
-/// the replacement. Idempotent on the ordinary (already-retired) path.
+/// Restore the crash invariant after a grace-revived identity: the exit
+/// hook retires before the CrashEvent is sent, but a grace-resolved identity
+/// landed via upsert AFTER the hook — and upsert un-retires (identity.rs:123)
+/// — so the hub re-retires before the decision match. Called only when the
+/// grace path observed the revival; idempotent regardless.
 fn retire_identity(&self, terminal_id: &str);
 ```
 
-(iv) The grace block at the top of the event loop. Add the `'events:` label to the outer `while let Some(ev) = rx.recv().await` and replace the first line after it:
+(iv) The grace block at the top of the event loop. Add the `'events:` label to the outer `while let Some(ev) = rx.recv().await`, track late-revival, and re-retire before the match:
 
 ```rust
 'events: while let Some(ev) = rx.recv().await {
             let mut sref = driver.resumable_session_ref(&ev.terminal_id);
+            // True iff the identity was absent at the first query but
+            // present after the grace — i.e. an upsert REVIVED the retired
+            // entry (upsert un-retires, identity.rs:123) while the pane was
+            // dead. Such identities must be re-retired before the decision
+            // match or the dead terminal stays in live-only lookups
+            // (identity.list()/find_by_session filter retired) no matter
+            // whether the outcome is Resume or a settle.
+            let mut identity_revived = false;
             // Identity grace (kata kmbs): `no_resumable_identity` used to be
             // a one-shot, never-reconsidered settle — a permanently dead pane
             // when identity legitimately landed seconds later (locator
@@ -273,6 +310,7 @@ fn retire_identity(&self, terminal_id: &str);
                     }
                     sref = driver.resumable_session_ref(&ev.terminal_id);
                     if sref.is_some() {
+                        identity_revived = true;
                         tracing::info!(
                             terminal_id = %ev.terminal_id,
                             "terminal.auto_resume.identity_grace_resolved"
@@ -281,10 +319,12 @@ fn retire_identity(&self, terminal_id: &str);
                     }
                 }
             }
+            if identity_revived {
+                driver.retire_identity(&ev.terminal_id);
+            }
 ```
 
-The remaining loop body is untouched EXCEPT the Resume arm's first line becomes
-`driver.retire_identity(&ev.terminal_id);` (before `let (provider, session_id, cwd) = sref.expect(...)`), with the crash-invariant comment.
+The remaining loop body is untouched (the ordinary Resume path never sets `identity_revived` — its identity was retired by the exit hook before the CrashEvent was sent — so no separate Resume-arm retire is needed; the conditional retire covers Resume AND every settle tail uniformly).
 
 (v) Public harness entry point (no pub visibility change on HubConfig — the schedule constructor is pub(crate) and the spawn fn takes plain Vecs):
 
@@ -580,7 +620,7 @@ git commit -m "test(auto-resume): e2e pins for identity grace (success-in-grace 
 
 - [ ] **Step 1: Deletion pre-check (read-only)**
 
-Run: `grep -rn "classify-resume-waiver\|classifyResumeWaiver" --exclude-dir=node_modules --exclude-dir=target --exclude-dir=.git --exclude-dir=.worktrees . | grep -v "^docs/plans/"`
+Run: `grep -rn "classify-resume-waiver\|classifyResumeWaiver" --exclude-dir=node_modules --exclude-dir=target --exclude-dir=.git --exclude-dir=.worktrees . | grep -v "/docs/plans/"`
 
 Expected: hits ONLY in `scripts/classify-resume-waiver.ts`, `test/unit/scripts/classify-resume-waiver.test.ts`, and the auto_resume_e2e.rs comments. (`docs/plans/` is excluded by design: historical plans may keep the tokens as ORIGINAL narrative — including THIS plan and the flake-hardening plan; the supersede notes explain the removal.)
 
@@ -605,9 +645,11 @@ Expected: PASS (comment-only rust change cannot shift behavior).
 - [ ] **Step 5: Commit the task**
 
 ```bash
-git add -A scripts test/unit/scripts crates/freshell-ws/tests/auto_resume_e2e.rs docs/plans
+git add scripts/classify-resume-waiver.ts test/unit/scripts/classify-resume-waiver.test.ts crates/freshell-ws/tests/auto_resume_e2e.rs docs/plans/2026-09-02-test-flake-hardening.md docs/plans/2026-07-27-agent-crash-resilience.md
 git commit -m "chore(tests): remove waiver classifier — mechanism-B fixed, certification strict again"
 ```
+
+(Explicit pathspecs only — `git add <path>` stages the deletions for the two removed files; no broad `git add -A <dir>` in a concurrent repo.)
 
 ---
 
@@ -633,7 +675,7 @@ echo "aggregate failures:${fails:-none}"
 test -z "$fails"
 ```
 
-Expected: ten PASS lines, aggregate `none`, exit 0. Additionally: `grep -l "no_resumable_identity" reports/cert/auto-resume-run-*.log` must return NOTHING — a passing run prints no settle frames anywhere (the exhaustion test asserts on receipt silently; the string appears only in ring dumps on failure).
+Expected: ten PASS lines, aggregate `none`, exit 0. Additionally: `grep -l "no_resumable_identity" /home/dan/code/freshell/.worktrees/.the-usual-logs/auto-resume-hub-grace/reports/cert/auto-resume-run-*.log` must exit nonzero with NO output — a passing run prints no settle frames anywhere (the exhaustion test asserts on receipt silently; the string appears only in ring dumps on failure).
 
 - [ ] **Step 2: Campaign report** — write `reports/cert/certification.md` (per-run rows + grep result); append the ledger entry to the run progress ledger.
 
