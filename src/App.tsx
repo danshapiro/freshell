@@ -46,6 +46,7 @@ import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
+import { startSessionGreyTouchWatcher } from '@/store/sessionGreyTouch'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
@@ -514,6 +515,7 @@ export default function App() {
     let cleanedUp = false
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
+    let stopSessionGreyTouch: (() => void) | null = null
     let stopWsDisconnectSync: (() => void) | null = null
     let bootstrapDataLoading = false
     let sidebarWindowLoading = false
@@ -553,6 +555,7 @@ export default function App() {
         // fetches (cleanup + stopTabRegistrySync are already assigned by now).
         cleanup?.()
         stopTabRegistrySync?.()
+        stopSessionGreyTouch?.()
       }
 
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
@@ -715,6 +718,10 @@ export default function App() {
       // early messages.
       const ws = getWsClient()
       stopTabRegistrySync = startTabRegistrySync(appStore, ws)
+      // Grey-transition touch: sessions leaving non-grey status (any of the
+      // four tiers) get an activity ratchet, so the default sort floats them
+      // to the top of the grey agents. Store-only; no WS dependency.
+      stopSessionGreyTouch = startSessionGreyTouchWatcher(appStore)
 
       // Set up hello extension to include session IDs for prioritized repair
       ws.setHelloExtensionProvider(() => ({
@@ -1592,6 +1599,7 @@ export default function App() {
       clearReconcileResultWait()
       cleanup?.()
       stopTabRegistrySync?.()
+      stopSessionGreyTouch?.()
       stopWsDisconnectSync?.()
       void cleanupPromise
     }
