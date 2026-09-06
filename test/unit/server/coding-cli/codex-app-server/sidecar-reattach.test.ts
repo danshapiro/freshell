@@ -678,6 +678,58 @@ describeWithLinuxProc('CodexSidecarReconciler settleFailedClaim', () => {
     expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
   })
 
+  it('settles a codex_survivor_identity failure on a dead survivor by unlinking its record WITHOUT signaling', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'settle-identity-gone',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-identity',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const log = createReconcilerLog()
+    const reconciler = new CodexSidecarReconciler({ log })
+    expect(await reconciler.hold(ownership)).toBe('held')
+    const claimed = reconciler.claimForSession('thr-identity')
+    expect(claimed).not.toBeNull()
+    // Pre-settle state: held + in-flight, file on disk — so the drain below is non-vacuous.
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 1 })
+    await expect(fsp.stat(ownership.metadataPath)).resolves.toBeDefined()
+
+    // The survivor dies between claim and settle. At settle time the record's process
+    // classification is NOT 'owned' (the group resolves 'gone') — the same record shape the
+    // runtime codes codex_survivor_identity on and pointedly leaves on disk (see "refuses attach
+    // when the survivor group is gone" above; disposal is the settler's job).
+    process.kill(-pid, 'SIGKILL')
+    await waitForProcessExit(pid)
+    rawChildren.delete(pid) // already dead and reaped; afterEach must never signal a reused pgid
+    expect(await isProcessGroupAlive(pid)).toBe(false)
+
+    // The conservative verdict pins NO signal delivery: a 'gone' group is unlinked without being
+    // signaled. Spy installed AFTER the rig's own SIGKILL so only the settle itself is observed.
+    const originalKill = process.kill
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((killPid: number, signal?: NodeJS.Signals | number) =>
+      originalKill(killPid, signal as any)) as typeof process.kill)
+    try {
+      await reconciler.settleFailedClaim(claimed!, 'codex_survivor_identity')
+    } finally {
+      killSpy.mockRestore()
+    }
+
+    // Not one real signal was aimed at the dead group (signal 0 liveness probes excluded).
+    expect(killSpy.mock.calls.filter(([killPid, signal]) => killPid === -pid && signal !== 0)).toEqual([])
+    // The dead record is unlinked from disk …
+    await expect(fsp.stat(ownership.metadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    // … through the silent-success 'gone' verdict: no refusal/throw warn fired.
+    expect(log.warn).not.toHaveBeenCalled()
+    // … and dropClaim bookkeeping ran: nothing held, claimable, in-flight, or sweep-protected.
+    expect(reconciler.claimForSession('thr-identity')).toBeNull()
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set())
+  })
+
   it('settles a codex_survivor_not_writer failure by keeping the survivor alive and held', async () => {
     const metadataDir = await makeTempDir()
     const { pid, identity } = await spawnRawSurvivingChild()
