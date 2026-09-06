@@ -234,6 +234,17 @@ function applyOverride(
     createdAt: ov?.createdAtOverride ?? session.createdAt,
     archived: ov?.archived ?? session.archived ?? false,
     titleSource,
+    // b5fb: expose the reset-flow provenance exactly when the override APPLIES
+    // — `providerTitle` is the parsed pre-override title, `titleOverrideSource`
+    // the stored override row's source. A suppressed (provider-generated
+    // shadow) or absent override leaves all three fields off the row.
+    ...(shouldApplyTitleOverride
+      ? {
+          titleOverridden: true as const,
+          providerTitle: session.title,
+          titleOverrideSource: ov?.titleSource,
+        }
+      : {}),
   }
 }
 

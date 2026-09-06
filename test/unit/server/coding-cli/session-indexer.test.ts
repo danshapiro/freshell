@@ -1583,6 +1583,50 @@ describe('CodingCliSessionIndexer', () => {
     expect(session?.title).toBe('Overridden')
   })
 
+  it('exposes override provenance (titleOverridden/providerTitle/titleOverrideSource) on session rows', async () => {
+    // b5fb: a row whose title is currently shadowed by a stored override must
+    // SAY so, carry the pre-override (provider-native) title, and record the
+    // override's titleSource — the data a "Reset to provider title" preview
+    // (Task 7) needs. A row with NO override carries NONE of the three fields.
+    const fileA = path.join(tempDir, 'provenance-target.jsonl')
+    const fileB = path.join(tempDir, 'provenance-control.jsonl')
+    await Promise.all([
+      fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'First prompt title' }) + '\n'),
+      fsp.writeFile(fileB, JSON.stringify({ cwd: '/project/a', title: 'Untouched title' }) + '\n'),
+    ])
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', 'provenance-target')]: {
+          titleOverride: 'Accidental pane label',
+          titleSource: 'user',
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {},
+        },
+      },
+    })
+
+    const indexer = new CodingCliSessionIndexer([makeProvider([fileA, fileB])])
+    await indexer.refresh()
+
+    const sessions = indexer.getProjects().flatMap((project) => project.sessions)
+    const overridden = sessions.find((session) => session.sessionId === 'provenance-target')
+    expect(overridden?.title).toBe('Accidental pane label')
+    expect(overridden?.titleOverridden).toBe(true)
+    expect(overridden?.providerTitle).toBe('First prompt title')
+    expect(overridden?.titleOverrideSource).toBe('user')
+
+    const control = sessions.find((session) => session.sessionId === 'provenance-control')
+    expect(control?.title).toBe('Untouched title')
+    expect(control?.titleOverridden).toBeUndefined()
+    expect(control?.providerTitle).toBeUndefined()
+    expect(control?.titleOverrideSource).toBeUndefined()
+  })
+
   it('avoids relisting session files when nothing changed', async () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')
     await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')

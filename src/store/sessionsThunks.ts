@@ -106,6 +106,11 @@ function searchResultsToProjects(
       liveTerminalOnly: result.liveTerminalOnly,
       // STATUS-STRIP: search-result rows carry live usage for the strip meter.
       ...(result.tokenUsage ? { tokenUsage: result.tokenUsage } : {}),
+      // b5fb: search rows are an explicit allowlist — forward the reviewed
+      // reset flow's provenance fields or they never reach Redux.
+      ...(result.titleOverridden ? { titleOverridden: true } : {}),
+      ...(result.providerTitle !== undefined ? { providerTitle: result.providerTitle } : {}),
+      ...(result.titleOverrideSource ? { titleOverrideSource: result.titleOverrideSource } : {}),
     })
 
     grouped.set(result.projectPath, existing)
