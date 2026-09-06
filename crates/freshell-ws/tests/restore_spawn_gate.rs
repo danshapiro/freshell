@@ -5,6 +5,10 @@
 //! `restore == Some(true)` creates -- the restart-storm fleet the gate
 //! exists for -- are gated. REAL axum server + REAL tokio-tungstenite
 //! client, the session_identity_frames.rs harness convention.
+//!
+//! Each test uses two Tokio workers for cross-thread scheduling. Sizing every
+//! test runtime to the host's CPU count leaves less of the shared PID budget
+//! for the real storm's PTY children, reader threads, and waiter threads.
 
 mod common;
 
@@ -336,7 +340,7 @@ fn create_frame(request_id: &str, restore: bool) -> String {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn third_non_restore_create_in_window_is_rate_limited() {
     let cfg = CreateProtectConfig {
         rate_limit: 2,
@@ -365,7 +369,7 @@ async fn third_non_restore_create_in_window_is_rate_limited() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_creates_are_gated_and_non_restore_bypass() {
     // RESTORE-ONLY gate scope (user decision, PR #552): interactive
     // (non-restore) creates are latency-visible one-at-a-time human actions
@@ -433,7 +437,7 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_creates_queue_behind_held_permit_and_both_settle() {
     // Deterministic rework of the former settled-hold race: the TEST holds
     // the gate's single permit while both restore creates arrive, so "the
@@ -506,7 +510,7 @@ async fn restore_creates_queue_behind_held_permit_and_both_settle() {
     assert_eq!(registry.kill_all(), 2);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gated_create_racing_shutdown_leaves_no_live_pty() {
     // A10 (V3, FALSIFIED): main's registry.kill_all() snapshots the id set
     // ONCE (registry.rs:889-892) with no re-sweep; a detached gated create
@@ -539,7 +543,7 @@ async fn gated_create_racing_shutdown_leaves_no_live_pty() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
     // Zero-permit gate + long timeout: the restore create parks in the queue.
     let cfg = CreateProtectConfig {
@@ -587,7 +591,7 @@ async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
     assert_eq!(registry.kill_all(), 0, "no PTY may have been spawned");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
     let cfg = CreateProtectConfig {
         spawn_timeout_ms: 30_000,
@@ -637,7 +641,7 @@ async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
     assert_eq!(registry.kill_all(), 0, "no PTY may have been spawned");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
     // N restore creates > gate limit: every create must settle with its own
     // requestId, exactly once, with no duplicate PTYs; and no terminal may
@@ -714,7 +718,7 @@ async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
     assert_eq!(registry.kill_all(), N, "exactly N PTYs, no duplicates");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_requestid_resend_returns_existing_terminal() {
     // A20: the frozen client re-sends terminal.create with the SAME
     // requestId on reconnect (TerminalView.tsx:4227-4262; ws-client.ts
@@ -742,7 +746,7 @@ async fn same_requestid_resend_returns_existing_terminal() {
     assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_while_queued_does_not_double_spawn() {
     // Zero-permit gate + long timeout: the first create parks in the gate
     // queue; a duplicate arriving meanwhile must be swallowed by the
@@ -778,7 +782,7 @@ async fn duplicate_while_queued_does_not_double_spawn() {
     assert_eq!(registry.kill_all(), 0, "no PTY spawned for either copy");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resend_on_new_connection_returns_same_terminal() {
     // The A20 reconnect shape end-to-end: the frozen client re-sends an
     // unanswered create with the SAME requestId on a NEW connection
@@ -807,7 +811,7 @@ async fn resend_on_new_connection_returns_same_terminal() {
     assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resend_on_new_connection_never_swallowed_while_inflight() {
     // The A2 wedge guard: a duplicate landing while the original is in
     // flight must NEVER be silently dropped -- the original's reply goes to
