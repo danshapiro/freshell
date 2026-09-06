@@ -240,7 +240,7 @@ pub fn ensure_session(
         Ok(())
     })();
     if let Err(e) = write_result {
-        // Gate5 mutation checkpoint: prove the retained test detects missing rollback.
+        let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
     Ok(EnsuredSession {
