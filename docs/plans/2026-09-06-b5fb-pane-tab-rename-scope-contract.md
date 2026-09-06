@@ -771,7 +771,7 @@ Keep `rename_of_plain_shell_terminal_does_not_create_a_session_override` unchang
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-server patch_clear_title_removes_override_and_source rename_does_not_write`
+Run: `cargo test -p freshell-server patch_clear_title_removes_override_and_source` AND `cargo test -p freshell-server rename_does_not_write` (cargo test accepts exactly one name filter — two invocations)
 
 Expected: FAIL — the clear test fails on the leftover `titleSource: 'user'`
 (only `titleOverride` is removed today) and the two terminal pins fail because
@@ -822,7 +822,7 @@ it), so no dead-field clippy warning appears.
 The sessions PATCH handler is also covered by `sessions_tests.rs` wholesale and
 the auto-title sweep suite.
 
-Run: `cargo test -p freshell-server sessions_tests && cargo test -p freshell-server terminals && cargo fmt --all --check`
+Run: `cargo test -p freshell-server sessions::tests && cargo test -p freshell-server terminals:: && cargo fmt --all --check` (test-name filters are substring matches on the module path: `sessions::tests`, not `sessions_tests`)
 
 Expected: PASS. (`mod cascade_tests` was renamed — no stale module names in any
 error output.)
@@ -942,10 +942,10 @@ async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-freshagent rename_pane_never_cascades pane_reuse_across_sessions_never_leaves_durable_titles`
+Run: `cargo test -p freshell-freshagent rename_pane_never_cascades` AND `cargo test -p freshell-freshagent pane_reuse_across_sessions_never_leaves_durable_titles`
 
 Expected: FAIL — the current `persist_syncable_terminal_rename` calls the fake
-(`session_calls` non-empty) and bumps the revision.
+(`session_calls` non-empty) on both.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
