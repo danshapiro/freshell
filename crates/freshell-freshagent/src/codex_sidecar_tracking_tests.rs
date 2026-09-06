@@ -5,6 +5,7 @@
 //! test runs concurrently (they all take ENV_LOCK for the same keys).
 #![cfg(target_os = "linux")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use freshell_codex::sidecar_store::{
@@ -78,13 +79,22 @@ async fn create_tracked_session(
     rx: &mut tokio::sync::broadcast::Receiver<String>,
     request_id: &str,
 ) -> String {
+    create_tracked_session_with_resume(st, rx, request_id, None).await
+}
+
+async fn create_tracked_session_with_resume(
+    st: &FreshCodexState,
+    rx: &mut tokio::sync::broadcast::Receiver<String>,
+    request_id: &str,
+    resume_session_id: Option<&str>,
+) -> String {
     st.handle_create(FreshAgentCreate {
         request_id: request_id.to_string(),
         session_type: freshell_protocol::SessionType::Freshcodex,
         provider: Some(freshell_protocol::AgentProvider::Codex),
         cwd: None,
         legacy_restore_context: None,
-        resume_session_id: None,
+        resume_session_id: resume_session_id.map(str::to_string),
         session_ref: None,
         model: None,
         model_selection: None,
@@ -237,5 +247,195 @@ async fn failed_spawn_leaves_no_record() {
     assert!(
         guard.records().is_empty(),
         "a failed spawn must scrub the record it optimistically wrote"
+    );
+}
+
+// ── Task 3: scrub the record on EVERY reap path ─────────────────────────────
+
+/// Build a tracked sleeper + exit watcher exactly as production does.
+async fn build_recorded_watch(
+    ownership_id: &str,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Sender<()>,
+    u32,
+) {
+    let child = spawn_sleep_child();
+    let pid = child.id().expect("spawned pid");
+    record_spawned_sidecar(ownership_id, pid, "ws://127.0.0.1:1").await;
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+    let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+    let watcher = crate::codex::spawn_exit_watcher(
+        child,
+        ownership_id.to_string(),
+        "thread-wfah-t3".to_string(),
+        Arc::new(tx),
+        kill_rx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+    );
+    (watcher, kill_tx, pid)
+}
+
+#[tokio::test]
+async fn requested_kill_arm_removes_the_record() {
+    let _env = ENV_LOCK.lock().await;
+    let guard = TrackingStoreGuard::install();
+    let (watcher, kill_tx, pid) = build_recorded_watch("codex-sidecar-wfah-t3-kill").await;
+    assert_eq!(guard.records().len(), 1, "recorded before the kill");
+
+    kill_tx.send(()).expect("kill channel open");
+    watcher.await.expect("watcher completes");
+
+    assert!(
+        guard.records().is_empty(),
+        "requested kill scrubs the record"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the child itself is really gone"
+    );
+}
+
+#[tokio::test]
+async fn unrequested_exit_arm_removes_the_record() {
+    let _env = ENV_LOCK.lock().await;
+    let guard = TrackingStoreGuard::install();
+    let mut child = spawn_sleep_child();
+    let pid = child.id().expect("spawned pid");
+    record_spawned_sidecar("codex-sidecar-wfah-t3-crash", pid, "ws://127.0.0.1:1").await;
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
+    let (_kill_tx, kill_rx) = tokio::sync::oneshot::channel();
+    let exited = Arc::new(AtomicBool::new(false));
+    child.start_kill().expect("start_kill a live child"); // the "crash"
+
+    let watcher = crate::codex::spawn_exit_watcher(
+        child,
+        "codex-sidecar-wfah-t3-crash".to_string(),
+        "thread-wfah-t3".to_string(),
+        Arc::new(tx),
+        kill_rx,
+        exited.clone(),
+        Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+    );
+    watcher.await.expect("watcher completes");
+
+    assert!(
+        guard.records().is_empty(),
+        "the crash arm scrubs the record"
+    );
+    assert!(
+        exited.load(Ordering::SeqCst),
+        "the crash arm flips the lazy-restart flag"
+    );
+}
+
+#[tokio::test]
+async fn handle_kill_leaves_no_record() {
+    let _env = ENV_LOCK.lock().await;
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let (st, mut rx) = tracking_state();
+    let session_id = create_tracked_session(&st, &mut rx, "req-wfah-t3-kill").await;
+    assert_eq!(guard.records().len(), 1);
+
+    st.handle_kill(freshell_protocol::FreshAgentKill {
+        provider: freshell_protocol::AgentProvider::Codex,
+        session_id,
+        session_type: freshell_protocol::SessionType::Freshcodex,
+        cwd: None,
+    })
+    .await;
+
+    assert!(
+        guard.records().is_empty(),
+        "freshAgent.kill reaps through the watcher, which scrubs"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_leaves_no_records() {
+    let _env = ENV_LOCK.lock().await;
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let (st, mut rx) = tracking_state();
+    create_tracked_session(&st, &mut rx, "req-wfah-t3-shutdown-a").await;
+    // The fixture answers EVERY default `thread/start` with `thread-new-1`, so a
+    // second PLAIN create would hit finish_create's live-incumbent adopt path and
+    // tear its own sidecar down (correctly scrubbing it) — leaving ONE record and
+    // one sidecar, not the two this test needs. Resume-create pins a distinct
+    // thread id (the fixture echoes `params.threadId`), so session b genuinely
+    // owns a second live sidecar.
+    create_tracked_session_with_resume(
+        &st,
+        &mut rx,
+        "req-wfah-t3-shutdown-b",
+        Some("thread-wfah-t3-shutdown-b"),
+    )
+    .await;
+    assert_eq!(guard.records().len(), 2);
+
+    st.shutdown().await;
+
+    assert!(
+        guard.records().is_empty(),
+        "graceful shutdown reaps the lane's sidecars AND their records"
+    );
+}
+
+#[tokio::test]
+async fn create_bail_after_spawn_leaves_no_record() {
+    let _env = ENV_LOCK.lock().await;
+    // thread/start errors AFTER spawn_sidecar returned OK: the lane takes the
+    // pre-watcher bail arm, which kills the child directly. The freshly
+    // written record must not linger.
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        json!({
+            "overrides": {
+                "thread/start": { "error": { "code": -32000, "message": "forced wfah bail" } }
+            }
+        })
+        .to_string(),
+    );
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let (st, mut rx) = tracking_state();
+
+    st.handle_create(FreshAgentCreate {
+        request_id: "req-wfah-t3-bail".to_string(),
+        session_type: freshell_protocol::SessionType::Freshcodex,
+        provider: Some(freshell_protocol::AgentProvider::Codex),
+        cwd: None,
+        legacy_restore_context: None,
+        resume_session_id: None,
+        session_ref: None,
+        model: None,
+        model_selection: None,
+        permission_mode: None,
+        sandbox: None,
+        effort: None,
+        plugins: None,
+    })
+    .await;
+    let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let frame: Value = serde_json::from_str(&rx.recv().await.expect("bus")).expect("json");
+            if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed"
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("failure frame within the budget");
+    assert_eq!(
+        frame["type"], "freshAgent.create.failed",
+        "expected the bail: {frame}"
+    );
+
+    assert!(
+        guard.records().is_empty(),
+        "a pre-watcher bail must scrub the record it wrote at spawn"
     );
 }
