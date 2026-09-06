@@ -168,6 +168,24 @@ function isTextEntryElement(value: Element | null): boolean {
 }
 
 /**
+ * Maps a failed upload response to the attachment chip's error text. The
+ * server-oracle messages win (data.error / data.message), except two statuses
+ * get clearer client-side wording: 404 means the attachments route is absent
+ * on this server (e.g. a build without it), and 413 trips the 10 MB cap —
+ * express's error body there is an unparseable HTML page, so the size limit is
+ * spelled out here instead.
+ */
+export function attachmentUploadErrorMessage(
+  status: number,
+  data: { error?: string; message?: string } | null,
+  filename: string,
+): string {
+  if (status === 404) return 'Attachments are not supported by this server'
+  if (status === 413) return `"${filename}" exceeds the 10 MB attachment size limit`
+  return data?.error || data?.message || `upload failed (${status})`
+}
+
+/**
  * Raw binary upload. Deliberately NOT base64-in-JSON: the server's global
  * express.json caps JSON bodies at 1mb, so attachments ship as
  * application/octet-stream (which the JSON parser ignores) with the filename
@@ -183,8 +201,11 @@ async function uploadAttachment(file: globalThis.File): Promise<{ path: string; 
     headers,
   })
   if (!res.ok) {
-    const data = await res.json().catch(() => null) as { error?: string; message?: string } | null
-    throw new Error(data?.error || data?.message || `upload failed (${res.status})`)
+    const data = (await res.json().catch(() => null)) as {
+      error?: string
+      message?: string
+    } | null
+    throw new Error(attachmentUploadErrorMessage(res.status, data, file.name))
   }
   return res.json() as Promise<{ path: string; bytes: number }>
 }

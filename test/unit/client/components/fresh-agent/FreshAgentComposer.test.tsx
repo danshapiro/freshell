@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRef } from 'react'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { FreshAgentComposer, type FreshAgentComposerHandle } from '@/components/fresh-agent/FreshAgentComposer'
+import userEvent from '@testing-library/user-event'
+import { attachmentUploadErrorMessage, FreshAgentComposer, type FreshAgentComposerHandle } from '@/components/fresh-agent/FreshAgentComposer'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 const apiGet = vi.fn()
@@ -444,6 +445,112 @@ describe('FreshAgentComposer', () => {
       expect(getInput()).not.toHaveAttribute('aria-expanded')
       expect(getInput()).not.toHaveAttribute('aria-controls')
       expect(getInput()).not.toHaveAttribute('aria-activedescendant')
+    })
+  })
+
+  describe('attachmentUploadErrorMessage', () => {
+    it.each<[number, { error?: string; message?: string } | null, string, string]>([
+      // 404 = route absent on this server (e.g. Rust build without attachments).
+      [404, { error: 'Not found' }, 'a.txt', 'Attachments are not supported by this server'],
+      // 413 trips the 10 MB cap; express's HTML error body is unparseable, so
+      // the limit is spelled out client-side.
+      [413, null, 'big.txt', '"big.txt" exceeds the 10 MB attachment size limit'],
+      // Anything else: the server's own error/message text wins.
+      [401, { error: 'Unauthorized' }, 'a.txt', 'Unauthorized'],
+      // message worded without error: the message branch is exercised.
+      [500, { message: 'server exploded' }, 'a.txt', 'server exploded'],
+      [500, null, 'a.txt', 'upload failed (500)'],
+    ])('status %i with %s maps to a clear chip message', (status, data, filename, expected) => {
+      expect(attachmentUploadErrorMessage(status, data, filename)).toBe(expected)
+    })
+  })
+
+  describe('attachments', () => {
+    const fetchMock = vi.fn()
+
+    beforeEach(() => {
+      fetchMock.mockReset()
+      vi.stubGlobal('fetch', fetchMock)
+    })
+
+    afterEach(() => {
+      vi.unstubAllGlobals()
+    })
+
+    it('uploads an attachment, shows the stored path on the chip, and sends its path', async () => {
+      const user = userEvent.setup()
+      const onSend = vi.fn()
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ path: '/home/u/.freshell/attachments/abcd1234-note.txt', bytes: 16 }),
+      })
+      const { container } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} />)
+
+      await user.upload(
+        container.querySelector('input[type="file"]') as HTMLInputElement,
+        new File(['hello attachment'], 'note.txt', { type: 'text/plain' }),
+      )
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/fresh-agent/attachments?name=note.txt',
+        expect.objectContaining({ method: 'POST' }),
+      )
+
+      const list = await screen.findByRole('list', { name: 'Attachments' })
+      const item = within(list).getByRole('listitem')
+      await waitFor(() => {
+        expect(item).toHaveAttribute('title', '/home/u/.freshell/attachments/abcd1234-note.txt')
+      })
+
+      await user.type(getInput(), 'look at this')
+      await user.click(screen.getByRole('button', { name: 'Send' }))
+      expect(onSend).toHaveBeenCalledWith('look at this', ['/home/u/.freshell/attachments/abcd1234-note.txt'])
+    })
+
+    it('shows a visible error chip when the server lacks the attachments route (404)', async () => {
+      const user = userEvent.setup()
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ error: 'Not found' }),
+      })
+      const { container } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} />)
+
+      await user.upload(
+        container.querySelector('input[type="file"]') as HTMLInputElement,
+        new File(['hello'], 'note.txt', { type: 'text/plain' }),
+      )
+
+      const list = await screen.findByRole('list', { name: 'Attachments' })
+      expect(
+        await within(list).findByText('— Attachments are not supported by this server'),
+      ).toBeInTheDocument()
+    })
+
+    it('shows a visible error chip for an unparsable 413 (express HTML error page)', async () => {
+      const user = userEvent.setup()
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 413,
+        json: async () => { throw new SyntaxError('Unexpected token < in JSON') },
+      })
+      const { container } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} />)
+
+      await user.upload(
+        container.querySelector('input[type="file"]') as HTMLInputElement,
+        new File(['x'.repeat(64)], 'huge.txt', { type: 'text/plain' }),
+      )
+
+      // Fetch WAS called: .txt passes the client-side extension gate, so the
+      // failure provenance is the server, not a pre-fetch client rejection.
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/fresh-agent/attachments?name=huge.txt',
+        expect.objectContaining({ method: 'POST' }),
+      )
+      const list = await screen.findByRole('list', { name: 'Attachments' })
+      expect(
+        await within(list).findByText(/exceeds the 10 MB attachment size limit/),
+      ).toBeInTheDocument()
     })
   })
 
