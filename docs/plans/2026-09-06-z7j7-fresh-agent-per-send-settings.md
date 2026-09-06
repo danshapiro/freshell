@@ -610,7 +610,7 @@ Claude lane test: boot freshclaude, create pane; change permission mode via the 
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium fresh-agent-control-rust -g "per-send settings"`
 
-Expected: FAIL — codex lane: the recorded turns have identical start params (or fixture lacks the field; either is an intended failure: the fixture edit is prep, Step 3 covers both fixture and product side); claude lane: no `settings.update` frame exists in the audit log.
+Expected: FAIL — codex lane: the recorded turns lack per-turn start params (the `start` field doesn't exist on recorded turns until the fixture change). Claude lane: the `settings.update` frame IS already present in the raw stdin audit log after Task 3 (the fake sidecar logs every stdin line regardless of type), so the failing assertion is the `sdk.session.metadata` echo on the events log — the fake only emits it after the Step-3 fixture change. (Review-correction R1: the pre-Task-3 version of this clause claimed the settings.update frame itself would be absent; that inaccuracy is fixed here.)
 
 NOTE: these e2e runs need the release Rust binary (`cargo build --release -p freshell-server` — `ensureRustServerBuilt` handles it) and are LONG; run them with generous timeout. If the whole spec takes too long in this environment, the two new tests are gated by `-g "per-send settings"` and self-boot per lane; total 2 lane boots.
 
