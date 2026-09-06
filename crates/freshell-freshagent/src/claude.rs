@@ -9910,13 +9910,14 @@ rl.on('line', (line) => {
 
         // Park C2's write mid-window.
         let pid = freeze_fixture_stdin(&st, "rb-armfail-gar").await;
-        let driver = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                st.handle_compact(compact_msg("rb-armfail-gar", None)).await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let driver = st.handle_compact(compact_msg("rb-armfail-gar", None));
+        tokio::pin!(driver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut driver)
+                .await
+                .is_err(),
+            "C2's compact write is pending while the reader is stopped"
+        );
 
         // C1's terminal edge folds mid-window: retires the promoted C1 — the
         // gate stays closed with C2's armed entry + S1 still owed.
@@ -9933,10 +9934,9 @@ rl.on('line', (line) => {
             0,
             "SIGKILL the fixture child — the parked write fails"
         );
-        tokio::time::timeout(Duration::from_secs(15), driver)
+        tokio::time::timeout(Duration::from_secs(15), &mut driver)
             .await
-            .expect("the failed write resolves the handler")
-            .expect("the compact task joins");
+            .expect("the failed write resolves the handler");
         assert!(
             in_turn.load(std::sync::atomic::Ordering::SeqCst),
             "ep2-r2 F3: the failed arm's undo never releases the gate while S1 is owed"
@@ -10034,30 +10034,20 @@ rl.on('line', (line) => {
         // `write_all` could instead hide bytes accepted before the timeout.
         use tokio::io::AsyncWriteExt as _;
         let junk = [b'x'; 4096];
-        loop {
-            match tokio::time::timeout(Duration::from_millis(100), session.stdin.write(&junk)).await
-            {
-                Ok(Ok(n)) if n > 0 => {}
-                result => {
-                    assert!(
-                        result.is_err(),
-                        "the chunk fill must stop on backpressure: {result:?}"
-                    );
-                    break;
-                }
-            }
-        }
-        loop {
-            match tokio::time::timeout(Duration::from_millis(100), session.stdin.write(&junk[..1]))
-                .await
-            {
-                Ok(Ok(1)) => {}
-                result => {
-                    assert!(
-                        result.is_err(),
-                        "even a one-byte write must be blocked: {result:?}"
-                    );
-                    break;
+        for chunk in [&junk[..], &junk[..1]] {
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), session.stdin.write(chunk))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => {}
+                    result => {
+                        assert!(
+                            result.is_err(),
+                            "the {}-byte fill must stop on backpressure: {result:?}",
+                            chunk.len()
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -10165,13 +10155,14 @@ rl.on('line', (line) => {
 
         // The compact queues behind the running prior turn — and parks INSIDE
         // the write await (the stopped child never drains a full pipe).
-        let driver = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                st.handle_compact(compact_msg("rb-armrace", None)).await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let driver = st.handle_compact(compact_msg("rb-armrace", None));
+        tokio::pin!(driver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut driver)
+                .await
+                .is_err(),
+            "the compact write is pending while the reader is stopped"
+        );
         fold_terminal_edge(&in_turn, &turn_tracker);
         {
             let tracker = turn_tracker.lock().expect("turn tracker lock");
@@ -10197,10 +10188,9 @@ rl.on('line', (line) => {
             0,
             "SIGCONT the fixture child"
         );
-        tokio::time::timeout(Duration::from_secs(15), driver)
+        tokio::time::timeout(Duration::from_secs(15), &mut driver)
             .await
-            .expect("the parked compact write completes once the child resumes")
-            .expect("the compact task joins");
+            .expect("the parked compact write completes once the child resumes");
         assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             turn_tracker.lock().expect("turn tracker lock").queued.len(),
@@ -10256,13 +10246,14 @@ rl.on('line', (line) => {
         // mid-window would deadlock the rig.
         let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-armfail").await;
 
-        let driver = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                st.handle_compact(compact_msg("rb-armfail", None)).await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let driver = st.handle_compact(compact_msg("rb-armfail", None));
+        tokio::pin!(driver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut driver)
+                .await
+                .is_err(),
+            "the compact write is pending while the reader is stopped"
+        );
         // The prior turn's terminal edge folds mid-window: retires the running
         // turn; the armed compact's queued entry survives (busy holds).
         fold_terminal_edge(&in_turn, &turn_tracker);
@@ -10274,10 +10265,9 @@ rl.on('line', (line) => {
             0,
             "SIGKILL the fixture child — the parked write fails"
         );
-        tokio::time::timeout(Duration::from_secs(15), driver)
+        tokio::time::timeout(Duration::from_secs(15), &mut driver)
             .await
-            .expect("the failed write resolves the handler")
-            .expect("the compact task joins");
+            .expect("the failed write resolves the handler");
 
         // The frame is LOUD (the compact failure surfaces as INTERNAL_ERROR).
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
