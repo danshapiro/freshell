@@ -480,6 +480,13 @@ describe('Codex fresh-agent adapter', () => {
       threadId: 'thread-new-1',
       revision: 7,
     })
+    // kata z7j7: every knob per-send (the adapter merges them into turn/start).
+    expect(snapshot.capabilities.settingScopes).toEqual({
+      model: 'per-send',
+      effort: 'per-send',
+      sandbox: 'per-send',
+      permissionMode: 'per-send',
+    })
     expect(snapshot.turns).toHaveLength(2)
     expect(snapshot.turns[0]).toMatchObject({ role: 'user', ordinal: 0 })
     expect(snapshot.turns[1]).toMatchObject({ role: 'assistant', ordinal: 1 })

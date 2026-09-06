@@ -232,6 +232,14 @@ describe('Claude fresh-agent adapter', () => {
       },
     })
     expect(snapshot?.turns.map((turn: { source: string }) => turn.source)).toEqual(['live'])
+    // kata z7j7: Node claude applies model/effort/permissionMode per-send
+    // (adapter.ts send -> sdkBridge.configureSession); sandbox has no claude-side concept.
+    expect((snapshot as any)?.capabilities.settingScopes).toEqual({
+      model: 'per-send',
+      effort: 'per-send',
+      permissionMode: 'per-send',
+      sandbox: 'unsupported',
+    })
   })
 
   it('carries the session\'s published slash-command rows into the resolved snapshot', async () => {

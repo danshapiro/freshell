@@ -996,6 +996,20 @@ impl FreshOpencodeState {
             (session.model.clone(), session.effort.clone(), cwd)
         };
 
+        // kata z7j7: sandbox/permissionMode have NO opencode wire concept — when
+        // they arrive on a send they are dropped; log it observably (id + boolean
+        // flags only, never the prompt text) instead of silently.
+        if let Some(settings) = msg.settings.as_ref() {
+            if settings.sandbox.is_some() || settings.permission_mode.is_some() {
+                tracing::info!(
+                    session_id = %session.placeholder_id,
+                    has_sandbox = %settings.sandbox.is_some(),
+                    has_permission_mode = %settings.permission_mode.is_some(),
+                    "freshagent.opencode.unsupported-settings-ignored"
+                );
+            }
+        }
+
         let manager = self.fresh_agent.ensure_manager().await;
 
         // `emitStatus(state, 'running')` (adapter.ts:336) -- BEFORE any session
@@ -3787,6 +3801,138 @@ mod tests {
             sandbox: None,
             session_ref: None,
             tab_id: None,
+        }
+    }
+
+    /// kata z7j7: thread-local tracing capture for the observability-log test —
+    /// the event under test fires INLINE in `handle_send`, awaited by this
+    /// test's own current-thread runtime, so `set_default` (thread-local) is
+    /// sound and must not touch the test binary's global subscriber.
+    mod info_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Debug, Clone, Default)]
+        pub struct CapturedEvent {
+            pub message: String,
+            pub fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "message" {
+                    self.message = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedEvent {
+                        message: visitor.message,
+                        fields: visitor.fields,
+                    });
+            }
+        }
+
+        pub fn capture() -> (
+            Arc<Mutex<Vec<CapturedEvent>>>,
+            tracing::subscriber::DefaultGuard,
+        ) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (events, guard)
+        }
+    }
+
+    /// kata z7j7 (opencode scope honesty): a `freshAgent.send` whose `settings`
+    /// carries sandbox and/or permissionMode — knobs opencode has NO wire
+    /// contract for (the `prompt_async` body carries parts/model/variant only) —
+    /// must surface the drop observably as
+    /// `freshagent.opencode.unsupported-settings-ignored` (session id + two
+    /// booleans ONLY, never prompt content), instead of silently vanishing
+    /// (the pre-z7j7 "parsed and discarded" bug pattern).
+    #[tokio::test]
+    async fn send_with_unsupported_settings_emits_unsupported_settings_ignored_log() {
+        let (events, _guard) = info_capture::capture();
+        let (st, _killed) = state().await;
+        st.handle_create(create_msg("req-ign"), None).await;
+        let placeholder = "freshopencode-req-ign";
+        let mut msg = send_msg(placeholder, "ignored knobs should log");
+        msg.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            effort: None,
+            model: None,
+            permission_mode: Some("on-request".to_string()),
+            sandbox: Some(freshell_protocol::Sandbox::ReadOnly),
+        });
+        st.handle_send(msg).await;
+
+        let events = events.lock().expect("capture lock");
+        let event = events
+            .iter()
+            .find(|e| {
+                e.message
+                    .contains("freshagent.opencode.unsupported-settings-ignored")
+            })
+            .expect("expected a freshagent.opencode.unsupported-settings-ignored info event");
+        assert_eq!(
+            event.fields.get("session_id").map(String::as_str),
+            Some(placeholder),
+            "the event is tagged with the send's session id"
+        );
+        assert_eq!(
+            event.fields.get("has_sandbox").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            event.fields.get("has_permission_mode").map(String::as_str),
+            Some("true")
+        );
+        // Repo logging discipline: ids + flags ONLY — no content-shaped fields.
+        for key in event.fields.keys() {
+            assert!(
+                !matches!(key.as_str(), "text" | "prompt" | "parts" | "body"),
+                "the observability event must never carry prompt content (saw `{key}`)"
+            );
         }
     }
 

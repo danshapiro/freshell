@@ -69,6 +69,10 @@ import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
+import {
+  getCanonicalPaneResumeSessionId,
+  getFreshAgentSnapshotThreadId,
+} from '@/lib/fresh-agent-snapshot-thread'
 import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   checkpointLabelForText,
@@ -249,24 +253,14 @@ function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
 
-function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
-  if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
-    return pane.sessionRef.sessionId
-  }
-  if (isValidClaudeSessionId(pane.resumeSessionId)) {
-    return pane.resumeSessionId
-  }
-  if (pane.provider === 'claude' && isValidClaudeSessionId(pane.sessionId)) {
-    return pane.sessionId
-  }
-  return undefined
-}
-
 // Codex fresh-agent threads don't have a UUID-format validator the way Claude
 // does (isValidClaudeSessionId), so this mirrors getCanonicalPaneResumeSessionId's
 // fallback chain (sessionRef -> resumeSessionId -> sessionId) without that
 // claude-specific format check. Used only to let a lost codex session attempt
 // a bounded resume instead of being permanently abandoned (see triggerRecovery).
+// (getCanonicalPaneResumeSessionId and getFreshAgentSnapshotThreadId live in
+// @/lib/fresh-agent-snapshot-thread — shared with the settings popover's
+// settingScopes probe.)
 function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
   if (pane.sessionRef?.provider === 'codex' && pane.sessionRef.sessionId) {
     return pane.sessionRef.sessionId
@@ -278,39 +272,6 @@ function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string |
     return pane.sessionId
   }
   return undefined
-}
-
-function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: string | undefined): boolean {
-  return pane.provider === 'opencode'
-    && pane.sessionType === 'freshopencode'
-    && typeof sessionId === 'string'
-    && sessionId.startsWith('freshopencode-')
-}
-
-function getFreshAgentSnapshotThreadId(
-  pane: FreshAgentPaneContent,
-  claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
-): string | undefined {
-  if (pane.provider === 'claude') {
-    // Snapshot history is keyed by Claude's durable UUID. Runtime-only live
-    // handles stay interactive through the WS transport, but should not hit
-    // the snapshot route or surface history-load errors.
-    return getCanonicalDurableSessionId(claudeSession)
-      ?? getCanonicalPaneResumeSessionId(pane)
-  }
-  if (EARLY_STATES.has(pane.status)) {
-    // While a new session is still being created, avoid reading an older durable ref.
-    return pane.sessionId
-  }
-  const sessionRefId = pane.sessionRef?.provider === pane.provider ? pane.sessionRef.sessionId : undefined
-  if (!pane.sessionId && isFreshOpencodePlaceholderId(pane, sessionRefId)) {
-    // Legacy Freshopencode panes could persist only the placeholder sessionRef.
-    // Let freshAgent.create/resume repair it before snapshot loading; otherwise
-    // the placeholder 404 races the promotion and marks the pane unrecoverable.
-    return undefined
-  }
-  return pane.sessionId
-    ?? sessionRefId
 }
 
 function getCreatedResumeSessionId(
@@ -2978,6 +2939,7 @@ export function FreshAgentView({
               open={modelDialogOpen}
               onClose={closeModelDialog}
               onCatalogUnavailable={handleModelCatalogUnavailable}
+              settingScopes={snapshot?.capabilities?.settingScopes}
             />
           </div>
           <FreshAgentSidebar

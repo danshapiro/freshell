@@ -8,6 +8,7 @@ import { useAppSelector } from '@/store/hooks'
 import panesReducer, { initLayout, mergePaneContent } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
+import type { FreshAgentSettingScopes } from '@shared/fresh-agent-contract'
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
   type: 'settings/saveServerSettingsPatch',
@@ -183,7 +184,7 @@ function seedKilroyPane(
   })
 }
 
-function StoreBackedDialog(props: { open: boolean; onClose?: () => void; onCatalogUnavailable?: () => void }) {
+function StoreBackedDialog(props: { open: boolean; onClose?: () => void; onCatalogUnavailable?: () => void; settingScopes?: FreshAgentSettingScopes }) {
   const paneContent = useAppSelector((state) => {
     const layout = state.panes.layouts['tab-1']
     if (!layout || layout.type !== 'leaf' || layout.id !== 'pane-1' || layout.content.kind !== 'fresh-agent') {
@@ -199,6 +200,7 @@ function StoreBackedDialog(props: { open: boolean; onClose?: () => void; onCatal
       open={props.open}
       onClose={props.onClose ?? (() => {})}
       {...(props.onCatalogUnavailable ? { onCatalogUnavailable: props.onCatalogUnavailable } : {})}
+      settingScopes={props.settingScopes}
     />
   )
 }
@@ -836,5 +838,35 @@ describe('FreshAgentModelDialog (kilroy)', () => {
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(screen.getByRole('option', { name: /Claude Opus 5 \(1M context\)/ })).toBeInTheDocument()
     expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('kilroy', expect.objectContaining({ cwd: '/repo/project-a' }))
+  })
+})
+
+describe('FreshAgentModelDialog (scope-driven footer)', () => {
+  it('renders the create-only footer copy when settingScopes marks model and effort create-only', async () => {
+    const store = createStore()
+    seedFreshopencodePane(store)
+
+    renderDialog(store, {
+      open: true,
+      settingScopes: { model: 'create-only', effort: 'create-only' },
+    })
+
+    const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    expect(dialog).toHaveTextContent('applies at session start · becomes your default')
+    expect(dialog).not.toHaveTextContent('applies from your next message')
+  })
+
+  it('renders the per-send footer copy when settingScopes marks model and effort per-send', async () => {
+    const store = createStore()
+    seedFreshopencodePane(store)
+
+    renderDialog(store, {
+      open: true,
+      settingScopes: { model: 'per-send', effort: 'per-send' },
+    })
+
+    const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    expect(dialog).toHaveTextContent('applies from your next message · becomes your default')
+    expect(dialog).not.toHaveTextContent('applies at session start')
   })
 })

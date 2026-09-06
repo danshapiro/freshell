@@ -5007,6 +5007,15 @@ fn build_codex_snapshot_json(
             // hard-coded true.
             "undo": undo_capable,
             "redo": false,
+            // kata z7j7: all four knobs are per-send — the client ships them on
+            // every `freshAgent.send` and `handle_send` merges them over the
+            // session baseline before `turn/start`.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "per-send",
+                "permissionMode": "per-send",
+            },
         },
         "tokenUsage": {
             "inputTokens": 0,
@@ -15532,6 +15541,18 @@ pub(crate) mod tests {
         assert_eq!(snapshot["tokenUsage"]["inputTokens"], json!(0));
         assert_eq!(snapshot["pendingApprovals"], json!([]));
         assert_eq!(snapshot["extensions"]["codex"], json!({}));
+
+        // kata z7j7: codex honors all four settings knobs per send (merged over
+        // the session baseline before turn/start).
+        assert_eq!(
+            snapshot["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "per-send",
+                "permissionMode": "per-send",
+            })
+        );
 
         // The turn's transcript text survived the mapping.
         let turns = snapshot["turns"].as_array().expect("turns array");
