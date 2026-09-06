@@ -29,6 +29,22 @@ describe('freshAgentSlice busy/streaming clearing', () => {
     expect(state.sessions[key].status).toBe('idle')
   })
 
+  it('setSessionStatus(stuck) writes the status and clears streamingActive', () => {
+    const stuckLoc = { sessionId: 'thread-stuck', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    const stuckKey = makeFreshAgentSessionKey(stuckLoc)
+    // Seed an in-flight stream exactly like the existing streaming() tests;
+    // the wedged-sidecar deadman fires mid-turn, so `stuck` must stop the
+    // busy-driving flags just like idle/exited do.
+    let state = reducer(undefined, sessionSnapshotReceived({ ...stuckLoc, latestTurnId: null, status: 'running', streamingActive: true }))
+    expect(state.sessions[stuckKey].streamingActive).toBe(true)
+    state = reducer(state, setSessionStatus({ ...stuckLoc, status: 'stuck' }))
+    expect(state.sessions[stuckKey].status).toBe('stuck')
+    expect(state.sessions[stuckKey].streamingActive).toBe(false)
+    // Recovery must remain reachable: a stuck session still accepts later statuses.
+    state = reducer(state, setSessionStatus({ ...stuckLoc, status: 'idle' }))
+    expect(state.sessions[stuckKey].status).toBe('idle')
+  })
+
   it('sessionError (non-RESTORE) clears streamingActive and resets running -> idle', () => {
     let state = streaming()
     state = reducer(state, sessionError({ ...loc, message: 'boom' }))

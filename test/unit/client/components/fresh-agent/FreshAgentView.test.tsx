@@ -6091,6 +6091,76 @@ describe('FreshAgentView transcript font size', () => {
   })
 })
 
+describe('freshcodex wedged-sidecar notice', () => {
+  // Same store-backed render shape as the 'composer focus on pane activation
+  // (0bc6)' harness above: a mounted freshcodex pane whose live status flows
+  // from the freshAgent slice (the stuck card reads the store status, not the
+  // persisted pane content).
+  function renderFocusPane(options?: { sessionId?: string; status?: string }) {
+    const store = createStore()
+    const sessionId = options && 'sessionId' in options ? options.sessionId : 'thread-stuck-1'
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-focus-0bc6',
+            sessionId,
+            status: options?.status ?? 'idle',
+          }}
+        />
+      </Provider>,
+    )
+    return { store }
+  }
+
+  function dispatchStuck(store: ReturnType<typeof createStore>) {
+    act(() => {
+      store.dispatch(setSessionStatus({
+        sessionId: 'thread-stuck-1', sessionType: 'freshcodex', provider: 'codex', status: 'stuck',
+      }))
+    })
+  }
+
+  it('renders the stuck notice with restart and start-new actions', async () => {
+    const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
+    dispatchStuck(store)
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/appears stuck/i)
+    expect(screen.getByRole('button', { name: /restart sidecar and resume session/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
+  })
+
+  it('Restart sidecar kills the wedged session then re-mints a creating pane on the canonical resume id', async () => {
+    const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
+    // Install the spy BEFORE the stuck fold re-renders: the click closure
+    // captures `dispatch` at render time (react-redux useDispatch), so a spy
+    // installed after the last render would observe nothing.
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    dispatchStuck(store)
+    await screen.findByRole('alert')
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-stuck-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    const remints = dispatchSpy.mock.calls
+      .map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+        && action.payload?.content?.status === 'creating')
+    expect(remints).toHaveLength(1)
+    expect(remints[0].payload.content.resumeSessionId).toBe('thread-stuck-1')
+    expect(remints[0].payload.content.sessionId).toBeUndefined()
+    expect(remints[0].payload.content.createRequestId).not.toBe('req-focus-0bc6')
+  })
+})
+
 describe('snapshot scheduler integration (zrrj)', () => {
   const SCHED_SESSION_ID = 'ses_late_change'
 

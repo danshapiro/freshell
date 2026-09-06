@@ -26,6 +26,7 @@ export type FreshAgentSessionStatus =
   | 'idle'
   | 'compacting'
   | 'exited'
+  | 'stuck'
 
 export type FreshAgentSessionLocator = {
   sessionType: FreshAgentSessionType

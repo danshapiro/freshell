@@ -74,6 +74,9 @@ import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+// Copy for the stuck-notice card (role="alert") shown while the store carries
+// the deadman's 'stuck' status; recovery actions live on the card itself.
+const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
 
 // Task 14: SESSION_RESERVED bounded re-drive. The window must outlast the
 // server lease TTL (20s) with margin -- same arithmetic as TerminalView's
@@ -1370,6 +1373,24 @@ export function FreshAgentView({
     }))
   }, [claudeSession, dispatch, paneId, tabId])
 
+  // Stuck-card recovery: kill the wedged sidecar (same kill-frame shape as
+  // startNewConversation), then re-mint the pane through the existing
+  // triggerRecovery path so the canonical resume id keeps the durable thread.
+  const restartStuckSidecar = useCallback(() => {
+    const current = paneContentRef.current
+    if (current.sessionId) {
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage({
+        type: 'freshAgent.kill',
+        sessionId: current.sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+        ...(cwd ? { cwd } : {}),
+      })
+    }
+    triggerRecovery()
+  }, [sendFreshAgentMessage, triggerRecovery])
+
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane
   // reconcile owned by this view (fold-ownership rule: it folds only its own
@@ -2601,6 +2622,32 @@ export function FreshAgentView({
                 </div>
               ) : null}
               {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
+              {effectiveStatus === 'stuck' ? (
+                <div
+                  className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+                  role="alert"
+                >
+                  <span>{FRESH_AGENT_STUCK_NOTICE_TEXT}</span>
+                  <div className="flex shrink-0 gap-2">
+                    <button
+                      type="button"
+                      className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Restart sidecar and resume session"
+                      onClick={restartStuckSidecar}
+                    >
+                      Restart sidecar
+                    </button>
+                    <button
+                      type="button"
+                      className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Start new conversation"
+                      onClick={startNewConversation}
+                    >
+                      Start new conversation
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               {sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
@@ -2779,6 +2826,7 @@ export function FreshAgentView({
     paneContent,
     pendingCreateFailure,
     queuedMessages,
+    restartStuckSidecar,
     rewindToTurn,
     runShellCommand,
     sessionEnded,

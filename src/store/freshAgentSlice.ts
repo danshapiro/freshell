@@ -399,7 +399,9 @@ const freshAgentSlice = createSlice({
       // A terminal/idle status ends the turn: clear streaming too, else busy stays
       // true (isFreshAgentBusy = streamingActive || running) and the pane is stuck
       // blue after a natural stream-end / freshAgent.status:idle broadcast.
-      if (action.payload.status === 'idle' || action.payload.status === 'exited') {
+      // 'stuck' (wedged-sidecar deadman) ends the busy assertion the same way —
+      // without emitting any completion edge.
+      if (action.payload.status === 'idle' || action.payload.status === 'exited' || action.payload.status === 'stuck') {
         session.streamingActive = false
       }
     },
