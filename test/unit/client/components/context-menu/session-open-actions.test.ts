@@ -73,6 +73,7 @@ function context(overrides: Partial<MenuBuildContext> = {}): MenuBuildContext {
     actions: actions(),
     aiEnabled: false,
     platform: 'linux',
+    agentRestartSupported: true,
     ...overrides,
   }
 }

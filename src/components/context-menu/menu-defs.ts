@@ -102,6 +102,10 @@ export type MenuBuildContext = {
   actions: MenuActions
   aiEnabled: boolean
   platform: string | null
+  /** Whether the server advertised `agentRestartV1` on the ready frame.
+   * Withheld on platforms whose persisted replacement-fence recovery cannot
+   * succeed — the menu then degrades Restart to Refresh (fail closed). */
+  agentRestartSupported: boolean
   localServerInstanceId?: string
   extensions?: ClientExtensionEntry[]
   reopenActivityByPaneId?: Record<string, ReopenPaneActivity>
@@ -245,9 +249,10 @@ function buildPaneLifecycleItem(
   tabId: string,
   paneId: string,
   content: PaneContent | null,
+  agentRestartSupported: boolean,
   actions: MenuActions,
 ): MenuItem {
-  if (content && resolveAgentRestartTarget(content)) {
+  if (content && agentRestartSupported && resolveAgentRestartTarget(content)) {
     return {
       type: 'item',
       id: 'restart-pane',
@@ -448,7 +453,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     return [
       ...paneResumeMenuItem,
       ...reopenPaneAsItem,
-      buildPaneLifecycleItem(target.tabId, target.paneId, paneContent, actions),
+      buildPaneLifecycleItem(target.tabId, target.paneId, paneContent, ctx.agentRestartSupported, actions),
       { type: 'item', id: 'split-right', label: 'Split right', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'pane-split-sep' },
@@ -508,7 +513,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       ...urlItems,
       ...buildTerminalClipboardItems(terminalActions, hasSelection),
       { type: 'separator', id: 'terminal-clipboard-sep' },
-      buildPaneLifecycleItem(target.tabId, target.paneId, paneContent, actions),
+      buildPaneLifecycleItem(target.tabId, target.paneId, paneContent, ctx.agentRestartSupported, actions),
       { type: 'item', id: 'terminal-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'terminal-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'terminal-split-sep' },

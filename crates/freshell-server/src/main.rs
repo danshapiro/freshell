@@ -308,6 +308,23 @@ async fn main() -> ExitCode {
             "restart state has no durable home directory",
         ),
     };
+    // Platform gate (fix 4): off-Linux the persisted replacement fence can
+    // never be quiesced, so pending restart rows stay fail-closed forever.
+    // Surface that loudly at boot instead of silently sitting on rows that
+    // can never recover (the capability is also withheld from the handshake
+    // and every preflight is rejected with UNSUPPORTED_PLATFORM).
+    if !freshell_ws::restart::restart_fence_recovery_supported() {
+        let pending_count = restart.pending_recoveries().len();
+        if pending_count > 0 {
+            tracing::error!(
+                count = pending_count,
+                "agent.restart.pending_rows_platform_unsupported: restart transaction \
+                 journal has pending rows, but this platform cannot prove replacement-fence \
+                 quiescence (recovery requires Linux /proc ownership scanning); rows remain \
+                 fail-closed pending"
+            );
+        }
+    }
 
     // Task 2 (AI key cell): process-local mirror of Node's `AI_CONFIG`
     // (`server/ai-prompts.ts:13-23`). Boot semantics = `server/index.ts:251`:

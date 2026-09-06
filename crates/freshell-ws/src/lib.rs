@@ -776,11 +776,18 @@ async fn handle_socket(
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
+    //
+    // The restart advertisement is additionally gated on the server's
+    // platform being able to recover a persisted replacement fence
+    // (Linux /proc ownership scanning): where recovery can never succeed the
+    // capability is withheld entirely, so a client never learns to send
+    // `agent.restart` (preflight independently rejects with
+    // UNSUPPORTED_PLATFORM for hand-rolled senders).
     for msg in build_handshake_with_capabilities(
         &state,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
-        agent_restart_v1,
+        agent_restart_v1 && crate::restart::restart_fence_recovery_supported(),
     )
     .await
     {

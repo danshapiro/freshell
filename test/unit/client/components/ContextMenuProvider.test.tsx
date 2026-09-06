@@ -48,6 +48,7 @@ const wsMocks = vi.hoisted(() => ({
   onMessage: vi.fn().mockReturnValue(() => {}),
   onReconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
+  getServerCapabilities: vi.fn(() => ({ agentRestartV1: true })),
 }))
 
 const apiMocks = vi.hoisted(() => ({

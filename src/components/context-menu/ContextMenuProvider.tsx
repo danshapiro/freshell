@@ -181,6 +181,9 @@ export function ContextMenuProvider({
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const localServerInstanceId = useAppSelector((s) => s.connection?.serverInstanceId)
+  // Bumps on every `ready`; lets the menu memo re-read the freshly negotiated
+  // server capabilities (e.g. agentRestartV1) after a reconnect.
+  const lastReadyAt = useAppSelector((s) => s.connection?.lastReadyAt)
   const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
@@ -1435,6 +1438,10 @@ export function ContextMenuProvider({
       clickTarget: menuState.clickTarget,
       aiEnabled: Boolean(appSettings.ai?.geminiApiKey) || Boolean(featureFlags.aiEnabled),
       platform,
+      // The server withholds agentRestartV1 on platforms whose persisted
+      // replacement-fence recovery cannot succeed; the menu then degrades
+      // Restart to Refresh (fail closed until the ready frame advertises).
+      agentRestartSupported: ws.getServerCapabilities().agentRestartV1 === true,
       localServerInstanceId: appStore.getState().connection?.serverInstanceId,
       extensions: extensionEntries,
       reopenActivityByPaneId,
@@ -1521,6 +1528,8 @@ export function ContextMenuProvider({
     historySessions,
     expandedProjects,
     platform,
+    lastReadyAt,
+    ws,
     extensionEntries,
     appSettings.ai?.geminiApiKey,
     featureFlags.aiEnabled,

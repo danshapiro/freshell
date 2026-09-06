@@ -28,6 +28,10 @@ function context(content: PaneContent, menuActions = actions()): MenuBuildContex
     actions: menuActions,
     aiEnabled: false,
     platform: 'linux',
+    // Content-eligibility axis: the capability gate is exercised by
+    // test/unit/components/context-menu/menu-defs.test.ts; here the server
+    // advertises the capability.
+    agentRestartSupported: true,
   }
 }
 

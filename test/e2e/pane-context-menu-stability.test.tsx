@@ -26,6 +26,10 @@ const wsMocks = {
   onMessage: vi.fn(() => vi.fn()),
   onReconnect: vi.fn(() => vi.fn()),
   setHelloExtensionProvider: vi.fn(),
+  // The pane menu's Restart item is gated on the server-advertised
+  // agentRestartV1 capability; the suite runs against a Linux (gate-open)
+  // server shape, so advertise it.
+  getServerCapabilities: vi.fn(() => ({ agentRestartV1: true })),
 }
 
 const terminalInstances = vi.hoisted(() => [] as Array<{

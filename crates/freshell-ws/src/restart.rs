@@ -16,6 +16,21 @@ use serde::{Deserialize, Serialize};
 
 const RESTART_REPLACEMENT_OWNERSHIP_ENV: &str = "FRESHELL_RESTART_REPLACEMENT_ID";
 
+/// Linux is the only platform whose ownership scanning can prove a persisted
+/// replacement fence safe to re-spawn (Task: fix 4). Everywhere else the
+/// barrier stubs fail closed. Runtime tests force the gate closed with
+/// FRESHELL_RESTART_PLATFORM_GATE=0 (serialized env lock); `=1` is ignored so
+/// tests can never fabricate support on a genuinely unsupported host.
+pub fn restart_fence_recovery_supported() -> bool {
+    if std::env::var("FRESHELL_RESTART_PLATFORM_GATE")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    cfg!(target_os = "linux")
+}
+
 /// Canonical durable identity of one restartable runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuntimeLocator {
@@ -3845,6 +3860,13 @@ impl RestartRuntime for ProductionRestartRuntime {
     type ResumePlan = ();
 
     async fn preflight(&self, request: &AgentRestart) -> Result<(), RestartFailure> {
+        if !crate::restart::restart_fence_recovery_supported() {
+            return Err(RestartFailure::new(
+                AgentRestartFailureCode::UnsupportedPlatform,
+                "pane restart is not supported on this server's platform (restart recovery requires Linux /proc ownership scanning)",
+                false,
+            ));
+        }
         let (provider, _) = Self::provider(request)?;
         self.validate_durable(request)?;
         let (context, actions, fresh_preflight_reservation) = match request.kind {

@@ -20,6 +20,7 @@ const wsMock = {
   sendTabsSyncPush: vi.fn(),
   onMessage: vi.fn(() => () => {}),
   onReconnect: vi.fn(() => () => {}),
+  getServerCapabilities: vi.fn(() => ({ agentRestartV1: true })),
 }
 
 vi.mock('@/lib/ws-client', () => ({

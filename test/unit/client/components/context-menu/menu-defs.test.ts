@@ -123,6 +123,7 @@ function createMockContext(actions: MenuActions): MenuBuildContext {
     actions,
     aiEnabled: false,
     platform: null,
+    agentRestartSupported: true,
   }
 }
 

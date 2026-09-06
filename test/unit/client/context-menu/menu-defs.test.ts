@@ -111,6 +111,7 @@ function makeCtx(actions: MenuActions, overrides?: Partial<MenuBuildContext>): M
     actions,
     aiEnabled: false,
     platform: 'linux',
+    agentRestartSupported: true,
     ...overrides,
   }
 }

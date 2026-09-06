@@ -289,6 +289,10 @@ pub enum AgentRestartFailureCode {
     PreflightFailed,
     ShutdownFailed,
     ReplacementFailed,
+    /// The server's platform cannot prove a persisted replacement fence
+    /// quiescent (recovery requires Linux `/proc` ownership scanning), so the
+    /// restart was never started and the durable session was never touched.
+    UnsupportedPlatform,
 }
 
 /// Old-runtime descriptor flattened with `old*` wire names on a committed
