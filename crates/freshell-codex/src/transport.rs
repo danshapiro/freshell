@@ -87,9 +87,14 @@ impl WsTransport for TungsteniteTransport {
 
 /// A capture-before-kill ownership barrier for one process tree.
 ///
-/// Linux/YAMA can make a descendant's `/proc/<pid>/environ` unreadable as soon
-/// as its direct parent exits and it reparents outside Freshell's ancestry.
-/// Therefore callers capture ownership-tagged `(pid, starttime)` pairs before
+/// A descendant's `/proc/<pid>/environ` can become unreadable as soon as its
+/// direct parent exits and it reparents outside Freshell's ancestry.
+/// Current yama scopes only `PTRACE_MODE_ATTACH`, so environ reads of a
+/// same-uid/gid dumpable process stay allowed at any `ptrace_scope` (see
+/// [`scan_owned_pids_in`]); the unreadable class is non-dumpable transitions
+/// (`PR_SET_DUMPABLE=0`, LSM confinement) and kernels/LSM policies that scope
+/// `PTRACE_MODE_READ`. The capture-before-kill design covers every class:
+/// callers capture ownership-tagged `(pid, starttime)` pairs before
 /// closing transports or signaling the direct child, retain that exact set
 /// across retries, and confirm death through world-readable `/proc/<pid>/stat`.
 /// The start-time fence prevents a recycled PID from being mistaken for the
@@ -318,9 +323,11 @@ impl OwnedProcessTreeBarrier {
     }
 
     /// Fold newly-visible members in. An Indeterminate round NEVER shrinks
-    /// membership (a `/proc` gap can hide a live writer; retaining a stale
-    /// member is the fail-closed direction) and (re-)poisons the barrier. Only
-    /// a fully-Complete round prunes gone incarnations and clears the poison.
+    /// membership: the retain runs only when the WHOLE round is Complete —
+    /// both sub-scans (ownership and process-group) decided no gap. A `/proc`
+    /// gap from either leg can hide a live writer, so retaining a stale member
+    /// is the fail-closed direction. Only a fully-Complete round prunes gone
+    /// incarnations and clears the poison; any gap (re-)poisons the barrier.
     #[cfg(target_os = "linux")]
     fn refresh_members(&mut self) {
         let mut discovered = Vec::new();
@@ -331,21 +338,25 @@ impl OwnedProcessTreeBarrier {
                 OwnershipScan::Indeterminate(g) => gap = Some(g),
             }
         }
+        // Compute the process-group sub-scan BEFORE the retain below, so the
+        // shrink is gated on the round's FINAL poison state (fix-5 review 4.2).
+        // A numeric process-group id can be recycled. Discover forks only
+        // while at least one exact `(pid,starttime)` predecessor incarnation
+        // remains captured (pre-retain membership — a fork folded in on the
+        // same round its last predecessor dies gets its own starttime fence,
+        // which stays fail-closed). Once that captured set is empty, never use
+        // the naked pgrp as authority to adopt or signal a newly-reused group.
+        if !self.members.is_empty() {
+            if let Some(process_group_id) = self.process_group_id {
+                match scan_process_group_in(self.proc_root(), process_group_id) {
+                    OwnershipScan::Complete(pids) => discovered.extend(pids),
+                    OwnershipScan::Indeterminate(g) => gap = Some(g),
+                }
+            }
+        }
         if gap.is_none() {
             self.members
                 .retain(|(pid, start)| proc_starttime(*pid) == Some(*start));
-            // A numeric process-group id can be recycled. Discover forks only
-            // while at least one exact `(pid,starttime)` predecessor incarnation
-            // remains. Once that captured set is empty, never use the naked pgrp
-            // as authority to adopt or signal a newly-reused group.
-            if !self.members.is_empty() {
-                if let Some(process_group_id) = self.process_group_id {
-                    match scan_process_group(process_group_id) {
-                        OwnershipScan::Complete(pids) => discovered.extend(pids),
-                        OwnershipScan::Indeterminate(g) => gap = Some(g),
-                    }
-                }
-            }
         }
         if let Some(gap) = &gap {
             warn_scan_incomplete(gap);
@@ -427,8 +438,17 @@ fn env_tag_matches(environ: &[u8], ownership_env: &str, ownership_id: &str) -> b
 /// so only the root listing itself can fail; pid-gone stat races skip).
 #[cfg(target_os = "linux")]
 fn scan_process_group(process_group_id: i32) -> OwnershipScan {
+    scan_process_group_in(Path::new("/proc"), process_group_id)
+}
+
+/// One process-group round against `root` — the per-barrier test seam matching
+/// [`scan_owned_pids_in`]; production callers go through [`scan_process_group`]
+/// (the real `/proc`) or [`OwnedProcessTreeBarrier::proc_root`].
+#[cfg(target_os = "linux")]
+fn scan_process_group_in(root: &Path, process_group_id: i32) -> OwnershipScan {
     let mut found = Vec::new();
-    let entries = match std::fs::read_dir("/proc") {
+    let mut unusable_entries = 0usize;
+    let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => {
             return OwnershipScan::Indeterminate(ScanGap {
@@ -437,7 +457,17 @@ fn scan_process_group(process_group_id: i32) -> OwnershipScan {
             })
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // fix-5's letter ("must not silently skip unreadable entries"): a
+        // per-entry readdir error means the process group was never fully
+        // inspected — count it as a gap, never silently drop it.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unusable_entries += 1;
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Ok(pid) = name.parse::<i32>() else {
@@ -447,7 +477,14 @@ fn scan_process_group(process_group_id: i32) -> OwnershipScan {
             found.push(pid);
         }
     }
-    OwnershipScan::Complete(found)
+    if unusable_entries > 0 {
+        OwnershipScan::Indeterminate(ScanGap {
+            read_dir_failed: false,
+            unusable_owned_entries: unusable_entries,
+        })
+    } else {
+        OwnershipScan::Complete(found)
+    }
 }
 
 /// One ownership round against the real `/proc` (no test override). Production
@@ -489,7 +526,20 @@ fn scan_owned_pids_in(root: &Path, ownership_env: &str, ownership_id: &str) -> O
     };
     // geteuid/getegid are plain id reads with no preconditions (always sound).
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // fix-5's letter ("must not silently skip unreadable entries"): a
+        // per-entry readdir error means the owned set was never fully
+        // inspected — count it as a gap, never silently drop it. The entry's
+        // name/ownership are unknowable, so it goes to `unusable_owned_entries`
+        // (the worst case is a hidden OWNED entry, which is exactly the class
+        // the fail-closed contract exists for).
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unusable_owned_entries += 1;
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(text) = name.to_str() else { continue };
         let Ok(pid) = text.parse::<i32>() else {
@@ -819,6 +869,37 @@ mod tests {
         assert!(
             barrier.scan_incomplete,
             "the Indeterminate round re-poisons the barrier"
+        );
+    }
+
+    /// fix-5 review (4.2): the retain is gated on the round's FINAL poison
+    /// state, so a gap from the process-group sub-scan — not only from the
+    /// ownership sub-scan — must also prevent any membership shrink. A
+    /// PTY-style barrier (no ownership leg) whose process-group sub-scan
+    /// cannot list its proc root ends the round Indeterminate and keeps every
+    /// member, including ones whose stat looks long gone.
+    #[test]
+    fn indeterminate_process_group_round_never_shrinks_membership() {
+        let root = tempfile::tempdir().unwrap();
+        // A proc root that cannot be listed: read_dir fails ⇒ Indeterminate.
+        let gone_root = root.path().join("no-such-dir");
+        let mut barrier = OwnedProcessTreeBarrier {
+            ownership_env: String::new(), // PTY-style: no ownership scan leg
+            ownership_id: String::new(),
+            members: vec![(i32::MAX - 1, 1)],
+            process_group_id: Some(12345),
+            scan_incomplete: false,
+            test_proc_root: Some(gone_root),
+        };
+        barrier.refresh_members();
+        assert!(
+            barrier.members.contains(&(i32::MAX - 1, 1)),
+            "a process-group-Indeterminate round must keep every member: {:?}",
+            barrier.members
+        );
+        assert!(
+            barrier.scan_incomplete,
+            "the process-group gap must poison the round"
         );
     }
 }

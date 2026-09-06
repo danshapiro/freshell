@@ -340,8 +340,8 @@ fn reap_owned_processes(ownership_id: &str) {
 /// The fail-closed ownership scan every provider reaper keys on. Canonical
 /// home: `freshell_codex::transport::scan_owned_pids_fail_closed` — mirrored
 /// in-file because this leaf crate intentionally depends on no other freshell
-/// crate; keep the algorithm, predicate, log key, and `Some(pids)`/`None`
-/// contract in lockstep with the canonical copy.
+/// crate; keep the algorithm, predicate, log key, `Some(pids)`/`None` contract,
+/// and the `_in(root, …)` test-seam split in lockstep with the canonical copy.
 ///
 /// Ownership screen (validated live on garageserver, Ubuntu 24.04 + yama=1):
 /// only an entry whose `/proc/<pid>` directory is owned by our euid AND egid
@@ -353,11 +353,23 @@ fn reap_owned_processes(ownership_id: &str) {
 /// `environ` of an OWNED entry is a real gap ⇒ `None`.
 #[cfg(target_os = "linux")]
 fn scan_owned_pids_fail_closed(ownership_env: &str, ownership_id: &str) -> Option<Vec<i32>> {
+    scan_owned_pids_fail_closed_in(std::path::Path::new("/proc"), ownership_env, ownership_id)
+}
+
+/// One fail-closed ownership round against `root` — the test seam mirroring the
+/// canonical `scan_owned_pids_in(root, …)`; production callers go through
+/// [`scan_owned_pids_fail_closed`] (the real `/proc`).
+#[cfg(target_os = "linux")]
+fn scan_owned_pids_fail_closed_in(
+    root: &std::path::Path,
+    ownership_env: &str,
+    ownership_id: &str,
+) -> Option<Vec<i32>> {
     use std::os::unix::fs::MetadataExt;
     let needle = format!("{ownership_env}={ownership_id}");
     let mut found = Vec::new();
     let mut unusable_owned_entries = 0usize;
-    let entries = match std::fs::read_dir("/proc") {
+    let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => {
             warn_reapers_skip(true, 0);
@@ -366,7 +378,17 @@ fn scan_owned_pids_fail_closed(ownership_env: &str, ownership_id: &str) -> Optio
     };
     // geteuid/getegid are plain id reads with no preconditions (always sound).
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // fix-5's letter ("must not silently skip unreadable entries"): a
+        // per-entry readdir error means the owned set was never fully
+        // inspected — count it as a gap, never silently drop it.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unusable_owned_entries += 1;
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Ok(pid) = name.parse::<i32>() else {
@@ -452,5 +474,103 @@ mod tests {
         // The plain loopback clients always build (no TLS backend required).
         let _http = ReqwestServeHttp::new();
         let _sse = ReqwestEventSource::new();
+    }
+}
+
+/// fix-5 review: the in-file mirror of the fail-closed ownership-scan predicate
+/// gets its OWN red/green proof — the canonical codex tests never execute these
+/// compiled items, so nothing but these tests pins the mirror's skip/gap
+/// classification (`None` on gap, `Some(pids)` only on a complete scan).
+#[cfg(all(test, target_os = "linux"))]
+mod ownership_scan_tests {
+    use super::*;
+
+    /// A unique, auto-cleaned fake `/proc` root. This leaf crate carries no
+    /// `tempfile` dev-dep, and `uuid` is already a dependency.
+    struct FakeProcRoot(std::path::PathBuf);
+    impl FakeProcRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "freshell-opencode-ownerscan-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for FakeProcRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A fake `/proc/<pid>` entry whose `environ` file carries `contents`
+    /// verbatim (`None` simulates the pid-gone `ENOENT` read race).
+    fn fake_proc_entry(root: &std::path::Path, pid: i32, contents: Option<&[u8]>) {
+        let pid_dir = root.join(pid.to_string());
+        std::fs::create_dir(&pid_dir).unwrap();
+        if let Some(contents) = contents {
+            std::fs::write(pid_dir.join("environ"), contents).unwrap();
+        }
+    }
+
+    /// A fake entry whose `environ` is a directory: every read fails `EISDIR` —
+    /// a deterministic, root-safe anomalous-entry gap (chmod-0o000 would land in
+    /// the `EACCES` skip class and is a no-op as root).
+    fn fake_proc_gap_entry(root: &std::path::Path, pid: i32) {
+        let pid_dir = root.join(pid.to_string());
+        std::fs::create_dir(&pid_dir).unwrap();
+        std::fs::create_dir(pid_dir.join("environ")).unwrap();
+    }
+
+    /// (i) Gap leg: an owned-but-unreadable `environ` (`EISDIR`) makes the scan
+    /// INDETERMINATE ⇒ `None` — fail closed, a partial candidate list can never
+    /// be trusted as the full owned set.
+    #[test]
+    fn gap_entry_makes_fail_closed_scan_none() {
+        let root = FakeProcRoot::new();
+        fake_proc_gap_entry(&root.0, 4242);
+        let scan =
+            scan_owned_pids_fail_closed_in(&root.0, "FRESHELL_TEST_OPENCODE_OWNERSCAN", "fence-x");
+        assert!(
+            scan.is_none(),
+            "an owned-but-unreadable entry must make the scan indeterminate, got {scan:?}"
+        );
+    }
+
+    /// (ii) Skip legs: a pid-gone entry (`ENOENT` environ race) and a readable
+    /// entry with a NON-matching tag are skips, not gaps ⇒ a complete scan
+    /// reporting the empty owned set.
+    #[test]
+    fn pid_gone_and_non_matching_tag_complete_empty() {
+        let root = FakeProcRoot::new();
+        fake_proc_entry(&root.0, 5555, None); // pid-gone read race
+        fake_proc_entry(
+            &root.0,
+            6666,
+            Some(b"FRESHELL_TEST_OPENCODE_OWNERSCAN=other\0"),
+        );
+        let scan =
+            scan_owned_pids_fail_closed_in(&root.0, "FRESHELL_TEST_OPENCODE_OWNERSCAN", "fence-x");
+        assert_eq!(
+            scan,
+            Some(vec![]),
+            "pid-gone + non-matching-tag entries must scan Complete and empty, got {scan:?}"
+        );
+    }
+
+    /// (iii) Happy path: a fully readable root with a tagged entry reports
+    /// exactly that pid.
+    #[test]
+    fn tagged_match_happy_path_reports_the_tagged_pid() {
+        let root = FakeProcRoot::new();
+        fake_proc_entry(
+            &root.0,
+            4242,
+            Some(b"LANG=C\0FRESHELL_TEST_OPENCODE_OWNERSCAN=fence-x\0"),
+        );
+        let scan =
+            scan_owned_pids_fail_closed_in(&root.0, "FRESHELL_TEST_OPENCODE_OWNERSCAN", "fence-x");
+        assert_eq!(scan, Some(vec![4242]));
     }
 }
