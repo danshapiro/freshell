@@ -40,7 +40,8 @@ in logs either way (armed / fired / resolved).
   Node lane is proven at unit level.
 - A sidecar wedged before emitting any event is detected from send/attach-time
   arming only; a thread restored mid-turn with zero subsequent events is armed
-  from snapshot observation (empty→running re-seed), never from later snapshot
+  from snapshot observation (empty→running re-seed: Node `findActiveTurnId`
+  (:273-285); Rust `get_snapshot` seed, Task 3 §3c), never from later snapshot
   polls.
 - All file:line anchors were verified against the run's base commit
   `398a866f527909e37e68c46424a5d3a77951cf60`; `origin/main` has since drifted
@@ -114,6 +115,12 @@ behavior-driven fake).
 - Keep both lanes' wire behavior byte-identical for the client: the event
   shape `{ type: 'freshAgent.status', sessionId, status: 'stuck' }` and the
   REST snapshot `status: 'stuck'` overlay are produced by both servers.
+- Rust plumbing (validator-established): the sessions map is a tokio Mutex
+  (codex.rs:109) and must never be held across an await; `reduce_notification`
+  (:3922) is sync. Deadman state therefore lives in a per-session
+  `Arc<std::sync::Mutex<QuietDeadman>>` (the `active_turn` :207 field pattern),
+  threaded by parameter into the consumer/watchers; no new workspace
+  dependencies, and no `tokio::time::pause` (unused in this crate).
 
 ---
 
@@ -268,6 +275,8 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       const stuckNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 7)
       expect(stuckNow.status).toBe('stuck')
       handlers.turnCompleted?.({ threadId: 'thread-1', params: { turn: { status: 'completed' } } })
+      // the provider truth moves to idle after the completion commits:
+      runtime.readThread.mockResolvedValue({ thread: { ...makeCodexThread('thread-1'), status: { type: 'idle' }, turns: [] } })
       const resolvedNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 8)
       expect(resolvedNow.status).toBe('idle')
     } finally {
@@ -340,7 +349,7 @@ turn by scanning `thread.turns` for `status: 'inProgress'` — hence the
 
 Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts`
 
-Expected: FAIL — the 8 new deadman tests fail because `quietWindowMs` is an
+Expected: FAIL — the 7 new deadman tests fail because `quietWindowMs` is an
 unknown dep and no `sdk.status` `'stuck'` event, no `onTurnStarted`
 subscription, and no `fresh_agent_stuck_deadman` observability events exist
 yet. (Existing tests in the file must stay green; if the type-only additions
@@ -543,7 +552,7 @@ const disarmQuietWindow = (
 
 Run: `npm run test:vitest -- run test/unit/server/fresh-agent/codex-adapter.test.ts`
 
-Expected: PASS (all tests in the file, including the 8 new deadman tests).
+Expected: PASS (all tests in the file, including the 7 new deadman tests).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -805,86 +814,141 @@ git commit -m "feat(freshagent): surface agent-stuck state with restart/resume r
 
 **Files:**
 - Create: none.
-- Modify: `crates/freshell-freshagent/src/codex.rs` (session state, `handle_send` :1090-1193, consumer `spawn_consumer_after` :2587-2633, `reduce_notification` :3922-3981, `spawn_exit_watcher` :3859-3911, snapshot path `get_snapshot` :2644, `adapter_event_to_frame` :3985-4012, `FreshCodexState::new` wiring at `crates/freshell-server/src/main.rs:333`)
-- Modify: `crates/freshell-server/src/main.rs:333` region — only if `FreshCodexState::new` needs an env-parse seam; otherwise read the env lazily inside codex.rs and leave main.rs untouched.
-- Test: in-crate `mod tests` inside `crates/freshell-freshagent/src/codex.rs` (:4238+; helpers `state_with_bus` :4712, `insert_fake_session_with_real_consumer` :4780, `spawn_sleeper` :4767, tracing capture harness :5880-5944, self-heal test :6246)
+- Modify: `crates/freshell-codex/src/events.rs` — add `CodexStatus::Stuck` (:29-35 enum) with the lowercase `"stuck"` arm in `as_str()` (:40-47); no serde derives there, the wire casing is manual.
+- Modify: `crates/freshell-freshagent/src/codex.rs` (session state + `CodexSession` :207 region, `FreshCodexState` fields :141-144 precedent, `handle_send` :1090-1193, `handle_compact` only reads active_turn (:1339) — NOT an arm site, consumer `spawn_consumer_after` :2587-2633, `spawn_exit_watcher` :3859-3911, `reduce_notification` :3922-3981 incl. the TurnStarted arm :3965, `get_snapshot` :2644 incl. the post-`read_thread` point :2665 and status serialization :3675, `adapter_event_to_frame` :3985-4012 esp. the Status arm :4011)
+- Modify: no changes to `crates/freshell-server/src/main.rs` (env parse happens inside codex.rs; `FreshCodexState::new` keeps its current params — window config rides a plain field per the `dead_thread_ttl` :141-144 precedent).
+- Test: in-crate `mod tests` inside `crates/freshell-freshagent/src/codex.rs` (:4238+; REAL harness names: `state_with_bus` :4712, `insert_fake_session_with_real_consumer` :4780, scripted peer idiom `peer.expect_request()` → `peer.respond(&id, json!(...))` → `peer.emit_notification(...)` :5134-5141 (+`crates/freshell-codex/src/app_server.rs:867`), tracing capture `tracing_capture::capture_by_session(id)` → `.events()` :4244-4451 (usage :4472-4497), frame-string assertions `serde_json::from_str` :4590-4624, `spawn_sleeper` :4767 — note the existing self-heal test :6246 uses a plain `true` child and so do these tests).
 
 **Interfaces:**
-- Consumes: existing `CodexSession.active_turn`, `CodexAdapterEvent` + `adapter_event_to_frame` (:3985-4012), the broadcast bus from `state_with_bus`, the scripted `ChannelPeer` fake-client harness, and the `set_*_busy_deadman_for_tests` setter precedent (`crates/freshell-ws/src/activity.rs:590/608`).
+- Consumes: existing `CodexSession.active_turn` (:207 field region), `CodexAdapterEvent` + `adapter_event_to_frame` (:3985-4012 — the `Status` arm :4011 structurally cannot emit a turn-complete, which is the no-chime guarantee), the broadcast bus from `state_with_bus`, and the scripted `ChannelPeer` harness.
 - Produces:
-  - `CodexStatus::Stuck` (serde-serializes as `"stuck"`) on the status enum used by `adapter_event_to_frame`, broadcast as `{ "type": "freshAgent.event", sessionId, sessionType: "freshcodex", provider: "codex", event: { "type": "freshAgent.status", "status": "stuck" } }` — byte-identical to Task 1's Node wire shape.
-  - Snapshot truth: `get_snapshot` (:2644) reports `status: "stuck"` while flagged.
-  - `#[cfg(test)] pub(crate) fn set_codex_quiet_window_ms_for_tests(&self, ms: u64)` on `FreshCodexState`.
+  - `CodexStatus::Stuck` → wire string `"stuck"` via `as_str()`, broadcast as `{ "type": "freshAgent.event", sessionId, sessionType: "freshcodex", provider: "codex", event: { "type": "freshAgent.status", "status": "stuck" } }` — byte-identical to Task 1's Node wire shape; the REST snapshot serializer (:3675) reports `"stuck"` while flagged.
+  - Per-session `quiet_deadman: Arc<std::sync::Mutex<QuietDeadman>>` on `CodexSession` (mirrors the `active_turn` :207 field pattern; the sessions map is a tokio Mutex :109 and `reduce_notification` is sync, so deadman state must be independently lockable).
+  - `#[cfg(test)] pub(crate) fn set_codex_quiet_window_ms_for_tests(&self, ms: u64)` on `FreshCodexState` (mirrors `set_opencode_busy_deadman_for_tests`, `crates/freshell-ws/src/activity.rs:590/608`).
   - Production scaling: `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (positive integer ms; invalid/absent → 600_000).
-  - Structured logs: `tracing::info!` on arm/resolve, `tracing::warn!` on fire, event name `freshagent.codex.quiet_deadman` with `phase` (`armed|fired|resolved`), hashed session id, and `quiet_window_ms`.
+  - Structured logs: `tracing::info!` on arm/resolve, `tracing::warn!` on fire — event `freshagent.codex.quiet_deadman` with `phase` (`armed|fired|resolved`), field scheme mirroring the existing `freshagent.turn.complete` log (:2624) exactly (same keys, same hashed-id treatment).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Three in-crate tests (names exact; helper invocation signatures are pinned
-against the in-file harness at :4712-4830 and :6246):
+Four in-crate tests. All idioms below exist in the file today (validated at
+base_ref): `state_with_bus()` (:4712) returns the state plus a broadcast frame
+`Receiver<String>`; `insert_fake_session_with_real_consumer(...)` (:4780)
+registers a session whose client is a scripted `ChannelPeer` with a real
+consumer driving production `reduce_notification`; the peer idiom is
+`let req = peer.expect_request().await` → `peer.respond(&req["id"], json!({...}))`
+→ `peer.emit_notification("turn/started", ...)` (:5134-5141, script format at
+`crates/freshell-codex/src/app_server.rs:867`); frames arrive as JSON strings
+asserted via `serde_json::from_str` (:4590-4624); tracing assertions use
+`tracing_capture::capture_by_session("...")` → `.events()` (:4244-4451, usage
+:4472-4497); the child stand-in is a plain `true` process (mirrors :6246).
 
 ```rust
 #[tokio::test]
 async fn quiet_deadman_fires_stuck_status_without_fabricating_a_turn_complete() {
-    let (state, mut frames) = state_with_bus();
+    let (state, mut frame_rx) = state_with_bus();
     state.set_codex_quiet_window_ms_for_tests(150);
-    let peer = insert_fake_session_with_real_consumer(&state, "thread-stuck").await;
-    // scripted peer answers turn/start; spawn_sleeper stands in for the
-    // alive-but-wedged app-server process:
-    peer.answer_turn_start("turn-1").await; // exact helper name per :4780-4830 idiom
-    state.handle_send(<send msg for "thread-stuck">).await.expect("send ok");
-    // The deadline elapses with zero notifications on an alive process.
-    let fired = wait_for_frame_collecting(&mut frames, |f| {
-        f["event"]["type"] == "freshAgent.status" && f["event"]["status"] == "stuck"
-    }, Duration::from_secs(2)).await;
-    assert!(fired.is_some(), "deadman must surface the stuck status");
-    assert!(
-        frames.collected().iter().all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
-        "deadman must never fabricate a completion edge",
-    );
-    // Snapshot truth agrees (and the in-flight turn is untouched):
+    let cap = tracing_capture::capture_by_session("thread-stuck");
+    let (peer, _child) = insert_fake_session_with_real_consumer(
+        &state, "thread-stuck", /* args per :4780 signature */,
+    ).await;
+    // Drive the production send path; the peer answers turn/start, emits
+    // turn/started, and then stays silent forever (alive process, zero events).
+    let send = tokio::spawn(state.clone().handle_send(send_msg("thread-stuck", "run")));
+    let req = peer.expect_request().await;                       // turn/start RPC
+    peer.respond(&req["id"], serde_json::json!({"turn": {"id": "turn-1"}})).await;
+    peer.emit_notification("turn/started",
+        serde_json::json!({"threadId": "thread-stuck", "turn": {"id": "turn-1", "status": "inProgress"}})).await;
+    send.await.expect("send ok").expect("send accepted");
+    // Collect frames for up to 2 s; the stuck status must arrive, and no
+    // turn-complete edge may EVER be emitted by the deadman.
+    let collect = collect_frames_until(&mut frame_rx, Duration::from_secs(2),
+        |w| w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck").await;
+    assert!(collect.matched, "deadman must surface the stuck status");
+    assert!(collect.frames.iter().all(|w| w["event"]["type"] != "freshAgent.turn.complete"),
+        "deadman must never fabricate a completion edge");
     let snap = state.get_snapshot("thread-stuck").await.expect("snapshot");
-    assert_eq!(snap["status"], "stuck");
-    let tracing_events = peer.tracing_capture().await; // DIAG-01 harness :5880-5944
-    assert!(tracing_events.iter().any(|e| e.contains("freshagent.codex.quiet_deadman") && e.contains("\"phase\":\"fired\"")));
+    assert_eq!(snap["status"], "stuck");                          // REST overlay agrees
+    assert!(cap.events().iter().any(|e| e.contains("freshagent.codex.quiet_deadman") && e.contains("fired")),
+        "fire is observable in the tracing stream");
 }
 
 #[tokio::test]
 async fn quiet_deadman_resets_on_lane_events_and_resolves_on_turn_completion() {
-    let (state, mut frames) = state_with_bus();
+    let (state, mut frame_rx) = state_with_bus();
     state.set_codex_quiet_window_ms_for_tests(300);
-    let peer = insert_fake_session_with_real_consumer(&state, "thread-reset").await;
-    peer.answer_turn_start("turn-1").await;
-    state.handle_send(<send msg for "thread-reset">).await.expect("send ok");
-    sleep_ms(200).await;
-    // activity inside the window restarts it:
-    peer.push_notification(<thread status active notification for "thread-reset">).await;
-    sleep_ms(250).await; // past the ORIGINAL 300ms deadline
-    assert!(!frames.collected().iter().any(|f| f["event"]["status"] == "stuck"),
-        "no fire before the reset deadline");
-    sleep_ms(200).await; // past the reset deadline
-    assert!(frames.collected().iter().any(|f| f["event"]["status"] == "stuck"));
-    // genuine completion resolves the stuck state without a deadman edge:
-    peer.push_notification(<turn/completed {status:"completed"} for "thread-reset" turn-1>).await;
-    let idle = wait_for_frame_collecting(&mut frames, |f| {
-        (f["event"]["type"] == "freshAgent.session.snapshot" && f["event"]["status"] == "idle")
-            || (f["event"]["type"] == "freshAgent.status" && f["event"]["status"] == "idle")
-    }, Duration::from_secs(2)).await;
-    assert!(idle.is_some(), "completion restores an idle status");
-    assert!(frames.collected().iter().filter(|f| f["event"]["status"] == "stuck").count() == 1);
+    let (peer, _child) = insert_fake_session_with_real_consumer(&state, "thread-reset", /* :4780 args */).await;
+    let send = tokio::spawn(state.clone().handle_send(send_msg("thread-reset", "run")));
+    let req = peer.expect_request().await;
+    peer.respond(&req["id"], serde_json::json!({"turn": {"id": "turn-1"}})).await;
+    peer.emit_notification("turn/started", serde_json::json!({"threadId": "thread-reset", "turn": {"id": "turn-1", "status": "inProgress"}})).await;
+    send.await.expect("send ok").expect("send accepted");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    peer.emit_notification("thread/status/changed",
+        serde_json::json!({"threadId": "thread-reset", "status": {"type": "active"}})).await; // feed
+    let pre = collect_frames_until(&mut frame_rx, Duration::from_millis(250), |_| false).await;
+    assert!(pre.frames.iter().all(|w| w["event"]["status"] != "stuck"),
+        "no fire before the RESET deadline");
+    let post = collect_frames_until(&mut frame_rx, Duration::from_secs(2),
+        |w| w["event"]["status"] == "stuck").await;
+    assert!(post.matched, "fire after the reset deadline");
+    peer.emit_notification("turn/completed",
+        serde_json::json!({"threadId": "thread-reset", "turn": {"id": "turn-1", "status": "completed"}})).await;
+    let idle = collect_frames_until(&mut frame_rx, Duration::from_secs(2), |w|
+        (w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle")
+        || (w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "idle")).await;
+    assert!(idle.matched, "genuine completion restores an idle status");
+    assert_eq!(idle.frames.iter().filter(|w| w["event"]["status"] == "stuck").count(), 1,
+        "exactly one stuck fire, no repeat flapping");
     let snap = state.get_snapshot("thread-reset").await.expect("snapshot");
     assert_eq!(snap["status"], "idle");
 }
 
 #[tokio::test]
-async fn quiet_deadman_ignores_quiet_sessions_with_no_turn_in_flight() {
-    let (state, mut frames) = state_with_bus();
+async fn quiet_deadman_arms_from_snapshot_observed_in_flight_turn() {
+    // U-1 repair: a session registered WITHOUT any adapter-observed turn
+    // (restore mid-turn), then a live thread read sees an in-flight turn ->
+    // seed active_turn (side-state only) and arm the window; wedged still fires.
+    let (state, mut frame_rx) = state_with_bus();
     state.set_codex_quiet_window_ms_for_tests(150);
-    let _peer = insert_fake_session_with_real_consumer(&state, "thread-idle").await;
-    sleep_ms(500).await;
-    assert!(frames.collected().iter().all(|f| f["event"]["status"] != "stuck"));
+    let (peer, _child) = insert_fake_session_with_real_consumer(&state, "thread-midrestore", /* active_turn: None */ /* :4780 args */).await;
+    let snap_req = tokio::spawn(state.clone().get_snapshot("thread-midrestore"));
+    let req = peer.expect_request().await;                       // thread/read RPC
+    peer.respond(&req["id"], serde_json::json!({
+        "thread": {
+            "id": "thread-midrestore",
+            "status": {"type": "active"},
+            "turns": [{"id": "turn-9", "status": "inProgress", "items": []}],
+            // ...minimal fields per the :4830 snapshot-drive idiom...
+        }
+    })).await;
+    let snap = snap_req.await.expect("snapshot ok").expect("snapshot");
+    assert_eq!(snap["status"], "running");
+    let collect = collect_frames_until(&mut frame_rx, Duration::from_secs(2),
+        |w| w["event"]["status"] == "stuck").await;
+    assert!(collect.matched, "snapshot-observed running turn arms the window");
+    let snap2 = state.get_snapshot("thread-midrestore").await.expect("snapshot");
+    assert_eq!(snap2["status"], "stuck");
+}
+
+#[tokio::test]
+async fn quiet_deadman_ignores_quiet_sessions_with_no_turn_in_flight() {
+    let (state, mut frame_rx) = state_with_bus();
+    state.set_codex_quiet_window_ms_for_tests(150);
+    let _peer = insert_fake_session_with_real_consumer(&state, "thread-idle", /* :4780 args */).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drain = collect_frames_until(&mut frame_rx, Duration::from_millis(50), |_| false).await;
+    assert!(drain.frames.iter().all(|w| w["event"]["status"] != "stuck"));
 }
 ```
+
+The test-local helpers written by this task (kept inside `mod tests`):
+`send_msg(thread_id, text)` — builds the WS client frame the existing tests
+feed to `handle_send` (copy the construction from the :4906-5060
+interrupt/kill tests); `collect_frames_until(rx, dur, pred)` — drain-with-timeout
+over the `Receiver<String>` returning `{ matched: bool, frames: Vec<serde_json::Value> }`
+(parsed per the :4590-4624 idiom). Exact `insert_fake_session_with_real_consumer`
+argument list follows its :4780 signature (state, thread id, scripted client,
+active_turn, notifs, child, ownership_id).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -898,70 +962,111 @@ assertions fail before implementing the timer).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-3a. State. In `crates/freshell-freshagent/src/codex.rs`'s `CodexSession`, add:
+3a. Status enum (`crates/freshell-codex/src/events.rs`): add `Stuck` to
+`CodexStatus` (:29-35) and the `"stuck"` arm in its `as_str()` (:40-47). The
+wire Json then flows through both the `freshAgent.status` arm (:4011) and the
+snapshot serializer (:3675) with no additional mapping.
+
+3b. Per-session deadman state (`crates/freshell-freshagent/src/codex.rs`). The
+sessions map rides a tokio Mutex (:109, never held across awaits) and
+`reduce_notification` is sync, so the deadman state is an independently
+lockable per-session field mirroring the `active_turn` pattern (:207):
 
 ```rust
-quiet_generation: u64,                        // bumped on every arm feed
-quiet_deadline: Option<tokio::time::Instant>, // Some only while a turn is in flight
-stuck_since: Option<std::time::Instant>,
-```
+// on CodexSession:
+quiet_deadman: Arc<std::sync::Mutex<QuietDeadman>>,
 
-In `FreshCodexState`, add:
-
-```rust
-quiet_window_ms: std::sync::atomic::AtomicU64, // seeded from env; default 600_000
-```
-
-- env parse at `FreshCodexState::new` (or a `OnceLock<u64>` if construction
-  stays sync-free of new params): `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` parsed
-  as u64, fallback 600_000.
-- `#[cfg(test)] pub(crate) fn set_codex_quiet_window_ms_for_tests(&self, ms: u64)`
-  (atomic store; mirrors `set_opencode_busy_deadman_for_tests`,
-  `crates/freshell-ws/src/activity.rs:590`).
-
-3b. Arm/feed/disarm helpers on `FreshCodexState`:
-
-```rust
-/// Reset semantics: every lane-visible notification for the session restarts
-/// the quiet window. Resolves any stuck flag first.
-fn note_codex_activity(self: &Arc<Self>, thread_id: &str) {
-    // lock sessions; if stuck_since.take().is_some() → tracing::info!(event = "freshagent.codex.quiet_deadman", phase = "resolved", ...)
-    // if active_turn.is_some():
-    //   session.quiet_generation += 1;
-    //   session.quiet_deadline = Some(Instant::now() + Duration::from_millis(self.quiet_window_ms()));
-    //   if this is a fresh arm (generation was 0 / deadline was None) → info!(phase = "armed")
-    //   spawn the waiter: tokio::spawn(self.clone().watch_quiet_deadline(thread_id.to_string(), generation))
-}
-
-fn disarm_codex_quiet(&self, thread_id: &str, reason: &str) {
-    // lock; quiet_deadline = None; quiet_generation += 1 (invalidates waiters);
-    // if stuck_since.take().is_some() → info!(phase = "resolved", resolution = reason)
-}
-
-async fn watch_quiet_deadline(self: Arc<Self>, thread_id: String, generation: u64) {
-    // read (generation, deadline) under lock; sleep until deadline; then re-lock and fire iff:
-    //   session still exists, quiet_generation == generation, deadline elapsed,
-    //   active_turn.is_some(), stuck_since.is_none()
-    // fire: stuck_since = Some(now); warn!(phase = "fired", quiet_window_ms, hashed id);
-    //   broadcast adapter_event_to_frame(CodexAdapterEvent::Status { status: CodexStatus::Stuck }, session id)
-    // The waiter then exits (next activity re-arms with a new generation).
+struct QuietDeadman {
+    generation: u64,                              // bumped on every feed -> stale waiters exit
+    deadline: Option<tokio::time::Instant>,       // Some only while a turn is in flight
+    stuck_since: Option<std::time::Instant>,
 }
 ```
 
-3c. Wire the call sites:
+On `FreshCodexState` add a plain window field following the `dead_thread_ttl`
+precedent (:141-144), seeded at construction from
+`FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (u64 ms parse; invalid/absent →
+`Duration::from_millis(600_000)`), plus `#[cfg(test)] pub(crate) fn
+set_codex_quiet_window_ms_for_tests(&self, ms: u64)` (the file's existing
+`dead_thread_ttl` mutator pattern decides Mutex-vs-plain-field; mirror it).
 
-- `handle_send` (:1090-1193): immediately after `active_turn` is set (:1164), call `note_codex_activity`.
-- The compact-turn path that sets `active_turn`: same.
-- `reduce_notification` (:3922-3981): at the point the target session is resolved, call `note_codex_activity` (every lane-visible notification feeds).
-- Non-running / terminal statuses and `turn/completed` resolution: after `active_turn` clears, call `disarm_codex_quiet(thread_id, "turn_complete"|"activity")`.
-- `spawn_exit_watcher` (:3859-3911): on an unrequested exit, alongside setting `exited = true`, call `disarm_codex_quiet(thread_id, "exit")`.
-- `handle_kill`/teardown: `disarm_codex_quiet(thread_id, "kill")`.
-- `get_snapshot` (:2644): when computing the serialized status, overlay: `stuck_since.is_some() && status == Running → Stuck`. (The mid-turn snapshot-observation arming path from Node — arm-if-absent on an in-flight re-seed — applies here too wherever Rust seeds `active_turn` from a live snap; if Rust seeds it only in `ensure_session_alive`/resume flows, arm-if-absent right there.)
+3c. Arm/feed/disarm wiring — state handle threaded by parameter, not by
+capture change, at exactly three call sites:
 
-3d. Status enum: add `Stuck` to the `CodexStatus` enum consumed by
-`adapter_event_to_frame` (:3985-4012); serde output `"stuck"`; the
-`freshAgent.status` frame branch (:4008-4012) then emits the Task-1-identical
-wire shape.
+- `spawn_consumer_after` (:2587-2633) gains a `&Arc<FreshCodexState>` (or the
+  narrow handle the consumer already holds plus it) and passes it into
+  `reduce_notification` (one new parameter); inside `reduce_notification`
+  (:3922-3981), at the point the target session is resolved, call
+  `note_codex_activity(state, thread_id, &session.quiet_deadman)` — every
+  lane-visible notification feeds (generation bump = reset; resolves stuck
+  first). The TurnStarted arm (:3965) performs this same call right after it
+  sets `active_turn`, so a turn that started outside `handle_send` also arms.
+- `handle_send` (:1090-1193): immediately after `active_turn` is set (:1164),
+  call `note_codex_activity(...)`. (`handle_compact` only READS `active_turn`
+  (:1339) — not an arm site; compact turns feed via their normal events.)
+- `get_snapshot` (:2644): after `read_thread` returns (:2665), if the fresh
+  read shows the thread running (`thread.status.active` :3621) — with a turn id
+  from the `inProgress` turn in the payload (:3648/:3750/:3804) — and the
+  session's `active_turn` is `None`, seed `active_turn` (record the turn id;
+  this is SIDE-STATE only — never fold into `is_running`; the FIX-1 revert at
+  :3622-3640 documents why) and arm-if-absent via `note_codex_activity`. A
+  later snapshot MUST NOT reset an armed window (do not call the feed when the
+  window is already armed — arm-if-absent only). Also overlay the serialized
+  status (:3675): `stuck_since.is_some() && status == Running → Stuck`.
+- `spawn_exit_watcher` (:3859-3911): accept the deadman `Arc` as an additional
+  parameter (the existing `exited`-flag param is the precedent); on an
+  unrequested exit call `disarm_codex_quiet(&quiet, "exit")`. Same on
+  `handle_kill`/teardown paths (`"kill"`).
+
+```rust
+fn note_codex_activity(state: &Arc<FreshCodexState>, thread_id: &str,
+                       quiet: &Arc<std::sync::Mutex<QuietDeadman>>) {
+    let mut q = quiet.lock().expect("quiet deadman lock");
+    if q.stuck_since.take().is_some() {
+        tracing::info!(event = "freshagent.codex.quiet_deadman", phase = "resolved", /* freshagent.turn.complete's field scheme (:2624) */);
+    }
+    if <session still has active_turn> {
+        q.generation += 1;
+        let window = state.codex_quiet_window();
+        q.deadline = Some(tokio::time::Instant::now() + window);
+        let generation = q.generation;
+        let first_arm = q.stuck_since.is_none() /* freshly armed from disarmed */;
+        if first_arm { tracing::info!(event = "freshagent.codex.quiet_deadman", phase = "armed", quiet_window_ms = window.as_millis() as u64 /* + scheme */); }
+        tokio::spawn(state.clone().watch_codex_quiet_deadline(thread_id.to_string(), generation));
+    } else {
+        q.deadline = None;
+    }
+}
+
+fn disarm_codex_quiet(quiet: &Arc<std::sync::Mutex<QuietDeadman>>, resolution: &str) {
+    let mut q = quiet.lock().expect("quiet deadman lock");
+    q.generation += 1;                 // invalidate waiters
+    q.deadline = None;
+    if q.stuck_since.take().is_some() {
+        tracing::info!(event = "freshagent.codex.quiet_deadman", phase = "resolved", resolution, );
+    }
+}
+
+async fn watch_codex_quiet_deadline(self: Arc<FreshCodexState>, thread_id: String, generation: u64) {
+    // snapshot (deadline, quiet Arc) without holding the sessions lock across an await;
+    let (quiet, deadline) = { /* lock sessions briefly */ };
+    let Some(deadline) = deadline else { return };
+    tokio::time::sleep_until(deadline).await;
+    // re-lock: sessions -> session -> quiet.deadman; fire iff
+    //   q.generation == generation && deadline elapsed(still Some) && active_turn.is_some() && q.stuck_since.is_none()
+    // fire: q.stuck_since = Some(Instant::now());
+    //   tracing::warn!(event = "freshagent.codex.quiet_deadman", phase = "fired", quiet_window_ms, hashed ids per :2624 scheme);
+    //   broadcast adapter_event_to_frame(CodexAdapterEvent::Status{ status: CodexStatus::Stuck }, session_id)
+    //     — the :4011 arm structurally cannot emit a turn-complete edge (no-chime guarantee).
+    // The waiter exits; the next feed spawns a fresh waiter under a new generation.
+}
+```
+
+Deadlock audit for the implementer (validator-verified constraints): the
+sessions tokio Mutex is never held across an await today and must stay that
+way; the deadman `std::sync::Mutex` is LOCK-BRIEF only (never held across
+awaits, never held while broadcasting); the waiter locks the sessions map
+twice (before/after the sleep), each time briefly.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -982,14 +1087,14 @@ Impacted set: the whole `freshell-freshagent` crate suite (the consumer and
 snapshot builders are shared), the `freshell-ws` codex-touching tests, and the
 workspace lint gates for the touched crates.
 
-Run: `cargo test -p freshell-freshagent -p freshell-ws && cargo clippy -p freshell-freshagent -p freshell-ws --all-targets -- -D warnings && cargo fmt --all --check`
+Run: `cargo test -p freshell-freshagent -p freshell-codex -p freshell-ws && cargo clippy -p freshell-freshagent -p freshell-codex -p freshell-ws --all-targets -- -D warnings && cargo fmt --all --check`
 
 Expected: PASS.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-freshagent/src/codex.rs
+git add crates/freshell-codex/src/events.rs crates/freshell-freshagent/src/codex.rs
 git commit -m "feat(freshagent): wedged-sidecar quiet deadman for the Rust freshcodex lane"
 ```
 
@@ -1196,3 +1301,16 @@ git commit -m "test(freshagent): e2e coverage for the freshcodex wedged-sidecar 
    no rollback needed (additive behavior; deleting the tasks' commits reverts).
 
 Self-review result: PASS. No UNRESOLVED COVERAGE GAP.
+
+### Addendum (2026-09-06, post-load-bearing re-review)
+
+Stage 2 applied these corrections (evidence: traces ledger
+`load-bearing-ledger.md`, finder/validator reports under `reports/`):
+Task 3's enum edit site moved to `crates/freshell-codex/src/events.rs`; its
+plumbing rewritten for the sync `reduce_notification` reality (per-session
+`Arc<StdMutex<QuietDeadman>>`, parameter threading); the mid-turn-restore seam
+became a real Rust code path (`get_snapshot` seed+arm, side-state only per the
+FIX-1 revert :3622-3640); its tests rewritten to the in-crate harness's real
+idioms with a fourth test pinning the snapshot-observed arm; Task 1 test 5's
+post-resolve stub fixed to idle; deadman test count corrected to 7. The
+changed tasks re-passed the 6-point self-review above after each edit.
