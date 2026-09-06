@@ -38,6 +38,7 @@ import {
   FreshAgentStaleThreadRevisionError,
   FreshAgentUnsupportedCapabilityError,
 } from '../fresh-agent/runtime-manager.js'
+import { ClaudeFreshAgentHistoryResolutionError } from '../fresh-agent/history/claude/history-service.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -918,6 +919,15 @@ export function createAgentApiRouter({
         })
         return res.type('text/plain').send(renderFreshAgentTranscript(snapshot))
       } catch (err: any) {
+        // A RESTORE_NOT_FOUND resolution means no session by this id exists on
+        // this server (a legacy/foreign layout-sync pane): answer with the
+        // generic pane-kind validation gate wording instead of an unhandled
+        // 500. Every other failure keeps its documented status mapping.
+        if (err instanceof ClaudeFreshAgentHistoryResolutionError && err.code === 'RESTORE_NOT_FOUND') {
+          return res.status(422).json(
+            fail(`pane kind "${paneSnapshot.kind}" does not support capture-pane; use screenshot-pane`),
+          )
+        }
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent capture failed'))
       }
     }

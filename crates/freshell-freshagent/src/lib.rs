@@ -2542,7 +2542,28 @@ async fn capture(
         .cloned()
     {
         Some(pane) => pane,
-        None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
+        None => {
+            // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to
+            // `fresh-agent` by a remote client's layout sync): mirror the Node
+            // capture route's pane-kind gate (router.ts:955-959) — every
+            // non-terminal layout kind answers the 422 validation wording the
+            // `content_panes` branch in terminal_tabs.rs already emits, rather
+            // than falling through to an unhandled 500 (Node, pre-fix) or a
+            // misleading 404. Runtime-backed fresh-agent panes resolved above;
+            // layout-visible terminal kinds and unknown ids keep 404
+            // `pane not found`.
+            if let Some(snap) = state.layout.get_pane_snapshot(&pane_id) {
+                if let Some(kind) = snap.kind.as_deref().filter(|k| *k != "terminal") {
+                    return fail_json(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "pane kind \"{kind}\" does not support capture-pane; use screenshot-pane"
+                        ),
+                    );
+                }
+            }
+            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
+        }
     };
     let Some(durable_id) = pane.durable_id else {
         // No turn yet → empty transcript (text/plain), matching a fresh pane.
