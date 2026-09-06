@@ -8,6 +8,9 @@ playwright-report/
 coverage/
 .nyc_output/
 
+# Retired backend checkout residue must not enter the Rust-only source image.
+/server/
+
 # Version control and CI
 .git/
 .github/
@@ -28,7 +31,6 @@ coverage/
 docs/plans/
 docs/development/
 installers/
-electron/
 examples/
 # port/ stays excluded (7.4M oracle corpus belongs to the config-excluded
 # vitest.port.config.ts suites), EXCEPT the tiny 80K fixture dir the
@@ -65,9 +67,9 @@ port/vm-bridge/*
 !.github/workflows/rust-clippy.yml
 !.github/workflows/typecheck-client.yml
 
-!electron/
-electron/*
-!electron/port-check.ts
+# Only the root app sources; test/**/electron contains runtime evidence.
+/electron/*
+!/electron/port-check.ts
 
 !examples/
 examples/*
