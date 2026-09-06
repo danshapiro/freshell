@@ -3924,6 +3924,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_preflight_release_requires_the_exact_runtime_and_token_tuple() {
+        // The restart coordinator's terminal-outcome hook releases reservations
+        // through this seam with the tuple recorded at preflight; a release
+        // carrying anything but the exact (runtime, token) pair must leave the
+        // reservation held so a live restart is never un-fenced mid-transaction.
+        let (st, _killed) = state().await;
+        let placeholder = "freshopencode-req-release-tuple";
+        st.handle_create(create_msg("req-release-tuple")).await;
+        let runtime = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            session.runtime.clone()
+        };
+        st.reserve_restart_preflight(placeholder, &runtime.runtime_id, "reservation-exact")
+            .await
+            .unwrap();
+        let held = || async {
+            st.sessions
+                .lock()
+                .await
+                .get(placeholder)
+                .unwrap()
+                .lock()
+                .await
+                .restart_reservation
+                .clone()
+        };
+
+        st.release_restart_preflight(placeholder, &runtime.runtime_id, "reservation-other")
+            .await;
+        assert_eq!(held().await.as_deref(), Some("reservation-exact"));
+
+        st.release_restart_preflight(placeholder, "other-runtime", "reservation-exact")
+            .await;
+        assert_eq!(held().await.as_deref(), Some("reservation-exact"));
+
+        st.release_restart_preflight(placeholder, &runtime.runtime_id, "reservation-exact")
+            .await;
+        assert_eq!(held().await, None);
+
+        // The freed runtime can be reserved by the next restart immediately.
+        st.reserve_restart_preflight(placeholder, &runtime.runtime_id, "reservation-next")
+            .await
+            .unwrap();
+        assert_eq!(held().await.as_deref(), Some("reservation-next"));
+    }
+
+    #[tokio::test]
     async fn send_to_unknown_session_errors() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));

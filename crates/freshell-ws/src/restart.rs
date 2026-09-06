@@ -272,6 +272,15 @@ pub trait RestartRuntime: Send + Sync {
     /// shutdown boundary. Implementations without a reservation are no-ops.
     async fn abort_preflight(&self, _request: &AgentRestart, _plan: &Self::ResumePlan) {}
 
+    /// The coordinator reached a terminal outcome for this request (a durable
+    /// commit or a terminal failure): release any preflight plan/reservation
+    /// state held for it. Called once per request whose durable pending row was
+    /// finally removed, and only after the terminal state is persisted;
+    /// retryable outcomes keep their rows (and therefore their plans) so a
+    /// same-request retry reuses its reservation token (the OpenCode lane).
+    /// Implementations without per-request plan state are no-ops.
+    async fn on_terminal_outcome(&self, _request: &AgentRestart) {}
+
     /// Quiesce only the selected live runtime without final-close semantics.
     async fn shutdown_for_restart(
         &self,
@@ -1414,6 +1423,52 @@ impl RestartCoordinator {
             .write()
             .expect("registered restart runtime lock") = Some(Arc::downgrade(&runtime));
         RestartRuntimeRegistration { _runtime: runtime }
+    }
+
+    /// The registered restart adapter, when it is still alive. The Weak seam
+    /// (fix 4) keeps a completed server free to drop the adapter: a dropped
+    /// runtime simply skips the terminal-outcome notify rather than being
+    /// resurrected into a stubborn restart.
+    fn registered_runtime_arc(&self) -> Option<Arc<dyn RestartRuntime<ResumePlan = ()>>> {
+        self.registered_runtime
+            .read()
+            .expect("registered restart runtime lock")
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Notify the registered adapter once per request whose durable pending
+    /// row was finally removed, so it can drop the request's active preflight
+    /// plan and release any provider reservation (the OpenCode lane). The
+    /// caller must already have persisted the terminal state; this never runs
+    /// while an ownership lock is held.
+    async fn notify_terminal_outcomes(&self, requests: &[AgentRestart]) {
+        let Some(runtime) = self.registered_runtime_arc() else {
+            return;
+        };
+        for request in requests {
+            runtime.on_terminal_outcome(request).await;
+        }
+    }
+
+    /// The one terminal-outcome choke point (fix 7): persist the write that
+    /// removes the durable row(s), then — only when the write durably
+    /// committed — notify the adapter so active plans/reservations are
+    /// released. Anything else keeps its plan: retryable failures are recorded
+    /// through `try_update_ownership` directly, an indeterminate write retains
+    /// the row via the fail-closed union merge, and a not-committed write
+    /// leaves the pre-write world untouched.
+    async fn finish_requests(
+        &self,
+        operation: &'static str,
+        notify: Vec<AgentRestart>,
+        update: impl FnOnce(&mut RuntimeOwnership),
+    ) -> std::io::Result<((), UpdateDurability)> {
+        let persisted = self.try_update_ownership(operation, update);
+        if matches!(persisted, Ok(((), UpdateDurability::Committed))) {
+            self.notify_terminal_outcomes(&notify).await;
+        }
+        persisted
     }
 
     pub async fn execute_registered<F>(&self, request: AgentRestart, emit: F) -> RestartOutcome
@@ -2890,10 +2945,15 @@ impl RestartCoordinator {
                     }
                 })
             } else {
-                self.try_update_ownership("store_failed_shutdown", |ownership| {
-                    ownership.pending_recoveries.remove(&request.request_id);
-                    self.insert_result_locked(ownership, &request, terminal.clone());
-                })
+                self.finish_requests(
+                    "store_failed_shutdown",
+                    vec![request.clone()],
+                    |ownership| {
+                        ownership.pending_recoveries.remove(&request.request_id);
+                        self.insert_result_locked(ownership, &request, terminal.clone());
+                    },
+                )
+                .await
             };
             let mut outcome = self.persisted_outcome(
                 &request,
@@ -3042,13 +3102,16 @@ impl RestartCoordinator {
                         "agent.restart.replacement.failed"
                     );
                     let terminal = self.failure_message(&request, expected.clone(), &failure);
-                    let persisted = self.try_update_ownership(
-                        "store_terminal_replacement_failure",
-                        |ownership| {
-                            ownership.pending_recoveries.remove(&request.request_id);
-                            self.insert_result_locked(ownership, &request, terminal.clone());
-                        },
-                    );
+                    let persisted = self
+                        .finish_requests(
+                            "store_terminal_replacement_failure",
+                            vec![request.clone()],
+                            |ownership| {
+                                ownership.pending_recoveries.remove(&request.request_id);
+                                self.insert_result_locked(ownership, &request, terminal.clone());
+                            },
+                        )
+                        .await;
                     let mut outcome = self.persisted_outcome(
                         &request,
                         expected,
@@ -3100,17 +3163,18 @@ impl RestartCoordinator {
             return outcome;
         }
 
-        let (_replacement, terminal) =
-            match self.commit_replacement(&request, &expected, replacement_id) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    let mut outcome =
-                        self.commit_persist_failure_outcome(&request, &expected, error);
-                    emit(&outcome.messages[0]);
-                    outcome.messages.insert(0, started);
-                    return outcome;
-                }
-            };
+        let (_replacement, terminal) = match self
+            .commit_replacement(&request, &expected, replacement_id)
+            .await
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                let mut outcome = self.commit_persist_failure_outcome(&request, &expected, error);
+                emit(&outcome.messages[0]);
+                outcome.messages.insert(0, started);
+                return outcome;
+            }
+        };
         emit(&terminal);
         RestartOutcome {
             messages: vec![started, terminal],
@@ -3271,26 +3335,32 @@ impl RestartCoordinator {
                         }
                     })
                 } else {
-                    self.try_update_ownership("store_terminal_retirement_failure", |ownership| {
-                        let correlated = ownership
-                            .pending_recoveries
-                            .remove(&owner_request_id)
-                            .map(|recovery| {
-                                std::iter::once(recovery.request)
-                                    .chain(recovery.followers)
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_else(|| vec![request.clone()]);
-                        for correlated_request in correlated {
-                            let mut correlated_failed = failed.clone();
-                            correlated_failed.request_id = correlated_request.request_id.clone();
-                            self.insert_result_locked(
-                                ownership,
-                                &correlated_request,
-                                ServerMessage::AgentRestartFailed(correlated_failed),
-                            );
-                        }
-                    })
+                    self.finish_requests(
+                        "store_terminal_retirement_failure",
+                        vec![pending.request.clone()],
+                        |ownership| {
+                            let correlated = ownership
+                                .pending_recoveries
+                                .remove(&owner_request_id)
+                                .map(|recovery| {
+                                    std::iter::once(recovery.request)
+                                        .chain(recovery.followers)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_else(|| vec![request.clone()]);
+                            for correlated_request in correlated {
+                                let mut correlated_failed = failed.clone();
+                                correlated_failed.request_id =
+                                    correlated_request.request_id.clone();
+                                self.insert_result_locked(
+                                    ownership,
+                                    &correlated_request,
+                                    ServerMessage::AgentRestartFailed(correlated_failed),
+                                );
+                            }
+                        },
+                    )
+                    .await
                 };
                 let mut outcome = self.persisted_outcome(
                     &request,
@@ -3411,11 +3481,10 @@ impl RestartCoordinator {
                 generation = replacement.generation,
                 "agent.restart.recovery.adopting_registered_replacement_after_retirement"
             );
-            let terminal = match self.commit_replacement(
-                &request,
-                &pending.old_runtime,
-                replacement.runtime_id,
-            ) {
+            let terminal = match self
+                .commit_replacement(&request, &pending.old_runtime, replacement.runtime_id)
+                .await
+            {
                 Ok((_replacement, terminal)) => terminal,
                 Err(error) => {
                     let terminal = self
@@ -3598,26 +3667,32 @@ impl RestartCoordinator {
                     })
                 } else {
                     let owner_request_id = pending.request_id.clone();
-                    self.try_update_ownership("store_terminal_recovery_failure", |ownership| {
-                        let correlated = ownership
-                            .pending_recoveries
-                            .remove(&owner_request_id)
-                            .map(|recovery| {
-                                std::iter::once(recovery.request)
-                                    .chain(recovery.followers)
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_else(|| vec![request.clone()]);
-                        for correlated_request in correlated {
-                            let mut correlated_failed = failed.clone();
-                            correlated_failed.request_id = correlated_request.request_id.clone();
-                            self.insert_result_locked(
-                                ownership,
-                                &correlated_request,
-                                ServerMessage::AgentRestartFailed(correlated_failed),
-                            );
-                        }
-                    })
+                    self.finish_requests(
+                        "store_terminal_recovery_failure",
+                        vec![pending.request.clone()],
+                        |ownership| {
+                            let correlated = ownership
+                                .pending_recoveries
+                                .remove(&owner_request_id)
+                                .map(|recovery| {
+                                    std::iter::once(recovery.request)
+                                        .chain(recovery.followers)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_else(|| vec![request.clone()]);
+                            for correlated_request in correlated {
+                                let mut correlated_failed = failed.clone();
+                                correlated_failed.request_id =
+                                    correlated_request.request_id.clone();
+                                self.insert_result_locked(
+                                    ownership,
+                                    &correlated_request,
+                                    ServerMessage::AgentRestartFailed(correlated_failed),
+                                );
+                            }
+                        },
+                    )
+                    .await
                 };
                 let terminal = self
                     .persisted_outcome(
@@ -3682,7 +3757,9 @@ impl RestartCoordinator {
                 replayed: false,
             };
         }
-        let terminal = match self.commit_replacement(&request, &pending.old_runtime, replacement_id)
+        let terminal = match self
+            .commit_replacement(&request, &pending.old_runtime, replacement_id)
+            .await
         {
             Ok((_replacement, terminal)) => terminal,
             Err(error) => {
@@ -3732,21 +3809,23 @@ impl RestartCoordinator {
             "agent.restart.recovery.adopting_registered_replacement"
         );
         emit(&started);
-        let terminal =
-            match self.commit_replacement(&request, &pending.old_runtime, replacement.runtime_id) {
-                Ok((_replacement, terminal)) => terminal,
-                Err(error) => {
-                    let terminal = self
-                        .commit_persist_failure_outcome(&request, &pending.old_runtime, error)
-                        .messages
-                        .remove(0);
-                    emit(&terminal);
-                    return RestartOutcome {
-                        messages: vec![started, terminal],
-                        replayed: false,
-                    };
-                }
-            };
+        let terminal = match self
+            .commit_replacement(&request, &pending.old_runtime, replacement.runtime_id)
+            .await
+        {
+            Ok((_replacement, terminal)) => terminal,
+            Err(error) => {
+                let terminal = self
+                    .commit_persist_failure_outcome(&request, &pending.old_runtime, error)
+                    .messages
+                    .remove(0);
+                emit(&terminal);
+                return RestartOutcome {
+                    messages: vec![started, terminal],
+                    replayed: false,
+                };
+            }
+        };
         emit(&terminal);
         RestartOutcome {
             messages: vec![started, terminal],
@@ -3754,7 +3833,7 @@ impl RestartCoordinator {
         }
     }
 
-    fn commit_replacement(
+    async fn commit_replacement(
         &self,
         request: &AgentRestart,
         old_runtime: &RuntimeDescriptor,
@@ -3790,78 +3869,83 @@ impl RestartCoordinator {
             old_runtime: OldRuntimeDescriptor::from(old_runtime.clone()),
             runtime: replacement.clone(),
         });
-        let (committed, durability) = match self.try_update_ownership("commit_replacement", |ownership| {
-            if ownership.pending_recoveries.values().any(|pending| {
-                pending.retirement_pending && Self::same_durable_session(&pending.request, request)
-            }) {
-                return false;
-            }
-            let pending_keys = ownership
-                .pending_recoveries
-                .iter()
-                .filter(|(_, pending)| Self::same_durable_session(&pending.request, request))
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            let mut correlated_requests = vec![(request.clone(), old_runtime.clone())];
-            for key in pending_keys {
-                if let Some(pending) = ownership.pending_recoveries.remove(&key) {
-                    let pending_old_runtime = pending.old_runtime;
-                    correlated_requests.push((pending.request, pending_old_runtime.clone()));
-                    correlated_requests.extend(
-                        pending
-                            .followers
-                            .into_iter()
-                            .map(|follower| (follower, pending_old_runtime.clone())),
-                    );
+        let (committed, notify, durability) =
+            match self.try_update_ownership("commit_replacement", |ownership| {
+                if ownership.pending_recoveries.values().any(|pending| {
+                    pending.retirement_pending && Self::same_durable_session(&pending.request, request)
+                }) {
+                    return (false, Vec::new());
                 }
-            }
-            correlated_requests.sort_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
-            correlated_requests.dedup_by(|left, right| left.0.request_id == right.0.request_id);
+                let pending_keys = ownership
+                    .pending_recoveries
+                    .iter()
+                    .filter(|(_, pending)| Self::same_durable_session(&pending.request, request))
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                let mut correlated_requests = vec![(request.clone(), old_runtime.clone())];
+                for key in pending_keys {
+                    if let Some(pending) = ownership.pending_recoveries.remove(&key) {
+                        let pending_old_runtime = pending.old_runtime;
+                        correlated_requests.push((pending.request, pending_old_runtime.clone()));
+                        correlated_requests.extend(
+                            pending
+                                .followers
+                                .into_iter()
+                                .map(|follower| (follower, pending_old_runtime.clone())),
+                        );
+                    }
+                }
+                correlated_requests.sort_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
+                correlated_requests.dedup_by(|left, right| left.0.request_id == right.0.request_id);
 
-            let replacement_key = (request.kind, replacement.runtime_id.clone());
-            ownership
-                .descriptor_by_live
-                .insert(replacement_key.clone(), replacement.clone());
-            Self::touch_descriptor_locked(ownership, replacement_key);
-            Self::set_generation_locked(ownership, locator.clone(), replacement.generation);
-            Self::bind_locator_locked(
-                ownership,
-                locator,
-                replacement.runtime_id.clone(),
-                replacement.clone(),
-            );
-            for (correlated_request, correlated_old_runtime) in correlated_requests {
-                let correlated_terminal = if correlated_request.kind == request.kind {
-                    ServerMessage::AgentRestartReplaced(AgentRestartReplaced {
-                        request_id: correlated_request.request_id.clone(),
-                        provider: correlated_request.provider.clone(),
-                        session_id: correlated_request.session_id.clone(),
-                        kind: correlated_request.kind,
-                        old_runtime: OldRuntimeDescriptor::from(correlated_old_runtime),
-                        runtime: replacement.clone(),
-                    })
-                } else {
-                    ServerMessage::AgentRestartFailed(AgentRestartFailed {
-                        request_id: correlated_request.request_id.clone(),
-                        provider: correlated_request.provider.clone(),
-                        session_id: correlated_request.session_id.clone(),
-                        kind: correlated_request.kind,
-                        runtime: correlated_old_runtime,
-                        code: AgentRestartFailureCode::ReplacementFailed,
-                        message: format!(
-                            "restart recovery was superseded by a {:?} replacement for the same durable session",
-                            request.kind
-                        ),
-                        retryable: false,
-                        recovery_pending: false,
-                    })
-                };
-                self.insert_result_locked(ownership, &correlated_request, correlated_terminal);
-            }
-            Self::prune_ownership_locked(ownership, self.ownership_limit);
-            true
-        }) {
-            Ok(committed) => committed,
+                let replacement_key = (request.kind, replacement.runtime_id.clone());
+                ownership
+                    .descriptor_by_live
+                    .insert(replacement_key.clone(), replacement.clone());
+                Self::touch_descriptor_locked(ownership, replacement_key);
+                Self::set_generation_locked(ownership, locator.clone(), replacement.generation);
+                Self::bind_locator_locked(
+                    ownership,
+                    locator,
+                    replacement.runtime_id.clone(),
+                    replacement.clone(),
+                );
+                for (correlated_request, correlated_old_runtime) in &correlated_requests {
+                    let correlated_terminal = if correlated_request.kind == request.kind {
+                        ServerMessage::AgentRestartReplaced(AgentRestartReplaced {
+                            request_id: correlated_request.request_id.clone(),
+                            provider: correlated_request.provider.clone(),
+                            session_id: correlated_request.session_id.clone(),
+                            kind: correlated_request.kind,
+                            old_runtime: OldRuntimeDescriptor::from(correlated_old_runtime.clone()),
+                            runtime: replacement.clone(),
+                        })
+                    } else {
+                        ServerMessage::AgentRestartFailed(AgentRestartFailed {
+                            request_id: correlated_request.request_id.clone(),
+                            provider: correlated_request.provider.clone(),
+                            session_id: correlated_request.session_id.clone(),
+                            kind: correlated_request.kind,
+                            runtime: correlated_old_runtime.clone(),
+                            code: AgentRestartFailureCode::ReplacementFailed,
+                            message: format!(
+                                "restart recovery was superseded by a {:?} replacement for the same durable session",
+                                request.kind
+                            ),
+                            retryable: false,
+                            recovery_pending: false,
+                        })
+                    };
+                    self.insert_result_locked(ownership, correlated_request, correlated_terminal);
+                }
+                Self::prune_ownership_locked(ownership, self.ownership_limit);
+                let notify = correlated_requests
+                    .into_iter()
+                    .map(|(correlated_request, _)| correlated_request)
+                    .collect::<Vec<_>>();
+                (true, notify)
+            }) {
+            Ok(((committed, notify), durability)) => (committed, notify, durability),
             Err(error) => return Err(ReplacementCommitError::NotCommitted(error)),
         };
         if !committed {
@@ -3881,15 +3965,20 @@ impl RestartCoordinator {
         if durability == UpdateDurability::Indeterminate {
             // The fail-closed union merge already adopted the candidate
             // (bindings and results) and retained the pending rows. Do NOT
-            // surface a `replaced` frame whose durability is unproven:
-            // convergence belongs to the always-on recovery driver through the
-            // adoption path.
+            // surface a `replaced` frame whose durability is unproven — and do
+            // NOT notify terminal outcomes either: the retained rows (and
+            // their active plans/reservations) belong to the always-on
+            // recovery driver, which converges through the adoption path.
             return Err(ReplacementCommitError::Indeterminate(
                 std::io::Error::other(
                     "post-rename journal directory sync failed at replacement commit",
                 ),
             ));
         }
+        // The commit is durable: every request whose pending row was just
+        // removed releases its active plan/reservation (fix 7). The notify
+        // runs AFTER persistence, never under a lock.
+        self.notify_terminal_outcomes(&notify).await;
         tracing::info!(
             request_id = %request.request_id,
             provider = %request.provider,
@@ -4829,7 +4918,13 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
 /// terminal restore and fresh-agent resume paths used by ordinary clients.
 pub struct ProductionRestartRuntime {
     state: crate::WsState,
-    plans: Mutex<HashMap<String, ProductionResumePlan>>,
+    /// Active restart plans, keyed by request id and retained for the whole
+    /// life of their transaction. Never evicted and never capacity-refused
+    /// (fix 7): Task 7's ingress caps bound in-flight transactions and pending
+    /// durable rows, which implicitly bounds admission; dropping an ACTIVE
+    /// plan mid-transaction wedges its durable row. Plans are removed only at
+    /// a terminal outcome (`on_terminal_outcome`) or by `abort_preflight`.
+    active_plans: Mutex<HashMap<String, ProductionResumePlan>>,
     fresh_runtime: Arc<dyn ProductionFreshRuntime>,
 }
 
@@ -4851,7 +4946,7 @@ impl ProductionRestartRuntime {
     ) -> Self {
         Self {
             state,
-            plans: Mutex::new(HashMap::new()),
+            active_plans: Mutex::new(HashMap::new()),
             fresh_runtime,
         }
     }
@@ -5059,6 +5154,31 @@ impl ProductionRestartRuntime {
             }
         }
     }
+
+    /// Remove the request's active plan and, when it held a provider
+    /// reservation (the OpenCode lane), release it through the fresh-runtime
+    /// seam with the exact (provider, session, live runtime, token) tuple the
+    /// reservation was acquired under. Shared by `abort_preflight` (no durable
+    /// boundary could be recorded) and `on_terminal_outcome` (commit/terminal
+    /// failure persisted): in both worlds the transaction will not use the
+    /// plan again, while retryable outcomes never pass through here.
+    async fn release_active_plan(&self, request: &AgentRestart) {
+        let reservation = self
+            .active_plans
+            .lock()
+            .expect("production restart active plans")
+            .remove(&request.request_id)
+            .and_then(|plan| plan.fresh_preflight_reservation);
+        let Some(token) = reservation else {
+            return;
+        };
+        let Ok((provider, _)) = Self::provider(request) else {
+            return;
+        };
+        self.fresh_runtime
+            .release_restart_preflight(provider, &request.session_id, &request.live_id, &token)
+            .await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -5207,67 +5327,26 @@ impl RestartRuntime for ProductionRestartRuntime {
             origin_boot_id: self.state.boot_id.as_ref().clone(),
             actions,
         };
-        let inserted = {
-            let mut plans = self.plans.lock().expect("production restart plans");
-            if plans.len() >= DEFAULT_RESTART_LOCK_LIMIT {
-                let evictable = plans
-                    .iter()
-                    .find(|(_, plan)| plan.fresh_preflight_reservation.is_none())
-                    .map(|(request_id, _)| request_id.clone());
-                if let Some(request_id) = evictable {
-                    plans.remove(&request_id);
-                }
-            }
-            if plans.len() >= DEFAULT_RESTART_LOCK_LIMIT {
-                false
-            } else {
-                plans.insert(
-                    request.request_id.clone(),
-                    ProductionResumePlan {
-                        context,
-                        retirement_fence,
-                        fresh_preflight_reservation: fresh_preflight_reservation.clone(),
-                    },
-                );
-                true
-            }
-        };
-        if !inserted {
-            if let Some(token) = fresh_preflight_reservation.as_deref() {
-                self.fresh_runtime
-                    .release_restart_preflight(
-                        provider,
-                        &request.session_id,
-                        &request.live_id,
-                        token,
-                    )
-                    .await;
-            }
-            return Err(RestartFailure::new(
-                AgentRestartFailureCode::PreflightFailed,
-                "restart preflight capacity is exhausted",
-                true,
-            ));
-        }
+        self.active_plans
+            .lock()
+            .expect("production restart active plans")
+            .insert(
+                request.request_id.clone(),
+                ProductionResumePlan {
+                    context,
+                    retirement_fence,
+                    fresh_preflight_reservation,
+                },
+            );
         Ok(())
     }
 
     async fn abort_preflight(&self, request: &AgentRestart, _plan: &()) {
-        let reservation = self
-            .plans
-            .lock()
-            .expect("production restart plans")
-            .remove(&request.request_id)
-            .and_then(|plan| plan.fresh_preflight_reservation);
-        let Some(token) = reservation else {
-            return;
-        };
-        let Ok((provider, _)) = Self::provider(request) else {
-            return;
-        };
-        self.fresh_runtime
-            .release_restart_preflight(provider, &request.session_id, &request.live_id, &token)
-            .await;
+        self.release_active_plan(request).await;
+    }
+
+    async fn on_terminal_outcome(&self, request: &AgentRestart) {
+        self.release_active_plan(request).await;
     }
 
     async fn shutdown_for_restart(
@@ -5300,9 +5379,9 @@ impl RestartRuntime for ProductionRestartRuntime {
             }
             AgentRuntimeKind::FreshAgent => {
                 let reservation = self
-                    .plans
+                    .active_plans
                     .lock()
-                    .expect("production restart plans")
+                    .expect("production restart active plans")
                     .get(&request.request_id)
                     .and_then(|plan| plan.fresh_preflight_reservation.clone());
                 let outcome = self
@@ -5343,11 +5422,15 @@ impl RestartRuntime for ProductionRestartRuntime {
         request: &AgentRestart,
         _plan: (),
     ) -> Result<String, RestartFailure> {
+        // The plan stays resident: a failed create may be retryable, and only
+        // the coordinator's terminal-outcome hook (or abort_preflight)
+        // removes the plan and releases its reservation (fix 7).
         let plan = self
-            .plans
+            .active_plans
             .lock()
-            .expect("production restart plans")
-            .remove(&request.request_id)
+            .expect("production restart active plans")
+            .get(&request.request_id)
+            .cloned()
             .ok_or_else(|| {
                 RestartFailure::new(
                     AgentRestartFailureCode::ReplacementFailed,
@@ -5377,10 +5460,11 @@ impl RestartRuntime for ProductionRestartRuntime {
             )
         })?;
         let plan = self
-            .plans
+            .active_plans
             .lock()
-            .expect("production restart plans")
-            .remove(&request.request_id)
+            .expect("production restart active plans")
+            .get(&request.request_id)
+            .cloned()
             .ok_or_else(|| {
                 RestartFailure::new(
                     AgentRestartFailureCode::ReplacementFailed,
@@ -5397,9 +5481,9 @@ impl RestartRuntime for ProductionRestartRuntime {
         request: &AgentRestart,
         _plan: &(),
     ) -> Option<RestartResumeContext> {
-        self.plans
+        self.active_plans
             .lock()
-            .expect("production restart plans")
+            .expect("production restart active plans")
             .get(&request.request_id)
             .map(|plan| plan.context.clone())
     }
@@ -5409,9 +5493,9 @@ impl RestartRuntime for ProductionRestartRuntime {
         request: &AgentRestart,
         _plan: &(),
     ) -> Option<RestartRetirementFence> {
-        self.plans
+        self.active_plans
             .lock()
-            .expect("production restart plans")
+            .expect("production restart active plans")
             .get(&request.request_id)
             .map(|plan| plan.retirement_fence.clone())
     }

@@ -13,10 +13,11 @@ use freshell_protocol::{
     TerminalOutput, TerminalRunStatus, TerminalSessionAssociated,
 };
 use freshell_ws::restart::{
-    run_restart_recovery_driver, JournalParentSync, ProductionFreshResumePlan,
-    ProductionFreshRuntime, RestartCoordinator, RestartFailure, RestartIngressLimits,
-    RestartOutcome, RestartReplacementFence, RestartResumeContext, RestartRetirementAction,
-    RestartRetirementFence, RestartRuntime, RuntimeLocator, SpawnRegistrationRaceGate,
+    run_restart_recovery_driver, JournalParentSync, ProductionFreshPreflight,
+    ProductionFreshResumePlan, ProductionFreshRuntime, RestartCoordinator, RestartFailure,
+    RestartIngressLimits, RestartOutcome, RestartReplacementFence, RestartResumeContext,
+    RestartRetirementAction, RestartRetirementFence, RestartRuntime, RuntimeLocator,
+    SpawnRegistrationRaceGate,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -4933,6 +4934,551 @@ async fn fresh_replacement_result_uses_one_deadline_despite_unrelated_broadcasts
         failure.message,
         "fresh-agent replacement did not report a result"
     );
+    registry.kill_all();
+}
+
+// ---------------------------------------------------------------------------
+// Fix 7: active restart plans are never evicted by other requests' preflight
+// floods, and every terminal outcome (commit, terminal failure) removes the
+// plan and releases the OpenCode preflight reservation through the
+// `RestartRuntime::on_terminal_outcome` hook. Retryable outcomes keep both
+// the durable row and the plan so a same-request retry reuses its token.
+// ---------------------------------------------------------------------------
+
+/// One deterministically parked shutdown: the production adapter holds the
+/// request's active plan between preflight and replacement creation, which is
+/// exactly the window an eviction would have to hit.
+#[derive(Clone)]
+struct RecordedShutdownGate {
+    session_id: String,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+/// Fix-7 recording seam: faithful enough to drive the real
+/// `ProductionRestartRuntime` ordering (reserve → shutdown → fenced create →
+/// commit) without external provider binaries, while recording every
+/// reservation acquire/release tuple and injecting gated or failing shutdowns.
+struct ReservationRecordingFreshRuntime {
+    coordinator: RestartCoordinator,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    live: Mutex<HashMap<(String, String), String>>,
+    plans: Mutex<HashMap<(String, String), ProductionFreshResumePlan>>,
+    reservations: Mutex<Vec<(String, String, String)>>,
+    releases: Mutex<Vec<(freshell_protocol::AgentProvider, String, String, String)>>,
+    shutdown_outcomes:
+        Mutex<HashMap<(String, String), freshell_freshagent::RestartShutdownOutcome>>,
+    shutdown_gate: Mutex<Option<RecordedShutdownGate>>,
+}
+
+impl ReservationRecordingFreshRuntime {
+    fn new(
+        coordinator: RestartCoordinator,
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    ) -> Self {
+        Self {
+            coordinator,
+            broadcast_tx,
+            live: Mutex::new(HashMap::new()),
+            plans: Mutex::new(HashMap::new()),
+            reservations: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
+            shutdown_outcomes: Mutex::new(HashMap::new()),
+            shutdown_gate: Mutex::new(None),
+        }
+    }
+
+    fn enroll_live_session(&self, provider: &str, session_id: &str, runtime_id: &str) {
+        self.live.lock().unwrap().insert(
+            (provider.to_string(), session_id.to_string()),
+            runtime_id.to_string(),
+        );
+        self.plans.lock().unwrap().insert(
+            (provider.to_string(), session_id.to_string()),
+            ProductionFreshResumePlan {
+                session_type: match provider {
+                    "codex" => freshell_protocol::SessionType::Freshcodex,
+                    "opencode" => freshell_protocol::SessionType::Freshopencode,
+                    _ => freshell_protocol::SessionType::Freshclaude,
+                },
+                cwd: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                sandbox: None,
+            },
+        );
+    }
+
+    fn gate_shutdown_for(
+        &self,
+        session_id: &str,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.shutdown_gate.lock().unwrap() = Some(RecordedShutdownGate {
+            session_id: session_id.to_string(),
+            entered,
+            release,
+        });
+    }
+
+    fn set_shutdown_outcome(
+        &self,
+        provider: &str,
+        session_id: &str,
+        outcome: freshell_freshagent::RestartShutdownOutcome,
+    ) {
+        self.shutdown_outcomes
+            .lock()
+            .unwrap()
+            .insert((provider.to_string(), session_id.to_string()), outcome);
+    }
+
+    fn releases(&self) -> Vec<(freshell_protocol::AgentProvider, String, String, String)> {
+        self.releases.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ProductionFreshRuntime for ReservationRecordingFreshRuntime {
+    async fn has_live_session(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+    ) -> bool {
+        self.live
+            .lock()
+            .unwrap()
+            .contains_key(&(provider_name(provider).to_string(), session_id.to_string()))
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> bool {
+        let mut live = self.live.lock().unwrap();
+        let key = (provider_name(provider).to_string(), session_id.to_string());
+        if live.get(&key).map(String::as_str) != Some(expected_runtime_id) {
+            return false;
+        }
+        live.remove(&key);
+        true
+    }
+
+    async fn shutdown_reserved_for_restart_detailed(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+        reservation_token: Option<&str>,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
+        let key = (provider_name(provider).to_string(), session_id.to_string());
+        if let Some(outcome) = self.shutdown_outcomes.lock().unwrap().get(&key).cloned() {
+            return outcome;
+        }
+        let gate = self.shutdown_gate.lock().unwrap().clone();
+        if let Some(gate) = gate.filter(|gate| gate.session_id == session_id) {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        // The adapter hands the exact reservation token its plan recorded at
+        // preflight; only OpenCode plans carry one.
+        assert_eq!(
+            reservation_token.is_some(),
+            provider == freshell_protocol::AgentProvider::Opencode
+        );
+        let mut live = self.live.lock().unwrap();
+        if live.get(&key).map(String::as_str) != Some(expected_runtime_id) {
+            return freshell_freshagent::RestartShutdownOutcome::Stale;
+        }
+        live.remove(&key);
+        freshell_freshagent::RestartShutdownOutcome::Stopped
+    }
+
+    async fn capture_resume_plan(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        _expected_runtime_id: &str,
+    ) -> Option<ProductionFreshResumePlan> {
+        self.plans
+            .lock()
+            .unwrap()
+            .get(&(provider_name(provider).to_string(), session_id.to_string()))
+            .cloned()
+    }
+
+    async fn reserve_restart_preflight(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+        reservation_token: &str,
+    ) -> Result<ProductionFreshPreflight, String> {
+        if !self.has_live_session(provider, session_id).await {
+            return Err("selected fresh-agent runtime is no longer live".to_string());
+        }
+        let plan = self
+            .capture_resume_plan(provider, session_id, expected_runtime_id)
+            .await
+            .ok_or_else(|| "selected fresh-agent runtime settings are unavailable".to_string())?;
+        // Only the OpenCode lane holds a provider-side reservation.
+        let token = (provider == freshell_protocol::AgentProvider::Opencode)
+            .then(|| reservation_token.to_string());
+        if let Some(token) = &token {
+            self.reservations.lock().unwrap().push((
+                session_id.to_string(),
+                expected_runtime_id.to_string(),
+                token.clone(),
+            ));
+        }
+        Ok(ProductionFreshPreflight {
+            plan,
+            actions: Vec::new(),
+            reservation_token: token,
+        })
+    }
+
+    async fn release_restart_preflight(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        session_id: &str,
+        expected_runtime_id: &str,
+        reservation_token: &str,
+    ) {
+        self.releases.lock().unwrap().push((
+            provider,
+            session_id.to_string(),
+            expected_runtime_id.to_string(),
+            reservation_token.to_string(),
+        ));
+    }
+
+    async fn handle_create(
+        &self,
+        provider: freshell_protocol::AgentProvider,
+        create: freshell_protocol::FreshAgentCreate,
+    ) {
+        let durable_id = create
+            .resume_session_id
+            .as_deref()
+            .expect("production restart must use the resume path");
+        let provider = provider_name(provider);
+        let runtime_id = format!("fresh-{provider}-replacement-{durable_id}");
+        let runtime = self.coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::FreshAgent, provider, durable_id),
+            &runtime_id,
+        );
+        self.live
+            .lock()
+            .unwrap()
+            .insert((provider.to_string(), durable_id.to_string()), runtime_id);
+        let created = ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: provider.to_string(),
+            request_id: create.request_id,
+            runtime_provider: provider.to_string(),
+            session_id: durable_id.to_string(),
+            session_type: match create.session_type {
+                freshell_protocol::SessionType::Freshclaude => "freshclaude",
+                freshell_protocol::SessionType::Kilroy => "kilroy",
+                freshell_protocol::SessionType::Freshcodex => "freshcodex",
+                freshell_protocol::SessionType::Freshopencode => "freshopencode",
+            }
+            .to_string(),
+            session_ref: create.session_ref,
+            runtime: Some(runtime),
+        });
+        self.broadcast_tx
+            .send(serde_json::to_string(&created).unwrap())
+            .unwrap();
+    }
+}
+
+/// LB-12: direct host paths (the recovery adapter, concurrent door races) can
+/// reach `ProductionRestartRuntime::preflight` without crossing the Task-7
+/// ingress caps. More than the 1,024-wide retired/history bound of such
+/// preflights must never evict an in-flight transaction's active plan. The
+/// flood's OpenCode plans all hold reservations, so the pre-fix eviction —
+/// which skipped reservation holders — deterministically selected the held
+/// transaction's non-reservation plan.
+#[tokio::test]
+async fn active_plan_survives_preflight_flood_from_other_requests() {
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let durable_id = "durable-flood-held".to_string();
+    let old_runtime_id = "fresh-claude-flood-held-old".to_string();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "claude", durable_id.clone());
+    let old = state.restart.register_initial(locator, &old_runtime_id);
+    let fresh_runtime = Arc::new(ReservationRecordingFreshRuntime::new(
+        state.restart.clone(),
+        Arc::clone(&state.broadcast_tx),
+    ));
+    fresh_runtime.enroll_live_session("claude", &durable_id, &old_runtime_id);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    fresh_runtime.gate_shutdown_for(&durable_id, Arc::clone(&entered), Arc::clone(&release));
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            fresh_runtime.clone(),
+        ),
+    );
+    let _registration = state.restart.set_runtime(production.clone());
+    let request = AgentRestart {
+        request_id: "flood-held".to_string(),
+        provider: "claude".to_string(),
+        session_id: durable_id.clone(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id.clone(),
+        expected_generation: old.generation,
+    };
+    let driver = {
+        let restart = state.restart.clone();
+        let request = request.clone();
+        tokio::spawn(async move { restart.execute_registered(request, |_| {}).await })
+    };
+    // The held transaction is now parked mid-shutdown: preflight inserted its
+    // active plan, replacement creation has not consumed it.
+    entered.notified().await;
+
+    for index in 0..(1_024 + 8) {
+        let flood = AgentRestart {
+            request_id: format!("flood-{index}"),
+            provider: "opencode".to_string(),
+            session_id: format!("durable-flood-{index}"),
+            kind: AgentRuntimeKind::FreshAgent,
+            live_id: format!("fresh-opencode-flood-{index}"),
+            expected_generation: 1,
+        };
+        fresh_runtime.enroll_live_session("opencode", &flood.session_id, &flood.live_id);
+        RestartRuntime::preflight(production.as_ref(), &flood)
+            .await
+            .expect("a direct preflight beyond the retired/history bound still admits");
+    }
+
+    release.notify_one();
+    let outcome = driver.await.expect("held transaction task");
+    assert!(
+        matches!(
+            outcome.messages.last(),
+            Some(ServerMessage::AgentRestartReplaced(replaced))
+                if replaced.request_id == request.request_id
+        ),
+        "the held transaction must commit: its active plan was never evicted by the flood: {:?}",
+        outcome.messages
+    );
+    assert!(state.restart.pending_recoveries().is_empty());
+    registry.kill_all();
+}
+
+/// A committed OpenCode restart must remove its active plan AND release the
+/// provider-side preflight reservation with the exact
+/// (provider, session, runtime, token) tuple it was acquired under; otherwise
+/// the session stays "reserved by another restart" forever (kill/interrupt
+/// refused).
+#[tokio::test]
+async fn commit_removes_plan_and_releases_opencode_preflight_reservation() {
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let durable_id = "durable-release-commit".to_string();
+    let old_runtime_id = "fresh-opencode-release-old".to_string();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "opencode", durable_id.clone());
+    let old = state.restart.register_initial(locator, &old_runtime_id);
+    let fresh_runtime = Arc::new(ReservationRecordingFreshRuntime::new(
+        state.restart.clone(),
+        Arc::clone(&state.broadcast_tx),
+    ));
+    fresh_runtime.enroll_live_session("opencode", &durable_id, &old_runtime_id);
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            fresh_runtime.clone(),
+        ),
+    );
+    let _registration = state.restart.set_runtime(production.clone());
+    let request = AgentRestart {
+        request_id: "release-commit".to_string(),
+        provider: "opencode".to_string(),
+        session_id: durable_id.clone(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id.clone(),
+        expected_generation: old.generation,
+    };
+
+    let outcome = state
+        .restart
+        .execute_registered(request.clone(), |_| {})
+        .await;
+
+    assert!(
+        matches!(
+            outcome.messages.last(),
+            Some(ServerMessage::AgentRestartReplaced(_))
+        ),
+        "the restart commits before its release is checked: {:?}",
+        outcome.messages
+    );
+    assert_eq!(
+        fresh_runtime.releases(),
+        vec![(
+            freshell_protocol::AgentProvider::Opencode,
+            durable_id.clone(),
+            old_runtime_id.clone(),
+            format!("restart-preflight:{}", request.request_id),
+        )],
+        "a committed restart releases its preflight reservation exactly once, with the exact tuple"
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_none(),
+        "a committed request's active plan is removed"
+    );
+    assert!(state.restart.pending_recoveries().is_empty());
+    registry.kill_all();
+}
+
+/// A TERMINAL (non-retryable) shutdown failure is a terminal outcome: the
+/// durable row is removed, the plan goes with it, and the OpenCode
+/// reservation is released. Compare the retryable counterpart below.
+#[tokio::test]
+async fn terminal_shutdown_failure_removes_plan_and_releases_reservation() {
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let durable_id = "durable-release-terminal-failure".to_string();
+    let old_runtime_id = "fresh-opencode-terminal-failure-old".to_string();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "opencode", durable_id.clone());
+    let old = state.restart.register_initial(locator, &old_runtime_id);
+    let fresh_runtime = Arc::new(ReservationRecordingFreshRuntime::new(
+        state.restart.clone(),
+        Arc::clone(&state.broadcast_tx),
+    ));
+    fresh_runtime.enroll_live_session("opencode", &durable_id, &old_runtime_id);
+    fresh_runtime.set_shutdown_outcome(
+        "opencode",
+        &durable_id,
+        freshell_freshagent::RestartShutdownOutcome::Stale,
+    );
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            fresh_runtime.clone(),
+        ),
+    );
+    let _registration = state.restart.set_runtime(production.clone());
+    let request = AgentRestart {
+        request_id: "release-terminal-failure".to_string(),
+        provider: "opencode".to_string(),
+        session_id: durable_id.clone(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id.clone(),
+        expected_generation: old.generation,
+    };
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_none(),
+        "no plan exists before preflight"
+    );
+
+    let outcome = state
+        .restart
+        .execute_registered(request.clone(), |_| {})
+        .await;
+
+    let Some(ServerMessage::AgentRestartFailed(failed)) = outcome.messages.last() else {
+        panic!("terminal shutdown failure expected: {:?}", outcome.messages);
+    };
+    assert!(
+        !failed.retryable,
+        "a terminal shutdown failure is not retryable"
+    );
+    assert!(
+        !failed.recovery_pending,
+        "a terminal shutdown failure retains no recovery row"
+    );
+    assert_eq!(
+        fresh_runtime.releases(),
+        vec![(
+            freshell_protocol::AgentProvider::Opencode,
+            durable_id.clone(),
+            old_runtime_id.clone(),
+            format!("restart-preflight:{}", request.request_id),
+        )],
+        "a terminal shutdown failure releases the reservation it can never use"
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_none(),
+        "a terminal failure removes the request's active plan"
+    );
+    assert!(state.restart.pending_recoveries().is_empty());
+    registry.kill_all();
+}
+
+/// Counterpart: a RETRYABLE shutdown failure keeps the durable row AND the
+/// plan, so a same-request retry/redegraded recovery reuses the exact
+/// reservation token instead of colliding with "reserved by another restart".
+#[tokio::test]
+async fn retryable_shutdown_failure_keeps_plan_and_reservation() {
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let durable_id = "durable-release-retryable".to_string();
+    let old_runtime_id = "fresh-opencode-retryable-old".to_string();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "opencode", durable_id.clone());
+    let old = state.restart.register_initial(locator, &old_runtime_id);
+    let fresh_runtime = Arc::new(ReservationRecordingFreshRuntime::new(
+        state.restart.clone(),
+        Arc::clone(&state.broadcast_tx),
+    ));
+    fresh_runtime.enroll_live_session("opencode", &durable_id, &old_runtime_id);
+    fresh_runtime.set_shutdown_outcome(
+        "opencode",
+        &durable_id,
+        freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete {
+            message: "degraded remote abort".to_string(),
+        },
+    );
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            fresh_runtime.clone(),
+        ),
+    );
+    let _registration = state.restart.set_runtime(production.clone());
+    let request = AgentRestart {
+        request_id: "release-retryable".to_string(),
+        provider: "opencode".to_string(),
+        session_id: durable_id.clone(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id.clone(),
+        expected_generation: old.generation,
+    };
+
+    let outcome = state
+        .restart
+        .execute_registered(request.clone(), |_| {})
+        .await;
+
+    let Some(ServerMessage::AgentRestartFailed(failed)) = outcome.messages.last() else {
+        panic!(
+            "retryable shutdown failure expected: {:?}",
+            outcome.messages
+        );
+    };
+    assert!(failed.retryable);
+    assert!(
+        failed.recovery_pending,
+        "a retryable shutdown failure retains its recovery row"
+    );
+    assert!(
+        fresh_runtime.releases().is_empty(),
+        "the reservation survives for the retry: {:?}",
+        fresh_runtime.releases()
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_some(),
+        "a retryable failure keeps the request's active plan"
+    );
+    assert_eq!(state.restart.pending_recoveries().len(), 1);
     registry.kill_all();
 }
 
