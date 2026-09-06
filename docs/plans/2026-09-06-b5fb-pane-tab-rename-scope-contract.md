@@ -215,10 +215,11 @@ describe('pane/tab rename local scope (b5fb)', () => {
       createRequestId: 'r-pre', status: 'connecting',
     } as unknown as PaneContent)
     store.dispatch(applyPaneRename({ tabId, paneId, title: 'Pre-ID label' }))
-    expect(apiMocks.patch).not.toHaveBeenCalled()
-    // Identity adoption writes sessionId into content only; titleSync keeps no pending rename.
-    // (Adoption itself is covered by materializeFreshAgentSession tests; this pins that no
-    // PATCH ever fires from the rename path once the ID exists.)
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Pre-ID label')
+    // Nothing is queued for later: with sync machinery deleted there is no
+    // replay path, so an identity adoption (sessionId arriving later) can
+    // never retro-persist this label. (FreshAgentView adoption coverage tests
+    //  verify content adoption itself.)
     expect(apiMocks.patch).not.toHaveBeenCalled()
   })
 
@@ -431,9 +432,11 @@ cannot sneak in through the tab route.)
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.server.config.ts test/server/agent-panes-write.test.ts`
 
-Expected: FAIL — the two pins fail because `persistSyncableTerminalRename` still
-writes terminal/session overrides, bumps the registry title, and broadcasts
-`terminals.changed`.
+Expected: FAIL — the FIRST pin fails because `persistSyncableTerminalRename`
+still writes terminal/session overrides, bumps the registry title, and
+broadcasts `terminals.changed`. The second pin is a guard that is GREEN before
+and after (the old cascade early-returns on `!terminalId`, so a sessionRef-only
+pane never persisted anyway — it pins that gap can never reopen).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -511,8 +514,14 @@ it('clear patch removes titleOverride AND titleSource, unblocking the ladder', a
 })
 ```
 
-Today the second patch leaves `titleSource: 'user'` behind (the spread only
-touches `titleOverride`), so the final write is ladder-blocked → RED.
+This store-level pin is **GREEN from the start** (a guard, not RED evidence):
+`patchSessionOverride` spread-merges `{...existing, ...patch}`, and with BOTH
+patch keys `undefined` the merge clears both keys while the ladder gate is
+skipped — the store already honors the contract the fixed route relies on. The
+defect lives one layer up: the route never SENDS `titleSource: undefined` on a
+clear (`...(cleanString(titleOverride) ? { titleSource: 'user' } : {})` omits
+the key outright), so the stored rung survives. The RED for the route fix is
+integration Test 4 below.
 
 `test/integration/server/unified-rename-integration.test.ts` — rewrite:
 - Test 1 → "terminal rename does NOT write a session override (live)":
@@ -564,9 +573,11 @@ app.patch('/api/sessions/:sessionId', async (req, res) => {
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.server.config.ts test/integration/server/unified-rename-integration.test.ts test/unit/server/config-store.ladder.test.ts`
 
-Expected: FAIL — Tests 1/2 currently write the session override; the ladder pin
-fails on the leftover `titleSource: 'user'`; Test 4 fails because today's
-sessions route spreads the clear without dropping `titleSource`.
+Expected: FAIL — Tests 1/2 currently write the session override through the
+today-behavior mirror app, and Test 4 fails because today's sessions route never
+emits `titleSource: undefined`, so the stored `titleSource:'user'` survives the
+clear and stays ladder-blocking. The store-level ladder pin passes already
+(green-from-start guard — guard, not RED).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
