@@ -15,7 +15,15 @@ import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { ApiError } from '@/lib/api'
-import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
+import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
+import {
+  ROLLBACK_BUSY_REDO_NOTICE,
+  ROLLBACK_BUSY_UNDO_NOTICE,
+  REDO_CODEX_UNSUPPORTED_NOTICE,
+  UNDO_REFILL_NOTICE,
+  rollbackUnsupportedNotice,
+} from '@/lib/fresh-agent-rollback'
+import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -190,6 +198,13 @@ function getFreshAgentPaneContent(store: ReturnType<typeof createStore>) {
   return layout.content
 }
 
+function finishOutgoingTurn(store: ReturnType<typeof createStore>) {
+  const content = getFreshAgentPaneContent(store)
+  const locator = { sessionId: content.sessionId!, sessionType: content.sessionType, provider: content.provider }
+  act(() => store.dispatch(setSessionStatus({ ...locator, status: 'running' })))
+  act(() => store.dispatch(setSessionStatus({ ...locator, status: 'idle' })))
+}
+
 function sentFreshAgentMessages(type: string) {
   return wsMock.send.mock.calls
     .map(([message]) => message)
@@ -314,6 +329,234 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
+  describe('outgoing message queue', () => {
+    async function setup(status = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status, capabilities: { send: canSend, interrupt: true }, turns: [],
+      })
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: provider === 'claude' ? 'freshclaude' as const : 'freshcodex' as const,
+        provider, createRequestId: 'queue-create',
+        sessionId: provider === 'claude' ? CLAUDE_THREAD_ID : 'queue-session', status: status as 'running' | 'idle',
+      }
+      const view = (nextStatus: string) => (
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={{ ...content, status: nextStatus as 'idle' }} />
+        </Provider>
+      )
+      const rendered = render(view(status))
+      await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled())
+      const send = (text: string) => {
+        fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: text } })
+        fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      }
+      return { send, store, status: (nextStatus: string) => {
+        act(() => store.dispatch(setSessionStatus({
+          sessionId: content.sessionId, sessionType: content.sessionType, provider,
+          status: nextStatus as 'idle',
+        })))
+        rendered.rerender(view(nextStatus))
+      } }
+    }
+
+    it('keeps queued work when the provider exits', async () => {
+      const queue = await setup()
+      queue.send('Keep this follow-up')
+      queue.status('exited')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('sends queued messages one turn at a time', async () => {
+      const queue = await setup()
+      queue.send('First follow-up')
+      queue.send('Second follow-up')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: 'First follow-up' })
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      queue.status('running')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second follow-up' })
+    })
+
+    it('queues rapid sends before the provider reports running', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('advances after a fast interrupted turn whose status updates share one render', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        listener({ type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.status', status: 'running' } })
+        queue.store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+        queue.store.dispatch(setSessionStatus({ ...locator, status: 'idle' }))
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it('advances after real Codex snapshot lifecycle frames complete within one render', async () => {
+      const queue = await setup('idle')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        for (const status of ['running', 'idle']) {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null, timelineSessionId: locator.sessionId, status } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+    })
+
+    it('does not unlock the next Codex send with an earlier turn HTTP response', async () => {
+      const queue = await setup('idle')
+      queue.send('Repeat this task')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const snapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementationOnce(() => snapshot.promise)
+      const locator = { sessionId: 'queue-session', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({ type: 'freshAgent.send.accepted', ...locator, requestId: first.requestId }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      queue.send('Repeat this task')
+      queue.send('Last follow-up')
+      act(() => {
+        for (const status of ['running', 'idle']) {
+          const message = { type: 'freshAgent.event', ...locator, event: { type: 'freshAgent.session.snapshot', sessionId: locator.sessionId, latestTurnId: null, timelineSessionId: locator.sessionId, status } }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      await act(async () => snapshot.resolve({
+        ...freshopencodeSnapshot('finished first turn', 1),
+        sessionType: 'freshcodex', provider: 'codex', sessionId: locator.sessionId, threadId: locator.sessionId,
+        turns: [{ id: 'first-user-turn', turnId: 'first-user-turn', role: 'user', summary: 'Repeat this task', items: [{ id: 'first-user-text', kind: 'text', text: 'Repeat this task' }] }],
+      }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('advances after Claude streams and completes within one render', async () => {
+      const queue = await setup('idle', true, 'claude')
+      queue.send('First message')
+      queue.send('Second message')
+      const locator = { sessionId: CLAUDE_THREAD_ID, sessionType: 'freshclaude' as const, provider: 'claude' as const }
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => {
+        for (const event of [
+          { type: 'freshAgent.stream', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } },
+          { type: 'freshAgent.stream', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } } },
+          { type: 'freshAgent.result' },
+          { type: 'freshAgent.status', status: 'idle' },
+        ]) {
+          const message = { type: 'freshAgent.event', ...locator, event }
+          handleFreshAgentMessage(queue.store.dispatch, message)
+          listener(message)
+        }
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+    })
+
+    it.each(['codex', 'claude'] as const)('advances %s after reconnect when an authoritative idle snapshot contains the submitted turn', async (provider) => {
+      const queue = await setup('idle', true, provider)
+      queue.send('First message')
+      queue.send('Second message')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'disconnected' }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionId: first.sessionId, status: 'idle', capabilities: { send: true, interrupt: true },
+        extensions: provider === 'claude' ? { claude: { statusFromLiveState: true } } : {},
+        turns: [{ id: 'completed-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'user-text', kind: 'text', text: 'First message' }] }],
+      })
+      act(() => {
+        queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' })
+        reconnect()
+      })
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(2))
+      expect(sentFreshAgentMessages('freshAgent.send')[1]).toMatchObject({ text: 'Second message' })
+    })
+
+    it('does not advance Claude from disk-only idle history after accepting a prompt', async () => {
+      const queue = await setup('idle', true, 'claude')
+      queue.send('Accepted but not finished')
+      queue.send('Later follow-up')
+      const first = sentFreshAgentMessages('freshAgent.send')[0]
+      const beforeRefresh = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        sessionId: CLAUDE_THREAD_ID, status: 'idle', capabilities: { send: true, interrupt: true },
+        turns: [{ id: 'accepted-user-turn', role: 'user', requestId: first.requestId, items: [{ id: 'accepted-text', kind: 'text', text: 'Accepted but not finished' }] }],
+        extensions: { claude: { liveSessionId: CLAUDE_THREAD_ID } },
+      })
+      const listener = wsMock.onMessage.mock.calls.at(-1)?.[0] as unknown as (message: unknown) => void
+      act(() => listener({
+        type: 'freshAgent.send.accepted', sessionId: CLAUDE_THREAD_ID,
+        sessionType: 'freshclaude', provider: 'claude', requestId: first.requestId,
+        submittedTurnId: 'accepted-user-turn',
+      }))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps the reservation when a reconnect idle snapshot does not contain the submitted turn', async () => {
+      const queue = await setup('idle')
+      queue.send('Still awaiting acceptance')
+      queue.send('Later follow-up')
+      const beforeRefresh = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      const reconnect = wsMock.onReconnect.mock.calls.at(-1)?.[0] as unknown as () => void
+      act(() => reconnect())
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(beforeRefresh))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps queued work while the idle snapshot does not allow sends', async () => {
+      const queue = await setup('running', false)
+      queue.send('Wait for permission to send')
+      queue.status('idle')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    })
+
+    it('keeps queued work while disconnected and sends after reconnect', async () => {
+      const queue = await setup()
+      queue.send('After reconnect')
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'disconnected' }))
+      queue.status('idle')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      act(() => queue.store.dispatch({ type: 'connection/setStatus', payload: 'ready' }))
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1))
+    })
+
+    it('checks current agent status when a shell command finishes', async () => {
+      const queue = await setup('idle')
+      let finishShell!: (result: { output: string; exitCode: number }) => void
+      apiMock.post.mockImplementationOnce(() => new Promise((resolve) => { finishShell = resolve }))
+      queue.send('!pwd')
+      queue.status('running')
+      await act(async () => finishShell({ output: '/workspace', exitCode: 0 }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      queue.status('idle')
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject({ text: expect.stringContaining('/workspace') }))
+    })
+  })
+
   it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -924,6 +1167,38 @@ describe('FreshAgentView', () => {
     await screen.findByRole('textbox', { name: 'Chat message input' })
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-split-restore', expect.any(Object))
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+  })
+
+  it('stamps freshAgent.create with the pane tab identity (D8 provenance)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-tabid',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // D8 (restore-open-sessions-only): the server composes the ledger row's
+    // tabKey as `deviceId:tabId` from the hello-stamped connection identity
+    // plus this field; the D8 judgment never offers rows whose parent
+    // evidence cannot see them, so a dropped tabId would silently orphan the
+    // pane's placement on restore.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-tabid',
+      tabId: 'tab-1',
+    }))
   })
 
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
@@ -2313,6 +2588,7 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second title' },
     })
@@ -2381,6 +2657,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-session-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second durable title' },
     })
@@ -2461,6 +2738,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-session-refine-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Second refined title' },
     })
@@ -2676,6 +2954,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('thread-same-identity')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Should not replace codex same identity title' },
     })
@@ -2744,6 +3023,7 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentSessionId()).toBe('live-same-durable-2')
     })
 
+    finishOutgoingTurn(store)
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
       target: { value: 'Should not replace durable title' },
     })
@@ -3709,6 +3989,20 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
     })
+    // The replacement conversation starts only once the durable close is
+    // acknowledged (correlated close waits, focused-episode-6 round 2).
+    const aliasHandlers = wsMock.onMessage.mock.calls.map(([h]) => h).filter(Boolean)
+    act(() => {
+      for (const handler of aliasHandlers) {
+        ;(handler as (msg: unknown) => void)({
+          type: 'freshAgent.killed',
+          sessionId: 'thread-reset-alias',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          success: true,
+        })
+      }
+    })
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'freshAgent.create',
@@ -3806,6 +4100,115 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('starts the new conversation only once the old session close is durably acknowledged', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-new-ack',
+        sessionId: 'thread-new-ack',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-new-ack' }),
+    )
+    // Ungated before: the pane stays on the OLD conversation until the close lands.
+    const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(before.content).toMatchObject({ sessionId: 'thread-new-ack', status: 'idle' })
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-new-ack',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(after.content).toMatchObject({ status: 'creating' })
+      expect((after.content as { sessionId?: string }).sessionId).toBeUndefined()
+    })
+  })
+
+  it('keeps the current conversation when the new-conversation close is not durably recorded', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-new-fail',
+        sessionId: 'thread-new-fail',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-new-fail',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+      })
+    }
+    await waitFor(() => {
+      // The KILL_FAILED banner state is folded (close flows never drop the
+      // conversation on an unrecorded close).
+      expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-new-fail']?.lastErrorCode).toBe('KILL_FAILED')
+    })
+    const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(after.content).toMatchObject({ sessionId: 'thread-new-fail', status: 'idle' })
+  })
+
   it('routes FreshOpenCode forks through the pane cwd', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -3850,6 +4253,7 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_fork_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      tabId: 'tab-1',
       cwd: '/repo/route-aware',
       input: { atTurnId: 'turn-route-fork' },
     })
@@ -6175,31 +6579,47 @@ describe('snapshot scheduler integration (zrrj)', () => {
   })
 
   it('keeps the last good snapshot visible and stops fetching during 429 backoff', async () => {
-    const store = createStore()
-    const broadcast = captureWsBroadcast()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
+    // Wall-clock debounce plus waitFor's 1s deadline races CPU contention in
+    // cloud shards. Advance the actual scheduler/React timers deterministically.
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const broadcast = captureWsBroadcast()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
 
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
-    await screen.findByText('hello world')
-    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
 
-    broadcast(sessionChanged())
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
-    await flushMs(50)
-    // Last good transcript stays visible; no load-error banner.
-    expect(screen.getByText('hello world')).toBeInTheDocument()
-    expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
+      broadcast(sessionChanged())
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      // Last good transcript stays visible; no load-error banner.
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
 
-    // Further invalidations during backoff are suppressed without network.
-    broadcast(sessionChanged())
-    await flushMs(400)
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
-    expect(screen.getByText('hello world')).toBeInTheDocument()
+      // Invalidations stay suppressed throughout Retry-After, then the view's
+      // automatic retry refreshes the transcript once backoff has elapsed.
+      broadcast(sessionChanged())
+      await act(async () => { await vi.advanceTimersByTimeAsync(59_999) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(screen.getByText('hello world')).toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('recovered transcript', 11))
+      await act(async () => { await vi.advanceTimersByTimeAsync(51) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(screen.getByText('recovered transcript')).toBeInTheDocument()
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 
   it('does not refetch when another session sends (send.accepted for a foreign request)', async () => {
@@ -6353,6 +6773,563 @@ describe('FreshAgentView /model slash command', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Model catalog unavailable — try again')
     expect(screen.queryByRole('dialog', { name: 'Model and thinking level' })).not.toBeInTheDocument()
+  })
+})
+
+describe('/undo + /redo dispatch (kata 1wxv)', () => {
+  function rollbackCapableSnapshot(overrides: Record<string, unknown> = {}) {
+    return {
+      status: 'idle',
+      summary: 'rollback capable',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'rolled prompt', items: [{ id: 'u9-i', kind: 'text', text: 'rolled prompt' }], rolledBack: true },
+      ],
+      turns: [
+        { id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] },
+        { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'first answer', items: [{ id: 'a1-i', kind: 'text', text: 'first answer' }] },
+      ],
+      ...overrides,
+    }
+  }
+
+  function initOpencodePane(store: ReturnType<typeof createStore>, { sessionId = 'ses_rollback', status = 'idle' } = {}) {
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-rollback',
+        sessionId,
+        initialCwd: '/repo/route-aware',
+        status,
+      },
+    }))
+  }
+
+  function getComposer() {
+    return screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  }
+
+  it('/undo sends the frozen freshAgent.undo frame when idle and capable', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.keyDown(getComposer(), { key: 'Enter' })
+
+    // The frame goes out; the model NEVER receives '/undo' as text.
+    expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame).toMatchObject({
+      type: 'freshAgent.undo',
+      sessionId: 'ses_rollback',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      mode: 'step',
+      cwd: '/repo/route-aware',
+    })
+    expect(frame?.requestId).toEqual(expect.any(String))
+  })
+
+  it('/undo mid-turn writes nothing and shows the direction-aware busy UNDO notice verbatim', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({ status: 'running' }))
+    initOpencodePane(store, { status: 'running' })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.undo')).toEqual([])
+    expect(screen.getByText(ROLLBACK_BUSY_UNDO_NOTICE)).toBeInTheDocument()
+  })
+
+  it('/redo mid-turn writes nothing and shows the direction-aware busy REDO notice verbatim', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({ status: 'running' }))
+    initOpencodePane(store, { status: 'running' })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/redo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.redo')).toEqual([])
+    expect(screen.getByText(ROLLBACK_BUSY_REDO_NOTICE)).toBeInTheDocument()
+  })
+
+  it('typed /undo on a capability-false pane rolls to the pinned unsupported notice and sends nothing', async () => {
+    const store = createStore()
+    // No undo/redo stamps: a legacy server (or capability-false provider) surface.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'legacy caps',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        { id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] },
+        { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'first answer', items: [{ id: 'a1-i', kind: 'text', text: 'first answer' }] },
+      ],
+    })
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(sentFreshAgentMessages('freshAgent.undo')).toEqual([])
+    expect(screen.getByText(rollbackUnsupportedNotice('Freshopencode'))).toBeInTheDocument()
+  })
+
+  it('the freshcodex slash menu offers /undo but NEVER a /redo entry (codex is undo-only)', async () => {
+    const store = createStore()
+    // The freshcodex server shape: undo stamped (paginated thread), redo never.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-rb-codex-menu',
+        sessionId: 'thread-rb-codex-menu',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
+    // The snapshot's turn text rendering IS the proof the capability stamps landed
+    // (the transcript reads the committed snapshot state), so the menu consult is
+    // deterministic without retries.
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.getByRole('menuitem', { name: /\/undo/ })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+  })
+
+  it('delta-r1 F7: the slash menu hides /undo and /redo on a capability-false (legacy) snapshot, keeping only capability-free rows', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'legacy caps',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{ id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] }],
+    })
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first prompt')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.queryByRole('menuitem', { name: /\/undo/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+    // Capability-free rows stay (the menu itself is alive).
+    expect(screen.getByRole('menuitem', { name: /\/compact/ })).toBeInTheDocument()
+  })
+
+  it('delta-r1 F7: before capability discovery (no snapshot yet), the slash menu offers neither /undo nor /redo', async () => {
+    const store = createStore()
+    // The snapshot promise never resolves during this check — the pre-discovery state.
+    let resolveSnapshot: ((value: unknown) => void) | undefined
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(() => new Promise((resolve) => { resolveSnapshot = resolve }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Slash commands' }))
+
+    expect(screen.queryByRole('menuitem', { name: /\/undo/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /\/redo/ })).not.toBeInTheDocument()
+    resolveSnapshot?.(rollbackCapableSnapshot())
+  })
+
+  it('delta-r1 F6: the view passes the snapshot redoableTurnIds through to the marker section (frozen markers hidden, current-epoch marker enabled)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({
+      rolledBackTurns: [
+        { id: 'u8', turnId: 'u8', role: 'user', summary: 'frozen marker', items: [{ id: 'u8-i', kind: 'text', text: 'frozen marker' }], rolledBack: true },
+        { id: 'a8', turnId: 'a8', role: 'assistant', summary: 'frozen answer', items: [{ id: 'a8-i', kind: 'text', text: 'frozen answer' }], rolledBack: true },
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'current marker', items: [{ id: 'u9-i', kind: 'text', text: 'current marker' }], rolledBack: true },
+      ],
+      rollback: { canRedo: true, undoneDepth: 2, redoableTurnIds: ['u9'] },
+    }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('frozen marker')).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    const buttons = Array.from(section.querySelectorAll('button[aria-label="Redo to here"]'))
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0].closest('div.flex.items-start')?.textContent).toContain('current marker')
+  })
+
+  it('delta-r1 F6 legacy: a rollback block WITHOUT redoableTurnIds offers no per-marker redo', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot({
+      rollback: { canRedo: true, undoneDepth: 1 },
+    }))
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('rolled prompt')).toBeInTheDocument())
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    expect(section.querySelectorAll('button[aria-label="Redo to here"]')).toHaveLength(0)
+  })
+
+  it('typed /redo on a freshcodex pane hits the composer RESERVED seam: pinned codex notice, NEVER a send (r3 correction 8)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-rb-codex',
+        sessionId: 'thread-rb-codex',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('Codex turn')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/redo' } })
+    fireEvent.keyDown(getComposer(), { key: 'Enter' })
+
+    // The composer's pre-catalog-resolution seam intercepts the reserved name: the
+    // pinned codex notice shows, and the text NEVER reaches the model or the wire.
+    expect(screen.getByText(REDO_CODEX_UNSUPPORTED_NOTICE)).toBeInTheDocument()
+    expect(sentFreshAgentMessages('freshAgent.redo')).toEqual([])
+    expect(sentFreshAgentMessages('freshAgent.send')).toEqual([])
+    expect(getComposer().value).toBe('')
+    // …but the typed text is pushed to prompt history exactly like a resolved command.
+    expect(JSON.parse(window.localStorage.getItem('fresh-agent-prompt-history:freshcodex') ?? '[]')).toContain('/redo')
+  })
+
+  it('a rolledBack ack refills the composer with the removed prompt (overwrite, never append) + refill notice', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    expect(onMessage).toBeTypeOf('function')
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The user keeps typing while the rollback is in flight — the refill OVERWRITES.
+    fireEvent.change(getComposer(), { target: { value: 'stale draft' } })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_rollback',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.rolledBack',
+          requestId: String(frame?.requestId),
+          sessionId: 'ses_rollback',
+          direction: 'undo',
+          mode: 'step',
+          removedPromptText: 'the removed prompt',
+          removedTurnIds: ['u1', 'a1'],
+          canRedo: true,
+        },
+      })
+    })
+
+    await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
+    expect(screen.getByText(UNDO_REFILL_NOTICE)).toBeInTheDocument()
+    // a11y: the refilled composer regains focus for immediate editing.
+    await waitFor(() => expect(document.activeElement).toBe(getComposer()))
+  })
+
+  it('a redone ack leaves the composer contents alone (the server kept prompt truth)', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/redo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.redo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    fireEvent.change(getComposer(), { target: { value: 'keep this draft' } })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_rollback',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.redone',
+          requestId: String(frame?.requestId),
+          sessionId: 'ses_rollback',
+          direction: 'redo',
+          restoredThroughTurnId: 'u9',
+          canRedo: false,
+        },
+      })
+    })
+
+    // No refill, no refill notice — a redo restores turns, not composer text.
+    await waitFor(() => expect(getComposer().value).toBe('keep this draft'))
+    expect(screen.queryByText(UNDO_REFILL_NOTICE)).not.toBeInTheDocument()
+  })
+
+  it('a rollback-flagged error renders the server-supplied message VERBATIM on the notice banner', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The server-pinned copy (e.g. the claude moved-tip refusal) renders VERBATIM —
+    // the client NEVER substitutes its own guess copy for a supplied message.
+    const serverCopy = 'Redo is no longer available — the original conversation’s history changed since the undo.'
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_rollback',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.error',
+          sessionId: 'ses_rollback',
+          code: 'REDO_UNAVAILABLE',
+          rollback: true,
+          requestId: String(frame?.requestId),
+          message: serverCopy,
+        },
+      })
+    })
+
+    expect(screen.getByText(serverCopy)).toBeInTheDocument()
+  })
+
+  it('a re-delivered rolledBack ack with the SAME requestId NEVER re-refills the composer (consume-once per requestId)', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(rollbackCapableSnapshot())
+    initOpencodePane(store)
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first answer')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame?.requestId).toEqual(expect.any(String))
+
+    // The SAME ack frame delivered twice (ws redundancy / reconnect replays can
+    // re-deliver); the pending-rollback dedupe list consumes exactly once per
+    // requestId, so the refill effect fires exactly once.
+    const ackFrame = {
+      type: 'freshAgent.event',
+      sessionId: 'ses_rollback',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.rolledBack',
+        requestId: String(frame?.requestId),
+        sessionId: 'ses_rollback',
+        direction: 'undo',
+        mode: 'step',
+        removedPromptText: 'the removed prompt',
+        removedTurnIds: ['u1', 'a1'],
+        canRedo: true,
+      },
+    }
+    act(() => {
+      onMessage?.(ackFrame)
+    })
+    await waitFor(() => expect(getComposer().value).toBe('the removed prompt'))
+
+    // A user edit after the refill must survive the replayed ack — a second
+    // refill would clobber it with 'the removed prompt' again.
+    fireEvent.change(getComposer(), { target: { value: 'post-refill edit' } })
+    act(() => {
+      onMessage?.(ackFrame)
+    })
+
+    expect(getComposer().value).toBe('post-refill edit')
+  })
+
+  it('a freshcodex pane stamps undo-only rollback capabilities on the pane-action registry (NEVER redo)', async () => {
+    // The server stamps undo:true / redo:false for freshcodex — the registry must
+    // never carry a redo capability for the context menu to offer.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Codex rollback caps',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: false },
+      rollback: { canRedo: false, undoneDepth: 0 },
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-caps-codex',
+        sessionId: 'thread-caps-codex',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const actions = getFreshAgentPaneActions('pane-1')
+      expect(actions?.undoSupported).toBe(true)
+      expect(actions?.redoSupported).toBe(false)
+      expect(actions?.canUndo).toBe(true)
+    })
+  })
+
+  it('a freshclaude pane with canRedo stamps both rollback capabilities on the pane-action registry (the menu row is offered, enabled)', async () => {
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'Claude rollback caps',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [],
+      turns: [],
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-caps-claude',
+        sessionId: CLAUDE_THREAD_ID,
+        status: 'connected',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      const actions = getFreshAgentPaneActions('pane-1')
+      expect(actions?.undoSupported).toBe(true)
+      expect(actions?.redoSupported).toBe(true)
+      expect(actions?.canRedo).toBe(true)
+    })
   })
 })
 

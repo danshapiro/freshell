@@ -29,6 +29,81 @@ function candidate(url: string, token?: string): LaunchServerCandidate {
   }
 }
 
+describe('server ownership', () => {
+  it('a named app-bound profile ALWAYS starts its own server (never auto-connects to a discovered one)', () => {
+    expect(chooseLaunchAction({
+      desktopConfig: config({ serverMode: 'app-bound', port: 3002 }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })).toEqual({ type: 'start-local' })
+  })
+
+  it('a named daemon profile skips discovery-driven chooser/auto-connect', () => {
+    expect(chooseLaunchAction({
+      desktopConfig: config({ serverMode: 'daemon' }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })).toEqual({ type: 'start-local' })
+  })
+
+  it('a default boot inside a multi-profile install owns its server too', () => {
+    // When the registry names any profile, the Default boot behaves like any
+    // other tenant: it must NEVER auto-attach to a neighbor profile's server.
+    expect(chooseLaunchAction({
+      desktopConfig: config(),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })).toEqual({ type: 'start-local' })
+  })
+
+  it('a legacy default boot (ownsServer unset) keeps historical discovery behavior', () => {
+    const c = candidate('http://localhost:3001', 'tok')
+    expect(chooseLaunchAction({
+      desktopConfig: config(),
+      candidates: [c],
+      savedRemoteReachable: false,
+      ownsServer: false,
+    })).toEqual({ type: 'auto-connect', candidate: c })
+  })
+
+  it('an absent ownsServer (legacy call shape) keeps historical discovery behavior', () => {
+    const c = candidate('http://localhost:3001', 'tok')
+    expect(chooseLaunchAction({
+      desktopConfig: config(),
+      candidates: [c],
+      savedRemoteReachable: false,
+    })).toEqual({ type: 'auto-connect', candidate: c })
+  })
+  it('owning boots honor alwaysAskOnLaunch (chooser still reachable — its remote/manual sections stay useful)', () => {
+    const result = chooseLaunchAction({
+      desktopConfig: config({ alwaysAskOnLaunch: true }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })
+    expect(result.type).toBe('show-chooser')
+    if (result.type === 'show-chooser') {
+      expect(result.reason).toBe('always-ask')
+    }
+  })
+
+  it('an owning remote-mode boot with no saved URL NEVER auto-connects a discovered candidate', () => {
+    const result = chooseLaunchAction({
+      desktopConfig: config({ serverMode: 'remote' }),
+      candidates: [candidate('http://localhost:3001', 'tok')],
+      savedRemoteReachable: false,
+      ownsServer: true,
+    })
+    expect(result.type).toBe('show-chooser')
+    if (result.type === 'show-chooser') {
+      expect(result.reason).toBe('manual-choice')
+    }
+  })
+})
+
 describe('launch policy', () => {
   it('shows setup when setup is incomplete', () => {
     expect(chooseLaunchAction({

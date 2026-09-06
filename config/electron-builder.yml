@@ -54,6 +54,11 @@ extraResources:
     to: launch-chooser
     filter:
       - "**/*"
+  # Profile picker assets (loaded from the real filesystem before connecting)
+  - from: dist/profile-picker
+    to: profile-picker
+    filter:
+      - "**/*"
   # Pruned server runtime dependencies (see prepare-bundled-node.ts Step 4)
   - from: server-node-modules
     to: server-node-modules

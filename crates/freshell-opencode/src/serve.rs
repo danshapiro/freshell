@@ -39,6 +39,179 @@ use crate::events::{
 /// detached listener (`OWNERSHIP_ENV`, `serve-manager.ts:11`).
 pub const OPENCODE_SIDECAR_OWNERSHIP_ENV: &str = "FRESHELL_OPENCODE_SIDECAR_ID";
 
+/// kata 1wxv Task 3 (decision 1 — conversation rollback NEVER touches files): the
+/// env-var lane the vendored opencode 1.18.21 CLI merges as an inline config document
+/// (parsed with the highest-precedence "local" scope — `loaded custom config from
+/// OPENCODE_CONFIG_CONTENT`).
+pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// The managed fresh-agent serve's pinned config: opencode snapshots DISABLED via the
+/// vendored CLI's verified config key (`snapshot: false`, 1.18.21). Probe-verified at
+/// Stage 2: with snapshots enabled, native `revert` re-applies FILE state for
+/// patch-carrying turns — as long as the managed sidecar carries this, conversation
+/// rollback can never touch the working tree (the Task 7 byte-identical-tree e2e is
+/// the behavioral arbiter).
+pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
+
+/// Delta-r1 F3: the effective snapshots-disabled `OPENCODE_CONFIG_CONTENT` value.
+/// A user could legitimately populate this env var with inline config (the repo
+/// documents server plugins flowing through it), so the managed launch MERGES the
+/// snapshots pin INTO an inherited JSON document instead of replacing it:
+/// - `None`/absent → exactly [`OPENCODE_SNAPSHOTS_DISABLED_CONFIG`];
+/// - a JSONC OBJECT → the same document with top-level `"snapshot": false` forced
+///   (a user-supplied `snapshot` key is overwritten — conversation rollback must
+///   never re-apply file state; that pin is the entire point of the decision).
+///   Focused ep1-r4 F1: the inherited document is normalized through
+///   [`jsonc_to_strict_json`] FIRST because OpenCode parses this lane with its
+///   JSONC parser (1.18.21 `ConfigParse.jsonc` → `jsonc-parser` with
+///   `allowTrailingComma`) — the merge accepts EXACTLY the same dialect the
+///   vendored CLI would, never replacing valid comment/trailing-comma config;
+/// - MALFORMED (unparseable even after JSONC normalization, or a JSON value that
+///   isn't an object — a document with no
+///   top-level key space can't take the pin) → replaced by the bare pin document,
+///   with a structured warning naming ONLY the replaced value's byte length.
+///   Focused ep1-r2 F5: inline config can carry credential-shaped fields (API
+///   keys, authorization headers), so the warning NEVER logs any content
+///   substring.
+pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
+    match inherited.filter(|raw| !raw.is_empty()) {
+        None => OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
+        Some(raw) => match serde_json::from_str::<Value>(&jsonc_to_strict_json(raw)) {
+            Ok(Value::Object(mut map)) => {
+                map.insert("snapshot".to_string(), Value::Bool(false));
+                Value::Object(map).to_string()
+            }
+            _ => {
+                tracing::warn!(
+                    replaced_value_bytes_len = raw.len(),
+                    "freshell_opencode.config_content.malformed_inline_config_replaced"
+                );
+                OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string()
+            }
+        },
+    }
+}
+
+/// Focused ep1-r4 F1: normalize the JSONC dialect OpenCode's own config loader
+/// accepts for this lane (1.18.21 `ConfigParse.jsonc` — `jsonc-parser` with
+/// `allowTrailingComma: true`) into the strict JSON `serde_json` parses, so the
+/// merge accepts EXACTLY the same documents the vendored CLI would have:
+///   (1) strip `//` line and TERMINATED `/* */` block comments (each replaced
+///       by ONE space so adjacent value tokens are never fused — `1/**/2` →
+///       `1 2`, not `12`); string-literal-aware, so a URL's `//`, a `\"`
+///       before a closer, or a literal `/*` inside a quoted string survive
+///       VERBATIM; an UNTERMINATED block comment's tail survives VERBATIM too
+///       (jsonc-parser rejects it lexically) — stripping it to EOF could leave
+///       a VALID strict document, silently accepting malformed JSONC
+///       (ep2-r4);
+///   (2) drop a comma whose next non-whitespace character is `}` or `]`
+///       (whitespace between the comma and the closer — including a stripped
+///       comment's space — is left in place).
+/// Anything still unparseable after normalization keeps the existing
+/// content-free malformed path above (the warning NEVER logs content — F5).
+fn jsonc_to_strict_json(raw: &str) -> String {
+    let stripped = {
+        // Pass (1): comment strip, one left-to-right scan.
+        let chars: Vec<char> = raw.chars().collect();
+        let mut out = String::with_capacity(raw.len());
+        let mut i = 0;
+        let mut in_string = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_string {
+                out.push(c);
+                // `\` escapes the NEXT char verbatim (it can never end the string).
+                if c == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 1;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                i += 1;
+            } else if c == '"' {
+                in_string = true;
+                out.push(c);
+                i += 1;
+            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+                // Line comment: ONE space; runs to (never consuming) the line
+                // break — LF or bare CR alike (ep2-r1 F3: jsonc-parser, the
+                // parser the vendored CLI's ConfigParse.jsonc delegates to,
+                // ends line comments on either), or to EOF.
+                out.push(' ');
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
+                    i += 1;
+                }
+            } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+                // Block comment: ONE space; runs through the closer. An
+                // UNTERMINATED block comment keeps its tail VERBATIM (ep2-r4:
+                // stripping to EOF can leave a VALID strict document —
+                // `{"a":1}/* dangling` → `{"a":1} ` — silently accepting
+                // malformed JSONC into the merge. The parser OpenCode actually
+                // delegates to errors lexically on it; the merge must accept
+                // exactly the same document set, so the tail survives verbatim
+                // and the strict parse rejects it).
+                let comment_start = i;
+                out.push(' ');
+                i += 2;
+                let mut closed = false;
+                while i < chars.len() {
+                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    out.extend(chars[comment_start..].iter());
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    };
+    // Pass (2): trailing-comma drop over the comment-stripped text.
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut out = String::with_capacity(stripped.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 1;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == ',' {
+            let mut j = i + 1;
+            while matches!(chars.get(j), Some(' ' | '\t' | '\n' | '\r')) {
+                j += 1;
+            }
+            if matches!(chars.get(j), Some('}' | ']')) {
+                i += 1; // trailing comma: drop it, keep the whitespace run
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// A boxed, `Send` future — the object-safe async return used by the injected IO
 /// traits (keeps them `dyn`-compatible without an `async-trait` dependency).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -127,13 +300,42 @@ impl ServeHttpResponse {
     }
 }
 
-/// The HTTP transport seam (`fetchFn`). One request/response round-trip. `Err(String)`
-/// is a transport/connection failure (e.g. connection refused before the serve is up).
+/// The transport-local failure classes for one HTTP exchange (ep1-r3 F2): the
+/// ONLY distinction that matters downstream is whether the request provably
+/// NEVER reached the server. OpenCode ≥1.18.21's summarize handler runs
+/// `revertSvc.cleanup` FIRST and its later stages atomically, so once the POST
+/// may have left the client, ANY failure is possibly-mutated — while a
+/// connect-phase refusal (DNS/connect failed before a byte was written) proves
+/// the server never saw the request, so none of its side effects ran.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServeHttpError {
+    /// The request provably never reached the server: the transport's connect
+    /// phase failed BEFORE any byte left the client (connect refused / DNS).
+    Undelivered(String),
+    /// Every other exchange failure: mid-flight reset, post-headers body loss,
+    /// in-handler failure surfaces — the request MAY have reached the server.
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for ServeHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServeHttpError::Undelivered(s) | ServeHttpError::Ambiguous(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for ServeHttpError {}
+
+/// The HTTP transport seam (`fetchFn`). One request/response round-trip. The
+/// `Err` side is a [`ServeHttpError`]: `Undelivered` ONLY for a provable
+/// connect-phase refusal (never a byte sent), `Ambiguous` for everything else
+/// (e.g. connection reset mid-exchange — the serve may have received it).
 pub trait ServeHttp: Send + Sync {
     fn request<'a>(
         &'a self,
         req: ServeHttpRequest,
-    ) -> BoxFuture<'a, Result<ServeHttpResponse, String>>;
+    ) -> BoxFuture<'a, Result<ServeHttpResponse, ServeHttpError>>;
 }
 
 /// An endpoint the sidecar should bind (`allocateLocalhostPort`,
@@ -232,6 +434,11 @@ pub enum ServeError {
         timeout_ms: u64,
     },
     Transport(String),
+    /// The transport's connect phase refused BEFORE a byte left the client
+    /// ([`ServeHttpError::Undelivered`]) — the serve provably never saw the
+    /// request (ep1-r3 F2: the ONLY failure class downstream may treat as
+    /// "no side effects ran").
+    Undelivered(String),
     Decode(String),
     IdleTimeout {
         session_id: String,
@@ -261,6 +468,9 @@ impl std::fmt::Display for ServeError {
                 write!(f, "opencode serve {method} {url} timed out after {timeout_ms}ms")
             }
             ServeError::Transport(s) => write!(f, "opencode serve transport error: {s}"),
+            ServeError::Undelivered(s) => {
+                write!(f, "opencode serve request never reached the server: {s}")
+            }
             ServeError::Decode(s) => write!(f, "opencode serve response decode error: {s}"),
             ServeError::IdleTimeout { session_id, timeout_ms } => write!(
                 f,
@@ -275,6 +485,44 @@ impl std::fmt::Display for ServeError {
 }
 
 impl std::error::Error for ServeError {}
+
+impl ServeError {
+    /// TRUE exactly when this failure PROVES the request never left the client
+    /// process — the downstream rollback-redo compensation predicate
+    /// (ep1-r3 F2, widened by focused ep2-r1 F3). Two provable families:
+    ///
+    /// - [`ServeError::Undelivered`] — the transport's connect phase refused
+    ///   BEFORE a byte left the client (the serve provably never saw the
+    ///   request);
+    /// - EVERY startup-phase failure — [`ServeError::ShuttingDown`],
+    ///   [`ServeError::StartupAborted`], [`ServeError::StartupFailed`],
+    ///   [`ServeError::ProcessExited`], [`ServeError::PortAllocation`],
+    ///   [`ServeError::Spawn`], [`ServeError::NotHealthy`]: all raised from
+    ///   `ensure_started`/`wait_for_health` BEFORE the request is even
+    ///   constructed, so no POST could exist.
+    ///
+    /// Everything else is post-dispatch or ambiguous — an answered non-2xx
+    /// ([`ServeError::Http`]; OpenCode ≥1.18.21 summarize runs
+    /// `revertSvc.cleanup` FIRST, so the tail may already be gone), a
+    /// mid-flight [`ServeError::RequestTimeout`], an ongoing-connection
+    /// [`ServeError::Transport`] (the ambiguous transport leg), a
+    /// [`ServeError::Decode`] (answer bytes arrived), and the post-send
+    /// [`ServeError::IdleTimeout`]/[`ServeError::SidecarLost`] — and must keep
+    /// the redo destroy intact FOREVER (error-after-send ≠ tail survived).
+    pub fn never_dispatched(&self) -> bool {
+        matches!(
+            self,
+            ServeError::Undelivered(_)
+                | ServeError::ShuttingDown
+                | ServeError::StartupAborted
+                | ServeError::StartupFailed(_)
+                | ServeError::ProcessExited { .. }
+                | ServeError::PortAllocation(_)
+                | ServeError::Spawn(_)
+                | ServeError::NotHealthy { .. }
+        )
+    }
+}
 
 // ── config / deps ────────────────────────────────────────────────────────────────
 
@@ -428,6 +676,27 @@ impl OpencodeServeManager {
             OPENCODE_SIDECAR_OWNERSHIP_ENV.to_string(),
             ownership_id.clone(),
         ));
+        // kata 1wxv Task 3 (decision 1): the MANAGED fresh-agent serve ALWAYS carries
+        // opencode snapshots disabled. Delta-r1 F3: MERGE the pin into any inherited
+        // inline config instead of replacing it (a user-supplied `snapshot` key is
+        // overwritten — conversation rollback (revert/unrevert) must never re-apply
+        // file state, but sibling keys — e.g. the server plugins this repo documents
+        // under this var — must survive). The inherited value is the LAST
+        // config-supplied entry if present, else the process env's; the spawn env
+        // ends with EXACTLY ONE entry (the merged value).
+        let inherited = {
+            let from_config = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+                .map(|(_, v)| v.clone());
+            env.retain(|(key, _)| key != OPENCODE_CONFIG_CONTENT_ENV);
+            from_config.or_else(|| std::env::var(OPENCODE_CONFIG_CONTENT_ENV).ok())
+        };
+        env.push((
+            OPENCODE_CONFIG_CONTENT_ENV.to_string(),
+            merged_opencode_config_content(inherited.as_deref()),
+        ));
         let process = self
             .inner
             .deps
@@ -550,6 +819,23 @@ impl OpencodeServeManager {
         body: Option<Value>,
         not_found_value: Option<Value>,
     ) -> Result<Value, ServeError> {
+        self.json_request_maybe_witnessed(method, path, body, not_found_value, None)
+            .await
+    }
+
+    /// [`json_request`] with an optional dispatch witness: when present, the
+    /// flag flips exactly once the URL exists and the HTTP send is issued —
+    /// after this call's own `require_base` — the TRUE dispatch point (ep4-r6
+    /// F3: arming the witness between two require_base calls misclassifies an
+    /// abort that lands inside the second one's wait as "dispatched").
+    async fn json_request_maybe_witnessed(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+        not_found_value: Option<Value>,
+        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Value, ServeError> {
         let base = self.require_base().await?;
         let url = format!("{base}{path}");
         let timeout = self.config().request_timeout;
@@ -563,7 +849,14 @@ impl OpencodeServeManager {
         req = req.with_timeout(timeout);
 
         let method_str = format!("{method:?}").to_uppercase();
-        let resp = match tokio::time::timeout(timeout, self.inner.deps.http.request(req)).await {
+        let resp = match {
+            if let Some(witness) = &dispatch_witness {
+                witness.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            tokio::time::timeout(timeout, self.inner.deps.http.request(req))
+        }
+        .await
+        {
             Err(_) => {
                 self.discard_running("request_timeout").await;
                 return Err(ServeError::RequestTimeout {
@@ -572,7 +865,14 @@ impl OpencodeServeManager {
                     timeout_ms: timeout.as_millis() as u64,
                 });
             }
-            Ok(Err(transport)) => return Err(ServeError::Transport(transport)),
+            Ok(Err(transport)) => {
+                return Err(match transport {
+                    // ep1-r3 F2: keep the delivery truth lossless — a provable
+                    // connect-phase refusal is NOT a generic transport error.
+                    ServeHttpError::Undelivered(s) => ServeError::Undelivered(s),
+                    ServeHttpError::Ambiguous(s) => ServeError::Transport(s),
+                });
+            }
             Ok(Ok(resp)) => resp,
         };
 
@@ -717,22 +1017,36 @@ impl OpencodeServeManager {
     /// EXACTLY those two keys — the manager stores no session metadata, hence the model
     /// pair is an EXPLICIT parameter the caller resolved upstream. The 200 `boolean`
     /// result is not consumed by the fresh-agent path.
+    ///
+    /// kata 1wxv ep4-r5 (abort-window boundary): `dispatched_witness` flips to
+    /// `true` exactly when the drive crosses from the cancellable leg into the
+    /// request leg — AFTER `require_base` (the serve is running; aborts in the
+    /// cold-start leg are still provably no-side-effects) and BEFORE the HTTP
+    /// call is issued. An aborted drive past this point is ambiguous-possibly-
+    /// mutated and must never be compensated by ledger restore.
     pub async fn compact(
         &self,
         id: &str,
         provider_id: &str,
         model_id: &str,
         route: &Route,
+        dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/summarize", encode_path_segment(id)),
             route,
         );
-        self.json_request(
+        // The witness flips INSIDE the request leg at the true send point —
+        // after its own `require_base` (the serve is running; aborts in the
+        // cold-start leg are still provably no-side-effects) and right where
+        // the HTTP call is issued (an abort inside the request leg's shared
+        // lock waits doesn't falsely look dispatched — ep4-r6 F3).
+        self.json_request_maybe_witnessed(
             HttpMethod::Post,
             &path,
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
+            dispatched_witness,
         )
         .await?;
         Ok(())
@@ -767,6 +1081,44 @@ impl OpencodeServeManager {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         })
+    }
+
+    /// `POST /session/:id/revert` (opencode 1.18.21, kata 1wxv Task 3) —
+    /// message-targeted conversation rollback: `{messageID}` marks that message AND
+    /// everything after it as reverted (the boundary is INCLUSIVE of the named
+    /// message; an assistant target normalizes to its parent user message). Body
+    /// discipline mirrors `fork` (additionalProperties:false upstream): EXACTLY one
+    /// key.
+    pub async fn revert(
+        &self,
+        id: &str,
+        message_id: &str,
+        route: &Route,
+    ) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/revert", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(
+            HttpMethod::Post,
+            &path,
+            Some(json!({ "messageID": message_id })),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `POST /session/:id/unrevert` — restores ALL reverted messages (opencode's
+    /// all-or-nothing redo). No body.
+    pub async fn unrevert(&self, id: &str, route: &Route) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/unrevert", encode_path_segment(id)),
+            route,
+        );
+        self.json_request(HttpMethod::Post, &path, None, None)
+            .await?;
+        Ok(())
     }
 
     // ── SSE fan-out (serve-manager.ts:419-438) ──────────────────────────────────
@@ -1165,6 +1517,7 @@ mod tests {
         fork_status: u16,
         fork_body: Vec<u8>,
         config_body: Vec<u8>,
+        revert_status: u16,
     }
 
     impl RecordingHttp {
@@ -1175,6 +1528,7 @@ mod tests {
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
+                revert_status: 200,
             }
         }
 
@@ -1187,7 +1541,8 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ServeHttpRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a>>
+        {
             let method = format!("{:?}", req.method).to_uppercase();
             self.requests.lock().expect("requests mutex").push((
                 method,
@@ -1212,6 +1567,15 @@ mod tests {
             if req.url.contains("/fork") {
                 let status = self.fork_status;
                 let body = self.fork_body.clone();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
+            }
+            if req.url.contains("/revert") {
+                let status = self.revert_status;
+                let body = if status == 200 {
+                    b"true".to_vec()
+                } else {
+                    br#"{"error":"unknown route"}"#.to_vec()
+                };
                 return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/config") {
@@ -1278,9 +1642,15 @@ mod tests {
         let http = Arc::new(RecordingHttp::new());
         let mgr = started_recording_manager(http.clone()).await;
 
-        mgr.compact("ses_9", "prov-a", "mdl-x", &Some("/work dir".to_string()))
-            .await
-            .expect("200 summarize succeeds");
+        mgr.compact(
+            "ses_9",
+            "prov-a",
+            "mdl-x",
+            &Some("/work dir".to_string()),
+            None,
+        )
+        .await
+        .expect("200 summarize succeeds");
 
         let requests = http.recorded();
         let (_, url, body) = requests
@@ -1315,7 +1685,7 @@ mod tests {
         });
         let mgr = started_recording_manager(http).await;
 
-        match mgr.compact("ses_9", "prov-a", "mdl-x", &None).await {
+        match mgr.compact("ses_9", "prov-a", "mdl-x", &None, None).await {
             Err(ServeError::Http { method, status, .. }) => {
                 assert_eq!(method, "POST");
                 assert_eq!(status, 400);
@@ -1427,5 +1797,615 @@ mod tests {
             }
             other => panic!("expected a 400 Http error, got {other:?}"),
         }
+    }
+
+    // ── revert/unrevert + snapshots-disabled launch (kata 1wxv Task 3) ────────
+
+    /// The recorded revert-family POST requests, if any (`/revert` AND `/unrevert` —
+    /// the latter never contains the former as a substring).
+    fn revert_requests(http: &RecordingHttp) -> Vec<(String, String, Option<String>)> {
+        http.recorded()
+            .into_iter()
+            .filter(|(method, url, _)| method == "POST" && url.contains("revert"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn revert_posts_exactly_the_message_id_key() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.revert("ses_9", "msg_u3", &Some("/work dir".to_string()))
+            .await
+            .expect("200 revert succeeds");
+
+        let requests = revert_requests(&http);
+        assert_eq!(requests.len(), 1, "exactly one revert POST");
+        let (_, url, body) = requests.into_iter().next().expect("one revert POST");
+        assert!(
+            url.contains("/session/ses_9/revert"),
+            "the revert path carries the session id: {url}"
+        );
+        assert!(
+            url.contains("directory=%2Fwork%20dir"),
+            "the route is preserved: {url}"
+        );
+        // additionalProperties:false upstream: EXACTLY the one key.
+        let body: Value =
+            serde_json::from_str(body.as_deref().expect("revert carries a JSON body")).unwrap();
+        assert_eq!(body, serde_json::json!({ "messageID": "msg_u3" }), "{body}");
+    }
+
+    #[tokio::test]
+    async fn unrevert_posts_no_body() {
+        let http = Arc::new(RecordingHttp::new());
+        let mgr = started_recording_manager(http.clone()).await;
+
+        mgr.unrevert("ses_9", &None)
+            .await
+            .expect("200 unrevert succeeds");
+
+        let requests = revert_requests(&http);
+        assert_eq!(requests.len(), 1, "exactly one unrevert POST");
+        let (_, url, body) = requests.into_iter().next().expect("one unrevert POST");
+        assert!(
+            url.contains("/session/ses_9/unrevert"),
+            "the unrevert path carries the session id: {url}"
+        );
+        assert!(
+            body.is_none(),
+            "unrevert is the legacy no-POST-body shape: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_surfaces_a_404_as_an_http_error() {
+        // A CLI predating the revert surface answers 404/unknown-route; the caller
+        // maps it to UNSUPPORTED_CAPABILITY (never an uncontextualized INTERNAL_ERROR).
+        let http = Arc::new(RecordingHttp {
+            revert_status: 404,
+            ..RecordingHttp::new()
+        });
+        let mgr = started_recording_manager(http).await;
+
+        match mgr.revert("ses_9", "msg_u3", &None).await {
+            Err(ServeError::Http { method, status, .. }) => {
+                assert_eq!(method, "POST");
+                assert_eq!(status, 404);
+            }
+            other => panic!("expected a 404 Http error, got {other:?}"),
+        }
+    }
+
+    /// A spawner that CAPTURES its spawn requests (the launch-config assertion).
+    struct CapturingSpawner {
+        requests: Mutex<Vec<SpawnRequest>>,
+    }
+    impl ProcessSpawner for CapturingSpawner {
+        fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            self.requests.lock().expect("spawns mutex").push(req);
+            Ok(Box::new(NeverExitsProcess))
+        }
+    }
+
+    /// kata 1wxv Task 3 (decision 1 — rollback NEVER touches files): native
+    /// revert re-applies FILE state for patch-carrying turns when snapshots are
+    /// enabled (probe-verified against the vendored 1.18.21 CLI), so the managed
+    /// fresh-agent `opencode serve` sidecar ALWAYS launches with opencode
+    /// snapshots DISABLED via `OPENCODE_CONFIG_CONTENT={"snapshot": false}`
+    /// (the vendored CLI's verified config key; merged config, highest-precedence
+    /// env lane). The Task 7 byte-identical-working-tree e2e is the behavioral
+    /// arbiter; this pins the launch config itself.
+    ///
+    /// Env-hermetic (delta-r1 F3): the launch now MERGES an inherited value,
+    /// so this default-path pin scrubs a possibly-hostile host var first.
+    #[tokio::test]
+    async fn the_managed_serve_launches_with_opencode_snapshots_disabled() {
+        let _env_guard = config_env_lock().await;
+        let scrubbed = scrub_config_env();
+
+        let spawner = Arc::new(CapturingSpawner {
+            requests: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: spawner.clone(),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let requests = spawner.requests.lock().expect("spawns mutex");
+        assert_eq!(requests.len(), 1, "exactly one sidecar spawn");
+        let entry = requests[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+            .expect("the managed serve carries OPENCODE_CONFIG_CONTENT");
+        assert_eq!(
+            entry.1, OPENCODE_SNAPSHOTS_DISABLED_CONFIG,
+            "the managed config is exactly the snapshots-disabled document"
+        );
+        let parsed: Value =
+            serde_json::from_str(&entry.1).expect("the managed config is valid JSON");
+        assert_eq!(parsed, serde_json::json!({ "snapshot": false }));
+        drop(scrubbed);
+    }
+
+    // ── delta-r1 F3: the managed config MERGE (never destroys inherited values) ──
+
+    /// Serialize env mutation for the config-env probes (parallel tests share the
+    /// process env; the scrubbers below mutate it). A TOKIO mutex: the guard is
+    /// held across the spawn-level tests' `.await points.
+    async fn config_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    /// Remove the process-inherited `OPENCODE_CONFIG_CONTENT` for the duration of
+    /// a default-path test; restore on drop.
+    fn scrub_config_env() -> impl Drop {
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var(OPENCODE_CONFIG_CONTENT_ENV, v),
+                    None => std::env::remove_var(OPENCODE_CONFIG_CONTENT_ENV),
+                }
+            }
+        }
+        let prior = std::env::var(OPENCODE_CONFIG_CONTENT_ENV).ok();
+        std::env::remove_var(OPENCODE_CONFIG_CONTENT_ENV);
+        Restore(prior)
+    }
+
+    #[test]
+    fn merged_config_absent_writes_the_bare_pin_document() {
+        assert_eq!(
+            merged_opencode_config_content(None),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+        );
+        // An empty inherited value merges as absent, never a malformed warning.
+        assert_eq!(
+            merged_opencode_config_content(Some("")),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+        );
+    }
+
+    #[test]
+    fn merged_config_merges_into_an_inherited_object_and_forces_the_pin() {
+        let user =
+            r#"{"plugin":["file:///home/me/plugin.ts"],"model":"openai/gpt-5","theme":"dark"}"#;
+        let parsed: Value = serde_json::from_str(&merged_opencode_config_content(Some(user)))
+            .expect("merged is valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "plugin": ["file:///home/me/plugin.ts"],
+                "model": "openai/gpt-5",
+                "theme": "dark",
+                "snapshot": false,
+            }),
+            "sibling keys preserved; the snapshots pin is forced in"
+        );
+        // A user-supplied top-level `snapshot` NEVER wins — the rollback decision
+        // pins it (that is the point of the managed lane).
+        let overridden: Value = serde_json::from_str(&merged_opencode_config_content(Some(
+            r#"{"snapshot":true,"autoupdate":false}"#,
+        )))
+        .expect("merged is valid JSON");
+        assert_eq!(
+            overridden,
+            serde_json::json!({ "snapshot": false, "autoupdate": false })
+        );
+    }
+
+    /// tracing capture facility (the freshell-freshagent DIAG-01 idiom):
+    /// thread-local, for the synchronous warn inside the merge helper.
+    mod config_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        struct Visitor {
+            fields: BTreeMap<String, String>,
+        }
+        impl Visit for Visitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        /// The capture target: one `BTreeMap<field, value>` per traced event.
+        type CapturedEvents = Arc<Mutex<Vec<BTreeMap<String, String>>>>;
+
+        struct CaptureLayer {
+            events: CapturedEvents,
+        }
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = Visitor {
+                    fields: BTreeMap::new(),
+                };
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(visitor.fields);
+            }
+        }
+
+        /// Thread-local capture (the helper under test emits synchronously on
+        /// the calling thread — no spawned tasks cross here).
+        pub fn capture() -> (CapturedEvents, tracing::subscriber::DefaultGuard) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            (events, tracing::subscriber::set_default(subscriber))
+        }
+    }
+
+    /// Focused-review ep1-r2 F5 (log hygiene): the malformed-inline-config
+    /// warning must never copy user config into persistent logs — an inline
+    /// OpenCode document can carry credential-shaped fields (API keys,
+    /// authorization headers), and a truncated/malformed secret-bearing value
+    /// would otherwise leak. The warn names ONLY the replaced value's byte
+    /// length; NO substring of the content appears in any traced field.
+    #[test]
+    fn merged_config_malformed_is_replaced_with_a_content_free_length_only_warning() {
+        let (events, _guard) = config_capture::capture();
+        let malformed = "not-json-at-all{ this is longer than twenty four chars }";
+        let replaced = merged_opencode_config_content(Some(malformed));
+        assert_eq!(replaced, OPENCODE_SNAPSHOTS_DISABLED_CONFIG);
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshell_opencode.config_content.malformed_inline_config_replaced")
+            })
+            .expect("a malformed inline config warns loudly");
+        assert_eq!(
+            warn.get("replaced_value_bytes_len")
+                .cloned()
+                .unwrap_or_default(),
+            malformed.len().to_string(),
+            "the warning names ONLY the replaced value's byte length: {warn:?}"
+        );
+        for (field, value) in warn.iter() {
+            for n in [8usize, 16, 24, malformed.len()] {
+                let needle = &malformed[..n.min(malformed.len())];
+                assert!(
+                    !value.contains(needle),
+                    "no content substring ({needle:?}) may appear in any traced field ({field}={value:?})"
+                );
+            }
+        }
+    }
+
+    // ── focused ep1-r4 F1: OpenCode (v1.18.21) parses OPENCODE_CONFIG_CONTENT
+    //    with a JSONC parser (// and /* */ comments, trailing commas) — the merge
+    //    must accept the same dialect, never replace valid inline config ──────
+
+    #[test]
+    fn jsonc_normalization_strips_comments_string_literal_aware() {
+        // Line comments end AT the newline; block comments end at the closer.
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//note\n{\"b\":2}"),
+            "{\"a\":1} \n{\"b\":2}"
+        );
+        assert_eq!(
+            jsonc_to_strict_json("{/* head */\"a\": /* inline */ 1}"),
+            "{ \"a\":   1}"
+        );
+        // A removed comment leaves ONE space — adjacent tokens are NEVER fused.
+        assert_eq!(jsonc_to_strict_json("1/**/2"), "1 2");
+        // An UNTERMINATED block comment keeps its tail VERBATIM (ep2-r4: the
+        // parser OpenCode actually uses raises a lexical error there — stripping
+        // to EOF could leave a VALID strict document ("{"a":1}/* dangling" →
+        // "{"a":1} "), silently accepting malformed JSONC into the merge).
+        let verbatim = jsonc_to_strict_json("{\"a\":1}/* dangling");
+        assert_eq!(verbatim, "{\"a\":1} /* dangling");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&verbatim).is_err(),
+            "the unterminated document stays INVALID for the strict parse: {verbatim:?}"
+        );
+        // Comment OPENERS INSIDE string literals survive verbatim (a URL's "//"
+        // is data, never a comment).
+        assert_eq!(
+            jsonc_to_strict_json("{\"u\":\"https://x//y\",\"s\":\"/* not a comment */\"}"),
+            "{\"u\":\"https://x//y\",\"s\":\"/* not a comment */\"}"
+        );
+        // An escaped quote does NOT close the string — the trailing // stays
+        // string content.
+        assert_eq!(
+            jsonc_to_strict_json("{\"s\":\"a\\\"//b\"}"),
+            "{\"s\":\"a\\\"//b\"}"
+        );
+    }
+
+    #[test]
+    fn jsonc_normalization_drops_trailing_commas_string_literal_aware() {
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":[1,2,],\"b\":2,}"),
+            "{\"a\":[1,2],\"b\":2}"
+        );
+        // A comma separated from the closer by a (now-stripped) comment/ws drops.
+        assert_eq!(jsonc_to_strict_json("{\"a\":1, /* x */ }"), "{\"a\":1   }");
+        // ",}" / ",]" sequences INSIDE strings are data — never stripped.
+        assert_eq!(
+            jsonc_to_strict_json("{\"s\":\"a,}b,]c\",\"t\":1,}"),
+            "{\"s\":\"a,}b,]c\",\"t\":1}"
+        );
+        // A REAL content comma is kept (only a comma directly before a closer drops).
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1,\"b\":2}"),
+            "{\"a\":1,\"b\":2}"
+        );
+    }
+
+    #[test]
+    fn merged_config_parses_jsonc_and_preserves_every_user_key_verbatim() {
+        let user = r#"{
+            // the provider pin — credential-shaped fields legitimately ride this lane
+            "provider": {
+                "dev": {
+                    "models": { "m-x": { "name": "M X" } },
+                    "options": {
+                        "apiKey": "sk-test-only",
+                        "headers": { "X-Api-Key": "hdr-test-only", "Authorization": "Bearer t" }
+                    }
+                }
+            },
+            "model": "dev/m-x",
+            "plugin": [
+                "https://plugins.example/p.js", // a quoted URL carries "//" — data, never a comment
+            ],
+            "log": "https://logs.example/tail", /* a block comment before the closer */
+            "snapshot": true,
+        }"#;
+        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(user)))
+            .expect("the merged document is valid strict JSON");
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "provider": { "dev": {
+                    "models": { "m-x": { "name": "M X" } },
+                    "options": {
+                        "apiKey": "sk-test-only",
+                        "headers": { "X-Api-Key": "hdr-test-only", "Authorization": "Bearer t" }
+                    },
+                }},
+                "model": "dev/m-x",
+                "plugin": ["https://plugins.example/p.js"],
+                "log": "https://logs.example/tail",
+                "snapshot": false,
+            }),
+            "JSONC object ⇒ merged preserving ALL user keys verbatim (incl. models/apiKey/headers \
+             and comment-containing strings); the snapshot:false pin still wins over the user key"
+        );
+    }
+
+    /// Focused ep1-r4 F1: a VALID JSONC document never enters the malformed
+    /// branch — the content-free warning fires ONLY for genuinely unparseable
+    /// input (below).
+    #[test]
+    fn merged_config_valid_jsonc_never_emits_the_malformed_warning() {
+        let (events, _guard) = config_capture::capture();
+        let jsonc = "{\n  // line comment\n  \"share\": \"disabled\", /* block */\n  \"autoupdate\": false,\n}";
+        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(jsonc)))
+            .expect("the merged document is valid strict JSON");
+        assert_eq!(
+            merged,
+            serde_json::json!({ "share": "disabled", "autoupdate": false, "snapshot": false })
+        );
+        let events = events.lock().expect("capture lock");
+        assert!(
+            events.iter().all(|fields| {
+                fields.get("message").map(String::as_str)
+                    != Some("freshell_opencode.config_content.malformed_inline_config_replaced")
+            }),
+            "valid JSONC never warns: {events:?}"
+        );
+    }
+
+    /// A document unparseable even AFTER comment/trailing-comma normalization
+    /// keeps the existing content-free replace+warn behavior (F5 unchanged).
+    #[test]
+    fn merged_config_unparseable_after_jsonc_normalization_still_warns_content_free() {
+        let (events, _guard) = config_capture::capture();
+        let malformed = "{ \"model\": , // no value\n }";
+        let replaced = merged_opencode_config_content(Some(malformed));
+        assert_eq!(replaced, OPENCODE_SNAPSHOTS_DISABLED_CONFIG);
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshell_opencode.config_content.malformed_inline_config_replaced")
+            })
+            .expect("a genuinely unparseable document still warns loudly");
+        assert_eq!(
+            warn.get("replaced_value_bytes_len")
+                .cloned()
+                .unwrap_or_default(),
+            malformed.len().to_string(),
+            "length-only, content-free (F5): {warn:?}"
+        );
+        assert!(
+            warn.values().all(|v| !v.contains("model")),
+            "no content substring survives into the warning: {warn:?}"
+        );
+    }
+
+    /// Focused ep2-r1 F3: `jsonc-parser` (the parser OpenCode's 1.18.21
+    /// `ConfigParse.jsonc` actually uses) ends `//` line comments at LF **or
+    /// bare CR** (microsoft/node-jsonc-parser scanner) — the normalizer must
+    /// match, or a valid CR-only inline config loses everything after its
+    /// first comment (→ strict-parse miss → content-free replace, silently
+    /// dropping model/plugin/auth settings).
+    #[test]
+    fn jsonc_normalization_line_comments_end_at_lf_or_bare_cr() {
+        // LF (baseline, already covered) and CR both terminate; the terminator
+        // itself stays as document whitespace.
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//x\n{\"b\":2}"),
+            "{\"a\":1} \n{\"b\":2}"
+        );
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//x\r{\"b\":2}"),
+            "{\"a\":1} \r{\"b\":2}"
+        );
+        // CRLF terminates at the CR (the \n that follows is plain whitespace).
+        assert_eq!(
+            jsonc_to_strict_json("{\"a\":1}//note\r\n{\"b\":2}"),
+            "{\"a\":1} \r\n{\"b\":2}"
+        );
+        // The full valid document on bare-CR line endings merges — never the
+        // malformed branch.
+        let cr_only = "{\r  // provider pin\r  \"model\": \"dev/m-x\",\r}\r";
+        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(cr_only)))
+            .expect("CR-only JSONC is valid after normalization");
+        assert_eq!(
+            merged,
+            serde_json::json!({ "model": "dev/m-x", "snapshot": false })
+        );
+    }
+
+    /// A non-object JSON value can't take a top-level pin either — same
+    /// replace+warn, content-free (F5).
+    #[test]
+    fn merged_config_json_scalars_and_arrays_are_replaced_with_the_warning() {
+        let (events, _guard) = config_capture::capture();
+        let scalar = r#"["plugin-x"]"#;
+        assert_eq!(
+            merged_opencode_config_content(Some(scalar)),
+            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+        );
+        let events = events.lock().expect("capture lock");
+        assert_eq!(events.len(), 1, "one warn per replaced malformed value");
+        assert_eq!(
+            events[0]
+                .get("replaced_value_bytes_len")
+                .cloned()
+                .unwrap_or_default(),
+            scalar.len().to_string(),
+        );
+        assert!(
+            events[0].values().all(|v| !v.contains("plugin-x")),
+            "no content substring survives into the warning: {:?}",
+            events[0]
+        );
+    }
+
+    /// Spawn-level: a config-supplied inline document is MERGED into the launch
+    /// (sibling keys survive, snapshot pinned), never replaced — and the spawn env
+    /// carries EXACTLY ONE occurrence (the merged value).
+    #[tokio::test]
+    async fn the_managed_serve_merges_a_config_supplied_inline_document() {
+        let _env_guard = config_env_lock().await;
+        let scrubbed = scrub_config_env();
+        let spawner = Arc::new(CapturingSpawner {
+            requests: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: spawner.clone(),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            env: vec![(
+                OPENCODE_CONFIG_CONTENT_ENV.to_string(),
+                r#"{"plugin":["file:///p.ts"],"provider":{"x":{"models":{}}}}"#.to_string(),
+            )],
+            ..ServeConfig::default()
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        drop(scrubbed);
+
+        let requests = spawner.requests.lock().expect("spawns mutex");
+        assert_eq!(requests.len(), 1, "exactly one sidecar spawn");
+        let occurrences: Vec<&String> = requests[0]
+            .env
+            .iter()
+            .filter(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            occurrences.len(),
+            1,
+            "exactly one OPENCODE_CONFIG_CONTENT entry — the MERGED value"
+        );
+        let parsed: Value = serde_json::from_str(occurrences[0]).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "plugin": ["file:///p.ts"],
+                "provider": { "x": { "models": {} } },
+                "snapshot": false,
+            })
+        );
+    }
+
+    /// Spawn-level: the PROCESS-inherited value merges the same way (the launch
+    /// environment is the lane the finding names — a freshell server running
+    /// WITH OPENCODE_CONFIG_CONTENT exports it to the managed serve).
+    #[tokio::test]
+    async fn the_managed_serve_merges_the_process_inherited_inline_document() {
+        let _env_guard = config_env_lock().await;
+        std::env::set_var(OPENCODE_CONFIG_CONTENT_ENV, r#"{"share":"disabled"}"#);
+        let _scrubbed = DeferUnset;
+        struct DeferUnset;
+        impl Drop for DeferUnset {
+            fn drop(&mut self) {
+                std::env::remove_var(OPENCODE_CONFIG_CONTENT_ENV);
+            }
+        }
+
+        let spawner = Arc::new(CapturingSpawner {
+            requests: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: spawner.clone(),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        OpencodeServeManager::new(deps, ServeConfig::default())
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let requests = spawner.requests.lock().expect("spawns mutex");
+        let entry = requests[0]
+            .env
+            .iter()
+            .find(|(key, _)| key == OPENCODE_CONFIG_CONTENT_ENV)
+            .expect("the managed serve carries OPENCODE_CONFIG_CONTENT");
+        let parsed: Value = serde_json::from_str(&entry.1).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "share": "disabled", "snapshot": false }),
+            "the inherited document survives; the pin merges in"
+        );
     }
 }

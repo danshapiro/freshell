@@ -87,7 +87,7 @@ describe('T0 external-process handshake conformance (original server)', () => {
 
   it('(b) agrees on WS_PROTOCOL_VERSION across client, contract, and hello', () => {
     const validator = new ContractValidator()
-    expect(WS_PROTOCOL_VERSION).toBe(7)
+    expect(WS_PROTOCOL_VERSION).toBe(8)
     expect(validator.wsProtocolVersion).toBe(WS_PROTOCOL_VERSION)
 
     const hello = handshake.find((m) => m.dir === 'out' && m.type === 'hello')

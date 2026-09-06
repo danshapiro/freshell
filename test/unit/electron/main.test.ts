@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
-import { initMainProcess, type ElectronApp, type MainProcessDeps } from '../../../electron/main.js'
+import { initMainProcess, acquireInstanceLock, type ElectronApp, type MainProcessDeps } from '../../../electron/main.js'
 
 function createMockApp(): ElectronApp & EventEmitter {
   const emitter = new EventEmitter() as ElectronApp & EventEmitter
@@ -40,11 +40,33 @@ describe('initMainProcess', () => {
     expect(deps.createMainWindow).toHaveBeenCalled()
   })
 
-  it('quits when single instance lock fails', async () => {
-    ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+  describe('acquireInstanceLock', () => {
+    it('returns true without quitting when the lock is acquired', () => {
+      const app = createMockApp()
+      expect(acquireInstanceLock(app)).toBe(true)
+      expect(app.quit).not.toHaveBeenCalled()
+    })
+
+    it('quits and returns false when another instance holds the lock', () => {
+      const app = createMockApp()
+      ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+      expect(acquireInstanceLock(app)).toBe(false)
+      expect(app.quit).toHaveBeenCalled()
+    })
+
+    it('invokes onDenied BEFORE quitting (so entry.ts can lift the wizard-phase will-quit veto)', () => {
+      const app = createMockApp()
+      ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
+      const onDenied = vi.fn()
+      expect(acquireInstanceLock(app, onDenied)).toBe(false)
+      expect(onDenied.mock.invocationCallOrder[0])
+        .toBeLessThan((app.quit as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+    })
+  })
+
+  it('does not register a second-instance handler (entry.ts installs the canonical one in main())', async () => {
     await initMainProcess(deps)
-    expect(app.quit).toHaveBeenCalled()
-    expect(deps.createMainWindow).not.toHaveBeenCalled()
+    expect(app.listenerCount('second-instance')).toBe(0)
   })
 
   it('close-to-tray hides window instead of quitting', async () => {

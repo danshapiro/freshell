@@ -83,6 +83,19 @@ describe('GET /api/bootstrap', () => {
     expect(res.body.configFallback).toEqual({ reason: 'read_error', backupExists: true })
   })
 
+  it('includes the effective config dir for profile-aware surfaces', async () => {
+    const appWithDir = createTestApp({
+      getConfigDir: () => '/home/user/.freshell-work',
+    })
+
+    const res = await request(appWithDir)
+      .get('/api/bootstrap')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.configDir).toBe('/home/user/.freshell-work')
+  })
+
   it('routes bootstrap through the critical read-model lane without binding first paint to request aborts', async () => {
     const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal?: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
       expect(lane).toBe('critical')

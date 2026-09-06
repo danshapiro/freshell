@@ -8,12 +8,11 @@ use tracing::Instrument;
 
 /// Where a `terminal.create` reply goes.
 pub(crate) enum CreateOutput<'a> {
-    /// Direct socket sink — the inline (non-restore) path. A send failure
-    /// propagates as `false`, which closes the connection (existing
-    /// semantics, unchanged).
+    /// The handler's nonblocking connection outbox. Admission failure closes
+    /// the reader; actual socket errors are observed by writer supervision.
     Socket(&'a mut crate::terminal::WsSink),
-    /// The connection's mpsc frame sink — the spawned (restore) path. The
-    /// select loop drains it to the socket; pushing is non-blocking, so a
+    /// The connection's frame sink — used by both create workers. The
+    /// independent writer drains it; pushing is non-blocking, so a
     /// stalled client can never wedge a gate permit. A dead connection just
     /// drops the frames.
     Channel(&'a FrameSink),
@@ -61,6 +60,7 @@ where
 /// per-connection cancel watch fires (send or sender drop), and every queued
 /// restore create for that connection unblocks as Cancelled WITHOUT spawning
 /// a PTY.
+#[allow(clippy::too_many_arguments)] // Same create-context plumbing as `handle_create`.
 pub(crate) fn spawn_gated_restore_create(
     create: TerminalCreate,
     state: &WsState,
@@ -68,6 +68,14 @@ pub(crate) fn spawn_gated_restore_create(
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     conn_id: u64,
     pane_reconcile_v1: bool,
+    // D8: the dispatching connection's identity, carried into the detached
+    // task so the restore create's ledger rows stamp like an inline create's.
+    conn_identity: crate::terminal::ConnectionIdentity,
+    // Focused-ep4-r2 Findings 1+2: the create message's RECEIPT time, captured
+    // by the dispatch arm. A restore create can park in the gate queue long
+    // after the pane's tab state moved on — its ledger provenance must still
+    // carry the browser's assertion, never this task's eventual run time.
+    asserted_at: i64,
 ) {
     let state = state.clone();
     let sink = std::sync::Arc::clone(conn_sink);
@@ -236,6 +244,8 @@ pub(crate) fn spawn_gated_restore_create(
                     conn_id,
                     pane_reconcile_v1,
                     &mut create_limiter,
+                    &conn_identity,
+                    asserted_at,
                 )
                 .await;
                 // Covers create failure: no-op when handle_create settled the entry,

@@ -302,7 +302,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -310,7 +310,7 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'sessionRef', 'agent', 'model', 'effort'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
@@ -455,6 +455,7 @@ Pane commands:
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
   respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
+  hostStats       Pass hostStats: true on new-tab or split-pane to create a Host Stats pane (CPU/RAM/load metrics) instead of a terminal -- no process is spawned.
 
 Terminal I/O:
   send-keys       Send input to a pane. Params: target, keys, literal?, sessionRef?

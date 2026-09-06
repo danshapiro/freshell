@@ -10,11 +10,9 @@ const MAX_LEVEL_ENTRIES = 50
 /**
  * Providers that share the cwd-scoped model MRU + per-model last-used-level
  * stores. The store keys keep the historical freshopencode prefix so existing
- * entries survive, and give freshcodex its own namespace so the two catalogs
- * never collide. The dialog is the only consumer: freshclaude/kilroy keep
- * their simple popover list and never record here.
+ * entries survive. Each session type has its own namespace.
  */
-export type FreshAgentModelMruProvider = 'freshopencode' | 'freshcodex'
+export type FreshAgentModelMruProvider = 'freshopencode' | 'freshcodex' | 'freshclaude' | 'kilroy'
 
 export type FreshAgentModelMruEntry = {
   id: string
@@ -45,7 +43,8 @@ function levelMruStorageKey(provider: FreshAgentModelMruProvider): string {
 }
 
 function runtimeProviderFor(provider: FreshAgentModelMruProvider): FreshAgentModelCapability['provider'] {
-  return provider === 'freshcodex' ? 'codex' : 'opencode'
+  if (provider === 'freshcodex') return 'codex'
+  return provider === 'freshopencode' ? 'opencode' : 'claude'
 }
 
 function resolveStorage(storage?: Storage): Storage | undefined {

@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
+import { getFreshellConfigDir } from '../../freshell-home.js'
 import {
   CodexDurabilityStoreRecordSchema,
   type CodexDurabilityStoreRecord,
@@ -24,7 +24,7 @@ export class CodexDurabilityRestoreAmbiguousError extends Error {
 
 export function defaultCodexDurabilityStoreDir(): string {
   return process.env.FRESHELL_CODEX_DURABILITY_DIR
-    || path.join(os.homedir(), '.freshell', 'codex-durability')
+    || path.join(getFreshellConfigDir(), 'codex-durability')
 }
 
 export class CodexDurabilityStore {

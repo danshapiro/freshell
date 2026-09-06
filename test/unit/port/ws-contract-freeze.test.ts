@@ -25,6 +25,8 @@ const ZOD_BACKED_SERVER_MESSAGES = [
   'claude.activity.updated',
   'codex.activity.list.response',
   'codex.activity.updated',
+  'hoststats.refresh.response',
+  'hoststats.snapshot',
   'opencode.activity.list.response',
   'opencode.activity.updated',
   'pane.reconcile.result',

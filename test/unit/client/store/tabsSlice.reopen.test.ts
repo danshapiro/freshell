@@ -1,6 +1,44 @@
 // Tests for the reopenClosedTab thunk (Alt+H feature).
 
-import { describe, it, expect } from 'vitest'
+
+import { describe, it, expect, vi } from 'vitest'
+
+const { paneCloseAckHandlers } = vi.hoisted(() => ({
+  paneCloseAckHandlers: new Set<(msg: unknown) => void>(),
+}))
+
+// Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close gate awaits
+// the correlated `pane.closed.result` before the layout loses a pane — this
+// mock answers EVERY pane.closed with success (the healthy-server shape), so
+// these tests exercise the acknowledged-close path end to end.
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: (msg: unknown) => {
+      const m = msg as { type?: string; createRequestId?: string; requestId?: string }
+      if (m?.type === 'pane.closed' && m.createRequestId) {
+        for (const handler of [...paneCloseAckHandlers]) {
+          handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+        }
+      }
+      // Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+      // batch envelope — answer the correlated `panes.closed.result` (the
+      // healthy-server shape), same as the per-pane lane above.
+      if (m?.type === 'panes.closed' && m.requestId) {
+        for (const handler of [...paneCloseAckHandlers]) {
+          handler({ type: 'panes.closed.result', requestId: m.requestId, success: true })
+        }
+      }
+    },
+    onMessage: (handler: (msg: unknown) => void) => {
+      paneCloseAckHandlers.add(handler)
+      return () => {
+        paneCloseAckHandlers.delete(handler)
+      }
+    },
+  }),
+  resetWsClientForTests: vi.fn(),
+}))
+
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, closeTab, reopenClosedTab } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout, splitPane, updatePaneTitle } from '../../../../src/store/panesSlice'
