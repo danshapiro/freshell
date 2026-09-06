@@ -770,6 +770,14 @@ export function normalizeCodexThreadSnapshot(input: {
       worktrees: (input.rawSnapshot.worktrees?.length ?? 0) > 0,
       diffs: (input.rawSnapshot.diffs?.length ?? 0) > 0,
       childThreads: (input.rawSnapshot.childThreads?.length ?? 0) > 0,
+      // All four knobs are per-send (the client ships them on every freshAgent.send;
+      // the send path merges them over the session baseline, adapter.ts:957-967).
+      settingScopes: {
+        model: 'per-send',
+        effort: 'per-send',
+        sandbox: 'per-send',
+        permissionMode: 'per-send',
+      },
     },
     tokenUsage: input.rawSnapshot.tokenUsage ?? {
       inputTokens: 0,

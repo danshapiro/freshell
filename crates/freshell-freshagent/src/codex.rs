@@ -1134,9 +1134,25 @@ impl FreshCodexState {
             return;
         };
 
-        // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
-        let model = normalize_freshcodex_model(Some(&model));
-        let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
+        // Merge msg.settings over the session baseline (Node adapter.ts:957-967):
+        // explicit send-side fields win; omitted fields keep the stored baseline.
+        let settings = msg.settings.as_ref();
+        let model_raw = settings.and_then(|s| s.model.clone()).unwrap_or(model);
+        let effort_raw = settings.and_then(|s| s.effort.clone()).or(effort);
+        let turn_cwd = settings.and_then(|s| s.cwd.clone()).or(turn_cwd);
+        let sandbox = settings
+            .and_then(|s| s.sandbox)
+            .map(sandbox_wire_value)
+            .or(sandbox);
+        let permission_mode = settings
+            .and_then(|s| s.permission_mode.clone())
+            .or(permission_mode);
+
+        // Re-normalize the merged model/effort on send (adapter.ts:961-963) — idempotent
+        // for stored values; a menu-unknown effort clamps to the model menu (the create
+        // policy), only a wire-unmappable survivor errors (INVALID_EFFORT).
+        let model = normalize_freshcodex_model(Some(&model_raw));
+        let effort = normalize_freshcodex_effort(Some(&model), effort_raw.as_deref());
         let wire_effort = match to_codex_reasoning_effort(effort.as_deref()) {
             Ok(value) => value,
             Err(err) => {
@@ -1144,6 +1160,35 @@ impl FreshCodexState {
                 return;
             }
         };
+
+        // The send-side settings become the NEW session baseline (Node
+        // `settingsByThread.set(sessionId, settings)`, adapter.ts:965-967): persist the
+        // merged values back onto the session record and refresh the pane-ledger binding
+        // BEFORE starting the turn (the ledger keeps the row's original create_request_id
+        // when `None` is passed — pane_ledger.rs:498-501).
+        if msg.settings.is_some() {
+            {
+                let mut guard = self.sessions.lock().await;
+                if let Some(session) = guard.get_mut(&session_id) {
+                    session.model = model.clone();
+                    session.effort = effort.clone();
+                    session.cwd = turn_cwd.clone();
+                    session.sandbox = sandbox.clone();
+                    session.permission_mode = permission_mode.clone();
+                }
+            }
+            self.record_codex_binding(
+                &session_id,
+                None,
+                &model,
+                sandbox.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+                turn_cwd.as_deref(),
+                None,
+            )
+            .await;
+        }
 
         let params = StartTurnParams {
             thread_id: session_id.clone(),
@@ -3683,6 +3728,14 @@ fn build_codex_snapshot_json(
             "worktrees": false,
             "diffs": false,
             "childThreads": false,
+            // All four knobs are per-send: the client ships them on every
+            // `freshAgent.send` and `handle_send` merges them over the session baseline.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "per-send",
+                "permissionMode": "per-send",
+            },
         },
         "tokenUsage": {
             "inputTokens": 0,
@@ -5007,6 +5060,285 @@ pub(crate) mod tests {
 
         let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "error");
+    }
+
+    // ── per-send settings merge onto turn/start ────────────────────────────────
+    //
+    // Every freshcodex `send` may carry a `settings` frame (the client's per-send
+    // override for model/effort/sandbox/permissionMode). Explicit send-side fields win
+    // over the session baseline; omitted fields keep the stored baseline (Node
+    // `rememberThreadSettings`, adapter.ts:957-967).
+
+    #[tokio::test]
+    async fn handle_send_applies_per_send_settings_to_turn_start() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, _rx) = state_with_bus();
+        let active_turn = Arc::new(StdMutex::new(None));
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            active_turn,
+            spawn_sleeper(),
+            "codex-per-send-settings",
+        )
+        .await;
+        // Baseline: fixture defaults (model gpt-5.3-codex-spark / no effort / no sandbox /
+        // no permissionMode).
+
+        // DRIVER PATTERN (handle_send awaits the turn/start RPC response, so driving it
+        // in the foreground would deadlock): spawn it; answer the initialize handshake
+        // the fresh client's first RPC triggers; then read the turn/start request.
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-1".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "turn two".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: Some(freshell_protocol::FreshAgentSendSettings {
+                        cwd: None,
+                        effort: Some("low".to_string()),
+                        model: Some("gpt-5.4-flash".to_string()),
+                        permission_mode: Some("never".to_string()),
+                        sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                    }),
+                })
+                .await;
+            })
+        };
+
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        assert_eq!(params["model"], json!("gpt-5.4-flash"));
+        assert_eq!(params["effort"], json!("low"));
+        assert_eq!(params["sandboxPolicy"], json!({ "type": "workspaceWrite" }));
+        assert_eq!(params["approvalPolicy"], json!("never"));
+        peer.respond(
+            &id,
+            json!({ "turn": { "id": "turn-2", "status": "inProgress" } }),
+        );
+        driver.await.expect("send task");
+    }
+
+    /// Per-send fields are persisted as the NEW session baseline (Node
+    /// `settingsByThread.set(sessionId, settings)`, adapter.ts:965-967): a later send
+    /// carrying NO settings reuses them instead of the create-time values.
+    #[tokio::test]
+    async fn handle_send_per_send_settings_persist_as_new_baseline() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-per-send-baseline",
+        )
+        .await;
+
+        // Send 1: per-send overrides for every knob.
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-1".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "turn two".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: Some(freshell_protocol::FreshAgentSendSettings {
+                        cwd: Some("/per-send/cwd".to_string()),
+                        effort: Some("low".to_string()),
+                        model: Some("gpt-5.4-flash".to_string()),
+                        permission_mode: Some("never".to_string()),
+                        sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                    }),
+                })
+                .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(
+            &id,
+            json!({ "turn": { "id": "turn-2", "status": "inProgress" } }),
+        );
+        driver.await.expect("send task");
+
+        // Send 2: NO settings — must reuse the merged baseline. The client caches its
+        // initialize handshake (single-flight), so the next request is the turn/start.
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-2".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "turn three".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        assert_eq!(
+            params["model"],
+            json!("gpt-5.4-flash"),
+            "the per-send model must stick as the new baseline"
+        );
+        assert_eq!(params["effort"], json!("low"));
+        assert_eq!(params["cwd"], json!("/per-send/cwd"));
+        assert_eq!(params["sandboxPolicy"], json!({ "type": "workspaceWrite" }));
+        assert_eq!(params["approvalPolicy"], json!("never"));
+        peer.respond(
+            &id,
+            json!({ "turn": { "id": "turn-3", "status": "inProgress" } }),
+        );
+        driver.await.expect("send task");
+    }
+
+    /// Per-send effort obeys the SAME menu-clamp normalization as create
+    /// (`normalize_freshcodex_effort` runs BEFORE `to_codex_reasoning_effort` on both
+    /// paths): a menu-unknown value clamps to the model menu rather than erroring — the
+    /// documented create policy — while genuinely wire-unmappable values still hit
+    /// INVALID_EFFORT (that guard is unchanged).
+    #[tokio::test]
+    async fn handle_send_per_send_effort_normalization_matches_create() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-per-send-effort-normalize",
+        )
+        .await;
+        {
+            // Baseline: gpt-5.5 with a deliberately non-default stored effort, so a send
+            // that IGNORED per-send settings would emit the stored effort, not the clamp.
+            let mut guard = st.sessions.lock().await;
+            let s = guard.get_mut("thread-1").expect("session");
+            s.model = "gpt-5.5".to_string();
+            s.effort = Some("low".to_string());
+        }
+        // The value create would ALSO emit for model gpt-5.5 + effort "totally-bogus":
+        // menu-clamp to the model's defaultEffort ("max"), then wire-map ("xhigh").
+        let create_wire_effort = to_codex_reasoning_effort(
+            normalize_freshcodex_effort(Some("gpt-5.5"), Some("totally-bogus")).as_deref(),
+        )
+        .expect("the create path maps menu-clamped values");
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-1".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "turn two".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: Some(freshell_protocol::FreshAgentSendSettings {
+                        cwd: None,
+                        effort: Some("totally-bogus".to_string()),
+                        model: None,
+                        permission_mode: None,
+                        sandbox: None,
+                    }),
+                })
+                .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        assert_eq!(params["model"], json!("gpt-5.5"));
+        assert_eq!(
+            params["effort"],
+            json!(create_wire_effort),
+            "per-send effort must menu-clamp exactly like create"
+        );
+        assert_eq!(
+            params["effort"],
+            json!("xhigh"),
+            "gpt-5.5 clamp table: 'totally-bogus' -> defaultEffort 'max' -> wire 'xhigh'"
+        );
+        peer.respond(
+            &id,
+            json!({ "turn": { "id": "turn-2", "status": "inProgress" } }),
+        );
+        driver.await.expect("send task");
+    }
+
+    /// The codex snapshot advertises `capabilities.settingScopes`: all four knobs are
+    /// per-send (the client ships them on every `freshAgent.send`; `handle_send` merges
+    /// them over the session baseline).
+    #[tokio::test]
+    async fn codex_snapshot_advertises_setting_scopes_per_send() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-setting-scopes",
+        )
+        .await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "status": { "type": "idle" },
+                    "turns": [],
+                }
+            }),
+        );
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(
+            snapshot["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "per-send",
+                "permissionMode": "per-send",
+            })
+        );
     }
 
     #[tokio::test]

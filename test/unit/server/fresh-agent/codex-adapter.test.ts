@@ -480,6 +480,15 @@ describe('Codex fresh-agent adapter', () => {
       threadId: 'thread-new-1',
       revision: 7,
     })
+    // Per-send settings scope pin: the codex adapter merges msg.settings over the
+    // session baseline on every send (adapter.ts:957-967), so all four knobs are
+    // advertised as per-send.
+    expect(snapshot.capabilities.settingScopes).toEqual({
+      model: 'per-send',
+      effort: 'per-send',
+      sandbox: 'per-send',
+      permissionMode: 'per-send',
+    })
     expect(snapshot.turns).toHaveLength(2)
     expect(snapshot.turns[0]).toMatchObject({ role: 'user', ordinal: 0 })
     expect(snapshot.turns[1]).toMatchObject({ role: 'assistant', ordinal: 1 })
