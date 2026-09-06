@@ -15,6 +15,8 @@ const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
 
 const getFreshAgentModelCapabilitiesSpy = vi.hoisted(() => vi.fn())
 
+const getFreshAgentThreadSnapshotSpy = vi.hoisted(() => vi.fn())
+
 vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
@@ -24,6 +26,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
   return {
     ...actual,
     getFreshAgentModelCapabilities: (...args: unknown[]) => getFreshAgentModelCapabilitiesSpy(...args),
+    getFreshAgentThreadSnapshot: (...args: unknown[]) => getFreshAgentThreadSnapshotSpy(...args),
   }
 })
 
@@ -79,6 +82,56 @@ const CLAUDE_CATALOG_RESPONSE = {
       supportsAdaptiveThinking: false,
     },
   ],
+}
+
+// Benign default: a snapshot WITHOUT capabilities.settingScopes, so the
+// popover keeps its legacy copy (the pre-scopes server contract).
+const THREAD_SNAPSHOT_WITHOUT_SCOPES = {
+  sessionType: 'freshclaude' as const,
+  provider: 'claude' as const,
+  threadId: 'thread-settings',
+  revision: 1,
+  status: 'idle',
+  capabilities: {
+    send: true,
+    interrupt: true,
+    approvals: true,
+    questions: true,
+    fork: true,
+  },
+  tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+}
+
+// A canonical claude UUID: the snapshot thread-id helper only resolves claude
+// panes through durable UUID identity (getCanonicalPaneResumeSessionId), so a
+// live freshclaude session id must pass isValidClaudeSessionId for the fetch
+// to fire.
+const LIVE_CLAUDE_SESSION_ID = '123e4567-e89b-12d3-a456-426614174000'
+
+const CREATE_ONLY_SCOPES = {
+  model: 'create-only',
+  effort: 'create-only',
+  permissionMode: 'create-only',
+} as const
+
+const PER_SEND_SCOPES = {
+  model: 'per-send',
+  effort: 'per-send',
+  permissionMode: 'per-send',
+} as const
+
+const CREATE_ONLY_COPY = 'Applies when a session starts — start a new conversation to change it.'
+const PER_SEND_COPY = 'Applies from the next message.'
+
+function threadSnapshotWithScopes(scopes: typeof CREATE_ONLY_SCOPES | typeof PER_SEND_SCOPES) {
+  return {
+    ...THREAD_SNAPSHOT_WITHOUT_SCOPES,
+    threadId: LIVE_CLAUDE_SESSION_ID,
+    capabilities: {
+      ...THREAD_SNAPSHOT_WITHOUT_SCOPES.capabilities,
+      settingScopes: scopes,
+    },
+  }
 }
 
 function createStore() {
@@ -144,6 +197,8 @@ beforeEach(() => {
   saveServerSettingsPatchSpy.mockClear()
   getFreshAgentModelCapabilitiesSpy.mockReset()
   getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CATALOG_RESPONSE)
+  getFreshAgentThreadSnapshotSpy.mockReset()
+  getFreshAgentThreadSnapshotSpy.mockResolvedValue(THREAD_SNAPSHOT_WITHOUT_SCOPES)
   window.localStorage.removeItem('freshopencode.modelMru.v2')
   window.localStorage.removeItem('freshcodex.modelMru.v2')
   window.localStorage.removeItem('freshopencode.modelLevelMru.v1')
@@ -658,5 +713,103 @@ describe('FreshAgentSettingsButton', () => {
     // rendered inline inside it is clipped to a sliver of the header stripe.
     // The popover must escape the header (portal to document.body).
     expect(dialog.closest('.pane-header')).toBeNull()
+  })
+
+  it('shows the create-only hint under the model list, Thinking select, and permission mode when the thread snapshot advertises create-only scopes', async () => {
+    getFreshAgentThreadSnapshotSpy.mockResolvedValue(threadSnapshotWithScopes(CREATE_ONLY_SCOPES))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+      sessionId: LIVE_CLAUDE_SESSION_ID,
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    await waitFor(() => {
+      expect(getFreshAgentThreadSnapshotSpy).toHaveBeenCalledWith('freshclaude', 'claude', LIVE_CLAUDE_SESSION_ID)
+    })
+    // model fieldset + Thinking select + permission mode select: one hint each
+    expect(await screen.findAllByText(CREATE_ONLY_COPY)).toHaveLength(3)
+    expect(screen.queryByText(PER_SEND_COPY)).not.toBeInTheDocument()
+  })
+
+  it('shows the per-send hint under every scoped control when the thread snapshot advertises per-send scopes', async () => {
+    getFreshAgentThreadSnapshotSpy.mockResolvedValue(threadSnapshotWithScopes(PER_SEND_SCOPES))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+      sessionId: LIVE_CLAUDE_SESSION_ID,
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    await waitFor(() => {
+      expect(getFreshAgentThreadSnapshotSpy).toHaveBeenCalledWith('freshclaude', 'claude', LIVE_CLAUDE_SESSION_ID)
+    })
+    expect(await screen.findAllByText(PER_SEND_COPY)).toHaveLength(3)
+    expect(screen.queryByText(CREATE_ONLY_COPY)).not.toBeInTheDocument()
+  })
+
+  it('drops fetched scopes back to the legacy hint when the reopened pane no longer resolves a snapshot thread', async () => {
+    getFreshAgentThreadSnapshotSpy.mockResolvedValue(threadSnapshotWithScopes(CREATE_ONLY_SCOPES))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+      sessionId: LIVE_CLAUDE_SESSION_ID,
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    expect(await screen.findAllByText(CREATE_ONLY_COPY)).toHaveLength(3)
+
+    // close the popover, then swap the pane's identity to a runtime-only
+    // (non-UUID, no sessionRef) session id: the snapshot thread no longer
+    // resolves, so the no-threadId early-return branch runs on reopen
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    store.dispatch(mergePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      updates: { sessionId: 'thread-settings' },
+    }))
+    getFreshAgentThreadSnapshotSpy.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    // no thread to fetch from — the previously fetched scopes must NOT stick
+    expect(getFreshAgentThreadSnapshotSpy).not.toHaveBeenCalled()
+    expect(screen.queryByText(CREATE_ONLY_COPY)).not.toBeInTheDocument()
+    expect(screen.getAllByText(PER_SEND_COPY)).toHaveLength(3)
+  })
+
+  it('keeps the legacy copy when the thread snapshot fetch rejects (older server contract)', async () => {
+    getFreshAgentThreadSnapshotSpy.mockRejectedValue(new Error('snapshot route missing'))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+      sessionId: LIVE_CLAUDE_SESSION_ID,
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    await waitFor(() => {
+      expect(getFreshAgentThreadSnapshotSpy).toHaveBeenCalledTimes(1)
+    })
+    // failure falls back to the legacy per-send copy — no crash, no create-only text
+    expect(screen.getAllByText(PER_SEND_COPY).length).toBeGreaterThanOrEqual(1)
+    expect(screen.queryByText(CREATE_ONLY_COPY)).not.toBeInTheDocument()
   })
 })

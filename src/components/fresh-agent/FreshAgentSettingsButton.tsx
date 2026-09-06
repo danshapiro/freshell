@@ -12,7 +12,11 @@ import {
   resolveEffectiveFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
-import { getFreshAgentModelCapabilities } from '@/lib/api'
+import { getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot } from '@/lib/api'
+import { getFreshAgentSnapshotThreadId } from '@/lib/fresh-agent-snapshot-thread'
+import { settingScopeHint } from '@/lib/fresh-agent-setting-scopes'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { FreshAgentSettingScopes } from '@shared/fresh-agent-contract'
 import {
   FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE,
   mergeClaudeSelectorOptions,
@@ -108,6 +112,20 @@ export function FreshAgentSettingsButton({
   const [popoverPos, setPopoverPos] = useState<{ top: number; right: number } | undefined>(undefined)
   const [probedCapabilities, setProbedCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
   const [modelDialogOpen, setModelDialogOpen] = useState(false)
+  const [settingScopes, setSettingScopes] = useState<FreshAgentSettingScopes | undefined>(undefined)
+
+  // Mirrors FreshAgentView's selector: the snapshot thread-id helper needs the
+  // claude session-identity slice to resolve a durable UUID for claude panes.
+  // Guarded — the popover also renders in stores without the freshAgent slice.
+  const claudeSession = useAppSelector((state) => {
+    if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
+    const sessionKey = makeFreshAgentSessionKey({
+      sessionId: paneContent.sessionId,
+      sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
+    })
+    return state.freshAgent?.sessions?.[sessionKey]
+  })
 
   const activeModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
   const modelValue = activeModel ?? ''
@@ -198,6 +216,37 @@ export function FreshAgentSettingsButton({
       })
     return () => { cancelled = true }
   }, [open, isFreshopencode, keepsSimpleModelList, paneContent.sessionType, paneContent.initialCwd])
+
+  // Scope-driven disclosure: on popover open, fetch the thread snapshot's
+  // capabilities.settingScopes (when the pane resolves to a live snapshot
+  // thread) so each gated control can say per-send vs create-only honestly.
+  // Same cancelled-flag pattern as the catalog probe above: no loading gate —
+  // absent scopes (older server, fetch failure, pre-create pane) fall through
+  // to settingScopeHint's legacy per-send copy.
+  useEffect(() => {
+    if (!open) {
+      // Popover closed: drop fetched scopes so a later open never displays
+      // scopes fetched against a previous pane identity / thread.
+      setSettingScopes(undefined)
+      return
+    }
+    const threadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
+    if (!threadId) {
+      // No snapshot thread resolves: any previously fetched scopes are stale.
+      setSettingScopes(undefined)
+      return
+    }
+    let cancelled = false
+    void getFreshAgentThreadSnapshot(paneContent.sessionType, paneContent.provider, threadId)
+      .then((snapshot) => {
+        if (!cancelled) setSettingScopes(snapshot?.capabilities?.settingScopes)
+      })
+      .catch(() => {
+        if (!cancelled) setSettingScopes(undefined)
+      })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sessionRef/sessionId/status/provider/sessionType are the ONLY paneContent fields the closure reads; narrowing avoids a refetch on every store-driven paneContent bump while open.
+  }, [open, paneContent.sessionId, paneContent.sessionRef?.sessionId, paneContent.sessionType, paneContent.provider, paneContent.status, claudeSession])
 
   useEffect(() => {
     if (!open) return
@@ -354,6 +403,9 @@ export function FreshAgentSettingsButton({
                     </label>
                   ))}
                 </div>
+                <span className="block text-[11px] text-muted-foreground">
+                  {settingScopeHint(settingScopes, 'model')}
+                </span>
               </fieldset>
             ) : null}
 
@@ -379,6 +431,9 @@ export function FreshAgentSettingsButton({
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
                 </select>
+                <span className="block text-[11px] text-muted-foreground">
+                  {settingScopeHint(settingScopes, 'effort')}
+                </span>
               </label>
             ) : null}
 
@@ -433,7 +488,7 @@ export function FreshAgentSettingsButton({
                   </span>
                 ) : null}
                 <span className="block text-[11px] text-muted-foreground">
-                  Applies from the next message.
+                  {settingScopeHint(settingScopes, 'permissionMode')}
                 </span>
               </label>
             ) : null}
@@ -449,6 +504,7 @@ export function FreshAgentSettingsButton({
           paneContent={paneContent}
           open={modelDialogOpen}
           onClose={closeModelDialog}
+          settingScopes={settingScopes}
         />
       ) : null}
     </div>

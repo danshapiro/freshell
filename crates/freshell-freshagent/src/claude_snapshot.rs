@@ -1074,6 +1074,14 @@ pub(crate) fn build_claude_snapshot_json(
             // UNSUPPORTED_CAPABILITY refusal at op time, never at stamp time.
             "undo": true,
             "redo": true,
+            // kata z7j7: model/effort/permissionMode apply per-send via the
+            // configure frame (configure_for_send); sandbox has no claude-side concept.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "permissionMode": "per-send",
+                "sandbox": "unsupported",
+            },
         },
         "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
         "pendingApprovals": [],

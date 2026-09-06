@@ -1581,6 +1581,15 @@ fn build_opencode_snapshot_json(
             // UNSUPPORTED_CAPABILITY (Task 1's pinned copy), never at stamp time.
             "undo": true,
             "redo": true,
+            // kata z7j7: model/effort are per-send (merged into the POST
+            // /session/:id/prompt_async body); sandbox/permissionMode have no
+            // opencode wire concept.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            },
         }),
     );
     snapshot.insert("tokenUsage".to_string(), opencode_token_usage(info));
@@ -4198,6 +4207,17 @@ mod tests {
         let info = json!({ "id": "ses_x", "title": "t", "time": { "updated": 5 } });
         let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
         assert_eq!(snap["capabilities"]["undo"], json!(true));
+        // kata z7j7: opencode advertises per-send model/effort; sandbox and
+        // permissionMode have no opencode wire contract.
+        assert_eq!(
+            snap["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            })
+        );
         assert_eq!(snap["capabilities"]["redo"], json!(true));
         assert_eq!(
             snap["rollback"],

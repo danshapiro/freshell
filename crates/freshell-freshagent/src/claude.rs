@@ -1978,6 +1978,17 @@ impl FreshClaudeState {
         // parked through it.
         let _turn = turn_lock.lock().await;
         if let Some(settings) = msg.settings.as_ref() {
+            // kata z7j7: sandbox has NO claude-side concept — when it arrives on
+            // a send, log observably (id + boolean flag only, never the prompt
+            // text) instead of silently dropping. The scope advertisement
+            // already says `unsupported`; this closes the silent-drop path.
+            if settings.sandbox.is_some() {
+                tracing::info!(
+                    session_id = %session_id,
+                    has_sandbox = %true,
+                    "freshagent.claude.unsupported-settings-ignored"
+                );
+            }
             if let Err(err) = self
                 .configure_for_send(&map_key, settings, session_type)
                 .await
@@ -6882,6 +6893,112 @@ rl.on('line', (line) => {
             images: None,
             request_id: None,
             settings: None,
+        }
+    }
+
+    /// kata z7j7 (claude scope honesty): a settings-bearing send whose payload
+    /// includes `sandbox` — a knob claude has NO wire concept for (the configure
+    /// frame carries only model/effort/permissionMode/cwd) — must surface the
+    /// drop observably as `freshagent.claude.unsupported-settings-ignored`
+    /// (session id + a boolean flag ONLY, never prompt content), instead of
+    /// silently vanishing (the pre-z7j7 "parsed and discarded" bug pattern).
+    ///
+    /// Thread-local capture: the event fires INLINE in `handle_send`, awaited
+    /// by this test's own current-thread runtime, so `set_default` (thread-local)
+    /// is sound and must not touch the test binary's global subscriber.
+    mod info_capture_for_test {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "message" {
+                    self.message = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+        }
+        type Captured = (String, BTreeMap<String, String>);
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<Captured>>>,
+        }
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push((visitor.message, visitor.fields));
+            }
+        }
+        pub fn capture() -> (Arc<Mutex<Vec<Captured>>>, tracing::subscriber::DefaultGuard) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            (events, tracing::subscriber::set_default(subscriber))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_with_unsupported_sandbox_emits_unsupported_settings_ignored_log() {
+        let (events, _capture_guard) = info_capture_for_test::capture();
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        state
+            .handle_create(dedup_create_msg("sandbox-ignored"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "sandbox-ignored").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let mut send = send_msg(&session_id, "carries an unsupported knob");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+        });
+        state.handle_send(send).await;
+        // Give the sidecar-ack'd send a beat so the knowledge that this is the
+        // exact turn's settings moment (the log fires BEFORE the configure
+        // ack wait completes) is exercised.
+        let _ = env.respond_log_frames(1).await;
+
+        let events = events.lock().expect("capture lock");
+        let found = events
+            .iter()
+            .find(|(message, _fields)| {
+                message.contains("freshagent.claude.unsupported-settings-ignored")
+            })
+            .expect("expected a freshagent.claude.unsupported-settings-ignored info event");
+        assert_eq!(
+            found.1.get("session_id").map(String::as_str),
+            Some(session_id.as_str()),
+            "the event is tagged with the send's session id"
+        );
+        assert_eq!(found.1.get("has_sandbox").map(String::as_str), Some("true"));
+        // Repo logging discipline: ids + flags ONLY — no content-shaped fields.
+        for key in found.1.keys() {
+            assert!(
+                !matches!(key.as_str(), "text" | "prompt" | "parts" | "body"),
+                "the observability event must never carry prompt content (saw `{key}`)"
+            );
         }
     }
 
