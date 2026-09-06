@@ -454,6 +454,8 @@ describe('FreshAgentComposer', () => {
       [413, null, 'big.txt', '"big.txt" exceeds the 10 MB attachment size limit'],
       // Anything else: the server's own error/message text wins.
       [401, { error: 'Unauthorized' }, 'a.txt', 'Unauthorized'],
+      // message worded without error: the message branch is exercised.
+      [500, { message: 'server exploded' }, 'a.txt', 'server exploded'],
       [500, null, 'a.txt', 'upload failed (500)'],
     ])('status %i with %s maps to a clear chip message', (status, data, filename, expected) => {
       expect(attachmentUploadErrorMessage(status, data, filename)).toBe(expected)
