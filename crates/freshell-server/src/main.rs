@@ -1134,7 +1134,7 @@ async fn main() -> ExitCode {
     let _restart_runtime_registration = restart.set_runtime(std::sync::Arc::new(
         freshell_ws::restart::ProductionRestartRuntime::new(ws_state.clone()),
     ));
-    let boot_recovery = {
+    {
         let recovery_broadcast_tx = Arc::clone(&broadcast_tx);
         complete_restart_boot_recovery(session_index.clone(), restart.clone(), move |message| {
             if let Ok(frame) = serde_json::to_string(message) {
@@ -1143,20 +1143,22 @@ async fn main() -> ExitCode {
         })
         .await
     };
-    let restart_recovery_retry_task = if boot_recovery.pending_after > 0 {
+    // Always-on recovery driver (fix 2): runs for the process lifetime, parks
+    // on the coordinator's recovery Notify, and is woken the moment any
+    // runtime-created retryable pending row lands — recovery no longer needs
+    // a boot-pass backlog or a browser resend.
+    let restart_recovery_driver_task = {
         let recovery_broadcast_tx = Arc::clone(&broadcast_tx);
-        Some(spawn_restart_boot_recovery_retry_driver(
+        tokio::spawn(freshell_ws::restart::run_restart_recovery_driver(
             restart.clone(),
-            Arc::clone(&shutdown_notify),
             Arc::clone(&shutdown_started),
+            Arc::clone(&shutdown_notify),
             move |message| {
                 if let Ok(frame) = serde_json::to_string(message) {
                     let _ = recovery_broadcast_tx.send(frame);
                 }
             },
         ))
-    } else {
-        None
     };
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
@@ -1957,15 +1959,14 @@ async fn main() -> ExitCode {
     // idempotent and keeps this drain correct under any future serve path.)
     shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
     shutdown_notify.notify_waiters();
-    if let Some(mut retry_task) = restart_recovery_retry_task {
-        if tokio::time::timeout(SHUTDOWN_HARD_TIMEOUT, &mut retry_task)
-            .await
-            .is_err()
-        {
-            tracing::error!("agent.restart.boot_recovery.shutdown_timeout");
-            retry_task.abort();
-            let _ = retry_task.await;
-        }
+    let mut recovery_driver_task = restart_recovery_driver_task;
+    if tokio::time::timeout(SHUTDOWN_HARD_TIMEOUT, &mut recovery_driver_task)
+        .await
+        .is_err()
+    {
+        tracing::error!("agent.restart.recovery_driver.shutdown_timeout");
+        recovery_driver_task.abort();
+        let _ = recovery_driver_task.await;
     }
 
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
@@ -2609,12 +2610,6 @@ struct RestartBootRecoveryReport {
     pending_after: usize,
 }
 
-/// The retry driver starts quickly enough to resolve short-lived provider
-/// shutdown/index races, then backs off to a low steady-state load for fences
-/// that require external progress.
-const RESTART_BOOT_RECOVERY_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
-const RESTART_BOOT_RECOVERY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Complete one deterministic recovery attempt for every restart transaction
 /// loaded at boot before auto-resume, reconciliation, or create paths become
 /// reachable.
@@ -2668,85 +2663,6 @@ where
         pending_before,
         pending_after,
     }
-}
-
-/// Continue retrying boot-loaded restart transactions after readiness.
-///
-/// The durable coordinator remains the source of truth: every pass uses its
-/// normal per-session admission and journal transitions, and the task stops
-/// only when no pending transaction remains or server shutdown begins. The
-/// shutdown latch closes the race where `Notify::notify_waiters` fires between
-/// loop iterations; an in-progress provider operation is allowed to finish so
-/// cancellation cannot strand it halfway across an ownership barrier.
-async fn run_restart_boot_recovery_retry_driver<F>(
-    restart: freshell_ws::restart::RestartCoordinator,
-    shutdown: Arc<tokio::sync::Notify>,
-    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
-    initial_delay: std::time::Duration,
-    max_delay: std::time::Duration,
-    mut emit: F,
-) where
-    F: FnMut(&freshell_protocol::ServerMessage) + Send + 'static,
-{
-    let initial_delay = initial_delay.min(max_delay);
-    let mut delay = initial_delay;
-    let mut attempt = 0_u64;
-
-    loop {
-        let pending = restart.pending_recoveries().len();
-        if pending == 0 || shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
-        tracing::info!(
-            pending,
-            attempt = attempt.saturating_add(1),
-            delay_ms = delay.as_millis() as u64,
-            "agent.restart.boot_recovery.retry_scheduled"
-        );
-        tokio::select! {
-            _ = shutdown.notified() => return,
-            _ = tokio::time::sleep(delay) => {}
-        }
-        if shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-
-        attempt = attempt.saturating_add(1);
-        restart
-            .recover_pending_registered(|message| emit(message))
-            .await;
-        let pending_after = restart.pending_recoveries().len();
-        if pending_after == 0 {
-            tracing::info!(attempt, "agent.restart.boot_recovery.background_completed");
-            return;
-        }
-        tracing::warn!(
-            attempt,
-            pending_after,
-            "agent.restart.boot_recovery.background_incomplete"
-        );
-        delay = delay.saturating_mul(2).min(max_delay);
-    }
-}
-
-fn spawn_restart_boot_recovery_retry_driver<F>(
-    restart: freshell_ws::restart::RestartCoordinator,
-    shutdown: Arc<tokio::sync::Notify>,
-    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
-    emit: F,
-) -> tokio::task::JoinHandle<()>
-where
-    F: FnMut(&freshell_protocol::ServerMessage) + Send + 'static,
-{
-    tokio::spawn(run_restart_boot_recovery_retry_driver(
-        restart,
-        shutdown,
-        shutdown_started,
-        RESTART_BOOT_RECOVERY_RETRY_INITIAL,
-        RESTART_BOOT_RECOVERY_RETRY_MAX,
-        emit,
-    ))
 }
 
 /// SESSION-09 sweep cadence (identity ticker fallback). The sessions sweep is
@@ -3297,11 +3213,6 @@ mod sessions_sweep_tests {
 
     struct RetirementAlwaysPending;
 
-    struct TransientBootRecovery {
-        retirement_attempts: AtomicUsize,
-        succeeds_on_attempt: usize,
-    }
-
     #[async_trait::async_trait]
     impl RestartRuntime for RetirementAlwaysPending {
         type ResumePlan = ();
@@ -3331,60 +3242,6 @@ mod sessions_sweep_tests {
             _plan: Self::ResumePlan,
         ) -> Result<String, RestartFailure> {
             unreachable!("retirement never completed")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl RestartRuntime for TransientBootRecovery {
-        type ResumePlan = ();
-
-        async fn preflight(
-            &self,
-            _request: &AgentRestart,
-        ) -> Result<Self::ResumePlan, RestartFailure> {
-            Ok(())
-        }
-
-        async fn shutdown_for_restart(
-            &self,
-            _request: &AgentRestart,
-            _plan: &Self::ResumePlan,
-        ) -> Result<(), RestartFailure> {
-            unreachable!("boot recovery uses the persisted retirement path")
-        }
-
-        async fn create_replacement(
-            &self,
-            _request: &AgentRestart,
-            _plan: Self::ResumePlan,
-        ) -> Result<String, RestartFailure> {
-            unreachable!("boot recovery uses recover_replacement")
-        }
-
-        async fn recover_persisted_retirement(
-            &self,
-            _request: &AgentRestart,
-            _context: Option<&freshell_ws::restart::RestartResumeContext>,
-            _fence: Option<&freshell_ws::restart::RestartRetirementFence>,
-        ) -> Result<(), RestartFailure> {
-            let attempt = self.retirement_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            if attempt < self.succeeds_on_attempt {
-                Err(RestartFailure::new(
-                    AgentRestartFailureCode::ShutdownFailed,
-                    "transient retirement fence failure",
-                    true,
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn recover_replacement(
-            &self,
-            _request: &AgentRestart,
-            _context: Option<&freshell_ws::restart::RestartResumeContext>,
-        ) -> Result<String, RestartFailure> {
-            Ok("term-after-background-recovery".to_string())
         }
     }
 
@@ -3524,150 +3381,6 @@ mod sessions_sweep_tests {
             "claude",
             "unrelated-session",
         )));
-    }
-
-    /// A browser may disappear with the server process that initiated a
-    /// restart. Once readiness is released after a retryable boot failure,
-    /// server-owned retries must eventually finish the durable transaction
-    /// without depending on that browser's in-memory retry timer.
-    #[tokio::test(start_paused = true)]
-    async fn retryable_boot_recovery_continues_in_background_with_backoff() {
-        let restart_dir = unique_temp_dir("restart-background-retry");
-        let restart_path = restart_dir.join("restart-state.json");
-        let coordinator = RestartCoordinator::new_persistent(restart_path.clone()).unwrap();
-        coordinator.register_initial(
-            RuntimeLocator::new(
-                AgentRuntimeKind::Terminal,
-                "claude",
-                "background-retry-session",
-            ),
-            "term-before-background-retry",
-        );
-        let request = AgentRestart {
-            request_id: "background-retry-r1".to_string(),
-            provider: "claude".to_string(),
-            session_id: "background-retry-session".to_string(),
-            kind: AgentRuntimeKind::Terminal,
-            live_id: "term-before-background-retry".to_string(),
-            expected_generation: 1,
-        };
-        coordinator.execute(request, &RetirementAlwaysPending).await;
-        assert_eq!(coordinator.pending_recoveries().len(), 1);
-        drop(coordinator);
-
-        let coordinator = RestartCoordinator::new_persistent(restart_path).unwrap();
-        let runtime = Arc::new(TransientBootRecovery {
-            retirement_attempts: AtomicUsize::new(0),
-            succeeds_on_attempt: 3,
-        });
-        let _registration = coordinator.set_runtime(runtime.clone());
-
-        let first = complete_restart_boot_recovery(None, coordinator.clone(), |_| {}).await;
-        assert_eq!(first.pending_after, 1);
-        assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 1);
-
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let shutdown_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let driver = tokio::spawn(run_restart_boot_recovery_retry_driver(
-            coordinator.clone(),
-            Arc::clone(&shutdown),
-            Arc::clone(&shutdown_started),
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(4),
-            |_| {},
-        ));
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(std::time::Duration::from_millis(999)).await;
-        assert_eq!(
-            runtime.retirement_attempts.load(Ordering::SeqCst),
-            1,
-            "the retry driver must not busy-loop"
-        );
-        tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(coordinator.pending_recoveries().len(), 1);
-
-        tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
-        assert_eq!(
-            runtime.retirement_attempts.load(Ordering::SeqCst),
-            2,
-            "the second delay must back off"
-        );
-        tokio::time::advance(std::time::Duration::from_millis(1)).await;
-        driver.await.unwrap();
-
-        assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 3);
-        assert!(
-            coordinator.pending_recoveries().is_empty(),
-            "server-owned recovery must release the durable session reservation"
-        );
-        drop(_registration);
-        drop(coordinator);
-        std::fs::remove_dir_all(restart_dir).ok();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn boot_recovery_retry_driver_stops_on_server_shutdown() {
-        let restart_dir = unique_temp_dir("restart-background-shutdown");
-        let restart_path = restart_dir.join("restart-state.json");
-        let coordinator = RestartCoordinator::new_persistent(restart_path.clone()).unwrap();
-        coordinator.register_initial(
-            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "shutdown-session"),
-            "term-before-shutdown",
-        );
-        coordinator
-            .execute(
-                AgentRestart {
-                    request_id: "shutdown-retry-r1".to_string(),
-                    provider: "claude".to_string(),
-                    session_id: "shutdown-session".to_string(),
-                    kind: AgentRuntimeKind::Terminal,
-                    live_id: "term-before-shutdown".to_string(),
-                    expected_generation: 1,
-                },
-                &RetirementAlwaysPending,
-            )
-            .await;
-        let runtime = Arc::new(TransientBootRecovery {
-            retirement_attempts: AtomicUsize::new(0),
-            succeeds_on_attempt: usize::MAX,
-        });
-        let _registration = coordinator.set_runtime(runtime.clone());
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let shutdown_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let driver = tokio::spawn(run_restart_boot_recovery_retry_driver(
-            coordinator.clone(),
-            Arc::clone(&shutdown),
-            Arc::clone(&shutdown_started),
-            std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(4),
-            |_| {},
-        ));
-
-        shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
-        shutdown.notify_waiters();
-        driver.await.unwrap();
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
-
-        assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            coordinator.pending_recoveries().len(),
-            1,
-            "shutdown preserves the durable transaction for the next boot"
-        );
-        drop(_registration);
-        drop(coordinator);
-
-        let reopened = RestartCoordinator::new_persistent(restart_path).unwrap();
-        assert_eq!(
-            reopened.pending_recoveries().len(),
-            1,
-            "the next server boot must inherit the unfinished transaction"
-        );
-        drop(reopened);
-        std::fs::remove_dir_all(restart_dir).ok();
     }
 
     /// The corpus-composition bug this reproduces: a REAL session-directory

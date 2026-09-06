@@ -12,9 +12,10 @@ use freshell_protocol::{
     TerminalOutput, TerminalRunStatus, TerminalSessionAssociated,
 };
 use freshell_ws::restart::{
-    ProductionFreshResumePlan, ProductionFreshRuntime, RestartCoordinator, RestartFailure,
-    RestartOutcome, RestartReplacementFence, RestartResumeContext, RestartRetirementAction,
-    RestartRetirementFence, RestartRuntime, RuntimeLocator,
+    run_restart_recovery_driver, ProductionFreshResumePlan, ProductionFreshRuntime,
+    RestartCoordinator, RestartFailure, RestartOutcome, RestartReplacementFence,
+    RestartResumeContext, RestartRetirementAction, RestartRetirementFence, RestartRuntime,
+    RuntimeLocator,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -4613,4 +4614,571 @@ async fn fresh_agent_runtime_is_registered_before_created_broadcast() {
         )),
         Some(runtime)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Always-on recovery driver (fix 2). The process-lifetime loop in
+// `freshell_ws::restart::run_restart_recovery_driver` parks on the
+// coordinator's recovery Notify and is woken by every committed transaction
+// write that leaves durable pending rows — recovery no longer needs a boot
+// pass with pending rows or a browser resend. The two `start_paused` tests
+// below are the old main.rs boot-retry driver tests, moved and re-sequenced
+// per LB-08 (a spawn with pending rows now drives an immediate first pass, so
+// the zero-first-pass assertion requires the shutdown latch to precede the
+// spawn).
+// ---------------------------------------------------------------------------
+
+/// Real-time bounded poll (LB-08: this suite has no shared wait helper). The
+/// driver's wake latency is scheduling-bound, so probe with a deadline instead
+/// of assuming a fixed sleep is enough.
+async fn wait_until(deadline: std::time::Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let until = tokio::time::Instant::now() + deadline;
+    while tokio::time::Instant::now() < until {
+        if probe() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    probe()
+}
+
+/// Paused-time sibling of `wait_until`: bounded scheduler yields only (no
+/// timers), so probing can never move virtual time.
+async fn yield_until(mut probe: impl FnMut() -> bool) -> bool {
+    for _ in 0..1_000 {
+        if probe() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    probe()
+}
+
+/// Faithful port of the old main.rs test-module helper (LB-08: recreated
+/// suite-local): label + pid + nanos + counter uniqueness for throwaway
+/// journal dirs.
+fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "freshell-restart-driver-{label}-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ))
+}
+
+fn driver_test_locator(session_id: &str) -> RuntimeLocator {
+    RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", session_id)
+}
+
+fn driver_test_request(request_id: &str, session_id: &str, live_id: &str) -> AgentRestart {
+    AgentRestart {
+        request_id: request_id.to_string(),
+        provider: "claude".to_string(),
+        session_id: session_id.to_string(),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: live_id.to_string(),
+        expected_generation: 1,
+    }
+}
+
+/// Every direct teardown attempt fails retryably (leaving the durable pending
+/// row); the server-owned recovery pass then always retires and replaces
+/// successfully. Tracks total runtime traffic so paused-time tests can prove
+/// the parked driver does not busy-poll.
+struct FlakyThenSucceedRuntime {
+    shutdown_calls: AtomicUsize,
+    recovery_attempts: AtomicUsize,
+    replacements: AtomicUsize,
+}
+
+impl FlakyThenSucceedRuntime {
+    fn new() -> Self {
+        Self {
+            shutdown_calls: AtomicUsize::new(0),
+            recovery_attempts: AtomicUsize::new(0),
+            replacements: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.shutdown_calls.load(Ordering::SeqCst)
+            + self.recovery_attempts.load(Ordering::SeqCst)
+            + self.replacements.load(Ordering::SeqCst)
+    }
+
+    fn succeeded_count(&self) -> usize {
+        self.replacements.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for FlakyThenSucceedRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ShutdownFailed,
+            "transient retirement fence failure",
+            true,
+        ))
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        unreachable!("retirement never completes on the direct path")
+    }
+
+    async fn recover_persisted_retirement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+        _fence: Option<&RestartRetirementFence>,
+    ) -> Result<(), RestartFailure> {
+        self.recovery_attempts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn recover_replacement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        self.replacements.fetch_add(1, Ordering::SeqCst);
+        Ok("term-after-runtime-wake".to_string())
+    }
+}
+
+/// Retirement never completes: every direct teardown fails retryably, so the
+/// durable row survives for the driver's recovery passes. (Faithful port of
+/// the old main.rs driver-test module local per LB-08.)
+struct RetirementAlwaysPending;
+
+#[async_trait::async_trait]
+impl RestartRuntime for RetirementAlwaysPending {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ShutdownFailed,
+            "retirement fence is still active",
+            true,
+        ))
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        unreachable!("retirement never completed")
+    }
+}
+
+/// Boot-loadable recovery: `recover_persisted_retirement` fails retryably
+/// until `succeeds_on_attempt`, then lets `recover_replacement` finish the
+/// row. (Faithful port of the old main.rs driver-test module local per LB-08.)
+struct TransientBootRecovery {
+    retirement_attempts: AtomicUsize,
+    succeeds_on_attempt: usize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for TransientBootRecovery {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        unreachable!("boot recovery uses the persisted retirement path")
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        unreachable!("boot recovery uses recover_replacement")
+    }
+
+    async fn recover_persisted_retirement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+        _fence: Option<&RestartRetirementFence>,
+    ) -> Result<(), RestartFailure> {
+        let attempt = self.retirement_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt < self.succeeds_on_attempt {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "transient retirement fence failure",
+                true,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn recover_replacement(
+        &self,
+        _request: &AgentRestart,
+        _context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        Ok("term-after-background-recovery".to_string())
+    }
+}
+
+#[tokio::test] // real time, bounded
+async fn runtime_created_pending_row_wakes_the_recovery_driver() {
+    let restart = RestartCoordinator::new(); // in-memory; no persistence needed
+    restart.register_initial(
+        driver_test_locator("runtime-wake-session"),
+        "term-before-runtime-wake",
+    );
+    let runtime = Arc::new(FlakyThenSucceedRuntime::new());
+    let _registration = restart.set_runtime(runtime.clone());
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        restart.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        move |message| emit_sink.lock().unwrap().push(message.clone()),
+    ));
+    // The driver starts with ZERO pending rows — the pre-fix driver exited
+    // immediately in that state.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!driver.is_finished(), "driver must park, not exit on empty");
+    // A normal-runtime failure creates a retryable row (no boot, no browser
+    // resend).
+    let outcome = restart
+        .execute_registered(
+            driver_test_request(
+                "runtime-wake-r1",
+                "runtime-wake-session",
+                "term-before-runtime-wake",
+            ),
+            |_| {},
+        )
+        .await;
+    assert!(
+        matches!(
+            outcome.messages.last(),
+            Some(ServerMessage::AgentRestartFailed(failed)) if failed.retryable && failed.recovery_pending
+        ),
+        "the runtime failure must leave a retryable durable row: {:?}",
+        outcome.messages
+    );
+    // The driver wakes on the Notify and finishes the row by itself.
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || restart
+            .pending_recoveries()
+            .is_empty())
+        .await,
+        "the always-on driver must drain a runtime-created pending row with no browser resend"
+    );
+    assert!(
+        runtime.succeeded_count() >= 1,
+        "the drained row must end in a recovered replacement"
+    );
+    // The moved driver keeps the exact emit threading main.rs had: the
+    // recovery terminal result reaches the sink the caller handed the driver.
+    assert!(
+        wait_until(std::time::Duration::from_secs(1), || {
+            emitted.lock().unwrap().iter().any(|message| {
+                matches!(
+                    message,
+                    ServerMessage::AgentRestartReplaced(replaced)
+                        if replaced.runtime.runtime_id == "term-after-runtime-wake"
+                )
+            })
+        })
+        .await,
+        "recovery results must flow through the driver's emit sink"
+    );
+    // Shutdown edge (LB-07 evidence): `notify_waiters` stores no permit, so
+    // the driver re-checks the latch after every select arm and must exit
+    // promptly even when the notify lands between iterations.
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("driver exits on shutdown")
+        .expect("driver task did not panic");
+    drop(_registration);
+}
+
+/// Paused-time sibling: a parked (or drained) driver never busy-polls. After
+/// each wake+drain the runtime call count stays flat across a virtual minute
+/// until the NEXT runtime-created row wakes it again.
+#[tokio::test(start_paused = true)]
+async fn parked_recovery_driver_does_not_busy_poll_between_wakes() {
+    let restart = RestartCoordinator::new();
+    restart.register_initial(
+        driver_test_locator("parked-session-a"),
+        "term-before-park-a",
+    );
+    let runtime = Arc::new(FlakyThenSucceedRuntime::new());
+    let _registration = restart.set_runtime(runtime.clone());
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        restart.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        |_| {},
+    ));
+    // Parked on empty: scheduler yields alone must not produce any runtime
+    // traffic, and the driver must not exit.
+    assert!(
+        !yield_until(|| driver.is_finished()).await,
+        "driver must park, not exit on empty"
+    );
+    assert_eq!(runtime.call_count(), 0);
+
+    // Wake #1: a runtime-created retryable row drains with no time advance.
+    restart
+        .execute_registered(
+            driver_test_request("park-a-r1", "parked-session-a", "term-before-park-a"),
+            |_| {},
+        )
+        .await;
+    assert!(
+        yield_until(|| runtime.succeeded_count() >= 1).await,
+        "the notify wake must drive the pass without advancing time"
+    );
+    assert!(restart.pending_recoveries().is_empty());
+    let settled = runtime.call_count();
+
+    // A virtual minute of silence: still no traffic, still parked (not exited).
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        runtime.call_count(),
+        settled,
+        "the parked driver must not busy-poll between wakes"
+    );
+    assert!(
+        !driver.is_finished(),
+        "the driver stays alive and parked after a drain"
+    );
+
+    // Wake #2: another runtime-created row drains again without time passing.
+    restart.register_initial(
+        driver_test_locator("parked-session-b"),
+        "term-before-park-b",
+    );
+    restart
+        .execute_registered(
+            driver_test_request("park-b-r1", "parked-session-b", "term-before-park-b"),
+            |_| {},
+        )
+        .await;
+    assert!(
+        yield_until(|| runtime.succeeded_count() >= 2).await,
+        "the next wake must drive without advancing time"
+    );
+    assert!(restart.pending_recoveries().is_empty());
+
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    driver.await.expect("driver exits on shutdown");
+    drop(_registration);
+}
+
+/// A browser may disappear with the server process that initiated a restart.
+/// Boot-loaded retryable rows must still finish under the always-on driver
+/// with the old backoff shape, re-sequenced for the new spawn behavior
+/// (LB-08): an immediate first pass while rows exist, then a doubling delay,
+/// then a park — never a busy-loop.
+#[tokio::test(start_paused = true)]
+async fn recovery_driver_continues_retryable_boot_recovery_with_backoff() {
+    let restart_dir = unique_temp_dir("restart-background-retry");
+    let restart_path = restart_dir.join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(restart_path.clone()).unwrap();
+    coordinator.register_initial(
+        driver_test_locator("background-retry-session"),
+        "term-before-background-retry",
+    );
+    coordinator
+        .execute(
+            driver_test_request(
+                "background-retry-r1",
+                "background-retry-session",
+                "term-before-background-retry",
+            ),
+            &RetirementAlwaysPending,
+        )
+        .await;
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+    drop(coordinator);
+
+    let coordinator = RestartCoordinator::new_persistent(restart_path).unwrap();
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "the next server boot must inherit the unfinished transaction"
+    );
+    let runtime = Arc::new(TransientBootRecovery {
+        retirement_attempts: AtomicUsize::new(0),
+        succeeds_on_attempt: 3,
+    });
+    let _registration = coordinator.set_runtime(runtime.clone());
+
+    // The boot pass (main.rs keeps `complete_restart_boot_recovery`; a direct
+    // registered recovery pass is the same attempt against the public API):
+    // the first recovery attempt still fails retryably.
+    coordinator.recover_pending_registered(|_| {}).await;
+    assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        coordinator.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        |_| {},
+    ));
+
+    // RE-SEQUENCED (LB-08): a spawn with a pending row drives an immediate
+    // first pass — the old driver slept `initial_delay` before attempting.
+    assert!(
+        yield_until(|| runtime.retirement_attempts.load(Ordering::SeqCst) == 2).await,
+        "spawn with a pending row must drive an immediate first pass"
+    );
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+
+    // The failed pass backs the next attempt off (initial 1s doubled to 2s):
+    // within that window the driver must not busy-loop.
+    tokio::time::advance(std::time::Duration::from_millis(1_999)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        runtime.retirement_attempts.load(Ordering::SeqCst),
+        2,
+        "the driver must back off between failed passes, not busy-loop"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    assert!(
+        yield_until(|| runtime.retirement_attempts.load(Ordering::SeqCst) == 3).await,
+        "the next pass fires when the backoff expires"
+    );
+    assert!(
+        yield_until(|| coordinator.pending_recoveries().is_empty()).await,
+        "server-owned recovery must release the durable session reservation"
+    );
+
+    // Drained: the driver parks instead of exiting (always-on) and stays quiet.
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 3);
+    assert!(
+        !driver.is_finished(),
+        "the driver parks after draining instead of exiting"
+    );
+
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    driver.await.expect("driver exits on shutdown");
+    drop(_registration);
+    drop(coordinator);
+    std::fs::remove_dir_all(restart_dir).ok();
+}
+
+/// Shutdown stops the driver without touching the durable journal, so the
+/// next boot inherits the unfinished transaction. RE-SEQUENCED per LB-08:
+/// because a spawn with pending rows now drives an immediate first pass, the
+/// shutdown latch must be set BEFORE the spawn for the zero-attempts
+/// assertion to hold (the loop-top latch check guarantees no pass starts).
+#[tokio::test(start_paused = true)]
+async fn recovery_driver_stops_when_shutdown_precedes_spawn() {
+    let restart_dir = unique_temp_dir("restart-background-shutdown");
+    let restart_path = restart_dir.join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent(restart_path.clone()).unwrap();
+    coordinator.register_initial(
+        driver_test_locator("shutdown-session"),
+        "term-before-shutdown",
+    );
+    coordinator
+        .execute(
+            driver_test_request(
+                "shutdown-retry-r1",
+                "shutdown-session",
+                "term-before-shutdown",
+            ),
+            &RetirementAlwaysPending,
+        )
+        .await;
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+    let runtime = Arc::new(TransientBootRecovery {
+        retirement_attempts: AtomicUsize::new(0),
+        succeeds_on_attempt: usize::MAX,
+    });
+    let _registration = coordinator.set_runtime(runtime.clone());
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+
+    // Latch BEFORE spawn (LB-08). The old driver slept `initial_delay` first,
+    // so a post-spawn latch still observed zero attempts; the always-on
+    // driver's immediate first pass requires this ordering instead.
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        coordinator.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        |_| {},
+    ));
+
+    driver.await.unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+
+    assert_eq!(runtime.retirement_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "shutdown preserves the durable transaction for the next boot"
+    );
+    drop(_registration);
+    drop(coordinator);
+
+    let reopened = RestartCoordinator::new_persistent(restart_path).unwrap();
+    assert_eq!(
+        reopened.pending_recoveries().len(),
+        1,
+        "the next server boot must inherit the unfinished transaction"
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(restart_dir).ok();
 }

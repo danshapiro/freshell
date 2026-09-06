@@ -494,6 +494,12 @@ pub struct RestartCoordinator {
     ownership_limit: usize,
     registered_runtime:
         Arc<std::sync::RwLock<Option<std::sync::Weak<dyn RestartRuntime<ResumePlan = ()>>>>>,
+    /// Runtime wake for the always-on recovery driver: every committed
+    /// transaction write that INSERTS a durable pending row fires
+    /// `notify_one` (insert-only — see `try_update_ownership`), so rows
+    /// created during normal runtime recover without any boot-pass backlog or
+    /// browser resend.
+    recovery_notify: Arc<tokio::sync::Notify>,
 }
 
 const DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT: usize = 1_024;
@@ -561,6 +567,7 @@ impl RestartCoordinator {
             lock_limit: lock_limit.max(1),
             ownership_limit: ownership_limit.max(1),
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
+            recovery_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -594,6 +601,7 @@ impl RestartCoordinator {
             lock_limit,
             ownership_limit,
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
+            recovery_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -913,7 +921,25 @@ impl RestartCoordinator {
             );
             error
         })?;
+        // A newly-inserted pending row is the runtime wake for the always-on
+        // recovery driver. Waking only on INSERT (not on every write that
+        // leaves rows present) is load-bearing: the driver's own
+        // `last_failure` bookkeeping writes after a failed pass must not
+        // re-wake it, or the pass-backoff select would complete instantly and
+        // a stuck fence would be hot-looped forever. Progress within an
+        // existing row needs no wake either: the inserting caller holds the
+        // session lock through its whole transaction, so any woken pass
+        // observes that transaction's final committed state. `notify_one`
+        // stores a permit when nobody is parked, so a row committed before
+        // the driver first parks is not lost.
+        let new_pending_row = candidate
+            .pending_recoveries
+            .keys()
+            .any(|key| !ownership.pending_recoveries.contains_key(key));
         *ownership = candidate;
+        if new_pending_row {
+            self.recovery_notify.notify_one();
+        }
         Ok(output)
     }
 
@@ -955,6 +981,13 @@ impl RestartCoordinator {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// The wake the always-on recovery driver parks on. Every committed
+    /// transaction write that inserts a durable pending row fires
+    /// `notify_one` on this Notify (see `try_update_ownership`).
+    pub fn recovery_notify_handle(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.recovery_notify)
     }
 
     /// Whether this durable provider session is reserved by any unfinished
@@ -3109,6 +3142,139 @@ impl RestartCoordinator {
                 replayed,
             },
             Err(error) => self.persistence_failure(&request, descriptor, error),
+        }
+    }
+}
+
+/// Recovery-pass backoff, moved from the old main.rs boot-retry driver
+/// (`RESTART_BOOT_RECOVERY_RETRY_INITIAL`/`_MAX`): the driver starts quickly
+/// enough to resolve short-lived provider shutdown/index races, then backs
+/// off to a low steady-state load for fences that require external progress.
+const RECOVERY_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+const RECOVERY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Watchdog fallback while parked with no pending rows. The Notify permit is
+/// the primary wake (lossless: `notify_one` stores a permit when nobody
+/// waits); this slow poll is defense in depth so even a hypothetical missed
+/// wake can only delay recovery by this much, never drop it.
+const RECOVERY_PARK_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One bounded recovery attempt over every durable pending row, extracted
+/// from the old main.rs boot-retry driver body (emit threading preserved).
+/// Returns true when the pass strictly shrank the pending set.
+async fn run_recovery_pass<F>(
+    restart: &RestartCoordinator,
+    mut emit: F,
+    pending_before: usize,
+) -> bool
+where
+    F: FnMut(&ServerMessage),
+{
+    tracing::info!(
+        pending = pending_before,
+        "agent.restart.recovery_driver.pass_started"
+    );
+    restart
+        .recover_pending_registered(|message| emit(message))
+        .await;
+    let pending_after = restart.pending_recoveries().len();
+    if pending_after == 0 {
+        tracing::info!("agent.restart.recovery_driver.pass_completed");
+    } else {
+        tracing::warn!(
+            pending_after,
+            "agent.restart.recovery_driver.pass_incomplete"
+        );
+    }
+    pending_after < pending_before
+}
+
+/// Always-on recovery driver. Parks on the coordinator's recovery Notify
+/// (permitted by every committed transaction write that inserts a durable
+/// pending row), falls back to a slow watchdog poll, and runs the existing
+/// recovery passes with the existing backoff while rows are pending. Never
+/// exits on empty; exits on shutdown. `shutdown_started` is re-checked after
+/// every select arm because `Notify::notify_waiters` stores no permit, so the
+/// notify alone cannot prove shutdown began (LB-07).
+pub async fn run_restart_recovery_driver<F>(
+    restart: RestartCoordinator,
+    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    emit: F,
+) where
+    F: FnMut(&ServerMessage) + Send + 'static,
+{
+    let recovery_notify = restart.recovery_notify_handle();
+    let mut emit = Some(emit);
+    let mut backoff = RECOVERY_RETRY_INITIAL;
+    loop {
+        if shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        // Register wake interest BEFORE reading the pending set so a
+        // transaction committed between the read and the park cannot be
+        // missed (a pre-park `notify_one` would otherwise race the read).
+        let notified = recovery_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let pending = restart.pending_recoveries().len();
+        if pending == 0 {
+            backoff = RECOVERY_RETRY_INITIAL;
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = shutdown_notify.notified() => {
+                    if shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(RECOVERY_PARK_POLL) => {}
+            }
+            continue;
+        }
+        let progressed = if let Some(pass_emit) = emit.take() {
+            // Each pass runs spawned so a panicking provider adapter cannot
+            // take down the process-lifetime driver. The emit sink moves in
+            // and comes back out, preserving the exact broadcast threading the
+            // old main.rs driver used across passes.
+            let pass_restart = restart.clone();
+            let pass = tokio::spawn(async move {
+                let mut pass_emit = pass_emit;
+                let progressed = run_recovery_pass(&pass_restart, &mut pass_emit, pending).await;
+                (pass_emit, progressed)
+            });
+            match pass.await {
+                Ok((returned_emit, progressed)) => {
+                    emit = Some(returned_emit);
+                    progressed
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "agent.restart.recovery_driver.pass_panicked"
+                    );
+                    false
+                }
+            }
+        } else {
+            // A panicked pass dropped the emit sink. Durable recovery must
+            // still continue — terminal results are journaled before they are
+            // emitted, so a later replay redelivers them — with the loss
+            // already logged on the panic edge above.
+            run_recovery_pass(&restart, |_message: &ServerMessage| {}, pending).await
+        };
+        backoff = if progressed {
+            RECOVERY_RETRY_INITIAL
+        } else {
+            backoff.saturating_mul(2).min(RECOVERY_RETRY_MAX)
+        };
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = shutdown_notify.notified() => {
+                if shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(backoff) => {}
         }
     }
 }
