@@ -9,6 +9,7 @@
 import type { AppDispatch, RootState } from './store'
 import { updatePaneTitle, updatePaneTitleByTerminalId, updatePaneTitleBySessionRef } from './panesSlice'
 import { updateTab } from './tabsSlice'
+import { api } from '@/lib/api'
 
 type TitleSyncThunk = (dispatch: AppDispatch, getState: () => RootState) => void
 
@@ -84,4 +85,16 @@ export function applyTabRename(input: {
       title: input.title,
     }))
   }
+}
+
+/**
+ * Reviewed reset: clear the durable session title override AND its source so
+ * the provider-native title is revealed and the title-source ladder unblocks.
+ * Session-scoped by definition — called only from an explicit per-session
+ * "Reset to provider title" action. (`PATCH /api/sessions/:key` with
+ * `{titleOverride: null}`; servers now clear titleSource too.)
+ */
+export async function clearSessionTitleOverride(provider: string, sessionId: string): Promise<void> {
+  const compositeKey = `${provider}:${sessionId}`
+  await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: null })
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
-import { applySessionRenameCascade } from '@/store/titleSync'
+import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
 import { renameOverviewTerminal } from '@/components/OverviewView'
 
 vi.mock('nanoid', () => { let n = 0; return { nanoid: vi.fn(() => `pane-${++n}`) } })
@@ -50,6 +50,25 @@ describe('applySessionRenameCascade', () => {
     applySessionRenameCascade({ dispatch: store.dispatch, provider: 'claude',
       sessionId: 's1', title: 'Renamed', cascadedTerminalId: null })
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Renamed')
+  })
+})
+
+describe('clearSessionTitleOverride (reset to provider title)', () => {
+  beforeEach(() => apiMocks.patch.mockClear())
+
+  it('PATCHes the session with titleOverride:null by composite key', async () => {
+    await clearSessionTitleOverride('claude', 's1')
+    expect(apiMocks.patch).toHaveBeenCalledWith('/api/sessions/claude%3As1', { titleOverride: null })
+  })
+
+  it('URI-encodes the composite key as a single route segment', async () => {
+    await clearSessionTitleOverride('opencode', 'a/b c')
+    expect(apiMocks.patch).toHaveBeenCalledWith('/api/sessions/opencode%3Aa%2Fb%20c', { titleOverride: null })
+  })
+
+  it('propagates server errors (caller surfaces them in the dialog)', async () => {
+    apiMocks.patch.mockRejectedValueOnce(new Error('500 boom'))
+    await expect(clearSessionTitleOverride('opencode', 'z9')).rejects.toThrow('500 boom')
   })
 })
 
