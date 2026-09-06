@@ -459,6 +459,17 @@ export function normalizeOpencodeSnapshot(input: {
       worktrees: false,
       diffs: true,
       childThreads: false,
+      // Task z7j7-4 (AGENT-12 scope advertisement): model/effort are per-send —
+      // normalizeOpencodeInput re-normalizes each send's settings frame and the
+      // prompt_async body merge (adapter.ts materializeOrSend) applies them.
+      // sandbox/permissionMode are honestly unsupported (opencode has no contract
+      // for either). The UI gates "applies to next send only" copy on this map.
+      settingScopes: {
+        model: 'per-send',
+        effort: 'per-send',
+        sandbox: 'unsupported',
+        permissionMode: 'unsupported',
+      },
     },
     settings: {
       ...(sessionModel ? { model: sessionModel } : {}),

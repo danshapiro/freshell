@@ -646,6 +646,26 @@ impl FreshOpencodeState {
             (session.model.clone(), session.effort.clone(), cwd)
         };
 
+        // Task z7j7-4 (AGENT-12 observability): opencode has NO sandbox/permission_mode
+        // contract — the `prompt_async` body (`build_prompt_body`) carries only
+        // parts/model/variant. When a per-send `settings` frame still carries either
+        // knob, the merge above honors model/effort/cwd and these two are silently
+        // inert; surface that drop as an id/flags-only info event (NEVER prompt
+        // content — repo logging discipline).
+        let (has_sandbox, has_permission_mode) = msg
+            .settings
+            .as_ref()
+            .map(|s| (s.sandbox.is_some(), s.permission_mode.is_some()))
+            .unwrap_or((false, false));
+        if has_sandbox || has_permission_mode {
+            tracing::info!(
+                session_id = %session_id,
+                has_sandbox = %has_sandbox,
+                has_permission_mode = %has_permission_mode,
+                "freshagent.opencode.unsupported-settings-ignored"
+            );
+        }
+
         let manager = self.fresh_agent.ensure_manager().await;
 
         // `emitStatus(state, 'running')` (adapter.ts:336) -- BEFORE any session
@@ -1817,7 +1837,7 @@ mod tests {
         ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpRequest, ServeHttpResponse,
         ServeProcess, SpawnRequest,
     };
-    use freshell_protocol::{AgentProvider, SessionType};
+    use freshell_protocol::{AgentProvider, FreshAgentSendSettings, Sandbox, SessionType};
     use serde_json::json;
 
     // ── fakes (no real `opencode` process, no network) ──────────────────────
@@ -3379,6 +3399,424 @@ mod tests {
             complete_at[0] > 0,
             "at must be a positive monotonic timestamp"
         );
+    }
+
+    // ── Task z7j7-4: provider-level per-send wire proof + observability ──
+
+    /// Task z7j7-4: [`StatusPollFakeHttp`]'s deterministic busy→idle settle (so
+    /// `run_turn` resolves on the status-poll fallback exactly as in the PR-3 settle
+    /// tests) PLUS the [`ForkFakeHttp`]/[`CompactFakeHttp`] `RecordedRequest`
+    /// recording — so a send's ACTUAL wire body (the `POST /session/:id/prompt_async`
+    /// payload [`build_prompt_body`] assembled) can be asserted per turn. This is the
+    /// `PromptRecordingFakeHttp` the plan names (a recording `ServeHttp` wrapper).
+    ///
+    /// One deliberate deviation from a pure delegation: [`StatusPollFakeHttp`]'s busy
+    /// budget is GLOBAL to the fake (exhausted by turn 1, so a second send's
+    /// `await_idle` never observes activity and hangs until its real timeout), which
+    /// this two-turn test cannot tolerate. The [`CompactFakeHttp`] mechanic fixes it:
+    /// a per-session busy budget RE-ARMED on every `prompt_async` POST, so the
+    /// busy→idle pattern repeats per turn.
+    struct PromptRecordingFakeHttp {
+        inner: StatusPollFakeHttp,
+        recorded: StdMutex<Vec<RecordedRequest>>,
+        busy_budget: StdMutex<std::collections::HashMap<String, usize>>,
+        busy_polls_per_turn: usize,
+    }
+
+    impl PromptRecordingFakeHttp {
+        fn new(busy_polls_per_turn: usize) -> Self {
+            Self {
+                inner: StatusPollFakeHttp::new(busy_polls_per_turn),
+                recorded: StdMutex::new(Vec::new()),
+                busy_budget: StdMutex::new(std::collections::HashMap::new()),
+                busy_polls_per_turn,
+            }
+        }
+
+        fn recorded(&self) -> Vec<RecordedRequest> {
+            self.recorded.lock().expect("recorded mutex").clone()
+        }
+
+        /// Every `POST .../prompt_async` request, in arrival order.
+        fn prompt_requests(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.url.contains("/prompt_async"))
+                .collect()
+        }
+    }
+
+    impl ServeHttp for PromptRecordingFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let method = format!("{:?}", req.method).to_uppercase();
+            let body = req
+                .body
+                .as_ref()
+                .and_then(|b| serde_json::from_slice::<Value>(b).ok());
+            self.recorded
+                .lock()
+                .expect("recorded mutex")
+                .push(RecordedRequest {
+                    method: method.clone(),
+                    url: req.url.clone(),
+                    body,
+                });
+
+            // The busy→idle pair is wrapper-owned (see the type's doc comment):
+            // a global `/session/status` poll reports every armed session busy for
+            // its per-turn budget, then absent (idle).
+            if method == "GET" && req.url.contains("/session/status") {
+                let mut budgets = self.busy_budget.lock().expect("busy budget mutex");
+                let mut map = serde_json::Map::new();
+                for (id, budget) in budgets.iter_mut() {
+                    if *budget > 0 {
+                        *budget -= 1;
+                        map.insert(id.clone(), json!({ "type": "busy" }));
+                    }
+                }
+                let body = serde_json::to_vec(&Value::Object(map)).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if method == "POST" && req.url.contains("/prompt_async") {
+                let id = req
+                    .url
+                    .split("/session/")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['/', '?']).next())
+                    .unwrap_or("")
+                    .to_string();
+                let arm = self.busy_polls_per_turn;
+                self.busy_budget
+                    .lock()
+                    .expect("busy budget mutex")
+                    .insert(id, arm);
+            }
+            self.inner.request(req)
+        }
+    }
+
+    /// Build a [`FreshOpencodeState`] over a [`PromptRecordingFakeHttp`]-backed
+    /// serve manager (the `state_with_status_poll_and_receiver` wiring, recording
+    /// edition): returns the state, a broadcast receiver subscribed BEFORE any
+    /// handler runs, and a handle to the recording fake.
+    async fn prompt_recording_state(
+        busy_polls: usize,
+    ) -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<PromptRecordingFakeHttp>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(PromptRecordingFakeHttp::new(busy_polls));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(fresh_agent), rx, http)
+    }
+
+    /// A `freshAgent.send` carrying a per-send `settings` frame (the client's
+    /// between-sends model/effort selection shape).
+    fn send_msg_with_settings(
+        session_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> FreshAgentSend {
+        FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            text: text.to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some(format!("req-{text}")),
+            settings: Some(FreshAgentSendSettings {
+                cwd: None,
+                effort: effort.map(str::to_string),
+                model: model.map(str::to_string),
+                permission_mode: None,
+                sandbox: None,
+            }),
+        }
+    }
+
+    /// Poll the broadcast receiver until `count` `freshAgent.turn.complete` frames
+    /// have been seen (deadline-bounded, same idiom as the PR-3 settle tests) — the
+    /// deterministic busy→idle settle signal for `n` sequential sends.
+    async fn await_turn_completes(rx: &mut tokio::sync::broadcast::Receiver<String>, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+        let mut seen = 0;
+        while seen < count {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {count} turn.complete frames (saw {seen})"
+            );
+            let raw = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .map_err(|_| "elapsed".to_string())
+                .and_then(|r| r.map_err(|e| format!("{e:?}")))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "broadcast recv outcome waiting for turn.complete frames (saw {seen}): {e}"
+                    )
+                });
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                seen += 1;
+            }
+        }
+    }
+
+    /// Task z7j7-4 (THE AGENT-12 provider-level wire assertion): per-send opencode
+    /// model/effort settings must measurably alter THAT turn's prompt POST body —
+    /// turn 1's `openai/gpt-5.5`+`high` and turn 2's `openai/gpt-5-nano`+`low` land
+    /// as distinct `model`/`variant` keys in the recorded `prompt_async` bodies.
+    /// This behavior pre-exists (the `handle_send` settings merge + `build_prompt_body`);
+    /// this test's job is to prove the wire actually changes — and the vacuity receipt
+    /// (neutered-merge RED run) lives in the task report.
+    #[tokio::test]
+    async fn send_with_changed_settings_rewrites_the_prompt_body() {
+        let (st, mut rx, http) = prompt_recording_state(1).await;
+        st.handle_create(create_msg("req-body")).await;
+        let placeholder = "freshopencode-req-body";
+
+        st.handle_send(send_msg_with_settings(
+            placeholder,
+            "turn one",
+            Some("openai/gpt-5.5"),
+            Some("high"),
+        ))
+        .await;
+        await_turn_completes(&mut rx, 1).await;
+
+        st.handle_send(send_msg_with_settings(
+            placeholder,
+            "turn two",
+            Some("openai/gpt-5-nano"),
+            Some("low"),
+        ))
+        .await;
+        // each call counts THIS call's frames: one complete per settled turn.
+        await_turn_completes(&mut rx, 1).await;
+
+        let prompts = http.prompt_requests();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "exactly two prompt_async posts should have been recorded: {prompts:?}"
+        );
+        let turn1_body = prompts[0].body.as_ref().expect("turn 1 body");
+        assert_eq!(turn1_body["parts"][0]["text"], json!("turn one"));
+        assert_eq!(
+            turn1_body["model"],
+            json!({ "providerID": "openai", "modelID": "gpt-5.5" }),
+            "turn 1 must carry its per-send model split"
+        );
+        assert_eq!(turn1_body["variant"], json!("high"));
+        let turn2_body = prompts[1].body.as_ref().expect("turn 2 body");
+        assert_eq!(turn2_body["parts"][0]["text"], json!("turn two"));
+        assert_eq!(
+            turn2_body["model"],
+            json!({ "providerID": "openai", "modelID": "gpt-5-nano" }),
+            "turn 2 must carry ITS per-send model split — proving the body changed"
+        );
+        assert_eq!(turn2_body["variant"], json!("low"));
+    }
+
+    /// Task z7j7-4 (scope advertisement): the REST opencode snapshot advertises
+    /// `capabilities.settingScopes` — model/effort `per-send` (the `handle_send`
+    /// merge rewrites each `prompt_async` body, proven by
+    /// [`send_with_changed_settings_rewrites_the_prompt_body`]); sandbox/
+    /// permissionMode `unsupported` (opencode has NO contract for either — the
+    /// `freshagent.opencode.unsupported-settings-ignored` info event reports the
+    /// drop). The client's "applies to next send only" vs "session create only"
+    /// copy gates on this map. The opencode WS-side `snapshot_event` stays minimal
+    /// ({type,sessionId,status}) by design; capabilities live on the REST snapshot.
+    #[tokio::test]
+    async fn opencode_snapshot_advertises_setting_scopes() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+
+        // The placeholder short-circuit builds the snapshot through the SAME
+        // `build_opencode_snapshot_json` the materialized (REST serve read) path uses.
+        let snapshot = fresh_agent
+            .get_opencode_snapshot("freshopencode-req-scopes", None)
+            .await
+            .expect("placeholder snapshot builds");
+
+        assert_eq!(snapshot["provider"], json!("opencode"));
+        assert_eq!(snapshot["capabilities"]["send"], json!(true));
+        assert_eq!(
+            snapshot["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            }),
+            "opencode snapshot must advertise honest per-setting scopes"
+        );
+    }
+
+    /// Thread-local tracing capture for the observability-log test below — the
+    /// `codex.rs` `tracing_capture` / `terminal_tabs.rs` `invariant_capture`
+    /// convention. `set_default` (thread-local) is SOUND here (unlike DIAG-01's
+    /// `spawn_exit_watcher`, the event under test fires INLINE in `handle_send`,
+    /// awaited directly by this test's own current-thread runtime) and must NOT
+    /// use `set_global_default`: DIAG-01 already installs the test binary's one
+    /// allowed global subscriber.
+    mod info_capture {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::Layer;
+
+        #[derive(Debug, Clone, Default)]
+        pub struct CapturedEvent {
+            pub message: String,
+            pub fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            message: String,
+            fields: BTreeMap<String, String>,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}");
+                if field.name() == "message" {
+                    self.message = rendered;
+                } else {
+                    self.fields.insert(field.name().to_string(), rendered);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_string();
+                } else {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push(CapturedEvent {
+                        message: visitor.message,
+                        fields: visitor.fields,
+                    });
+            }
+        }
+
+        pub fn capture() -> (
+            Arc<Mutex<Vec<CapturedEvent>>>,
+            tracing::subscriber::DefaultGuard,
+        ) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (events, guard)
+        }
+    }
+
+    /// Task z7j7-4 (observability): a `freshAgent.send` whose `settings` carries
+    /// sandbox and/or permission_mode — knobs opencode has NO contract for (the
+    /// `prompt_async` body carries only parts/model/variant) — must surface the
+    /// drop as `freshagent.opencode.unsupported-settings-ignored` (session id +
+    /// two booleans ONLY, never prompt content), instead of being silently
+    /// ignored.
+    #[tokio::test]
+    async fn send_with_unsupported_settings_emits_unsupported_settings_ignored_log() {
+        let (events, _guard) = info_capture::capture();
+        let (st, mut rx, _http) = prompt_recording_state(1).await;
+        st.handle_create(create_msg("req-ign")).await;
+        let placeholder = "freshopencode-req-ign";
+
+        let mut msg = send_msg_with_settings(
+            placeholder,
+            "ignored knobs",
+            Some("openai/gpt-5.5"),
+            Some("high"),
+        );
+        let settings = msg.settings.as_mut().expect("settings present");
+        settings.sandbox = Some(Sandbox::ReadOnly);
+        settings.permission_mode = Some("plan".to_string());
+        st.handle_send(msg).await;
+        await_turn_completes(&mut rx, 1).await;
+
+        let events = events.lock().expect("capture lock");
+        let event = events
+            .iter()
+            .find(|e| {
+                e.message
+                    .contains("freshagent.opencode.unsupported-settings-ignored")
+            })
+            .expect("expected a freshagent.opencode.unsupported-settings-ignored info event");
+        assert_eq!(
+            event.fields.get("session_id").map(String::as_str),
+            Some(placeholder),
+            "the event is tagged with the send's session id"
+        );
+        assert_eq!(
+            event.fields.get("has_sandbox").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            event.fields.get("has_permission_mode").map(String::as_str),
+            Some("true")
+        );
+        // Repo logging discipline: ids + flags ONLY — no content-shaped fields.
+        for key in event.fields.keys() {
+            assert!(
+                !matches!(key.as_str(), "text" | "prompt" | "parts" | "body"),
+                "the observability event must never carry prompt content (saw `{key}`)"
+            );
+        }
     }
 
     #[tokio::test]

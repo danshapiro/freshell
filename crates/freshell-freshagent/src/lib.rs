@@ -1549,6 +1549,21 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
             "worktrees": false,
             "diffs": true,
             "childThreads": false,
+            // Task z7j7-4 (AGENT-12 scope advertisement): model/effort are per-send —
+            // `handle_send`'s settings merge rewrites each turn's `prompt_async` body
+            // (proven provider-level by
+            // `opencode_ws::tests::send_with_changed_settings_rewrites_the_prompt_body`).
+            // sandbox/permissionMode are honestly unsupported: opencode has NO contract
+            // for either knob, and `handle_send` surfaces a dropped pair as the
+            // `freshagent.opencode.unsupported-settings-ignored` info event. The
+            // client's "applies to next send only" vs "session create only" copy gates
+            // on this map.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            },
         }),
     );
     snapshot.insert("tokenUsage".to_string(), opencode_token_usage(info));

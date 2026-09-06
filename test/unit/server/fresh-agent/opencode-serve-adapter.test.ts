@@ -967,6 +967,16 @@ describe('OpenCode serve adapter: history reads', () => {
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
     const snap: any = await adapter.getSnapshot?.({ sessionType: 'freshopencode', provider: 'opencode', threadId: 'ses_real_1' })
     expect(snap.capabilities).toMatchObject({ fork: true, approvals: false, questions: false })
+    // Task z7j7-4 (scope advertisement): model/effort are per-send (normalizeOpencodeInput
+    // re-normalizes each send's settings; the prompt_async body merge applies them);
+    // sandbox/permissionMode are honestly unsupported (opencode has no contract for
+    // either). The UI gates "applies to next send only" copy on this map.
+    expect(snap.capabilities.settingScopes).toEqual({
+      model: 'per-send',
+      effort: 'per-send',
+      sandbox: 'unsupported',
+      permissionMode: 'unsupported',
+    })
   })
 })
 
