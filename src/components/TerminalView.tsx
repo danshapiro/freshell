@@ -110,7 +110,7 @@ import {
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
-import { findLocalFilePaths } from '@/lib/path-utils'
+import { findLocalFilePaths, isImageFilePath } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
 import { openExternalUrl, shouldOpenLinkExternally } from '@/lib/open-url'
 import { setHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
@@ -2200,6 +2200,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
               if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
+              if (isImageFilePath(m.path)) {
+                queuePaneSplit({
+                  kind: 'browser',
+                  url: `/api/files/raw?path=${encodeURIComponent(m.path)}`,
+                  devToolsOpen: false,
+                })
+                return
+              }
               queuePaneSplit({
                 kind: 'editor',
                 filePath: m.path,

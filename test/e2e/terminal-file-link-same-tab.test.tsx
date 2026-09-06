@@ -82,6 +82,8 @@ vi.mock('@monaco-editor/react', () => {
   }
 })
 
+const mockTerminalText = vi.hoisted(() => ({ line: '/tmp/example.txt' }))
+
 const linkProvidersByPaneId = new Map<string, {
   provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
 }>()
@@ -96,7 +98,7 @@ vi.mock('@xterm/xterm', () => {
       active: {
         viewportY: 0,
         getLine: vi.fn(() => ({
-          translateToString: () => '/tmp/example.txt',
+          translateToString: () => mockTerminalText.line,
         })),
       },
     }
@@ -249,6 +251,7 @@ describe('terminal file links open Monaco on the clicked pane branch without nav
     wsMocks.onReconnect.mockClear()
     wsMocks.setHelloExtensionProvider.mockClear()
     linkProvidersByPaneId.clear()
+    mockTerminalText.line = '/tmp/example.txt'
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
@@ -322,5 +325,54 @@ describe('terminal file links open Monaco on the clicked pane branch without nav
     await waitFor(() => {
       expect(apiMocks.get).toHaveBeenCalledWith('/api/files/read?path=%2Ftmp%2Fexample.txt')
     })
+  })
+
+  it('routes image file links to a browser pane instead of the editor', async () => {
+    mockTerminalText.line = '/tmp/example.png'
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <TabContent tabId="tab-1" />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(linkProvidersByPaneId.has('pane-clicked')).toBe(true)
+    })
+
+    const clickedProvider = linkProvidersByPaneId.get('pane-clicked')!
+    let links: any[] | undefined
+    clickedProvider.provideLinks(1, (provided) => {
+      links = provided
+    })
+
+    expect(links).toHaveLength(1)
+    expect(links![0].text).toBe('/tmp/example.png')
+
+    links![0].activate()
+
+    await waitFor(() => {
+      const root = store.getState().panes.layouts['tab-1']
+      if (root.type !== 'split') throw new Error('expected root split layout')
+      const rightBranch = root.children[1]
+      if (rightBranch.type !== 'split') throw new Error('expected right branch split')
+      const clickedBranch = rightBranch.children[1]
+      if (clickedBranch.type !== 'split') throw new Error('expected clicked branch split')
+      expect(clickedBranch.children[1]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'browser',
+          url: '/api/files/raw?path=%2Ftmp%2Fexample.png',
+        },
+      })
+    })
+
+    // The editor lane is NOT exercised for images: no read call, no Monaco.
+    const readCalls = apiMocks.get.mock.calls.filter((c) =>
+      String(c[0]).startsWith('/api/files/read'),
+    )
+    expect(readCalls).toHaveLength(0)
+    expect(screen.queryByTestId('monaco-mock')).not.toBeInTheDocument()
   })
 })
