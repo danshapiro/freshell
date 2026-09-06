@@ -1,5 +1,5 @@
 //! `POST /api/fresh-agent/attachments` — a faithful port of the Node oracle
-//! route (`server/fresh-agent-extras-router.ts:10,15-22,258-287`) so the
+//! route (`server/fresh-agent-extras-router.ts:10,15-22,268-287`) so the
 //! fresh-agent composer's paperclip upload
 //! (`src/components/fresh-agent/FreshAgentComposer.tsx:160-174`, which fetches
 //! `POST /api/fresh-agent/attachments?name=<raw>` with the raw `File` body)
@@ -430,6 +430,9 @@ mod tests {
         assert_eq!(disk, b"data");
     }
 
+    /// Node oracle: express's `raw({ type })` parses the body only when the
+    /// content type matches, so both a WRONG and an ABSENT Content-Type leave
+    /// `req.body` unparsed and the oracle 400s with the body message.
     #[tokio::test]
     async fn rejects_a_non_empty_body_with_the_wrong_content_type() {
         let home = tempfile::tempdir().unwrap();
@@ -441,6 +444,21 @@ mod tests {
                 "?name=note.txt",
                 Some("tok"),
                 Some("text/plain"),
+                b"data".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_error(resp, StatusCode::BAD_REQUEST, BODY_MSG).await;
+
+        // No Content-Type header at all: `headers.get(..)` misses, so
+        // `is_octet_stream`'s `None` branch is false and the same 400 fires —
+        // matching the oracle's type-skip on a missing content type.
+        let resp = app
+            .clone()
+            .oneshot(post_upload(
+                "?name=note.txt",
+                Some("tok"),
+                None,
                 b"data".to_vec(),
             ))
             .await
