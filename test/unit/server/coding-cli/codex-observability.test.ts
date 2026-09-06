@@ -567,6 +567,63 @@ describeWithLinuxProc('codex-observability reaper maintenance tick reconciler sw
     expect(await isProcessGroupAlive(pid)).toBe(true)
     expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 0 })
   })
+
+  it('hands the reaper a per-record skip-set function, so a claim landing mid-pass is honored (review Minor 1)', async () => {
+    const metadataDir = await makeTempDir()
+    // An EXPIRED reconciler holding two survivors; both records are scanned in one reaper pass.
+    const claimedChild = await spawnSweepFixtureChild()
+    const claimedPath = path.join(metadataDir, 'obs-late-claim.json')
+    await fsp.writeFile(claimedPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-late-claim',
+      wrapperPid: claimedChild.pid,
+      processGroupId: claimedChild.pid,
+      wrapperIdentity: claimedChild.identity,
+      sessionId: 'thr-late-claim',
+    })), { mode: 0o600 })
+    const sweptChild = await spawnSweepFixtureChild()
+    const sweptPath = path.join(metadataDir, 'obs-mid-pass-swept.json')
+    await fsp.writeFile(sweptPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-mid-pass-swept',
+      wrapperPid: sweptChild.pid,
+      processGroupId: sweptChild.pid,
+      wrapperIdentity: sweptChild.identity,
+    })), { mode: 0o600 })
+    const reconciler = buildExpired()
+    for (const recordPath of [claimedPath, sweptPath]) {
+      const metadata = JSON.parse(await fsp.readFile(recordPath, 'utf8'))
+      expect(await reconciler.hold({ metadataDir, metadataPath: recordPath, metadata })).toBe('held')
+    }
+    expect(reconciler.snapshot()).toMatchObject({ held: 2, claimableSessions: 1, inFlightClaims: 0 })
+
+    // The claim lands while the pass is already scanning: the first per-record consultation
+    // performs it, and every record checked afterwards sees the id in-flight. A pass-start
+    // snapshot would consult the set exactly once for the whole pass.
+    const original = reconciler.sweepProtectionSet.bind(reconciler)
+    let claimLanded = false
+    const spy = vi.spyOn(reconciler, 'sweepProtectionSet').mockImplementation(() => {
+      if (!claimLanded) {
+        claimLanded = true
+        expect(reconciler.claimForSession('thr-late-claim')?.metadata.ownershipId).toBe('obs-late-claim')
+      }
+      return original()
+    })
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1, reconciler })
+
+    // Per-record re-query: more than one consultation for a two-record pass.
+    expect(claimLanded).toBe(true)
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+    // The claimed survivor was protected from every check after its claim landed: no signal, no
+    // retry bookkeeping, record kept.
+    expect(await isProcessGroupAlive(claimedChild.pid)).toBe(true)
+    await expect(fsp.stat(claimedPath)).resolves.toBeDefined()
+    await expect(fsp.stat(`${claimedPath}.reaper.json`)).rejects.toMatchObject({ code: 'ENOENT' })
+    // …while the unclaimed expired record was swept and then forgotten by the reconciler.
+    expect(await isProcessGroupAlive(sweptChild.pid)).toBe(false)
+    await expect(fsp.stat(sweptPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 1 })
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set(['obs-late-claim']))
+  }, 20_000)
 })
 
 describeWithLinuxProc('codex-observability lifecycle', () => {

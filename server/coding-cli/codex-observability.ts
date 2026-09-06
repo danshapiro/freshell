@@ -228,9 +228,10 @@ export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintena
   try {
     const { promotedRecords } = await rescanCodexReaperQuarantine(options.metadataDir)
     const due = await hasDueCodexReaperRetries(options.metadataDir)
+    const reconciler = options.reconciler
     // 4g2a sweep: an expired reconciler with survivors still held regains the reaper's full
     // authority (kill + unlink) over anything unclaimed and not in flight.
-    const sweepDue = options.reconciler?.hasExpired() === true && options.reconciler.snapshot().held > 0
+    const sweepDue = reconciler?.hasExpired() === true && reconciler.snapshot().held > 0
     if (promotedRecords.length === 0 && !due && !sweepDue) return
     const result = await reapOrphanedCodexAppServerSidecars({
       serverInstanceId: options.serverInstanceId,
@@ -238,10 +239,12 @@ export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintena
       respectRetryBackoff: true,
       ...(options.metadataDir !== undefined ? { metadataDir: options.metadataDir } : {}),
       ...(options.terminateGraceMs !== undefined ? { terminateGraceMs: options.terminateGraceMs } : {}),
-      ...(options.reconciler !== undefined ? { skipOwnershipIds: options.reconciler.sweepProtectionSet() } : {}),
+      // Function form: the reaper re-consults the protection set PER RECORD, so a claim that
+      // lands mid-pass is honored by every record scanned after it (review Minor 1).
+      ...(reconciler !== undefined ? { skipOwnershipIds: () => reconciler.sweepProtectionSet() } : {}),
     })
     // Killed records must leave the held maps (else sweepDue stays true forever over ghost ids).
-    options.reconciler?.forget(result.reapedOwnershipIds)
+    reconciler?.forget(result.reapedOwnershipIds)
   } catch (error) {
     try {
       log.warn({ err: error }, 'codex reaper hourly retry tick failed')

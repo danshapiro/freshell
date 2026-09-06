@@ -573,6 +573,29 @@ describeWithLinuxProc('CodexSidecarReconciler hold verdicts', () => {
     expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 0 })
     expect(reconciler.claimForSession('thr-anything')).toBeNull()
   })
+
+  it('re-holding the same ownershipId keeps its session index single (review Nit 3)', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const ownership = await writeHeldRecord(metadataDir, buildHeldRecord({
+      ownershipId: 'hold-twice',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-twice',
+    }))
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    expect(await reconciler.hold(ownership)).toBe('held')
+    // The boot reaper offers each record exactly once, but a re-hold must never double-index.
+    expect(await reconciler.hold(ownership)).toBe('held')
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 1, inFlightClaims: 0 })
+
+    // One claim consumes the single index entry; a duplicated entry would be claimed (and
+    // counted in-flight) a second time here.
+    expect(reconciler.claimForSession('thr-twice')?.metadata.ownershipId).toBe('hold-twice')
+    expect(reconciler.claimForSession('thr-twice')).toBeNull()
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 1 })
+  })
 })
 
 describeWithLinuxProc('CodexSidecarReconciler claims', () => {
@@ -741,6 +764,21 @@ describe('resolveCodexSidecarReapGraceMs', () => {
     expect(resolveCodexSidecarReapGraceMs('nonsense', log)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
     expect(log.warn).toHaveBeenCalledTimes(1)
     expect(resolveCodexSidecarReapGraceMs('-5', log)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
+    expect(log.warn).toHaveBeenCalledTimes(2)
+  })
+
+  it('falls back to the default with a warn on digit strings that overflow a safe integer (review Nit 2)', () => {
+    const log = createReconcilerLog()
+    // A 400-digit string parses to Infinity; without the safe-integer guard hasExpired() would be
+    // permanently false and the sweep would silently never run.
+    expect(resolveCodexSidecarReapGraceMs('9'.repeat(400), log)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
+    expect(log.warn).toHaveBeenCalledTimes(1)
+    expect(log.warn).toHaveBeenCalledWith({ raw: '9'.repeat(400) }, expect.any(String))
+    // 2^53+1 in digits loses precision on parse (not a safe integer); MAX_SAFE_INTEGER itself is
+    // still honored literally.
+    expect(resolveCodexSidecarReapGraceMs('9007199254740993', log)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
+    expect(log.warn).toHaveBeenCalledTimes(2)
+    expect(resolveCodexSidecarReapGraceMs(String(Number.MAX_SAFE_INTEGER), log)).toBe(Number.MAX_SAFE_INTEGER)
     expect(log.warn).toHaveBeenCalledTimes(2)
   })
 })

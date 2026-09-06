@@ -205,11 +205,13 @@ export type ReapOrphanedSidecarsOptions = {
    */
   holdReconciler?: CodexSidecarHoldSink
   /**
-   * Ownership ids the reaper must skip this pass, checked before the budget/teardown tail. The
-   * hourly sweep passes the reconciler's protection set here (held survivors before grace expiry;
-   * in-flight claims always).
+   * Ownership ids the reaper must skip, checked before the budget/teardown tail. The hourly
+   * sweep passes the reconciler's protection set here (held survivors before grace expiry;
+   * in-flight claims always). The function form is re-consulted PER RECORD, so a claim that
+   * lands mid-pass protects every record scanned after it — a static set would snapshot the
+   * protection at pass start and could reap a survivor claimed during the pass.
    */
-  skipOwnershipIds?: ReadonlySet<string>
+  skipOwnershipIds?: ReadonlySet<string> | (() => ReadonlySet<string>)
   /** Clock seam for the teardown budget (tests only). */
   nowFn?: () => number
 }
@@ -1405,8 +1407,13 @@ export async function reapOrphanedCodexAppServerSidecars(
 
       const ownership: ActiveOwnership = { metadataDir, metadataPath, metadata }
       // 4g2a: the reconciler's protection set is honored BEFORE the budget/teardown tail — no
-      // signal, no retry bookkeeping for swept-over held or in-flight ids.
-      if (options.skipOwnershipIds?.has(metadata.ownershipId)) {
+      // signal, no retry bookkeeping for swept-over held or in-flight ids. The function form is
+      // resolved PER RECORD so a claim that lands mid-pass still protects every record scanned
+      // after it.
+      const skipOwnershipIds = typeof options.skipOwnershipIds === 'function'
+        ? options.skipOwnershipIds()
+        : options.skipOwnershipIds
+      if (skipOwnershipIds?.has(metadata.ownershipId)) {
         result.skippedActiveOwnershipIds.push(metadata.ownershipId)
         continue
       }

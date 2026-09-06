@@ -2444,6 +2444,59 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       await expect(fsp.stat(`${ready.metadataPath}.reaper.json`)).rejects.toMatchObject({ code: 'ENOENT' })
     }, 20_000)
 
+    it('resolves a function skipOwnershipIds per record, honoring a protection that lands mid-pass', async () => {
+      const metadataDir = await makeTempDir()
+      // Bare dead-owner records with long-gone groups: teardown proves `gone` and unlinks without
+      // ever signaling, so the pass stays deterministic under suite CPU starvation (the
+      // neighboring live-fixture test pins the no-signal-to-a-live-group property).
+      const writeOrphanRecord = async (name: string, ownershipId: string) => {
+        const now = new Date().toISOString()
+        await fsp.writeFile(path.join(metadataDir, name), JSON.stringify({
+          schemaVersion: 1,
+          ownershipId,
+          serverInstanceId: 'srv-previous',
+          ownerServerPid: 999_999_999,
+          terminalId: null,
+          generation: null,
+          wsUrl: 'ws://127.0.0.1:1',
+          wrapperPid: 999_999_998,
+          processGroupId: 999_999_997,
+          wrapperIdentity: { commandLine: ['codex'], cwd: '/tmp', startTimeTicks: 1 },
+          createdAt: now,
+          updatedAt: now,
+        }), { mode: 0o600 })
+      }
+      await writeOrphanRecord('mid-pass-protected.json', 'mid-pass-protected')
+      await writeOrphanRecord('mid-pass-swept.json', 'mid-pass-swept')
+
+      // A protection that lands WHILE the pass is scanning: the first per-record consultation
+      // adds the id, and the record carrying it must be skipped regardless of scan order. A
+      // pass-start snapshot would consult this exactly once for the whole pass.
+      const liveProtections = new Set<string>()
+      const skipSpy = vi.fn((): ReadonlySet<string> => {
+        liveProtections.add('mid-pass-protected')
+        return liveProtections
+      })
+
+      const result = await reapOrphanedCodexAppServerSidecars({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+        skipOwnershipIds: skipSpy,
+      })
+
+      // Per-record resolution: consulted once per scanned record, never snapshotted at pass start.
+      expect(skipSpy).toHaveBeenCalledTimes(2)
+      expect(result.failedOwnershipIds).toEqual([])
+      expect(result.skippedActiveOwnershipIds).toEqual(['mid-pass-protected'])
+      expect(result.reapedOwnershipIds).toEqual(['mid-pass-swept'])
+      // The mid-pass protection fully shielded its record: kept on disk, no retry bookkeeping.
+      await expect(fsp.stat(path.join(metadataDir, 'mid-pass-protected.json'))).resolves.toBeDefined()
+      await expect(fsp.stat(path.join(metadataDir, 'mid-pass-protected.json.reaper.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      // The unprotected record went through the normal verified teardown.
+      await expect(fsp.stat(path.join(metadataDir, 'mid-pass-swept.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    }, 30_000)
+
     it('routes hold-sink verdicts to held/reaped/retried buckets and unlinks the retry sidecar only on removed-unowned', async () => {
       const metadataDir = await makeTempDir()
       const runtimeHeld = createRuntime({ metadataDir, serverInstanceId: 'srv-previous' })

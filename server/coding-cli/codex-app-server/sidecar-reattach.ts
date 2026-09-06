@@ -22,16 +22,21 @@ export type CodexSidecarReconcilerLogger = {
   warn: (fields: Record<string, unknown>, message: string) => void
 }
 
-// Parses FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS: absent → default; '0' (or any non-negative integer)
-// honored literally; anything else → default plus a warn (a mistyped value must never disable the
-// safety net, and must never crash boot either).
+// Parses FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS: absent → default; '0' (or any non-negative safe
+// integer) honored literally; anything else → default plus a warn (a mistyped value must never
+// disable the safety net, and must never crash boot either). Digit strings too long for a safe
+// integer parse to Infinity (or lose precision), which would make hasExpired() permanently false
+// and silently disable the sweep — they fall back like any other invalid value.
 export function resolveCodexSidecarReapGraceMs(
   raw: string | undefined,
   log: { warn: (fields: Record<string, unknown>, message: string) => void } = logger,
 ): number {
   if (raw === undefined) return CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS
   const trimmed = raw.trim()
-  if (/^\d+$/.test(trimmed)) return Number(trimmed)
+  if (/^\d+$/.test(trimmed)) {
+    const parsed = Number(trimmed)
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed
+  }
   log.warn({ raw }, 'Invalid FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS; falling back to the default sidecar reap grace')
   return CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS
 }
@@ -82,7 +87,10 @@ export class CodexSidecarReconciler {
     this.held.set(metadata.ownershipId, ownership)
     const sessionId = metadata.sessionId
     if (isClaimableSessionId(sessionId)) {
-      const ids = [...(this.bySession.get(sessionId) ?? []), metadata.ownershipId]
+      // Re-holding an already-indexed record must not append a duplicate: the held map dedupes by
+      // key, this array does not (a duplicate would offer the same record to a second claim).
+      const ids = this.bySession.get(sessionId) ?? []
+      if (!ids.includes(metadata.ownershipId)) ids.push(metadata.ownershipId)
       // Newest-updatedAt-first so a restore claims the freshest record for its thread.
       ids.sort((a, b) => {
         const updatedAtA = this.held.get(a)?.metadata.updatedAt ?? ''
