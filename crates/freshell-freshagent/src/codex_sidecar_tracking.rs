@@ -33,6 +33,12 @@ fn now_millis() -> i64 {
 /// identity, or an io error are all logged loudly and leave today's
 /// kill-on-drop-only posture in place for that child.
 pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url: &str) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ownership_id, pid, ws_url);
+        return; // /proc identity evidence is Linux-only
+    }
+
     let Some(store) = codex_sidecar_store() else {
         return;
     };

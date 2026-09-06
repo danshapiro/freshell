@@ -189,9 +189,16 @@ async fn create_writes_a_freshagent_laned_record_for_the_real_sidecar() {
 #[tokio::test]
 async fn failed_spawn_leaves_no_record() {
     let _env = ENV_LOCK.lock().await;
-    // Exits ~0.2s in without ever listening: spawn_sidecar returns Err via the
-    // "exited before listening" arm.
-    std::env::set_var("CODEX_CMD", "sh -c 'sleep 0.2'");
+    // The node child survives ~1.5s — far beyond any realistic evidence-poll
+    // latency, so the optimistic record write deterministically lands before
+    // the child exits — it never listens, then exits, so spawn_sidecar returns
+    // Err via the "exited before listening" arm with the record already
+    // written. (No inner spaces in the script: spawn_sidecar whitespace-splits
+    // CODEX_CMD, so the script must stay a single argv. The trailing `--`
+    // stops node's option parsing, so the `-c ...` app-server args
+    // spawn_sidecar appends cannot be misparsed as node flags — without it
+    // node dies in milliseconds on `either --check or --eval`.)
+    std::env::set_var("CODEX_CMD", "node -e setTimeout(()=>{},1500) --");
     let guard = TrackingStoreGuard::install();
     let (st, mut rx) = tracking_state();
 
