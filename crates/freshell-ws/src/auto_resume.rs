@@ -1895,8 +1895,11 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
         drain().await;
         assert!(
-            fake.settled_frames()
-                .contains(&("t2".to_string(), "no_resumable_identity".to_string(), None)),
+            fake.settled_frames().contains(&(
+                "t2".to_string(),
+                "no_resumable_identity".to_string(),
+                None
+            )),
             "grace exhausted: t2 settles no_resumable_identity"
         );
 
@@ -1939,7 +1942,10 @@ mod tests {
             .unwrap();
         drain().await;
         assert!(fake.settled_frames().is_empty(), "no settle during grace");
-        assert!(fake.recovering_calls().is_empty(), "no recover before identity");
+        assert!(
+            fake.recovering_calls().is_empty(),
+            "no recover before identity"
+        );
 
         // Grace step 1 elapses with no identity: re-check sees None, loop holds.
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
@@ -1952,7 +1958,10 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
         drain().await;
         assert_eq!(fake.recovering_calls(), vec![("t1".into(), 1u32, 2u32)]);
-        assert!(fake.respawn_calls().is_empty(), "resume backoff still respected");
+        assert!(
+            fake.respawn_calls().is_empty(),
+            "resume backoff still respected"
+        );
         tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
         drain().await;
         assert_eq!(
@@ -1980,14 +1989,15 @@ mod tests {
         assert!(fake.settled_frames().is_empty(), "grace must run first");
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
         drain().await;
-        assert!(fake.settled_frames().is_empty(), "second grace step pending");
+        assert!(
+            fake.settled_frames().is_empty(),
+            "second grace step pending"
+        );
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
         drain().await;
         assert_eq!(
             fake.settled_frames(),
-            vec![
-                ("t2".to_string(), "no_resumable_identity".to_string(), None)
-            ]
+            vec![("t2".to_string(), "no_resumable_identity".to_string(), None)]
         );
         assert!(fake.respawn_calls().is_empty());
         // Delta-fix-1: the exhaustion tail retires unconditionally — a
@@ -2037,9 +2047,9 @@ mod tests {
         tx.send(crash("t6", 1, "claude", Some("cr-6"), 1_000))
             .unwrap();
         drain().await; // hub is now parked in grace sleep #1
-        // Cancel AND identity revival land in the same grace sleep (the race
-        // round-3 flagged): both must be handled — cancelled settle AND
-        // re-retire, never a live leftover.
+                       // Cancel AND identity revival land in the same grace sleep (the race
+                       // round-3 flagged): both must be handled — cancelled settle AND
+                       // re-retire, never a live leftover.
         fake.set_cancelled("t6");
         fake.set_session(Some(("claude".into(), "sess-1".into(), None)));
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
@@ -2085,11 +2095,7 @@ mod tests {
         assert!(fake.respawn_calls().is_empty(), "cap was exhausted");
         assert_eq!(
             fake.settled_frames(),
-            vec![(
-                "t7".to_string(),
-                "respawn_cap_exhausted".to_string(),
-                None
-            )]
+            vec![("t7".to_string(), "respawn_cap_exhausted".to_string(), None)]
         );
         // The revived identity did NOT leak into live-only registry lookups:
         assert!(fake.retired().contains(&"t7".to_string()));

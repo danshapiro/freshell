@@ -763,12 +763,20 @@ async fn crash_with_identity_arriving_during_grace_is_resumed() {
         }
         tokio::time::Instant::now()
     };
-    tokio::time::sleep_until(marker_seen + Duration::from_millis(1_200) + Duration::from_millis(250))
-        .await;
+    tokio::time::sleep_until(
+        marker_seen + Duration::from_millis(1_200) + Duration::from_millis(250),
+    )
+    .await;
     // NoIndexProbe::default() -> Unknown for codex -> respawn gate fails open
     // (resume_validation passthrough), so this fabricated thread id is
     // sufficient — the same authority the locator-adoption path upserts.
-    state.identity.upsert(&old_tid, Some("codex"), Some("thread-grace-1"), None, now_ms());
+    state.identity.upsert(
+        &old_tid,
+        Some("codex"),
+        Some("thread-grace-1"),
+        None,
+        now_ms(),
+    );
 
     // Engagement proof (the anti-vacuity gate): the hub logged grace entry
     // for THIS terminal. A pathological stall that let the upsert beat
