@@ -53,6 +53,7 @@ export type MenuActions = {
   openSessionInNewTab: (sessionId: string, provider?: string) => void
   openSessionInThisTab: (sessionId: string, provider?: string) => void
   renameSession: (sessionId: string, provider?: string, withSummary?: boolean) => void
+  resetSessionTitle: (sessionId: string, provider?: string) => void
   generateSessionTitle: (sessionId: string, provider?: string) => void
   toggleArchiveSession: (sessionId: string, provider: string | undefined, next: boolean) => void
   deleteSession: (sessionId: string, provider?: string) => void
@@ -627,6 +628,20 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider) },
+      // Reviewed reset (b5fb): offered only when an override is applied AND its
+      // recorded source is not a sweep rung ('first-message'/'dir') the
+      // auto-title sweep would instantly re-apply. Source-less historical
+      // (pane-era) overrides still qualify.
+      ...(sessionInfo?.session.titleOverridden
+          && sessionInfo.session.titleOverrideSource !== 'first-message'
+          && sessionInfo.session.titleOverrideSource !== 'dir'
+        ? [{
+            type: 'item' as const,
+            id: 'session-reset-title',
+            label: 'Reset to provider title',
+            onSelect: () => actions.resetSessionTitle(target.sessionId, target.provider),
+          }]
+        : []),
       ...(ctx.aiEnabled
         ? [{ type: 'item' as const, id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) }]
         : []),
@@ -675,6 +690,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     return [
       { type: 'item', id: 'history-session-open', label: 'Open session', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'history-session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider, true) },
+      ...(sessionInfo?.session.titleOverridden
+          && sessionInfo.session.titleOverrideSource !== 'first-message'
+          && sessionInfo.session.titleOverrideSource !== 'dir'
+        ? [{
+            type: 'item' as const,
+            id: 'history-session-reset-title',
+            label: 'Reset to provider title',
+            onSelect: () => actions.resetSessionTitle(target.sessionId, target.provider),
+          }]
+        : []),
       { type: 'item', id: 'history-session-delete', label: 'Delete session', onSelect: () => actions.deleteSession(target.sessionId, target.provider), danger: true, disabled: isOpen },
       { type: 'separator', id: 'history-session-sep' },
       { type: 'item', id: 'history-session-copy-id', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },

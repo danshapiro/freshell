@@ -244,6 +244,103 @@ describe('sessionsThunks', () => {
     })
   })
 
+  it('lands title-override provenance fields from a directory refresh into Redux session rows', async () => {
+    // b5fb: the Task 7 "Reset to provider title" flow reads these fields off
+    // the committed Redux rows — a directory refresh whose items carry the
+    // three provenance fields must land them intact (and a plain row gains
+    // none of them).
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [
+        {
+          projectPath: '/tmp/project-alpha',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionId: 'session-renamed',
+              projectPath: '/tmp/project-alpha',
+              lastActivityAt: 1_000,
+              title: 'Accidental pane label',
+              titleOverridden: true,
+              providerTitle: 'Provider native title',
+              titleOverrideSource: 'user',
+            },
+            {
+              provider: 'claude',
+              sessionId: 'session-plain',
+              projectPath: '/tmp/project-alpha',
+              lastActivityAt: 900,
+              title: 'Plain provider title',
+            },
+          ],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 900,
+      oldestIncludedSessionId: 'claude:session-plain',
+      hasMore: false,
+    })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    const rows = store.getState().sessions.projects[0]?.sessions ?? []
+    const renamed = rows.find((row) => row.sessionId === 'session-renamed')
+    expect(renamed).toMatchObject({
+      title: 'Accidental pane label',
+      titleOverridden: true,
+      providerTitle: 'Provider native title',
+      titleOverrideSource: 'user',
+    })
+    const plain = rows.find((row) => row.sessionId === 'session-plain')
+    expect(plain).toMatchObject({ title: 'Plain provider title' })
+    expect(plain?.titleOverridden).toBeUndefined()
+    expect(plain?.providerTitle).toBeUndefined()
+    expect(plain?.titleOverrideSource).toBeUndefined()
+  })
+
+  it('lands title-override provenance fields from search results into Redux session rows', async () => {
+    // b5fb: search-window rows pass through the searchResultsToProjects
+    // allowlist — the three provenance fields must be forwarded there too.
+    searchSessions.mockResolvedValueOnce({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-renamed',
+        projectPath: '/tmp/project-alpha',
+        title: 'Accidental pane label',
+        matchedIn: 'title',
+        lastActivityAt: 1_000,
+        titleOverridden: true,
+        providerTitle: 'Provider native title',
+        titleOverrideSource: 'user',
+      }],
+      tier: 'title',
+      query: 'accidental',
+      totalScanned: 1,
+    })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'accidental',
+    }) as any)
+
+    expect(store.getState().sessions.windows.sidebar.projects[0]?.sessions[0]).toMatchObject({
+      provider: 'claude',
+      sessionId: 'session-renamed',
+      title: 'Accidental pane label',
+      titleOverridden: true,
+      providerTitle: 'Provider native title',
+      titleOverrideSource: 'user',
+    })
+  })
+
   it('keeps tier changes and clearing a non-empty query in the visible search intent', async () => {
     const tierChange = createDeferred<any>()
     const clearSearch = createDeferred<any>()

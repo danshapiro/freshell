@@ -159,6 +159,21 @@ struct DirItem {
     /// meter (`compactPercent` etc.). `None` when the source carries none
     /// (opencode direct rows, live-terminal synthesized items).
     token_usage: Option<freshell_sessions::meta::TokenSummary>,
+    /// b5fb provenance exposure (`SessionDirectoryItem.titleOverridden`,
+    /// `shared/read-models.ts`): `true` exactly when a stored `titleOverride`
+    /// currently applies to this row. Wire-facing: serialized by
+    /// [`DirItem::to_value`] (only when true, mirroring the `isSubagent`
+    /// convention); set by [`apply_session_overrides`].
+    title_overridden: bool,
+    /// b5fb (`SessionDirectoryItem.providerTitle`): the parsed PRE-override
+    /// (provider-native) title captured before the overlay replaced it —
+    /// the reset flow's preview. `None` when no override applies (or the parse
+    /// had no title — in that case there is no provider title to reveal).
+    provider_title: Option<String>,
+    /// b5fb (`SessionDirectoryItem.titleOverrideSource`): the applied override
+    /// row's recorded `titleSource` (`user`/`ai`/`first-message`/`legacy`/
+    /// `dir`); `None` when the override never recorded one.
+    title_override_source: Option<String>,
 }
 
 impl DirItem {
@@ -227,6 +242,19 @@ impl DirItem {
         }
         if let Some(u) = &self.token_usage {
             o.insert("tokenUsage".into(), token_usage_value(u));
+        }
+        // b5fb: provenance trio — `titleOverridden` only when true (same
+        // convention as `isSubagent`/`isNonInteractive`), the two optionals
+        // only when present. Absent means "not overridden / no provider title
+        // recorded" (the zod `.optional()` semantics).
+        if self.title_overridden {
+            o.insert("titleOverridden".into(), json!(true));
+        }
+        if let Some(v) = &self.provider_title {
+            o.insert("providerTitle".into(), json!(v));
+        }
+        if let Some(v) = &self.title_override_source {
+            o.insert("titleOverrideSource".into(), json!(v));
         }
         Value::Object(o)
     }
@@ -880,6 +908,11 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         title_source: idx.title_source.clone(),
         source_file: idx.source_file.clone(),
         token_usage: idx.token_usage.clone(),
+        // Provenance is overlay-derived (`apply_session_overrides`), never
+        // parsed from the transcript.
+        title_overridden: false,
+        provider_title: None,
+        title_override_source: None,
     }
 }
 
@@ -1041,6 +1074,9 @@ fn item_from_meta(
         title_source: meta.title_source.clone(),
         source_file,
         token_usage: None,
+        title_overridden: false,
+        provider_title: None,
+        title_override_source: None,
     }
 }
 
@@ -1087,6 +1123,24 @@ fn apply_session_overrides(
                         == Some("provider-generated")
                         && matches!(row_source, Some("dir") | Some("first-message"));
                     if !t.is_empty() && !provider_generated_shadow {
+                        // b5fb: expose the reset-flow provenance exactly when
+                        // the override APPLIES (the same gate as Node's
+                        // `applyOverride`). Capture the pre-overlay
+                        // (parsed/provider-native) title into `provider_title`
+                        // BEFORE replacing it — left None when the parse had
+                        // no title. `title_override_source` re-validates the
+                        // stored row: config.json is hand-editable, and an
+                        // out-of-ladder string would fail the client's z.enum
+                        // page parse (`shared/read-models.ts`) — junk degrades
+                        // to "no source recorded", matching Node's
+                        // `isTitleSource` gate in `applyOverride`.
+                        item.title_overridden = true;
+                        item.title_override_source = row_source
+                            .filter(|s| {
+                                matches!(*s, "user" | "ai" | "first-message" | "legacy" | "dir")
+                            })
+                            .map(str::to_string);
+                        item.provider_title = item.title.clone();
                         item.title = Some(t.to_string());
                     }
                 }
@@ -1244,6 +1298,11 @@ fn build_live_terminal_session_item(
         // indexed from transcripts (their usage arrives via that path), so
         // this gap only covers pre-adoption transient rows.
         token_usage: None,
+        // A synthesized live-terminal row never carries override provenance
+        // (Node's `buildLiveTerminalSessionItem` sets none either).
+        title_overridden: false,
+        provider_title: None,
+        title_override_source: None,
     })
 }
 
@@ -1305,6 +1364,9 @@ mod join_tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         }
     }
 
@@ -2222,6 +2284,9 @@ mod tests {
                 compact_threshold_tokens: Some(1000),
                 compact_percent: Some(90),
             }),
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         }
     }
 
@@ -2476,6 +2541,9 @@ mod tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         };
         let items = vec![mk("a", 100), mk("b", 200)];
         let q = DirQuery {
@@ -2692,6 +2760,9 @@ mod tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         };
         let items = vec![mk("keep"), mk("gone")];
 
@@ -2738,6 +2809,9 @@ mod tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         };
         let mut overrides = serde_json::Map::new();
         overrides.insert(
@@ -2799,6 +2873,9 @@ mod tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         };
         let copied = DirItem {
             session_id: "copied-transcript".into(),
@@ -2862,6 +2939,9 @@ mod tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         };
         let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
         let v = overlaid[0].to_value();
@@ -2906,6 +2986,9 @@ mod tests {
             title_source: title_source.map(str::to_string),
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         }
     }
 
@@ -3007,6 +3090,98 @@ mod tests {
         assert_eq!(out[0].title.as_deref(), Some("Provider Title"));
         assert_eq!(out[0].summary.as_deref(), Some("sum"));
         assert!(out[0].archived);
+    }
+
+    // -- b5fb: override provenance on the wire (Task 7's reviewed reset flow) --
+
+    #[test]
+    fn applied_title_override_exposes_provenance_on_the_wire() {
+        // A row whose title is currently shadowed by a stored override must
+        // SAY so on the wire, and must carry the pre-override (provider-native)
+        // title plus the override's recorded titleSource, so the client can
+        // offer a "Reset to provider title" preview.
+        let item = DirItem {
+            session_id: "sess-1".into(),
+            legacy_session_id: None,
+            provider: "claude".into(),
+            project_path: "/p".into(),
+            title: Some("Provider native title".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: None,
+            source_file: None,
+            token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
+        };
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:sess-1".to_string(),
+            json!({ "titleOverride": "Accidental pane label", "titleSource": "user" }),
+        );
+        let out = apply_session_overrides(vec![item], &overrides);
+        assert_eq!(out.len(), 1);
+        let v = out[0].to_value();
+        assert_eq!(v["title"], json!("Accidental pane label"));
+        assert_eq!(v["titleOverridden"], json!(true));
+        assert_eq!(v["providerTitle"], json!("Provider native title"));
+        assert_eq!(v["titleOverrideSource"], json!("user"));
+    }
+
+    #[test]
+    fn non_applied_shadow_override_stays_invisible_to_provenance() {
+        // A provider-generated session with a sweep-written `dir` row keeps its
+        // parsed title (the read-guard suppresses the write). Such a row is NOT
+        // overridden on the wire, so NONE of the provenance fields may appear —
+        // there is nothing to reset (the provider title is already showing).
+        let item = guard_item("s1", Some("provider-generated"));
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            item.key(),
+            json!({ "titleOverride": "proj", "titleSource": "dir" }),
+        );
+        let out = apply_session_overrides(vec![item], &overrides);
+        assert_eq!(out.len(), 1);
+        let v = out[0].to_value();
+        assert_eq!(v["title"], json!("Provider Title"));
+        assert!(v.get("titleOverridden").is_none());
+        assert!(v.get("providerTitle").is_none());
+        assert!(v.get("titleOverrideSource").is_none());
+    }
+
+    #[test]
+    fn bogus_stored_title_source_is_dropped_from_the_wire() {
+        // Defensive: config.json is hand-editable, so a stored `titleSource`
+        // can be ANY string. Forwarding an out-of-ladder source would fail the
+        // client's z.enum page parse (`shared/read-models.ts`) and reject the
+        // whole directory page. The override itself must still apply — junk
+        // degrades to "no source recorded", never to a dropped override or a
+        // poisoned page.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "amplifier:s1".to_string(),
+            json!({ "titleOverride": "Hand-edited rename", "titleSource": "bogus-value" }),
+        );
+        let out = apply_session_overrides(vec![guard_item("s1", None)], &overrides);
+        assert_eq!(out.len(), 1);
+        let v = out[0].to_value();
+        assert_eq!(v["title"], json!("Hand-edited rename"));
+        assert_eq!(v["titleOverridden"], json!(true));
+        assert_eq!(v["providerTitle"], json!("Provider Title"));
+        assert!(v.get("titleOverrideSource").is_none());
     }
 
     // -- Batch B: the `SessionIndex`-backed production path --
@@ -4502,6 +4677,9 @@ mod tests {
             title_source: None,
             source_file: None,
             token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
         };
         let mut overrides = serde_json::Map::new();
         overrides.insert(

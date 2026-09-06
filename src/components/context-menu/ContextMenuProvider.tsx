@@ -14,7 +14,7 @@ import {
   updatePaneContent,
   updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
-import { applySessionRenameCascade } from '@/store/titleSync'
+import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { sendTerminalKillAndAwait, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
@@ -591,6 +591,38 @@ export function ContextMenuProvider({
         // no longer removes vanished sessions — propagate the delete
         // explicitly and immediately.
         dispatch(removeSessionFromProjects({ provider: provider || info.session.provider, sessionId }))
+        await dispatch(refreshActiveSessionWindow() as any)
+      },
+    })
+  }, [dispatch, getSessionInfo, menuState?.target])
+
+  const resetSessionTitle = useCallback((sessionId: string, provider?: string) => {
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
+    if (!info) return
+    const resolvedProvider = provider || info.session.provider || 'claude'
+    setConfirmState({
+      title: 'Reset to provider title?',
+      confirmLabel: 'Reset title',
+      body: (
+        <div className="space-y-2">
+          <div className="text-xs">This removes the custom title override for this session only. A backup of the previous config is kept in config.backup.json.</div>
+          <div className="text-xs">Current title: {info.session.title || '(untitled)'}</div>
+          <div className="text-xs">Provider title: {info.session.providerTitle || '(none yet — the next generated title will show)'}</div>
+        </div>
+      ),
+      onConfirm: async () => {
+        try {
+          await clearSessionTitleOverride(resolvedProvider, sessionId)
+        } catch (err) {
+          // SESSION-03: failed reset must not LOOK like success — keep the
+          // dialog open and announce the failure.
+          const message = err instanceof Error ? err.message : 'Reset failed'
+          setConfirmState((prev) =>
+            prev ? { ...prev, error: `Failed to reset title: ${message}` } : prev,
+          )
+          return
+        }
+        setConfirmState(null)
         await dispatch(refreshActiveSessionWindow() as any)
       },
     })
@@ -1362,6 +1394,7 @@ export function ContextMenuProvider({
         openSessionInNewTab,
         openSessionInThisTab,
         renameSession,
+        resetSessionTitle,
         generateSessionTitle,
         toggleArchiveSession,
         deleteSession,
@@ -1434,6 +1467,7 @@ export function ContextMenuProvider({
     openSessionInNewTab,
     openSessionInThisTab,
     renameSession,
+    resetSessionTitle,
     toggleArchiveSession,
     deleteSession,
     copySessionId,

@@ -26,6 +26,13 @@ function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirec
     a.isSubagent === b.isSubagent &&
     a.isNonInteractive === b.isNonInteractive &&
     a.firstUserMessage === b.firstUserMessage &&
+    // b5fb: override provenance is directory-visible — a rename/clear (or any
+    // provenance-only change at the same displayed title) must count as a
+    // change so `sessions.changed` fires and clients refetch the reset-flow
+    // fields.
+    a.titleOverridden === b.titleOverridden &&
+    a.providerTitle === b.providerTitle &&
+    a.titleOverrideSource === b.titleOverrideSource &&
     // STATUS-STRIP: usage ticks must count as a change so `sessions.changed`
     // fires and the strip's context meter refetches — otherwise the meter
     // would only move when some other field happened to change too.
@@ -49,6 +56,10 @@ export function toSessionDirectoryComparableItem(session: CodingCliSession): Ses
     isSubagent: session.isSubagent,
     isNonInteractive: session.isNonInteractive,
     firstUserMessage: session.firstUserMessage,
+    // b5fb: the reviewed reset flow's provenance fields ride the directory row.
+    titleOverridden: session.titleOverridden,
+    providerTitle: session.providerTitle,
+    titleOverrideSource: session.titleOverrideSource,
     tokenUsage: session.tokenUsage,
   }
 }

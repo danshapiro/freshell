@@ -6,6 +6,7 @@ import chokidar from 'chokidar'
 import type { CodingCliProvider } from '../../../../server/coding-cli/provider'
 import { CodingCliSessionIndexer } from '../../../../server/coding-cli/session-indexer'
 import { configStore } from '../../../../server/config-store'
+import type { SessionOverride } from '../../../../server/config-store'
 import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
 import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
@@ -1581,6 +1582,87 @@ describe('CodingCliSessionIndexer', () => {
     const session = indexer.getProjects()[0]?.sessions[0]
     expect(session?.sessionId).toBe(legacyId)
     expect(session?.title).toBe('Overridden')
+  })
+
+  it('exposes override provenance (titleOverridden/providerTitle/titleOverrideSource) on session rows', async () => {
+    // b5fb: a row whose title is currently shadowed by a stored override must
+    // SAY so, carry the pre-override (provider-native) title, and record the
+    // override's titleSource — the data a "Reset to provider title" preview
+    // (Task 7) needs. A row with NO override carries NONE of the three fields.
+    const fileA = path.join(tempDir, 'provenance-target.jsonl')
+    const fileB = path.join(tempDir, 'provenance-control.jsonl')
+    await Promise.all([
+      fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'First prompt title' }) + '\n'),
+      fsp.writeFile(fileB, JSON.stringify({ cwd: '/project/a', title: 'Untouched title' }) + '\n'),
+    ])
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', 'provenance-target')]: {
+          titleOverride: 'Accidental pane label',
+          titleSource: 'user',
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {},
+        },
+      },
+    })
+
+    const indexer = new CodingCliSessionIndexer([makeProvider([fileA, fileB])])
+    await indexer.refresh()
+
+    const sessions = indexer.getProjects().flatMap((project) => project.sessions)
+    const overridden = sessions.find((session) => session.sessionId === 'provenance-target')
+    expect(overridden?.title).toBe('Accidental pane label')
+    expect(overridden?.titleOverridden).toBe(true)
+    expect(overridden?.providerTitle).toBe('First prompt title')
+    expect(overridden?.titleOverrideSource).toBe('user')
+
+    const control = sessions.find((session) => session.sessionId === 'provenance-control')
+    expect(control?.title).toBe('Untouched title')
+    expect(control?.titleOverridden).toBeUndefined()
+    expect(control?.providerTitle).toBeUndefined()
+    expect(control?.titleOverrideSource).toBeUndefined()
+  })
+
+  it('omits titleOverrideSource when the stored override row carries a bogus titleSource', async () => {
+    // Defensive: config.json is hand-editable, so a stored titleSource can be
+    // ANY string at runtime. Forwarding an out-of-ladder source would fail the
+    // client's z.enum page parse (shared/read-models.ts) and reject the whole
+    // directory page. The override itself must still apply — junk degrades to
+    // "no source recorded", never to a dropped override or a poisoned page.
+    const fileA = path.join(tempDir, 'bogus-source.jsonl')
+    await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Parsed title' }) + '\n')
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', 'bogus-source')]: {
+          titleOverride: 'Hand-edited rename',
+          // Simulate the hand-edited stored row the type system cannot express.
+          titleSource: 'bogus-value' as unknown as SessionOverride['titleSource'],
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {},
+        },
+      },
+    })
+
+    const indexer = new CodingCliSessionIndexer([makeProvider([fileA])])
+    await indexer.refresh()
+
+    const session = indexer.getProjects().flatMap((project) => project.sessions)
+      .find((s) => s.sessionId === 'bogus-source')
+    expect(session?.title).toBe('Hand-edited rename')
+    expect(session?.titleOverridden).toBe(true)
+    expect(session?.providerTitle).toBe('Parsed title')
+    expect(session?.titleOverrideSource).toBeUndefined()
+    expect(session && 'titleOverrideSource' in session).toBe(false)
   })
 
   it('avoids relisting session files when nothing changed', async () => {

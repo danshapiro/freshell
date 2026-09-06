@@ -2891,7 +2891,7 @@ mod tests {
         assert_eq!(event.cwd.as_deref(), Some(tmp.to_string_lossy().as_ref()));
     }
 
-    /// The hook is optional wiring (the `rename_persistence` convention):
+    /// The hook is optional wiring (the Option-until-wired convention):
     /// an unwired state creates terminals exactly as before -- no panic, no
     /// behavior change (every pre-existing test in this module already runs
     /// unwired; this pins the contract explicitly).

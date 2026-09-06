@@ -162,11 +162,14 @@ export const MATRIX_SPECS = [
   // are deterministic. Authored under the df1 deferred-Playwright policy; see
   // docs/plans/df1-evidence/AUTO-01.md.
   /layout-sync-authoritative\.spec\.ts$/,
-  // Task 21 (naming-persistence sweep) -- cross-surface title convergence
-  // (pane header / sidebar / History / Overview / automation PATCH renames
-  // must converge on both surfaces). Pins EDEV-09; the client fixes are
-  // shared code, so legacy is a true regression control proving they didn't
-  // regress Node behavior. See title-sync-convergence.spec.ts.
+  // b5fb (pane/tab rename scope contract) -- name-scope parity between the
+  // fixture-default and legacy-controlled servers: pane/tab organization
+  // names stay local on both, explicit session renames/clears converge
+  // through the sessions routes, and the reviewed reset flow reveals
+  // provider-native titles. Pins the AMENDED EDEV-09 client/server parity
+  // semantics (see port/oracle/DEVIATIONS.md and
+  // docs/development/rename-scope-contract.md); legacy remains the true
+  // parity control. See title-sync-convergence.spec.ts.
   /title-sync-convergence\.spec\.ts$/,
   // HOST-STATS (host-pressure-pane plan, Task 10) — Host Stats pane smoke:
   // picker create, verdict strip/CPU tile, refresh interaction (Collecting
