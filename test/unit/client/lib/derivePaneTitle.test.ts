@@ -18,6 +18,36 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Browser')
   })
 
+  it('titles raw-file viewer panes by the file basename', () => {
+    expect(
+      derivePaneTitle({
+        kind: 'browser',
+        browserInstanceId: 'b1',
+        url: '/api/files/raw?path=%2Ftmp%2Fshot.png',
+        devToolsOpen: false,
+      }),
+    ).toBe('shot.png')
+    expect(
+      derivePaneTitle({
+        kind: 'browser',
+        browserInstanceId: 'b2',
+        url: '/local-file?path=%2Fhome%2Fdan%2Flogo.svg',
+        devToolsOpen: false,
+      }),
+    ).toBe('logo.svg')
+  })
+
+  it('keeps hostname titles for ordinary web URLs', () => {
+    expect(
+      derivePaneTitle({
+        kind: 'browser',
+        browserInstanceId: 'b3',
+        url: 'https://example.com/docs',
+        devToolsOpen: false,
+      }),
+    ).toBe('example.com')
+  })
+
   it('returns "Shell" for shell mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
