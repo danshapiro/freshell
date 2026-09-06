@@ -33,6 +33,7 @@ fn sample_record(ownership_id: &str) -> CodexSidecarRecord {
         created_at: 1_700_000_000_000,
         updated_at: 1_700_000_000_001,
         state: SidecarRecordState::Active,
+        lane: None,
     }
 }
 
@@ -72,6 +73,36 @@ fn record_roundtrips_through_disk() {
     let mut loaded = store.load_all();
     loaded.sort_by(|a, b| a.ownership_id.cmp(&b.ownership_id));
     assert_eq!(loaded, vec![active, retained]);
+}
+
+#[test]
+fn lane_field_roundtrips_and_legacy_rows_decode_with_lane_none() {
+    let legacy = serde_json::json!({
+        "recordVersion": 1,
+        "ownershipId": "codex-sidecar-legacy",
+        "pid": 424242,
+        "starttime": 123456789,
+        "cmdline": ["codex", "app-server", "--listen", "ws://127.0.0.1:9"],
+        "wsUrl": "ws://127.0.0.1:9",
+        "serverInstanceId": "srv-prev",
+        "createdAt": 1,
+        "updatedAt": 1,
+        "state": { "kind": "active" },
+    });
+    let record: CodexSidecarRecord = serde_json::from_value(legacy).expect("legacy row decodes");
+    assert_eq!(
+        record.lane, None,
+        "rows written before the lane field decode as terminal-pane"
+    );
+
+    let with_lane = CodexSidecarRecord {
+        lane: Some(SidecarLane::FreshAgent),
+        ..record
+    };
+    let json = serde_json::to_string(&with_lane).expect("serialize");
+    assert!(json.contains("\"lane\":\"freshAgent\""));
+    let back: CodexSidecarRecord = serde_json::from_str(&json).expect("roundtrip");
+    assert_eq!(back.lane, Some(SidecarLane::FreshAgent));
 }
 
 #[test]
