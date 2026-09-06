@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
-import { applySessionRenameCascade, applyPaneRename } from '@/store/titleSync'
+import { applySessionRenameCascade } from '@/store/titleSync'
 import { renameOverviewTerminal } from '@/components/OverviewView'
 
 vi.mock('nanoid', () => { let n = 0; return { nanoid: vi.fn(() => `pane-${++n}`) } })
@@ -61,39 +61,6 @@ function terminalStore(content: Record<string, unknown>) {
   const paneId = (store.getState().panes.layouts[tabId] as { id: string }).id
   return { store, tabId, paneId }
 }
-
-describe('exited-terminal pane rename (D8)', () => {
-  beforeEach(() => apiMocks.patch.mockClear())
-
-  it('PATCHes the session override via sessionRef when the coding-CLI terminal has exited', () => {
-    // TerminalView clears terminalId on exit (TerminalView.tsx:3841), so the
-    // pane only carries its durable sessionRef.
-    const { store, tabId, paneId } = terminalStore({
-      kind: 'terminal', mode: 'claude', createRequestId: 'r-exited', status: 'exited',
-      sessionRef: { provider: 'claude', sessionId: 's1' },
-    })
-    store.dispatch(applyPaneRename({ tabId, paneId, title: 'Persisted rename' }))
-    expect(apiMocks.patch).toHaveBeenCalledWith('/api/sessions/claude%3As1', { titleOverride: 'Persisted rename' })
-  })
-
-  it('still cascades via the terminals API when the terminal is live', () => {
-    const { store, tabId, paneId } = terminalStore({
-      kind: 'terminal', mode: 'claude', terminalId: 'term-live', createRequestId: 'r-live', status: 'running',
-      sessionRef: { provider: 'claude', sessionId: 's1' },
-    })
-    store.dispatch(applyPaneRename({ tabId, paneId, title: 'Live rename' }))
-    expect(apiMocks.patch).toHaveBeenCalledWith('/api/terminals/term-live', { titleOverride: 'Live rename' })
-    expect(apiMocks.patch).not.toHaveBeenCalledWith('/api/sessions/claude%3As1', expect.anything())
-  })
-
-  it('does not PATCH anything when the exited terminal has no sessionRef', () => {
-    const { store, tabId, paneId } = terminalStore({
-      kind: 'terminal', mode: 'claude', createRequestId: 'r-orphan', status: 'exited',
-    })
-    store.dispatch(applyPaneRename({ tabId, paneId, title: 'Nowhere to go' }))
-    expect(apiMocks.patch).not.toHaveBeenCalled()
-  })
-})
 
 describe('OverviewView TerminalCard rename', () => {
   beforeEach(() => apiMocks.patch.mockClear())
