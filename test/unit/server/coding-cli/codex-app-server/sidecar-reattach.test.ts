@@ -154,12 +154,16 @@ async function spawnSurvivingFixture(input: {
   metadataDir: string
   loadedThreadIds: string[]
   claimKey: string
+  delayMethodsMs?: Record<string, number>
 }): Promise<{ ready: ReadyState; held: HeldCodexSidecarOwnership }> {
   const owner = createRuntime({
     metadataDir: input.metadataDir,
     serverInstanceId: 'srv-previous',
     env: {
-      FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ loadedThreadIds: input.loadedThreadIds }),
+      FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+        loadedThreadIds: input.loadedThreadIds,
+        ...(input.delayMethodsMs ? { delayMethodsMs: input.delayMethodsMs } : {}),
+      }),
     },
   })
   const ready = await owner.ensureReady()
@@ -319,6 +323,47 @@ describeWithLinuxProc('CodexAppServerRuntime.attachToSurvivingSidecar', () => {
     expect(record.ownerServerPid).toBe(999_999_999)
     expect(record.updatedAt).toBe(held.metadata.updatedAt)
     expect(attachRuntime.status()).toBe('stopped')
+  })
+
+  it('fails at ~the SINGLE shared deadline when both probes answer slowly, never ~two stacked budgets', async () => {
+    // M1 pin (runtime.ts withProbeBudget + `probeDeadlineMs - Date.now()` handoff): each probe
+    // races only the REMAINING slice of one shared deadline. With per-probe stacked budgets the
+    // attaches below would either take ~2x the budget or SUCCEED — both fail these assertions.
+    const delayCases: Array<Record<string, number>> = [
+      // initialize consumes ~2.5s of the 3s deadline; the list probe's ~0.5s remainder expires
+      // against a 2.5s fixture delay.
+      { initialize: 2_500, 'thread/loaded/list': 2_500 },
+      // Symmetric: the list WOULD answer (~3.5s) inside a fresh stacked second budget; the shared
+      // deadline must cut it off at ~3s because initialize alone ate nearly the whole budget.
+      { initialize: 2_500, 'thread/loaded/list': 1_000 },
+    ]
+
+    for (const delayMethodsMs of delayCases) {
+      const metadataDir = await makeTempDir()
+      const { ready: survivorReady, held } = await spawnSurvivingFixture({
+        metadataDir,
+        loadedThreadIds: ['thr-slow'],
+        claimKey: 'thr-slow',
+        delayMethodsMs,
+      })
+      const attachRuntime = createRuntime({ metadataDir, serverInstanceId: 'srv-current' })
+
+      const startedAt = Date.now()
+      const error = await attachRuntime.attachToSurvivingSidecar(held, { sessionId: 'thr-slow' })
+        .catch((caught: unknown) => caught)
+      const elapsedMs = Date.now() - startedAt
+
+      expect(getCodexSurvivorAttachErrorCode(error)).toBe('codex_survivor_unreachable')
+      // The deadline governed: the attach ran to ≈ CODEX_REATTACH_PROBE_BUDGET_MS total …
+      expect(elapsedMs).toBeGreaterThanOrEqual(CODEX_REATTACH_PROBE_BUDGET_MS * 0.9)
+      // … and did NOT take two stacked budgets (~6s) — same 1.5x real-clock tolerance as test 3.
+      expect(elapsedMs).toBeLessThan(CODEX_REATTACH_PROBE_BUDGET_MS * 1.5)
+      // N1: the timeout message names both the expired remaining slice and the CONFIGURED total.
+      expect((error as Error).message).toContain(`of the ${CODEX_REATTACH_PROBE_BUDGET_MS}ms reattach probe budget`)
+      // The survivor is never signaled even when its probes time out.
+      expect(await isProcessGroupAlive(survivorReady.processGroupId)).toBe(true)
+      expect(attachRuntime.status()).toBe('stopped')
+    }
   })
 
   it('keeps a reachable survivor that is not the thread writer, without retitling its record', async () => {

@@ -1489,11 +1489,11 @@ function codexSurvivorAttachError(code: CodexSurvivorAttachErrorCode, message: s
 // Races one probe against the REMAINING share of the attach deadline: each probe call in
 // `attachToSurvivingSidecar` is handed `probeDeadlineMs - Date.now()`, never a fresh full
 // budget, so initialize + thread/loaded/list together stay inside one ~3s deadline.
-async function withProbeBudget<T>(label: string, promise: Promise<T>, budgetMs: number): Promise<T> {
+async function withProbeBudget<T>(label: string, promise: Promise<T>, budgetMs: number, totalBudgetMs: number = budgetMs): Promise<T> {
   return await Promise.race([
     promise,
     sleep(budgetMs).then(() => {
-      throw codexSurvivorAttachError('codex_survivor_unreachable', `${label} exceeded the ${budgetMs}ms reattach probe budget`)
+      throw codexSurvivorAttachError('codex_survivor_unreachable', `${label} did not finish within its remaining ${budgetMs}ms slice of the ${totalBudgetMs}ms reattach probe budget`)
     }),
   ])
 }
@@ -1630,8 +1630,8 @@ export class CodexAppServerRuntime {
     this.client = client
     let initialized: CodexInitializeResult
     try {
-      initialized = await withProbeBudget('survivor initialize', client.initialize(), probeDeadlineMs - Date.now())
-      const loaded = await withProbeBudget('survivor thread/loaded/list', client.listLoadedThreads(), Math.max(0, probeDeadlineMs - Date.now()))
+      initialized = await withProbeBudget('survivor initialize', client.initialize(), probeDeadlineMs - Date.now(), budgetMs)
+      const loaded = await withProbeBudget('survivor thread/loaded/list', client.listLoadedThreads(), Math.max(0, probeDeadlineMs - Date.now()), budgetMs)
       if (!loaded.includes(options.sessionId)) {
         // Reachable but not the writer for this claim key: keep the survivor alive — it may be
         // the writer of another key's thread.
