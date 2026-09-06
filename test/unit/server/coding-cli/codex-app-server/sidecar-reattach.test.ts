@@ -9,10 +9,14 @@ import {
   CODEX_REATTACH_PROBE_BUDGET_MS,
   CodexAppServerRuntime,
   getCodexSurvivorAttachErrorCode,
+  runCodexStartupReaper,
   type CodexSidecarOwnershipMetadata,
   type HeldCodexSidecarOwnership,
   type ReadyState,
 } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
+import { CodexAppServerClient } from '../../../../../server/coding-cli/codex-app-server/client.js'
+import { CodexLaunchPlanner } from '../../../../../server/coding-cli/codex-app-server/launch-planner.js'
+import { CodexRemoteProxy } from '../../../../../server/coding-cli/codex-app-server/remote-proxy.js'
 import {
   CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS,
   CodexSidecarReconciler,
@@ -34,6 +38,10 @@ const WAIT_HELPER_TIMEOUT_MS = 15_000
 const runtimes = new Set<CodexAppServerRuntime>()
 const blockers = new Set<http.Server>()
 const tempDirs = new Set<string>()
+// TUI-role clients and remote proxies still tracked by the scenario tests. Both are idempotent
+// to close and safe to re-close after a mid-test failure, so they live in their own registries.
+const tuiClients = new Set<CodexAppServerClient>()
+const launchProxies = new Set<CodexRemoteProxy>()
 let fixtureCodexHome: string
 
 beforeEach(async () => {
@@ -46,6 +54,14 @@ async function closeBlocker(server: http.Server): Promise<void> {
 }
 
 afterEach(async () => {
+  await Promise.all([...tuiClients].map(async (client) => {
+    tuiClients.delete(client)
+    await client.close().catch(() => undefined)
+  }))
+  await Promise.all([...launchProxies].map(async (proxy) => {
+    launchProxies.delete(proxy)
+    await proxy.close().catch(() => undefined)
+  }))
   await Promise.all([...runtimes].map(async (runtime) => {
     runtimes.delete(runtime)
     await runtime.shutdown()
@@ -167,6 +183,7 @@ async function spawnSurvivingFixture(input: {
   loadedThreadIds: string[]
   claimKey: string
   delayMethodsMs?: Record<string, number>
+  appendThreadOperationLogPath?: string
 }): Promise<{ ready: ReadyState; held: HeldCodexSidecarOwnership }> {
   const owner = createRuntime({
     metadataDir: input.metadataDir,
@@ -175,6 +192,9 @@ async function spawnSurvivingFixture(input: {
       FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
         loadedThreadIds: input.loadedThreadIds,
         ...(input.delayMethodsMs ? { delayMethodsMs: input.delayMethodsMs } : {}),
+        ...(input.appendThreadOperationLogPath
+          ? { appendThreadOperationLogPath: input.appendThreadOperationLogPath }
+          : {}),
       }),
     },
   })
@@ -829,5 +849,235 @@ describe('resolveCodexSidecarReapGraceMs', () => {
     expect(log.warn).toHaveBeenCalledTimes(2)
     expect(resolveCodexSidecarReapGraceMs(String(Number.MAX_SAFE_INTEGER), log)).toBe(Number.MAX_SAFE_INTEGER)
     expect(log.warn).toHaveBeenCalledTimes(2)
+  })
+})
+
+// --- Task 5: three-scenario restore-reattach proof at the planner+runtime layer ---
+
+// A TUI-role client: what the codex TUI does against the plan's remote proxy (initialize, then
+// thread/resume). Tracked so a mid-test failure never leaks an open socket.
+function connectTuiClient(wsUrl: string): CodexAppServerClient {
+  const client = new CodexAppServerClient({ wsUrl })
+  tuiClients.add(client)
+  return client
+}
+
+// Planner proxyFactory that hands the REAL CodexRemoteProxy to the plan while keeping a handle
+// for afterEach cleanup (proxies listen on real loopback ports).
+function trackedProxyFactory(options: ConstructorParameters<typeof CodexRemoteProxy>[0]): CodexRemoteProxy {
+  const proxy = new CodexRemoteProxy(options)
+  launchProxies.add(proxy)
+  return proxy
+}
+
+type FixtureThreadOperation = {
+  method: string
+  threadId: string | null
+  listenUrl: string
+  at: string
+  params?: Record<string, unknown>
+}
+
+// The fixture appends one JSONL entry per served thread/* op, each stamped with the SERVING
+// sidecar's own --listen URL. An ENOENT log means the fixture received zero thread ops — that is
+// itself the readable "no resume ever landed here" signal (the negative-control run leans on it).
+async function readThreadOperationLog(logPath: string): Promise<FixtureThreadOperation[]> {
+  const raw = await fsp.readFile(logPath, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  })
+  return raw
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as FixtureThreadOperation)
+}
+
+describeWithLinuxProc('restore-reattach scenarios at the planner+runtime layer (kata 4g2a, da92 parity)', () => {
+  it('scenario 1: a resume-keyed restore claims the surviving sidecar and the TUI resume is served by it', async () => {
+    const metadataDir = await makeTempDir()
+    const logsDir = await makeTempDir()
+    const spawnCwd = await makeTempDir()
+    const logA = path.join(logsDir, 'fixture-a-thread-ops.jsonl')
+    const freshArgLog = path.join(logsDir, 'fresh-spawn-argv.json')
+    const freshOpLog = path.join(logsDir, 'fresh-spawn-thread-ops.jsonl')
+
+    // Unclean-death stand-in: fixture A survives with an authentic record retitled to a dead
+    // owner from a previous server generation, carrying the thr-A claim key.
+    const { ready: survivorReady } = await spawnSurvivingFixture({
+      metadataDir,
+      loadedThreadIds: ['thr-A'],
+      claimKey: 'thr-A',
+      appendThreadOperationLogPath: logA,
+    })
+    const survivorStartTimeTicks = (await readWrapperIdentityForTest(survivorReady.processPid)).startTimeTicks
+
+    // Boot reconcile: A is HELD claimable (the pre-feature reaper would have killed it here).
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    const boot = await runCodexStartupReaper({
+      serverInstanceId: 'srv-current',
+      metadataDir,
+      holdReconciler: reconciler,
+    })
+    expect(boot.heldOwnershipIds).toEqual([survivorReady.ownershipId])
+    expect(await isProcessGroupAlive(survivorReady.processGroupId)).toBe(true)
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 1, inFlightClaims: 0 })
+
+    // Same wiring the server's restore path takes (serverInstanceId/current); the env below is
+    // only ever consumed if the claim silently fails and a fresh spawn runs instead.
+    const planner = new CodexLaunchPlanner(() => createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          loadedThreadIds: ['thr-A'],
+          appendThreadOperationLogPath: freshOpLog,
+        }),
+        FAKE_CODEX_APP_SERVER_ARG_LOG: freshArgLog,
+      },
+    }), {
+      reconciler,
+      proxyFactory: trackedProxyFactory,
+    })
+
+    const plan = await planner.planCreate({ cwd: spawnCwd, resumeSessionId: 'thr-A' })
+    expect(plan.sessionId).toBe('thr-A')
+
+    // Play the TUI through the plan's remote proxy.
+    const tui = connectTuiClient(plan.remote.wsUrl)
+    await tui.initialize()
+    const resume = await tui.resumeThread({ threadId: 'thr-A' })
+    expect(resume.threadId).toBe('thr-A')
+
+    // Decisive reattach evidence: A's op log records the resume, stamped with A's OWN listener —
+    // the request was served by the surviving sidecar, not by a fresh incarnation.
+    const opsA = await readThreadOperationLog(logA)
+    expect(opsA.filter((op) => op.method === 'thread/loaded/list').map((op) => op.listenUrl))
+      .toEqual([survivorReady.wsUrl])
+    const resumes = opsA.filter((op) => op.method === 'thread/resume')
+    expect(resumes).toHaveLength(1)
+    expect(resumes[0]).toMatchObject({ threadId: 'thr-A', listenUrl: survivorReady.wsUrl })
+
+    // No fresh spawn ever ran: the claim path minted a runtime but never spawned through it.
+    await expect(fsp.stat(freshArgLog)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readThreadOperationLog(freshOpLog)).toEqual([])
+
+    // A is alive in the SAME incarnation (identical /proc start time — pid-reuse is excluded).
+    process.kill(survivorReady.processPid, 0)
+    expect((await readWrapperIdentityForTest(survivorReady.processPid)).startTimeTicks)
+      .toBe(survivorStartTimeTicks)
+
+    // adopt() retitles the record to the new terminal identity of this server generation.
+    await plan.sidecar.adopt({ terminalId: 't-1', generation: 0 })
+    const retitled = JSON.parse(await fsp.readFile(survivorReady.metadataPath, 'utf8'))
+    expect(retitled.terminalId).toBe('t-1')
+    expect(retitled.generation).toBe(0)
+    expect(retitled.ownerServerPid).toBe(process.pid)
+
+    // The claim was one-shot: thr-A has nothing left to claim.
+    expect(reconciler.claimForSession('thr-A')).toBeNull()
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+
+    await plan.sidecar.shutdown()
+  })
+
+  it('scenario 2: an empty survivor store falls back to a byte-compatible fresh spawn', async () => {
+    const metadataDir = await makeTempDir()
+    const logsDir = await makeTempDir()
+    const spawnCwd = await makeTempDir()
+    const logB = path.join(logsDir, 'fixture-b-thread-ops.jsonl')
+    const argLogB = path.join(logsDir, 'fixture-b-argv.json')
+
+    // Same wiring as scenario 1 but the store holds nothing: claimForSession returns null and the
+    // planner takes the pre-feature spawn path unchanged.
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    const planner = new CodexLaunchPlanner(() => createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          loadedThreadIds: ['thr-B'],
+          appendThreadOperationLogPath: logB,
+        }),
+        FAKE_CODEX_APP_SERVER_ARG_LOG: argLogB,
+      },
+    }), {
+      reconciler,
+      proxyFactory: trackedProxyFactory,
+    })
+
+    const plan = await planner.planCreate({ cwd: spawnCwd, resumeSessionId: 'thr-B' })
+    expect(plan.sessionId).toBe('thr-B')
+
+    const tui = connectTuiClient(plan.remote.wsUrl)
+    await tui.initialize()
+    const resume = await tui.resumeThread({ threadId: 'thr-B' })
+    expect(resume.threadId).toBe('thr-B')
+
+    // A fresh ownership record materialized with the Task-1 session stamp, owned by THIS server.
+    const recordFiles = (await fsp.readdir(metadataDir)).filter((entry) => entry.endsWith('.json'))
+    expect(recordFiles).toHaveLength(1)
+    const record = JSON.parse(
+      await fsp.readFile(path.join(metadataDir, recordFiles[0]), 'utf8'),
+    ) as CodexSidecarOwnershipMetadata
+    expect(record.sessionId).toBe('thr-B')
+    expect(record.ownerServerPid).toBe(process.pid)
+
+    // The fresh spawn itself served the resume (its own listener, matching its record).
+    const opsB = await readThreadOperationLog(logB)
+    const resumes = opsB.filter((op) => op.method === 'thread/resume')
+    expect(resumes).toHaveLength(1)
+    expect(resumes[0]).toMatchObject({ threadId: 'thr-B', listenUrl: record.wsUrl })
+
+    // Spawn argv integrity: the managed remote config args and `app-server --listen` shape are
+    // byte-identical to the pre-feature spawn path.
+    const argLog = JSON.parse(await fsp.readFile(argLogB, 'utf8')) as { argv: string[] }
+    const listenIndex = argLog.argv.indexOf('--listen')
+    expect(argLog.argv).toContain('-c')
+    expect(argLog.argv).toContain('features.apps=false')
+    expect(argLog.argv).toContain('app-server')
+    expect(listenIndex).toBeGreaterThanOrEqual(0)
+    expect(argLog.argv[listenIndex + 1]).toBe(record.wsUrl)
+
+    await plan.sidecar.shutdown()
+  })
+
+  it('scenario 3: the active-writer -32600 collision stays confined to the fresh-spawn path', async () => {
+    const metadataDir = await makeTempDir()
+    const spawnCwd = await makeTempDir()
+
+    // Fixture C stands in for a SECOND sidecar that adopted the thread: its scripted override is
+    // the exact -32600 the real app-server returns when a thread already has an active writer.
+    // Together with scenario 1 this pins the da92 asymmetry: the SAME resume succeeds against a
+    // claimed survivor and is rejected only on the fresh path.
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    const planner = new CodexLaunchPlanner(() => createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          overrides: {
+            'thread/resume': {
+              error: { code: -32600, message: 'thread already has an active writer' },
+            },
+          },
+        }),
+      },
+    }), {
+      reconciler,
+      proxyFactory: trackedProxyFactory,
+    })
+
+    const plan = await planner.planCreate({ cwd: spawnCwd, resumeSessionId: 'thr-C' })
+    expect(plan.sessionId).toBe('thr-C')
+
+    const tui = connectTuiClient(plan.remote.wsUrl)
+    await tui.initialize()
+    const error = await tui.resumeThread({ threadId: 'thr-C' }).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as { code?: unknown }).code).toBe(-32600)
+    expect((error as Error).message).toContain('thread already has an active writer')
+
+    await plan.sidecar.shutdown()
   })
 })
