@@ -41,7 +41,7 @@ import type { PermissionUpdate, PermissionResult } from '@anthropic-ai/claude-ag
 import type { ContentBlock, Usage } from '../shared/ws-protocol.js'
 import type { FreshAgentSessionCommand } from '../shared/fresh-agent-contract.js'
 
-export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
+export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'stuck'
 export type SdkRestoreFailureCode =
   | 'RESTORE_NOT_FOUND'
   | 'RESTORE_UNAVAILABLE'

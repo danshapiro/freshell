@@ -26,6 +26,7 @@ import {
 } from './normalize.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
+import { hashForLogs, recordFreshAgentObservabilityEvent } from '../../observability.js'
 
 type CodexThreadLifecycleEvent =
   | {
@@ -68,6 +69,9 @@ type CodexRuntimePort = {
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
   onTurnCompleted?: (
     handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void,
+  ) => () => void
+  onTurnStarted?: (
+    handler: (event: { threadId: string; turnId?: string }) => void,
   ) => () => void
   onExit?: (
     handler: (error?: Error, source?: 'app_server_exit' | 'app_server_client_disconnect') => void,
@@ -115,6 +119,18 @@ const DISPLAY_CURSOR_PREFIX = 'codex-cursor:v1:'
 const DISPLAY_CURSOR_TTL_MS = 5 * 60 * 1000
 const DISPLAY_CURSOR_MAX_ENTRIES = 512
 const SUBMITTED_INPUT_TTL_MS = 30 * 60 * 1000
+
+// Wedged-sidecar quiet-window bound. This is a turn-scale timeout (mirrors
+// freshopencode's DEFAULT_TURN_TIMEOUT_MS), not the 120 s terminal-lane
+// deadman: a healthy fresh-agent turn has no per-second activity requirement.
+export const DEFAULT_FRESHCODEX_QUIET_WINDOW_MS = 600_000
+
+function resolveQuietWindowMs(explicit?: number): number {
+  if (typeof explicit === 'number' && Number.isFinite(explicit) && explicit > 0) return explicit
+  const raw = process.env.FRESHELL_FRESHCODEX_QUIET_WINDOW_MS
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_FRESHCODEX_QUIET_WINDOW_MS
+}
 
 function toCodexApprovalPolicy(value: string | undefined) {
   if (value === undefined) return undefined
@@ -287,12 +303,17 @@ export function createCodexFreshAgentAdapter(deps: {
   displayIdSecret: string
   runtime?: CodexRuntimePort
   runtimeFactory?: () => CodexRuntimePort
+  quietWindowMs?: number
 }): FreshAgentRuntimeAdapter {
   if (typeof deps.displayIdSecret !== 'string' || deps.displayIdSecret.trim().length === 0) {
     throw new Error('Codex fresh-agent adapter requires a persisted display-id secret.')
   }
   const displayIdSecret = deps.displayIdSecret
   const activeTurnByThread = new Map<string, string>()
+  const quietWindowMs = resolveQuietWindowMs(deps.quietWindowMs)
+  const quietTimerByThread = new Map<string, NodeJS.Timeout>()
+  const stuckSinceByThread = new Map<string, number>()
+  const deadmanListenersByThread = new Map<string, Set<(message: unknown) => void>>()
   // Per-thread (not per-subscription) so the monotonic turn-complete clamp survives a WS
   // reconnect, matching how Claude/OpenCode keep it on session state.
   const lastTurnCompleteAtByThread = new Map<string, number>()
@@ -692,6 +713,88 @@ export function createCodexFreshAgentAdapter(deps: {
     }
   }
 
+  // ── Wedged-sidecar quiet-window deadman ──────────────────────────────────
+  // A wedged-but-alive sidecar (process running, no events, no exit) must not
+  // leave the pane asserting "working" forever: after quietWindowMs with a
+  // turn in flight and zero lane-visible push events, flag the thread stuck
+  // and fan out a 'stuck' status. The deadman NEVER fabricates a completion —
+  // no sdk.turn.complete edge, no green/idle chime (repo policy for
+  // stuck-recovery paths). Only push notifications feed the window;
+  // request/response RPC traffic (snapshot polls) must never reset it.
+  const logDeadman = (
+    sessionId: string,
+    phase: 'armed' | 'fired' | 'resolved',
+    resolution?: 'activity' | 'turn_complete' | 'exit' | 'thread_closed' | 'kill' | 'shutdown',
+  ) => {
+    recordFreshAgentObservabilityEvent({
+      kind: 'fresh_agent_stuck_deadman',
+      provider: 'codex',
+      sessionIdHash: hashForLogs(sessionId),
+      phase,
+      resolution,
+      quietWindowMs,
+    })
+  }
+
+  const fireQuietWindow = (sessionId: string) => {
+    quietTimerByThread.delete(sessionId)
+    if (!activeTurnByThread.has(sessionId)) return
+    if (stuckSinceByThread.has(sessionId)) return
+    stuckSinceByThread.set(sessionId, Date.now())
+    logDeadman(sessionId, 'fired')
+    const listeners = deadmanListenersByThread.get(sessionId)
+    if (!listeners) return
+    for (const listener of listeners) {
+      listener({ type: 'sdk.status', sessionId, status: 'stuck' })
+    }
+  }
+
+  /** Reset semantics: genuine push activity restarts the window. */
+  const feedQuietWindow = (sessionId: string) => {
+    const existing = quietTimerByThread.get(sessionId)
+    if (existing) clearTimeout(existing)
+    if (stuckSinceByThread.has(sessionId)) {
+      stuckSinceByThread.delete(sessionId)
+      logDeadman(sessionId, 'resolved', 'activity')
+    }
+    if (!activeTurnByThread.has(sessionId)) {
+      quietTimerByThread.delete(sessionId)
+      return
+    }
+    if (!existing) logDeadman(sessionId, 'armed')
+    const timer = setTimeout(() => fireQuietWindow(sessionId), quietWindowMs)
+    timer.unref?.()
+    quietTimerByThread.set(sessionId, timer)
+  }
+
+  /** Arm-if-absent semantics: snapshot observation never starves the deadman. */
+  const armQuietWindowIfAbsent = (sessionId: string) => {
+    if (quietTimerByThread.has(sessionId)) return
+    // Already fired: stuck truth resolves on push activity (or kill/shutdown)
+    // only — a snapshot poll must not feed the window and clear the flag.
+    if (stuckSinceByThread.has(sessionId)) return
+    if (!activeTurnByThread.has(sessionId)) return
+    feedQuietWindow(sessionId)
+  }
+
+  const disarmQuietWindow = (
+    sessionId: string,
+    reason: 'activity' | 'turn_complete' | 'exit' | 'thread_closed' | 'kill' | 'shutdown',
+  ) => {
+    const timer = quietTimerByThread.get(sessionId)
+    if (timer) clearTimeout(timer)
+    quietTimerByThread.delete(sessionId)
+    if (stuckSinceByThread.delete(sessionId)) {
+      logDeadman(sessionId, 'resolved', reason)
+    }
+  }
+
+  /** Snapshot status overlay: stuck truth only overrides an in-flight status. */
+  const withStuckOverlay = (sessionId: string, rawStatus: string): string =>
+    stuckSinceByThread.has(sessionId) && (rawStatus === 'running' || rawStatus === 'starting')
+      ? 'stuck'
+      : rawStatus
+
   const rememberThreadSettings = (
     threadId: string,
     settings?: Partial<FreshAgentCreateRequest>,
@@ -878,15 +981,25 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!runtime.onThreadLifecycle) {
         throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
       }
+      const deadmanListeners = deadmanListenersByThread.get(sessionId) ?? new Set<(message: unknown) => void>()
+      deadmanListeners.add(listener)
+      deadmanListenersByThread.set(sessionId, deadmanListeners)
+      const offTurnStarted = runtime.onTurnStarted?.((event) => {
+        if (event.threadId !== sessionId) return
+        feedQuietWindow(sessionId)
+      })
+      armQuietWindowIfAbsent(sessionId)
       const offLifecycle = runtime.onThreadLifecycle((event) => {
         if (event.kind === 'thread_started') {
           if (event.thread.id !== sessionId) return
+          feedQuietWindow(sessionId)
           listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
           return
         }
         if (event.kind === 'thread_closed') {
           if (event.threadId !== sessionId) return
           clearThreadState(sessionId)
+          disarmQuietWindow(sessionId, 'thread_closed')
           void releaseRuntime(sessionId).catch(() => undefined)
           listener({
             type: 'sdk.status',
@@ -899,6 +1012,9 @@ export function createCodexFreshAgentAdapter(deps: {
         const status = normalizeCodexThreadStatus(event.status)
         if (status !== 'running' && status !== 'starting') {
           activeTurnByThread.delete(sessionId)
+          disarmQuietWindow(sessionId, 'activity') // logs resolved only when stuck
+        } else {
+          feedQuietWindow(sessionId)
         }
         listener(makeCodexStatusEvent(sessionId, event.status))
       })
@@ -911,6 +1027,7 @@ export function createCodexFreshAgentAdapter(deps: {
       const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
         if (event.threadId !== sessionId) return
         activeTurnByThread.delete(sessionId)
+        disarmQuietWindow(sessionId, 'turn_complete')
         listener(makeCodexStatusEvent(sessionId, 'idle'))
 
         // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
@@ -942,6 +1059,7 @@ export function createCodexFreshAgentAdapter(deps: {
         // ensureReady(), and this subscription's handlers (bound to the same runtime object)
         // keep delivering events. Just emit the terminal status to clear BLUE (no chime; a
         // crash is not a positive completion).
+        disarmQuietWindow(sessionId, 'exit')
         listener({ type: 'sdk.status', sessionId, status: 'exited' })
       })
 
@@ -949,6 +1067,14 @@ export function createCodexFreshAgentAdapter(deps: {
         offLifecycle()
         offTurnCompleted?.()
         offExit?.()
+        offTurnStarted?.()
+        const deadmanListeners = deadmanListenersByThread.get(sessionId)
+        deadmanListeners?.delete(listener)
+        if (deadmanListeners && deadmanListeners.size === 0) {
+          deadmanListenersByThread.delete(sessionId)
+        }
+        // The quiet timer itself intentionally survives unsubscribe — the
+        // snapshot truth stays warm for the next attach.
       }
     },
 
@@ -978,6 +1104,7 @@ export function createCodexFreshAgentAdapter(deps: {
         effort: toCodexReasoningEffort(settings.effort),
       })
       activeTurnByThread.set(sessionId, turn.turnId)
+      feedQuietWindow(sessionId) // a fresh turn resets the window
       const submittedTurnId = createCodexDisplayId({
         secret: displayIdSecret,
         threadId: sessionId,
@@ -1048,6 +1175,7 @@ export function createCodexFreshAgentAdapter(deps: {
         effort: toCodexReasoningEffort(settings?.effort),
       })
       activeTurnByThread.set(sessionId, turn.turnId)
+      feedQuietWindow(sessionId)
     },
 
     async fork(sessionId, input) {
@@ -1096,12 +1224,17 @@ export function createCodexFreshAgentAdapter(deps: {
       const rawThreadTurns: unknown[] = Array.isArray(rawSnapshot.thread?.turns)
         ? rawSnapshot.thread.turns
         : []
+      const rawStatus = normalizeCodexThreadStatus(rawSnapshot.thread?.status)
       const activeTurnId = findActiveTurnId(rawSnapshot)
       if (activeTurnId) {
         activeTurnByThread.set(thread.threadId, activeTurnId)
-      } else if (normalizeCodexThreadStatus(rawSnapshot.thread?.status) !== 'running') {
+      } else if (rawStatus !== 'running') {
         activeTurnByThread.delete(thread.threadId)
       }
+      // Snapshot observation may ARM the deadman (attach-mid-turn re-seed) but
+      // must never RESET an existing timer — the client's busy snapshot polls
+      // would otherwise starve the deadman forever.
+      armQuietWindowIfAbsent(thread.threadId)
       const rawTurns = rawThreadTurns
         .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
       const revisionNumber = Number(rawSnapshot.thread?.updatedAt ?? revision ?? 0)
@@ -1113,7 +1246,7 @@ export function createCodexFreshAgentAdapter(deps: {
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: revisionNumber,
-        status: normalizeCodexThreadStatus(rawSnapshot.thread?.status),
+        status: withStuckOverlay(thread.threadId, rawStatus),
         transcript: {
           turns,
         },
@@ -1212,6 +1345,7 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async kill(sessionId) {
+      disarmQuietWindow(sessionId, 'kill')
       clearThreadState(sessionId)
       runtimeResumeGenerationByThread.set(sessionId, (runtimeResumeGenerationByThread.get(sessionId) ?? 0) + 1)
       runtimeResumeByThread.delete(sessionId)
@@ -1220,6 +1354,10 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async shutdown() {
+      for (const sessionId of new Set([...quietTimerByThread.keys(), ...stuckSinceByThread.keys()])) {
+        disarmQuietWindow(sessionId, 'shutdown')
+      }
+      deadmanListenersByThread.clear()
       const runtimes = [...ownedRuntimes]
       ownedRuntimes.clear()
       runtimeByThread.clear()

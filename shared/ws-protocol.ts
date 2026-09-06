@@ -1106,7 +1106,7 @@ export type CodingCliWsMessage =
 
 // -- Fresh Agent server→client messages --
 
-export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
+export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'stuck'
 export type SdkRestoreFailureCode =
   | 'RESTORE_NOT_FOUND'
   | 'RESTORE_UNAVAILABLE'

@@ -125,6 +125,15 @@ export type FreshAgentObservabilityEvent =
     reason: string
     messageIdHash?: string
   }
+  | {
+    kind: 'fresh_agent_stuck_deadman'
+    provider: 'codex'
+    sessionIdHash: string
+    threadIdHash?: string
+    phase: 'armed' | 'fired' | 'resolved'
+    resolution?: 'activity' | 'turn_complete' | 'exit' | 'thread_closed' | 'kill' | 'shutdown'
+    quietWindowMs: number
+  }
 
 type FreshAgentObservabilitySink = Pick<typeof freshAgentObservabilityLogger, 'info' | 'warn'>
 
@@ -153,6 +162,7 @@ function isWarnEvent(event: FreshAgentObservabilityEvent): boolean {
   if (WARN_KINDS.has(event.kind)) return true
   if (event.kind === 'fresh_agent_sidecar') return event.phase !== 'started'
   if (event.kind === 'fresh_agent_monitor') return event.phase === 'timeout' || event.phase === 'sidecar_lost'
+  if (event.kind === 'fresh_agent_stuck_deadman') return event.phase === 'fired'
   return false
 }
 
