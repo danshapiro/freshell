@@ -29,6 +29,8 @@ import {
   resolveEffectiveFreshAgentModel,
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
+import { freshAgentDialogFooterCopy } from '@/lib/fresh-agent-setting-scopes'
+import type { FreshAgentSettingScopes } from '@shared/fresh-agent-contract'
 import type {
   FreshAgentModelCapabilities,
   FreshAgentModelCapabilitiesResponse,
@@ -82,6 +84,7 @@ export function FreshAgentModelDialog({
   tabId,
   paneId,
   paneContent,
+  settingScopes,
 }: {
   open: boolean
   onClose: () => void
@@ -89,6 +92,10 @@ export function FreshAgentModelDialog({
   tabId: string
   paneId: string
   paneContent: FreshAgentPaneContent
+  /** Server-advertised per-knob scopes (capabilities.settingScopes). Absent —
+   * older servers, pre-create panes, failed fetches — falls back to the legacy
+   * per-send footer copy. */
+  settingScopes?: FreshAgentSettingScopes
 }) {
   const dispatch = useAppDispatch()
   const sessionType = paneContent.sessionType
@@ -553,7 +560,7 @@ export function FreshAgentModelDialog({
         )}
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border p-3">
           <p className="mr-auto text-[11px] text-muted-foreground">
-            ↑↓ move · ←→ switch column · Enter = OK · Esc = cancel · applies from your next message · becomes your default
+            {freshAgentDialogFooterCopy(settingScopes)}
           </p>
           <button
             type="button"
