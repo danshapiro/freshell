@@ -64,8 +64,7 @@ use freshell_protocol::{
     FreshAgentAttach, FreshAgentCreateFailed, FreshAgentEvent, Pong, RuntimeDescriptor,
     ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel,
     TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalInputBlocked,
-    TerminalInputBlockedReason, TerminalKill,
-    TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
+    TerminalInputBlockedReason, TerminalKill, TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -835,7 +834,9 @@ async fn handle_client_text(
     if value.get("resumeSessionId").is_some() {
         // presence is what matters; the value is never read by the refusal
         match value.get("type").and_then(|t| t.as_str()) {
-            Some("terminal.create") | Some("codingcli.create") if !terminal_resume_ref_echo(&value) => {
+            Some("terminal.create") | Some("codingcli.create")
+                if !terminal_resume_ref_echo(&value) =>
+            {
                 let reply = ServerMessage::Error(ErrorMsg {
                     code: ErrorCode::InvalidMessage,
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
@@ -2819,12 +2820,13 @@ async fn handle_create_with_restart_launch(
             }
         },
     };
-    let effective_session_locator = fence_resume_session_id
-        .as_ref()
-        .map(|session_id| SessionLocator {
-            provider: mode.clone(),
-            session_id: session_id.clone(),
-        });
+    let effective_session_locator =
+        fence_resume_session_id
+            .as_ref()
+            .map(|session_id| SessionLocator {
+                provider: mode.clone(),
+                session_id: session_id.clone(),
+            });
     // A coordinator-owned replacement reaches this helper with
     // `restart_launch` while `RestartCoordinator::execute` already holds the
     // same session mutex. Re-acquiring here would self-deadlock. Every

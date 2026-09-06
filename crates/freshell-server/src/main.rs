@@ -1136,12 +1136,16 @@ async fn main() -> ExitCode {
     ));
     {
         let recovery_broadcast_tx = Arc::clone(&broadcast_tx);
-        complete_restart_boot_recovery(session_index.clone(), restart.clone(), move |message| {
-            if let Ok(frame) = serde_json::to_string(message) {
-                let _ = recovery_broadcast_tx.send(frame);
-            }
-        })
-        .await
+        let _boot_recovery_report = complete_restart_boot_recovery(
+            session_index.clone(),
+            restart.clone(),
+            move |message| {
+                if let Ok(frame) = serde_json::to_string(message) {
+                    let _ = recovery_broadcast_tx.send(frame);
+                }
+            },
+        )
+        .await;
     };
     // Always-on recovery driver (fix 2): runs for the process lifetime, parks
     // on the coordinator's recovery Notify, and is woken the moment any

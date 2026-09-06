@@ -3207,6 +3207,7 @@ pub async fn run_restart_recovery_driver<F>(
     let recovery_notify = restart.recovery_notify_handle();
     let mut emit = Some(emit);
     let mut backoff = RECOVERY_RETRY_INITIAL;
+    let mut attempt: u32 = 0;
     loop {
         if shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -3263,9 +3264,18 @@ pub async fn run_restart_recovery_driver<F>(
             run_recovery_pass(&restart, |_message: &ServerMessage| {}, pending).await
         };
         backoff = if progressed {
+            attempt = 0;
             RECOVERY_RETRY_INITIAL
         } else {
-            backoff.saturating_mul(2).min(RECOVERY_RETRY_MAX)
+            attempt = attempt.saturating_add(1);
+            let delay = backoff.saturating_mul(2).min(RECOVERY_RETRY_MAX);
+            tracing::info!(
+                attempt,
+                delay_ms = delay.as_millis(),
+                pending,
+                "agent.restart.recovery_driver.retry_scheduled"
+            );
+            delay
         };
         tokio::select! {
             _ = &mut notified => {}
