@@ -13,6 +13,7 @@ import {
   __setFreshAgentObservabilitySinkForTest,
   hashForLogs,
 } from '../../../../server/fresh-agent/observability.js'
+import { freshAgentObservabilityLogger } from '../../../../server/logger.js'
 
 const DISPLAY_SECRET = 'task-3-persisted-display-secret'
 
@@ -1920,7 +1921,57 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       expect(phases).toContain('resolved')
       void listener
     } finally {
-      __setFreshAgentObservabilitySinkForTest({ info: () => {}, warn: () => {} })
+      // The module exposes a setter only, so restore its default explicitly:
+      // re-set the real logger the sink was initialized with (observability.ts).
+      __setFreshAgentObservabilitySinkForTest(freshAgentObservabilityLogger)
+      vi.useRealTimers()
+    }
+  })
+
+  it('self-clears the stuck flag when push activity resumes mid-turn (resolved: activity)', async () => {
+    vi.useFakeTimers()
+    const infoSpy = vi.fn()
+    const warnSpy = vi.fn()
+    __setFreshAgentObservabilitySinkForTest({ info: infoSpy, warn: warnSpy })
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime({ type: 'active', activeFlags: ['turn-1'] })
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      const stuckCalls = () => listener.mock.calls.filter(([message]) => (message as any)?.status === 'stuck')
+      // The full quiet window elapses with the turn still in flight: stuck fires.
+      await vi.advanceTimersByTimeAsync(QUIET_MS + 1)
+      expect(stuckCalls()).toHaveLength(1)
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const stuckNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 7)
+      expect(stuckNow.status).toBe('stuck')
+      // Lane-visible push activity resumes while the turn is still running.
+      handlers.lifecycle?.({ kind: 'thread_status_changed', threadId: 'thread-1', status: { type: 'active', activeFlags: ['turn-1'] } })
+      // (a) No re-fire/duplicate stuck edge rides along with the resumed activity.
+      expect(stuckCalls()).toHaveLength(1)
+      // (b) The snapshot overlay is gone: provider truth is reported again.
+      const resumedNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 8)
+      expect(resumedNow.status).toBe('running')
+      // (c) The resolution was logged as activity-driven.
+      const resolutions = infoSpy.mock.calls
+        .map(([payload]) => payload as any)
+        .filter((payload) => payload.event === 'fresh_agent_stuck_deadman' && payload.phase === 'resolved')
+      expect(resolutions).toEqual([
+        expect.objectContaining({
+          resolution: 'activity',
+          sessionIdHash: hashForLogs('thread-1'),
+          quietWindowMs: QUIET_MS,
+        }),
+      ])
+      // The window re-armed: no premature re-fire at window − ε, and a further
+      // full window of silence fires exactly once more.
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 1)
+      expect(stuckCalls()).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(2)
+      expect(stuckCalls()).toHaveLength(2)
+    } finally {
+      // The module exposes a setter only, so restore its default explicitly:
+      // re-set the real logger the sink was initialized with (observability.ts).
+      __setFreshAgentObservabilitySinkForTest(freshAgentObservabilityLogger)
       vi.useRealTimers()
     }
   })
