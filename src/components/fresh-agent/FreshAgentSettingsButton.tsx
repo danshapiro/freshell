@@ -245,7 +245,8 @@ export function FreshAgentSettingsButton({
         if (!cancelled) setSettingScopes(undefined)
       })
     return () => { cancelled = true }
-  }, [open, paneContent, claudeSession])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sessionRef/sessionId/status/provider/sessionType are the ONLY paneContent fields the closure reads; narrowing avoids a refetch on every store-driven paneContent bump while open.
+  }, [open, paneContent.sessionId, paneContent.sessionRef?.sessionId, paneContent.sessionType, paneContent.provider, paneContent.status, claudeSession])
 
   useEffect(() => {
     if (!open) return
