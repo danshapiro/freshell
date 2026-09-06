@@ -2528,6 +2528,14 @@ impl FreshCodexState {
         // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
         drain_child_io(&mut child);
 
+        // wfah: durable tracking BEFORE the handshake — the record must exist
+        // even while this sidecar's 45s startup budget is still running, or an
+        // unclean server death would leave the child untracked.
+        if let Some(pid) = child.id() {
+            crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, &ws_url)
+                .await;
+        }
+
         let deadline = Instant::now() + SIDECAR_START_BUDGET;
 
         // Connect the WS as soon as the listener is up (the app-server binds it after startup).
@@ -2536,6 +2544,7 @@ impl FreshCodexState {
                 Ok(transport) => break Arc::new(transport),
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!(
                             "codex app-server exited before listening: {status}"
                         ));
@@ -2543,6 +2552,7 @@ impl FreshCodexState {
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server WS never came up: {err}"));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2563,6 +2573,7 @@ impl FreshCodexState {
                         client.close().await;
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server initialize failed: {err}"));
                     }
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -7740,9 +7751,10 @@ pub(crate) mod tests {
         )
     }
 
-    const ISOLATED_CODEX_ENV_KEYS: [&str; 5] = [
+    const ISOLATED_CODEX_ENV_KEYS: [&str; 6] = [
         "CODEX_HOME",
         "CODEX_CMD",
+        "FRESHELL_HOME",
         "FAKE_CODEX_APP_SERVER_BEHAVIOR",
         "FAKE_CODEX_APP_SERVER_ARG_LOG",
         "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
