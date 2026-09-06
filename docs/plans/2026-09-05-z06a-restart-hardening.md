@@ -62,7 +62,7 @@ Acceptance evidence required: red/green/refactor regression tests for every item
 
 **Interfaces:**
 - Consumes: existing `CodexKillRequest`, `spawn_exit_watcher` kill arm, `leases.clear_binding`, `RESTART_CONSUMER_JOIN_BUDGET` (codex.rs:103).
-- Produces: `CodexKillRequest { captured: oneshot::Sender<()>, defer_binding_release: bool }`; panic-safe fixture guard; green `codex::tests` module in-suite.
+- Produces: quarantine-membership-gated lease release in BOTH `spawn_exit_watcher` arms (kill arm + unrequested-exit arm; see LB-04 correction in Step 3); panic-safe fixture guard; green `codex::tests` module in-suite.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -74,9 +74,11 @@ async fn restart_quarantine_holds_lease_binding_until_retirement_completes() {
     let state = state();
     let (session_id, child_pid) = insert_fake_session(&state, "thread-restart-bind").await;
     // Claim a durable lease binding for the session, mirroring restart preflight.
+    // (Load-bearing note: the real claim type is `FreshSessionClaim`, not
+    // `ClaimOutcome`; mirror the exact call shape of codex.rs:5827-5837.)
     assert!(matches!(
         state.leases.claim(PROVIDER, &session_id, /* per claim API used at codex.rs:5827-5837 */),
-        crate::session_lease::ClaimOutcome::Acquired
+        crate::session_lease::FreshSessionClaim::Acquired
     ));
     // Begin retirement; the quarantine path sends CodexKillRequest to the watcher.
     let outcome = state.shutdown_for_restart_detailed(/* as existing test 5859 does */).await;
@@ -108,27 +110,13 @@ Expected: FAIL because the kill arm cleared the lease binding (`claim` returns `
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-```rust
-// codex.rs (~246)
-struct CodexKillRequest {
-    captured: oneshot::Sender<()>,
-    /// Restart-quarantine kills defer the durable lease release to the
-    /// retirement completion path (`continue_codex_restart_retirement`),
-    /// so a fast tree kill cannot invalidate a still-quarantined binding.
-    defer_binding_release: bool,
-}
-```
+**Load-bearing correction (LB-04): the kill-arm-only guard is insufficient.** The watcher has a SECOND release arm: the unrequested-exit (`child.wait()`) arm at codex.rs:4399-4423 runs a best-effort non-confirming `reap_owned_codex_sidecars` then unconditionally `leases.clear_binding` (:4404) and returns `true`. Policy fix must cover both arms, keyed on quarantine membership rather than a per-request flag:
 
-Update both send sites: `shutdown_for_restart_detailed` (~1986) sends `defer_binding_release: true`; `stop_codex_session` (~4320) sends `defer_binding_release: false`. In the watcher kill arm (~4384) guard the release:
+- In `spawn_exit_watcher`, before any `leases.clear_binding(PROVIDER, &thread_id)` (both the kill arm :4384 AND the wait arm :4404), check whether the session is currently quarantined (present in `restart_retirements`, keyed by runtime id — pin the exact key by reading the insert sites :1967→1992). If quarantined: do not clear; the `Stopped` path of `continue_codex_restart_retirement` (:2102) owns the release.
+- Ordering requirement (verify at implementation time; swap if needed): `shutdown_for_restart_detailed` must INSERT the quarantine entry before the `CodexKillRequest` is sent, so neither watcher arm can observe an unquarantined session mid-retirement.
+- `stop_codex_session` (~4320, non-restart kill path) keeps immediate clearing (not quarantined ⇒ arms clear).
 
-```rust
-if tree_dead && child_reaped {
-    if !request_defer_binding_release {
-        leases.clear_binding(PROVIDER, &thread_id);
-    }
-    ...existing log + true...
-}
-```
+Regression coverage: the deterministic join-watcher test above PLUS a second fixture where the fake child dies naturally BEFORE the kill request lands (drives the wait arm), asserting the binding is still held (BoundLive) while quarantined.
 
 (Extract the flag before `request.captured.send(())` consumes the request; `request` is `Ok(...)` in this arm.) Also make the existing test's `Condvar` blocker panic-safe: replace the bare `blocker` release at 5878-5882 with a drop guard:
 
@@ -194,6 +182,8 @@ Convert the `/proc/*/environ` ownership scan into a tri-state (`Complete` / `Ind
 - Produces: `pub(crate) enum OwnershipScan { Complete(Vec<i32>), Indeterminate(ScanGap) }` with `pub(crate) struct ScanGap { pub read_dir_failed: bool, pub unusable_owned_entries: usize }` in `freshell-codex/src/transport.rs`; `OwnedProcessTreeBarrier` gains `scan_incomplete: bool` (serde `#[serde(default)]`); a test-only proc-root override `FRESHELL_OWNERSHIP_TEST_PROC_ROOT` consulted only by tests (house pattern: env-override seams, cf. `FRESHELL_FRESH_AGENT_LEASE_TTL_MS`).
 - Consumes: existing barrier state machine unchanged otherwise.
 
+**Load-bearing correction (LB-01 = falsified-as-designed, plan fixed):** every `cargo test -p freshell-codex` command in this plan carries `--features real-transport` — without it, `transport` (lib.rs:66-67) and the whole `launch_lifecycle` target (tests/launch_lifecycle.rs:13) are cfg-erased and the commands pass vacuously with zero tests (verified by `-- --list` probes: 0 unflagged / 2 flagged). The Red step must prove tests actually RUN.
+
 - [ ] **Step 1: Write the failing behavioral tests**
 
 Unit tests in `crates/freshell-codex/src/transport.rs` tests module:
@@ -228,9 +218,13 @@ async fn indeterminate_scan_blocks_confirmed_termination() {
 
 Implementation seam: split `scan_owned_pids` into `scan_owned_pids(env, id)` (production, real `/proc`) and `scan_owned_pids_in(root, env, id)` (test-visible). The test-local proc-root override only needs to exist behind the private `_in` function plus `cfg(test)` callers — do not add a production env knob unless integration tests in `crates/freshell-ws/tests/` need it (they do NOT for the unit-level poison tests; see Step 6 for the integration coverage choice).
 
+**Poison lifecycle contract (load-bearing decision LB-11 = verified-decision):** a poisoned (Indeterminate-tainted) barrier forces `terminate_and_confirm()` `false` *while incomplete*; the first fully-`Complete` scan round CLEARS the poison (a Complete round rediscovers any live tagged writer, so clearing is safe); `refresh_members` never shrinks membership on an Indeterminate round; poison persists across boots via `#[serde(default)]` and can only be cleared by a Complete round, so a wedged fence recovers as soon as the host's /proc is readable again. Four unit tests pin this lifecycle (added to the Step-1 batch): (a) poisoned barrier never confirms; (b) poison → Complete-clean round → confirms; (c) poison round-trips a persisted barrier reopen; (d) refresh never shrinks on Indeterminate.
+
+**Residual miss class (load-bearing LB-05 = acceptable, recorded):** the euid+egid `/proc/<pid>`-dir ownership screen cannot see a tagged writer that changed its own dumpable attribute (`PR_SET_DUMPABLE=0` ⇒ the dir is presented root:root, proc_pid(5)) or its gid. Verified by grep (2026-09-06): no freshell production spawn path invokes prctl/set_dumpable/setuid/setgid/pre_exec uid/gid changes, so we can never produce this class ourselves; a user CLI child self-hiding requires deliberate non-good-faith behavior, out of the declared threat model. Follow-up (not this work item): fix-4C's persisted `(pid,starttime)` primary path shrinks this residual. Sandbox gid leg (no Indeterminate storms inside the Docker sandbox) is deferred to Task 11's recorded sandbox run; WSL2 is documented as unchecked (it IS Linux /proc; acceptable).
+
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
-Run: `cargo test -p freshell-codex --lib transport`
+Run: `cargo test -p freshell-codex --features real-transport --lib transport`
 
 Expected: FAIL — test 1 fails because the current `continue` on unreadable environ makes the scan silently `Complete(vec![])`; tests 2-3 fail to compile (types don't exist yet), which is the intended missing-behavior failure.
 
@@ -296,7 +290,7 @@ Unify the three reaper copies onto this scanner (claude.rs:2543-2567, opencode t
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `cargo test -p freshell-codex --lib transport`
+Run: `cargo test -p freshell-codex --features real-transport --lib transport`
 
 Expected: PASS (new tri-state tests plus the existing Linux barrier tests).
 
@@ -308,7 +302,7 @@ Dedupe env-tag matching into one helper; ensure the pub(crate) surface stays min
 
 Impacted: freshell-codex transport + launch_lifecycle barrier consumers, freshagent claude/codex reapers, opencode transport reaper, and the restart fence path.
 
-Run: `cargo test -p freshell-codex && cargo test -p freshell-ws --test restart_protocol -- persisted_spawn_fence`
+Run: `cargo test -p freshell-codex --features real-transport && cargo test -p freshell-ws --test restart_protocol -- persisted_spawn_fence`
 
 Expected: PASS.
 
@@ -332,7 +326,7 @@ The replacement-fence ownership barrier (`OwnedProcessTreeBarrier`, `crates/fres
 - Modify: `crates/freshell-server/src/main.rs:289-310` (loud boot log if pending rows exist on an unsupported platform)
 - Modify: `src/components/context-menu/menu-defs.ts:93-109,244-266,451,511` (capability-aware lifecycle item)
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx` (populate the new context flag from `getServerCapabilities()`)
-- Test: `crates/freshell-ws/tests/restart_protocol.rs` (gate tests), `test/unit/components/context-menu/menu-defs.test.ts` (NEW), `test/e2e/pane-context-menu-stability.test.tsx` (keep green)
+- Test: `crates/freshell-ws/tests/restart_platform_gate.rs` (NEW binary — env-race isolation per LB-13), `test/unit/components/context-menu/menu-defs.test.ts` (NEW), `test/e2e/pane-context-menu-stability.test.tsx` (keep green)
 
 **Interfaces:**
 - Produces: `pub fn restart_fence_recovery_supported() -> bool` (restart.rs); `AgentRestartFailureCode::UnsupportedPlatform` (wire `UNSUPPORTED_PLATFORM`); client `MenuBuildContext.agentRestartSupported: boolean`.
@@ -342,13 +336,16 @@ The replacement-fence ownership barrier (`OwnedProcessTreeBarrier`, `crates/fres
 
 Rust (new tests in `crates/freshell-ws/tests/restart_protocol.rs`):
 
+**Load-bearing correction (LB-13 = falsified-as-designed):** the gate env knob is process-global while 8 sibling handshake-reader sites in `restart_protocol.rs` read it implicitly under parallel scheduling. The fix is test-binary isolation: these gate tests live in a NEW integration binary `crates/freshell-ws/tests/restart_platform_gate.rs` (its own process, so no other suite ever observes the forced-off window), with a binary-local serialized env guard (LEASE_ENV_LOCK/IsolatedCodexEnv precedent, freshagent_session_lease.rs:30-69). The production gate fn reads the env var on every call; production never sets it.
+
 ```rust
+// crates/freshell-ws/tests/restart_platform_gate.rs
 #[tokio::test]
 async fn handshake_omits_restart_advertisement_when_platform_gate_closed() {
     let _env = EnvGate::set("0"); // serialized test env lock; forces gate closed
-    // Existing handshake harness: build WsState via common::spawn_server_* and
-    // read the `ready` capabilities for a hello that opts into agentRestartV1.
-    let mut ws = /* connect + hello with capabilities.agentRestartV1: true, as v7_connection_without_restart_negotiation tests do (:3355-3384) */;
+    // Existing handshake harness pattern (see restart_protocol.rs:3355-3384):
+    // connect + hello with capabilities.agentRestartV1: true, read ready frame.
+    let mut ws = /* connect + hello */;
     let ready = /* read ready frame */;
     assert!(ready.capabilities.and_then(|c| c.agent_restart_v1).is_none());
 }
@@ -363,8 +360,6 @@ async fn preflight_rejects_restart_when_platform_gate_closed() {
     assert!(!outcome.retryable);
 }
 ```
-
-Implement the env lock as a freshagent-style serialized guard (precedent: `LEASE_ENV_LOCK` in `crates/freshell-ws/tests/freshagent_session_lease.rs`); `restart_fence_recovery_supported()` must read it every call so the gate flips intra-process:
 
 ```rust
 /// Linux is the only platform whose ownership scanning can prove a persisted
@@ -400,7 +395,7 @@ it('shows Restart when content is eligible and the server advertises the capabil
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `cargo test -p freshell-ws --test restart_protocol -- gate_closed` and `npm run test:vitest -- run test/unit/components/context-menu/menu-defs.test.ts --config config/vitest/vitest.config.ts`
+Run: `cargo test -p freshell-ws --test restart_platform_gate` and `npm run test:vitest -- run test/unit/components/context-menu/menu-defs.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: FAIL (Rust: no gate/arm exists yet — compile-level missing; client: `agentRestartSupported` unknown to the menu builder, Restart shows regardless).
 
@@ -425,7 +420,7 @@ if !crate::restart::restart_fence_recovery_supported() {
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `cargo test -p freshell-ws --test restart_protocol -- platform_gate` and the new menu-defs vitest file.
+Run: `cargo test -p freshell-ws --test restart_platform_gate` and the new menu-defs vitest file.
 
 Expected: PASS.
 
@@ -444,7 +439,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/restart.rs crates/freshell-ws/src/lib.rs crates/freshell-server/src/main.rs src/components/context-menu/menu-defs.ts src/components/context-menu/ContextMenuProvider.tsx test/unit/components/context-menu/menu-defs.test.ts crates/freshell-ws/tests/restart_protocol.rs
+git add crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/restart.rs crates/freshell-ws/src/lib.rs crates/freshell-server/src/main.rs src/components/context-menu/menu-defs.ts src/components/context-menu/ContextMenuProvider.tsx test/unit/components/context-menu/menu-defs.test.ts crates/freshell-ws/tests/restart_platform_gate.rs
 git commit -m "feat(restart): gate restart capability and preflight to platforms with fence recovery"
 ```
 
@@ -464,32 +459,48 @@ Today only three recovery triggers exist: boot pass, a backoff retry task spawne
 - Produces: `pub fn recovery_notify_handle(&self) -> Arc<Notify>`; `pub async fn run_restart_recovery_driver(restart: RestartCoordinator, shutdown: Arc<Notify>)` in restart.rs; coordinator-side row-count probe reuse `pending_recoveries()`.
 - Consumes: existing `recover_pending_registered` (:1016-1046), `RESTART_BOOT_RECOVERY_RETRY_INITIAL/MAX` backoff constants (move to restart.rs as `RECOVERY_RETRY_INITIAL/MAX`).
 
+**Load-bearing corrections applied to this task:**
+- (LB-07 = falsified-as-sketched) The relocated driver keeps today's `shutdown_started: Arc<AtomicBool>` input and re-checks it after every select arm — `Notify::notify_waiters` stores no permit (house rule documented at net_bind.rs:12-13; the current driver re-checks at main.rs:2694-2696 for exactly this reason). The wake `Notify` is additive, not a replacement.
+- (LB-08 = falsified-as-sketched) The suite has NO `wait_until` poller — write one in this task's test section (a simple real-time poll loop with deadline). The moved paused-time tests need RE-SEQUENCING, not just moving: under the always-on driver, spawn triggers an immediate first pass when a row exists, so `boot_recovery_retry_driver_stops_on_server_shutdown`'s `retirement_attempts == 0` assertion only holds if the shutdown latch precedes the spawn. Recreate the main.rs-test-module locals the tests use (`RetirementAlwaysPending`, `TransientBootRecovery`, `unique_temp_dir`) in restart_protocol.rs. The driver loop must thread the recovery `emit` broadcast wiring that `recover_pending_registered` requires (the old main.rs driver had it).
+
 - [ ] **Step 1: Write the failing behavioral tests**
 
 In restart_protocol.rs (fake runtime machinery at :132-206 / :1115-1290 is already available here, not in main.rs):
 
 ```rust
-#[tokio::test(start_paused false)] // real time, bounded
+async fn wait_until(deadline: Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let until = tokio::time::Instant::now() + deadline;
+    while tokio::time::Instant::now() < until {
+        if probe() { return true; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    probe()
+}
+
+#[tokio::test] // real time, bounded
 async fn runtime_created_pending_row_wakes_the_parked_recovery_driver() {
     let restart = RestartCoordinator::new(); // in-memory; no persistence needed
     let runtime = FlakyThenSucceedRuntime::new(); // first execute fails retryable, recovery attempt succeeds
     restart.set_runtime(Arc::new(runtime.clone()));
-    let shutdown = Arc::new(Notify::new());
-    let driver = tokio::spawn(run_restart_recovery_driver(restart.clone(), shutdown.clone()));
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
+    let driver = tokio::spawn(run_restart_recovery_driver(restart.clone(), shutdown_started.clone(), shutdown_notify.clone()));
     // Driver starts with ZERO pending rows — the pre-fix driver would exit immediately.
-    time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!driver.is_finished(), "driver must park, not exit on empty");
     // Normal-runtime failure creates a retryable row (no boot, no browser resend).
-    restart.execute_registered(request_for(&runtime), sink()).await; // sinks the retryable failure frame
+    restart.execute_registered(request_for(&runtime), sink()).await;
     // The driver wakes on the Notify and finishes the row by itself.
-    wait_until(Duration::from_secs(5), || restart.pending_recoveries().is_empty()).await;
+    assert!(wait_until(Duration::from_secs(5), || restart.pending_recoveries().is_empty()).await);
     assert!(runtime.succeeded_count() >= 1);
-    shutdown.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(1), &mut driver).await.expect("driver exits on shutdown");
+    // Mid-pass shutdown edge (LB-07 evidence): notify_waiters mid-pass must exit promptly.
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), driver).await.expect("driver exits on shutdown");
 }
 ```
 
-(`wait_until` polling helper already exists in the suite — confirm name at :3098-3133; if it is `wait_for`, use that.) Second test: paused-time sibling asserting no busy-poll: after wake+drain, the driver never calls into the runtime again until the next notify (assert call-count stability across a `time::advance(60s)` with `#[tokio::test(start_paused)]`).
+Second test: paused-time sibling (`#[tokio::test(start_paused = true)]`) asserting no busy-poll: after wake+drain, runtime call-count stays stable across `time::advance(60s)` until the next notify.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -521,11 +532,13 @@ pub fn recovery_notify_handle(&self) -> Arc<tokio::sync::Notify> {
 /// exits on shutdown.
 pub async fn run_restart_recovery_driver(
     restart: RestartCoordinator,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 ) {
     let notify = restart.recovery_notify_handle();
     let mut backoff = RECOVERY_RETRY_INITIAL;
     loop {
+        if shutdown_started.load(Ordering::SeqCst) { break; } // LB-07: notify_waiters stores no permit
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable(); // register interest BEFORE re-checking (missed-wake race)
@@ -534,24 +547,24 @@ pub async fn run_restart_recovery_driver(
             backoff = RECOVERY_RETRY_INITIAL;
             tokio::select! {
                 _ = &mut notified => {}
-                _ = shutdown.notified() => break,
+                _ = shutdown_notify.notified() => { if shutdown_started.load(Ordering::SeqCst) { break; } }
                 _ = tokio::time::sleep(RECOVERY_PARK_POLL) => {} // 30s watchdog fallback
             }
             continue;
         }
-        let progressed = run_recovery_pass(&restart).await; // extracted existing attempt body;
+        let progressed = run_recovery_pass(&restart).await; // extracted existing attempt body (emit threading preserved);
         // wrap each pass: spawn + await JoinHandle; JoinError => tracing::error!("agent.restart.recovery_driver.pass_panicked") + progressed = false
         backoff = if progressed { RECOVERY_RETRY_INITIAL } else { (backoff * 2).min(RECOVERY_RETRY_MAX) };
         tokio::select! {
             _ = &mut notified => {}
-            _ = shutdown.notified() => break,
+            _ = shutdown_notify.notified() => { if shutdown_started.load(Ordering::SeqCst) { break; } }
             _ = tokio::time::sleep(backoff) => {}
         }
     }
 }
 ```
 
-main.rs: at :1129 drop the `if boot_recovery.pending_after > 0` condition and spawn `run_restart_recovery_driver(restart.clone(), shutdown_notify.clone())` unconditionally (keep the join handle for shutdown — the existing join at :1943-1952 already covers it). Delete the old `run_restart_boot_recovery_retry_driver`/`spawn_restart_boot_recovery_retry_driver` bodies; `complete_restart_boot_recovery` (readiness gate) is unchanged. Move the two driver tests out of main.rs into restart_protocol.rs (they use `start_paused`; the notify arm keeps them deterministic under paused time).
+main.rs: at :1129 drop the `if boot_recovery.pending_after > 0` condition and spawn `run_restart_recovery_driver(restart.clone(), shutdown_started.clone(), shutdown_notify.clone())` unconditionally (keep the join handle for shutdown — the existing join at :1943-1952 already covers it). Delete the old `run_restart_boot_recovery_retry_driver`/`spawn_restart_boot_recovery_retry_driver` bodies; `complete_restart_boot_recovery` (readiness gate) is unchanged. Move the two driver tests (`retryable_boot_recovery_continues_in_background_with_backoff` main.rs:3516-3591, `boot_recovery_retry_driver_stops_on_server_shutdown` :3594-3654) out of main.rs into restart_protocol.rs **with re-sequencing (LB-08)**: latch `shutdown_started`/notify BEFORE spawning the driver where a zero-first-pass assertion is needed, and port their helper locals (`RetirementAlwaysPending`, `TransientBootRecovery`, `unique_temp_dir`) into the suite. They use `start_paused`; the notify arm keeps them deterministic under paused time.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -749,7 +762,7 @@ Today: WS ingress spawns each restart as a detached `tokio::spawn` with a discar
 - Test: `crates/freshell-ws/tests/restart_protocol.rs` (latch/join tests), `crates/freshell-freshagent/src/codex.rs` + `claude.rs` tests (drain tests)
 
 **Interfaces:**
-- Produces: `pub fn spawn_registered(self: &RestartCoordinator, request: AgentRestart, emit: impl FnMut(&ServerMessage) + Send + 'static) -> bool` (false = rejected due to shutdown, after emitting the failure frame); `pub fn begin_restart_shutdown(&self)`; `pub async fn join_in_flight_transactions(&self)`; `FreshCodexState::drain_restart_retirements(&self)`, `FreshClaudeState::drain_restart_retirements(&self)`; `OpencodeWsState::drain_restart_retirements(&self)`.
+- Produces: `pub async fn spawn_registered(self: &RestartCoordinator, request: AgentRestart, emit: impl FnMut(&ServerMessage) + Send + 'static) -> bool` (false = rejected due to shutdown, after emitting the failure frame); `pub fn begin_restart_shutdown(&self)`; `pub async fn join_in_flight_transactions(&self)`; `FreshCodexState::drain_restart_retirements(&self, deadline: tokio::time::Instant)`, `FreshClaudeState::drain_restart_retirements(&self, deadline: tokio::time::Instant)` (per-entry budgets clamped by the shared deadline; truncation logs loudly); `OpencodeWsState::drain_restart_retirements(&self)` (bookkeeping only).
 - Consumes: existing `SHUTDOWN_HARD_TIMEOUT` (main.rs:2042), existing codex/claude retirement machinery and budgets (`RESTART_CONSUMER_JOIN_BUDGET`, `RESTART_WATCHER_JOIN_BUDGET`).
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -777,6 +790,25 @@ async fn recovery_pass_skips_replacement_creation_after_shutdown_latch() {
     // Seed a pending row whose phase needs recover_replacement_fenced; latch;
     // run the recovery pass; assert no spawn happened and the row remains.
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_registered_cannot_insert_after_the_drain_observed_empty() {
+    // LB-06 mandatory race test: coordinate a spawn_registered that has passed the
+    // fast-path latch check and parks on the transactions mutex, run
+    // begin_restart_shutdown + join_in_flight_transactions to completion, then
+    // release the parked task; it must observe the latch INSIDE the lock, emit the
+    // typed rejection, and NOT register. Assert the finished drain saw zero tasks
+    // and no late AgentRestartStarted arrives.
+}
+
+#[tokio::test]
+async fn shutdown_sequence_completes_within_the_shared_deadline_with_a_live_gated_transaction_and_quarantine_entry() {
+    // LB-02 acceptance evidence: fake runtime gating a mid-flight transaction +
+    // one quarantined codex retirement; run the Task-6 phased order with the
+    // 3s/2s split (scaled constants under test); assert: join awaited, drain ran,
+    // total wall time under the shared envelope, and no orphan: the quarantined
+    // child pid is gone from /proc.
+}
 ```
 
 freshagent codex.rs tests:
@@ -795,7 +827,7 @@ and the claude.rs analogue using its existing `restart_shutdown_*` fixtures.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `cargo test -p freshell-ws --test restart_protocol -- shutdown_` and `cargo test -p freshell-freshagent --lib "codex::tests::shutdown_drains" "claude::tests::shutdown_drains"` (adjust filter to actual names)
+Run: `cargo test -p freshell-ws --test restart_protocol -- shutdown_ spawn_registered` and `cargo test -p freshell-freshagent --lib "codex::tests::shutdown_drains" "claude::tests::shutdown_drains"` (adjust filter to actual names)
 
 Expected: FAIL — no latch/registry/drain exists (compile-red on new methods; behavioral red where stubs are wired).
 
@@ -818,14 +850,21 @@ pub async fn spawn_registered(&self, request: AgentRestart, mut emit: impl FnMut
         emit(&failure);
         return false;
     }
-    // Register directly under the mutex (the door is an async handler; the lock
-    // is held only for the JoinSet insertion). The latch check + insertion are
-    // serialized against join_in_flight_transactions' drain by the same mutex,
-    // so a transaction can never be inserted after the drain observed an empty set.
+    // Register under the mutex with the latch re-checked INSIDE the lock
+    // (load-bearing LB-06): the latch load above is only a fast path; a task
+    // parked on the mutex could otherwise resume after begin_restart_shutdown +
+    // a completed empty drain and insert a racing transaction.
     let coordinator = self.clone();
-    self.transactions.lock().await.spawn(async move {
+    let mut transactions = self.transactions.lock().await;
+    if self.shutdown_latch.load(Ordering::SeqCst) {
+        drop(transactions);
+        emit(&failure_frame_for(&request)); // same typed shape as above
+        return false;
+    }
+    transactions.spawn(async move {
         coordinator.execute_registered(request, |m| emit(m)).await;
     });
+    drop(transactions);
     true
 }
 
@@ -845,10 +884,12 @@ freshagent codex.rs:
 /// Server-shutdown drain: quarantined runtimes are outside `sessions`, so the
 /// ordinary shutdown sweep never sees them. Drive every retirement to the same
 /// bounded steps as `continue_codex_restart_retirement` and log loudly on any
-/// budget violation; the durable pending row owns recovery next boot.
-pub async fn drain_restart_retirements(&self) {
+/// budget violation; per-entry budgets are CLAMPED by the shared drain deadline
+/// (LB-02); truncated entries log and release to cross-boot recovery — the
+/// durable pending row owns recovery next boot.
+pub async fn drain_restart_retirements(&self, deadline: tokio::time::Instant) {
     let entries: Vec<CodexRestartRetirement> = self.restart_retirements.lock().await.drain().map(|(_, v)| v).collect();
-    for entry in entries { /* capture-ack 1s; consumer abort+join; client.close(); watcher join 3s; on timeout tracing::error!("agent.restart.codex_quarantine_drain_not_quiescent", ...) */ }
+    for entry in entries { /* capture-ack ≤ min(1s, remaining); consumer abort+join; client.close(); watcher join ≤ min(3s, remaining); on timeout/truncation tracing::error!("agent.restart.codex_quarantine_drain_not_quiescent", ...) */ if tokio::time::Instant::now() >= deadline { tracing::error!("agent.restart.codex_quarantine_drain_deadline_exhausted"); break; } }
 }
 ```
 
@@ -856,20 +897,26 @@ claude.rs: same shape against `ClaudeRestartRetirement` — start_kill, `tree.te
 
 main.rs shutdown ordering (after the existing boot-driver join at :1943-1952, before `registry.kill_all()` at :1995):
 
+**Load-bearing correction (LB-02 = falsified-as-designed):** the SAFE-11 shutdown watchdog (main.rs:2042 `SHUTDOWN_HARD_TIMEOUT = 5s`, armed at signal arrival :2112-2118) bounds the ENTIRE graceful sequence — `timeout(5s, …)` on the transaction join plus ~N×5s of sequential drains cannot fit inside it beside the existing boots. Budget as ONE shared deadline: transaction join ≤ 3,000 ms, then quarantine drains ≤ 2,000 ms total (across both providers, in parallel per provider), then the pre-existing kill_all/provider sequence keeps its remaining time. Spend-tracking is a simple `Instant` deadline handed to each phase; truncation logs loudly and lets cross-boot fence recovery finish the stragglers (durable rows + Task-2 confirmed barriers remain the fail-closed backstop):
+
 ```rust
 restart.begin_restart_shutdown();
-if tokio::time::timeout(SHUTDOWN_HARD_TIMEOUT, restart.join_in_flight_transactions()).await.is_err() {
+let deadline = tokio::time::Instant::now() + Duration::from_millis(3_000);
+if let Err(_) = tokio::time::timeout_at(deadline, restart.join_in_flight_transactions()).await {
     tracing::error!("agent.restart.shutdown.transactions_join_timeout"); // do NOT abort; durable rows + cleanup reaps
 }
-fresh_codex_state.drain_restart_retirements().await;   // bounded internally
-fresh_claude_state.drain_restart_retirements().await;
+let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(2_000);
+tokio::join!(
+    fresh_codex_state.drain_restart_retirements(drain_deadline),  // per-entry budgets CLAMPED by the shared deadline
+    fresh_claude_state.drain_restart_retirements(drain_deadline),
+);
 ```
 
 and the opencode bookkeeping drain adjacent to its provider shutdown. Keep the existing sequences otherwise untouched. Wire the latch at construction: `ws_state.restart.set_shutdown_latch(shutdown_started.clone())`.
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `cargo test -p freshell-ws --test restart_protocol -- shutdown_ && cargo test -p freshell-freshagent --lib "codex::tests::shutdown_drains" "claude::tests::shutdown_drains"`
+Run: `cargo test -p freshell-ws --test restart_protocol -- shutdown_ spawn_registered` && cargo test -p freshell-freshagent --lib "codex::tests::shutdown_drains" "claude::tests::shutdown_drains"`
 
 Expected: PASS.
 
@@ -905,7 +952,7 @@ Today restart ingress is a WS-only door (terminal.rs:1114-1153) whose only bound
 - Test: `crates/freshell-ws/tests/restart_protocol.rs` (coordinator + WS door tests)
 
 **Interfaces:**
-- Produces: `AgentRestartFailureCode::Overloaded` (wire `OVERLOADED`); `pub fn try_admit_restart(&self, request: &AgentRestart) -> Result<AdmissionGuard, RestartFailure>`; `pub struct AdmissionGuard` (holds a global semaphore permit, releases the per-session slot on drop); constants `MAX_AGENT_RESTART_FIELD_BYTES = 256`, `MAX_PENDING_RESTART_RECOVERIES = 1_024`, `MAX_IN_FLIGHT_RESTARTS = 256`, `MAX_QUEUED_RESTARTS_PER_SESSION = 4`, `MAX_RESTART_JOURNAL_BYTES = 8 * 1024 * 1024`.
+- Produces: `AgentRestartFailureCode::Overloaded` (wire `OVERLOADED`); `pub fn is_known_request(&self, request: &AgentRestart) -> bool` (LB-03 dedupe: in-flight registry ∪ pending rows ∪ stored results); `pub fn try_admit_restart(&self, request: &AgentRestart) -> Result<AdmissionGuard, RestartFailure>`; `pub struct AdmissionGuard` (holds a global semaphore permit, releases the per-session slot on drop); constants `MAX_AGENT_RESTART_FIELD_BYTES = 256`, `MAX_PENDING_RESTART_RECOVERIES = 1_024`, `MAX_IN_FLIGHT_RESTARTS = 256`, `MAX_QUEUED_RESTARTS_PER_SESSION = 4` (counts DISTINCT new requests per session after dedupe), `MAX_RESTART_JOURNAL_BYTES = 8 * 1024 * 1024`.
 - Consumes: existing `RestartFailure` (:235) and door failure-frame shape (capability rejection at terminal.rs:1122-1139 — the Overloaded frame must mirror its runtime-descriptor fill from the request).
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -1004,13 +1051,22 @@ pub fn try_admit_restart(&self, request: &AgentRestart) -> Result<AdmissionGuard
 
 3. terminal.rs door (after the capability check, before spawning):
 
+**Load-bearing correction (LB-03 = falsified-as-designed):** arrivals must be deduped BEFORE any counting — the shipped client resends the SAME `request_id` on a 500ms→4s backoff loop (ws-client.ts:290-314, up to 4 arrivals per request, more with reconnects/followers), while resend handling (`replay_or_conflict` :3053-3071, follower correlation :1837-1904, pending-row retry :1805-1826) lives INSIDE `execute_with_events`, downstream of the door. Arrival-counting as sketched could Overload a healthy single restart (a 5th correlated arrival). Rule: an arrival whose `request_id` is already (a) an in-flight registered transaction, (b) a pending durable row, or (c) a stored terminal result bypasses admission entirely and goes straight to the coordinator (existing replay/follower machinery handles it); only DISTINCT new request ids consume per-session/global budget. Overloaded for the global/journal caps stays `retryable: true`; since dedupe happens first, the per-session cap is never hit by resends, so no separate non-retryable variant is required.
+
 ```rust
-let admission = match restart.try_admit_restart(&request) {
-    Ok(guard) => guard,
-    Err(failure) => return send(ws_tx, &failure_frame_for(&request, failure)).await,
+// Door order: capability -> dedupe probe (restart.is_known_request(&request):
+// in-flight registry membership OR pending row OR stored result) -> admission.
+let known = restart.is_known_request(&request);
+let admission = if known {
+    None
+} else {
+    match restart.try_admit_restart(&request) {
+        Ok(guard) => Some(guard),
+        Err(failure) => return send(ws_tx, &failure_frame_for(&request, failure)).await,
+    }
 };
 ```
-Hold the guard across the whole spawned task (move it into `spawn_registered`'s task from Task 6; also skip admission for the shutdown-latch rejection path).
+Hold the guard (when present) across the whole spawned task (move it into `spawn_registered`'s task from Task 6; also skip admission for the shutdown-latch rejection path). The per-session-key queue test that sent "5 distinct requests for one session" stays distinct-request-shaped; add one new test: the same request_id resent 6 times through a gated retirement receives NO Overloaded and replays normally.
 
 4. execute_with_events backstop at :1998 (immediately before `try_update_ownership("record_shutdown_pending", ...)`): if this request does not already own a pending row and `pending_recoveries.len() >= self.pending_limit`, run `abort_preflight` (:2018 path) and emit Overloaded retryable — never insert.
 
@@ -1058,13 +1114,15 @@ git commit -m "feat(restart): bound restart ingress with typed overload failures
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
+**Load-bearing correction (LB-12 = falsified-as-sketched):** after Task 7's door caps (256 global / 4 per-session), >1,024 preflights cannot arrive via `execute_registered`/the WS door. The flood drives `ProductionRestartRuntime::preflight` DIRECTLY (adapter test ctor `with_fresh_runtime`, restart.rs:3627; adapter-test template :4060-4616) while the held transaction runs through the coordinator door.
+
 ```rust
 #[tokio::test]
 async fn active_plan_survives_preflight_flood_from_other_requests() {
-    // Production adapter (with_fresh_runtime test ctor) as in the production-adapter tests
-    // (:4060-4616). Hold one transaction's plan un-created (preflight done, create gated),
-    // run >1_024 preflights for distinct request ids + sessions, then un-gate and assert the
-    // original transaction commits (its plan was never evicted).
+    // Production adapter (with_fresh_runtime test ctor). Hold one transaction's plan
+    // un-created (preflight done, create gated), run >1_024 DIRECT preflight calls for
+    // distinct request ids + sessions, then un-gate and assert the original transaction
+    // commits (its plan was never evicted).
 }
 
 #[tokio::test]
@@ -1179,7 +1237,15 @@ Expected: FAIL — after >1,024 churn the live descriptor is evicted by the sing
 2. `prune_ownership_locked` (:1187-1231): prune ONLY `retired_descriptors` (pop oldest; also drop the retired membership) plus locators/aliases/generations as today; never touch `descriptor_by_live`.
 3. Retirements (:1364 in `bind_locator_locked`, and the two replacement sites :2111-2114 / :2638-2642): move the entry from live to the retired store (FIFO-clamped) at exactly the places `retired_live.insert` happened.
 4. `runtime_for_live` (:1405-1415): live first, then `retired_descriptors` (late frames).
-5. `pub fn unpin_descriptor(&self, kind, runtime_id)`: move live → retired (no-op if absent); call it from the PTY exit hook where the identity retires (terminal.rs:2278 region) and extend `FreshRuntimeRegistry` (restart.rs:4411-4423) with `fn unregister_runtime(&self, provider: &str, durable_session_id: &str, live_runtime_id: &str) {}`—implemented by the coordinator to unpin; call it where fresh sessions are finally removed (retirement `Stopped` map removal, kill paths).
+5. `pub fn unpin_descriptor(&self, kind, runtime_id)`: move live → retired (no-op if absent; idempotent — double-calls are harmless); call it from the PTY exit hook where the identity retires (terminal.rs:2278 region) and extend `FreshRuntimeRegistry` (restart.rs:4411-4423) with `fn unregister_runtime(&self, provider: &str, durable_session_id: &str, live_runtime_id: &str) {}` — implemented by the coordinator to unpin.
+
+**Load-bearing finding (LB-10 = verified):** the fresh-agent removal sites are now enumerated; the unpin call set is exactly:
+- create lease-revoke teardown: codex.rs:1011, claude.rs:636
+- `freshAgent.kill`: codex.rs:1878, claude.rs:784, opencode_ws.rs:1080-1082
+- attach-resume lease-revoke teardown: codex.rs:3433, claude.rs:1785
+- claude sidecar consumer-exit eviction (death-without-rebind — the easy-to-miss one): claude.rs:1991-2000
+- retirement `Stopped` map removal: codex.rs:2102-2106, claude.rs:~1000-1010, opencode_ws.rs:1280-1283
+- Do NOT unpin at: watcher arms (codex.rs:4384/4404 — sessions entry retained for lazy respawn), codex crash self-heal (sessions stays mapped with `exited=true`; unpin lands on its later kill/rebind), quarantine-install moves (alias moves only), or shutdown sweeps (process dying anyway).
 6. Preserve persisted surface: the retired store stays in-memory like today's descriptors (no journal format change).
 
 - [ ] **Step 4: Run the focused tests**
@@ -1243,7 +1309,7 @@ fn abandoned_restart_retiring_tombstones_are_fifo_bounded() {
 }
 ```
 
-Auto-resume: extend the `:1672-1700` paused-time test so that after the settle-with-`restart_retiring` decision the registry no longer reports the id (proves the consumption wiring through `pre_respawn_guard`).
+Auto-resume consumption proof — **load-bearing correction (LB-09 = falsified-as-designed):** the paused hub-test harness (auto_resume.rs:1672-1700) drives `FakeDriver` (:1251/:1351-1370) whose `pre_respawn_guard`/`resumable_session_ref` return canned values with no `TerminalRegistry` at all — extending it could never fail when the production wiring is missing. Leave that harness untouched and instead write tests against the real targets: (a) `WsAutoResumeDriver::pre_respawn_guard`/`resumable_session_ref` unit-ish tests backed by a fresh REAL `TerminalRegistry` with a marked tombstone — assert the tombstone is consumed after the settle; (b) the exit-hook suppression path (terminal.rs:2344-2364) consuming the tombstone (WS-harness or registry-level drive of the hook branch); plus the two registry unit tests above.
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -1286,7 +1352,7 @@ Keep `is_restart_retiring` as the read-only probe (used by tests/diagnostics); `
 
 Impacted: terminal exit hooks, auto-resume hub, codex managed-launch sibling set (must stay consume-on-success/retain-on-failure: `freshell-codex` launch_lifecycle tests :620-690).
 
-Run: `cargo test -p freshell-terminal && cargo test -p freshell-ws auto_resume && cargo test -p freshell-codex --test launch_lifecycle restart`
+Run: `cargo test -p freshell-terminal && cargo test -p freshell-ws auto_resume && cargo test -p freshell-codex --features real-transport --test launch_lifecycle restart`
 
 Expected: PASS.
 
@@ -1317,7 +1383,7 @@ cargo test -p freshell-ws --test restart_protocol
 cargo test -p freshell-ws --lib restart::
 cargo test -p freshell-freshagent --lib   # must TERMINATE and pass (Task 1 hang fixed; external `timeout 1200`)
 cargo test -p freshell-server boot_recovery
-cargo test -p freshell-codex --test launch_lifecycle restart
+cargo test -p freshell-codex --features real-transport --test launch_lifecycle restart
 cargo test -p freshell-terminal
 cargo test -p freshell-ws --test restore_plan_queue_cap && cargo test -p freshell-ws --test max_payload
 ```
@@ -1368,6 +1434,10 @@ git commit -am "chore(restart): gate-driven clippy/fmt fixes for restart hardeni
 - Task ordering rationale: Task 1 unblocks the freshagent binary (all later evidence depends on it); 2→3 because gating depends on scan semantics; 4 before 5 so indeterminate-retained rows are driven immediately upon introduction; 6 before 7 because ingress admission reuses the transaction registry/latch; 7 before 8 because plan retention is bounded by the ingress caps; 9 and 10 are independent leaves after the core lands.
 - Merge-carryover ambiguity flags (from the owner-branch merge of `1d591b723`, recorded in run-state.md) — reviewers/implementers should NOT "fix" these mid-task; flag to me if a task's code legitimately conflicts: claude ladder stays post-adopt (main pin); fenced plan lane bypasses the class/cancel budget queue; try_rebind ack speaks real tracked status + runtime; opencode compact settle frames now carry runtime; ejh6 raw guard now fence-first (legacy-only refusal / inert echo passthrough / pending-retirement SESSION_RESERVED); freshagent_session_lease destructive suite requires sandbox (5 host failures pre-existing, also failing on pure 1d591b723).
 - Pre-existing vitest failures (baseline ledger) are identity-tracked; do not repair them to force green.
+
+## Load-bearing validation record (Stage 2)
+
+13 claims validated (2026-09-06): 2 verified (LB-10 unpin-site enumeration; LB-11 poison-lifecycle decision = clear-on-Complete), 10 falsified-as-designed with plan corrections applied in place (LB-01 codex test commands now carry `--features real-transport`; LB-02 shared 3s/2s join+drain deadline; LB-03 admission dedupes request_id before counting; LB-04 both watcher arms gated on quarantine membership; LB-06 latch re-checked under the transactions mutex; LB-07 driver keeps shutdown_started re-check; LB-08 moved driver tests re-sequenced with recreated helpers; LB-09 tombstone-consumption tests target real WsAutoResumeDriver+registry; LB-12 flood test drives the adapter directly; LB-13 gate tests isolated in their own test binary), 1 acceptable (LB-05 euid+egid predicate — residual self-hiding miss class is outside the threat model and unreachable via our own spawn paths; fix-4C stays optional follow-up). Halt: false. Ledger: `<logs_dir>/load-bearing-ledger.md`; evidence reports: `<logs_dir>/reports/load-bearing-finder.md`, `load-bearing-strategist.md`.
 
 
 
