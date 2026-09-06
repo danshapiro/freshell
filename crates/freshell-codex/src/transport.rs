@@ -208,8 +208,9 @@ impl OwnedProcessTreeBarrier {
     /// Capture a PTY's whole process group with `(pid,starttime)` recycling
     /// fences. Unlike signaling `-pgid` after a reboot, this never risks a
     /// newly-reused process-group id: only exact captured incarnations are
-    /// signaled, while new members are accepted only while the original group
-    /// is still observable.
+    /// signaled, while new members are accepted only while a verified-live
+    /// captured incarnation keeps the original group observable (never off
+    /// the naked pgrp once the last captured incarnation is gone).
     #[cfg(target_os = "linux")]
     pub fn capture_process_group(root_pid: u32) -> Self {
         let process_group_id = proc_info(root_pid as i32).map(|(_, pgrp, _)| pgrp);
@@ -278,9 +279,11 @@ impl OwnedProcessTreeBarrier {
     ///
     /// Fail closed (fix 5): a poisoned barrier — any scan round ended
     /// Indeterminate — reports `false` even with zero known members, and an
-    /// Indeterminate round never shrinks membership. The first fully-Complete
-    /// round clears the poison, so a barrier wedged on an unreadable `/proc`
-    /// recovers as soon as the host is readable again.
+    /// ownership-Indeterminate round never shrinks membership (a process-group
+    /// gap still poisons its round, but the retain preceding it pruned only
+    /// stat-proven-dead incarnations). The first fully-Complete round clears
+    /// the poison, so a barrier wedged on an unreadable `/proc` recovers as
+    /// soon as the host is readable again.
     #[cfg(target_os = "linux")]
     pub async fn terminate_and_confirm(&mut self) -> bool {
         for round in 0..24u8 {
@@ -322,12 +325,17 @@ impl OwnedProcessTreeBarrier {
             .unwrap_or_else(|| Path::new("/proc"))
     }
 
-    /// Fold newly-visible members in. An Indeterminate round NEVER shrinks
-    /// membership: the retain runs only when the WHOLE round is Complete —
-    /// both sub-scans (ownership and process-group) decided no gap. A `/proc`
-    /// gap from either leg can hide a live writer, so retaining a stale member
-    /// is the fail-closed direction. Only a fully-Complete round prunes gone
-    /// incarnations and clears the poison; any gap (re-)poisons the barrier.
+    /// Fold newly-visible members in. An ownership-Indeterminate round never
+    /// shrinks membership: when the ownership leg cannot prove the owned set,
+    /// BOTH the retain and the process-group sub-scan are skipped and the
+    /// round ends poisoned (a `/proc` gap can hide a live writer, so retaining
+    /// a stale member is the fail-closed direction). Only a Complete ownership
+    /// leg runs the retain — each prune is an exact `(pid,starttime)` stat
+    /// proof of a gone incarnation — and the process-group sub-scan runs only
+    /// after it, gated on post-retain (verified-live) membership. A
+    /// process-group gap still poisons its round (quiescence is unprovable
+    /// off an incomplete scan) but never blocks the retain: it can hide an
+    /// unseen fork, while the members the retain pruned were stat-proven dead.
     #[cfg(target_os = "linux")]
     fn refresh_members(&mut self) {
         let mut discovered = Vec::new();
@@ -338,25 +346,27 @@ impl OwnedProcessTreeBarrier {
                 OwnershipScan::Indeterminate(g) => gap = Some(g),
             }
         }
-        // Compute the process-group sub-scan BEFORE the retain below, so the
-        // shrink is gated on the round's FINAL poison state (fix-5 review 4.2).
-        // A numeric process-group id can be recycled. Discover forks only
-        // while at least one exact `(pid,starttime)` predecessor incarnation
-        // remains captured (pre-retain membership — a fork folded in on the
-        // same round its last predecessor dies gets its own starttime fence,
-        // which stays fail-closed). Once that captured set is empty, never use
-        // the naked pgrp as authority to adopt or signal a newly-reused group.
-        if !self.members.is_empty() {
-            if let Some(process_group_id) = self.process_group_id {
-                match scan_process_group_in(self.proc_root(), process_group_id) {
-                    OwnershipScan::Complete(pids) => discovered.extend(pids),
-                    OwnershipScan::Indeterminate(g) => gap = Some(g),
-                }
-            }
-        }
+        // An ownership-Indeterminate round never shrinks membership AND never
+        // consults the group: pre-retain membership may be all-dead
+        // incarnations, which is no authority to adopt into a possibly
+        // recycled process-group id (fix-5 fix-review B.1).
         if gap.is_none() {
             self.members
                 .retain(|(pid, start)| proc_starttime(*pid) == Some(*start));
+            // A numeric process-group id can be recycled. Discover forks only
+            // while at least one post-retain — hence verified-live — exact
+            // `(pid,starttime)` incarnation keeps the captured group
+            // observable. Once the last captured incarnation is gone, never
+            // use the naked pgrp as authority to adopt or signal a
+            // newly-reused group.
+            if !self.members.is_empty() {
+                if let Some(process_group_id) = self.process_group_id {
+                    match scan_process_group_in(self.proc_root(), process_group_id) {
+                        OwnershipScan::Complete(pids) => discovered.extend(pids),
+                        OwnershipScan::Indeterminate(g) => gap = Some(g),
+                    }
+                }
+            }
         }
         if let Some(gap) = &gap {
             warn_scan_incomplete(gap);
@@ -872,34 +882,150 @@ mod tests {
         );
     }
 
-    /// fix-5 review (4.2): the retain is gated on the round's FINAL poison
-    /// state, so a gap from the process-group sub-scan — not only from the
-    /// ownership sub-scan — must also prevent any membership shrink. A
-    /// PTY-style barrier (no ownership leg) whose process-group sub-scan
-    /// cannot list its proc root ends the round Indeterminate and keeps every
-    /// member, including ones whose stat looks long gone.
+    /// fix-5 fix-review (B.1): an ownership-Indeterminate round must skip BOTH
+    /// the retain AND the process-group sub-scan — pre-retain membership may
+    /// consist entirely of dead incarnations, which is no authority to adopt
+    /// into a possibly recycled process-group id. The dead member stays
+    /// retained (fail closed), the unrelated live process standing in the
+    /// captured group id is NOT adopted, and the round ends poisoned.
     #[test]
-    fn indeterminate_process_group_round_never_shrinks_membership() {
+    fn ownership_indeterminate_round_skips_retain_and_process_group_adoption() {
+        let root = tempfile::tempdir().unwrap();
+        // The ownership leg cannot decide the owned set (owned EISDIR environ).
+        fake_proc_gap_entry(root.path(), i32::MAX - 2);
+        // Bait for any code that consults the naked pgrp off unproven
+        // membership: a live, unrelated process inside the captured group id,
+        // named under the fake root so a wrongly-run pgrp scan would adopt it.
+        // Its fake entry carries no `environ`, so the ownership leg skips it.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in live group member");
+        let pid = child.id() as i32;
+        let pgrp = proc_info(pid).expect("live child").1;
+        std::fs::create_dir(root.path().join(pid.to_string())).unwrap();
+        let mut barrier = OwnedProcessTreeBarrier {
+            ownership_env: "FRESHELL_TEST_B1_OWNERSHIP".to_string(),
+            ownership_id: "i".to_string(),
+            members: vec![(i32::MAX - 1, 1)], // long-dead captured leader
+            process_group_id: Some(pgrp),
+            scan_incomplete: false,
+            test_proc_root: Some(root.path().to_path_buf()),
+        };
+        barrier.refresh_members();
+        assert!(
+            barrier.members.contains(&(i32::MAX - 1, 1)),
+            "an ownership-Indeterminate round never shrinks membership: {:?}",
+            barrier.members
+        );
+        assert!(
+            !barrier.members.iter().any(|(known, _)| *known == pid),
+            "never adopt off the naked pgrp without a verified-live incarnation: {:?}",
+            barrier.members
+        );
+        assert!(barrier.scan_incomplete, "the round must end poisoned");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// fix-5 fix-review (B.1): a process-group gap discovered AFTER the
+    /// stat-proven retain still poisons the round (quiescence is unprovable
+    /// off an incomplete scan), but it neither revives a stat-proven-dead
+    /// member nor drops the verified-live one the retain kept.
+    #[test]
+    fn process_group_gap_poisons_round_but_retain_stays_stat_proven() {
         let root = tempfile::tempdir().unwrap();
         // A proc root that cannot be listed: read_dir fails ⇒ Indeterminate.
         let gone_root = root.path().join("no-such-dir");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn verified-live member");
+        let pid = child.id() as i32;
+        let start = proc_starttime(pid).expect("live child starttime");
         let mut barrier = OwnedProcessTreeBarrier {
             ownership_env: String::new(), // PTY-style: no ownership scan leg
             ownership_id: String::new(),
-            members: vec![(i32::MAX - 1, 1)],
-            process_group_id: Some(12345),
+            members: vec![(i32::MAX - 1, 1), (pid, start)],
+            process_group_id: Some(i32::MAX - 3),
             scan_incomplete: false,
             test_proc_root: Some(gone_root),
         };
         barrier.refresh_members();
         assert!(
-            barrier.members.contains(&(i32::MAX - 1, 1)),
-            "a process-group-Indeterminate round must keep every member: {:?}",
+            !barrier.members.contains(&(i32::MAX - 1, 1)),
+            "the retain ran before the gap and pruned the stat-proven-dead member: {:?}",
+            barrier.members
+        );
+        assert!(
+            barrier.members.contains(&(pid, start)),
+            "the verified-live member survives: {:?}",
             barrier.members
         );
         assert!(
             barrier.scan_incomplete,
-            "the process-group gap must poison the round"
+            "a process-group gap still poisons the round"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// fix-5 fix-review (B.1) regression pin — the persisted-fence recovery
+    /// scenario: every captured incarnation is dead (the captured tree died
+    /// while the server was down) and the numeric group id has been recycled
+    /// by an unrelated process. The retain prunes the stale incarnations, the
+    /// process-group sub-scan never runs against a bare pgrp, the recycler is
+    /// NOT adopted (hence never signaled), and the round confirms quiescence
+    /// unpoisoned.
+    #[test]
+    fn recycled_process_group_id_is_never_adopted_after_last_incarnation_dies() {
+        let root = tempfile::tempdir().unwrap();
+        // The unrelated recycler: a live process currently holding the
+        // captured group id, listed by the (listable) fake proc root.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn stand-in group recycler");
+        let pid = child.id() as i32;
+        let pgrp = proc_info(pid).expect("live child").1;
+        std::fs::create_dir(root.path().join(pid.to_string())).unwrap();
+        let mut barrier = OwnedProcessTreeBarrier {
+            ownership_env: String::new(), // PTY-style: capture_process_group
+            ownership_id: String::new(),
+            members: vec![(i32::MAX - 1, 1)], // the whole captured set, all dead
+            process_group_id: Some(pgrp),
+            scan_incomplete: false,
+            test_proc_root: Some(root.path().to_path_buf()),
+        };
+        barrier.refresh_members();
+        assert!(
+            !barrier.members.iter().any(|(known, _)| *known == pid),
+            "a recycled group id must never be adopted once every captured incarnation is gone: {:?}",
+            barrier.members
+        );
+        assert!(
+            barrier.members.is_empty(),
+            "the stale all-dead capture is pruned on stat proof: {:?}",
+            barrier.members
+        );
+        assert!(
+            !barrier.scan_incomplete,
+            "a fully-Complete round confirms quiescence — zero signals sent"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// fix-pass-2 review nit: the ownership scanner's root-level `read_dir`
+    /// failure arm gets its own pin — an unlistable proc root is a
+    /// `read_dir_failed` gap (barrier poison), never an empty scan.
+    #[test]
+    fn unlistable_root_makes_ownership_scan_indeterminate() {
+        let root = std::path::Path::new("/no/such/proc-root-z06a");
+        let scan = scan_owned_pids_in(root, "FRESHELL_TEST_ANY", "any-id");
+        assert!(
+            matches!(scan, OwnershipScan::Indeterminate(ref gap) if gap.read_dir_failed),
+            "an unlistable root must be a read_dir gap, got {scan:?}"
         );
     }
 }

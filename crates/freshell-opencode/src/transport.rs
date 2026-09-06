@@ -573,4 +573,17 @@ mod ownership_scan_tests {
             scan_owned_pids_fail_closed_in(&root.0, "FRESHELL_TEST_OPENCODE_OWNERSCAN", "fence-x");
         assert_eq!(scan, Some(vec![4242]));
     }
+
+    /// (iv) Root-level `read_dir` failure leg: an unlistable proc root reports
+    /// the read_dir gap ⇒ `None` (fail closed), never an empty scan.
+    #[test]
+    fn unlistable_root_makes_fail_closed_scan_none() {
+        let root = std::path::Path::new("/no/such/proc-root-z06a");
+        let scan =
+            scan_owned_pids_fail_closed_in(root, "FRESHELL_TEST_OPENCODE_OWNERSCAN", "fence-x");
+        assert!(
+            scan.is_none(),
+            "an unlistable root must be a read_dir gap (fail closed), got {scan:?}"
+        );
+    }
 }
