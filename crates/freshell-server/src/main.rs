@@ -905,6 +905,11 @@ async fn main() -> ExitCode {
     );
     // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
     let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Task 6 (fix 1): the restart coordinator consults the SAME latch for WS
+    // ingress rejection and replacement-creation refusal, so restart work
+    // latches shut the instant the signal handler flips this flag — before
+    // the graceful sequence below even starts its phased drain.
+    restart.set_shutdown_latch(std::sync::Arc::clone(&shutdown_started));
     // P1.13: inject the ledger-backed identity sink into the fresh-agent
     // states (constructed earlier, before the ledger exists — the
     // post-construction setter exists precisely for this ordering). All
@@ -1973,6 +1978,42 @@ async fn main() -> ExitCode {
         let _ = recovery_driver_task.await;
     }
 
+    // Task 6 (fix 1): graceful shutdown OWNS every registered restart
+    // transaction before provider/terminal cleanup. The latch was already
+    // asserted by `shutdown_signal` (which flips the SAME Arc wired into the
+    // coordinator at construction); re-asserting is idempotent and keeps this
+    // ordering correct under any future serve path. Then JOIN the registered
+    // in-flight set so `registry.kill_all()` below can never reap the
+    // selected old runtime of a mid-flight transaction, and DRAIN the
+    // codex/claude restart quarantines through their confirmed process-tree
+    // barriers — quarantined runtimes are outside the providers' `sessions`
+    // maps, so their ordinary shutdown sweeps never see them.
+    //
+    // LB-02: the SAFE-11 watchdog (SHUTDOWN_HARD_TIMEOUT, armed at signal
+    // arrival) bounds the ENTIRE graceful sequence, so these phases run under
+    // ONE shared spend deadline: the transaction join gets ≤ 3,000 ms, then
+    // the quarantine drains share ≤ 2,000 ms across both providers in
+    // parallel (per-entry budgets are clamped by the shared deadline inside
+    // each drain). Truncation logs loudly and leaves convergence to the
+    // durable pending rows + fenced cross-boot recovery next boot.
+    restart.begin_restart_shutdown();
+    let join_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3_000);
+    if tokio::time::timeout_at(join_deadline, restart.join_in_flight_transactions())
+        .await
+        .is_err()
+    {
+        // Do NOT abort stragglers: replacement creation is latched shut, so a
+        // still-running transaction can only be finishing its retirement —
+        // the cleanup sweep below reaps it, and its durable row owns
+        // cross-boot convergence.
+        tracing::error!("agent.restart.shutdown.transactions_join_timeout");
+    }
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
+    tokio::join!(
+        fresh_codex_state.drain_restart_retirements(drain_deadline),
+        fresh_claude_state.drain_restart_retirements(drain_deadline),
+    );
+
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
     // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
@@ -2025,6 +2066,11 @@ async fn main() -> ExitCode {
     // create_gate.rs's shutdown_started checks.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let _ = registry.kill_all();
+    // Task 6 (fix 1): clear the OpenCode restart quarantine bookkeeping. A
+    // quarantined opencode entry owns NO local process — its fenced remote
+    // abort is the next boot's cross-boot recovery job — so this drain logs
+    // the abandoned entries loudly rather than pretending local quiescence.
+    fresh_opencode_state.drain_restart_retirements().await;
     fresh_agent_state.shutdown().await;
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.

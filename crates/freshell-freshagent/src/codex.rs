@@ -272,6 +272,37 @@ struct CodexRestartRetirement {
     tree_quiesced: bool,
 }
 
+/// Per-step quiescence budgets for one codex restart retirement drive. The
+/// ordinary continuation path uses the full constants (the capture-ack budget
+/// is the historical `Duration::from_secs(1)`); the server-shutdown drain
+/// CLAMPS each step by what remains of the shared cross-provider drain
+/// deadline (LB-02), so a slow quiescence can never blow the shutdown
+/// envelope.
+#[derive(Debug, Clone, Copy)]
+struct CodexRestartRetirementBudgets {
+    capture: Duration,
+    consumer: Duration,
+    watcher: Duration,
+}
+
+impl CodexRestartRetirementBudgets {
+    fn full() -> Self {
+        Self {
+            capture: Duration::from_secs(1),
+            consumer: RESTART_CONSUMER_JOIN_BUDGET,
+            watcher: RESTART_WATCHER_JOIN_BUDGET,
+        }
+    }
+
+    fn clamped_by(self, remaining: Duration) -> Self {
+        Self {
+            capture: self.capture.min(remaining),
+            consumer: self.consumer.min(remaining),
+            watcher: self.watcher.min(remaining),
+        }
+    }
+}
+
 impl CodexRestartRetirement {
     /// Test-only deterministic join point: restart-ordering assertions await
     /// the quarantined exit-watcher's terminal step through the handle the
@@ -280,6 +311,66 @@ impl CodexRestartRetirement {
     #[cfg(test)]
     fn watcher_handle(&mut self) -> Option<&mut tokio::task::JoinHandle<bool>> {
         self.watcher.as_mut()
+    }
+
+    /// Drive the staged quiescence steps (capture ack → consumer abort+join →
+    /// transport close → confirmed tree death via the exit-watcher's barrier)
+    /// with the given budgets, preserving partial progress across calls: each
+    /// completed step latches its own flag, so a timed-out step simply STAYS
+    /// for a later drive. Only after the watcher has captured the
+    /// pid/start-time tree may transport closure or consumer cancellation
+    /// make the direct sidecar exit.
+    async fn drive_retirement(&mut self, budgets: CodexRestartRetirementBudgets) {
+        if !self.capture_confirmed {
+            if let Some(mut captured) = self.capture_rx.take() {
+                if tokio::time::timeout(budgets.capture, &mut captured)
+                    .await
+                    .is_ok()
+                {
+                    self.capture_confirmed = true;
+                } else {
+                    self.capture_rx = Some(captured);
+                }
+            }
+        }
+
+        if self.capture_confirmed {
+            if !self.consumer_quiesced {
+                if let Some(mut consumer) = self.consumer.take() {
+                    consumer.abort();
+                    if tokio::time::timeout(budgets.consumer, &mut consumer)
+                        .await
+                        .is_ok()
+                    {
+                        self.consumer_quiesced = true;
+                    } else {
+                        self.consumer = Some(consumer);
+                    }
+                } else {
+                    self.consumer_quiesced = true;
+                }
+            }
+            if !self.transport_closed {
+                self.client.close().await;
+                self.transport_closed = true;
+            }
+            if !self.tree_quiesced {
+                if let Some(mut watcher) = self.watcher.take() {
+                    match tokio::time::timeout(budgets.watcher, &mut watcher).await {
+                        Ok(Ok(true)) => self.tree_quiesced = true,
+                        Ok(_) => {}
+                        Err(_) => self.watcher = Some(watcher),
+                    }
+                }
+            }
+        }
+    }
+
+    fn quiesced(&self) -> bool {
+        self.capture_confirmed
+            && self.consumer_quiesced
+            && self.transport_closed
+            && self.tree_quiesced
     }
 }
 
@@ -2062,59 +2153,11 @@ impl FreshCodexState {
             return crate::RestartShutdownOutcome::Stale;
         };
 
-        if !retirement.capture_confirmed {
-            if let Some(mut captured) = retirement.capture_rx.take() {
-                if tokio::time::timeout(Duration::from_secs(1), &mut captured)
-                    .await
-                    .is_ok()
-                {
-                    retirement.capture_confirmed = true;
-                } else {
-                    retirement.capture_rx = Some(captured);
-                }
-            }
-        }
+        retirement
+            .drive_retirement(CodexRestartRetirementBudgets::full())
+            .await;
 
-        // Only after the watcher has captured the pid/start-time tree may
-        // transport closure or consumer cancellation make the direct sidecar
-        // exit. Retain unfinished handles in quarantine for a same-request
-        // coordinator retry.
-        if retirement.capture_confirmed {
-            if !retirement.consumer_quiesced {
-                if let Some(mut consumer) = retirement.consumer.take() {
-                    consumer.abort();
-                    if tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
-                        .await
-                        .is_ok()
-                    {
-                        retirement.consumer_quiesced = true;
-                    } else {
-                        retirement.consumer = Some(consumer);
-                    }
-                } else {
-                    retirement.consumer_quiesced = true;
-                }
-            }
-            if !retirement.transport_closed {
-                retirement.client.close().await;
-                retirement.transport_closed = true;
-            }
-            if !retirement.tree_quiesced {
-                if let Some(mut watcher) = retirement.watcher.take() {
-                    match tokio::time::timeout(RESTART_WATCHER_JOIN_BUDGET, &mut watcher).await {
-                        Ok(Ok(true)) => retirement.tree_quiesced = true,
-                        Ok(_) => {}
-                        Err(_) => retirement.watcher = Some(watcher),
-                    }
-                }
-            }
-        }
-
-        if !(retirement.capture_confirmed
-            && retirement.consumer_quiesced
-            && retirement.transport_closed
-            && retirement.tree_quiesced)
-        {
+        if !retirement.quiesced() {
             tracing::error!(
                 provider = PROVIDER,
                 session_id = %retirement.session_id,
@@ -2140,6 +2183,14 @@ impl FreshCodexState {
                 .insert(expected_runtime_id.to_string(), retirement);
             return crate::RestartShutdownOutcome::RetirementIncomplete { message };
         }
+        self.finalize_restart_retirement(&retirement).await;
+        crate::RestartShutdownOutcome::Stopped
+    }
+
+    /// The Stopped-path tail shared by the ordinary retirement continuation
+    /// and the server-shutdown drain: reopen the durable lease, drop the
+    /// restart lease pin, and evict the retired session's create-dedup cache.
+    async fn finalize_restart_retirement(&self, retirement: &CodexRestartRetirement) {
         self.leases.clear_binding(PROVIDER, &retirement.session_id);
         self.restart_lease_pins
             .lock()
@@ -2148,7 +2199,125 @@ impl FreshCodexState {
         self.create_dedup
             .clear_for_session(|record| record.session_id == retirement.session_id)
             .await;
-        crate::RestartShutdownOutcome::Stopped
+    }
+
+    /// Server-shutdown drain (fix 1): quarantined runtimes are outside
+    /// `sessions`, so the ordinary [`Self::shutdown`] sweep never sees them.
+    /// Drive every retirement through the same bounded quiescence steps as
+    /// [`Self::continue_codex_restart_retirement`] with per-entry budgets
+    /// CLAMPED by the shared drain deadline (LB-02), and log loudly on any
+    /// budget violation. A truncated entry is RELEASED (its lease pin stays
+    /// held — fail-closed): the durable pending row owns cross-boot recovery
+    /// next boot.
+    pub async fn drain_restart_retirements(&self, deadline: tokio::time::Instant) {
+        let entries: Vec<CodexRestartRetirement> = {
+            let mut retirements = self.restart_retirements.lock().await;
+            retirements
+                .drain()
+                .map(|(_, retirement)| retirement)
+                .collect()
+        };
+        if entries.is_empty() {
+            return;
+        }
+        tracing::info!(
+            provider = PROVIDER,
+            count = entries.len(),
+            "agent.restart.codex_quarantine_drain_started"
+        );
+        for mut retirement in entries {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::error!(
+                    provider = PROVIDER,
+                    session_id = %retirement.session_id,
+                    runtime_id = %retirement.runtime_id,
+                    "agent.restart.codex_quarantine_drain_deadline_exhausted"
+                );
+                continue;
+            }
+            retirement
+                .drive_retirement(CodexRestartRetirementBudgets::full().clamped_by(remaining))
+                .await;
+            if retirement.quiesced() {
+                self.finalize_restart_retirement(&retirement).await;
+            } else {
+                tracing::error!(
+                    provider = PROVIDER,
+                    session_id = %retirement.session_id,
+                    runtime_id = %retirement.runtime_id,
+                    capture_confirmed = retirement.capture_confirmed,
+                    consumer_quiesced = retirement.consumer_quiesced,
+                    transport_closed = retirement.transport_closed,
+                    tree_quiesced = retirement.tree_quiesced,
+                    "agent.restart.codex_quarantine_drain_not_quiescent"
+                );
+            }
+        }
+    }
+
+    /// Test-only fixture seam (cross-crate): insert a scripted codex session
+    /// without spawning a real `codex app-server`, so `freshell-ws`
+    /// integration tests (restart_protocol's LB-02 shared-deadline shutdown
+    /// sequence) can drive a REAL restart quarantine drain end-to-end. Mirrors
+    /// the in-crate `tests::insert_fake_session` with the caller's own
+    /// consumer driver; the caller owns the child (spawn it with a real pid
+    /// for /proc kill-confirmation assertions).
+    #[doc(hidden)]
+    pub async fn insert_fixture_session_for_restart_shutdown(
+        &self,
+        thread_id: &str,
+        client: Arc<CodexAppServerClient>,
+        consumer: tokio::task::JoinHandle<()>,
+        child: tokio::process::Child,
+        ownership_id: &str,
+    ) -> freshell_protocol::RuntimeDescriptor {
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let exited = Arc::new(AtomicBool::new(false));
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{thread_id}"),
+            generation: 1,
+        };
+        let root_pid = child.id().unwrap_or(0);
+        let watcher = spawn_exit_watcher(
+            child,
+            ownership_id.to_string(),
+            thread_id.to_string(),
+            self.broadcast_tx.clone(),
+            kill_rx,
+            exited.clone(),
+            Arc::clone(&self.leases),
+            Arc::clone(&self.restart_lease_pins),
+            runtime.clone(),
+        );
+        self.sessions.lock().await.insert(
+            thread_id.to_string(),
+            CodexSession {
+                runtime: runtime.clone(),
+                client,
+                root_pid,
+                ownership_id: ownership_id.to_string(),
+                model: "gpt-5.3-codex-spark".to_string(),
+                effort: None,
+                cwd: None,
+                sandbox: None,
+                permission_mode: None,
+                active_turn: Arc::new(StdMutex::new(None)),
+                consumer,
+                kill_tx: Some(kill_tx),
+                watcher,
+                exited,
+            },
+        );
+        runtime
+    }
+
+    /// Test-only visibility seam for the same cross-crate shutdown-drain
+    /// integration tests: how many restart retirements are currently
+    /// quarantined.
+    #[doc(hidden)]
+    pub async fn restart_retirement_count_for_test(&self) -> usize {
+        self.restart_retirements.lock().await.len()
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -4824,7 +4993,10 @@ pub(crate) mod tests {
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
     // ── DIAG-01 lifecycle tracing events (capturing test facility) ────────
-    mod tracing_capture {
+    // `pub(crate)`: the claude drain tests reuse this global capture from
+    // `crate::codex::tests::tracing_capture` rather than duplicating the
+    // layer.
+    pub(crate) mod tracing_capture {
         use std::collections::BTreeMap;
         use std::sync::{Arc, Mutex, OnceLock};
         use tracing::field::{Field, Visit};
@@ -6117,6 +6289,185 @@ while true; do read -r -t 1 _ || true; done
             ),
             "a quarantined restart retirement must hold the durable lease binding \
              until the retirement's Stopped path"
+        );
+    }
+
+    /// Shutdown drain (fix 1): quarantined retirements live OUTSIDE the
+    /// `sessions` map, so the ordinary `shutdown()` sweep never sees them.
+    /// `drain_restart_retirements` must drive every quarantined entry through
+    /// the same bounded quiescence steps — confirmed process-tree termination,
+    /// consumer join, transport close — and only then reopen the durable
+    /// lease and drop the lease pin.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_codex_restart_quarantine_with_confirmed_termination() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        let child = spawn_sleeper();
+        let child_pid = child.id().expect("fixture pid") as i32;
+        insert_fake_session(
+            &st,
+            "thread-shutdown-drain",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-shutdown-drain",
+        )
+        .await;
+        drop(peer);
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-shutdown-drain", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(
+            PROVIDER,
+            "thread-shutdown-drain",
+            "original",
+            "thread-shutdown-drain"
+        ));
+
+        // Park the consumer so the first retirement drive reports Incomplete
+        // (the entry quarantines). ReleaseOnDrop frees the parked blocking
+        // task on every exit path so a failed assertion cannot wedge the
+        // runtime.
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release = ReleaseOnDrop(blocker_release.clone());
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions
+                .get_mut("thread-shutdown-drain")
+                .expect("inserted session");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+
+        assert!(matches!(
+            st.shutdown_for_restart_detailed(
+                "thread-shutdown-drain",
+                "fresh-runtime-test-thread-shutdown-drain",
+            )
+            .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
+        assert_eq!(st.restart_retirements.lock().await.len(), 1);
+
+        // Free the parked consumer, then run the server-shutdown drain: the
+        // quarantined entry must reach full quiescence INSIDE the drain.
+        drop(_release);
+        st.drain_restart_retirements(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+
+        assert!(
+            st.restart_retirements.lock().await.is_empty(),
+            "the drain must empty the quarantine map"
+        );
+        assert!(
+            !st.restart_lease_pins
+                .lock()
+                .await
+                .contains("thread-shutdown-drain"),
+            "the drain's completed path must release the lease pin"
+        );
+        let probe = unsafe { libc::kill(child_pid, 0) };
+        assert!(
+            probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+            "the quarantined sidecar pid must be confirmed gone from /proc (kill verified, not detached)"
+        );
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-shutdown-drain", "next-boot", 2),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the durable lease reopens only after the drain confirms quiescence"
+        );
+    }
+
+    /// Drain truncation (fix 1): an entry that cannot quiesce within the
+    /// CLAMPED per-step budgets (the parked consumer outlives the shrunken
+    /// consumer budget) is RELEASED with a loud error — cross-boot recovery
+    /// through the durable pending row owns convergence — and the lease pin
+    /// stays held (fail-closed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_release_codex_truncated_entry_with_a_loud_log() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let st = state();
+        insert_fake_session(
+            &st,
+            "thread-drain-truncated",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-drain-truncated",
+        )
+        .await;
+        drop(peer);
+        let capture = tracing_capture::capture_by_session("thread-drain-truncated");
+
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release = ReleaseOnDrop(blocker_release.clone());
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions
+                .get_mut("thread-drain-truncated")
+                .expect("inserted session");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+        assert!(matches!(
+            st.shutdown_for_restart_detailed(
+                "thread-drain-truncated",
+                "fresh-runtime-test-thread-drain-truncated",
+            )
+            .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
+        assert_eq!(st.restart_retirements.lock().await.len(), 1);
+
+        // Keep the consumer parked THROUGH the drain and clamp the shared
+        // deadline so the consumer join outlives its budget: the entry cannot
+        // quiesce in time.
+        st.drain_restart_retirements(tokio::time::Instant::now() + Duration::from_millis(25))
+            .await;
+
+        assert!(
+            st.restart_retirements.lock().await.is_empty(),
+            "the truncated entry is released to cross-boot recovery, not re-quarantined"
+        );
+        assert!(
+            st.restart_lease_pins
+                .lock()
+                .await
+                .contains("thread-drain-truncated"),
+            "a truncated drain must keep the lease pin fail-closed"
+        );
+        let events = capture.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message == "agent.restart.codex_quarantine_drain_not_quiescent"),
+            "the truncation must log loudly: {events:?}"
         );
     }
 

@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use freshell_protocol::{
     AgentRestart, AgentRestartFailed, AgentRestartFailureCode, AgentRestartReplaced,
-    AgentRestartStarted, AgentRuntimeKind, OldRuntimeDescriptor, RuntimeDescriptor, ServerMessage,
+    AgentRestartStarted, AgentRuntimeKind, FreshAgentCreateFailed, OldRuntimeDescriptor,
+    RuntimeDescriptor, ServerMessage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -512,6 +513,20 @@ pub struct RestartCoordinator {
     /// created during normal runtime recover without any boot-pass backlog or
     /// browser resend.
     recovery_notify: Arc<tokio::sync::Notify>,
+    /// Graceful-shutdown latch (fix 1). `main.rs` wires the SAME
+    /// `Arc<AtomicBool>` its `shutdown_signal` sets, so restart ingress and
+    /// replacement creation refuse the instant shutdown begins. The
+    /// indirection lets boot order install the latch after construction while
+    /// every clone of the coordinator still observes one flag.
+    shutdown_latch: Arc<std::sync::RwLock<Arc<AtomicBool>>>,
+    /// Every restart transaction spawned through
+    /// [`Self::spawn_registered`] (the WS ingress door). Graceful shutdown
+    /// joins this set BEFORE provider/terminal cleanup, so `kill_all` can
+    /// never reap the selected old runtime of a mid-flight transaction.
+    transactions: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Test-only deterministic parking seam for the LB-06 race test (see
+    /// [`SpawnRegistrationRaceGate`]). Never installed in production.
+    spawn_race_gate: Arc<Mutex<Option<SpawnRegistrationRaceGate>>>,
 }
 
 const DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT: usize = 1_024;
@@ -540,6 +555,56 @@ pub struct RestartRuntimeRegistration {
 /// progress. Callers must retain it through the final spawn/adoption commit.
 pub struct RestartSessionAdmission {
     _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Test seam for the LB-06 race test
+/// (`spawn_registered_cannot_insert_after_the_drain_observed_empty`): when
+/// armed, the NEXT [`RestartCoordinator::spawn_registered`] call that clears
+/// the fast-path latch check signals `wait_until_fast_path_passed` and parks
+/// BEFORE acquiring the transactions mutex until [`Self::release`] fires.
+/// That pins the exact interleaving — fast-path passed, latch set, empty
+/// drain completed, THEN the mutex acquired — without sleeps, so the test
+/// proves the in-mutex latch re-check refuses a spawn that crosses a
+/// completed shutdown drain.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct SpawnRegistrationRaceGate {
+    inner: Arc<SpawnRegistrationRaceGateInner>,
+}
+
+#[derive(Default)]
+struct SpawnRegistrationRaceGateInner {
+    armed: AtomicBool,
+    passed: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl SpawnRegistrationRaceGate {
+    /// Arm the single-use parking point for the next spawn.
+    pub fn arm(&self) {
+        self.inner.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Resolve once the armed spawn has passed the fast-path latch check and
+    /// is parked immediately before the transactions mutex. (One stored
+    /// permit: resolving after the signal still returns immediately.)
+    pub async fn wait_until_fast_path_passed(&self) {
+        self.inner.passed.notified().await;
+    }
+
+    /// Let the parked spawn proceed to the mutex, where it must observe the
+    /// latch via the in-lock re-check. (One stored permit: releasing before
+    /// the spawn parks still passes it.)
+    pub fn release(&self) {
+        self.inner.release.notify_one();
+    }
+
+    async fn park_if_armed(&self) {
+        if self.inner.armed.swap(false, Ordering::SeqCst) {
+            self.inner.passed.notify_one();
+            self.inner.release.notified().await;
+        }
+    }
 }
 
 struct LockRetentionGuard<'a>(&'a RestartCoordinator);
@@ -619,6 +684,9 @@ impl RestartCoordinator {
             ownership_limit: ownership_limit.max(1),
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
             recovery_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_latch: Arc::new(std::sync::RwLock::new(Arc::new(AtomicBool::new(false)))),
+            transactions: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+            spawn_race_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -682,6 +750,9 @@ impl RestartCoordinator {
             ownership_limit,
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
             recovery_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_latch: Arc::new(std::sync::RwLock::new(Arc::new(AtomicBool::new(false)))),
+            transactions: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+            spawn_race_gate: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1214,6 +1285,149 @@ impl RestartCoordinator {
         let runtime = runtime.unwrap_or_else(|| Arc::new(UnavailableRestartRuntime));
         self.execute_with_events(request, runtime.as_ref(), emit)
             .await
+    }
+
+    /// Install the shared graceful-shutdown latch. `main.rs` wires the SAME
+    /// `Arc<AtomicBool>` its signal handler sets, so restarts refuse the
+    /// instant shutdown begins; until wired, the coordinator consults a
+    /// private never-set flag (every clone observes the installed latch).
+    pub fn set_shutdown_latch(&self, latch: Arc<AtomicBool>) {
+        *self
+            .shutdown_latch
+            .write()
+            .expect("restart shutdown latch lock") = latch;
+    }
+
+    /// The currently-installed shutdown latch (a process-wide `Arc` once
+    /// [`Self::set_shutdown_latch`] has run).
+    pub fn shutdown_latch_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(
+            &self
+                .shutdown_latch
+                .read()
+                .expect("restart shutdown latch lock"),
+        )
+    }
+
+    fn shutdown_latched(&self) -> bool {
+        self.shutdown_latch
+            .read()
+            .expect("restart shutdown latch lock")
+            .load(Ordering::SeqCst)
+    }
+
+    /// Latch restart ingress and replacement creation shut. Registered
+    /// in-flight transactions still run (the shutdown sequence joins them
+    /// through [`Self::join_in_flight_transactions`]), but no new spawn is
+    /// admitted and no replacement is created after this point.
+    pub fn begin_restart_shutdown(&self) {
+        self.shutdown_latch_handle().store(true, Ordering::SeqCst);
+    }
+
+    /// Install the LB-06 deterministic parking seam used by the
+    /// `spawn_registered_cannot_insert_after_the_drain_observed_empty` race
+    /// test. Never installed in production.
+    #[doc(hidden)]
+    pub fn set_spawn_registration_race_gate(&self, gate: SpawnRegistrationRaceGate) {
+        *self
+            .spawn_race_gate
+            .lock()
+            .expect("restart spawn race gate") = Some(gate);
+    }
+
+    /// The one typed ingress rejection shared by the WS door and the internal
+    /// entry check: retryable (a later server run may recover cleanly) but NOT
+    /// `recovery_pending` — no durable row exists for a never-started restart.
+    fn shutdown_rejection_frame(&self, request: &AgentRestart) -> ServerMessage {
+        ServerMessage::AgentRestartFailed(AgentRestartFailed {
+            request_id: request.request_id.clone(),
+            provider: request.provider.clone(),
+            session_id: request.session_id.clone(),
+            kind: request.kind,
+            runtime: RuntimeDescriptor {
+                runtime_id: request.live_id.clone(),
+                generation: request.expected_generation,
+            },
+            code: AgentRestartFailureCode::ShutdownFailed,
+            message: "server is shutting down; restart not started".to_string(),
+            retryable: true,
+            recovery_pending: false,
+        })
+    }
+
+    /// Register one restart transaction as a spawned task the graceful
+    /// shutdown sequence can join. Returns `false` — after emitting the typed
+    /// shutdown rejection through `emit` — when the shutdown latch is already
+    /// set, registering nothing.
+    ///
+    /// The latch is checked twice (load-bearing LB-06): the fast-path load
+    /// above the mutex is only an optimization; a task parked on the
+    /// transactions mutex could otherwise resume after
+    /// `begin_restart_shutdown` + a completed empty drain and insert a racing
+    /// transaction the join never visits. The authoritative check therefore
+    /// happens again INSIDE the lock.
+    pub async fn spawn_registered(
+        &self,
+        request: AgentRestart,
+        mut emit: impl FnMut(&ServerMessage) + Send + 'static,
+    ) -> bool {
+        if self.shutdown_latched() {
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                "agent.restart.rejected_shutdown"
+            );
+            emit(&self.shutdown_rejection_frame(&request));
+            return false;
+        }
+        let race_gate = self
+            .spawn_race_gate
+            .lock()
+            .expect("restart spawn race gate")
+            .clone();
+        if let Some(gate) = race_gate {
+            gate.park_if_armed().await;
+        }
+        let coordinator = self.clone();
+        let mut transactions = self.transactions.lock().await;
+        if self.shutdown_latched() {
+            drop(transactions);
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                "agent.restart.rejected_shutdown"
+            );
+            emit(&self.shutdown_rejection_frame(&request));
+            return false;
+        }
+        transactions.spawn(async move {
+            coordinator
+                .execute_registered(request, |message| emit(message))
+                .await;
+        });
+        drop(transactions);
+        true
+    }
+
+    /// Wait until every registered in-flight transaction task has returned.
+    /// The caller bounds the wait (the shutdown sequence hands this a slice
+    /// of the SAFE-11 hard-timeout watchdog); a late rejection can never
+    /// insert after this drain observed the set empty, because the in-mutex
+    /// latch re-check in [`Self::spawn_registered`] closes that race.
+    pub async fn join_in_flight_transactions(&self) {
+        let mut transactions = self.transactions.lock().await;
+        while let Some(result) = transactions.join_next().await {
+            if let Err(error) = result {
+                // Never propagate: the shutdown sequence must finish this
+                // pass over the remaining registered tasks.
+                tracing::error!(
+                    error = %error,
+                    "agent.restart.shutdown.transaction_panicked"
+                );
+            }
+        }
     }
 
     /// Retry every durable post-shutdown replacement after the production
@@ -2000,6 +2214,24 @@ impl RestartCoordinator {
         R: RestartRuntime + ?Sized,
         F: FnMut(&ServerMessage),
     {
+        // Shutdown latch (fix 1): once latched, no NEW transaction work
+        // begins — not even a retry of an already-pending row. Retained
+        // durable rows are converged by next-boot recovery; the outcome
+        // mirrors the WS door's typed ingress rejection.
+        if self.shutdown_latched() {
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                "agent.restart.rejected_shutdown"
+            );
+            let terminal = self.shutdown_rejection_frame(&request);
+            emit(&terminal);
+            return RestartOutcome {
+                messages: vec![terminal],
+                replayed: false,
+            };
+        }
         let locator = RuntimeLocator::from_request(&request);
         let session_key = locator.session_key();
         let request_lock = self.request_lock(&request.request_id);
@@ -2329,6 +2561,47 @@ impl RestartCoordinator {
                 return outcome;
             }
         };
+
+        // Shutdown interlock (fix 1/LB-02): the latch may have flipped while
+        // the provider retirement was in flight. Retirement completing is
+        // fine (its barriers confirm the old tree dead), but creating a NEW
+        // writer must never race the shutdown cleanup sweep. Refuse with the
+        // retryable recovery-pending shape: the durable row is retained and
+        // next-boot recovery owns the deferred replacement.
+        if self.shutdown_latched() {
+            let failure = RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "server is shutting down; replacement deferred",
+                true,
+            );
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                runtime_id = %expected.runtime_id,
+                generation = expected.generation,
+                "agent.restart.replacement.deferred_for_shutdown"
+            );
+            let failed = self.failure_frame(&request, expected.clone(), &failure, true);
+            let persisted =
+                self.try_update_ownership("record_retryable_replacement_failure", |ownership| {
+                    if let Some(recovery) =
+                        ownership.pending_recoveries.get_mut(&request.request_id)
+                    {
+                        recovery.last_failure = Some(failed.clone());
+                    }
+                });
+            let mut outcome = self.persisted_outcome(
+                &request,
+                expected,
+                ServerMessage::AgentRestartFailed(failed),
+                persisted,
+                IndeterminateEmit::KeepExisting,
+            );
+            emit(&outcome.messages[0]);
+            outcome.messages.insert(0, started);
+            return outcome;
+        }
 
         {
             let mut ownership = self.ownership.lock().expect("restart ownership lock");
@@ -2854,6 +3127,50 @@ impl RestartCoordinator {
                     };
                 }
             }
+        }
+
+        // Shutdown interlock (fix 1/LB-02): same refusal as the live path —
+        // the latch may have flipped while the recovery's retirement or
+        // ambiguous-replacement quiesce ran. Defer the replacement: the row
+        // is retained (retryable, recovery_pending) for next-boot recovery.
+        if self.shutdown_latched() {
+            let failure = RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "server is shutting down; replacement deferred",
+                true,
+            );
+            tracing::info!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                old_runtime_id = %pending.old_runtime.runtime_id,
+                old_generation = pending.old_runtime.generation,
+                "agent.restart.recovery.deferred_for_shutdown"
+            );
+            let failed = self.failure_frame(&request, pending.old_runtime.clone(), &failure, true);
+            let owner_request_id = pending.request_id.clone();
+            let persisted =
+                self.try_update_ownership("record_retryable_recovery_failure", |ownership| {
+                    if let Some(recovery) = ownership.pending_recoveries.get_mut(&owner_request_id)
+                    {
+                        recovery.last_failure = Some(failed.clone());
+                    }
+                });
+            let terminal = self
+                .persisted_outcome(
+                    &request,
+                    pending.old_runtime,
+                    ServerMessage::AgentRestartFailed(failed),
+                    persisted,
+                    IndeterminateEmit::KeepExisting,
+                )
+                .messages
+                .remove(0);
+            emit(&terminal);
+            return RestartOutcome {
+                messages: vec![started, terminal],
+                replayed: false,
+            };
         }
 
         {
@@ -4089,6 +4406,35 @@ impl ProductionFreshRuntime for WsStateFreshRuntime {
         create: freshell_protocol::FreshAgentCreate,
         replacement_ownership_id: Option<&str>,
     ) {
+        // Defense-in-depth (fix 1/LB-02): the coordinator refuses fenced
+        // replacement creation once the shutdown latch is set; guard the
+        // actual spawn too — a latch flipped between that check and this
+        // dispatch must never mint a writer the shutdown cleanup sweep is
+        // racing. Answer the awaiting transaction with a retryable failure
+        // frame so it settles inside the shutdown join budget instead of
+        // waiting out its result timeout with the row retained.
+        if self
+            .state
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::error!(
+                provider = provider_name(provider),
+                request_id = %create.request_id,
+                "agent.restart.replacement_refused_shutdown"
+            );
+            if let Ok(frame) = serde_json::to_string(&ServerMessage::FreshAgentCreateFailed(
+                FreshAgentCreateFailed {
+                    code: "SHUTDOWN_IN_PROGRESS".to_string(),
+                    message: "server is shutting down; fresh-agent replacement refused".to_string(),
+                    request_id: create.request_id.clone(),
+                    retryable: Some(true),
+                },
+            )) {
+                let _ = self.state.broadcast_tx.send(frame);
+            }
+            return;
+        }
         match (provider, replacement_ownership_id) {
             (freshell_protocol::AgentProvider::Claude, Some(ownership_id)) => {
                 self.state

@@ -266,6 +266,78 @@ struct ClaudeRestartRetirement {
     child_reaped: bool,
 }
 
+/// Per-step quiescence budgets for one claude restart retirement drive. The
+/// ordinary continuation path uses the full constants; the server-shutdown
+/// drain CLAMPS each step by what remains of the shared cross-provider drain
+/// deadline (LB-02), so a slow quiescence can never blow the shutdown
+/// envelope. (`tree.terminate_and_confirm()` is already self-bounded by its
+/// fixed signal rounds, so it is not driven by the budget.)
+#[derive(Debug, Clone, Copy)]
+struct ClaudeRestartRetirementBudgets {
+    consumer: Duration,
+    child_reap: Duration,
+}
+
+impl ClaudeRestartRetirementBudgets {
+    fn full() -> Self {
+        Self {
+            consumer: RESTART_CONSUMER_JOIN_BUDGET,
+            child_reap: RESTART_CHILD_REAP_BUDGET,
+        }
+    }
+
+    fn clamped_by(self, remaining: Duration) -> Self {
+        Self {
+            consumer: self.consumer.min(remaining),
+            child_reap: self.child_reap.min(remaining),
+        }
+    }
+}
+
+impl ClaudeRestartRetirement {
+    /// Drive the staged quiescence steps (confirmed process-tree death via the
+    /// capture-before-kill barrier → stdin close → consumer abort+join → child
+    /// reap) with the given budgets, preserving partial progress across calls:
+    /// each completed step latches its own flag. Keep stdin and the output
+    /// consumer alive until the capture-before-kill barrier finishes — closing
+    /// either first can make the sidecar exit and reparent an SDK child before
+    /// YAMA lets us identify it.
+    async fn drive_retirement(&mut self, budgets: ClaudeRestartRetirementBudgets) {
+        if !self.tree_dead {
+            self.tree_dead = self.tree.terminate_and_confirm().await;
+        }
+
+        if self.tree_dead {
+            self.stdin.take();
+            if !self.consumer_quiesced {
+                if let Some(mut consumer) = self.consumer.take() {
+                    consumer.abort();
+                    if tokio::time::timeout(budgets.consumer, &mut consumer)
+                        .await
+                        .is_ok()
+                    {
+                        self.consumer_quiesced = true;
+                    } else {
+                        self.consumer = Some(consumer);
+                    }
+                } else {
+                    self.consumer_quiesced = true;
+                }
+            }
+            if !self.child_reaped {
+                self.child_reaped = matches!(
+                    tokio::time::timeout(budgets.child_reap, self.child.wait()).await,
+                    Ok(Ok(_))
+                );
+            }
+        }
+    }
+
+    fn quiesced(&self) -> bool {
+        self.tree_dead && self.consumer_quiesced && self.child_reaped
+    }
+}
+
 impl FreshClaudeState {
     /// Build the state around the shared broadcast bus.
     pub fn new(broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>) -> Self {
@@ -940,39 +1012,11 @@ impl FreshClaudeState {
             return crate::RestartShutdownOutcome::Stale;
         };
 
-        if !retirement.tree_dead {
-            retirement.tree_dead = retirement.tree.terminate_and_confirm().await;
-        }
+        retirement
+            .drive_retirement(ClaudeRestartRetirementBudgets::full())
+            .await;
 
-        // Keep stdin and the output consumer alive until the capture-before-kill
-        // barrier finishes. Closing either first can make the sidecar exit and
-        // reparent an SDK child before YAMA lets us identify it.
-        if retirement.tree_dead {
-            retirement.stdin.take();
-            if !retirement.consumer_quiesced {
-                if let Some(mut consumer) = retirement.consumer.take() {
-                    consumer.abort();
-                    if tokio::time::timeout(RESTART_CONSUMER_JOIN_BUDGET, &mut consumer)
-                        .await
-                        .is_ok()
-                    {
-                        retirement.consumer_quiesced = true;
-                    } else {
-                        retirement.consumer = Some(consumer);
-                    }
-                } else {
-                    retirement.consumer_quiesced = true;
-                }
-            }
-            if !retirement.child_reaped {
-                retirement.child_reaped = matches!(
-                    tokio::time::timeout(RESTART_CHILD_REAP_BUDGET, retirement.child.wait()).await,
-                    Ok(Ok(_))
-                );
-            }
-        }
-
-        if !(retirement.tree_dead && retirement.consumer_quiesced && retirement.child_reaped) {
+        if !retirement.quiesced() {
             tracing::error!(
                 provider = PROVIDER,
                 session_id = %retirement.durable_session_id,
@@ -998,6 +1042,15 @@ impl FreshClaudeState {
             return crate::RestartShutdownOutcome::RetirementIncomplete { message };
         }
 
+        self.finalize_restart_retirement(&retirement).await;
+        crate::RestartShutdownOutcome::Stopped
+    }
+
+    /// The Stopped-path tail shared by the ordinary retirement continuation
+    /// and the server-shutdown drain: evict the retired session's create-dedup
+    /// cache, drop the durable cli_index routes, and reopen the durable lease
+    /// bindings.
+    async fn finalize_restart_retirement(&self, retirement: &ClaudeRestartRetirement) {
         self.create_dedup
             .clear_for_session(|record| record.session_id == retirement.map_key)
             .await;
@@ -1015,7 +1068,61 @@ impl FreshClaudeState {
         for durable in removed_durables {
             self.leases.clear_binding(PROVIDER, &durable);
         }
-        crate::RestartShutdownOutcome::Stopped
+    }
+
+    /// Server-shutdown drain (fix 1): quarantined runtimes are outside
+    /// `sessions`, so the ordinary [`Self::shutdown`] sweep never sees them.
+    /// Drive every retirement through the same bounded quiescence steps as
+    /// [`Self::continue_restart_retirement`] with per-entry budgets CLAMPED by
+    /// the shared drain deadline (LB-02), and log loudly on any budget
+    /// violation. A truncated entry is RELEASED (its durable rows and indexes
+    /// stay untouched — fail-closed): the durable pending row owns cross-boot
+    /// recovery next boot.
+    pub async fn drain_restart_retirements(&self, deadline: tokio::time::Instant) {
+        let entries: Vec<ClaudeRestartRetirement> = {
+            let mut retirements = self.restart_retirements.lock().await;
+            retirements
+                .drain()
+                .map(|(_, retirement)| retirement)
+                .collect()
+        };
+        if entries.is_empty() {
+            return;
+        }
+        tracing::info!(
+            provider = PROVIDER,
+            count = entries.len(),
+            "agent.restart.claude_quarantine_drain_started"
+        );
+        for mut retirement in entries {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::error!(
+                    provider = PROVIDER,
+                    session_id = %retirement.durable_session_id,
+                    runtime_id = %retirement.runtime_id,
+                    "agent.restart.claude_quarantine_drain_deadline_exhausted"
+                );
+                continue;
+            }
+            retirement
+                .drive_retirement(ClaudeRestartRetirementBudgets::full().clamped_by(remaining))
+                .await;
+            if retirement.quiesced() {
+                self.finalize_restart_retirement(&retirement).await;
+            } else {
+                tracing::error!(
+                    provider = PROVIDER,
+                    session_id = %retirement.durable_session_id,
+                    runtime_id = %retirement.runtime_id,
+                    ownership_id = %retirement.ownership_id,
+                    consumer_quiesced = retirement.consumer_quiesced,
+                    tree_dead = retirement.tree_dead,
+                    child_reaped = retirement.child_reaped,
+                    "agent.restart.claude_quarantine_drain_not_quiescent"
+                );
+            }
+        }
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
@@ -2605,6 +2712,20 @@ pub(crate) mod tests {
         (FreshClaudeState::new(Arc::new(tx)), rx)
     }
 
+    /// Panic-safe release for the parked-`spawn_blocking` consumer fixtures:
+    /// the blocker is signalled on EVERY scope exit, so an assertion panic can
+    /// never strand the blocking task parked on the `Condvar` and wedge the
+    /// `multi_thread` runtime's drop (the codex test suite's `ReleaseOnDrop`
+    /// precedent).
+    struct ReleaseOnDropClaude(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for ReleaseOnDropClaude {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+    }
+
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
             provider: freshell_protocol::AgentProvider::Claude,
@@ -3038,6 +3159,155 @@ exit 0
             st.leases.claim(PROVIDER, "eof-reparent", "replacement", 2),
             crate::session_lease::FreshSessionClaim::Acquired,
             "the durable lease reopens only after the descendant death barrier"
+        );
+    }
+
+    /// Shutdown drain (fix 1): quarantined retirements live OUTSIDE the
+    /// `sessions` map, so the ordinary `shutdown()` sweep never sees them.
+    /// `drain_restart_retirements` must drive every quarantined entry through
+    /// the same bounded quiescence steps — confirmed process-tree termination,
+    /// consumer join, child reap — and only then reopen the durable lease.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_claude_restart_quarantine_with_confirmed_termination() {
+        let st = state();
+        let durable = "drain-confirmed";
+        insert_fake_claude_session(&st, durable).await;
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), durable.to_string());
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(PROVIDER, durable, "original", durable));
+        let child_pid = {
+            let sessions = st.sessions.lock().await;
+            sessions[durable].child.id().expect("fixture pid") as i32
+        };
+
+        // Park the consumer so the first retirement drive reports Incomplete
+        // (the entry quarantines). The release below frees the parked blocking
+        // task before the drain so its bounded joins can finish.
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut(durable).expect("inserted fixture");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+
+        assert!(matches!(
+            st.shutdown_for_restart_detailed(durable, "fresh-runtime-test-drain-confirmed")
+                .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
+        assert_eq!(st.restart_retirements.lock().await.len(), 1);
+
+        {
+            let (released, wake) = &*blocker_release;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        st.drain_restart_retirements(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await;
+
+        assert!(
+            st.restart_retirements.lock().await.is_empty(),
+            "the drain must empty the quarantine map"
+        );
+        assert!(
+            !st.cli_index.lock().await.contains_key(durable),
+            "the drain's completed path must evict the dead durable route"
+        );
+        let probe = unsafe { libc::kill(child_pid, 0) };
+        assert!(
+            probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+            "the quarantined sidecar pid must be confirmed gone from /proc (kill verified, not detached)"
+        );
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "next-boot", 2),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "the durable lease reopens only after the drain confirms quiescence"
+        );
+    }
+
+    /// Drain truncation (fix 1): an entry that cannot quiesce within the
+    /// CLAMPED per-step budgets (the parked consumer outlives the shrunken
+    /// consumer budget) is RELEASED with a loud error — cross-boot recovery
+    /// through the durable pending row owns convergence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_release_claude_truncated_entry_with_a_loud_log() {
+        let st = state();
+        let durable = "drain-truncated";
+        insert_fake_claude_session(&st, durable).await;
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), durable.to_string());
+        assert_eq!(
+            st.leases.claim(PROVIDER, durable, "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(PROVIDER, durable, "original", durable));
+        let capture = crate::codex::tests::tracing_capture::capture_by_session(durable);
+
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release = ReleaseOnDropClaude(blocker_release.clone());
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions.get_mut(durable).expect("inserted fixture");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+        assert!(matches!(
+            st.shutdown_for_restart_detailed(durable, "fresh-runtime-test-drain-truncated")
+                .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
+        assert_eq!(st.restart_retirements.lock().await.len(), 1);
+
+        // Keep the consumer parked THROUGH the drain and clamp the shared
+        // deadline so the consumer join outlives its budget: the entry cannot
+        // quiesce in time.
+        st.drain_restart_retirements(tokio::time::Instant::now() + Duration::from_millis(25))
+            .await;
+
+        assert!(
+            st.restart_retirements.lock().await.is_empty(),
+            "the truncated entry is released to cross-boot recovery, not re-quarantined"
+        );
+        assert!(
+            st.cli_index.lock().await.contains_key(durable),
+            "a truncated drain keeps the durable route fail-closed"
+        );
+        let events = capture.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.message == "agent.restart.claude_quarantine_drain_not_quiescent"),
+            "the truncation must log loudly: {events:?}"
         );
     }
 

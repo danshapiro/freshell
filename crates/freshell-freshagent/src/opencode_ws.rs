@@ -1284,6 +1284,29 @@ impl FreshOpencodeState {
         crate::RestartShutdownOutcome::Stopped
     }
 
+    /// Server-shutdown bookkeeping drain (fix 1): a quarantined OpenCode
+    /// restart retirement owns NO local process — its fenced remote abort is
+    /// the NEXT BOOT's cross-boot recovery job (the durable pending row owns
+    /// it), so there is nothing here to confirm dead. Log the abandoned
+    /// entries loudly (never claim a quiet quiescence) and clear the map.
+    pub async fn drain_restart_retirements(&self) {
+        let drained: Vec<(String, String)> = {
+            let mut retirements = self.restart_retirements.lock().await;
+            retirements
+                .drain()
+                .map(|(runtime_id, retirement)| (runtime_id, retirement.requested_session_id))
+                .collect()
+        };
+        if !drained.is_empty() {
+            tracing::error!(
+                provider = PROVIDER,
+                entries = drained.len(),
+                retired = ?drained,
+                "agent.restart.opencode_quarantine_drain_bookkeeping"
+            );
+        }
+    }
+
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
 
     /// Handle a `freshAgent.interrupt` for opencode: mark the turn aborted (BEFORE
@@ -3502,6 +3525,43 @@ mod tests {
         assert!(
             !killed.load(Ordering::SeqCst),
             "per-session restart must preserve the shared serve sidecar"
+        );
+    }
+
+    /// Shutdown drain (fix 1): the OpenCode restart quarantine is bookkeeping
+    /// only — no local process to confirm dead (the durable pending row's
+    /// fenced remote abort is the NEXT BOOT's cross-boot recovery job) — so
+    /// the server-shutdown drain must log the abandoned entries loudly and
+    /// clear the map without touching the shared serve sidecar.
+    #[tokio::test]
+    async fn shutdown_drains_opencode_restart_bookkeeping_loudly() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: "fresh-runtime-test-opencode-drain".to_string(),
+            generation: 1,
+        };
+        st.restart_retirements.lock().await.insert(
+            runtime.runtime_id.clone(),
+            OpencodeRestartRetirement {
+                requested_session_id: "ses_drain_bookkeeping".to_string(),
+                session: Arc::new(TokioMutex::new(OpencodeSession::new(
+                    "freshopencode-req-drain".to_string(),
+                    runtime,
+                    None,
+                    None,
+                    None,
+                ))),
+            },
+        );
+        assert_eq!(st.restart_retirements.lock().await.len(), 1);
+
+        st.drain_restart_retirements().await;
+
+        assert!(
+            st.restart_retirements.lock().await.is_empty(),
+            "the bookkeeping drain must clear the quarantine map"
         );
     }
 

@@ -16,7 +16,7 @@ use freshell_ws::restart::{
     run_restart_recovery_driver, JournalParentSync, ProductionFreshResumePlan,
     ProductionFreshRuntime, RestartCoordinator, RestartFailure, RestartOutcome,
     RestartReplacementFence, RestartResumeContext, RestartRetirementAction, RestartRetirementFence,
-    RestartRuntime, RuntimeLocator,
+    RestartRuntime, RuntimeLocator, SpawnRegistrationRaceGate,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -5535,5 +5535,641 @@ async fn indeterminate_journal_write_during_commit_keeps_pending_row_and_defers_
         .await
         .expect("driver exits on shutdown")
         .expect("driver task did not panic");
+    drop(_registration);
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown interlock (fix 1): the coordinator latches restart ingress at
+// graceful shutdown, owns every registered in-flight transaction in a JoinSet
+// the shutdown sequence joins before provider/terminal cleanup, refuses
+// replacement creation once latched (retryable, durable row retained,
+// `recovery_pending`), and drains the codex/claude restart quarantines through
+// their confirmed process-tree barriers — all under ONE shared deadline
+// inside the SAFE-11 hard-timeout watchdog (join ≤ 3s, drains ≤ 2s).
+// ---------------------------------------------------------------------------
+
+/// Fast-path rejection at the WS door: once the shutdown latch flips,
+/// `spawn_registered` refuses WITHOUT registering a task — the typed failure
+/// frame is emitted through the same broadcast sink, no `AgentRestartStarted`
+/// fires, and no durable pending row is created.
+#[tokio::test]
+async fn restart_spawn_rejected_once_shutdown_latched() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator.begin_restart_shutdown();
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+
+    let accepted = coordinator
+        .spawn_registered(restart("shutdown-spawn-r1", "term-1", 1), move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+
+    assert!(
+        !accepted,
+        "a spawn after the shutdown latch must be refused"
+    );
+    let messages = emitted.lock().unwrap().clone();
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == "shutdown-spawn-r1"
+                    && failed.code == AgentRestartFailureCode::ShutdownFailed
+                    && failed.retryable
+                    && !failed.recovery_pending
+        ),
+        "the door must emit exactly one typed shutdown rejection: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, ServerMessage::AgentRestartStarted(_))),
+        "no started event fires for a rejected spawn"
+    );
+    assert!(
+        coordinator.pending_recoveries().is_empty(),
+        "no durable pending row is created for a rejected spawn"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coordinator.join_in_flight_transactions(),
+    )
+    .await
+    .expect("the register set is empty, so the join resolves immediately");
+}
+
+/// A retirement that parks inside `shutdown_for_restart` so tests can flip the
+/// shutdown latch deterministically mid-transaction. `creates` proves the
+/// replacement was never minted after the latch.
+#[derive(Default)]
+struct GatedRetirementRuntime {
+    shutdown_entered: tokio::sync::Notify,
+    shutdown_release: tokio::sync::Notify,
+    preflights: AtomicUsize,
+    shutdowns: AtomicUsize,
+    creates: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for GatedRetirementRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        self.preflights.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        self.shutdown_entered.notify_one();
+        self.shutdown_release.notified().await;
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        Ok("term-must-not-be-created".to_string())
+    }
+}
+
+/// In-flight settlement + mid-transaction latch: a transaction parked inside
+/// provider teardown when shutdown begins is still OWNED by the coordinator —
+/// the shutdown join awaits it, and once the latch is observed the replacement
+/// is refused (retryable + `recovery_pending`, durable row retained) instead
+/// of minting a writer the cleanup sweep would race.
+#[tokio::test]
+async fn in_flight_transaction_is_joined_by_shutdown_and_replacement_creation_after_latch_is_refused(
+) {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(GatedRetirementRuntime::default());
+    let _registration = coordinator.set_runtime(runtime.clone());
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+
+    let accepted = coordinator
+        .spawn_registered(restart("in-flight-r1", "term-1", 1), move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+    assert!(accepted, "pre-latch spawn registers normally");
+    // Deterministic: the transaction is parked INSIDE provider teardown before
+    // the latch flips, so the refusal below must come from the pre-replacement
+    // latch check, never the entry check.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.shutdown_entered.notified(),
+    )
+    .await
+    .expect("the transaction reached the gated retirement");
+
+    coordinator.begin_restart_shutdown();
+    runtime.shutdown_release.notify_one();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        coordinator.join_in_flight_transactions(),
+    )
+    .await
+    .expect("shutdown joins the in-flight transaction once retirement un-gates");
+
+    assert_eq!(
+        runtime.preflights.load(Ordering::SeqCst),
+        1,
+        "preflight ran exactly once"
+    );
+    assert_eq!(
+        runtime.shutdowns.load(Ordering::SeqCst),
+        1,
+        "the in-flight retirement completed"
+    );
+    assert_eq!(
+        runtime.creates.load(Ordering::SeqCst),
+        0,
+        "create_replacement_fenced must NOT run once the latch is set"
+    );
+    let messages = emitted.lock().unwrap().clone();
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, ServerMessage::AgentRestartStarted(_))),
+        "the in-flight transaction announced started before the latch: {messages:?}"
+    );
+    let failed = messages
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::AgentRestartFailed(failed) => Some(failed),
+            _ => None,
+        })
+        .expect("a terminal failure frame was emitted");
+    assert_eq!(failed.request_id, "in-flight-r1");
+    assert_eq!(failed.code, AgentRestartFailureCode::ShutdownFailed);
+    assert!(failed.retryable, "the refusal is retryable");
+    assert!(
+        failed.recovery_pending,
+        "the refusal retains the durable row (recovery_pending)"
+    );
+    let pending = coordinator.pending_recoveries();
+    assert_eq!(pending.len(), 1, "the durable row is retained");
+    assert!(
+        !pending[0].retirement_pending,
+        "retirement completed before the latch refusal, so only the replacement is owed"
+    );
+    drop(_registration);
+}
+
+/// Mid-flight RECOVERY sibling of the latch refusal: a retry that already
+/// entered `recover_persisted_retirement` when the latch flips must defer its
+/// `recover_replacement_fenced` call the same way (retryable +
+/// `recovery_pending`, row retained, no spawn).
+#[tokio::test]
+async fn recovery_in_flight_defers_replacement_creation_after_shutdown_latch() {
+    /// First direct teardown attempt fails retryably (leaving the durable row
+    /// with `retirement_pending`); the later recovery pass parks inside
+    /// `recover_persisted_retirement` so the test can latch deterministically
+    /// before the replacement phase.
+    struct GatedRecoveryRuntime {
+        recovery_entered: tokio::sync::Notify,
+        recovery_release: tokio::sync::Notify,
+        shutdown_calls: AtomicUsize,
+        creates: AtomicUsize,
+    }
+
+    impl GatedRecoveryRuntime {
+        fn new() -> Self {
+            Self {
+                recovery_entered: tokio::sync::Notify::new(),
+                recovery_release: tokio::sync::Notify::new(),
+                shutdown_calls: AtomicUsize::new(0),
+                creates: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RestartRuntime for GatedRecoveryRuntime {
+        type ResumePlan = ();
+
+        async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+            Ok(())
+        }
+
+        async fn shutdown_for_restart(
+            &self,
+            _request: &AgentRestart,
+            _plan: &(),
+        ) -> Result<(), RestartFailure> {
+            if self.shutdown_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(RestartFailure::new(
+                    AgentRestartFailureCode::ShutdownFailed,
+                    "transient teardown failure",
+                    true,
+                ));
+            }
+            Ok(())
+        }
+
+        async fn create_replacement(
+            &self,
+            _request: &AgentRestart,
+            _plan: (),
+        ) -> Result<String, RestartFailure> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok("term-must-not-be-recovered".to_string())
+        }
+
+        async fn recover_persisted_retirement(
+            &self,
+            _request: &AgentRestart,
+            _context: Option<&RestartResumeContext>,
+            _fence: Option<&RestartRetirementFence>,
+        ) -> Result<(), RestartFailure> {
+            self.recovery_entered.notify_one();
+            self.recovery_release.notified().await;
+            Ok(())
+        }
+    }
+
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(GatedRecoveryRuntime::new());
+    let _registration = coordinator.set_runtime(runtime.clone());
+
+    // Seed the retained row: shutdown fails retryably, so the transaction
+    // stops at `retirement_pending`.
+    let seeded = coordinator
+        .execute(restart("recovery-latch-r1", "term-1", 1), runtime.as_ref())
+        .await;
+    assert!(
+        matches!(
+            seeded.messages.last(),
+            Some(ServerMessage::AgentRestartFailed(failed))
+                if failed.retryable && failed.recovery_pending
+        ),
+        "the seed run must retain a retryable pending row: {:?}",
+        seeded.messages
+    );
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+    assert!(coordinator.pending_recoveries()[0].retirement_pending);
+
+    // Re-drive the retained row; the pass parks inside the recovery
+    // retirement so the latch can flip between phases.
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+    let retry_coordinator = coordinator.clone();
+    let retry = tokio::spawn(async move {
+        retry_coordinator
+            .execute_registered(restart("recovery-latch-r1", "term-1", 1), move |message| {
+                emit_sink.lock().unwrap().push(message.clone());
+            })
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.recovery_entered.notified(),
+    )
+    .await
+    .expect("the retried transaction reached the gated recovery retirement");
+
+    coordinator.begin_restart_shutdown();
+    runtime.recovery_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+        .await
+        .expect("the latched retry settles")
+        .expect("the retry task did not panic");
+
+    assert_eq!(
+        runtime.creates.load(Ordering::SeqCst),
+        0,
+        "recover_replacement_fenced must NOT run once the latch is set"
+    );
+    let messages = emitted.lock().unwrap().clone();
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, ServerMessage::AgentRestartStarted(_))),
+        "the recovery retry announced started before the latch: {messages:?}"
+    );
+    let failed = messages
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::AgentRestartFailed(failed) => Some(failed),
+            _ => None,
+        })
+        .expect("a terminal failure frame was emitted");
+    assert!(failed.retryable, "the recovery deferral is retryable");
+    assert!(
+        failed.recovery_pending,
+        "the recovery deferral retains the durable row"
+    );
+    let pending = coordinator.pending_recoveries();
+    assert_eq!(pending.len(), 1, "the durable row is retained");
+    assert!(
+        !pending[0].retirement_pending,
+        "the retirement phase finished; only the replacement is owed"
+    );
+    drop(_registration);
+}
+
+/// The recovery pass consults the latch too: once shutdown begins, driving
+/// retained rows spawns nothing and the rows remain for next-boot recovery.
+#[tokio::test]
+async fn recovery_pass_skips_replacement_creation_after_shutdown_latch() {
+    /// Teardown succeeds; the first replacement create fails retryably so the
+    /// retained row already owes ONLY the replacement phase
+    /// (`retirement_pending == false`).
+    struct FailCreateOnceRuntime {
+        creates: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RestartRuntime for FailCreateOnceRuntime {
+        type ResumePlan = ();
+
+        async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+            Ok(())
+        }
+
+        async fn shutdown_for_restart(
+            &self,
+            _request: &AgentRestart,
+            _plan: &(),
+        ) -> Result<(), RestartFailure> {
+            Ok(())
+        }
+
+        async fn create_replacement(
+            &self,
+            _request: &AgentRestart,
+            _plan: (),
+        ) -> Result<String, RestartFailure> {
+            if self.creates.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(RestartFailure::new(
+                    AgentRestartFailureCode::ReplacementFailed,
+                    "injected create failure",
+                    true,
+                ));
+            }
+            Ok("term-must-not-be-recovered".to_string())
+        }
+    }
+
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(FailCreateOnceRuntime {
+        creates: AtomicUsize::new(0),
+    });
+    let _registration = coordinator.set_runtime(runtime.clone());
+    coordinator
+        .execute(restart("recovery-pass-r1", "term-1", 1), runtime.as_ref())
+        .await;
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+    assert!(
+        !coordinator.pending_recoveries()[0].retirement_pending,
+        "the seeded row owes only the replacement phase"
+    );
+    assert_eq!(runtime.creates.load(Ordering::SeqCst), 1);
+
+    coordinator.begin_restart_shutdown();
+    coordinator.recover_pending_registered(|_| {}).await;
+
+    assert_eq!(
+        runtime.creates.load(Ordering::SeqCst),
+        1,
+        "the latched recovery pass must not spawn a replacement"
+    );
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "the row is retained for next-boot recovery"
+    );
+    drop(_registration);
+}
+
+/// LB-06 (load-bearing, mandatory): a spawner that passed the fast-path latch
+/// check and then parked before the transactions mutex must NOT register once
+/// `begin_restart_shutdown` + a completed (empty) join have run — the latch is
+/// re-checked INSIDE the lock, so the finished drain can never be followed by
+/// a late racing insert. The parking seam makes the exact interleaving
+/// deterministic without sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_registered_cannot_insert_after_the_drain_observed_empty() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let gate = SpawnRegistrationRaceGate::default();
+    coordinator.set_spawn_registration_race_gate(gate.clone());
+    gate.arm();
+
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+    let spawn_coordinator = coordinator.clone();
+    let spawned = tokio::spawn(async move {
+        spawn_coordinator
+            .spawn_registered(restart("race-r1", "term-1", 1), move |message| {
+                emit_sink.lock().unwrap().push(message.clone());
+            })
+            .await
+    });
+
+    // Deterministic: the spawner passed the fast-path latch check and now
+    // parks immediately before the transactions mutex.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gate.wait_until_fast_path_passed(),
+    )
+    .await
+    .expect("the spawner reached the pre-lock parking seam");
+
+    // The whole shutdown interlock runs to completion while the spawner parks:
+    // the latch is set, then the drain observes an EMPTY set and finishes.
+    coordinator.begin_restart_shutdown();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        coordinator.join_in_flight_transactions(),
+    )
+    .await
+    .expect("the drain must observe the set empty and complete while the spawner is parked");
+
+    // Release the parked spawner: the in-mutex re-check must now observe the
+    // latch, emit the typed rejection, and refuse registration.
+    gate.release();
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), spawned)
+        .await
+        .expect("the released spawner completes")
+        .expect("the spawner task did not panic");
+    assert!(
+        !accepted,
+        "a spawn crossing a completed drain must be refused"
+    );
+    let messages = emitted.lock().unwrap().clone();
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == "race-r1"
+                    && failed.code == AgentRestartFailureCode::ShutdownFailed
+                    && failed.retryable
+                    && !failed.recovery_pending
+        ),
+        "the late spawner receives exactly the typed shutdown rejection: {messages:?}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, ServerMessage::AgentRestartStarted(_))),
+        "no late AgentRestartStarted may arrive after a completed drain"
+    );
+    assert!(
+        coordinator.pending_recoveries().is_empty(),
+        "the late spawner must not create a durable row either"
+    );
+    // The drain had already finished; a second join still resolves immediately.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coordinator.join_in_flight_transactions(),
+    )
+    .await
+    .expect("the register set stays empty after the refused late spawn");
+}
+
+/// LB-02 (load-bearing, mandatory): the phased shutdown order — latch → join
+/// the in-flight transaction set → parallel per-provider quarantine drains —
+/// completes inside the shared deadline envelope (join ≤ 3,000 ms, drains ≤
+/// 2,000 ms total, within the SAFE-11 hard timeout) with a LIVE gated
+/// transaction mid-flight and a QUARANTINED codex retirement, and leaves no
+/// orphan: the quarantined sidecar's pid is confirmed gone from /proc.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_sequence_completes_within_the_shared_deadline_with_a_live_gated_transaction_and_quarantine_entry(
+) {
+    // ── Live gated transaction (parked inside provider teardown) ──
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(GatedRetirementRuntime::default());
+    let _registration = coordinator.set_runtime(runtime.clone());
+    let accepted = coordinator
+        .spawn_registered(restart("lb02-r1", "term-1", 1), |_| {})
+        .await;
+    assert!(accepted);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.shutdown_entered.notified(),
+    )
+    .await
+    .expect("the live transaction reached the gated retirement");
+
+    // ── One quarantined codex retirement (a parked consumer forces the first
+    // drive to retire Incomplete with the kill confirmed by the exit-watcher's
+    // barrier; releasing the blocker lets the DRAIN finish the joins) ──
+    let bus = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let codex = freshell_freshagent::FreshCodexState::new(
+        Arc::new("tok".to_string()),
+        Arc::clone(&bus),
+        serde_json::json!({ "freshAgent": { "enabled": false } }),
+    );
+    let claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&bus));
+    let (transport, peer) = freshell_codex::new_channel_transport();
+    let (client, _notifs) = freshell_codex::CodexAppServerClient::connect(transport);
+    let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let parked_consumer = {
+        let release = Arc::clone(&blocker_release);
+        tokio::task::spawn_blocking(move || {
+            let (released, wake) = &*release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        })
+    };
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the quarantined sidecar fixture");
+    let child_pid = child.id().expect("fixture pid") as i32;
+    let ownership_id = format!("codex-drain-lb02-{}", uuid::Uuid::new_v4());
+    let fixture_runtime = codex
+        .insert_fixture_session_for_restart_shutdown(
+            "thread-lb02-drain",
+            Arc::new(client),
+            parked_consumer,
+            child,
+            &ownership_id,
+        )
+        .await;
+    drop(peer);
+    let outcome = codex
+        .shutdown_for_restart_detailed("thread-lb02-drain", &fixture_runtime.runtime_id)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            freshell_freshagent::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ),
+        "the parked consumer must leave the retirement quarantined: {outcome:?}"
+    );
+    assert_eq!(
+        codex.restart_retirement_count_for_test().await,
+        1,
+        "one retirement is quarantined for the drain"
+    );
+    {
+        let (released, wake) = &*blocker_release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+
+    // ── The Task-6 phased order with the production 3s/2s split ──
+    let phase_start = tokio::time::Instant::now();
+    coordinator.begin_restart_shutdown();
+    runtime.shutdown_release.notify_one();
+    let join_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3_000);
+    tokio::time::timeout_at(join_deadline, coordinator.join_in_flight_transactions())
+        .await
+        .expect("the in-flight transaction join resolves within the 3s phase budget");
+    assert_eq!(
+        runtime.creates.load(Ordering::SeqCst),
+        0,
+        "the latched transaction refused its replacement"
+    );
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "the durable row is retained for cross-boot recovery"
+    );
+
+    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
+    tokio::join!(
+        codex.drain_restart_retirements(drain_deadline),
+        claude.drain_restart_retirements(drain_deadline),
+    );
+
+    assert!(
+        phase_start.elapsed() < std::time::Duration::from_millis(5_000),
+        "latch + join + parallel drains must complete inside the shared envelope: {:?}",
+        phase_start.elapsed()
+    );
+    assert_eq!(
+        codex.restart_retirement_count_for_test().await,
+        0,
+        "the quarantine drain ran every entry to quiescence"
+    );
+    // No orphan: the quarantined sidecar's kill was CONFIRMED (barrier + reap),
+    // not detached — the pid is gone from /proc (ESRCH, not a zombie).
+    let probe = unsafe { libc::kill(child_pid, 0) };
+    assert!(
+        probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "the quarantined sidecar pid must be gone from /proc after the drain"
+    );
     drop(_registration);
 }

@@ -1139,17 +1139,20 @@ async fn handle_client_text(
                 )
                 .await;
             }
-            let restart = state.restart.clone();
+            // Registered spawn (fix 1): the transaction is owned by the
+            // coordinator's JoinSet so graceful shutdown latches new work,
+            // joins the in-flight set before provider/terminal cleanup, and
+            // (during shutdown) emits the typed rejection through the SAME
+            // broadcast wiring below.
             let broadcast_tx = Arc::clone(&state.broadcast_tx);
-            tokio::spawn(async move {
-                restart
-                    .execute_registered(request, |message| {
-                        if let Ok(frame) = serde_json::to_string(message) {
-                            let _ = broadcast_tx.send(frame);
-                        }
-                    })
-                    .await;
-            });
+            state
+                .restart
+                .spawn_registered(request, move |message| {
+                    if let Ok(frame) = serde_json::to_string(message) {
+                        let _ = broadcast_tx.send(frame);
+                    }
+                })
+                .await;
             true
         }
         // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
@@ -5858,6 +5861,17 @@ pub(crate) async fn create_terminal_replacement(
     launch: freshell_terminal::TerminalRestartLaunch,
     replacement_ownership_id: Option<String>,
 ) -> Result<String, String> {
+    // A10-style defense-in-depth (fix 1): the restart coordinator refuses
+    // replacement creation once the shutdown latch is set, but a latch flipped
+    // between that check and this gated spawn must not insert a PTY the
+    // shutdown `kill_all` snapshot already passed. Mirror the restore door
+    // (create_gate.rs): check BEFORE acquiring the spawn-gate permit…
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("server is shutting down; terminal replacement refused".to_string());
+    }
     let create = TerminalCreate {
         request_id: format!(
             "agent-restart:{}:{}",
@@ -5889,6 +5903,14 @@ pub(crate) async fn create_terminal_replacement(
             let (_, message) = spawn_gate_error_parts(error);
             message.to_string()
         })?;
+    // …and again AFTER the permit, before `handle_create` inserts anything
+    // (the latch may have flipped while the permit wait was queued).
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("server is shutting down; terminal replacement refused".to_string());
+    }
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
     let sink: freshell_terminal::FrameSink = std::sync::Arc::new(move |message| {
         let _ = reply_tx.send(message);
