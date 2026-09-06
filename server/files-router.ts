@@ -110,6 +110,46 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
     }
   })
 
+  /**
+   * Raw-bytes lane for binary assets (images) opened in viewer panes.
+   * Unlike /local-file this IS sandboxed and resolves exactly like /read
+   * (tilde expansion, flavor-aware normalization, allowedFilePaths → 403);
+   * sendFile supplies the extension-based Content-Type (image/png, ...).
+   */
+  router.get('/raw', validatePath, async (req, res) => {
+    const filePath = req.query.path as string
+    if (!filePath) {
+      return res.status(400).json({ error: 'path query parameter required' })
+    }
+
+    const resolved = await resolveUserFilesystemPath(filePath)
+
+    try {
+      const stat = await fsp.stat(resolved)
+      if (stat.isDirectory()) {
+        return res.status(400).json({ error: 'Cannot read directory' })
+      }
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return res.status(404).json({ error: 'File not found' })
+      }
+      return res.status(500).json({ error: err.message })
+    }
+
+    await new Promise<void>((resolve) => {
+      res.sendFile(resolved, (error?: NodeJS.ErrnoException) => {
+        if (error && !res.headersSent) {
+          if (error.code === 'ENOENT') {
+            res.status(404).json({ error: 'File not found' })
+          } else {
+            res.status(500).json({ error: 'Failed to send file' })
+          }
+        }
+        resolve()
+      })
+    })
+  })
+
   router.get('/stat', validatePath, async (req, res) => {
     const filePath = req.query.path as string
     if (!filePath) {
