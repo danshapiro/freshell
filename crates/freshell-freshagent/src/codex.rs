@@ -3886,6 +3886,9 @@ pub(crate) fn spawn_exit_watcher(
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
 ) -> tokio::task::JoinHandle<()> {
+    // wfah: the thread id is fixed by the time the watcher is constructed at
+    // every successful spawn site; enrich the durable record once, here.
+    crate::codex_sidecar_tracking::enrich_record_session_id(&ownership_id, &thread_id);
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become

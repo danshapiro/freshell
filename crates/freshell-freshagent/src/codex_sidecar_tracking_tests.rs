@@ -15,9 +15,9 @@ use freshell_codex::sidecar_store::{
 use serde_json::{json, Value};
 
 use crate::codex::tests::ENV_LOCK;
-// `scrub_sidecar_record` is exercised indirectly (`failed_spawn_leaves_no_record`
-// observes its effect through spawn_sidecar); `enrich_record_session_id` is wired
-// by Tasks 3-4 — importing either here would be an unused-imports lint failure.
+// `scrub_sidecar_record` and `enrich_record_session_id` are exercised indirectly
+// (through spawn_sidecar / spawn_exit_watcher) — importing either here would be
+// an unused-imports lint failure.
 use crate::codex_sidecar_tracking::record_spawned_sidecar;
 // Same path codex.rs uses (re-exported from client_messages).
 use crate::FreshCodexState; // re-exported: `pub use codex::FreshCodexState` in lib.rs
@@ -251,6 +251,7 @@ async fn failed_spawn_leaves_no_record() {
 }
 
 // ── Task 3: scrub the record on EVERY reap path ─────────────────────────────
+// (The Task 4 tests live at the bottom of this file.)
 
 /// Build a tracked sleeper + exit watcher exactly as production does.
 async fn build_recorded_watch(
@@ -443,4 +444,101 @@ async fn create_bail_after_spawn_leaves_no_record() {
         guard.records().is_empty(),
         "a pre-watcher bail must scrub the record it wrote at spawn"
     );
+}
+
+// ── Task 4: thread-id enrichment + cross-generation hold/never-claim ────────
+
+use freshell_codex::sidecar_reconcile::SidecarReconciler;
+use freshell_codex::sidecar_sweep::SweepOutcome;
+
+#[tokio::test]
+async fn create_enriches_the_record_with_the_served_thread_id() {
+    let _env = ENV_LOCK.lock().await;
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let (st, mut rx) = tracking_state();
+
+    let session_id = create_tracked_session(&st, &mut rx, "req-wfah-t4-enrich").await;
+
+    // watcher construction performs the enrichment before the lane finishes
+    // create; poll defensively (<=3s) for the store write to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let records = guard.records();
+        if records.len() == 1 && records[0].session_id.as_deref() == Some(session_id.as_str()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "record not enriched: {records:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    st.shutdown().await;
+}
+
+#[tokio::test]
+async fn next_generation_holds_then_reaps_a_freshagent_survivor_never_claiming_it() {
+    let _env = ENV_LOCK.lock().await;
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let (st, mut rx) = tracking_state();
+    let session_id = create_tracked_session(&st, &mut rx, "req-wfah-t4-gen").await;
+    let ownership_id = guard.records()[0].ownership_id.clone();
+    let pid = guard.records()[0].pid;
+
+    // SIMULATE THE GENERATION BOUNDARY against the shared disk state: the old
+    // process is gone (crashed), its records survive; the new generation's boot
+    // reconcile reloads them. (We reuse the same fixture process — its
+    // /proc evidence is unchanged, exactly like a real orphan.)
+    let (reconciler, report) = SidecarReconciler::boot_reconcile(guard.store.clone());
+    assert_eq!(
+        report.pruned_dead + report.pruned_mismatch,
+        0,
+        "the live orphan is not pruned"
+    );
+    assert!(report.held >= 1, "the orphan is held for the sweep");
+
+    // A terminal-pane restore of the very same codex thread must never adopt the
+    // freshagent-lane record.
+    let claimed = reconciler.claim_for_session(&session_id).await;
+    assert!(
+        claimed.is_none(),
+        "freshagent records are never claimable: {claimed:?}"
+    );
+
+    // The grace-delayed sweep (driven directly here) reaps the verified-idle
+    // orphan (the fake fixture reports no active thread), removing the record.
+    let outcomes = reconciler.sweep_unclaimed().await;
+    let outcome = outcomes
+        .iter()
+        .find(|(oid, _)| oid == &ownership_id)
+        .map(|(_, o)| o)
+        .expect("the orphan record is swept");
+    assert_eq!(
+        outcome,
+        &SweepOutcome::Reaped,
+        "verified-idle orphan is reaped, not retained"
+    );
+
+    // The reaped process is really gone and the books are clean.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the swept orphan stays dead"
+    );
+    assert!(
+        guard.records().is_empty(),
+        "no record remains after the sweep"
+    );
+
+    // Old-generation cleanup: its watcher crash arm fires on the sweep's kill;
+    // shutdown still completes safely with the mapping present.
+    st.shutdown().await;
 }

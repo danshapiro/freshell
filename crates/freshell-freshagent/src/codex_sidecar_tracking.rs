@@ -132,9 +132,6 @@ pub(crate) fn scrub_sidecar_record(ownership_id: &str) {
 
 /// Record which codex thread a tracked sidecar serves once the lane knows it
 /// (watcher construction: the thread id is fixed at every successful spawn).
-// Wired by wfah Tasks 3-4 (watcher construction + respawn); no caller exists yet
-// inside this task's file list, so keep the lint green until those land.
-#[allow(dead_code)]
 pub(crate) fn enrich_record_session_id(ownership_id: &str, thread_id: &str) {
     let Some(store) = codex_sidecar_store() else {
         return;
