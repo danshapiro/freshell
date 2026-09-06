@@ -506,6 +506,40 @@ async fn reaped_wait(child: &mut Child, budget: Duration) -> bool {
     }
 }
 
+/// Panic-path cleanup for the cross-restart test's spawned pids.
+/// `std::process::Child` has no kill-on-drop, and the SIGKILL test
+/// deliberately leaves the fixture sidecar running across server1's death,
+/// so any assertion failure unwinding between a spawn and that spawn's own
+/// teardown arm would strand a live server and/or sidecar past test end.
+/// The guard SIGKILLs every registered pid on drop unless disarmed: panics
+/// kill the registered set; the success path (and every explicit-cleanup
+/// failure arm) disarms once its own teardown has run, so a later
+/// `panic!`/`assert!` never double-signals.
+struct KillOnPanic {
+    pids: Vec<u32>,
+    armed: bool,
+}
+
+impl KillOnPanic {
+    fn new(pids: Vec<u32>) -> Self {
+        Self { pids, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillOnPanic {
+    fn drop(&mut self) {
+        if self.armed {
+            for &pid in &self.pids {
+                let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
 /// wfah Task 5: the cross-restart proof. Generation 1 boots, spawns a
 /// freshcodex fresh-agent sidecar (a durable `lane:"freshAgent"` record names
 /// it), and is then `kill -9`'d — no graceful shutdown, no Drop, no record
@@ -540,12 +574,21 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn freshell-server #1");
+    // Panic guard: any panic between here and this test's own SIGKILL arm
+    // below (assertion failures, ws handshake errors, ...) would otherwise
+    // unwind past `server1`'s drop and leak a live server plus its fixture
+    // sidecar past test end. The sidecar pid is registered as soon as it is
+    // identified; server1 is de-registered right after this test reaps it,
+    // so a post-SIGKILL panic can never signal a recycled pid.
+    let mut panic_guard = KillOnPanic::new(vec![server1.id()]);
     if !wait_for_health(port1, &mut server1, Duration::from_secs(15)).await {
         // Kill (and reap) BEFORE draining stderr: `read_to_string` blocks
         // until the pipe EOFs, which only happens once the process exits.
         let _ = server1.kill();
         let _ = server1.wait();
         let stderr = drain_stderr(&mut server1);
+        // This arm already reaped everything it started.
+        panic_guard.disarm();
         panic!("server #1 never became healthy; stderr:\n{stderr}");
     }
     let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port1}/ws"))
@@ -591,6 +634,9 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
                 std::fs::read_to_string(home.path().join(".freshell/logs/rust-server.jsonl"))
                     .unwrap_or_default();
             let stderr = drain_stderr(&mut server1);
+            // The SIGTERM + reaped_wait above already killed server1 and let
+            // it gracefully reap any sidecar it held.
+            panic_guard.disarm();
             panic!(
                 "expected freshAgent.created, got {other:?}; server #1 stderr:\n{stderr}\nlog tail:\n{log_tail}"
             );
@@ -599,8 +645,24 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
 
     // The sidecar exists, and a durable tracked record names it.
     let server1_pid = server1.id();
-    let sidecar_pid = find_freshagent_sidecar_pid(server1_pid)
-        .expect("a fixture sidecar among the server's descendants");
+    let sidecar_pid = match find_freshagent_sidecar_pid(server1_pid) {
+        Some(pid) => pid,
+        None => {
+            // Explicit-cleanup arm: SIGTERM (whose graceful shutdown reaps
+            // any sidecar the server holds), not the guard's SIGKILL -- a
+            // guard kill of server1 alone could strand the very sidecar this
+            // arm failed to identify.
+            let _ = unsafe { libc::kill(server1_pid as libc::pid_t, libc::SIGTERM) };
+            let _ = reaped_wait(&mut server1, Duration::from_secs(10)).await;
+            let stderr = drain_stderr(&mut server1);
+            panic_guard.disarm();
+            panic!(
+                "expected a fixture sidecar among the server's descendants; \
+                 server #1 stderr:\n{stderr}"
+            );
+        }
+    };
+    panic_guard.pids.push(sidecar_pid);
     let deadline = Instant::now() + Duration::from_secs(10);
     let record = loop {
         let found = sidecar_store_records(home.path())
@@ -628,6 +690,10 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     assert_eq!(kill_rc, 0, "SIGKILL to the server must land");
     // Blocking std wait: SIGKILL landed, so the zombie is reaped promptly.
     let _ = server1.wait();
+    // server1 is now dead and reaped by the test's own hand: de-register it
+    // so a later panic can never SIGKILL a recycled pid. The deliberately
+    // orphaned sidecar stays registered until the teardown below completes.
+    panic_guard.pids.retain(|&p| p != server1_pid);
     // The orphan survives (that is precisely the bug class being fixed).
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
@@ -654,10 +720,18 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     if !wait_for_health(port2, &mut server2, Duration::from_secs(15)).await {
         // Same kill-then-drain discipline as generation 1, plus the leak
         // guard for the generation-1 orphan generation 2 was about to reap.
-        let _ = unsafe { libc::kill(sidecar_pid as libc::pid_t, libc::SIGKILL) };
+        // The guard signal is gated on identity re-verification (never
+        // signal a pid the test did not spawn AND verify): without a
+        // healthy server2 no sweep ran, so the orphan should still be ours
+        // -- but the discipline is not conditional on expectation.
+        if pid_cmdline(sidecar_pid).contains("fake-app-server") {
+            let _ = unsafe { libc::kill(sidecar_pid as libc::pid_t, libc::SIGKILL) };
+        }
         let _ = server2.kill();
         let _ = server2.wait();
         let stderr = drain_stderr(&mut server2);
+        // This arm killed server2 and the registered sidecar itself.
+        panic_guard.disarm();
         panic!("server #2 never became healthy; stderr:\n{stderr}");
     }
 
@@ -677,7 +751,13 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     }
 
     // Leak guard + teardown: never leave the fixture running past the test.
-    if !reaped {
+    // The guard SIGKILL is gated on identity re-verification
+    // (`pid_cmdline(...).contains("fake-app-server")`): if generation 2's
+    // sweep reaped the orphan and the row/pid checks raced an unrelated
+    // recycle of the pid, this must not signal a foreign process (never
+    // signal a pid the test did not spawn AND verify). A genuinely
+    // not-reaped orphan still matches its fixture cmdline and is killed.
+    if !reaped && pid_cmdline(sidecar_pid).contains("fake-app-server") {
         let _ = unsafe { libc::kill(sidecar_pid as libc::pid_t, libc::SIGKILL) };
     }
     let _ = unsafe { libc::kill(server2.id() as libc::pid_t, libc::SIGTERM) };
@@ -687,6 +767,12 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     let server2_stderr = drain_stderr(&mut server2);
     let log_tail = std::fs::read_to_string(home.path().join(".freshell/logs/rust-server.jsonl"))
         .unwrap_or_default();
+
+    // The test's own reaping/teardown is complete: on the success path the
+    // sweep already reaped the orphan, and on the failure path the leak
+    // guard above killed it. Disarm so a failing final assertion does not
+    // re-signal anything.
+    panic_guard.disarm();
 
     assert!(
         reaped,
