@@ -304,6 +304,11 @@ async fn unrequested_exit_arm_removes_the_record() {
     let mut child = spawn_sleep_child();
     let pid = child.id().expect("spawned pid");
     record_spawned_sidecar("codex-sidecar-wfah-t3-crash", pid, "ws://127.0.0.1:1").await;
+    assert_eq!(
+        guard.records().len(),
+        1,
+        "set-up must have written the record"
+    );
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(8);
     let (_kill_tx, kill_rx) = tokio::sync::oneshot::channel();
     let exited = Arc::new(AtomicBool::new(false));
