@@ -1688,9 +1688,7 @@ impl FreshOpencodeState {
             .or(route.clone());
         // Mint the child's runtime identity up front (restart fencing): the
         // serve-SSE bridge and every later control both fence on THIS descriptor.
-        let child_runtime = self
-            .runtime_identity
-            .mint_and_register(PROVIDER, &child.id);
+        let child_runtime = self.runtime_identity.mint_and_register(PROVIDER, &child.id);
         let mut child_session = OpencodeSession::new(
             child.id.clone(),
             child_runtime,
@@ -1840,7 +1838,11 @@ impl FreshOpencodeState {
         // (materialize-on-send) -- the client fold updates slice AND pane content.
         if let Some(real_id) = real_session_id.as_ref() {
             if real_id != &msg.session_id {
-                self.broadcast(&materialized_frame(&msg.session_id, real_id, Some(&runtime)));
+                self.broadcast(&materialized_frame(
+                    &msg.session_id,
+                    real_id,
+                    Some(&runtime),
+                ));
             }
         }
 
