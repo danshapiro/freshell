@@ -15,6 +15,8 @@
 //! and the completion gating are graded via the fake-injected tests, independent of this.
 
 use futures_util::{SinkExt, StreamExt};
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_tungstenite::tungstenite::Message;
@@ -109,6 +111,21 @@ pub struct OwnedProcessTreeBarrier {
     #[cfg(target_os = "linux")]
     #[serde(default)]
     process_group_id: Option<i32>,
+    /// Poison latch: the last ownership scan round was Indeterminate (an owned
+    /// `/proc/<pid>/environ` entry could not be read), so an empty member list
+    /// must NEVER be read as "quiescent". The first fully-`Complete` scan round
+    /// clears it (a Complete round rediscovers any live tagged writer, so
+    /// clearing is fail-safe). Persisted so poison survives a boot; rows
+    /// written before this field existed deserialize `false` — they were only
+    /// ever written by healthy scanners, so that default is exact.
+    #[cfg(target_os = "linux")]
+    #[serde(default)]
+    scan_incomplete: bool,
+    /// Test-only `/proc` root override — the unit-test seam behind
+    /// `scan_owned_pids_in` (never set in production, never persisted).
+    #[cfg(target_os = "linux")]
+    #[serde(skip)]
+    test_proc_root: Option<PathBuf>,
     #[cfg(not(target_os = "linux"))]
     _root_pid: u32,
     #[cfg(not(target_os = "linux"))]
@@ -129,6 +146,8 @@ impl OwnedProcessTreeBarrier {
             ownership_id: ownership_id.to_string(),
             members: Vec::new(),
             process_group_id: None,
+            scan_incomplete: false,
+            test_proc_root: None,
         }
     }
 
@@ -142,10 +161,19 @@ impl OwnedProcessTreeBarrier {
 
     /// Capture every currently-readable tagged process plus the known direct
     /// child. This performs no signaling and is safe to call while sidecar
-    /// transports are still live.
+    /// transports are still live. An Indeterminate initial scan poisons the
+    /// barrier (fail closed): nothing is signaled that the scan could not see,
+    /// and quiescence can never be confirmed off an incomplete round.
     #[cfg(target_os = "linux")]
     pub fn capture(root_pid: u32, ownership_env: &str, ownership_id: &str) -> Self {
-        let mut members: Vec<(i32, u64)> = scan_owned_pids(ownership_env, ownership_id)
+        let (scanned, scan_incomplete) = match scan_owned_pids(ownership_env, ownership_id) {
+            OwnershipScan::Complete(pids) => (pids, false),
+            OwnershipScan::Indeterminate(gap) => {
+                warn_scan_incomplete(&gap);
+                (Vec::new(), true)
+            }
+        };
+        let mut members: Vec<(i32, u64)> = scanned
             .into_iter()
             .filter_map(|pid| proc_starttime(pid).map(|start| (pid, start)))
             .collect();
@@ -159,6 +187,8 @@ impl OwnedProcessTreeBarrier {
             ownership_id: ownership_id.to_string(),
             members,
             process_group_id: None,
+            scan_incomplete,
+            test_proc_root: None,
         }
     }
 
@@ -178,9 +208,15 @@ impl OwnedProcessTreeBarrier {
     #[cfg(target_os = "linux")]
     pub fn capture_process_group(root_pid: u32) -> Self {
         let process_group_id = proc_info(root_pid as i32).map(|(_, pgrp, _)| pgrp);
-        let members = process_group_id
-            .map(scan_process_group)
-            .unwrap_or_default()
+        let (scanned, scan_incomplete) = match process_group_id.map(scan_process_group) {
+            Some(OwnershipScan::Complete(pids)) => (pids, false),
+            Some(OwnershipScan::Indeterminate(gap)) => {
+                warn_scan_incomplete(&gap);
+                (Vec::new(), true)
+            }
+            None => (Vec::new(), false),
+        };
+        let members = scanned
             .into_iter()
             .filter_map(|pid| proc_starttime(pid).map(|start| (pid, start)))
             .collect();
@@ -189,6 +225,8 @@ impl OwnedProcessTreeBarrier {
             ownership_id: String::new(),
             members,
             process_group_id,
+            scan_incomplete,
+            test_proc_root: None,
         }
     }
 
@@ -211,6 +249,8 @@ impl OwnedProcessTreeBarrier {
                 ownership_id: String::new(),
                 members: Vec::new(),
                 process_group_id: None,
+                scan_incomplete: false,
+                test_proc_root: None,
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -230,11 +270,18 @@ impl OwnedProcessTreeBarrier {
     /// its captured `(pid,starttime)` incarnation is gone or is a zombie.
     /// Failed attempts retain the captured members, so a later retry never
     /// depends on re-reading an environment that YAMA may now hide.
+    ///
+    /// Fail closed (fix 5): a poisoned barrier — any scan round ended
+    /// Indeterminate — reports `false` even with zero known members, and an
+    /// Indeterminate round never shrinks membership. The first fully-Complete
+    /// round clears the poison, so a barrier wedged on an unreadable `/proc`
+    /// recovers as soon as the host is readable again.
     #[cfg(target_os = "linux")]
     pub async fn terminate_and_confirm(&mut self) -> bool {
         for round in 0..24u8 {
             self.refresh_members();
-            if self.members.is_empty() {
+            // Quiescence is provable ONLY as empty-members on a Complete round.
+            if self.members.is_empty() && !self.scan_incomplete {
                 return true;
             }
             let signal = if round < 20 {
@@ -250,7 +297,7 @@ impl OwnedProcessTreeBarrier {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         self.refresh_members();
-        self.members.is_empty()
+        self.members.is_empty() && !self.scan_incomplete
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -261,24 +308,49 @@ impl OwnedProcessTreeBarrier {
         self.confirmed_empty
     }
 
+    /// The `/proc` root this barrier scans: the real root in production; the
+    /// test override only ever lands here from unit tests.
+    #[cfg(target_os = "linux")]
+    fn proc_root(&self) -> &Path {
+        self.test_proc_root
+            .as_deref()
+            .unwrap_or_else(|| Path::new("/proc"))
+    }
+
+    /// Fold newly-visible members in. An Indeterminate round NEVER shrinks
+    /// membership (a `/proc` gap can hide a live writer; retaining a stale
+    /// member is the fail-closed direction) and (re-)poisons the barrier. Only
+    /// a fully-Complete round prunes gone incarnations and clears the poison.
     #[cfg(target_os = "linux")]
     fn refresh_members(&mut self) {
-        self.members
-            .retain(|(pid, start)| proc_starttime(*pid) == Some(*start));
-        let mut discovered = if self.ownership_env.is_empty() {
-            Vec::new()
-        } else {
-            scan_owned_pids(&self.ownership_env, &self.ownership_id)
-        };
-        // A numeric process-group id can be recycled. Discover forks only
-        // while at least one exact `(pid,starttime)` predecessor incarnation
-        // remains. Once that captured set is empty, never use the naked pgrp
-        // as authority to adopt or signal a newly-reused group.
-        if !self.members.is_empty() {
-            if let Some(process_group_id) = self.process_group_id {
-                discovered.extend(scan_process_group(process_group_id));
+        let mut discovered = Vec::new();
+        let mut gap: Option<ScanGap> = None;
+        if !self.ownership_env.is_empty() {
+            match scan_owned_pids_in(self.proc_root(), &self.ownership_env, &self.ownership_id) {
+                OwnershipScan::Complete(pids) => discovered = pids,
+                OwnershipScan::Indeterminate(g) => gap = Some(g),
             }
         }
+        if gap.is_none() {
+            self.members
+                .retain(|(pid, start)| proc_starttime(*pid) == Some(*start));
+            // A numeric process-group id can be recycled. Discover forks only
+            // while at least one exact `(pid,starttime)` predecessor incarnation
+            // remains. Once that captured set is empty, never use the naked pgrp
+            // as authority to adopt or signal a newly-reused group.
+            if !self.members.is_empty() {
+                if let Some(process_group_id) = self.process_group_id {
+                    match scan_process_group(process_group_id) {
+                        OwnershipScan::Complete(pids) => discovered.extend(pids),
+                        OwnershipScan::Indeterminate(g) => gap = Some(g),
+                    }
+                }
+            }
+        }
+        if let Some(gap) = &gap {
+            warn_scan_incomplete(gap);
+        }
+        self.scan_incomplete = gap.is_some();
         for pid in discovered {
             if !self.members.iter().any(|(known, _)| *known == pid) {
                 if let Some(start) = proc_starttime(pid) {
@@ -310,11 +382,60 @@ fn proc_info(pid: i32) -> Option<(String, i32, u64)> {
     ))
 }
 
+/// The outcome of one `/proc` ownership scan round. `Complete` proves every
+/// entry owned by our euid+egid was inspected; `Indeterminate` carries the gap
+/// and must never be read as "the owned set is known" (fail closed).
 #[cfg(target_os = "linux")]
-fn scan_process_group(process_group_id: i32) -> Vec<i32> {
+#[derive(Debug)]
+pub(crate) enum OwnershipScan {
+    Complete(Vec<i32>),
+    Indeterminate(ScanGap),
+}
+
+/// Why a scan round is Indeterminate: the `/proc` root itself could not be
+/// listed, and/or this many entries owned by our euid AND egid had an
+/// `environ` unreadable for a reason other than the pid-gone race (`ENOENT`).
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct ScanGap {
+    pub read_dir_failed: bool,
+    pub unusable_owned_entries: usize,
+}
+
+/// Loud poison notification for the barrier path; the same event key drives
+/// the "an incomplete scan blocked a quiesce proof" observability.
+#[cfg(target_os = "linux")]
+fn warn_scan_incomplete(gap: &ScanGap) {
+    tracing::warn!(
+        read_dir_failed = gap.read_dir_failed,
+        unusable_owned_entries = gap.unusable_owned_entries,
+        "agent.restart.ownership_scan_incomplete"
+    );
+}
+
+/// The `KEY=value` environ-entry match (`\0`-separated) every ownership scan
+/// and reaper keys on.
+#[cfg(target_os = "linux")]
+fn env_tag_matches(environ: &[u8], ownership_env: &str, ownership_id: &str) -> bool {
+    let needle = format!("{ownership_env}={ownership_id}");
+    environ
+        .split(|byte| *byte == 0)
+        .any(|variable| variable == needle.as_bytes())
+}
+
+/// One process-group membership round (`/proc/<pid>/stat` is world-readable,
+/// so only the root listing itself can fail; pid-gone stat races skip).
+#[cfg(target_os = "linux")]
+fn scan_process_group(process_group_id: i32) -> OwnershipScan {
     let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return found;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => {
+            return OwnershipScan::Indeterminate(ScanGap {
+                read_dir_failed: true,
+                unusable_owned_entries: 0,
+            })
+        }
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -326,42 +447,121 @@ fn scan_process_group(process_group_id: i32) -> Vec<i32> {
             found.push(pid);
         }
     }
-    found
+    OwnershipScan::Complete(found)
 }
 
+/// One ownership round against the real `/proc` (no test override). Production
+/// callers that can carry the per-barrier seam use [`scan_owned_pids_in`]
+/// through [`OwnedProcessTreeBarrier::proc_root`] instead.
 #[cfg(target_os = "linux")]
-fn scan_owned_pids(ownership_env: &str, ownership_id: &str) -> Vec<i32> {
-    let needle = format!("{ownership_env}={ownership_id}");
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return found;
+fn scan_owned_pids(ownership_env: &str, ownership_id: &str) -> OwnershipScan {
+    scan_owned_pids_in(Path::new("/proc"), ownership_env, ownership_id)
+}
+
+/// One ownership round against `root`, tri-state so an incomplete scan can
+/// never be read as "quiescent".
+///
+/// Ownership screen (validated live on garageserver, Ubuntu 24.04 + yama=1):
+/// only an entry whose `/proc/<pid>` directory is owned by our euid AND egid
+/// can carry one of our tags — other-uid/gid entries (e.g. sandboxed browsers)
+/// are skipped, and pid-gone races (`ENOENT` on `environ`) are skips, not
+/// gaps. A same-owner `EACCES` is the *non-dumpable* signature: with yama at
+/// any scope, `PTRACE_MODE_READ` on a same-uid/gid dumpable process is never
+/// denied, so a persistent same-owner read denial means the target called
+/// `prctl(PR_SET_DUMPABLE, 0)`-family (e.g. ambient `gpg-agent`, `sd-pam`,
+/// `systemd --user`) — the already-recorded LB-05 residual class that no
+/// freshell spawn path can produce (grep-verified), hence a skip rather than
+/// a permanently self-wedging gap. Any OTHER failure to read the `environ`
+/// of an OWNED entry is genuinely anomalous ⇒ `Indeterminate`.
+#[cfg(target_os = "linux")]
+fn scan_owned_pids_in(root: &Path, ownership_env: &str, ownership_id: &str) -> OwnershipScan {
+    use std::os::unix::fs::MetadataExt;
+    let mut pids = Vec::new();
+    let mut unusable_owned_entries = 0usize;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return OwnershipScan::Indeterminate(ScanGap {
+                read_dir_failed: true,
+                unusable_owned_entries: 0,
+            })
+        }
     };
+    // geteuid/getegid are plain id reads with no preconditions (always sound).
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else {
+        let Some(text) = name.to_str() else { continue };
+        let Ok(pid) = text.parse::<i32>() else {
             continue;
         };
-        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        // The pid-gone race between listing and stat is a skip, not a gap.
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.uid() != euid || meta.gid() != egid {
             continue;
-        };
-        if environ
-            .split(|byte| *byte == 0)
-            .any(|variable| variable == needle.as_bytes())
-        {
-            found.push(pid);
+        }
+        match std::fs::read(entry.path().join("environ")) {
+            Ok(contents) => {
+                if env_tag_matches(&contents, ownership_env, ownership_id) {
+                    pids.push(pid);
+                }
+            }
+            // pid gone: a race skip, not a gap.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // Non-dumpable (LB-05 residual) / LSM-confined ambient process: a
+            // same-owner read can never be denied for a dumpable peer, so this
+            // cannot be one of our writers — a skip, not a gap.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            // Owned but unreadable for any other reason: a real gap.
+            Err(_) => unusable_owned_entries += 1,
         }
     }
-    found
+    if unusable_owned_entries > 0 {
+        OwnershipScan::Indeterminate(ScanGap {
+            read_dir_failed: false,
+            unusable_owned_entries,
+        })
+    } else {
+        OwnershipScan::Complete(pids)
+    }
+}
+
+/// Fail-closed ownership scan shared by every provider's `/proc` reaper (the
+/// `killOwnedProcesses` analogs). `Some(pids)` is a COMPLETE scan: the exact
+/// set of pids carrying `ownership_env=ownership_id`. `None` is INDETERMINATE:
+/// an owned entry could not be read, so the caller must skip signaling — a
+/// partial candidate list can never be trusted as the full owned set, and the
+/// fail-closed direction is to leave the hidden writer for a later complete
+/// round rather than pretend the tree is quiesced.
+#[cfg(target_os = "linux")]
+pub fn scan_owned_pids_fail_closed(ownership_env: &str, ownership_id: &str) -> Option<Vec<i32>> {
+    match scan_owned_pids(ownership_env, ownership_id) {
+        OwnershipScan::Complete(pids) => Some(pids),
+        OwnershipScan::Indeterminate(gap) => {
+            tracing::warn!(
+                ownership_env,
+                read_dir_failed = gap.read_dir_failed,
+                unusable_owned_entries = gap.unusable_owned_entries,
+                "agent.ownership_scan.incomplete_reapers_skip"
+            );
+            None
+        }
+    }
 }
 
 /// `killOwnedProcesses` analog for codex (`runtime.ts:452-586`): SIGTERM any process whose
 /// `/proc/<pid>/environ` carries our `FRESHELL_CODEX_SIDECAR_ID=<ownership_id>` tag — the
-/// detached app-server sidecar we own. Linux `/proc`-based, best-effort and platform-guarded;
+/// detached app-server sidecar we own. Linux `/proc`-based, platform-guarded;
 /// we only signal processes carrying OUR unique tag, so no unrelated process is touched.
+/// An Indeterminate scan skips signaling entirely (fail closed).
 #[cfg(target_os = "linux")]
 pub fn reap_owned_codex_sidecars(ownership_id: &str) {
-    for pid in scan_owned_pids(crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id) {
+    let Some(pids) =
+        scan_owned_pids_fail_closed(crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
+    else {
+        return;
+    };
+    for pid in pids {
         // SIGTERM (15). Safe: only processes carrying OUR tag are signaled.
         unsafe {
             libc::kill(pid, libc::SIGTERM);
@@ -430,5 +630,195 @@ mod tests {
         );
         let _ = child.wait().await;
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    // ── fix-5: fail-closed ownership scanning ─────────────────────────────────
+
+    /// A fake `/proc` entry under `root`: a numeric dir whose `environ` file
+    /// carries `contents` verbatim (`None` simulates the pid-gone read race).
+    fn fake_proc_entry(
+        root: &std::path::Path,
+        pid: i32,
+        contents: Option<&[u8]>,
+    ) -> std::path::PathBuf {
+        let pid_dir = root.join(pid.to_string());
+        std::fs::create_dir(&pid_dir).unwrap();
+        let environ = pid_dir.join("environ");
+        if let Some(contents) = contents {
+            std::fs::write(&environ, contents).unwrap();
+        }
+        environ
+    }
+
+    /// A fake `/proc` entry whose `environ` is unreadable for a reason that is
+    /// NEITHER pid-gone (`ENOENT`) nor the non-dumpable class (`EACCES`): the
+    /// `environ` name is a directory, so every read fails `EISDIR` — a
+    /// deterministic, root-safe stand-in for an anomalous owned-entry gap.
+    fn fake_proc_gap_entry(root: &std::path::Path, pid: i32) {
+        let pid_dir = root.join(pid.to_string());
+        std::fs::create_dir(&pid_dir).unwrap();
+        std::fs::create_dir(pid_dir.join("environ")).unwrap();
+    }
+
+    /// The validated live predicate: an entry owned by our euid AND egid whose
+    /// environ read fails with anything other than pid-gone (`ENOENT`) or the
+    /// non-dumpable class (`EACCES`) is a real gap — the scan must fail closed,
+    /// never read as "no writer".
+    #[test]
+    fn unreadable_owned_environ_makes_scan_indeterminate_not_empty() {
+        let root = tempfile::tempdir().unwrap();
+        fake_proc_gap_entry(root.path(), 4242);
+        let scan = scan_owned_pids_in(root.path(), "FRESHELL_RESTART_REPLACEMENT_ID", "fence-x");
+        assert!(
+            matches!(scan, OwnershipScan::Indeterminate(_)),
+            "an owned-but-unreadable entry must be a scan gap, got {scan:?}"
+        );
+        // The ambient non-dumpable class (same-owner EACCES) must stay a skip:
+        // mode-0o000 denies the owner EACCES exactly like the ambient daemons.
+        let root2 = tempfile::tempdir().unwrap();
+        let environ = fake_proc_entry(root2.path(), 4242, Some(b"X=1\0"));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&environ, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let scan2 = scan_owned_pids_in(root2.path(), "ANY_ENV", "any-id");
+        if std::fs::read(&environ).is_err() {
+            // Only meaningful where mode-0o000 actually denies reads (non-root):
+            // as root the file reads fine and the round is trivially Complete.
+            assert!(
+                matches!(scan2, OwnershipScan::Complete(_)),
+                "a same-owner EACCES entry is the non-dumpable residual class: skip, got {scan2:?}"
+            );
+        }
+    }
+
+    /// A clean fake root: the tagged pid is discovered, a pid-gone entry (no
+    /// environ file) is a race skip — NOT a gap — garbage and other-tag entries
+    /// are ignored, and the whole round is `Complete`.
+    #[test]
+    fn complete_clean_scan_reports_complete_with_tagged_pid() {
+        let root = tempfile::tempdir().unwrap();
+        fake_proc_entry(
+            root.path(),
+            4242,
+            Some(b"LANG=C\0FRESHELL_RESTART_REPLACEMENT_ID=fence-x\0"),
+        );
+        fake_proc_entry(root.path(), 5555, None); // pid-gone race
+        std::fs::create_dir(root.path().join("self-not-numeric")).unwrap();
+        fake_proc_entry(
+            root.path(),
+            6666,
+            Some(b"FRESHELL_RESTART_REPLACEMENT_ID=other\0"),
+        );
+        let scan = scan_owned_pids_in(root.path(), "FRESHELL_RESTART_REPLACEMENT_ID", "fence-x");
+        let OwnershipScan::Complete(pids) = scan else {
+            panic!("a fully readable fake root must be Complete, got {scan:?}")
+        };
+        assert_eq!(pids, vec![4242]);
+    }
+
+    /// Poison lifecycle (a): a poisoned barrier NEVER reports confirmed
+    /// termination while every round stays Indeterminate — even with zero
+    /// known members, which an unpoisoned barrier would confirm immediately.
+    #[tokio::test]
+    async fn indeterminate_scan_blocks_confirmed_termination() {
+        let root = tempfile::tempdir().unwrap();
+        fake_proc_gap_entry(root.path(), 4242);
+        let mut barrier = OwnedProcessTreeBarrier {
+            ownership_env: "FRESHELL_TEST_POISON_A".to_string(),
+            ownership_id: "irrelevant".to_string(),
+            members: Vec::new(),
+            process_group_id: None,
+            scan_incomplete: true,
+            test_proc_root: Some(root.path().to_path_buf()),
+        };
+        assert!(
+            !barrier.terminate_and_confirm().await,
+            "an empty-but-poisoned barrier must fail closed, never confirm quiescence"
+        );
+        assert!(barrier.scan_incomplete, "no Complete round ever cleared it");
+    }
+
+    /// Poison lifecycle (b): the first fully-Complete scan round CLEARS the
+    /// poison (a Complete round rediscovers any live tagged writer, so
+    /// clearing is fail-safe), letting a quiesced tree confirm.
+    #[tokio::test]
+    async fn complete_round_clears_poison_and_confirms_quiescence() {
+        let root = tempfile::tempdir().unwrap();
+        // Readable entry carrying a NON-matching tag: a clean Complete round.
+        fake_proc_entry(root.path(), 4242, Some(b"FRESHELL_TEST_POISON_B=other\0"));
+        let mut barrier = OwnedProcessTreeBarrier {
+            ownership_env: "FRESHELL_TEST_POISON_B".to_string(),
+            ownership_id: "fence".to_string(),
+            members: Vec::new(),
+            process_group_id: None,
+            scan_incomplete: true, // poisoned at capture; this round is clean
+            test_proc_root: Some(root.path().to_path_buf()),
+        };
+        assert!(
+            barrier.terminate_and_confirm().await,
+            "a Complete round clears the poison, so an empty tree may confirm"
+        );
+        assert!(
+            !barrier.scan_incomplete,
+            "the Complete round cleared the poison"
+        );
+    }
+
+    /// Poison lifecycle (c): poison persists across boots via a serde
+    /// round-trip; legacy rows written before this field existed deserialize
+    /// un-poisoned (`#[serde(default)]`) — they were only ever written by
+    /// healthy scanners, so `false` is exact for them.
+    #[test]
+    fn poison_survives_persisted_barrier_reopen() {
+        let barrier = OwnedProcessTreeBarrier {
+            ownership_env: "E".to_string(),
+            ownership_id: "i".to_string(),
+            members: vec![(123, 45)],
+            process_group_id: None,
+            scan_incomplete: true,
+            test_proc_root: None,
+        };
+        let bytes = serde_json::to_vec(&barrier).expect("serialize poisoned barrier");
+        let reopened: OwnedProcessTreeBarrier =
+            serde_json::from_slice(&bytes).expect("reopen persisted barrier");
+        assert!(
+            reopened.scan_incomplete,
+            "poison must survive a persisted barrier reopen"
+        );
+
+        let legacy: OwnedProcessTreeBarrier =
+            serde_json::from_str(r#"{"ownershipEnv":"E","ownershipId":"i","members":[[123,45]]}"#)
+                .expect("pre-fix rows remain readable");
+        assert!(
+            !legacy.scan_incomplete,
+            "pre-fix rows default to un-poisoned"
+        );
+    }
+
+    /// Poison lifecycle (d): an Indeterminate round NEVER shrinks membership —
+    /// a stale-looking member is retained until a Complete round can prove its
+    /// incarnation gone.
+    #[test]
+    fn indeterminate_round_never_shrinks_membership() {
+        let root = tempfile::tempdir().unwrap();
+        fake_proc_gap_entry(root.path(), 4242);
+        // A member whose incarnation looks long gone under /proc/<pid>/stat.
+        let mut barrier = OwnedProcessTreeBarrier {
+            ownership_env: "FRESHELL_TEST_POISON_D".to_string(),
+            ownership_id: "i".to_string(),
+            members: vec![(i32::MAX - 1, 1)],
+            process_group_id: None,
+            scan_incomplete: false,
+            test_proc_root: Some(root.path().to_path_buf()),
+        };
+        barrier.refresh_members();
+        assert!(
+            barrier.members.contains(&(i32::MAX - 1, 1)),
+            "an Indeterminate round must keep every member: {:?}",
+            barrier.members
+        );
+        assert!(
+            barrier.scan_incomplete,
+            "the Indeterminate round re-poisons the barrier"
+        );
     }
 }

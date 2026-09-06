@@ -2539,29 +2539,24 @@ fn terminate_pid(_pid: i32) {}
 /// `killOwnedProcesses` analog for claude: SIGTERM any process whose `/proc/<pid>/environ`
 /// carries our `FRESHELL_CLAUDE_SIDECAR_ID=<ownership_id>` tag — the Node sidecar AND the
 /// `claude` CLI grandchild the SDK spawns (which inherits the tag through the SDK clean-env).
-/// Linux `/proc`-based, best-effort; only processes carrying OUR unique tag are signaled.
+/// Linux `/proc`-based and platform-guarded; only processes carrying OUR unique tag are signaled.
+///
+/// Fail closed (fix 5): routes through the shared tri-state ownership scanner
+/// ([`freshell_codex::transport::scan_owned_pids_fail_closed`]). An Indeterminate round
+/// (an OWNED `/proc/<pid>/environ` that could not be read) logs
+/// `agent.ownership_scan.incomplete_reapers_skip` and skips signaling entirely: a partial
+/// candidate list can never be trusted as the full owned set.
 #[cfg(target_os = "linux")]
 fn reap_owned_claude_sidecars(ownership_id: &str) {
-    let needle = format!("{CLAUDE_SIDECAR_OWNERSHIP_ENV}={ownership_id}");
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Some(pids) = freshell_codex::transport::scan_owned_pids_fail_closed(
+        CLAUDE_SIDECAR_OWNERSHIP_ENV,
+        ownership_id,
+    ) else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else {
-            continue;
-        };
-        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
-            continue;
-        };
-        let carries_tag = environ
-            .split(|&b| b == 0)
-            .any(|var| var == needle.as_bytes());
-        if carries_tag {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+    for pid in pids {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
         }
     }
 }

@@ -314,34 +314,102 @@ impl ServeProcess for TokioServeProcess {
 }
 
 /// `killOwnedProcesses` (`serve-manager.ts:599-623`): SIGTERM any process carrying our
-/// `FRESHELL_OPENCODE_SIDECAR_ID` tag (the detached serve listener). Linux `/proc`-based,
-/// best-effort and platform-guarded — the exact "ownership-safe, no-orphans" machinery
+/// `FRESHELL_OPENCODE_SIDECAR_ID` tag (the detached serve listener). Linux `/proc`-based
+/// and platform-guarded — the exact "ownership-safe, no-orphans" machinery
 /// the oracle's safety checks demand.
+///
+/// Fail closed (fix 5): runs the shared tri-state ownership-scan algorithm — an
+/// owned `/proc/<pid>/environ` that cannot be read makes the round
+/// INDETERMINATE, which logs `agent.ownership_scan.incomplete_reapers_skip`
+/// and skips signaling entirely: a partial candidate list can never be trusted
+/// as the full owned set.
 #[cfg(target_os = "linux")]
 fn reap_owned_processes(ownership_id: &str) {
-    let needle = format!("{OPENCODE_SIDECAR_OWNERSHIP_ENV}={ownership_id}");
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Some(pids) = scan_owned_pids_fail_closed(OPENCODE_SIDECAR_OWNERSHIP_ENV, ownership_id)
+    else {
         return;
     };
+    for pid in pids {
+        // SIGTERM (15). Safe: we only signal processes carrying OUR unique tag.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+/// The fail-closed ownership scan every provider reaper keys on. Canonical
+/// home: `freshell_codex::transport::scan_owned_pids_fail_closed` — mirrored
+/// in-file because this leaf crate intentionally depends on no other freshell
+/// crate; keep the algorithm, predicate, log key, and `Some(pids)`/`None`
+/// contract in lockstep with the canonical copy.
+///
+/// Ownership screen (validated live on garageserver, Ubuntu 24.04 + yama=1):
+/// only an entry whose `/proc/<pid>` directory is owned by our euid AND egid
+/// can carry one of our tags; other-uid/gid entries and pid-gone read races
+/// (`ENOENT`) are skips, never gaps. A same-owner `EACCES` is the
+/// *non-dumpable* signature (ambient `gpg-agent`/`sd-pam`/`systemd --user`) —
+/// the LB-05 residual class no freshell spawn path can produce — so it is a
+/// skip, NOT a permanently self-wedging gap. Any OTHER failure to read the
+/// `environ` of an OWNED entry is a real gap ⇒ `None`.
+#[cfg(target_os = "linux")]
+fn scan_owned_pids_fail_closed(ownership_env: &str, ownership_id: &str) -> Option<Vec<i32>> {
+    use std::os::unix::fs::MetadataExt;
+    let needle = format!("{ownership_env}={ownership_id}");
+    let mut found = Vec::new();
+    let mut unusable_owned_entries = 0usize;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => {
+            warn_reapers_skip(true, 0);
+            return None;
+        }
+    };
+    // geteuid/getegid are plain id reads with no preconditions (always sound).
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         let Ok(pid) = name.parse::<i32>() else {
             continue;
         };
-        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        // The pid-gone race between listing and stat is a skip, not a gap.
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.uid() != euid || meta.gid() != egid {
             continue;
-        };
-        let carries_tag = environ
-            .split(|&b| b == 0)
-            .any(|var| var == needle.as_bytes());
-        if carries_tag {
-            // SIGTERM (15). Safe: we only signal processes carrying OUR unique tag.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+        }
+        match std::fs::read(entry.path().join("environ")) {
+            Ok(environ) => {
+                if environ
+                    .split(|&b| b == 0)
+                    .any(|var| var == needle.as_bytes())
+                {
+                    found.push(pid);
+                }
             }
+            // pid gone: a race skip, not a gap.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // Non-dumpable (LB-05 residual) ambient process: a skip, not a gap.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+            // Owned but unreadable for any other reason: a real gap.
+            Err(_) => unusable_owned_entries += 1,
         }
     }
+    if unusable_owned_entries > 0 {
+        warn_reapers_skip(false, unusable_owned_entries);
+        return None;
+    }
+    Some(found)
+}
+
+/// Loud indeterminate-scan notification (same event key as every provider
+/// reaper). This crate carries no `tracing` dependency, so the event is a
+/// single JSONL stderr line — which lands in the server log alongside the
+/// `tracing` output.
+#[cfg(target_os = "linux")]
+fn warn_reapers_skip(read_dir_failed: bool, unusable_owned_entries: usize) {
+    eprintln!(
+        "{{\"severity\":\"warn\",\"event\":\"agent.ownership_scan.incomplete_reapers_skip\",\"ownershipEnv\":\"{OPENCODE_SIDECAR_OWNERSHIP_ENV}\",\"readDirFailed\":{read_dir_failed},\"unusableOwnedEntries\":{unusable_owned_entries}}}"
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
