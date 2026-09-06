@@ -117,6 +117,7 @@ export const MATRIX_SPECS = [
   // checkpoint routes and the fresh-agent checkpoint UI are shared code
   // paths, not a Rust-only feature. See agent-checkpoint-rewind.spec.ts.
   /agent-checkpoint-rewind\.spec\.ts$/,
+  /agent-attachments\.spec\.ts$/, // AGENT-11 (slice): composer uploads land on the server; failures are visible
   // SESSION-05 -- project colors on History project headers: real color
   // gesture in one browser, broadcast-driven update in a second context,
   // reload/restart persistence, unrelated project unchanged. Legacy is a
