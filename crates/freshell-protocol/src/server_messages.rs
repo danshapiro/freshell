@@ -293,6 +293,12 @@ pub enum AgentRestartFailureCode {
     /// quiescent (recovery requires Linux `/proc` ownership scanning), so the
     /// restart was never started and the durable session was never touched.
     UnsupportedPlatform,
+    /// Restart ingress was over capacity (an oversized request field, a full
+    /// durable pending-recovery journal, a full per-session restart queue, or
+    /// the global in-flight cap) and the request was refused before any task
+    /// spawn, lock allocation, or journal write. `retryable` distinguishes
+    /// transient capacity (true) from a request that can never fit (false).
+    Overloaded,
 }
 
 /// Old-runtime descriptor flattened with `old*` wire names on a committed

@@ -60,11 +60,11 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, AgentRestartFailed, AgentRestartFailureCode, ClientMessage, ErrorCode, ErrorMsg,
-    FreshAgentAttach, FreshAgentCreateFailed, FreshAgentEvent, Pong, RuntimeDescriptor,
-    ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel,
-    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalInputBlocked,
-    TerminalInputBlockedReason, TerminalKill, TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
+    AgentProvider, AgentRestartFailureCode, ClientMessage, ErrorCode, ErrorMsg, FreshAgentAttach,
+    FreshAgentCreateFailed, FreshAgentEvent, Pong, ServerMessage, SessionLocator, SessionType,
+    Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated,
+    TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalResize,
+    LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -1122,32 +1122,54 @@ async fn handle_client_text(
                 );
                 return send(
                     ws_tx,
-                    &ServerMessage::AgentRestartFailed(AgentRestartFailed {
-                        request_id: request.request_id,
-                        provider: request.provider,
-                        session_id: request.session_id,
-                        kind: request.kind,
-                        runtime: RuntimeDescriptor {
-                            runtime_id: request.live_id,
-                            generation: request.expected_generation,
-                        },
-                        code: AgentRestartFailureCode::CapabilityNotNegotiated,
-                        message: "agent restart was not negotiated for this connection".into(),
-                        retryable: false,
-                        recovery_pending: false,
-                    }),
+                    &state.restart.failure_frame_for(
+                        &request,
+                        &crate::restart::RestartFailure::new(
+                            AgentRestartFailureCode::CapabilityNotNegotiated,
+                            "agent restart was not negotiated for this connection",
+                            false,
+                        ),
+                    ),
                 )
                 .await;
             }
+            // Bounded ingress (fix 6) BEFORE any spawn/lock: LB-03 says an
+            // arrival whose request id is already known (an in-flight
+            // registered transaction, a durable pending row, or a stored
+            // terminal result) is a correlated resend and bypasses admission
+            // entirely — `execute_with_events`'s replay/follower machinery
+            // answers it. Only DISTINCT new request ids consume the
+            // per-session/global/pending-row budget; overload is a typed
+            // failure echoing the request's runtime descriptor.
+            let admission = if state.restart.is_known_request(&request) {
+                None
+            } else {
+                match state.restart.try_admit_restart(&request) {
+                    Ok(guard) => Some(guard),
+                    Err(failure) => {
+                        tracing::warn!(
+                            request_id = %request.request_id,
+                            provider = %request.provider,
+                            session_id = %request.session_id,
+                            retryable = failure.retryable,
+                            reason = %failure.message,
+                            "agent.restart.rejected_overloaded"
+                        );
+                        return send(ws_tx, &state.restart.failure_frame_for(&request, &failure))
+                            .await;
+                    }
+                }
+            };
             // Registered spawn (fix 1): the transaction is owned by the
             // coordinator's JoinSet so graceful shutdown latches new work,
             // joins the in-flight set before provider/terminal cleanup, and
             // (during shutdown) emits the typed rejection through the SAME
-            // broadcast wiring below.
+            // broadcast wiring below. The admission guard (when present) is
+            // held across the whole spawned task.
             let broadcast_tx = Arc::clone(&state.broadcast_tx);
             state
                 .restart
-                .spawn_registered(request, move |message| {
+                .spawn_registered(request, admission, move |message| {
                     if let Ok(frame) = serde_json::to_string(message) {
                         let _ = broadcast_tx.send(frame);
                     }

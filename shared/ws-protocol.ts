@@ -820,6 +820,7 @@ export type AgentRestartFailureCode =
   | 'SHUTDOWN_FAILED'
   | 'REPLACEMENT_FAILED'
   | 'UNSUPPORTED_PLATFORM'
+  | 'OVERLOADED'
 
 export type AgentRestartStartedMessage = {
   type: 'agent.restart.started'

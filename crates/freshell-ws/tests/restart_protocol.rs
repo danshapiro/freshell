@@ -14,9 +14,9 @@ use freshell_protocol::{
 };
 use freshell_ws::restart::{
     run_restart_recovery_driver, JournalParentSync, ProductionFreshResumePlan,
-    ProductionFreshRuntime, RestartCoordinator, RestartFailure, RestartOutcome,
-    RestartReplacementFence, RestartResumeContext, RestartRetirementAction, RestartRetirementFence,
-    RestartRuntime, RuntimeLocator, SpawnRegistrationRaceGate,
+    ProductionFreshRuntime, RestartCoordinator, RestartFailure, RestartIngressLimits,
+    RestartOutcome, RestartReplacementFence, RestartResumeContext, RestartRetirementAction,
+    RestartRetirementFence, RestartRuntime, RuntimeLocator, SpawnRegistrationRaceGate,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -2448,7 +2448,13 @@ async fn reopened_late_terminal_association_advances_persisted_generation() {
 async fn durable_terminal_results_use_a_bounded_recent_replay_window() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bounded-restart-state.json");
-    let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 2, 2).unwrap();
+    let coordinator = RestartCoordinator::new_persistent_with_limits(
+        path.clone(),
+        2,
+        2,
+        RestartIngressLimits::default(),
+    )
+    .unwrap();
     for index in 0..3 {
         let locator = RuntimeLocator::new(
             AgentRuntimeKind::Terminal,
@@ -2477,7 +2483,9 @@ async fn durable_terminal_results_use_a_bounded_recent_replay_window() {
     assert!(coordinator.retained_lock_counts().1 <= 2);
     drop(coordinator);
 
-    let reopened = RestartCoordinator::new_persistent_with_limits(path, 2, 2).unwrap();
+    let reopened =
+        RestartCoordinator::new_persistent_with_limits(path, 2, 2, RestartIngressLimits::default())
+            .unwrap();
     assert_eq!(reopened.retained_result_count(), 2);
     let runtime = FakeRuntime::resumable("must-not-run");
     let replay = reopened
@@ -2501,7 +2509,13 @@ async fn durable_terminal_results_use_a_bounded_recent_replay_window() {
 async fn unique_invalid_restart_requests_cannot_grow_the_durable_journal_without_bound() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bounded-invalid-restart-state.json");
-    let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 3, 2).unwrap();
+    let coordinator = RestartCoordinator::new_persistent_with_limits(
+        path.clone(),
+        3,
+        2,
+        RestartIngressLimits::default(),
+    )
+    .unwrap();
 
     for index in 0..20 {
         let outcome = coordinator
@@ -2530,7 +2544,9 @@ async fn unique_invalid_restart_requests_cannot_grow_the_durable_journal_without
     assert_eq!(journal["results"].as_array().unwrap().len(), 3);
     drop(coordinator);
 
-    let reopened = RestartCoordinator::new_persistent_with_limits(path, 3, 2).unwrap();
+    let reopened =
+        RestartCoordinator::new_persistent_with_limits(path, 3, 2, RestartIngressLimits::default())
+            .unwrap();
     let replay = reopened
         .execute(
             AgentRestart {
@@ -2550,6 +2566,368 @@ async fn unique_invalid_restart_requests_cannot_grow_the_durable_journal_without
         [ServerMessage::AgentRestartFailed(failed)]
             if failed.code == AgentRestartFailureCode::RuntimeNotFound
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Bounded restart ingress (fix 6). Every bound — field byte caps, the durable
+// pending-row cap, the per-session queue cap, and the global in-flight cap —
+// is enforced BEFORE any task spawns or lock is allocated, overload returns a
+// typed `OVERLOADED` failure frame, and correlated client resends of one
+// request id bypass admission entirely (LB-03) so they can never overload a
+// healthy restart.
+// ---------------------------------------------------------------------------
+
+/// A 300-byte `sessionId` (field cap is 256) is refused at the WS door with
+/// `OVERLOADED` echoing the request's runtime descriptor — before any spawn,
+/// any lock, or any started frame.
+#[tokio::test]
+async fn oversized_restart_field_is_rejected_at_the_door_without_spawning() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let runtime = Arc::new(FakeRuntime::resumable("must-not-run"));
+    let _runtime_registration = state.restart.set_runtime(runtime.clone());
+    state.restart.register_initial(locator(), "term-oversized");
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "agentRestartV1": true })),
+    )
+    .await;
+
+    let oversized = AgentRestart {
+        request_id: "oversized-r1".to_string(),
+        provider: "claude".to_string(),
+        session_id: "x".repeat(300),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: "term-oversized".to_string(),
+        expected_generation: 1,
+    };
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&ClientMessage::AgentRestart(oversized)).unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    let failed = next_restart_failed_for(&mut ws, "oversized-r1").await;
+    assert_eq!(failed["code"], "OVERLOADED");
+    assert_eq!(failed["retryable"], false);
+    assert_eq!(failed["recoveryPending"], false);
+    // The failure frame mirrors the capability-rejection descriptor fill.
+    assert_eq!(failed["runtimeId"], "term-oversized");
+    assert_eq!(failed["generation"], 1);
+
+    let started = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        common::next_frame_of_type(&mut ws, "agent.restart.started"),
+    )
+    .await;
+    assert!(
+        started.is_err(),
+        "no agent.restart.started may arrive for a door-rejected request: {started:?}"
+    );
+    assert_eq!(
+        state.restart.in_flight_transaction_count(),
+        0,
+        "the oversized request never registered a transaction"
+    );
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 0);
+    registry.kill_all();
+}
+
+/// The durable pending-row cap is a limits-ctor knob: with the cap clamped to
+/// one and one row already seeded, a new DISTINCT request is refused
+/// (retryable) without the journal's `pendingRecoveries` changing on disk.
+#[tokio::test]
+async fn pending_row_cap_rejects_new_restart_without_touching_the_journal() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("pending-cap-restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent_with_limits(
+        path.clone(),
+        8,
+        8,
+        RestartIngressLimits {
+            pending_recoveries: 1,
+            ..RestartIngressLimits::default()
+        },
+    )
+    .unwrap();
+    coordinator.register_initial(locator(), "term-seed");
+    // Seed one durable pending row (retryable retirement failure).
+    let seeded = coordinator
+        .execute(
+            restart("pending-cap-seed", "term-seed", 1),
+            &RetirementRetries {
+                shutdowns: AtomicUsize::new(0),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            seeded.messages.last(),
+            Some(ServerMessage::AgentRestartFailed(failed)) if failed.retryable && failed.recovery_pending
+        ),
+        "the seed transaction must leave a retained pending row: {:?}",
+        seeded.messages
+    );
+    assert_eq!(coordinator.pending_recoveries().len(), 1);
+    let journal_before = std::fs::read(&path).unwrap();
+
+    let failure = coordinator
+        .try_admit_restart(&AgentRestart {
+            request_id: "pending-cap-new".to_string(),
+            provider: "claude".to_string(),
+            session_id: "durable-other".to_string(),
+            kind: AgentRuntimeKind::Terminal,
+            live_id: "term-other".to_string(),
+            expected_generation: 1,
+        })
+        .expect_err("the pending-row cap must reject a new distinct request");
+    assert_eq!(failure.code, AgentRestartFailureCode::Overloaded);
+    assert!(
+        failure.retryable,
+        "a full journal is transient for a later retry"
+    );
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "the refused request never owns a pending row"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        journal_before,
+        "the refused request left the on-disk journal untouched"
+    );
+}
+
+/// Five DISTINCT new request ids for one durable session arrive while the
+/// retirement machinery is gated: the default per-session queue cap (4)
+/// admits the first four and refuses the fifth at the door with `OVERLOADED`
+/// before any spawn for it; once the gate opens the admitted four drain to
+/// completion (the owner runs the one retirement; the other three adopt the
+/// owner's durable result under their own request ids).
+#[tokio::test]
+async fn per_session_queue_cap_rejects_excess_queued_restarts() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let runtime = Arc::new(GatedSharedRuntime {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        shutdowns: AtomicUsize::new(0),
+    });
+    let _runtime_registration = state.restart.set_runtime(runtime.clone());
+    state.restart.register_initial(locator(), "term-queued");
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "agentRestartV1": true })),
+    )
+    .await;
+
+    for index in 1..=5 {
+        ws.send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(restart(
+                &format!("queued-r{index}"),
+                "term-queued",
+                1,
+            )))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    // The fifth arrival is refused while the admitted four hold every per-slot.
+    let failed = next_restart_failed_for(&mut ws, "queued-r5").await;
+    assert_eq!(failed["code"], "OVERLOADED");
+    assert_eq!(failed["retryable"], true);
+    assert_eq!(
+        state.restart.in_flight_transaction_count(),
+        4,
+        "exactly the four admitted requests are registered"
+    );
+
+    runtime.release.notify_waiters();
+    let mut started = 0usize;
+    let mut replaced = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while replaced < 4 {
+        let message = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("the four admitted restarts drain after the gate opens")
+            .expect("websocket stays connected")
+            .expect("websocket frame");
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+        match frame["type"].as_str() {
+            Some("agent.restart.started") => {
+                assert_eq!(frame["requestId"], "queued-r1");
+                started += 1;
+            }
+            Some("agent.restart.replaced") => {
+                let request_id = frame["requestId"].as_str().unwrap();
+                assert!(
+                    (1..=4).any(|index| request_id == format!("queued-r{index}")),
+                    "only admitted requests may complete: {frame}"
+                );
+                replaced += 1;
+            }
+            Some("agent.restart.failed") => {
+                panic!("no admitted arrival may fail after the gate opens: {frame}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started, 1, "one owner transaction ran");
+    assert_eq!(replaced, 4, "all four admitted requests completed");
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.restart.in_flight_transaction_count(),
+        0,
+        "every admission drain released its registration"
+    );
+    registry.kill_all();
+}
+
+/// The global in-flight cap is a limits-ctor knob: with one slot and a gated
+/// transaction holding it, a second distinct request (another session, so the
+/// per-session cap cannot be the limiter) is refused retryable; draining the
+/// first frees the slot for a later admission.
+#[tokio::test]
+async fn global_in_flight_cap_rejects_overload() {
+    let coordinator = RestartCoordinator::new_with_limits(
+        8,
+        8,
+        RestartIngressLimits {
+            in_flight: 1,
+            ..RestartIngressLimits::default()
+        },
+    );
+    coordinator.register_initial(locator(), "term-global");
+    let runtime = Arc::new(GatedSharedRuntime {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        shutdowns: AtomicUsize::new(0),
+    });
+    let _registration = coordinator.set_runtime(runtime.clone());
+
+    let first = restart("global-r1", "term-global", 1);
+    let guard = coordinator
+        .try_admit_restart(&first)
+        .expect("the first admission fits the global cap");
+    let accepted = coordinator
+        .spawn_registered(first, Some(guard), |_| {})
+        .await;
+    assert!(accepted);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.entered.notified(),
+    )
+    .await
+    .expect("the first transaction parked inside preflight holding the one slot");
+
+    let second = AgentRestart {
+        request_id: "global-r2".to_string(),
+        provider: "claude".to_string(),
+        session_id: "durable-other".to_string(),
+        kind: AgentRuntimeKind::Terminal,
+        live_id: "term-other".to_string(),
+        expected_generation: 1,
+    };
+    coordinator.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "durable-other"),
+        "term-other",
+    );
+    let failure = coordinator
+        .try_admit_restart(&second)
+        .expect_err("the single global in-flight slot is taken");
+    assert_eq!(failure.code, AgentRestartFailureCode::Overloaded);
+    assert!(failure.retryable);
+
+    runtime.release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        coordinator.join_in_flight_transactions(),
+    )
+    .await
+    .expect("the gated transaction drains once un-gated");
+    coordinator
+        .try_admit_restart(&second)
+        .expect("the released global slot admits a new request");
+}
+
+/// LB-03 anti-regression pin: the shipped client resends the SAME request id
+/// on a backoff loop, so six arrivals of one request id through a gated
+/// retirement must NEVER be Overloaded — every resend is known (in-flight
+/// id, durable row, or stored result) and bypasses admission, and each one
+/// replays/receives the one transaction's terminal result.
+#[tokio::test]
+async fn correlated_resends_of_one_request_bypass_admission_and_never_overload() {
+    let (url, registry, state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    let runtime = Arc::new(GatedSharedRuntime {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        shutdowns: AtomicUsize::new(0),
+    });
+    let _runtime_registration = state.restart.set_runtime(runtime.clone());
+    state.restart.register_initial(locator(), "term-resend");
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "agentRestartV1": true })),
+    )
+    .await;
+
+    for _ in 0..6 {
+        ws.send(WsMessage::Text(
+            serde_json::to_string(&ClientMessage::AgentRestart(restart(
+                "resend-r1",
+                "term-resend",
+                1,
+            )))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.entered.notified(),
+    )
+    .await
+    .expect("the first arrival parked inside preflight");
+    assert_eq!(
+        state.restart.in_flight_transaction_count(),
+        1,
+        "six arrivals of ONE request id register one distinct in-flight request"
+    );
+
+    runtime.release.notify_waiters();
+    let mut started = 0usize;
+    let mut replaced = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while replaced < 6 {
+        let message = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("the owner and five resends all settle after the gate opens")
+            .expect("websocket stays connected")
+            .expect("websocket frame");
+        let WsMessage::Text(text) = message else {
+            continue;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+        if frame["requestId"] != "resend-r1" {
+            continue;
+        }
+        match frame["type"].as_str() {
+            Some("agent.restart.started") => started += 1,
+            Some("agent.restart.replaced") => replaced += 1,
+            Some("agent.restart.failed") => {
+                panic!("a correlated resend must never fail — least of all OVERLOADED: {frame}")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started, 1, "exactly one transaction started");
+    assert_eq!(replaced, 6, "every arrival received the terminal result");
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
+    registry.kill_all();
 }
 
 struct RecoveryMustNotSpawn {
@@ -2812,7 +3190,13 @@ async fn persisted_spawn_fence_quiesces_ambiguous_writer_before_boot_retry() {
 fn coordinator_bounds_runtime_identity_and_generation_retention() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("bounded-ownership-state.json");
-    let coordinator = RestartCoordinator::new_persistent_with_limits(path.clone(), 2, 2).unwrap();
+    let coordinator = RestartCoordinator::new_persistent_with_limits(
+        path.clone(),
+        2,
+        2,
+        RestartIngressLimits::default(),
+    )
+    .unwrap();
 
     for index in 0..8 {
         let locator = RuntimeLocator::new(
@@ -2844,13 +3228,15 @@ fn coordinator_bounds_runtime_identity_and_generation_retention() {
     assert!(counts.generation_high_waters <= 2, "{counts:?}");
     drop(coordinator);
 
-    let reopened = RestartCoordinator::new_persistent_with_limits(path, 2, 2).unwrap();
+    let reopened =
+        RestartCoordinator::new_persistent_with_limits(path, 2, 2, RestartIngressLimits::default())
+            .unwrap();
     assert!(reopened.retained_ownership_counts().generation_high_waters <= 2);
 }
 
 #[tokio::test]
 async fn retired_descriptor_fences_late_frames_only_for_the_bounded_window() {
-    let coordinator = RestartCoordinator::new_with_limits(2, 2);
+    let coordinator = RestartCoordinator::new_with_limits(2, 2, RestartIngressLimits::default());
     let old = coordinator.register_initial(locator(), "term-old");
     coordinator
         .execute(
@@ -5298,6 +5684,7 @@ async fn indeterminate_journal_write_during_record_shutdown_pending_keeps_row_an
         path.clone(),
         16,
         16,
+        RestartIngressLimits::default(),
         fault.gate(),
     )
     .unwrap();
@@ -5424,6 +5811,7 @@ async fn indeterminate_journal_write_during_commit_keeps_pending_row_and_defers_
         path.clone(),
         16,
         16,
+        RestartIngressLimits::default(),
         fault.gate(),
     )
     .unwrap();
@@ -5561,9 +5949,13 @@ async fn restart_spawn_rejected_once_shutdown_latched() {
     let emit_sink = Arc::clone(&emitted);
 
     let accepted = coordinator
-        .spawn_registered(restart("shutdown-spawn-r1", "term-1", 1), move |message| {
-            emit_sink.lock().unwrap().push(message.clone());
-        })
+        .spawn_registered(
+            restart("shutdown-spawn-r1", "term-1", 1),
+            None,
+            move |message| {
+                emit_sink.lock().unwrap().push(message.clone());
+            },
+        )
         .await;
 
     assert!(
@@ -5627,9 +6019,13 @@ async fn latched_retry_of_a_retained_pending_row_reports_recovery_pending() {
     let emitted = Arc::new(Mutex::new(Vec::new()));
     let emit_sink = Arc::clone(&emitted);
     let accepted = coordinator
-        .spawn_registered(restart("shutdown-retry-r1", "term-1", 1), move |message| {
-            emit_sink.lock().unwrap().push(message.clone());
-        })
+        .spawn_registered(
+            restart("shutdown-retry-r1", "term-1", 1),
+            None,
+            move |message| {
+                emit_sink.lock().unwrap().push(message.clone());
+            },
+        )
         .await;
     assert!(!accepted, "a latched retry is refused without spawning");
     let messages = emitted.lock().unwrap().clone();
@@ -5703,7 +6099,7 @@ async fn in_flight_transaction_is_joined_by_shutdown_and_replacement_creation_af
     let emit_sink = Arc::clone(&emitted);
 
     let accepted = coordinator
-        .spawn_registered(restart("in-flight-r1", "term-1", 1), move |message| {
+        .spawn_registered(restart("in-flight-r1", "term-1", 1), None, move |message| {
             emit_sink.lock().unwrap().push(message.clone());
         })
         .await;
@@ -6020,7 +6416,7 @@ async fn spawn_registered_cannot_insert_after_the_drain_observed_empty() {
     let spawn_coordinator = coordinator.clone();
     let spawned = tokio::spawn(async move {
         spawn_coordinator
-            .spawn_registered(restart("race-r1", "term-1", 1), move |message| {
+            .spawn_registered(restart("race-r1", "term-1", 1), None, move |message| {
                 emit_sink.lock().unwrap().push(message.clone());
             })
             .await
@@ -6103,7 +6499,7 @@ async fn shutdown_sequence_completes_within_the_shared_deadline_with_a_live_gate
     let runtime = Arc::new(GatedRetirementRuntime::default());
     let _registration = coordinator.set_runtime(runtime.clone());
     let accepted = coordinator
-        .spawn_registered(restart("lb02-r1", "term-1", 1), |_| {})
+        .spawn_registered(restart("lb02-r1", "term-1", 1), None, |_| {})
         .await;
     assert!(accepted);
     tokio::time::timeout(

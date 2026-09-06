@@ -505,6 +505,21 @@ pub struct RestartCoordinator {
     request_lock_order: Arc<Mutex<VecDeque<String>>>,
     lock_limit: usize,
     ownership_limit: usize,
+    /// Fix-6 ingress bounds (durable pending rows, global in-flight, distinct
+    /// per-session queue) applied BEFORE any spawn/lock at admission.
+    ingress_limits: RestartIngressLimits,
+    /// Global in-flight transaction bound; the [`AdmissionGuard`] owns one
+    /// permit per admitted distinct request.
+    in_flight: Arc<tokio::sync::Semaphore>,
+    /// Distinct new request ids queued per durable session. Bounded by
+    /// `MAX_QUEUED_RESTART_SESSION_KEYS` distinct keys; counts drop to zero
+    /// (and the key is pruned) as [`AdmissionGuard`]s release.
+    queued_by_session: Arc<Mutex<HashMap<RestartSessionKey, usize>>>,
+    /// LB-03 dedupe registry: request ids of every currently in-flight
+    /// registered transaction, inserted inside `spawn_registered`'s
+    /// transactions mutex and removed at task end. Cheap sync reads only —
+    /// the WS door probes it on its select loop before admission.
+    in_flight_request_ids: Arc<Mutex<HashSet<String>>>,
     registered_runtime:
         Arc<std::sync::RwLock<Option<std::sync::Weak<dyn RestartRuntime<ResumePlan = ()>>>>>,
     /// Runtime wake for the always-on recovery driver: every committed
@@ -532,6 +547,100 @@ pub struct RestartCoordinator {
 const DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT: usize = 1_024;
 const DEFAULT_RESTART_LOCK_LIMIT: usize = 1_024;
 const DEFAULT_RESTART_OWNERSHIP_LIMIT: usize = 4_096;
+
+/// Single upper bound on every string field of one `AgentRestart` client
+/// request, enforced at the ingress door before any spawn or lock (fix 6).
+const MAX_AGENT_RESTART_FIELD_BYTES: usize = 256;
+/// Default durable pending-recovery row cap for the restart journal.
+const MAX_PENDING_RESTART_RECOVERIES: usize = 1_024;
+/// Default global bound on concurrently registered restart transactions.
+const MAX_IN_FLIGHT_RESTARTS: usize = 256;
+/// Default bound on DISTINCT new request ids queued for one durable session
+/// (counted after the LB-03 resend dedupe, so client retries never count).
+const MAX_QUEUED_RESTARTS_PER_SESSION: usize = 4;
+/// Bound on distinct durable sessions with queued restart work; per-session
+/// entries are pruned when their count drops to zero (fix 6).
+const MAX_QUEUED_RESTART_SESSION_KEYS: usize = 1_024;
+/// The restart journal is whole-file rewritten on every transaction write;
+/// cap its serialized size so nothing can grow it without bound. An over-cap
+/// state is refused as `NotCommitted`, preserving the previously committed
+/// journal and the in-memory ownership state exactly.
+const MAX_RESTART_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Count bounds enforced on restart ingress BEFORE any task spawn, lock
+/// allocation, or journal write (fix 6). Tests clamp these through the
+/// `*_with_limits` constructors; production uses the `MAX_*` defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartIngressLimits {
+    /// Durable pending-recovery rows the journal may hold before a new,
+    /// distinct restart request is refused (retryable).
+    pub pending_recoveries: usize,
+    /// Global bound on concurrently registered in-flight restart transactions.
+    pub in_flight: usize,
+    /// Distinct new request ids one durable session may hold at once.
+    pub queued_per_session: usize,
+}
+
+impl Default for RestartIngressLimits {
+    fn default() -> Self {
+        Self {
+            pending_recoveries: MAX_PENDING_RESTART_RECOVERIES,
+            in_flight: MAX_IN_FLIGHT_RESTARTS,
+            queued_per_session: MAX_QUEUED_RESTARTS_PER_SESSION,
+        }
+    }
+}
+
+/// Same `max(1)` convention as the ownership/lock limits: a zero bound would
+/// deadlock the door (a zero-permit semaphore never acquires).
+fn clamped_ingress_limits(limits: RestartIngressLimits) -> RestartIngressLimits {
+    RestartIngressLimits {
+        pending_recoveries: limits.pending_recoveries.max(1),
+        in_flight: limits.in_flight.max(1),
+        queued_per_session: limits.queued_per_session.max(1),
+    }
+}
+
+/// One admitted distinct restart request (fix 6): holds the global in-flight
+/// semaphore permit and the per-session queue slot until drop (the registered
+/// transaction task end, including panic unwind — locals drop during unwind).
+/// A refused request never constructs this guard, so slots only ever come
+/// from admissions that registered or will emit a typed rejection.
+#[derive(Debug)]
+pub struct AdmissionGuard {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    session_key: RestartSessionKey,
+    queued: Arc<Mutex<HashMap<RestartSessionKey, usize>>>,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut queued = self.queued.lock().expect("restart queued-by-session");
+        if let Some(count) = queued.get_mut(&self.session_key) {
+            *count -= 1;
+            if *count == 0 {
+                queued.remove(&self.session_key);
+            }
+        }
+    }
+}
+
+/// Membership in the coordinator's in-flight request-id set (the LB-03
+/// dedupe registry). Removal on drop keeps the set exact even when a
+/// transaction task panics mid-flight.
+struct InFlightRequestRegistration {
+    ids: Arc<Mutex<HashSet<String>>>,
+    request_id: String,
+}
+
+impl Drop for InFlightRequestRegistration {
+    fn drop(&mut self) {
+        self.ids
+            .lock()
+            .expect("restart in-flight request ids")
+            .remove(&self.request_id);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedOwnershipCounts {
@@ -663,12 +772,18 @@ impl RestartCoordinator {
         let mut coordinator = Self::new_with_limits(
             DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT,
             DEFAULT_RESTART_LOCK_LIMIT,
+            RestartIngressLimits::default(),
         );
         coordinator.ownership_limit = DEFAULT_RESTART_OWNERSHIP_LIMIT;
         coordinator
     }
 
-    pub fn new_with_limits(ownership_limit: usize, lock_limit: usize) -> Self {
+    pub fn new_with_limits(
+        ownership_limit: usize,
+        lock_limit: usize,
+        ingress_limits: RestartIngressLimits,
+    ) -> Self {
+        let ingress_limits = clamped_ingress_limits(ingress_limits);
         Self {
             ownership: Arc::new(Mutex::new(RuntimeOwnership::default())),
             persistence_path: None,
@@ -682,6 +797,10 @@ impl RestartCoordinator {
             request_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             lock_limit: lock_limit.max(1),
             ownership_limit: ownership_limit.max(1),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(ingress_limits.in_flight)),
+            queued_by_session: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_request_ids: Arc::new(Mutex::new(HashSet::new())),
+            ingress_limits,
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
             recovery_notify: Arc::new(tokio::sync::Notify::new()),
             shutdown_latch: Arc::new(std::sync::RwLock::new(Arc::new(AtomicBool::new(false)))),
@@ -695,6 +814,7 @@ impl RestartCoordinator {
             path,
             DEFAULT_RESTART_PERSISTED_GENERATION_LIMIT,
             DEFAULT_RESTART_LOCK_LIMIT,
+            RestartIngressLimits::default(),
         )
     }
 
@@ -702,11 +822,13 @@ impl RestartCoordinator {
         path: impl Into<PathBuf>,
         ownership_limit: usize,
         lock_limit: usize,
+        ingress_limits: RestartIngressLimits,
     ) -> std::io::Result<Self> {
         Self::new_persistent_inner(
             path,
             ownership_limit,
             lock_limit,
+            ingress_limits,
             default_journal_parent_sync(),
         )
     }
@@ -719,20 +841,29 @@ impl RestartCoordinator {
         path: impl Into<PathBuf>,
         ownership_limit: usize,
         lock_limit: usize,
+        ingress_limits: RestartIngressLimits,
         sync_parent: JournalParentSync,
     ) -> std::io::Result<Self> {
-        Self::new_persistent_inner(path, ownership_limit, lock_limit, sync_parent)
+        Self::new_persistent_inner(
+            path,
+            ownership_limit,
+            lock_limit,
+            ingress_limits,
+            sync_parent,
+        )
     }
 
     fn new_persistent_inner(
         path: impl Into<PathBuf>,
         ownership_limit: usize,
         lock_limit: usize,
+        ingress_limits: RestartIngressLimits,
         sync_parent: JournalParentSync,
     ) -> std::io::Result<Self> {
         let path = path.into();
         let ownership_limit = ownership_limit.max(1);
         let lock_limit = lock_limit.max(1);
+        let ingress_limits = clamped_ingress_limits(ingress_limits);
         let persistence_lock = Self::acquire_persistence_lock(&path)?;
         let ownership = Self::load_persisted(&path, ownership_limit)?;
         Ok(Self {
@@ -748,6 +879,10 @@ impl RestartCoordinator {
             request_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             lock_limit,
             ownership_limit,
+            in_flight: Arc::new(tokio::sync::Semaphore::new(ingress_limits.in_flight)),
+            queued_by_session: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_request_ids: Arc::new(Mutex::new(HashSet::new())),
+            ingress_limits,
             registered_runtime: Arc::new(std::sync::RwLock::new(None)),
             recovery_notify: Arc::new(tokio::sync::Notify::new()),
             shutdown_latch: Arc::new(std::sync::RwLock::new(Arc::new(AtomicBool::new(false)))),
@@ -1050,6 +1185,15 @@ impl RestartCoordinator {
                 return JournalWriteOutcome::NotCommitted(std::io::Error::other(error.to_string()))
             }
         };
+        // Fix-6 journal byte cap: never stage an over-cap whole-file rewrite.
+        // The candidate is discarded entirely, so the previously committed
+        // journal and the caller's pre-update memory both stay authoritative.
+        if bytes.len() > MAX_RESTART_JOURNAL_BYTES {
+            return JournalWriteOutcome::NotCommitted(std::io::Error::other(format!(
+                "restart journal exceeds the {MAX_RESTART_JOURNAL_BYTES}-byte cap: {} bytes serialized",
+                bytes.len()
+            )));
+        }
         let temp = path.with_extension(format!(
             "tmp-{}-{}",
             std::process::id(),
@@ -1363,10 +1507,173 @@ impl RestartCoordinator {
         })
     }
 
+    /// LB-03 dedupe probe for the WS ingress door: a cheap synchronous read
+    /// (no `.await` — the door runs on the connection's select loop) answering
+    /// whether this request id is already owned by (a) an in-flight
+    /// registered transaction, (b) a durable pending row as owner or
+    /// correlated follower, or (c) a stored terminal result. A known arrival
+    /// bypasses admission entirely — `execute_with_events`'s replay/follower
+    /// machinery answers it — so a client resend of one request id never
+    /// consumes ingress budget and only DISTINCT new request ids count
+    /// against the caps.
+    pub fn is_known_request(&self, request: &AgentRestart) -> bool {
+        if self
+            .in_flight_request_ids
+            .lock()
+            .expect("restart in-flight request ids")
+            .contains(&request.request_id)
+        {
+            return true;
+        }
+        let ownership = self.ownership.lock().expect("restart ownership lock");
+        if ownership.results.contains_key(&request.request_id)
+            || ownership
+                .pending_recoveries
+                .contains_key(&request.request_id)
+        {
+            return true;
+        }
+        ownership.pending_recoveries.values().any(|pending| {
+            pending
+                .followers
+                .iter()
+                .any(|follower| follower.request_id == request.request_id)
+        })
+    }
+
+    /// Count of currently in-flight registered restart transactions — the
+    /// LB-03 id-set cardinality. Test/observability probe.
+    pub fn in_flight_transaction_count(&self) -> usize {
+        self.in_flight_request_ids
+            .lock()
+            .expect("restart in-flight request ids")
+            .len()
+    }
+
+    /// Admit one DISTINCT new restart request, enforcing every fix-6 ingress
+    /// bound BEFORE any task spawn, lock allocation, or journal write:
+    /// per-field byte caps (non-retryable — a request that can never fit),
+    /// the durable pending-row cap, the global in-flight cap, and the
+    /// per-session queue cap (all retryable — transient capacity). Correlated
+    /// resends must NOT pass through here: the door probes
+    /// [`Self::is_known_request`] first (LB-03). The returned
+    /// [`AdmissionGuard`] releases its slots when the registered transaction
+    /// task ends.
+    pub fn try_admit_restart(
+        &self,
+        request: &AgentRestart,
+    ) -> Result<AdmissionGuard, RestartFailure> {
+        for (name, value) in [
+            ("requestId", &request.request_id),
+            ("provider", &request.provider),
+            ("sessionId", &request.session_id),
+            ("liveId", &request.live_id),
+        ] {
+            if value.len() > MAX_AGENT_RESTART_FIELD_BYTES {
+                return Err(RestartFailure::new(
+                    AgentRestartFailureCode::Overloaded,
+                    format!(
+                        "agent restart field {name} exceeds {MAX_AGENT_RESTART_FIELD_BYTES} bytes"
+                    ),
+                    false,
+                ));
+            }
+        }
+        let pending = self
+            .ownership
+            .lock()
+            .expect("restart ownership lock")
+            .pending_recoveries
+            .len();
+        if pending >= self.ingress_limits.pending_recoveries {
+            return Err(RestartFailure::new(
+                AgentRestartFailureCode::Overloaded,
+                format!(
+                    "restart journal holds {pending} pending recoveries; cap {}",
+                    self.ingress_limits.pending_recoveries
+                ),
+                true,
+            ));
+        }
+        let permit = Arc::clone(&self.in_flight)
+            .try_acquire_owned()
+            .map_err(|_| {
+                RestartFailure::new(
+                    AgentRestartFailureCode::Overloaded,
+                    format!(
+                        "restart system is at the global in-flight cap of {}",
+                        self.ingress_limits.in_flight
+                    ),
+                    true,
+                )
+            })?;
+        let session_key = RuntimeLocator::from_request(request).session_key();
+        {
+            let mut queued = self
+                .queued_by_session
+                .lock()
+                .expect("restart queued-by-session");
+            match queued.get_mut(&session_key) {
+                Some(count) if *count >= self.ingress_limits.queued_per_session => {
+                    return Err(RestartFailure::new(
+                        AgentRestartFailureCode::Overloaded,
+                        format!(
+                            "session already queues {count} distinct restarts; cap {}",
+                            self.ingress_limits.queued_per_session
+                        ),
+                        true,
+                    ));
+                }
+                Some(count) => *count += 1,
+                None => {
+                    if queued.len() >= MAX_QUEUED_RESTART_SESSION_KEYS {
+                        return Err(RestartFailure::new(
+                            AgentRestartFailureCode::Overloaded,
+                            format!(
+                                "restart queue already tracks {MAX_QUEUED_RESTART_SESSION_KEYS} distinct sessions"
+                            ),
+                            true,
+                        ));
+                    }
+                    queued.insert(session_key.clone(), 1);
+                }
+            }
+        }
+        Ok(AdmissionGuard {
+            _permit: permit,
+            session_key,
+            queued: Arc::clone(&self.queued_by_session),
+        })
+    }
+
+    /// Typed ingress/door rejection frame echoing the request's runtime
+    /// descriptor — the same fill as the capability-rejection shape. Used
+    /// when a request is refused before any transaction work begins, so
+    /// `recovery_pending` is always false: a request id that already owns a
+    /// durable row is known to [`Self::is_known_request`] and never reaches
+    /// admission.
+    pub fn failure_frame_for(
+        &self,
+        request: &AgentRestart,
+        failure: &RestartFailure,
+    ) -> ServerMessage {
+        ServerMessage::AgentRestartFailed(self.failure_frame(
+            request,
+            RuntimeDescriptor {
+                runtime_id: request.live_id.clone(),
+                generation: request.expected_generation,
+            },
+            failure,
+            false,
+        ))
+    }
+
     /// Register one restart transaction as a spawned task the graceful
     /// shutdown sequence can join. Returns `false` — after emitting the typed
     /// shutdown rejection through `emit` — when the shutdown latch is already
-    /// set, registering nothing.
+    /// set, registering nothing. `admission` carries the fix-6 ingress guard
+    /// (param 2, `None` for LB-03-bypassed correlated arrivals and for the
+    /// latched-shutdown rejection path); the held permits release at task end.
     ///
     /// The latch is checked twice (load-bearing LB-06): the fast-path load
     /// above the mutex is only an optimization; a task parked on the
@@ -1377,6 +1684,7 @@ impl RestartCoordinator {
     pub async fn spawn_registered(
         &self,
         request: AgentRestart,
+        admission: Option<AdmissionGuard>,
         mut emit: impl FnMut(&ServerMessage) + Send + 'static,
     ) -> bool {
         if self.shutdown_latched() {
@@ -1398,6 +1706,7 @@ impl RestartCoordinator {
             gate.park_if_armed().await;
         }
         let coordinator = self.clone();
+        let request_id = request.request_id.clone();
         let mut transactions = self.transactions.lock().await;
         if self.shutdown_latched() {
             drop(transactions);
@@ -1410,7 +1719,20 @@ impl RestartCoordinator {
             emit(&self.shutdown_rejection_frame(&request));
             return false;
         }
+        // LB-03 id-set sync: membership begins inside this mutex (before the
+        // spawn is visible) so a resend that arrives on the same door directly
+        // after this call observes the request as known and bypasses
+        // admission; the registration guard drops at task end.
+        self.in_flight_request_ids
+            .lock()
+            .expect("restart in-flight request ids")
+            .insert(request_id.clone());
         transactions.spawn(async move {
+            let _registration = InFlightRequestRegistration {
+                ids: Arc::clone(&coordinator.in_flight_request_ids),
+                request_id,
+            };
+            let _admission = admission;
             coordinator
                 .execute_registered(request, |message| emit(message))
                 .await;
@@ -2441,6 +2763,48 @@ impl RestartCoordinator {
             kind: request.kind,
             runtime: expected.clone(),
         });
+        // Fix-6 backstop: the WS door refuses new distinct requests once the
+        // durable pending-row cap is reached, but door admission and this
+        // insert can race across sessions (each session runs under its own
+        // lock). Re-check before paying for the durable insert; on overflow
+        // release the preflight reservation and fail retryable WITHOUT
+        // inserting — the journal must never grow past the cap.
+        let pending_cap_reached = {
+            let ownership = self.ownership.lock().expect("restart ownership lock");
+            !ownership
+                .pending_recoveries
+                .contains_key(&request.request_id)
+                && ownership.pending_recoveries.len() >= self.ingress_limits.pending_recoveries
+        };
+        if pending_cap_reached {
+            tracing::warn!(
+                request_id = %request.request_id,
+                provider = %request.provider,
+                session_id = %request.session_id,
+                pending_limit = self.ingress_limits.pending_recoveries,
+                "agent.restart.rejected_overloaded_pending_cap"
+            );
+            runtime.abort_preflight(&request, &plan).await;
+            let failure = RestartFailure::new(
+                AgentRestartFailureCode::Overloaded,
+                format!(
+                    "restart journal is at the pending-recovery cap of {}",
+                    self.ingress_limits.pending_recoveries
+                ),
+                true,
+            );
+            let terminal = ServerMessage::AgentRestartFailed(self.failure_frame(
+                &request,
+                expected.clone(),
+                &failure,
+                false,
+            ));
+            emit(&terminal);
+            return RestartOutcome {
+                messages: vec![terminal],
+                replayed: false,
+            };
+        }
         let boundary_durability =
             match self.try_update_ownership("record_shutdown_pending", |ownership| {
                 ownership.pending_recoveries.insert(
@@ -5441,6 +5805,7 @@ mod persistence_tests {
             path.clone(),
             16,
             16,
+            RestartIngressLimits::default(),
             injected_sync,
         )
         .unwrap();
@@ -5626,5 +5991,77 @@ mod persistence_tests {
                     && replaced.old_runtime.old_runtime_id == newer.live_id
                     && replaced.runtime.runtime_id == "replacement-for-fresh-b"
         ));
+    }
+
+    /// Fix-6 journal byte cap: a whole-file journal rewrite whose serialized
+    /// state exceeds `MAX_RESTART_JOURNAL_BYTES` is refused as `NotCommitted`
+    /// — the previously committed journal on disk AND the in-memory ownership
+    /// state stay exactly as they were (the over-cap candidate is discarded).
+    #[test]
+    fn journal_write_refusing_megabyte_overrun_is_a_notcommitted_persistence_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-journal-bytes.json");
+        let coordinator = RestartCoordinator::new_persistent_with_limits(
+            path.clone(),
+            8,
+            8,
+            RestartIngressLimits::default(),
+        )
+        .unwrap();
+        coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "durable-bytes"),
+            "term-bytes",
+        );
+        let journal_before = std::fs::read(&path).unwrap();
+        assert!(
+            journal_before.len() <= MAX_RESTART_JOURNAL_BYTES,
+            "the baseline journal fits the cap"
+        );
+
+        // Build an over-cap candidate WITHOUT touching the coordinator's live
+        // ownership: one pending row carrying a megabyte-scale session id.
+        let mut candidate = coordinator.ownership.lock().unwrap().clone();
+        let oversized_request = AgentRestart {
+            request_id: "byte-cap-hog".to_string(),
+            provider: "claude".to_string(),
+            session_id: "s".repeat(MAX_RESTART_JOURNAL_BYTES + 1),
+            kind: AgentRuntimeKind::Terminal,
+            live_id: "term-bytes".to_string(),
+            expected_generation: 1,
+        };
+        candidate.pending_recoveries.insert(
+            oversized_request.request_id.clone(),
+            PendingRestartRecovery {
+                request_id: oversized_request.request_id.clone(),
+                request: oversized_request,
+                followers: Vec::new(),
+                old_runtime: RuntimeDescriptor {
+                    runtime_id: "term-bytes".to_string(),
+                    generation: 1,
+                },
+                retirement_pending: true,
+                resume_context: None,
+                retirement_fence: None,
+                replacement_fence: None,
+                last_failure: None,
+            },
+        );
+
+        let outcome = coordinator.persist_locked(&candidate);
+
+        assert!(
+            matches!(outcome, JournalWriteOutcome::NotCommitted(ref error)
+                if error.to_string().contains("byte cap")),
+            "an over-cap journal write is refused as NotCommitted: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            journal_before,
+            "the previously committed journal bytes are untouched"
+        );
+        assert!(
+            coordinator.pending_recoveries().is_empty(),
+            "the refused candidate never entered the live ownership state"
+        );
     }
 }
