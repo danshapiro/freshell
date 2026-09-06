@@ -46,7 +46,6 @@ pub mod model_capabilities;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
-pub mod rename_persistence;
 pub mod rollback_record;
 pub mod session_lease;
 pub mod snapshot;
@@ -72,7 +71,6 @@ pub use identity_sink::{
     SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
-pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
 pub use rollback_record::{
     now_ms, rollback_ack_frame, rollback_broadcast_frame, rollback_error_frame, RollbackDirection,
     RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest, CODEX_OLD_CLI_COPY,
@@ -313,21 +311,6 @@ pub struct FreshAgentState {
     /// snapshot) everywhere it isn't wired, matching the other Slice-1/3a
     /// fields' "unwired == degrades honestly" convention.
     pub layout: layout_store::LayoutStore,
-    /// Task 16 (`PATCH /api/panes/:id` cascade): the injected `configStore`
-    /// seam (`persistSyncableTerminalRename`'s terminal/session override
-    /// writes, `router.ts:681-683`) — `freshell-server`'s `main.rs` wires its
-    /// `SettingsRenamePersistence` here via [`Self::with_rename_persistence`].
-    /// `None` until wired (the `amplifier_locator` Option-until-wired
-    /// convention): the rename still lands in the layout store, only the
-    /// persistence cascade is skipped (Node's own `!configStore` guard,
-    /// `router.ts:668`).
-    pub(crate) rename_persistence: Option<Arc<dyn rename_persistence::RenamePersistence>>,
-    /// Task 16: the SAME handler-scoped `terminals.changed` revision counter
-    /// the WS lifecycle + REST `/api/terminals` broadcasts stamp (`main.rs`),
-    /// wired via [`Self::with_shared_terminals_revision`] so the rename
-    /// cascade's broadcast draws from the ONE monotonic sequence. `None`
-    /// until wired — the cascade then skips the broadcast honestly.
-    pub(crate) terminals_revision: Option<Arc<AtomicI64>>,
     /// Fix round 1 (Task 23 gap): the injectable post-create seam Node covers
     /// with the registry's `'terminal.created'` EVENT (`server/index.ts:647-655`
     /// -> `seedFromTerminal` for EVERY terminal, REST creates included). The
@@ -342,7 +325,7 @@ pub struct FreshAgentState {
     /// WS `terminal.create` path gets. Fired by
     /// [`terminal_tabs::spawn_terminal_pane`] after every successful
     /// REST-pipeline create (tab create, pane split, restore). `None` until
-    /// wired (the `rename_persistence` convention): creates proceed, only the
+    /// wired (the Option-until-wired convention): creates proceed, only the
     /// meta seeding is skipped.
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
     /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
@@ -451,8 +434,6 @@ impl FreshAgentState {
             on_stale_resume: None,
             sidecar_liveness: None,
             layout: layout_store::LayoutStore::default(),
-            rename_persistence: None,
-            terminals_revision: None,
             terminal_created_hook: None,
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
@@ -632,33 +613,14 @@ impl FreshAgentState {
         self
     }
 
-    /// Task 16 (`PATCH /api/panes/:id` cascade): wire in the production
-    /// [`RenamePersistence`] (`freshell-server`'s `SettingsRenamePersistence`
-    /// over the live settings store). Unwired == the rename route still
-    /// renames the store and broadcasts `ui.command{pane.rename}`, it just
-    /// skips the syncable-terminal persistence cascade.
-    pub fn with_rename_persistence(mut self, persistence: Arc<dyn RenamePersistence>) -> Self {
-        self.rename_persistence = Some(persistence);
-        self
-    }
-
     /// Fix round 1 (Task 23 gap): wire the post-create hook `freshell-server`
     /// uses to run the WS-parity meta seed -> async git enrich ->
     /// `terminal.meta.updated` broadcast for every REST-pipeline create (see
     /// the field doc for why this seam exists). Unwired == creates proceed,
-    /// meta seeding skipped. Mirrors [`Self::with_rename_persistence`].
+    /// meta seeding skipped. Mirrors the established `with_*` builder pattern
+    /// (e.g. [`Self::with_shared_sessions_revision`]).
     pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
         self.terminal_created_hook = Some(hook);
-        self
-    }
-
-    /// Task 16: share the ONE handler-scoped `terminals.changed` revision
-    /// counter (`main.rs`'s `terminals_revision`, also stamped by the WS
-    /// lifecycle and REST `/api/terminals` broadcasts) so the rename
-    /// cascade's `terminals.changed` never regresses the client's
-    /// revision watermark. Mirrors [`Self::with_shared_sessions_revision`].
-    pub fn with_shared_terminals_revision(mut self, revision: Arc<AtomicI64>) -> Self {
-        self.terminals_revision = Some(revision);
         self
     }
 
@@ -2204,19 +2166,23 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
 /// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane in the
 /// SHARED server-side layout store (Task 16 — kills D10's fake acknowledgement,
 /// which answered `{paneId, tabRenamed:false}` for ANY id without touching any
-/// state). Node behavior, clause for clause:
+/// state). Behavior, clause for clause:
 ///
 /// 1. name validation (blank → 400 `name required`; >500 → 400 length message);
-/// 2. `getPaneSnapshot` BEFORE the rename (the cascade reads PRE-rename content);
-/// 3. `renamePane` outcome — a miss answers 200 `ok({message})`
+/// 2. `renamePane` outcome — a miss answers 200 `ok({message})`
 ///    (`'pane not found'` / `'no layout snapshot'`, `router.ts:1411`+`:1423`);
-/// 4. on success, the best-effort syncable-terminal cascade
-///    ([`rename_persistence::persist_syncable_terminal_rename`]);
-/// 5. `tabRenamed` = the tab has exactly one pane — computed against the
+/// 3. `tabRenamed` = the tab has exactly one pane — computed against the
 ///    client snapshot where the pane resolved (multi-client store; Node reads
 ///    its single snapshot); broadcast
 ///    `ui.command{pane.rename,{tabId,paneId,title}}`; respond
 ///    `ok({tabId, paneId, tabRenamed}, 'pane renamed')`.
+///
+/// b5fb: the rename is LAYOUT-ONLY. Pane labels never touch the terminal
+/// registry title or durable session/terminal title overrides — the
+/// syncable-terminal persistence cascade (`persistSyncableTerminalRename`,
+/// formerly `rename_persistence::persist_syncable_terminal_rename`) was
+/// removed, and `PATCH /api/sessions/:key` is now the sole durable
+/// session-rename surface.
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -2237,9 +2203,6 @@ async fn rename_pane(
         );
     }
 
-    // Snapshot BEFORE the rename (`router.ts:1407`) so the cascade sees the
-    // pane's pre-rename content (terminalId/mode/session fields).
-    let pane_snapshot = state.layout.get_pane_snapshot(&pane_id);
     let outcome = state.layout.rename_pane(&pane_id, &name);
 
     let Some(tab_id) = outcome.tab_id else {
@@ -2250,10 +2213,6 @@ async fn rename_pane(
     };
     // `result.paneId || paneId` (`router.ts:1420`).
     let pane_id = outcome.pane_id.unwrap_or(pane_id);
-
-    if let Some(snapshot) = pane_snapshot.as_ref() {
-        rename_persistence::persist_syncable_terminal_rename(&state, snapshot, &name).await;
-    }
 
     // `tabRenamed` = single-pane tab (`router.ts:1414-1415`), computed from
     // the client snapshot where the pane actually RESOLVED (multi-client
@@ -4369,8 +4328,8 @@ mod tests {
 // ── PATCH /api/panes/:id (rename pane) ───────────────────────────────────
 
 #[cfg(test)]
-#[path = "rename_cascade_tests.rs"]
-mod rename_cascade_tests;
+#[path = "rename_route_tests.rs"]
+mod rename_route_tests;
 
 #[cfg(test)]
 mod rename_pane_tests {

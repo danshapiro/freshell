@@ -176,17 +176,29 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
     const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
+    // b5fb scope contract: EVERY override field is written only when its KEY is
+    // present in the request body (same rule as the Rust route in
+    // crates/freshell-server/src/sessions.rs). An absent key leaves the stored
+    // value untouched — ConfigStore merges {...existing, ...patch} and the JSON
+    // save drops keys spread as undefined, so unconditionally spreading an
+    // absent field would erase a stored archived/deleted/summary/createdAt
+    // value. Touching the title additionally writes/clears titleSource: an
+    // explicit null/blank clear removes the source rung too, so the ladder is
+    // unblocked afterwards (a leftover titleSource:'user' was a permanent
+    // freeze).
+    const touched = (key: string) => Object.prototype.hasOwnProperty.call(req.body ?? {}, key)
+    const cleanTitle = cleanString(titleOverride)
     const next = await configStore.patchSessionOverride(compositeKey, {
-      titleOverride: cleanString(titleOverride),
-      ...(cleanString(titleOverride) ? { titleSource: 'user' as const } : {}),
-      summaryOverride: cleanString(summaryOverride),
-      deleted,
-      archived,
-      createdAtOverride,
+      ...(touched('titleOverride')
+        ? { titleOverride: cleanTitle, titleSource: cleanTitle ? ('user' as const) : undefined }
+        : {}),
+      ...(touched('summaryOverride') ? { summaryOverride: cleanString(summaryOverride) } : {}),
+      ...(touched('deleted') ? { deleted } : {}),
+      ...(touched('archived') ? { archived } : {}),
+      ...(touched('createdAtOverride') ? { createdAtOverride } : {}),
     })
 
     // Cascade: if this session is running in a terminal, also rename the terminal
-    const cleanTitle = cleanString(titleOverride)
     let cascadedTerminalId: string | undefined
     if (cleanTitle && deps.terminalMetadata) {
       try {

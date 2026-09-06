@@ -30,6 +30,20 @@ export function titleSourceRank(source: TitleSource | undefined): number {
 }
 
 /**
+ * Narrow an arbitrary runtime value to a ladder source. The stored
+ * `SessionOverride.titleSource` is typed `TitleSource` but config.json is
+ * hand-editable, so emitters must re-validate before putting it on the wire —
+ * the client's `z.enum` (shared/read-models.ts) rejects a page carrying any
+ * out-of-ladder string. Uses `TITLE_SOURCE_RANK`'s OWN keys as the single
+ * source of truth (a bare `in` check would also match inherited names like
+ * 'toString').
+ */
+export function isTitleSource(value: unknown): value is TitleSource {
+  return typeof value === 'string'
+    && Object.prototype.hasOwnProperty.call(TITLE_SOURCE_RANK, value)
+}
+
+/**
  * A name is "finalized" once it has any source other than the dir placeholder.
  * Finalized names are frozen against all automatic writers; only a user rename
  * may replace them.

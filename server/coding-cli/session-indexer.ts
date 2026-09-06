@@ -10,6 +10,7 @@ import { extractTitleFromMessage } from '../title-utils.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ParsedSessionTitleSource, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
+import { isTitleSource } from '../../shared/title-source.js'
 import { extractClaudeGeneratedTitleFromJsonlObject } from './providers/claude-title.js'
 import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot, statMtimeMs } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
@@ -234,6 +235,21 @@ function applyOverride(
     createdAt: ov?.createdAtOverride ?? session.createdAt,
     archived: ov?.archived ?? session.archived ?? false,
     titleSource,
+    // b5fb: expose the reset-flow provenance exactly when the override APPLIES
+    // — `providerTitle` is the parsed pre-override title, `titleOverrideSource`
+    // the stored override row's source. A suppressed (provider-generated
+    // shadow) or absent override leaves all three fields off the row.
+    // `titleOverrideSource` re-validates the stored row: config.json is
+    // hand-editable, and an out-of-ladder string would fail the client's
+    // z.enum page parse (shared/read-models.ts) — junk degrades to "no source
+    // recorded", never to a poisoned page.
+    ...(shouldApplyTitleOverride
+      ? {
+          titleOverridden: true as const,
+          providerTitle: session.title,
+          ...(isTitleSource(ov?.titleSource) ? { titleOverrideSource: ov.titleSource } : {}),
+        }
+      : {}),
   }
 }
 

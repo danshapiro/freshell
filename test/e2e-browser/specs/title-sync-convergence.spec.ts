@@ -5,25 +5,35 @@ import { test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 /**
- * CROSS-SURFACE TITLE CONVERGENCE (Task 21, MATRIX -- both projects).
+ * RENAME SCOPE CONTRACT (b5fb) -- cross-server parity leg.
  *
- * Pins EDEV-09 (`port/oracle/DEVIATIONS.md`): the Task 19 client
- * title-convergence fixes -- sidebar/history/terminal-menu/Overview renames
- * now mirror into pane titles via `applySessionRenameCascade`
- * (`src/store/titleSync.ts`) and `updatePaneTitleBySessionRef`
- * (`src/store/panesSlice.ts`). The client is SHARED by both backends, so this
- * spec runs on `rust-chromium` AND `legacy-chromium`; the legacy run is the
- * regression control proving the client fixes didn't regress Node behavior.
+ * Pins the naming-ownership contract documented in
+ * docs/development/rename-scope-contract.md: pane labels belong to panes,
+ * tab labels to tabs, and the ONLY durable session rename surface is the
+ * explicit session-scope action (sidebar/history rename ->
+ * `PATCH /api/sessions/:key`, mirrored into open panes via
+ * `applySessionRenameCascade`). Pane/tab organization renames -- the pane
+ * header dblclick, the tab dblclick, the automation `PATCH /api/panes/:id`,
+ * and the Overview terminal rename -- stay layout-local and NEVER overwrite
+ * the durable provider-native session title. The reviewed "Reset to provider
+ * title" flow clears an explicit override and reveals that provider title.
+ *
+ * The client is SHARED by both backends, so this spec runs on
+ * `rust-chromium` AND `legacy-chromium`: the legacy run is the parity
+ * control proving the Node server obeys the same scope contract as the
+ * production Rust server.
  *
  * Each test drives a REAL UI journey (or the automation REST surface, where
  * the scenario is about automation) on its OWN dedicated seeded claude
- * session, then asserts BOTH surfaces (pane header + sidebar/tab) converge.
+ * session, then asserts BOTH the converging surface (pane header / tab
+ * label) AND the invariant one (the sidebar row keeps the provider title).
  * Sessions are resumed by a sidebar click, spawning the fake `claude` CLI
  * (`CLAUDE_CMD` override -- restore-matrix.spec.ts precedent, works on both
  * server kinds). `GOOGLE_GENERATIVE_AI_API_KEY` is force-blanked so neither
  * server's auto-name pass can reach a real Gemini: with no key, both servers'
- * sweeps settle sessions on the first-message heuristic, and every rename
- * below writes the finalized `user` ladder rung which the sweeps never
+ * sweeps settle sessions on the first-message heuristic (so the seeded
+ * provider-native title below is deterministic), and every EXPLICIT session
+ * rename writes the finalized `user` ladder rung which the sweeps never
  * clobber.
  */
 
@@ -32,6 +42,8 @@ const SESSION_SIDEBAR_RENAME = '00000000-0000-4000-8000-00000000c202'
 const SESSION_AUTOMATION_RENAME = '00000000-0000-4000-8000-00000000c303'
 const SESSION_HISTORY_RENAME = '00000000-0000-4000-8000-00000000c404'
 const SESSION_OVERVIEW_RENAME = '00000000-0000-4000-8000-00000000c505'
+const SESSION_TAB_RENAME = '00000000-0000-4000-8000-00000000c606'
+const SESSION_RESET = '00000000-0000-4000-8000-00000000c707'
 
 const SEEDED_SESSIONS: Array<{ id: string; dirName: string; firstMessage: string }> = [
   { id: SESSION_PANE_RENAME, dirName: 'convergence-alpha', firstMessage: 'convergence alpha pane rename journey' },
@@ -39,6 +51,8 @@ const SEEDED_SESSIONS: Array<{ id: string; dirName: string; firstMessage: string
   { id: SESSION_AUTOMATION_RENAME, dirName: 'convergence-gamma', firstMessage: 'convergence gamma automation rename journey' },
   { id: SESSION_HISTORY_RENAME, dirName: 'convergence-delta', firstMessage: 'convergence delta history rename journey' },
   { id: SESSION_OVERVIEW_RENAME, dirName: 'convergence-epsilon', firstMessage: 'convergence epsilon overview rename journey' },
+  { id: SESSION_TAB_RENAME, dirName: 'convergence-zeta', firstMessage: 'convergence zeta tab rename journey' },
+  { id: SESSION_RESET, dirName: 'convergence-eta', firstMessage: 'convergence eta reset journey' },
 ]
 
 /** Same trimmed real-reader JSONL shape as auto-title-rust.spec.ts: TWO
@@ -209,36 +223,35 @@ async function resumeSeededSession(
 test.describe('Title sync convergence', () => {
   test.setTimeout(120_000)
 
-  // Test 1: the pane-header inline rename (dblclick + type + Enter, the same
-  // interaction tab-management.spec.ts uses for tabs) PATCHes
-  // /api/panes/:id; the server's syncable-terminal cascade persists the
-  // session override (titleSource:'user'), and the sidebar row converges via
-  // the sessions.changed refetch -- no sidebar interaction at all.
-  test('pane header rename converges the sidebar', async ({ freshellPage, page, harness }) => {
+  // Test 1 (scope contract): the pane-header inline rename (dblclick + type +
+  // Enter) scopes to the PANE only (plus the single-pane tab label mirror).
+  // No session override is written, so the sidebar row keeps the
+  // provider-native first-message title -- never the pane label.
+  test('pane header rename stays pane-local; the sidebar keeps the provider title', async ({ freshellPage, page, harness }) => {
     const NEW_NAME = 'Pane Rename Target One'
     await resumeSeededSession(page, harness, SESSION_PANE_RENAME)
+    // Baseline: the sidebar shows the first-message title before any rename.
+    await expect(sidebarRow(page, SESSION_PANE_RENAME)).toContainText('convergence alpha pane rename journey', { timeout: 15_000 })
 
     const header = visiblePaneHeader(page)
-    await expect(header).toBeVisible({ timeout: 10_000 })
     await header.dblclick()
-
     const renameInput = page.getByLabel('Rename pane')
-    await expect(renameInput).toBeVisible({ timeout: 5_000 })
     await renameInput.fill(NEW_NAME)
     await renameInput.press('Enter')
 
-    // The pane header itself shows the committed rename...
     await expect(visiblePaneHeader(page)).toContainText(NEW_NAME, { timeout: 10_000 })
-    // ...and the SIDEBAR row converges (cascade + refetch), zero clicks.
-    await expect(sidebarRow(page, SESSION_PANE_RENAME)).toContainText(NEW_NAME, { timeout: 15_000 })
+    // Deliberate settle: if any stray cascade/sync existed, a sessions.changed
+    // refetch would flip the row well inside this window.
+    await page.waitForTimeout(3000)
+    await expect(sidebarRow(page, SESSION_PANE_RENAME)).toContainText('convergence alpha pane rename journey')
+    await expect(sidebarRow(page, SESSION_PANE_RENAME)).not.toContainText(NEW_NAME)
   })
 
-  // Test 2 (pins EDEV-09): the sidebar context-menu rename
-  // (`ContextMenuProvider.renameSession` -> window.prompt -> PATCH
-  // /api/sessions + `applySessionRenameCascade`) must mirror into the open
-  // pane's header immediately -- pre-fix, the client dropped
-  // `cascadedTerminalId` and the pane kept its stale name until a sidebar
-  // click.
+  // Test 2 (explicit session rename, retained): the sidebar context-menu
+  // rename (`ContextMenuProvider.renameSession` -> window.prompt -> PATCH
+  // /api/sessions + `applySessionRenameCascade`) is a SESSION-scope action,
+  // so it still mirrors into the open pane's header immediately and the
+  // sidebar row converges after the refetch.
   test('sidebar context-menu rename converges the pane header', async ({ freshellPage, page, harness }) => {
     const NEW_NAME = 'Sidebar Rename Target Two'
     await resumeSeededSession(page, harness, SESSION_SIDEBAR_RENAME)
@@ -252,30 +265,33 @@ test.describe('Title sync convergence', () => {
     await expect(renameItem).toBeVisible({ timeout: 5_000 })
     await renameItem.click()
 
-    // The PANE header updates with NO sidebar click needed (the EDEV-09 pin).
+    // The PANE header updates with NO sidebar click needed (the session->pane
+    // mirror is the retained leg of the contract).
     await expect(visiblePaneHeader(page)).toContainText(NEW_NAME, { timeout: 10_000 })
     // And the sidebar row itself reflects it after the refetch.
     await expect(sidebarRow(page, SESSION_SIDEBAR_RENAME)).toContainText(NEW_NAME, { timeout: 15_000 })
   })
 
-  // Test 3: the automation REST surface. PATCH /api/panes/:id renames the
-  // pane in the server-side layout store, broadcasts `ui.command{pane.rename}`
-  // (pane header), mirrors to the tab title (single-pane tab), and cascades
-  // to the session override for a syncable coding-CLI pane (sidebar row via
-  // the changed-broadcast refetch). On legacy-chromium this already works
-  // (Node behavior) -- the matrix run doubles as the regression control.
-  test('automation PATCH /api/panes/:id converges pane header + tab + sidebar', async ({ freshellPage, page, harness, serverInfo }) => {
+  // Test 3 (scope contract, automation surface): PATCH /api/panes/:id renames
+  // the pane in the server-side layout store, broadcasts
+  // `ui.command{pane.rename}` (pane header), and mirrors to the tab title
+  // (single-pane tab) -- and stops there. The agent-API rename obeys the same
+  // scope rule as the interactive UI, so no session override is written and
+  // the sidebar row keeps the provider-native title.
+  test('automation PATCH /api/panes/:id converges pane header + tab; the sidebar keeps the provider title', async ({ freshellPage, page, harness, serverInfo }) => {
     const NEW_NAME = 'Automation Name Three'
     const { tabId, paneId } = await resumeSeededSession(page, harness, SESSION_AUTOMATION_RENAME)
+    // Baseline: the sidebar shows the first-message title before any rename.
+    await expect(sidebarRow(page, SESSION_AUTOMATION_RENAME)).toContainText('convergence gamma automation rename journey', { timeout: 15_000 })
 
     // The server-side layout mirror is client-pushed (`ui.layout.sync`,
     // 200 ms trailing debounce, layoutMirrorMiddleware.ts) — until it lands,
     // BOTH servers answer a rename of the not-yet-mirrored pane with the
     // Node-parity no-op 200 `{message:'pane not found'}` (router.ts:1411 /
-    // rename_pane lib.rs:1516-1521) and skip the broadcast + cascade
-    // entirely. That miss is a real automation-contract outcome, not a
-    // convergence failure, so arrange like a real automation client: target
-    // a pane the server actually lists (GET /api/panes on both kinds).
+    // rename_pane lib.rs:1516-1521) and skip the broadcast entirely. That
+    // miss is a real automation-contract outcome, not a convergence failure,
+    // so arrange like a real automation client: target a pane the server
+    // actually lists (GET /api/panes on both kinds).
     await expect.poll(async () => {
       const listRes = await page.request.get(`${serverInfo.baseUrl}/api/panes?tabId=${encodeURIComponent(tabId)}`, {
         headers: { 'x-auth-token': serverInfo.token },
@@ -301,13 +317,17 @@ test.describe('Title sync convergence', () => {
     await expect(
       page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).getByText(NEW_NAME),
     ).toBeVisible({ timeout: 10_000 })
-    // Sidebar row (syncable coding-CLI cascade + refetch).
-    await expect(sidebarRow(page, SESSION_AUTOMATION_RENAME)).toContainText(NEW_NAME, { timeout: 15_000 })
+    // Deliberate settle: the sidebar row must NOT pick up the organization
+    // label (a stray pane->session cascade would flip it inside this window).
+    await page.waitForTimeout(3000)
+    await expect(sidebarRow(page, SESSION_AUTOMATION_RENAME)).toContainText('convergence gamma automation rename journey')
+    await expect(sidebarRow(page, SESSION_AUTOMATION_RENAME)).not.toContainText(NEW_NAME)
   })
 
-  // Test 4: the History (Projects) view's inline rename
-  // (`HistoryView.renameSession` -> PATCH /api/sessions +
-  // `applySessionRenameCascade`) converges the open pane's header.
+  // Test 4 (explicit session rename, retained): the History (Projects) view's
+  // inline rename (`HistoryView.renameSession` -> PATCH /api/sessions +
+  // `applySessionRenameCascade`) is session-scoped, so it still converges the
+  // open pane's header.
   test('history-view rename converges the pane', async ({ freshellPage, page, harness, serverInfo }) => {
     const NEW_NAME = 'History Rename Target Four'
     await resumeSeededSession(page, harness, SESSION_HISTORY_RENAME)
@@ -337,15 +357,16 @@ test.describe('Title sync convergence', () => {
     await expect(visiblePaneHeader(page)).toContainText(NEW_NAME, { timeout: 10_000 })
   })
 
-  // Test 5 (pins the OverviewView fix, validator-A5): the Overview page's
-  // TerminalCard inline rename routes through the shared rename helper
-  // (`renameOverviewTerminal`: PATCH /api/terminals/:id + pane mirror with
-  // setByUser). Pre-fix, the PATCH left paneTitles stale and the sweep was
-  // structurally blind post-PATCH (registry == override -> no mismatch -> no
-  // terminal.title.updated push), so the pane never converged.
-  test('Overview inline rename converges pane + sidebar', async ({ freshellPage, page, harness }) => {
+  // Test 5 (scope contract): the Overview page's TerminalCard inline rename
+  // routes through the shared rename helper (`renameOverviewTerminal`: PATCH
+  // /api/terminals/:id + pane mirror with setByUser). The pane header
+  // converges, but the terminal rename is no longer session-scoped anywhere,
+  // so the sidebar row keeps the provider-native title.
+  test('Overview inline rename converges the pane; the sidebar keeps the provider title', async ({ freshellPage, page, harness }) => {
     const NEW_NAME = 'Overview Rename Target Five'
     const { terminalId } = await resumeSeededSession(page, harness, SESSION_OVERVIEW_RENAME)
+    // Baseline: the sidebar shows the first-message title before any rename.
+    await expect(sidebarRow(page, SESSION_OVERVIEW_RENAME)).toContainText('convergence epsilon overview rename journey', { timeout: 15_000 })
 
     // Open the Overview page (nav label "Panes").
     await page.getByTitle('Panes (Ctrl+B O)').click()
@@ -360,10 +381,67 @@ test.describe('Title sync convergence', () => {
     await titleInput.fill(NEW_NAME)
     await page.getByRole('button', { name: 'Save', exact: true }).click()
 
-    // Back to the terminal view: the PANE header AND the sidebar row must
-    // BOTH converge (the validator-A5 double assertion).
+    // Back to the terminal view: the PANE header converges...
     await page.getByTitle('Coding Agents (Ctrl+B T)').click()
     await expect(visiblePaneHeader(page)).toContainText(NEW_NAME, { timeout: 10_000 })
-    await expect(sidebarRow(page, SESSION_OVERVIEW_RENAME)).toContainText(NEW_NAME, { timeout: 15_000 })
+    // ...but the sidebar row must NOT (the terminal rename is not a session
+    // rename on either server).
+    await page.waitForTimeout(3000)
+    await expect(sidebarRow(page, SESSION_OVERVIEW_RENAME)).toContainText('convergence epsilon overview rename journey')
+    await expect(sidebarRow(page, SESSION_OVERVIEW_RENAME)).not.toContainText(NEW_NAME)
+  })
+
+  // Test 6 (scope contract): a single-pane TAB rename (dblclick + type +
+  // Enter, the tab-management.spec.ts interaction) scopes to the tab's
+  // organization label only. It gains no broader durable semantics, so the
+  // sidebar row keeps the provider-native title.
+  test('tab rename stays tab-local; the sidebar keeps the provider title', async ({ freshellPage, page, harness }) => {
+    const NEW_NAME = 'Tab Rename Target Six'
+    const { tabId } = await resumeSeededSession(page, harness, SESSION_TAB_RENAME)
+    await expect(sidebarRow(page, SESSION_TAB_RENAME)).toContainText('convergence zeta tab rename journey', { timeout: 15_000 })
+    const tab = page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
+    await tab.dblclick()
+    const input = tab.locator('input')
+    await expect(input).toBeVisible({ timeout: 5_000 })
+    await input.fill(NEW_NAME)
+    await input.press('Enter')
+    await expect(tab.getByText(NEW_NAME)).toBeVisible({ timeout: 10_000 })
+    await page.waitForTimeout(3000)
+    await expect(sidebarRow(page, SESSION_TAB_RENAME)).toContainText('convergence zeta tab rename journey')
+    await expect(sidebarRow(page, SESSION_TAB_RENAME)).not.toContainText(NEW_NAME)
+  })
+
+  // Test 7 (reviewed reset flow): an explicit sidebar rename writes the
+  // durable override; the "Reset to provider title" context-menu item (gated
+  // on a non-sweep override source) then clears it with a current/provider
+  // title preview, the sidebar reverts to the provider-native title, and the
+  // reset item is gone afterwards.
+  test('explicit rename can be reset to the provider title from the context menu', async ({ freshellPage, page, harness }) => {
+    await resumeSeededSession(page, harness, SESSION_RESET)
+    const row = sidebarRow(page, SESSION_RESET)
+    await expect(row).toContainText('convergence eta reset journey', { timeout: 15_000 })
+
+    page.once('dialog', (dialog) => { void dialog.accept('Custom Reset Target') })
+    await row.click({ button: 'right' })
+    await page.getByRole('menuitem', { name: 'Rename', exact: true }).click()
+    await expect(row).toContainText('Custom Reset Target', { timeout: 15_000 })
+
+    await row.click({ button: 'right' })
+    const resetItem = page.getByRole('menuitem', { name: 'Reset to provider title' })
+    await expect(resetItem).toBeVisible({ timeout: 5_000 })
+    await resetItem.click()
+
+    const dialog = page.getByRole('dialog', { name: 'Reset to provider title?' })
+    await expect(dialog).toBeVisible({ timeout: 5_000 })
+    await expect(dialog).toContainText('Current title: Custom Reset Target')
+    await expect(dialog).toContainText('Provider title: convergence eta reset journey')
+    await dialog.getByRole('button', { name: 'Reset title' }).click()
+
+    await expect(row).toContainText('convergence eta reset journey', { timeout: 15_000 })
+    // Deterministic close-out: the sweep may re-apply a 'first-message' override
+    // within ~2s, but the menu gate excludes that rung (Task 7), so the item
+    // stays absent regardless of sweep timing.
+    await row.click({ button: 'right' })
+    await expect(page.getByRole('menuitem', { name: 'Reset to provider title' })).toHaveCount(0)
   })
 })

@@ -80,4 +80,15 @@ describe('ConfigStore session override title-source ladder', () => {
     const ov = await store.getSessionOverride(KEY)
     expect(ov?.titleOverride).toBe('Sourceless')
   })
+
+  it('clear patch removes titleOverride AND titleSource, unblocking the ladder', async () => {
+    await store.patchSessionOverride(KEY, { titleOverride: 'Intentional', titleSource: 'user' })
+    await store.patchSessionOverride(KEY, { titleOverride: undefined, titleSource: undefined })
+    const row = await store.getSessionOverride(KEY)
+    expect(row?.titleOverride).toBeUndefined()
+    expect(row?.titleSource).toBeUndefined()
+    // ladder unblocked: a lower-rung sourced title lands again
+    await store.patchSessionOverride(KEY, { titleOverride: 'first msg name', titleSource: 'first-message' })
+    expect((await store.getSessionOverride(KEY))?.titleOverride).toBe('first msg name')
+  })
 })

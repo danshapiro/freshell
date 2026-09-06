@@ -52,6 +52,85 @@ async fn patch_rename_persists_and_returns_merged_plus_cascade_null() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// b5fb: clearing a title (`{"titleOverride": null}`) removes BOTH the override
+/// and its source. A leftover titleSource:"user" would permanently finalize the
+/// row at rank 5, blocking every automatic title update forever after.
+#[tokio::test]
+async fn patch_clear_title_removes_override_and_source() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
+    std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+    let st = state(&dir);
+    let app = super::router(st.clone());
+
+    // 1) Explicit user rename lands with the 'user' rung.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/sessions/abc123?provider=claude")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"titleOverride":"Intentional rename"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["titleSource"], serde_json::json!("user"));
+
+    // 2) Clear: the response and the stored row lose BOTH keys.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/sessions/abc123?provider=claude")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"titleOverride":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert!(
+        v.get("titleOverride").map(|x| x.is_null()).unwrap_or(true),
+        "titleOverride cleared from response: {v}"
+    );
+    assert!(
+        v.get("titleSource").map(|x| x.is_null()).unwrap_or(true),
+        "titleSource cleared from response: {v}"
+    );
+
+    let overrides = st.settings.session_overrides();
+    let row = overrides.get("claude:abc123").cloned().unwrap_or_default();
+    assert!(row.get("titleOverride").is_none(), "stored row: {row}");
+    assert!(row.get("titleSource").is_none(), "stored row: {row}");
+
+    // 3) The ladder is unblocked: a first-message sourced write lands again.
+    st.settings
+        .patch_session_override(
+            "claude:abc123",
+            &[
+                (
+                    "titleOverride",
+                    Some(serde_json::json!("First message name")),
+                ),
+                ("titleSource", Some(serde_json::json!("first-message"))),
+            ],
+        )
+        .await;
+    let row = st
+        .settings
+        .session_overrides()
+        .get("claude:abc123")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["titleSource"], serde_json::json!("first-message"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Registers a REAL (but throwaway, immediately killable) terminal in the
 /// shared `TerminalRegistry` so the reverse cascade's registry
 /// write-through (`registry.update_title`) has an actual entry to mutate.
@@ -175,11 +254,10 @@ async fn patch_rename_cascades_all_four_effects_to_a_live_terminal() {
 /// `sessions-router.ts:149`): a RETIRED (already-exited) terminal's
 /// session can still be renamed through this route, but the rename does
 /// NOT reach back into the exited terminal -- `cascadedTerminalId` stays
-/// `null`. This pins the live-only semantic against the OPPOSITE
-/// (terminal -> session) direction's `.get()`-based
-/// `rename_cascades_even_after_the_terminal_has_exited` test in
-/// `terminals.rs`, which deliberately DOES still cascade for a retired
-/// terminal -- the two directions are asymmetric on purpose.
+/// `null`. The OPPOSITE (terminal -> session) direction no longer exists at
+/// all: b5fb removed that cascade outright (a terminal rename never writes a
+/// session override -- see `title_scope_tests` in `terminals.rs`), so this
+/// live-only session -> terminal reach-back is the only rename cascade left.
 #[tokio::test]
 async fn patch_rename_to_a_retired_terminal_identity_does_not_cascade() {
     let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));

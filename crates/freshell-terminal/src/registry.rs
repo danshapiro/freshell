@@ -730,8 +730,13 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
     /// inventory keys on `RetiredReason::Closed` meaning deliberate close
     /// (recovery_inventory.rs:299-301). Both A2 hazards are closed by the
     /// identity-row retire alone: the session directory joins identity
-    /// rows for liveness (session_directory.rs:716-766, and the rename
-    /// cascade with it, sessions.rs:167-187), and the claude drain's no-op
+    /// rows for liveness (session_directory.rs:716-766, and rename handling
+    /// can no longer rebind a dead pane — the sessions route's surviving
+    /// session→terminal mirror resolves LIVE identities via `find_by_session`
+    /// and only broadcasts beyond the live label write, sessions.rs:167-229
+    /// region; the terminal→session rename cascade is gone entirely, so
+    /// nothing cascades terminal renames into identity/session writes),
+    /// and the claude drain's no-op
     /// arm checks `current.retired` (claude_signal.rs:253-342), so a late
     /// new-id SessionStart cannot durably rebind a dead pane. Idempotent;
     /// harmless no-op for terminals with no identity row. Called from the
@@ -1889,27 +1894,6 @@ impl TerminalRegistry {
                 .map(|h| Arc::clone(&h.shared))
         };
         shared.map(|s| s.lock().expect("terminal lock").title.clone())
-    }
-
-    /// Single-id read of a terminal's live `mode` + resume/session id
-    /// (validator-A10): the provider/sessionId seam the Agent-API pane-rename
-    /// cascade resolves REGISTRY-FIRST (`persistSyncableTerminalRename`,
-    /// `router.ts:658-676` — terminal metadata before paneContent), because a
-    /// locator association writes the learned session id back HERE via
-    /// [`Self::set_meta`] with zero client involvement. Same single-id
-    /// pattern as [`Self::title_of`]; `None` for an unknown terminal id.
-    pub fn session_binding_of(&self, terminal_id: &str) -> Option<(String, Option<String>)> {
-        let shared = {
-            let inner = self.inner.lock().expect("registry lock");
-            inner
-                .terminals
-                .get(terminal_id)
-                .map(|h| Arc::clone(&h.shared))
-        };
-        shared.map(|shared| {
-            let s = shared.lock().expect("terminal lock");
-            (s.mode.clone(), s.resume_session_id.clone())
-        })
     }
 
     /// `registry.updateDescription()` — the PATCH write-through for

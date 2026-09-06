@@ -53,6 +53,7 @@ function createMockActions(): MenuActions {
     openSessionInNewTab: vi.fn(),
     openSessionInThisTab: vi.fn(),
     renameSession: vi.fn(),
+    resetSessionTitle: vi.fn(),
     toggleArchiveSession: vi.fn(),
     deleteSession: vi.fn(),
     copySessionId: vi.fn(),
@@ -633,5 +634,65 @@ describe('tabs-card menu', () => {
       { ...createMockContext(actions), tabRegistryGroups: makeRegistryGroups(), registryDeviceId: 'd' },
     )
     expect(unknownKey).toEqual([])
+  })
+})
+
+describe('buildMenuItems — session reset-to-provider-title gating (b5fb)', () => {
+  const target = { kind: 'sidebar-session', sessionId: 's1', provider: 'claude' } as ContextTarget
+
+  function ctxWithSession(sessionOverrides: Record<string, unknown>) {
+    const actions = createMockActions()
+    const ctx = createMockContext(actions)
+    ctx.sessions = [{
+      projectPath: '/repo/x',
+      sessions: [{
+        provider: 'claude', sessionId: 's1', projectPath: '/repo/x', lastActivityAt: 1,
+        title: 'Shown title', ...sessionOverrides,
+      } as never],
+    }] as never
+    return { actions, ctx }
+  }
+
+  it('offers the reset item when the row carries titleOverridden, wired to resetSessionTitle', () => {
+    const { actions, ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title', titleOverrideSource: 'user' })
+    const items = buildMenuItems(target, ctx)
+    const reset = items.find((i) => i.type === 'item' && i.id === 'session-reset-title')
+    expect(reset).toBeTruthy()
+    if (reset?.type === 'item') reset.onSelect()
+    expect(actions.resetSessionTitle).toHaveBeenCalledWith('s1', 'claude')
+  })
+
+  it('omits the reset item for rows without an applied override', () => {
+    const { ctx } = ctxWithSession({})
+    const items = buildMenuItems(target, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(false)
+  })
+
+  it('omits the reset item for sweep-rung overrides the sweep would instantly re-apply', () => {
+    const { ctx } = ctxWithSession({ titleOverridden: true, titleOverrideSource: 'first-message', providerTitle: 'Native title' })
+    const items = buildMenuItems(target, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(false)
+  })
+
+  it('omits the reset item for dir-sourced overrides (the second sweep rung)', () => {
+    const { ctx } = ctxWithSession({ titleOverridden: true, titleOverrideSource: 'dir', providerTitle: 'Native title' })
+    const items = buildMenuItems(target, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(false)
+  })
+
+  it('offers the reset item for historical overrides with NO recorded source (pane-era accidents)', () => {
+    const { ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title' })
+    const items = buildMenuItems(target, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(true)
+  })
+
+  it('offers the same item on the history-session menu, wired to resetSessionTitle', () => {
+    const { actions, ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title' })
+    const historyTarget = { kind: 'history-session', sessionId: 's1', provider: 'claude' } as ContextTarget
+    const items = buildMenuItems(historyTarget, ctx)
+    const reset = items.find((i) => i.type === 'item' && i.id === 'history-session-reset-title')
+    expect(reset).toBeTruthy()
+    if (reset?.type === 'item') reset.onSelect()
+    expect(actions.resetSessionTitle).toHaveBeenCalledWith('s1', 'claude')
   })
 })

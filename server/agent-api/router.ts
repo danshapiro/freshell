@@ -13,7 +13,6 @@ import {
   normalizeCodexSandboxSetting,
 } from '../coding-cli/codex-launch-config.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
-import { makeSessionKey } from '../coding-cli/types.js'
 import { terminalIdFromCreateError, UnknownTerminalModeError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
 import { buildSessionIdentityMismatchDetails, terminalMatchesExpectedSession } from '../terminal-session-identity.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
@@ -41,7 +40,6 @@ import {
 import { ClaudeFreshAgentHistoryResolutionError } from '../fresh-agent/history/claude/history-service.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
-const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const log = logger.child({ component: 'agent-api' })
 const CODEX_INPUT_READY_WAIT_TIMEOUT_MS = 60_000
 
@@ -497,8 +495,6 @@ export function createAgentApiRouter({
   registry,
   wsHandler,
   configStore,
-  terminalMetadata,
-  codingCliIndexer,
   codexActivityTracker,
   codexLaunchPlanner,
   assertTerminalCreateAccepted,
@@ -637,52 +633,6 @@ export function createAgentApiRouter({
     }
 
     return { tabId: requestedTabId, splitId: rawTarget, message: 'split not found' }
-  }
-
-  const persistSyncableTerminalRename = async (paneSnapshot: any, title: string) => {
-    const paneContent = paneSnapshot?.paneContent
-    const terminalId = typeof paneContent?.terminalId === 'string' ? paneContent.terminalId : undefined
-    const meta = terminalId
-      ? terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
-      : undefined
-    const resumeSessionId = typeof paneContent?.resumeSessionId === 'string'
-      ? paneContent.resumeSessionId
-      : undefined
-    const modeCandidates = [
-      typeof paneContent?.mode === 'string' ? paneContent.mode : undefined,
-      terminalId ? registry.get?.(terminalId)?.mode : undefined,
-      typeof meta?.provider === 'string' ? meta.provider : undefined,
-    ]
-    const mode = modeCandidates.find((candidate) => (
-      typeof candidate === 'string' && SYNCABLE_TERMINAL_MODES.has(candidate)
-    ))
-
-    if (!terminalId || !mode || !SYNCABLE_TERMINAL_MODES.has(mode) || !configStore) {
-      return
-    }
-
-    try {
-      await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
-      registry.updateTitle?.(terminalId, title)
-
-      const sessionProvider = typeof meta?.provider === 'string' ? meta.provider : mode
-      const sessionId = typeof meta?.sessionId === 'string' ? meta.sessionId : resumeSessionId
-      if (sessionProvider && sessionId) {
-        try {
-          await configStore.patchSessionOverride?.(makeSessionKey(sessionProvider as any, sessionId), {
-            titleOverride: title,
-          })
-          await codingCliIndexer?.refresh?.()
-        } catch {
-          // Match terminals-router semantics: terminal rename persistence is authoritative,
-          // but session-title cascade/index refresh is best-effort.
-        }
-      }
-
-      wsHandler?.broadcastTerminalsChanged?.()
-    } catch {
-      // Pane rename is authoritative for orchestration; syncable terminal persistence is best-effort.
-    }
   }
 
   router.post('/tabs', async (req, res) => {
@@ -1421,13 +1371,10 @@ export function createAgentApiRouter({
       const resolved = resolvePaneTarget(req.params.id)
       if (rejectPaneTargetError(res, resolved)) return
       const paneId = resolved.paneId || req.params.id
-      const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
       const result = layoutStore.renamePane(paneId, name)
       let responseData = result
 
       if (result?.tabId) {
-        await persistSyncableTerminalRename(paneSnapshot, name)
-
         const tabRenamed = (layoutStore.listPanes?.(result.tabId) || []).length === 1
         responseData = { ...result, tabRenamed }
 

@@ -95,6 +95,60 @@ describe('GET /api/session-directory', () => {
     expect(typeof res.body.revision).toBe('number')
   })
 
+  it('forwards title-override provenance fields verbatim onto directory wire items', async () => {
+    // b5fb: an indexer row that already carries override provenance must reach
+    // the wire untouched — this proves the projection + service toItems chain
+    // forwards the three fields (and the shared read model tolerates them).
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride,
+        deleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => [{
+          projectPath: '/repo/provenance',
+          sessions: [{
+            provider: 'claude',
+            sessionId: 'session-prov',
+            projectPath: '/repo/provenance',
+            lastActivityAt: 100,
+            title: 'Accidental pane label',
+            titleOverridden: true,
+            providerTitle: 'Provider native title',
+            titleOverrideSource: 'user',
+          }],
+        }],
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: {
+        list: () => [],
+      },
+    }))
+
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    const item = res.body.items.find((candidate: { sessionId: string }) => candidate.sessionId === 'session-prov')
+    expect(item).toMatchObject({
+      title: 'Accidental pane label',
+      titleOverridden: true,
+      providerTitle: 'Provider native title',
+      titleOverrideSource: 'user',
+    })
+  })
+
   it('quarantines persisted identity collisions while serving healthy session rows', async () => {
     const collisionCount = 1_003
     const collisionProjects: ProjectGroup[] = Array.from(

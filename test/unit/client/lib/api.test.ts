@@ -684,6 +684,96 @@ describe('visible-first read-model helpers', () => {
       liveTerminalOnly: true,
     })
   })
+
+  it('forwards title-override provenance from a raw page item into grouped sidebar window sessions', async () => {
+    // b5fb: groupDirectoryItemsAsProjects is an explicit ALLOWLIST mapper —
+    // deleting one of its provenance spreads silently drops reset-flow data
+    // before Redux ever sees it. Pin all three fields through from the raw
+    // server payload, mirroring the STATUS-STRIP tokenUsage pin above; a
+    // plain control item in the same payload proves absence stays absence.
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-provenance',
+        provider: 'claude',
+        projectPath: '/tmp/project-alpha',
+        title: 'Accidental pane label',
+        isRunning: false,
+        lastActivityAt: 1_000,
+        titleOverridden: true,
+        providerTitle: 'First prompt title',
+        titleOverrideSource: 'user',
+      }, {
+        sessionId: 'session-plain',
+        provider: 'claude',
+        projectPath: '/tmp/project-alpha',
+        title: 'Plain title',
+        isRunning: false,
+        lastActivityAt: 900,
+      }],
+      nextCursor: null,
+      revision: 1,
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    const sessions = response.projects[0]?.sessions ?? []
+    expect(sessions[0]).toMatchObject({
+      sessionId: 'session-provenance',
+      title: 'Accidental pane label',
+      titleOverridden: true,
+      providerTitle: 'First prompt title',
+      titleOverrideSource: 'user',
+    })
+    const plain = sessions.find((s: { sessionId: string }) => s.sessionId === 'session-plain')
+    expect(plain).toBeTruthy()
+    expect(plain).not.toHaveProperty('titleOverridden')
+    expect(plain).not.toHaveProperty('providerTitle')
+    expect(plain).not.toHaveProperty('titleOverrideSource')
+  })
+
+  it('forwards title-override provenance from a raw page item into search results', async () => {
+    // b5fb: searchSessions' results map is the second b5fb allowlist site —
+    // same pin as the sidebar mapper, one layer up (query page → SearchResponse).
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-search-provenance',
+        provider: 'codex',
+        projectPath: '/tmp/project-beta',
+        title: 'Accidental pane label',
+        matchedIn: 'title',
+        isRunning: false,
+        lastActivityAt: 2_000,
+        titleOverridden: true,
+        providerTitle: 'First prompt title',
+        titleOverrideSource: 'first-message',
+      }, {
+        sessionId: 'session-search-plain',
+        provider: 'codex',
+        projectPath: '/tmp/project-beta',
+        title: 'Plain title',
+        matchedIn: 'title',
+        isRunning: false,
+        lastActivityAt: 1_900,
+      }],
+      nextCursor: null,
+      revision: 2,
+    }))
+
+    const response = await searchSessions({ query: 'accidental' })
+
+    const provenance = response.results.find((r) => r.sessionId === 'session-search-provenance')
+    expect(provenance).toMatchObject({
+      title: 'Accidental pane label',
+      titleOverridden: true,
+      providerTitle: 'First prompt title',
+      titleOverrideSource: 'first-message',
+    })
+    const plain = response.results.find((r) => r.sessionId === 'session-search-plain')
+    expect(plain).toBeTruthy()
+    expect(plain).not.toHaveProperty('titleOverridden')
+    expect(plain).not.toHaveProperty('providerTitle')
+    expect(plain).not.toHaveProperty('titleOverrideSource')
+  })
 })
 
 describe('searchSessions tier forwarding', () => {
