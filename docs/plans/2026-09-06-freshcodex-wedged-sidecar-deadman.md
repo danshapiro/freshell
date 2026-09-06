@@ -478,7 +478,7 @@ const armQuietWindowIfAbsent = (sessionId: string) => {
 
 const disarmQuietWindow = (
   sessionId: string,
-  reason: 'turn_complete' | 'exit' | 'thread_closed' | 'kill' | 'shutdown',
+  reason: 'activity' | 'turn_complete' | 'exit' | 'thread_closed' | 'kill' | 'shutdown',
 ) => {
   const timer = quietTimerByThread.get(sessionId)
   if (timer) clearTimeout(timer)
@@ -608,7 +608,7 @@ Four test additions:
 ```ts
 // test/unit/client/store/freshAgentSlice.test.ts — sibling of the existing
 // `setSessionStatus(idle) clears streamingActive` test (:24-27); the file
-// already defines the `codexLoc` locator (:51).
+// already defines the `codexLoc` locator (:47, first used :51).
 it('setSessionStatus(stuck) writes the status and clears streamingActive', () => {
   let state = reducer(undefined, setSessionStatus({ ...codexLoc, status: 'running' }))
   // seed an in-flight stream exactly like the file's existing streaming tests;
@@ -948,7 +948,15 @@ interrupt/kill tests); `collect_frames_until(rx, dur, pred)` — drain-with-time
 over the `Receiver<String>` returning `{ matched: bool, frames: Vec<serde_json::Value> }`
 (parsed per the :4590-4624 idiom). Exact `insert_fake_session_with_real_consumer`
 argument list follows its :4780 signature (state, thread id, scripted client,
-active_turn, notifs, child, ownership_id).
+active_turn, notifs, child, ownership_id) and returns the broadcast
+`Receiver<String>` — bind the scripted peer handle per its real return shape
+(do not tuple-destructure the receiver). Note the peer calls are sync:
+`peer.respond(&id, json!(...))` and `peer.emit_notification(...)` are plain
+`pub fn` (no `.await`; `respond` at app_server.rs:728, `emit_notification` at
+:747), and `expect_request()` (:708) is the async one — destructure its return
+by position (`let (id, ..) = peer.expect_request().await`; the drafts above
+show `&req["id"]` for readability — the execution pass converts to the real
+tuple shape).
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -983,12 +991,15 @@ struct QuietDeadman {
 }
 ```
 
-On `FreshCodexState` add a plain window field following the `dead_thread_ttl`
-precedent (:141-144), seeded at construction from
+On `FreshCodexState` add the window as `Arc<std::sync::atomic::AtomicU64>`
+(the consumer-side cloned state handle must observe test-set changes, so a
+plain `Duration` field copied on clone does NOT work; `dead_thread_ttl` has a
+plain field mutated directly in tests at :7495, but our setter is a `&self`
+method per the `set_opencode_busy_deadman_for_tests` precedent
+(activity.rs:590) — interior-shared is required). Seed at construction from
 `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` (u64 ms parse; invalid/absent →
-`Duration::from_millis(600_000)`), plus `#[cfg(test)] pub(crate) fn
-set_codex_quiet_window_ms_for_tests(&self, ms: u64)` (the file's existing
-`dead_thread_ttl` mutator pattern decides Mutex-vs-plain-field; mirror it).
+600_000), plus `#[cfg(test)] pub(crate) fn
+set_codex_quiet_window_ms_for_tests(&self, ms: u64)` doing the atomic store.
 
 3c. Arm/feed/disarm wiring — state handle threaded by parameter, not by
 capture change, at exactly three call sites:
@@ -1191,7 +1202,9 @@ test('wedged sidecar: quiet window surfaces the stuck state with recovery, not a
   const respawnedFresh = opsAfter.filter((m: string) => m === 'thread/start').length >= 2
   expect(resumed || respawnedFresh).toBe(true)
   if (respawnedFresh && !resumed) {
-    await expect(paneRoot.getByRole('alert').filter({ hasText: /no longer has memory/i })).toBeVisible()
+    // respawn-as-new surfaces through the existing restore-error alert
+    // machinery (getRestoreErrorMessage, FreshAgentView.tsx:406-421):
+    await expect(paneRoot.getByRole('alert').filter({ hasText: /cannot be resumed|no longer has memory/i })).toBeVisible()
   }
 })
 
