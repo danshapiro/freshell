@@ -7,6 +7,7 @@
 //! `dead_code` allow (the idiomatic pattern for `tests/common/mod.rs`).
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,9 +85,16 @@ pub fn test_settings_value() -> serde_json::Value {
 /// `mode:"amplifier"` create genuinely spawns — the same recording-script
 /// convention as `freshell-freshagent`'s Slice 3a tests, minus the argv file
 /// (these tests assert on wire frames, not argv).
+///
+/// Each call writes a **unique** script path (PID + atomic counter) so parallel
+/// tests in the same binary never collide with ETXTBSY ("Text file busy") when
+/// one test writes the script while another is executing a prior copy.
+static SLEEPER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    let seq = SLEEPER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-identity-frames-sleeper-{name}-{}.sh",
+        "freshell-identity-frames-sleeper-{name}-{}-{seq}.sh",
         std::process::id()
     ));
     std::fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper script");
