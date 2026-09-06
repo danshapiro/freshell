@@ -9,13 +9,22 @@
 # built from such checkouts crashed under USER node with:
 #   bash: /usr/local/bin/e2e-entrypoint.sh: Permission denied
 # The fix pins the mode in the COPY itself (COPY --chmod=755). This test
-# deterministically reproduces the bad source mode (chmod 0700 around the
-# build), builds the ACTUAL Dockerfile, and asserts:
-#   1. the runtime user (node, uid 1000) can read AND execute the entrypoint
+# deterministically reproduces the bad source mode, builds the ACTUAL
+# Dockerfile, and asserts — against the exact image this build produced:
+#   0. the image's configured runtime user is the non-root user (uid 1000)
+#   1. that user can read AND execute the entrypoint
 #   2. the container starts through its configured ENTRYPOINT (--dry-run
 #      completes, no Permission denied)
 # It fails against the pre-fix Dockerfile (COPY + 'RUN chmod +x') and passes
 # against the fixed one.
+#
+# Concurrency: the 0700 fixture mutates the shared source file's mode in
+# place, so the chmod→build→restore window is guarded by a per-worktree
+# lock (overlapping invocations would otherwise save/restore modes under
+# each other's builds). Every assertion runs against the built image's
+# IMMUTABLE id (captured via --iidfile), never the mutable tag — tags are
+# shared across worktrees, so a concurrent rebuild could otherwise swap the
+# image between this build and its assertions.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,28 +47,55 @@ fail() {
   FAILURES=$((FAILURES + 1))
 }
 
-# --- Reproduce the bad source mode deterministically -----------------------
-# (a fresh git checkout under umask 0077 lands here anyway; forcing it makes
-# the test independent of the invoking shell's umask)
-ORIG_MODE="$(stat -c %a "$EP")"
-restore_mode() { chmod "$ORIG_MODE" "$EP"; }
-trap restore_mode EXIT
-chmod 700 "$EP"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+IIDFILE="$WORK/image-id"
+BUILD_LOG="$SCRIPT_DIR/.entrypoint-mode-build.log"
+# Per-worktree lock (same realpath -> same lock), outside the repo so it
+# never litters the tree.
+BUILD_LOCK="/tmp/freshell-entrypoint-mode-$(printf %s "$ROOT" | md5sum | cut -d' ' -f1).lock"
 
-# --- Build the ACTUAL Dockerfile from the restricted context ---------------
-echo "Building $DOCKERFILE with a 0700-entrypoint source (this may take a while on a cold cache)..."
-if ! docker build -f "$DOCKERFILE" -t "$IMAGE_TAG" . >"$SCRIPT_DIR/.entrypoint-mode-build.log" 2>&1; then
-  fail "docker build failed (see $SCRIPT_DIR/.entrypoint-mode-build.log)"
-  tail -30 "$SCRIPT_DIR/.entrypoint-mode-build.log"
+# --- Reproduce the bad source mode deterministically, build, restore --------
+# A fresh git checkout under umask 0077 lands at 0700 anyway; forcing it
+# makes the test independent of the invoking shell's umask. The whole
+# chmod→build→restore window is one critical section under the worktree
+# lock, and the build's image id is captured for the assertions below.
+BUILD_STATUS=0
+(
+  flock 9
+  ORIG_MODE="$(stat -c %a "$EP")"
+  chmod 700 "$EP"
+  docker build -f "$DOCKERFILE" --iidfile "$IIDFILE" -t "$IMAGE_TAG" . \
+    >"$BUILD_LOG" 2>&1 || BUILD_STATUS=1
+  chmod "$ORIG_MODE" "$EP"
+  exit "$BUILD_STATUS"
+) 9>"$BUILD_LOCK" || {
+  fail "docker build failed (see $BUILD_LOG)"
+  tail -30 "$BUILD_LOG"
+  exit 1
+}
+echo "PASS: docker build succeeded (mode-0700 entrypoint context)"
+
+if [ ! -s "$IIDFILE" ]; then
+  fail "docker build did not report an image id (--iidfile empty)"
   exit 1
 fi
-echo "PASS: docker build succeeded"
-restore_mode
-trap - EXIT
+IMAGE_ID="$(cat "$IIDFILE")"
 
-# --- Check 1: entrypoint readable+executable by the runtime user -----------
-# Runs as the image's USER (node, uid 1000) — exactly the runtime identity.
-if docker run --rm --entrypoint /bin/sh "$IMAGE_TAG" \
+# --- Check 0: the image's configured runtime user is the non-root user ------
+# No --user override: we assert the identity the image itself configures
+# (USER node -> uid 1000). If the image ever reverted to root, the
+# permission checks below would pass vacuously against a root-owned 0711
+# entrypoint — this check keeps them meaningful.
+RUN_UID="$(docker run --rm --entrypoint /bin/sh "$IMAGE_ID" -c 'id -u' 2>/dev/null || true)"
+if [ "$RUN_UID" = "1000" ]; then
+  echo "PASS: image's configured runtime user is non-root (uid 1000)"
+else
+  fail "image's configured runtime user is not the non-root user (got uid '${RUN_UID:-<run failed>}', expected 1000)"
+fi
+
+# --- Check 1: entrypoint readable+executable by that runtime user -----------
+if docker run --rm --entrypoint /bin/sh "$IMAGE_ID" \
   -c "test -r $IN_CONTAINER_EP && test -x $IN_CONTAINER_EP" >/dev/null 2>&1; then
   echo "PASS: entrypoint readable AND executable by the non-root runtime user"
 else
@@ -68,7 +104,7 @@ fi
 
 # --- Check 2: the container starts through its configured ENTRYPOINT -------
 set +e
-RUN_OUT="$(docker run --rm "$IMAGE_TAG" --dry-run 2>&1)"
+RUN_OUT="$(docker run --rm "$IMAGE_ID" --dry-run 2>&1)"
 RUN_EXIT=$?
 set -e
 if [ "$RUN_EXIT" -eq 0 ] && ! echo "$RUN_OUT" | grep -qi "permission denied"; then
