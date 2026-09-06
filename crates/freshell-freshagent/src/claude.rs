@@ -303,6 +303,25 @@ impl ClaudeRestartRetirement {
     /// either first can make the sidecar exit and reparent an SDK child before
     /// YAMA lets us identify it.
     async fn drive_retirement(&mut self, budgets: ClaudeRestartRetirementBudgets) {
+        self.drive_retirement_with_deadline(budgets, None).await;
+    }
+
+    /// Shut-down drain variant: every step's budget is recomputed fresh from
+    /// the shared `deadline` (per-entry recomputation, LB-02 honest envelope);
+    /// `tree.terminate_and_confirm()` stays self-bounded by its signal rounds.
+    async fn drive_retirement_with_deadline(
+        &mut self,
+        budgets: ClaudeRestartRetirementBudgets,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        let step_budget = |default: std::time::Duration| -> std::time::Duration {
+            match deadline {
+                Some(d) => d
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(default),
+                None => default,
+            }
+        };
         if !self.tree_dead {
             self.tree_dead = self.tree.terminate_and_confirm().await;
         }
@@ -312,7 +331,7 @@ impl ClaudeRestartRetirement {
             if !self.consumer_quiesced {
                 if let Some(mut consumer) = self.consumer.take() {
                     consumer.abort();
-                    if tokio::time::timeout(budgets.consumer, &mut consumer)
+                    if tokio::time::timeout(step_budget(budgets.consumer), &mut consumer)
                         .await
                         .is_ok()
                     {
@@ -326,7 +345,7 @@ impl ClaudeRestartRetirement {
             }
             if !self.child_reaped {
                 self.child_reaped = matches!(
-                    tokio::time::timeout(budgets.child_reap, self.child.wait()).await,
+                    tokio::time::timeout(step_budget(budgets.child_reap), self.child.wait()).await,
                     Ok(Ok(_))
                 );
             }
@@ -1106,7 +1125,10 @@ impl FreshClaudeState {
                 continue;
             }
             retirement
-                .drive_retirement(ClaudeRestartRetirementBudgets::full().clamped_by(remaining))
+                .drive_retirement_with_deadline(
+                    ClaudeRestartRetirementBudgets::full().clamped_by(remaining),
+                    Some(deadline),
+                )
                 .await;
             if retirement.quiesced() {
                 self.finalize_restart_retirement(&retirement).await;

@@ -1336,9 +1336,17 @@ impl RestartCoordinator {
     }
 
     /// The one typed ingress rejection shared by the WS door and the internal
-    /// entry check: retryable (a later server run may recover cleanly) but NOT
-    /// `recovery_pending` — no durable row exists for a never-started restart.
+    /// entry check: retryable (a later server run may recover cleanly).
+    /// `recovery_pending` is false for a never-started restart (no durable row)
+    /// but TRUE when this request id already owns a durable pending row — a
+    /// deferred retry lands exactly here, and cross-boot recovery owns it.
     fn shutdown_rejection_frame(&self, request: &AgentRestart) -> ServerMessage {
+        let recovery_pending = self
+            .ownership
+            .lock()
+            .expect("restart ownership lock")
+            .pending_recoveries
+            .contains_key(&request.request_id);
         ServerMessage::AgentRestartFailed(AgentRestartFailed {
             request_id: request.request_id.clone(),
             provider: request.provider.clone(),
@@ -1351,7 +1359,7 @@ impl RestartCoordinator {
             code: AgentRestartFailureCode::ShutdownFailed,
             message: "server is shutting down; restart not started".to_string(),
             retryable: true,
-            recovery_pending: false,
+            recovery_pending,
         })
     }
 

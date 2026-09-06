@@ -5600,6 +5600,51 @@ async fn restart_spawn_rejected_once_shutdown_latched() {
     .expect("the register set is empty, so the join resolves immediately");
 }
 
+/// A deferred RETRY (not a fresh request) arriving after the shutdown latch
+/// must keep reporting `recovery_pending` when its durable row already exists:
+/// cross-boot recovery owns the retained transaction and the client keys on
+/// the flag. A never-started request still reports `recovery_pending: false`
+/// (see `restart_spawn_rejected_once_shutdown_latched`).
+#[tokio::test]
+async fn latched_retry_of_a_retained_pending_row_reports_recovery_pending() {
+    let coordinator = RestartCoordinator::new();
+    coordinator.register_initial(locator(), "term-1");
+    coordinator
+        .execute(
+            restart("shutdown-retry-r1", "term-1", 1),
+            &RetirementRetries {
+                shutdowns: AtomicUsize::new(0),
+            },
+        )
+        .await;
+    assert_eq!(
+        coordinator.pending_recoveries().len(),
+        1,
+        "the retryable retirement failure must retain its durable row"
+    );
+
+    coordinator.begin_restart_shutdown();
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+    let accepted = coordinator
+        .spawn_registered(restart("shutdown-retry-r1", "term-1", 1), move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+    assert!(!accepted, "a latched retry is refused without spawning");
+    let messages = emitted.lock().unwrap().clone();
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [ServerMessage::AgentRestartFailed(failed)]
+                if failed.code == AgentRestartFailureCode::ShutdownFailed
+                    && failed.retryable
+                    && failed.recovery_pending
+        ),
+        "the latched retry rejection must report recovery_pending: {messages:?}"
+    );
+}
+
 /// A retirement that parks inside `shutdown_for_restart` so tests can flip the
 /// shutdown latch deterministically mid-transaction. `creates` proves the
 /// replacement was never minted after the latch.

@@ -321,9 +321,28 @@ impl CodexRestartRetirement {
     /// pid/start-time tree may transport closure or consumer cancellation
     /// make the direct sidecar exit.
     async fn drive_retirement(&mut self, budgets: CodexRestartRetirementBudgets) {
+        self.drive_retirement_with_deadline(budgets, None).await;
+    }
+
+    /// Shut-down drain variant: every step's budget is recomputed fresh from
+    /// the shared `deadline` (per-entry recomputation, LB-02 honest envelope), so
+    /// a slow early step cannot overspend against later steps.
+    async fn drive_retirement_with_deadline(
+        &mut self,
+        budgets: CodexRestartRetirementBudgets,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        let step_budget = |default: std::time::Duration| -> std::time::Duration {
+            match deadline {
+                Some(d) => d
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(default),
+                None => default,
+            }
+        };
         if !self.capture_confirmed {
             if let Some(mut captured) = self.capture_rx.take() {
-                if tokio::time::timeout(budgets.capture, &mut captured)
+                if tokio::time::timeout(step_budget(budgets.capture), &mut captured)
                     .await
                     .is_ok()
                 {
@@ -338,7 +357,7 @@ impl CodexRestartRetirement {
             if !self.consumer_quiesced {
                 if let Some(mut consumer) = self.consumer.take() {
                     consumer.abort();
-                    if tokio::time::timeout(budgets.consumer, &mut consumer)
+                    if tokio::time::timeout(step_budget(budgets.consumer), &mut consumer)
                         .await
                         .is_ok()
                     {
@@ -356,7 +375,7 @@ impl CodexRestartRetirement {
             }
             if !self.tree_quiesced {
                 if let Some(mut watcher) = self.watcher.take() {
-                    match tokio::time::timeout(budgets.watcher, &mut watcher).await {
+                    match tokio::time::timeout(step_budget(budgets.watcher), &mut watcher).await {
                         Ok(Ok(true)) => self.tree_quiesced = true,
                         Ok(_) => {}
                         Err(_) => self.watcher = Some(watcher),
@@ -2237,7 +2256,10 @@ impl FreshCodexState {
                 continue;
             }
             retirement
-                .drive_retirement(CodexRestartRetirementBudgets::full().clamped_by(remaining))
+                .drive_retirement_with_deadline(
+                    CodexRestartRetirementBudgets::full().clamped_by(remaining),
+                    Some(deadline),
+                )
                 .await;
             if retirement.quiesced() {
                 self.finalize_restart_retirement(&retirement).await;
