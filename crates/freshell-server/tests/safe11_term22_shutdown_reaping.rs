@@ -26,11 +26,17 @@
 //! graceful shutdown ("killing sidecars at shutdown is NOT acceptable —
 //! surviving restarts is a feature"). This suite's coverage is untouched by
 //! that: its codex leg is a freshagent-lane sidecar (`freshAgent.create
-//! {sessionType:"freshcodex"}`) plus a shell PTY, both OUTSIDE the retention
-//! scope, so it doubles as the tripwire that retention did not leak into the
-//! freshagent lane or shell-PTY reaping. The retention behavior itself is
-//! pinned by `crates/freshell-codex/tests/launch_lifecycle.rs`'s Task 10
-//! section.
+//! {sessionType:"freshcodex"}`) plus a shell PTY. The freshagent lane
+//! remains OUTSIDE the *retention* scope — it still kills its sidecars at
+//! graceful shutdown, so this test doubles as the tripwire that retention
+//! did not leak into the freshagent lane or shell-PTY reaping — but it is
+//! now INSIDE *tracking* (kata wfah): the lane writes a durable
+//! `lane:"freshAgent"` record at spawn, and the next server generation's
+//! boot reconcile + grace-delayed sweep reaps a tracked orphan left behind
+//! by an unclean death (proven below by
+//! `sigkill_restart_reaps_tracked_freshagent_sidecar_via_store`). The
+//! retention behavior itself is pinned by
+//! `crates/freshell-codex/tests/launch_lifecycle.rs`'s Task 10 section.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -449,5 +455,242 @@ async fn shutdown_reaps_terminal_and_codex_sidecar_within_5s() {
         still_alive.is_empty(),
         "orphaned descendant pids after a graceful shutdown: {still_alive:?} \
          (all recorded descendants: {descendants:?})"
+    );
+}
+
+/// Directory of durable sidecar records for a test server home.
+fn sidecar_store_records(home: &std::path::Path) -> Vec<serde_json::Value> {
+    let dir = home.join(".freshell/rust-codex-sidecars");
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".json") {
+                if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The freshagent-lane fixture sidecar of a test server, if any: its cmdline
+/// contains the fake app-server script name.
+fn find_freshagent_sidecar_pid(server_pid: u32) -> Option<u32> {
+    descendant_pids(server_pid)
+        .into_iter()
+        .find(|&pid| pid_cmdline(pid).contains("fake-app-server"))
+}
+
+/// Bounded `wait()` for a just-signalled std `Child`: poll `try_wait` until
+/// the process exits or the budget expires, escalating to SIGKILL so the
+/// caller's stderr drain can never block forever (`read_to_string` waits for
+/// the pipe EOF, which only the process's exit produces). All waits are
+/// `tokio::time::sleep`, matching the async discipline of the rest of this
+/// file.
+async fn reaped_wait(child: &mut Child, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// wfah Task 5: the cross-restart proof. Generation 1 boots, spawns a
+/// freshcodex fresh-agent sidecar (a durable `lane:"freshAgent"` record names
+/// it), and is then `kill -9`'d — no graceful shutdown, no Drop, no record
+/// scrub, so the sidecar survives orphaned (that is precisely the bug class
+/// being fixed). Generation 2 boots on the SAME home; its boot reconcile
+/// holds the record and the grace-delayed sweep (`1000ms` via
+/// `FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS`) verifies the survivor, finds no
+/// active thread on the fixture, reaps it, and removes the record. The test
+/// asserts the full chain: record exists -> SIGKILL -> orphan survives ->
+/// generation 2 -> orphan gone AND record scrubbed.
+///
+/// RED (pre-Tasks 1-4): the freshagent lane wrote no record, so the run
+/// fails at the "no tracked record for pid" assertion and generation 2's
+/// sweep has nothing to reap — the orphan survives.
+#[tokio::test]
+async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
+    let server_binary = discover_server_binary();
+    let home = tempfile::tempdir().expect("create temp home");
+    let port1 = allocate_ephemeral_port();
+    seed_fresh_agent_enabled(home.path());
+
+    // Generation 1: boot, create a freshcodex fresh-agent session.
+    let mut server1 = Command::new(&server_binary)
+        .env("PORT", port1.to_string())
+        .env("AUTH_TOKEN", AUTH_TOKEN)
+        .env("FRESHELL_HOME", home.path())
+        .env("HOME", home.path())
+        .env("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()))
+        .env_remove("FAKE_CODEX_APP_SERVER_BEHAVIOR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn freshell-server #1");
+    if !wait_for_health(port1, &mut server1, Duration::from_secs(15)).await {
+        // Kill (and reap) BEFORE draining stderr: `read_to_string` blocks
+        // until the pipe EOFs, which only happens once the process exits.
+        let _ = server1.kill();
+        let _ = server1.wait();
+        let stderr = drain_stderr(&mut server1);
+        panic!("server #1 never became healthy; stderr:\n{stderr}");
+    }
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port1}/ws"))
+        .await
+        .expect("ws connect");
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "hello", "protocolVersion": 7, "token": AUTH_TOKEN,
+        }),
+    )
+    .await;
+    wait_for_message_type(&mut ws, "ready", Duration::from_secs(5))
+        .await
+        .expect("ready handshake");
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": "rid-wfah-sigkill",
+            "sessionType": "freshcodex",
+            "provider": "codex",
+        }),
+    )
+    .await;
+    // Generous: `SIDECAR_START_BUDGET` is 45s server-side — mirror the
+    // graceful test's 50s frame budget.
+    match wait_for_any_message_type(
+        &mut ws,
+        &["freshAgent.created", "freshAgent.createFailed"],
+        Duration::from_secs(50),
+    )
+    .await
+    {
+        Some((got, _)) if got == "freshAgent.created" => {}
+        other => {
+            // Failure-path teardown mirrors the success path: SIGTERM lets
+            // the server gracefully reap any sidecar it already spawned
+            // before we panic, so no fixture tree leaks past test end.
+            let _ = unsafe { libc::kill(server1.id() as libc::pid_t, libc::SIGTERM) };
+            let _ = reaped_wait(&mut server1, Duration::from_secs(10)).await;
+            let log_tail =
+                std::fs::read_to_string(home.path().join(".freshell/logs/rust-server.jsonl"))
+                    .unwrap_or_default();
+            let stderr = drain_stderr(&mut server1);
+            panic!(
+                "expected freshAgent.created, got {other:?}; server #1 stderr:\n{stderr}\nlog tail:\n{log_tail}"
+            );
+        }
+    }
+
+    // The sidecar exists, and a durable tracked record names it.
+    let server1_pid = server1.id();
+    let sidecar_pid = find_freshagent_sidecar_pid(server1_pid)
+        .expect("a fixture sidecar among the server's descendants");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let record = loop {
+        let found = sidecar_store_records(home.path())
+            .into_iter()
+            .find(|r| r["pid"].as_u64() == Some(sidecar_pid as u64));
+        if let Some(record) = found {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no tracked record for pid {sidecar_pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        record["lane"].as_str(),
+        Some("freshAgent"),
+        "freshagent rows carry the lane marker: {record}"
+    );
+    assert_eq!(record["state"]["kind"].as_str(), Some("active"));
+    drop(ws);
+
+    // THE UNCLEAN DEATH: no graceful shutdown, no Drop, no record scrub.
+    let kill_rc = unsafe { libc::kill(server1_pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(kill_rc, 0, "SIGKILL to the server must land");
+    // Blocking std wait: SIGKILL landed, so the zombie is reaped promptly.
+    let _ = server1.wait();
+    // The orphan survives (that is precisely the bug class being fixed).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        pid_alive(sidecar_pid),
+        "the sidecar must still be alive after the unclean death — \
+         otherwise there is nothing to reap"
+    );
+
+    // Generation 2 on the SAME home: boot reconcile + shortened grace sweep.
+    let port2 = allocate_ephemeral_port();
+    let mut server2 = Command::new(&server_binary)
+        .env("PORT", port2.to_string())
+        .env("AUTH_TOKEN", AUTH_TOKEN)
+        .env("FRESHELL_HOME", home.path())
+        .env("HOME", home.path())
+        .env("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()))
+        .env("FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS", "1000")
+        .env_remove("FAKE_CODEX_APP_SERVER_BEHAVIOR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn freshell-server #2");
+    if !wait_for_health(port2, &mut server2, Duration::from_secs(15)).await {
+        // Same kill-then-drain discipline as generation 1, plus the leak
+        // guard for the generation-1 orphan generation 2 was about to reap.
+        let _ = unsafe { libc::kill(sidecar_pid as libc::pid_t, libc::SIGKILL) };
+        let _ = server2.kill();
+        let _ = server2.wait();
+        let stderr = drain_stderr(&mut server2);
+        panic!("server #2 never became healthy; stderr:\n{stderr}");
+    }
+
+    // Within the grace + probe budget, the orphan is reaped and its record removed.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut reaped = false;
+    while Instant::now() < deadline {
+        let gone = !pid_alive(sidecar_pid);
+        let scrubbed = !sidecar_store_records(home.path())
+            .iter()
+            .any(|r| r["pid"].as_u64() == Some(sidecar_pid as u64));
+        if gone && scrubbed {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Leak guard + teardown: never leave the fixture running past the test.
+    if !reaped {
+        let _ = unsafe { libc::kill(sidecar_pid as libc::pid_t, libc::SIGKILL) };
+    }
+    let _ = unsafe { libc::kill(server2.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = reaped_wait(&mut server2, Duration::from_secs(10)).await;
+    // Drain ONLY after server2 has exited (see `reaped_wait`): the pipe EOFs
+    // exactly once the process and every inherited-writer child are gone.
+    let server2_stderr = drain_stderr(&mut server2);
+    let log_tail = std::fs::read_to_string(home.path().join(".freshell/logs/rust-server.jsonl"))
+        .unwrap_or_default();
+
+    assert!(
+        reaped,
+        "the next generation must reap the tracked orphan. sidecar_pid={sidecar_pid} alive={} server2 stderr:\n{server2_stderr}\nlog tail:\n{log_tail}",
+        pid_alive(sidecar_pid),
     );
 }
