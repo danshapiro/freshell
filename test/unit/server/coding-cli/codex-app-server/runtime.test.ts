@@ -801,6 +801,30 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     })).rejects.toThrow(/no active owned codex app-server sidecar/i)
   })
 
+  it('stamps the codex thread sessionId onto the ownership record', async () => {
+    const metadataDir = await makeTempDir()
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-runtime-test',
+      startupAttemptTimeoutMs: REAL_STARTUP_ATTEMPT_TIMEOUT_MS,
+    })
+
+    const ready = await runtime.ensureReady()
+    await runtime.updateOwnershipMetadata({ sessionId: 'thr-1' })
+
+    const record = JSON.parse(await fsp.readFile(ready.metadataPath, 'utf8'))
+    expect(record.sessionId).toBe('thr-1')
+    expect(record.schemaVersion).toBe(1)
+    expect(record.ownershipId).toBe(ready.ownershipId)
+    expect(record.serverInstanceId).toBe('srv-runtime-test')
+    expect(record.ownerServerPid).toBe(process.pid)
+    expect(record.terminalId).toBeNull()
+    expect(record.generation).toBeNull()
+    expect(record.wsUrl).toBe(ready.wsUrl)
+    expect(record.wrapperPid).toBe(ready.processPid)
+    expect(record.processGroupId).toBe(ready.processGroupId)
+  })
+
   it('tears down the process group and fails startup when ownership metadata cannot be written', async () => {
     const tempDir = await makeTempDir()
     const metadataDir = path.join(tempDir, 'metadata')

@@ -634,6 +634,7 @@ export type TerminalRecord = {
     | 'resumeCandidateCapture'
     | 'readThreadTurn'
     | 'listThreadTurns'
+    | 'noteSessionId'
   >
   codexSidecarLifecycleUnsubscribe?: () => void
   codexSidecarLifecyclePublished?: boolean
@@ -2044,6 +2045,15 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
+  private async noteCodexSidecarSession(record: TerminalRecord, sessionId: string): Promise<void> {
+    if (!record.codexSidecar?.noteSessionId) return
+    try {
+      await record.codexSidecar.noteSessionId(sessionId)
+    } catch (error) {
+      logger.warn({ err: error, terminalId: record.terminalId, sessionId }, 'Failed to stamp Codex sidecar ownership record with session id; restore-claim for this sidecar is degraded')
+    }
+  }
+
   private armCodexRolloutWatch(record: TerminalRecord, candidate = this.getCodexRolloutWatchCandidate(record)): void {
     const sidecar = record.codexSidecar
     if (!candidate || !sidecar?.watchPath) return
@@ -2488,6 +2498,7 @@ export class TerminalRegistry extends EventEmitter {
     this.clearCodexForkHandoffPending(record)
     this.armCodexRolloutWatch(record, forkCandidate)
     record.codexSidecar?.markCandidatePersisted?.()
+    await this.noteCodexSidecarSession(record, forkCandidate.candidateThreadId)
     logger.info({
       terminalId: record.terminalId,
       oldSessionId: oldResumeSessionId,
@@ -2579,6 +2590,9 @@ export class TerminalRegistry extends EventEmitter {
     const storedDurability = this.codexDurabilityRecordToRef(stored)
     record.codexDurability = storedDurability
     record.codexSidecar?.markCandidatePersisted?.()
+    if (storedDurability.candidate) {
+      await this.noteCodexSidecarSession(record, storedDurability.candidate.candidateThreadId)
+    }
     this.clearCodexInputGate(record)
     this.armCodexRolloutWatch(record)
     logger.info({

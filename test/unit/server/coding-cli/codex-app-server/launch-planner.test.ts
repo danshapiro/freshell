@@ -17,6 +17,7 @@ class FakeRuntime {
   ensureReadyCwdCalls: Array<string | undefined> = []
   startThreadCalls = 0
   adopted: Array<{ terminalId: string; generation: number }> = []
+  updateOwnershipMetadataCalls: Array<{ terminalId?: string | null; generation?: number | null; sessionId?: string }> = []
   loadedThreadListCalls = 0
   adoptError?: Error
   ensureReadyBlocker?: Promise<void>
@@ -56,8 +57,9 @@ class FakeRuntime {
     }
   }
 
-  async updateOwnershipMetadata(input: { terminalId?: string | null; generation?: number | null }) {
+  async updateOwnershipMetadata(input: { terminalId?: string | null; generation?: number | null; sessionId?: string }) {
     if (this.adoptError) throw this.adoptError
+    this.updateOwnershipMetadataCalls.push(input)
     if (input.terminalId && typeof input.generation === 'number') {
       this.adopted.push({ terminalId: input.terminalId, generation: input.generation })
     }
@@ -416,6 +418,25 @@ describe('CodexLaunchPlanner', () => {
     await planner.planCreate({ resumeSessionId: 'thread-ready', cwd: '/repo/resume' })
 
     expect(runtime.ensureReadyCwdCalls).toEqual(['/repo/resume'])
+  })
+
+  it('stamps the resume sessionId onto the sidecar ownership record for resume plans', async () => {
+    const runtime = new FakeRuntime('ws://127.0.0.1:43042', 'thr-resume')
+    const planner = createPlanner(() => runtime as any)
+
+    const plan = await planner.planCreate({ resumeSessionId: 'thr-resume' })
+
+    expect(plan.sessionId).toBe('thr-resume')
+    expect(runtime.updateOwnershipMetadataCalls).toContainEqual({ sessionId: 'thr-resume' })
+  })
+
+  it('never stamps a sessionId onto the sidecar ownership record for fresh plans', async () => {
+    const runtime = new FakeRuntime('ws://127.0.0.1:43043', 'thread-fresh')
+    const planner = createPlanner(() => runtime as any)
+
+    await planner.planCreate({ cwd: '/repo/fresh' })
+
+    expect(runtime.updateOwnershipMetadataCalls.filter((input) => input.sessionId !== undefined)).toEqual([])
   })
 
   it('forwards candidate capture pause and resume through the sidecar', async () => {

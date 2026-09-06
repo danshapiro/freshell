@@ -7,6 +7,7 @@ import type {
   CodexThreadTurnsListResult,
 } from './protocol.js'
 import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
+import { logger } from '../../logger.js'
 import {
   CodexRemoteProxy,
   type CodexApprovalRequestEvent,
@@ -29,6 +30,7 @@ type CodexRuntimeLike = Pick<
 
 export type CodexLaunchSidecar = {
   adopt(input: { terminalId: string; generation: number }): Promise<void>
+  noteSessionId?(sessionId: string): Promise<void>
   markCandidatePersisted?(): void
   pauseCandidateCapture?(reason: string): void
   resumeCandidateCapture?(reason: string): void
@@ -140,6 +142,11 @@ export class CodexLaunchPlanner {
     try {
       if (input.resumeSessionId) {
         const ready = await runtime.ensureReady(input.cwd)
+        await runtime.updateOwnershipMetadata({ sessionId: input.resumeSessionId }).catch((error) => {
+          // Stamp loss must never break a working resume; it only forfeits this
+          // sidecar as a future restore claim candidate.
+          logger.warn({ err: error }, 'Codex sidecar ownership session stamp failed; restore-claim for this sidecar is degraded')
+        })
         proxy = this.proxyFactory({
           upstreamWsUrl: ready.wsUrl,
           requireCandidatePersistence: false,
@@ -244,6 +251,9 @@ export class CodexLaunchPlanner {
         assertAdoptable()
         this.activeSidecars.delete(sidecar)
         this.failedSidecarShutdowns.delete(sidecar)
+      },
+      noteSessionId: async (sessionId) => {
+        await runtime.updateOwnershipMetadata({ sessionId })
       },
       markCandidatePersisted: () => getProxy()?.markCandidatePersisted(),
       pauseCandidateCapture: (reason) => getProxy()?.pauseCandidateCapture(reason),

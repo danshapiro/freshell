@@ -58,6 +58,8 @@ export type CodexSidecarOwnershipMetadata = {
   createdAt: string
   updatedAt: string
   codexHome?: string
+  /** Codex thread id — the restore-time claim key (kata 4g2a); absent on pre-feature records. */
+  sessionId?: string
 }
 
 export type ReadyState = {
@@ -834,6 +836,7 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
     || !isWrapperIdentity(candidate.wrapperIdentity)
     || typeof candidate.createdAt !== 'string'
     || typeof candidate.updatedAt !== 'string'
+    || (candidate.sessionId !== undefined && typeof candidate.sessionId !== 'string')
   ) {
     return { kind: 'malformedNewSchema', ownershipId }
   }
@@ -1612,6 +1615,7 @@ export class CodexAppServerRuntime {
     terminalId?: string | null
     generation?: number | null
     codexHome?: string
+    sessionId?: string
   }): Promise<void> {
     await this.assertNoBlockedOwnership('update Codex app-server ownership metadata')
     if (!this.ownership) {
@@ -1622,6 +1626,7 @@ export class CodexAppServerRuntime {
       ...(input.terminalId !== undefined ? { terminalId: input.terminalId } : {}),
       ...(input.generation !== undefined ? { generation: input.generation } : {}),
       ...(input.codexHome !== undefined ? { codexHome: input.codexHome } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
       updatedAt: new Date().toISOString(),
     }
     await atomicWriteJson(this.ownership.metadataPath, this.ownership.metadata)
