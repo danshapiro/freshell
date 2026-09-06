@@ -487,6 +487,11 @@ async fn next_generation_holds_then_reaps_a_freshagent_survivor_never_claiming_i
     let session_id = create_tracked_session(&st, &mut rx, "req-wfah-t4-gen").await;
     let ownership_id = guard.records()[0].ownership_id.clone();
     let pid = guard.records()[0].pid;
+    assert_eq!(
+        guard.records()[0].session_id.as_deref(),
+        Some(session_id.as_str()),
+        "the claim-refusal assertion is only meaningful on an enriched (indexed) record"
+    );
 
     // SIMULATE THE GENERATION BOUNDARY against the shared disk state: the old
     // process is gone (crashed), its records survive; the new generation's boot
