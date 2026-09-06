@@ -25,7 +25,7 @@ Per-PR CI runs the Rust cargo test suites and the Tauri app-bound Rust server-sp
 
 **Goal:** Every PR runs the full Rust workspace test suite (`cargo test --workspace --locked`) and the Tauri app-bound server-spawn smoke test in CI, as a parallel job alongside the existing clippy gate.
 
-**Architecture:** Add a `rust-test` job to the existing `.github/workflows/rust-clippy.yml` workflow. The job reuses the same pinned toolchain (1.96.0), `Swatinem/rust-cache@v2`, and Tauri GTK/WebKit apt dependencies as the `clippy` job. It adds `npm ci` (needed because `freshell-freshagent` tests spawn MCP servers that require `tsx` from `node_modules`), explicitly builds `freshell-server` (so the Tauri smoke cannot soft-skip), sets `FRESHELL_SERVER_BIN` to the built binary path, runs `cargo test --workspace --locked`, then runs the Tauri smoke with `--nocapture` so the CI log visibly confirms "using server binary:" (non-vacuous). The job runs concurrently with `clippy` under the same workflow, so required-check wall time does not grow. The new check will display as "Rust Clippy / rust-test" in the GitHub UI.
+**Architecture:** Add a `rust-test` job to the existing `.github/workflows/rust-clippy.yml` workflow. The job reuses the same pinned toolchain (1.96.0), `Swatinem/rust-cache@v2`, and Tauri GTK/WebKit apt dependencies as the `clippy` job. It adds `npm ci` (needed because `freshell-freshagent` and `freshell-ws` tests spawn MCP servers that require `tsx` from `node_modules`), explicitly builds `freshell-server` (so the Tauri smoke cannot soft-skip), sets `FRESHELL_SERVER_BIN` to the built binary path, runs `cargo test --workspace --locked`, then runs the Tauri smoke with `--nocapture` and `pipefail`+`grep` enforcement so the CI log visibly confirms "using server binary:" and the step fails if the smoke soft-skips or the test itself fails. The job runs concurrently with `clippy` under the same workflow, so `clippy` wall time is unaffected. When `rust-test` later becomes a required check, the critical path grows from the clippy duration to the `rust-test` duration (accepted by the "parallel, not serial" constraint). The new check will display as "Rust Clippy / rust-test" in the GitHub UI.
 
 **Tech Stack:** GitHub Actions, Rust 1.96.0 (pinned), `Swatinem/rust-cache@v2`, `actions/setup-node@v4`, `npm ci`, `cargo test --workspace --locked`, `cargo build -p freshell-server --locked`.
 
@@ -34,10 +34,10 @@ Per-PR CI runs the Rust cargo test suites and the Tauri app-bound Rust server-sp
 - **Toolchain pin:** Rust 1.96.0 via `dtolnay/rust-toolchain@master` — must match the existing `clippy` job and workspace `rust-version`.
 - **Cache:** `Swatinem/rust-cache@v2` — keys on the job id by default (`add-job-id-key: true`), so `rust-test` gets its own cache separate from `clippy` (correct: clippy check artifacts and test codegen artifacts differ). No `shared-key` override needed. Set `cache-on-failure: true` so the cold build is cached even if the ETXTBSY flake triggers — without it, "Re-run failed jobs" pays the cold build again.
 - **Tauri system deps:** The exact same 8 apt packages as the `clippy` job (`libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev pkg-config build-essential`) — needed to compile `freshell-tauri`. `libdbus-1-dev` (added by PR #699) is not needed because it arrives as a transitive apt dependency of `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, and `libayatana-appindicator3-dev` (the `dbus` crate via tauri/tao needs `libdbus-sys`, which pkg-config resolves against the system dbus headers pulled in by those apt packages).
-- **Node.js:** `actions/setup-node@v4` with `node-version: 22` and `cache: npm` — needed because `freshell-freshagent` tests spawn MCP servers that resolve `tsx` from `node_modules/.bin/tsx`. Without `npm ci`, `freshell-freshagent` tests fail with `Unable to resolve MCP dependency "tsx"`.
+- **Node.js:** `actions/setup-node@v4` with `node-version: 22` and `cache: npm` — needed because `freshell-freshagent` and `freshell-ws` tests spawn MCP servers that resolve `tsx` (via `node_modules/tsx/dist/loader.mjs`) from `node_modules`. Without `npm ci`, these tests fail with `Unable to resolve MCP dependency "tsx"`.
 - **`--locked`:** Must use `cargo test --workspace --locked` and `cargo build -p freshell-server --locked` for reproducibility parity with `port-contract.yml`.
 - **`RUST_BACKTRACE=1`:** Set as an env var on the test step so runner-only failures are diagnosable.
-- **Timeout:** 60 minutes — the first run has a cold, job-keyed cache and must do full test-profile codegen of the Tauri tree. PR #699's warm-cache workspace tests took 7-8 minutes after build; cold first runs will be longer.
+- **Timeout:** 60 minutes — the first run has a cold, job-keyed cache and must do full test-profile codegen of the Tauri tree. PR #699's warm-cache workspace test step took 7.5 minutes but aborted early at the ETXTBSY panic (without `--no-fail-fast`, `cargo test` stops at the first failing binary). A full green pass will be longer; 60 minutes has ample margin. After the first green run, check `actions/cache/usage` — the repo uses ~5.9 GB of the 10 GB Actions cache allowance; a test-profile Tauri cache is much larger than the check-only clippy cache, and crossing 10 GB evicts LRU entries that could make other workflows cold.
 - **Concurrency:** The workflow already has `concurrency: rust-clippy-${{ github.ref }}` with `cancel-in-progress: true`. Both jobs share this group. A new push cancels the entire run (both jobs).
 - **Check display name:** The new check will display as "Rust Clippy / rust-test" in the GitHub UI (job name within the "Rust Clippy" workflow).
 - **No scope creep:** This PR only wires existing test suites into CI. It does not modify any Rust source code, test files, or the test suites themselves. The post-merge ruleset amendment is a follow-up.
@@ -68,7 +68,7 @@ git rebase origin/main
 
 The behavior under test is: "CI runs `cargo test --workspace --locked` on every PR." The test is the CI job itself running in GitHub Actions — there is no local unit test that can verify CI behavior (per AGENTS.md: "Checking that prose, prompts, docs, or config contain, match, or hash to expected text does not qualify"). The red phase is the current state: no `rust-test` job exists, so Rust tests (except `freshell-protocol` and `freshell-terminal` via `port-contract.yml`) do not run in CI.
 
-Local baseline verification (already completed during workspace setup):
+Local baseline verification (run after the Step 1 rebase to confirm the current test suite is green):
 
 ```bash
 # Verifies the test suite that CI will run is green locally
@@ -147,7 +147,9 @@ Add a `rust-test` job to `.github/workflows/rust-clippy.yml`, after the existing
       - name: Tauri app-bound server spawn smoke
         env:
           FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server
+        shell: bash
         run: |
+          set -o pipefail
           cargo test -p freshell-tauri --locked --test server_spawn_smoke app_bound_spawn_health_reap_end_to_end -- --exact --nocapture 2>&1 | tee /tmp/smoke.log
           grep -q 'using server binary:' /tmp/smoke.log
 ```
