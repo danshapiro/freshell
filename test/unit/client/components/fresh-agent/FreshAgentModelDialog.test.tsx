@@ -151,7 +151,7 @@ function seedFreshcodexPane(
   seedPane(store, {
     sessionType: 'freshcodex',
     provider: 'codex',
-    model: 'gpt-5.5',
+    model: 'gpt-6-astra',
     effort: 'max',
     ...overrides,
   })
@@ -543,7 +543,7 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     const store = createStore()
     seedFreshcodexPane(store, { effort: 'low' })
     renderDialog(store, { open: true })
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.5 · low' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-6 Astra · low' }))
     expect(paneContent(store).effort).toBe('low')
   })
 
@@ -551,11 +551,11 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     const store = createStore()
     seedFreshcodexPane(store)
     const view = renderDialog(store, { open: true })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
     view.rerender(<Provider store={store}><StoreBackedDialog open={false} /></Provider>)
     view.rerender(<Provider store={store}><StoreBackedDialog open /></Provider>)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.5 · max' }))
-    expect(paneContent(store).model).toBe('gpt-5.5')
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-6 Astra · max' }))
+    expect(paneContent(store).model).toBe('gpt-6-astra')
   })
   it('uses the static freshcodex table without probing the catalog endpoint', async () => {
     const store = createStore()
@@ -566,14 +566,14 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(getFreshAgentModelCapabilitiesSpy).not.toHaveBeenCalled()
     // the current model is marked everywhere it appears (Recent + its group)
-    expect(screen.getAllByRole('option', { name: /GPT-5\.5.*current/ }).length).toBeGreaterThanOrEqual(1)
-    expect(screen.getByRole('option', { name: /GPT-5\.4 Flash/ })).toBeInTheDocument()
+    expect(screen.getAllByRole('option', { name: /GPT-6 Astra.*current/ }).length).toBeGreaterThanOrEqual(1)
+    expect(screen.getByRole('option', { name: /GPT-5\.6 Luna/ })).toBeInTheDocument()
 
-    // GPT-5.5 levels canonically ordered
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.5' })
+    // GPT-6 Astra levels canonically ordered
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-6 Astra' })
     const levelNames = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
-    expect(levelNames.map((name) => name?.replace(/last used|highest|current|●/g, '').trim())).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'max'])
-    expect(screen.getByRole('button', { name: 'Use GPT-5.5 · max' })).toBeInTheDocument()
+    expect(levelNames.map((name) => name?.replace(/last used|highest|current|●/g, '').trim())).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(screen.getByRole('button', { name: 'Use GPT-6 Astra · max' })).toBeInTheDocument()
   })
 
   it('commits a freshcodex model + level under the freshcodex provider defaults and MRU scope', async () => {
@@ -583,28 +583,28 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
 
     renderDialog(store, { open: true, onClose })
 
-    fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.4 Flash/ }))
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.6 Luna/ }))
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     fireEvent.click(Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('low'))!)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · low' }))
 
     expect(onClose).toHaveBeenCalled()
     const content = paneContent(store)
-    expect(content.model).toBe('gpt-5.4-flash')
+    expect(content.model).toBe('gpt-5.6-luna')
     expect(content.effort).toBe('low')
 
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
           freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
             effort: 'low',
           },
         },
       },
     })
     const levelMru = JSON.parse(window.localStorage.getItem('freshcodex.modelLevelMru.v1') ?? '[]')
-    expect(levelMru).toEqual([expect.objectContaining({ modelId: 'gpt-5.4-flash', level: 'low' })])
+    expect(levelMru).toEqual([expect.objectContaining({ modelId: 'gpt-5.6-luna', level: 'low' })])
   })
 })
 

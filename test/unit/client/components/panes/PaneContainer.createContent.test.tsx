@@ -430,7 +430,7 @@ describe('createContentForType with ext: prefix', () => {
           enabled: true,
           providers: {
             freshcodex: {
-              modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+              modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
               defaultPermissionMode: 'never',
               effort: 'high',
               style: 'serif',
@@ -465,8 +465,8 @@ describe('createContentForType with ext: prefix', () => {
       if (paneContent.kind !== 'fresh-agent') return
       expect(paneContent.sessionType).toBe('freshcodex')
       expect(paneContent.provider).toBe('codex')
-      expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'gpt-5.4-flash' })
-      expect(paneContent.model).toBe('gpt-5.4-flash')
+      expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'gpt-5.6-luna' })
+      expect(paneContent.model).toBe('gpt-5.6-luna')
       expect(paneContent.permissionMode).toBe('never')
       expect(paneContent.effort).toBe('high')
       expect(paneContent.style).toBe('serif')

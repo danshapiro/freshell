@@ -9,7 +9,7 @@
 //!
 //! 1. **menu normalization** ([`normalize_freshcodex_model`] + [`normalize_freshcodex_effort`],
 //!    `fresh-agent-models.ts:101-152`): clamp the model to the freshcodex allowlist
-//!    (fallback `gpt-5.5`); rewrite codex `xhigh → max`; then clamp the effort to the
+//!    (fallback `gpt-6-astra`); rewrite codex `xhigh → max`; then clamp the effort to the
 //!    (normalized) model's `thinkingEfforts`, else its `defaultEffort`, else the last menu
 //!    entry.
 //! 2. **wire mapping** ([`to_codex_reasoning_effort`], `adapter.ts:127-134`): `max`/`xhigh`
@@ -28,7 +28,7 @@
 //! five values that pass through unchanged.
 
 /// `FRESHCODEX_DEFAULT_MODEL` (`fresh-agent-models.ts:15`).
-pub const FRESHCODEX_DEFAULT_MODEL: &str = "gpt-5.5";
+pub const FRESHCODEX_DEFAULT_MODEL: &str = "gpt-6-astra";
 /// `FRESHCODEX_DEFAULT_EFFORT` (`fresh-agent-models.ts:16`).
 pub const FRESHCODEX_DEFAULT_EFFORT: &str = "max";
 
@@ -43,7 +43,7 @@ pub const CHEAPEST_T2_MODEL: &str = "gpt-5.3-codex-spark";
 /// separately (both map to `xhigh`, `adapter.ts:129`).
 pub const FRESHCODEX_EFFORTS_VERBATIM: &[&str] = &["none", "minimal", "low", "medium", "high"];
 
-/// One freshcodex model menu entry (`fresh-agent-models.ts:30-49`).
+/// One freshcodex model menu entry (`fresh-agent-models.ts:30-61`).
 struct ModelOption {
     value: &'static str,
     thinking_efforts: &'static [&'static str],
@@ -51,19 +51,27 @@ struct ModelOption {
 }
 
 /// The freshcodex menu (`FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex`,
-/// `fresh-agent-models.ts:30-49`). `gpt-5.5` and `gpt-5.3-codex-spark` share efforts
-/// `[none,minimal,low,medium,high,max]` (default `max`); `gpt-5.4-flash` omits `max` and
-/// defaults `high`.
+/// `fresh-agent-models.ts:30-61`).
 const FRESHCODEX_MODEL_OPTIONS: &[ModelOption] = &[
     ModelOption {
-        value: "gpt-5.5",
-        thinking_efforts: &["none", "minimal", "low", "medium", "high", "max"],
+        value: "gpt-6-astra",
+        thinking_efforts: &["low", "medium", "high", "xhigh", "max"],
         default_effort: "max",
     },
     ModelOption {
-        value: "gpt-5.4-flash",
-        thinking_efforts: &["none", "minimal", "low", "medium", "high"],
-        default_effort: "high",
+        value: "gpt-5.6-sol",
+        thinking_efforts: &["none", "low", "medium", "high", "xhigh", "max"],
+        default_effort: "max",
+    },
+    ModelOption {
+        value: "gpt-5.6-terra",
+        thinking_efforts: &["none", "low", "medium", "high", "xhigh", "max"],
+        default_effort: "max",
+    },
+    ModelOption {
+        value: "gpt-5.6-luna",
+        thinking_efforts: &["none", "low", "medium", "high", "xhigh", "max"],
+        default_effort: "max",
     },
     ModelOption {
         value: "gpt-5.3-codex-spark",
@@ -77,9 +85,7 @@ fn find_option(model: &str) -> Option<&'static ModelOption> {
 }
 
 /// `normalizeFreshcodexModel(model)` (`fresh-agent-models.ts:101-104`): keep the model iff
-/// it is in the freshcodex allowlist, else fall back to `gpt-5.5`. Consequence
-/// (`codex-gptmini.json` provenance): `gpt-5.4-mini` is silently rewritten to `gpt-5.5`;
-/// `gpt-5.3-codex-spark` is the only non-flagship model reachable through freshcodex.
+/// it is in the freshcodex allowlist, else fall back to `gpt-6-astra`.
 pub fn normalize_freshcodex_model(model: Option<&str>) -> String {
     match model.and_then(find_option) {
         Some(option) => option.value.to_string(),
@@ -256,17 +262,31 @@ mod tests {
     #[test]
     fn model_clamps_to_freshcodex_allowlist() {
         // Allowlisted models pass through.
-        assert_eq!(normalize_freshcodex_model(Some("gpt-5.5")), "gpt-5.5");
         assert_eq!(
-            normalize_freshcodex_model(Some("gpt-5.4-flash")),
-            "gpt-5.4-flash"
+            normalize_freshcodex_model(Some("gpt-6-astra")),
+            "gpt-6-astra"
+        );
+        assert_eq!(
+            normalize_freshcodex_model(Some("gpt-5.6-sol")),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            normalize_freshcodex_model(Some("gpt-5.6-terra")),
+            "gpt-5.6-terra"
+        );
+        assert_eq!(
+            normalize_freshcodex_model(Some("gpt-5.6-luna")),
+            "gpt-5.6-luna"
         );
         assert_eq!(
             normalize_freshcodex_model(Some("gpt-5.3-codex-spark")),
             "gpt-5.3-codex-spark"
         );
-        // gpt-5.4-mini (in the codex catalog, NOT the freshcodex allowlist) → gpt-5.5.
-        assert_eq!(normalize_freshcodex_model(Some("gpt-5.4-mini")), "gpt-5.5");
+        // Retired/unknown models fall back to the current freshcodex default.
+        assert_eq!(
+            normalize_freshcodex_model(Some("gpt-5.4-mini")),
+            FRESHCODEX_DEFAULT_MODEL
+        );
         // Unknown / missing → the freshcodex default.
         assert_eq!(
             normalize_freshcodex_model(Some("random")),
@@ -311,35 +331,33 @@ mod tests {
     }
 
     #[test]
-    fn effort_menu_for_flash_omits_max_and_defaults_high() {
-        let flash = Some("gpt-5.4-flash");
-        // flash has no `max` on its menu; `xhigh → max` then clamps to defaultEffort `high`.
+    fn effort_menu_for_gpt_56_models_keeps_current_reasoning_levels() {
+        let terra = Some("gpt-5.6-terra");
         assert_eq!(
-            normalize_freshcodex_effort(flash, Some("xhigh")).as_deref(),
-            Some("high")
+            normalize_freshcodex_effort(terra, Some("xhigh")).as_deref(),
+            Some("max")
         );
         assert_eq!(
-            normalize_freshcodex_effort(flash, Some("max")).as_deref(),
-            Some("high")
+            normalize_freshcodex_effort(terra, Some("max")).as_deref(),
+            Some("max")
         );
-        // On-menu efforts kept, including the DEV-0003 pair.
         assert_eq!(
-            normalize_freshcodex_effort(flash, Some("none")).as_deref(),
+            normalize_freshcodex_effort(terra, Some("none")).as_deref(),
             Some("none")
         );
         assert_eq!(
-            normalize_freshcodex_effort(flash, Some("minimal")).as_deref(),
-            Some("minimal")
+            normalize_freshcodex_effort(terra, Some("minimal")).as_deref(),
+            Some("max")
         );
         assert_eq!(
-            normalize_freshcodex_effort(flash, None).as_deref(),
-            Some("high")
+            normalize_freshcodex_effort(terra, None).as_deref(),
+            Some("max")
         );
     }
 
     #[test]
     fn effort_for_unknown_model_uses_default_model_menu() {
-        // An unknown model normalizes to gpt-5.5, whose menu includes `max`.
+        // An unknown model normalizes to gpt-6-astra, whose menu includes `max`.
         let unknown = Some("mystery-model");
         assert_eq!(
             normalize_freshcodex_effort(unknown, Some("medium")).as_deref(),

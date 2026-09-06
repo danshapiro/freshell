@@ -6500,7 +6500,7 @@ pub(crate) mod tests {
                 st.handle_send(serde_json::from_value(json!({
                 "provider":"codex", "sessionType":"freshcodex", "sessionId":"thread-1", "text":"Look at this",
                 "images":[{"data":"aGVsbG8=", "mediaType":"image/png"}],
-                "settings":{"model":"gpt-5.5", "effort":"low", "permissionMode":"never", "sandbox":"read-only", "cwd":"/tmp"}
+                "settings":{"model":"gpt-6-astra", "effort":"low", "permissionMode":"never", "sandbox":"read-only", "cwd":"/tmp"}
             })).unwrap()).await;
             }
         });
@@ -6519,10 +6519,10 @@ pub(crate) mod tests {
             .expect("accepted settings survive resume");
         peer.disconnect();
         st.shutdown().await;
-        assert_eq!(saved.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(saved.model.as_deref(), Some("gpt-6-astra"));
         assert_eq!(saved.effort.as_deref(), Some("low"));
         assert_eq!(saved.permission_mode.as_deref(), Some("never"));
-        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["model"], "gpt-6-astra");
         assert_eq!(params["effort"], "low");
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandboxPolicy"]["type"], "readOnly");

@@ -2149,7 +2149,7 @@ describe('PaneContainer', () => {
           expect(paneContent.sessionType).toBe('freshcodex')
           expect(paneContent.provider).toBe('codex')
           expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
-          expect(paneContent.model).toBe('gpt-5.5')
+          expect(paneContent.model).toBe('gpt-6-astra')
           expect(paneContent.effort).toBe('max')
         }
       })
@@ -2162,12 +2162,12 @@ describe('PaneContainer', () => {
       }))
     })
 
-    it('normalizes stale Freshcodex effort from provider settings against the active model', async () => {
+    it('normalizes saved Freshcodex effort from provider settings against the active model', async () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(
         node,
         undefined,
-        { codex: { model: 'gpt-5.4-flash' } },
+        { codex: { model: 'gpt-5.6-luna' } },
         ['claude', 'codex'],
         { claude: true, codex: true },
         { freshcodex: { effort: 'xhigh' } },
@@ -2191,8 +2191,8 @@ describe('PaneContainer', () => {
         const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
         expect(paneContent.kind).toBe('fresh-agent')
         if (paneContent.kind === 'fresh-agent') {
-          expect(paneContent.model).toBe('gpt-5.4-flash')
-          expect(paneContent.effort).toBe('high')
+          expect(paneContent.model).toBe('gpt-5.6-luna')
+          expect(paneContent.effort).toBe('max')
         }
       })
     })

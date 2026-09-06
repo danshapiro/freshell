@@ -250,15 +250,15 @@ describe('FreshAgentSettingsButton', () => {
     seedPane(store, {
       sessionType: 'freshcodex',
       provider: 'codex',
-      model: 'gpt-5.5',
+      model: 'gpt-6-astra',
       effort: 'max',
     })
 
     renderButton(store)
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
 
-    expect(screen.getByRole('button', { name: /GPT-5\.5 · max.*Change/ })).toBeInTheDocument()
-    expect(screen.queryByRole('radio', { name: 'GPT-5.4 Flash' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GPT-6 Astra · max.*Change/ })).toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-5.6 Luna' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
   })
 
@@ -267,7 +267,7 @@ describe('FreshAgentSettingsButton', () => {
     seedPane(store, {
       sessionType: 'freshcodex',
       provider: 'codex',
-      model: 'gpt-5.5',
+      model: 'gpt-6-astra',
       effort: 'max',
     })
 
@@ -276,19 +276,19 @@ describe('FreshAgentSettingsButton', () => {
     fireEvent.click(screen.getByRole('button', { name: /Change/ }))
 
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const lowOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('low'))
     expect(lowOption).toBeDefined()
     fireEvent.click(lowOption!)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · low' }))
 
     await waitFor(() => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
         freshAgent: {
           providers: {
             freshcodex: {
-              modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+              modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
               effort: 'low',
             },
           },

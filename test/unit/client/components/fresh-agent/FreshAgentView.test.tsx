@@ -1226,7 +1226,7 @@ describe('FreshAgentView', () => {
       requestId: 'req-create',
       sessionType: 'freshcodex',
       provider: 'codex',
-      model: 'gpt-5.5',
+      model: 'gpt-6-astra',
       effort: 'max',
     }))
 
@@ -1789,7 +1789,7 @@ describe('FreshAgentView', () => {
 
     wsMock.send.mockClear()
 
-    expect(screen.queryByRole('radio', { name: 'GPT-5.5' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-6 Astra' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
@@ -4271,7 +4271,7 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-flash',
         sessionId: 'thread-flash',
         status: 'idle',
-        model: 'gpt-5.5',
+        model: 'gpt-6-astra',
         effort: 'max',
       },
     }))
@@ -4287,34 +4287,34 @@ describe('FreshAgentView', () => {
     // separate Thinking dropdown. Only the compact Model row remains.
     expect(screen.queryByRole('radiogroup', { name: 'Model' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /GPT-5\.5 · max.*Change/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GPT-6 Astra · max.*Change/ })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /Change/ }))
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
 
-    // GPT-5.4 Flash declares none..high (no xhigh/max); levels arrive in
+    // GPT-5.6 Luna declares the current GPT-5.6 reasoning levels in
     // canonical order.
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const levelTexts = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
     expect(levelTexts.map((text) => text?.replace(/last used|highest|current|●/g, '').trim())).toEqual(
-      ['none', 'minimal', 'low', 'medium', 'high'],
+      ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · high' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · max' }))
 
     await waitFor(() => {
       const layout = store.getState().panes.layouts['tab-1']
       expect(layout?.type).toBe('leaf')
-      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.4-flash')
-      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.6-luna')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('max')
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
           freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
-            effort: 'high',
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
+            effort: 'max',
           },
         },
       },
@@ -4333,7 +4333,7 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-persist-settings',
         sessionId: 'thread-persist-settings',
         status: 'idle',
-        model: 'gpt-5.4-flash',
+        model: 'gpt-5.6-luna',
         permissionMode: 'on-request',
         effort: 'medium',
       },
@@ -4347,13 +4347,13 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
     // Thinking now persists through the Change… dialog, not a retired dropdown.
-    fireEvent.click(screen.getByRole('button', { name: /GPT-5\.4 Flash · medium.*Change/ }))
+    fireEvent.click(screen.getByRole('button', { name: /GPT-5\.6 Luna · medium.*Change/ }))
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const highOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('high'))
     expect(highOption).toBeDefined()
     fireEvent.click(highOption!)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · high' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · high' }))
     fireEvent.change(screen.getByRole('combobox', { name: 'Permission mode' }), {
       target: { value: 'never' },
     })
@@ -4362,7 +4362,7 @@ describe('FreshAgentView', () => {
       freshAgent: {
         providers: {
           freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
             effort: 'high',
           },
         },
@@ -4389,7 +4389,7 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-style',
         sessionId: 'thread-style',
         status: 'idle',
-        model: 'gpt-5.4-flash',
+        model: 'gpt-5.6-luna',
         effort: 'high',
         style: 'sans',
       },
@@ -5435,7 +5435,7 @@ describe('FreshAgentView', () => {
     })
 
     expect(screen.getByText('Codex turn')).toBeInTheDocument()
-    expect(screen.queryByRole('radio', { name: 'GPT-5.5' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-6 Astra' })).not.toBeInTheDocument()
     expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
@@ -5620,7 +5620,7 @@ describe('FreshAgentView', () => {
       sessionId: 'codex-thread-lost',
       sessionType: 'freshcodex',
       provider: 'codex',
-      model: 'gpt-5.5',
+      model: 'gpt-6-astra',
     }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -6716,7 +6716,7 @@ describe('FreshAgentView /model slash command', () => {
       content: modelCommandPaneContent({
         sessionType: 'freshcodex',
         provider: 'codex',
-        model: 'gpt-5.5',
+        model: 'gpt-6-astra',
         effort: 'max',
       }),
     }))

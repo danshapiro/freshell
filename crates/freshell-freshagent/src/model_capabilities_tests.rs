@@ -309,19 +309,35 @@ async fn codex_serves_static_catalog() {
             "fetchedAt": 1_000,
             "models": [
                 {
-                    "id": "gpt-5.5",
-                    "displayName": "GPT-5.5",
+                    "id": "gpt-6-astra",
+                    "displayName": "GPT-6 Astra",
                     "provider": "codex",
                     "supportsEffort": true,
-                    "supportedEffortLevels": ["none", "minimal", "low", "medium", "high", "max"],
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
                     "supportsAdaptiveThinking": true,
                 },
                 {
-                    "id": "gpt-5.4-flash",
-                    "displayName": "GPT-5.4 Flash",
+                    "id": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6 Sol",
                     "provider": "codex",
                     "supportsEffort": true,
-                    "supportedEffortLevels": ["none", "minimal", "low", "medium", "high"],
+                    "supportedEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
+                    "supportsAdaptiveThinking": true,
+                },
+                {
+                    "id": "gpt-5.6-terra",
+                    "displayName": "GPT-5.6 Terra",
+                    "provider": "codex",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
+                    "supportsAdaptiveThinking": true,
+                },
+                {
+                    "id": "gpt-5.6-luna",
+                    "displayName": "GPT-5.6 Luna",
+                    "provider": "codex",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
                     "supportsAdaptiveThinking": true,
                 },
                 {
@@ -503,8 +519,8 @@ async fn get_freshcodex_serves_static_catalog_over_http() {
     let (status, body) = get(app, &format!("{CAP}/freshcodex?cwd=/ignored"), true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["runtimeProvider"], json!("codex"));
-    assert_eq!(body["models"].as_array().unwrap().len(), 3);
-    assert_eq!(body["models"][0]["id"], json!("gpt-5.5"));
+    assert_eq!(body["models"].as_array().unwrap().len(), 5);
+    assert_eq!(body["models"][0]["id"], json!("gpt-6-astra"));
     assert_eq!(probe.call_count().await, 0);
 }
 

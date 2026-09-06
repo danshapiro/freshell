@@ -496,14 +496,24 @@ fn static_models(session_type: SessionType) -> Vec<ModelCapability> {
     let rows: &[Row] = match session_type {
         SessionType::FreshCodex => &[
             (
-                "gpt-5.5",
-                "GPT-5.5",
-                &["none", "minimal", "low", "medium", "high", "max"],
+                "gpt-6-astra",
+                "GPT-6 Astra",
+                &["low", "medium", "high", "xhigh", "max"],
             ),
             (
-                "gpt-5.4-flash",
-                "GPT-5.4 Flash",
-                &["none", "minimal", "low", "medium", "high"],
+                "gpt-5.6-sol",
+                "GPT-5.6 Sol",
+                &["none", "low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                &["none", "low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "gpt-5.6-luna",
+                "GPT-5.6 Luna",
+                &["none", "low", "medium", "high", "xhigh", "max"],
             ),
             (
                 "gpt-5.3-codex-spark",
