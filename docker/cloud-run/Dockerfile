@@ -126,9 +126,13 @@ COPY . .
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 
 # Copy the entrypoint script (after COPY . . so it's not overwritten by
-# a stale copy in the source tree).
-COPY docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
-RUN chmod +x /usr/local/bin/e2e-entrypoint.sh
+# a stale copy in the source tree). --chmod=755 is load-bearing: COPY preserves
+# the context file's mode, and a umask-0077 checkout bakes 0700 (no group/other
+# READ). `RUN chmod +x` only ORs execute bits (0700|0111 = 0711), and a script
+# must be READABLE to execute — under USER node (uid 1000) that produced
+# "bash: .../e2e-entrypoint.sh: Permission denied" at container start (the
+# runtime stage below). Mirrors docker/sandbox/Dockerfile's COPY --chmod=755.
+COPY --chmod=755 docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
 
 # Switch to non-root user for runtime (node:22-bookworm provides UID 1000).
 # This is required by server-side tests that verify permission errors
