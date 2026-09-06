@@ -8,8 +8,11 @@ playwright-report/
 coverage/
 .nyc_output/
 
-# Retired backend checkout residue must not enter the Rust-only source image.
+# Retired backend source/test roots must not enter the Rust-only source image.
 /server/
+/test/server/
+/test/unit/server/
+/test/integration/server/
 
 # Version control and CI
 .git/
