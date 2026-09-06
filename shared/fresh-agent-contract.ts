@@ -11,6 +11,16 @@ export const FreshAgentThreadLocatorSchema = z.object({
 
 export const FreshAgentRequestIdSchema = z.union([z.string().min(1), z.number().int()])
 
+export const FreshAgentSettingScopeSchema = z.enum(['per-send', 'create-only', 'unsupported'])
+export type FreshAgentSettingScope = z.infer<typeof FreshAgentSettingScopeSchema>
+export const FreshAgentSettingScopesSchema = z.object({
+  model: FreshAgentSettingScopeSchema.optional(),
+  effort: FreshAgentSettingScopeSchema.optional(),
+  sandbox: FreshAgentSettingScopeSchema.optional(),
+  permissionMode: FreshAgentSettingScopeSchema.optional(),
+}).strict()
+export type FreshAgentSettingScopes = z.infer<typeof FreshAgentSettingScopesSchema>
+
 export const FreshAgentCapabilitiesSchema = z.object({
   send: z.boolean(),
   interrupt: z.boolean(),
@@ -20,6 +30,7 @@ export const FreshAgentCapabilitiesSchema = z.object({
   worktrees: z.boolean().optional(),
   diffs: z.boolean().optional(),
   childThreads: z.boolean().optional(),
+  settingScopes: FreshAgentSettingScopesSchema.optional(),
 }).strict()
 
 export const FreshAgentTokenUsageSchema = z.object({

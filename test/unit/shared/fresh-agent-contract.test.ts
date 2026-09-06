@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   FRESH_AGENT_CONTRACT_SCHEMA_NAMES,
   FreshAgentActionResultSchema,
+  FreshAgentCapabilitiesSchema,
   FreshAgentContractErrorSchema,
   FreshAgentRequestIdSchema,
   FreshAgentSessionCommandSchema,
@@ -107,5 +108,39 @@ describe('fresh-agent shared contract schemas', () => {
       provider: 'codex',
       threadId: 'thread-codex-1',
     }).code).toBe('FRESH_AGENT_CONTRACT_PARSE_FAILED')
+  })
+
+  describe('capabilities.settingScopes', () => {
+    const minimalCapabilities = {
+      send: true,
+      interrupt: true,
+      approvals: false,
+      questions: false,
+      fork: false,
+    }
+
+    it('round-trips a capabilities object advertising per-send scopes for every knob', () => {
+      const settingScopes = {
+        model: 'per-send',
+        effort: 'per-send',
+        sandbox: 'per-send',
+        permissionMode: 'per-send',
+      }
+      const parsed = FreshAgentCapabilitiesSchema.parse({ ...minimalCapabilities, settingScopes })
+      expect(parsed.settingScopes).toEqual(settingScopes)
+    })
+
+    it('still parses capabilities without settingScopes (backward compat)', () => {
+      const parsed = FreshAgentCapabilitiesSchema.parse(minimalCapabilities)
+      expect('settingScopes' in parsed).toBe(false)
+      expect(parsed.settingScopes).toBeUndefined()
+    })
+
+    it('rejects an unknown scope value inside settingScopes', () => {
+      expect(() => FreshAgentCapabilitiesSchema.parse({
+        ...minimalCapabilities,
+        settingScopes: { model: 'sometimes' },
+      })).toThrow()
+    })
   })
 })
