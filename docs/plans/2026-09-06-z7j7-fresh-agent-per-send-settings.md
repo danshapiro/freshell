@@ -428,7 +428,7 @@ Extract the knob validation into a small helper (`validate_claude_send_settings`
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run: `cargo test -p freshell-freshagent` && `cargo clippy -p freshell-freshagent --all-targets -- -D warnings` && `cargo fmt --check -p freshell-freshagent` && `cargo test -p freshell-freshagent claude_snapshot` && `npm run test:vitest -- run --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts`
+Run: `cargo test -p freshell-freshagent` && `cargo clippy -p freshell-freshagent --all-targets -- -D warnings` && `cargo fmt --check -p freshell-freshagent` && `cargo test -p freshell-freshagent claude_snapshot` && `npm run test:vitest -- run --config config/vitest/vitest.server.config.ts test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/rust-claude-snapshot-contract.test.ts` (the golden fixture is ALSO strict-schema-parsed client-side by the TS contract test — must keep passing with the extended golden)
 
 Expected: PASS
 
