@@ -120,8 +120,10 @@ fn clean_string(v: Option<&Value>) -> Option<String> {
 /// `PATCH /api/sessions/:sessionId` — validate the `SessionPatchSchema` body,
 /// build the JS-spread patch tuple list, persist via
 /// `SettingsStore::patch_session_override`, and respond with the merged
-/// override plus the always-`null` `cascadedTerminalId` (the terminal-cascade
-/// rename is out of scope for this port).
+/// override plus `cascadedTerminalId`: `null` unless this session is running
+/// in a LIVE terminal, in which case the terminal's label is renamed and its
+/// terminal id is returned (the session→terminal live mirror below; the
+/// reverse terminal→session cascade was removed by b5fb).
 async fn patch_session(
     State(state): State<SessionsState>,
     AxumPath(raw_id): AxumPath<String>,
