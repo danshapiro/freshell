@@ -1958,18 +1958,29 @@ async fn main() -> ExitCode {
         std::sync::Arc::clone(&shutdown_started),
     )
     .await;
+    // The SAFE-11 watchdog was armed the instant the signal arrived; every
+    // graceful phase below runs under ONE shared deadline so no phase can
+    // consume the budget of a later one (whole-branch review M-2).
+    let graceful_deadline = tokio::time::Instant::now() + SHUTDOWN_HARD_TIMEOUT;
     rebind.shutdown_all().await;
     // Stop background restart recovery before child-process cleanup. A pass
     // already inside a provider ownership barrier is allowed to finish, so a
     // replacement cannot appear after the cleanup sweep has taken its process
-    // snapshot. The outer shutdown watchdog remains the final bound if a
-    // provider operation itself does not return. (`shutdown_signal` already
-    // latched `shutdown_started` and notified waiters; re-asserting here is
-    // idempotent and keeps this drain correct under any future serve path.)
+    // snapshot. The driver normally exits on the first wakeup after
+    // `shutdown_notify` fires, so this bound is small; the shared graceful
+    // deadline remains the outer limit if a provider operation wedges (the
+    // abort below only detaches a wedged inner pass — convergence belongs to
+    // the durable pending rows next boot). (`shutdown_signal` already latched
+    // `shutdown_started` and notified waiters; re-asserting here is idempotent
+    // and keeps this drain correct under any future serve path.)
     shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
     shutdown_notify.notify_waiters();
     let mut recovery_driver_task = restart_recovery_driver_task;
-    if tokio::time::timeout(SHUTDOWN_HARD_TIMEOUT, &mut recovery_driver_task)
+    let driver_stop_deadline = std::cmp::min(
+        graceful_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+    if tokio::time::timeout_at(driver_stop_deadline, &mut recovery_driver_task)
         .await
         .is_err()
     {
@@ -1989,15 +2000,21 @@ async fn main() -> ExitCode {
     // barriers — quarantined runtimes are outside the providers' `sessions`
     // maps, so their ordinary shutdown sweeps never see them.
     //
-    // LB-02: the SAFE-11 watchdog (SHUTDOWN_HARD_TIMEOUT, armed at signal
-    // arrival) bounds the ENTIRE graceful sequence, so these phases run under
-    // ONE shared spend deadline: the transaction join gets ≤ 3,000 ms, then
-    // the quarantine drains share ≤ 2,000 ms across both providers in
-    // parallel (per-entry budgets are clamped by the shared deadline inside
-    // each drain). Truncation logs loudly and leaves convergence to the
-    // durable pending rows + fenced cross-boot recovery next boot.
+    // LB-02 (+ review M-2 clamping): the SAFE-11 watchdog
+    // (SHUTDOWN_HARD_TIMEOUT, armed at signal arrival) bounds the ENTIRE
+    // graceful sequence, so these phases run under ONE shared spend deadline:
+    // the transaction join gets ≤ 3,000 ms, then the quarantine drains share
+    // ≤ 2,000 ms across both providers in parallel (per-entry budgets are
+    // clamped by the shared deadline inside each drain) — each clamped so the
+    // earlier (WS-close flush, rebind, driver-stop) phases can never push a
+    // later one past the watchdog. Truncation logs loudly and leaves
+    // convergence to the durable pending rows + fenced cross-boot recovery
+    // next boot.
     restart.begin_restart_shutdown();
-    let join_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3_000);
+    let join_deadline = std::cmp::min(
+        graceful_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_millis(3_000),
+    );
     if tokio::time::timeout_at(join_deadline, restart.join_in_flight_transactions())
         .await
         .is_err()
@@ -2008,7 +2025,10 @@ async fn main() -> ExitCode {
         // cross-boot convergence.
         tracing::error!("agent.restart.shutdown.transactions_join_timeout");
     }
-    let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_000);
+    let drain_deadline = std::cmp::min(
+        graceful_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_millis(2_000),
+    );
     tokio::join!(
         fresh_codex_state.drain_restart_retirements(drain_deadline),
         fresh_claude_state.drain_restart_retirements(drain_deadline),

@@ -933,6 +933,16 @@ impl FreshClaudeState {
             .lock()
             .await
             .retain(|_, mapped| mapped != &map_key);
+        // NOTE (whole-branch review M-1, deliberate asymmetry vs codex): codex
+        // gates this release on `restart_lease_pins` so a quarantined restart
+        // retirement cannot lose its durable binding mid-flight; claude instead
+        // relies one layer up on the coordinator's restart pending-row guard —
+        // every spawn/attach/resume lane consults it before trusting a lease —
+        // so clearing here while a restart row is pending cannot mint a second
+        // writer, and `finalize_restart_retirement` re-clears idempotently at
+        // `Stopped`. If a future lane is added that trusts the lease WITHOUT
+        // the pending-row guard, mirror the codex pin gate first (see codex.rs
+        // quarantine-install + kill sites).
         self.leases.clear_binding(PROVIDER, &session_id);
 
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {

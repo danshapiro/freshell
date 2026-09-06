@@ -5272,6 +5272,21 @@ impl ProductionFreshRuntime for ReservationRecordingFreshRuntime {
         true
     }
 
+    /// The recording test world owns no out-of-process OpenCode writer, so a
+    /// cross-boot ambiguous-replacement abort quiesces nothing: success with
+    /// zero actions (the default "unavailable" answer would block the fence
+    /// re-proof convergence lane this seam now exercises).
+    async fn recover_opencode_remote_abort(
+        &self,
+        _session_id: &str,
+        _cwd: Option<&str>,
+    ) -> freshell_freshagent::RestartShutdownOutcome {
+        // No out-of-process writer exists in the recording test world, so
+        // "aborted" is the confirmed end state (the coordinator-only `Stale`
+        // path is exercised separately by the missing-session tests).
+        freshell_freshagent::RestartShutdownOutcome::Stopped
+    }
+
     async fn shutdown_reserved_for_restart_detailed(
         &self,
         provider: freshell_protocol::AgentProvider,
@@ -6961,8 +6976,390 @@ async fn indeterminate_commit_keeps_plan_and_reservation_until_driver_converges(
     registry.kill_all();
 }
 
-// ---------------------------------------------------------------------------
-// Shutdown interlock (fix 1): the coordinator latches restart ingress at
+/// Counting wrapper over the production adapter for the fence-defer test:
+/// records `create` entries and the parent-sync counter value at the first
+/// create — in a faultless pass that count IS the fence write's sync ordinal
+/// (the fence write is the last journal write before fenced replacement
+/// creation). Every trait method delegates untouched.
+struct CreateOrdinalRecordingRuntime {
+    inner: Arc<freshell_ws::restart::ProductionRestartRuntime>,
+    syncs: Arc<AtomicUsize>,
+    syncs_at_first_create: Arc<AtomicUsize>,
+    creates: Arc<AtomicUsize>,
+}
+
+impl CreateOrdinalRecordingRuntime {
+    fn record_create_entry(&self) {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        self.syncs_at_first_create
+            .store(self.syncs.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for CreateOrdinalRecordingRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, request: &AgentRestart) -> Result<Self::ResumePlan, RestartFailure> {
+        RestartRuntime::preflight(self.inner.as_ref(), request).await
+    }
+
+    async fn abort_preflight(&self, request: &AgentRestart, plan: &Self::ResumePlan) {
+        RestartRuntime::abort_preflight(self.inner.as_ref(), request, plan).await;
+    }
+
+    async fn on_terminal_outcome(&self, request: &AgentRestart) {
+        RestartRuntime::on_terminal_outcome(self.inner.as_ref(), request).await;
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        request: &AgentRestart,
+        plan: &Self::ResumePlan,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::shutdown_for_restart(self.inner.as_ref(), request, plan).await
+    }
+
+    async fn create_replacement(
+        &self,
+        request: &AgentRestart,
+        plan: Self::ResumePlan,
+    ) -> Result<String, RestartFailure> {
+        self.record_create_entry();
+        RestartRuntime::create_replacement(self.inner.as_ref(), request, plan).await
+    }
+
+    fn requires_replacement_fence(&self) -> bool {
+        RestartRuntime::requires_replacement_fence(self.inner.as_ref())
+    }
+
+    async fn create_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        plan: Self::ResumePlan,
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        self.record_create_entry();
+        RestartRuntime::create_replacement_fenced(self.inner.as_ref(), request, plan, fence).await
+    }
+
+    fn persisted_resume_context(
+        &self,
+        request: &AgentRestart,
+        plan: &Self::ResumePlan,
+    ) -> Option<RestartResumeContext> {
+        RestartRuntime::persisted_resume_context(self.inner.as_ref(), request, plan)
+    }
+
+    fn persisted_retirement_fence(
+        &self,
+        request: &AgentRestart,
+        plan: &Self::ResumePlan,
+    ) -> Option<RestartRetirementFence> {
+        RestartRuntime::persisted_retirement_fence(self.inner.as_ref(), request, plan)
+    }
+
+    async fn recover_replacement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        self.record_create_entry();
+        RestartRuntime::recover_replacement(self.inner.as_ref(), request, context).await
+    }
+
+    async fn recover_ambiguous_replacement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: &RestartReplacementFence,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::recover_ambiguous_replacement(self.inner.as_ref(), request, context, fence)
+            .await
+    }
+
+    async fn recover_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        self.record_create_entry();
+        RestartRuntime::recover_replacement_fenced(self.inner.as_ref(), request, context, fence)
+            .await
+    }
+
+    async fn recover_retirement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::recover_retirement(self.inner.as_ref(), request, context).await
+    }
+
+    async fn recover_persisted_retirement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: Option<&RestartRetirementFence>,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::recover_persisted_retirement(self.inner.as_ref(), request, context, fence)
+            .await
+    }
+}
+
+/// Shared scenario builder for the fence-defer test: a scratch-server state
+/// re-homed onto a persistent coordinator whose parent-sync gate is supplied
+/// by the test, plus the production adapter behind the ordinal recorder.
+#[allow(clippy::type_complexity)]
+async fn fence_defer_scenario(
+    gate: freshell_ws::restart::JournalParentSync,
+    syncs: Arc<AtomicUsize>,
+    syncs_at_first_create: Arc<AtomicUsize>,
+    creates: Arc<AtomicUsize>,
+) -> (
+    RestartCoordinator,
+    Arc<ReservationRecordingFreshRuntime>,
+    Arc<freshell_ws::restart::ProductionRestartRuntime>,
+    AgentRestart,
+    freshell_ws::restart::RestartRuntimeRegistration,
+    freshell_ws::WsState,
+    freshell_terminal::TerminalRegistry,
+    tempfile::TempDir,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let coordinator = RestartCoordinator::new_persistent_with_test_parent_sync(
+        path,
+        16,
+        16,
+        RestartIngressLimits::default(),
+        gate,
+    )
+    .unwrap();
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    state.restart = coordinator.clone();
+
+    let durable_id = "durable-fence-defer".to_string();
+    let old_runtime_id = "fresh-opencode-fence-defer-old".to_string();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "opencode", durable_id.clone());
+    let old = coordinator.register_initial(locator, &old_runtime_id);
+    let fresh_runtime = Arc::new(ReservationRecordingFreshRuntime::new(
+        coordinator.clone(),
+        Arc::clone(&state.broadcast_tx),
+    ));
+    fresh_runtime.enroll_live_session("opencode", &durable_id, &old_runtime_id);
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            fresh_runtime.clone(),
+        ),
+    );
+    let wrapper = Arc::new(CreateOrdinalRecordingRuntime {
+        inner: production.clone(),
+        syncs,
+        syncs_at_first_create,
+        creates,
+    });
+    let registration: freshell_ws::restart::RestartRuntimeRegistration =
+        coordinator.set_runtime(wrapper);
+    let request = AgentRestart {
+        request_id: "fence-defer".to_string(),
+        provider: "opencode".to_string(),
+        session_id: durable_id,
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id,
+        expected_generation: old.generation,
+    };
+    (
+        coordinator,
+        fresh_runtime,
+        production,
+        request,
+        registration,
+        state,
+        registry,
+        temp,
+    )
+}
+
+/// Whole-branch review I-1 (fix 3 contract): the replacement fence is the
+/// provenance boot recovery uses to quiesce a post-crash ambiguous writer —
+/// its write is therefore inside the indeterminate-commit contract. An
+/// INDETERMINATE fence write must NOT proceed to spawn: defer retryable +
+/// recovery_pending, retain the row, keep the plan/reservation, and re-drive
+/// through the always-on driver, which re-proves the journal directory before
+/// trusting the fence.
+#[tokio::test] // real time, bounded (drives the always-on recovery driver)
+async fn indeterminate_replacement_fence_write_defers_spawn_until_reproven() {
+    // Phase A — calibrate the fence write's parent-sync ordinal: run an
+    // unfaulted pass and read the sync counter at the first replacement
+    // creation (the fence write is the last journal write before it).
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let syncs_at_first_create = Arc::new(AtomicUsize::new(0));
+    let creates = Arc::new(AtomicUsize::new(0));
+    {
+        let counting_gate: freshell_ws::restart::JournalParentSync = Arc::new({
+            let syncs = Arc::clone(&syncs);
+            move |_parent: &Path| -> std::io::Result<()> {
+                syncs.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let (coordinator, _fresh, _production, request, _registration, _state, registry, _temp) =
+            fence_defer_scenario(
+                counting_gate,
+                Arc::clone(&syncs),
+                Arc::clone(&syncs_at_first_create),
+                Arc::clone(&creates),
+            )
+            .await;
+        let outcome = coordinator
+            .execute_registered(request.clone(), |_| {})
+            .await;
+        assert!(
+            matches!(
+                outcome.messages.last(),
+                Some(ServerMessage::AgentRestartReplaced(replaced))
+                    if replaced.request_id == request.request_id
+            ),
+            "the unfaulted calibration pass must commit: {:?}",
+            outcome.messages
+        );
+        registry.kill_all();
+    }
+    assert_eq!(
+        creates.load(Ordering::SeqCst),
+        1,
+        "calibration created exactly one replacement"
+    );
+    let fence_ordinal = syncs_at_first_create.load(Ordering::SeqCst);
+    assert!(
+        fence_ordinal >= 3,
+        "the fence write is at least the 3rd journal parent sync (boundary + retirement-complete + fence): counted {fence_ordinal}"
+    );
+
+    // Phase B — same scenario, faulting exactly the fence write's parent sync.
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let syncs_at_first_create = Arc::new(AtomicUsize::new(0));
+    let creates = Arc::new(AtomicUsize::new(0));
+    let fault_gate: freshell_ws::restart::JournalParentSync = Arc::new({
+        let syncs = Arc::clone(&syncs);
+        move |_parent: &Path| -> std::io::Result<()> {
+            let at = syncs.fetch_add(1, Ordering::SeqCst) + 1;
+            if at == fence_ordinal {
+                return Err(std::io::Error::other(
+                    "injected fence-write parent sync failure",
+                ));
+            }
+            Ok(())
+        }
+    });
+    let (coordinator, fresh_runtime, production, request, _registration, _state, registry, _temp) =
+        fence_defer_scenario(
+            fault_gate,
+            Arc::clone(&syncs),
+            Arc::clone(&syncs_at_first_create),
+            Arc::clone(&creates),
+        )
+        .await;
+
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+    let outcome = coordinator
+        .execute_registered(request.clone(), move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+
+    // The deferred pass must NOT spawn: no create call, a retryable +
+    // recovery_pending failure frame, a retained row holding the fence, a
+    // retained plan, and NO reservation release.
+    assert_eq!(
+        creates.load(Ordering::SeqCst),
+        0,
+        "an indeterminate fence write must NOT proceed to replacement creation"
+    );
+    assert_eq!(
+        fresh_runtime.releases(),
+        vec![],
+        "the deferred outcome keeps the OpenCode reservation for the re-drive"
+    );
+    assert!(
+        matches!(
+            outcome.messages.as_slice(),
+            [ServerMessage::AgentRestartStarted(_), ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == "fence-defer"
+                    && failed.retryable
+                    && failed.recovery_pending
+        ),
+        "the deferred pass surfaces retryable + recovery_pending: {:?}",
+        outcome.messages
+    );
+    let pending = coordinator.pending_recoveries();
+    assert!(
+        pending
+            .iter()
+            .any(|row| row.request_id == "fence-defer" && row.replacement_fence.is_some()),
+        "the retained row holds the (durability-unproven) fence for re-proof: {pending:?}"
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_some(),
+        "the deferred pass keeps the request's active plan"
+    );
+
+    // The always-on driver re-drives: the re-proof write clears the dirty flag
+    // (the one-shot fault is spent), and only then does the pass create and
+    // commit — AFTER the fence is durably proven.
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let driver_sink = Arc::clone(&emitted);
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        coordinator.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        move |message| driver_sink.lock().unwrap().push(message.clone()),
+    ));
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || coordinator
+            .pending_recoveries()
+            .is_empty())
+        .await,
+        "the driver must converge the retained row once the fence is re-proven (creates={} syncs={} pending={:?})",
+        creates.load(Ordering::SeqCst),
+        syncs.load(Ordering::SeqCst),
+        coordinator.pending_recoveries(),
+    );
+    assert_eq!(
+        creates.load(Ordering::SeqCst),
+        1,
+        "exactly one replacement is created, after the fence re-proof"
+    );
+    assert_eq!(
+        fresh_runtime.releases(),
+        vec![(
+            freshell_protocol::AgentProvider::Opencode,
+            "durable-fence-defer".to_string(),
+            "fresh-opencode-fence-defer-old".to_string(),
+            format!("restart-preflight:{}", request.request_id),
+        )],
+        "the reservation is released exactly once, on the converged terminal commit"
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_none(),
+        "the converged commit removes the active plan"
+    );
+
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("driver exits on shutdown")
+        .expect("driver task did not panic");
+    registry.kill_all();
+}
+
 // graceful shutdown, owns every registered in-flight transaction in a JoinSet
 // the shutdown sequence joins before provider/terminal cleanup, refuses
 // replacement creation once latched (retryable, durable row retained,

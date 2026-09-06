@@ -414,6 +414,24 @@ pub struct RestartOutcome {
     pub replayed: bool,
 }
 
+/// Result of [`RestartCoordinator::ensure_replacement_fence`] (whole-branch
+/// review finding I-1, fix 3 contract): the fence is trusted for spawning only
+/// when its durability is proven.
+enum ReplacementFenceProbe {
+    /// The fence is durably proven (freshly committed, already verified, or
+    /// re-proven by a successful no-mutation write): proceed to create.
+    Committed {
+        fence: Option<RestartReplacementFence>,
+        previously_persisted: bool,
+    },
+    /// The fence's durability is unproven (a fresh indeterminate/not-committed
+    /// write, or a re-proof that itself did not commit): do NOT create the
+    /// replacement this pass — surface the retryable recovery-pending defer
+    /// outcome. The retained row re-drives through the always-on driver; each
+    /// pass attempts the re-proof before trusting the fence.
+    Defer,
+}
+
 struct UnavailableRestartRuntime;
 
 #[async_trait::async_trait]
@@ -540,11 +558,13 @@ pub struct RestartCoordinator {
     in_flight_request_ids: Arc<Mutex<HashSet<String>>>,
     registered_runtime:
         Arc<std::sync::RwLock<Option<std::sync::Weak<dyn RestartRuntime<ResumePlan = ()>>>>>,
-    /// Runtime wake for the always-on recovery driver: every committed
-    /// transaction write that INSERTS a durable pending row fires
-    /// `notify_one` (insert-only — see `try_update_ownership`), so rows
-    /// created during normal runtime recover without any boot-pass backlog or
-    /// browser resend.
+    /// Runtime wake for the always-on recovery driver: every transaction
+    /// write that INSERTS a durable pending row fires `notify_one` in either
+    /// durability world — committed, or indeterminate (the fail-closed union
+    /// merge inserts the row in memory while its durability is unproven; the
+    /// retained row is exactly what recovery must drive — see
+    /// `try_update_ownership`). Insert-only, so rows created during normal
+    /// runtime recover without any boot-pass backlog or browser resend.
     recovery_notify: Arc<tokio::sync::Notify>,
     /// Graceful-shutdown latch (fix 1). `main.rs` wires the SAME
     /// `Arc<AtomicBool>` its `shutdown_signal` sets, so restart ingress and
@@ -1377,9 +1397,10 @@ impl RestartCoordinator {
             .collect()
     }
 
-    /// The wake the always-on recovery driver parks on. Every committed
-    /// transaction write that inserts a durable pending row fires
-    /// `notify_one` on this Notify (see `try_update_ownership`).
+    /// The wake the always-on recovery driver parks on. Every transaction
+    /// write that inserts a durable pending row fires `notify_one` on this
+    /// Notify in either durability world (committed or indeterminate — see
+    /// `try_update_ownership`).
     pub fn recovery_notify_handle(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.recovery_notify)
     }
@@ -3059,7 +3080,22 @@ impl RestartCoordinator {
         }
 
         let replacement_fence = match self.ensure_replacement_fence(&request.request_id, runtime) {
-            Ok((fence, _already_persisted)) => fence,
+            Ok(ReplacementFenceProbe::Committed { fence, .. }) => fence,
+            Ok(ReplacementFenceProbe::Defer) => {
+                // I-1: never spawn with a fence whose durability is unproven.
+                // Defer retryable + recovery_pending; the retained row's next
+                // driver pass re-proves the journal directory before trusting
+                // the fence.
+                let mut outcome = self.durability_indeterminate_outcome(
+                    &request,
+                    expected,
+                    true,
+                    "replacement fence durability is unproven — replacement deferred",
+                );
+                emit(&outcome.messages[0]);
+                outcome.messages.insert(0, started);
+                return outcome;
+            }
             Err(error) => {
                 let mut outcome =
                     self.persistence_failure_with_phase(&request, expected, error, true);
@@ -3273,11 +3309,21 @@ impl RestartCoordinator {
         left.provider == right.provider && left.session_id == right.session_id
     }
 
+    /// Fail-closed fence probe (whole-branch review finding I-1): every OTHER
+    /// transaction write has a dedicated `UpdateDurability` arm (fix 3); the
+    /// replacement-fence write must not be the exception. The fence exists so
+    /// that a post-crash recovery can quiesce a replacement whose spawn may
+    /// have completed; spawning with a fence whose rename is durably unproven
+    /// could mint a second writer no boot scan can attribute. `Defer` tells the
+    /// caller to stop BEFORE [`RestartRuntime::create_replacement_fenced`] this
+    /// pass and surface the retryable recovery-pending frame; the retained row
+    /// re-drives through the always-on driver once the journal directory is
+    /// re-proven.
     fn ensure_replacement_fence<R: RestartRuntime + ?Sized>(
         &self,
         owner_request_id: &str,
         runtime: &R,
-    ) -> std::io::Result<(Option<RestartReplacementFence>, bool)> {
+    ) -> std::io::Result<ReplacementFenceProbe> {
         let existing = self
             .ownership
             .lock()
@@ -3286,16 +3332,51 @@ impl RestartCoordinator {
             .get(owner_request_id)
             .and_then(|pending| pending.replacement_fence.clone());
         if let Some(existing) = existing {
-            return Ok((Some(existing), true));
+            if !self.journal_dir_sync_dirty.load(Ordering::SeqCst) {
+                return Ok(ReplacementFenceProbe::Committed {
+                    fence: Some(existing),
+                    previously_persisted: true,
+                });
+            }
+            // The in-memory fence came from a write whose duration is unproven
+            // (`journal_dir_sync_dirty`): re-prove the directory with a
+            // no-mutation write — the pre-write re-sync plus the rewrite clears
+            // the dirtiness and commits the fence — before trusting it for a
+            // spawn. A failed proof keeps the pass deferred (no busy loop:
+            // driver backoff paces the next attempt).
+            let (reproven, durability) =
+                self.try_update_ownership("reprove_replacement_spawn_fence", |ownership| {
+                    ownership
+                        .pending_recoveries
+                        .get(owner_request_id)
+                        .map(|pending| pending.replacement_fence.clone())
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "pending restart disappeared before fence re-proof",
+                            )
+                        })
+                })?;
+            reproven?;
+            return Ok(match durability {
+                UpdateDurability::Committed => ReplacementFenceProbe::Committed {
+                    fence: Some(existing),
+                    previously_persisted: true,
+                },
+                UpdateDurability::Indeterminate => ReplacementFenceProbe::Defer,
+            });
         }
         if !runtime.requires_replacement_fence() {
-            return Ok((None, false));
+            return Ok(ReplacementFenceProbe::Committed {
+                fence: None,
+                previously_persisted: false,
+            });
         }
 
         let fence = RestartReplacementFence {
             ownership_id: uuid::Uuid::new_v4().to_string(),
         };
-        let (persisted, _durability) =
+        let (persisted, durability) =
             self.try_update_ownership("record_replacement_spawn_fence", |ownership| {
                 let pending = ownership
                     .pending_recoveries
@@ -3311,7 +3392,20 @@ impl RestartCoordinator {
                 }
                 Ok::<_, std::io::Error>(pending.replacement_fence.clone())
             })?;
-        Ok((persisted?, false))
+        let fence = persisted?;
+        Ok(match durability {
+            UpdateDurability::Committed => ReplacementFenceProbe::Committed {
+                fence,
+                previously_persisted: false,
+            },
+            UpdateDurability::Indeterminate => {
+                // The fence may or may not be durable (the rename may have
+                // landed without its directory sync), and the in-memory row now
+                // holds it. Do NOT spawn: defer so the NEXT pass's re-proof
+                // precedes any replacement creation (I-1).
+                ReplacementFenceProbe::Defer
+            }
+        })
     }
 
     fn join_completed_replacement(&self, request: &AgentRestart) -> Option<RestartOutcome> {
@@ -3586,7 +3680,29 @@ impl RestartCoordinator {
 
         let (replacement_fence, fence_previously_persisted) =
             match self.ensure_replacement_fence(&pending.request_id, runtime) {
-                Ok(fence) => fence,
+                Ok(ReplacementFenceProbe::Committed {
+                    fence,
+                    previously_persisted,
+                }) => (fence, previously_persisted),
+                Ok(ReplacementFenceProbe::Defer) => {
+                    // I-1: never spawn with a fence whose durability is
+                    // unproven; defer retryable + recovery_pending, the next
+                    // driver pass re-proves first.
+                    let terminal = self
+                        .durability_indeterminate_outcome(
+                            &request,
+                            pending.old_runtime.clone(),
+                            true,
+                            "replacement fence durability is unproven — replacement deferred",
+                        )
+                        .messages
+                        .remove(0);
+                    emit(&terminal);
+                    return RestartOutcome {
+                        messages: vec![started, terminal],
+                        replayed: false,
+                    };
+                }
                 Err(error) => {
                     let terminal = self
                         .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
