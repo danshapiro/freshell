@@ -161,6 +161,7 @@ class FakeProxy {
   closeCalls = 0
   closeBlocker?: Promise<void>
   closeError?: Error
+  startError?: Error
   readonly wsUrl: string
   readonly upstreamWsUrl: string
   readonly requireCandidatePersistence: boolean
@@ -174,6 +175,7 @@ class FakeProxy {
   }
 
   async start() {
+    if (this.startError) throw this.startError
     return { wsUrl: this.wsUrl }
   }
 
@@ -196,10 +198,13 @@ function createPlanner(
   runtimeOrFactory: ConstructorParameters<typeof CodexLaunchPlanner>[0],
   proxies: FakeProxy[] = [],
   reconciler?: FakeClaimSource,
+  proxyStartErrors: ReadonlyArray<Error | undefined> = [],
 ) {
   return new CodexLaunchPlanner(runtimeOrFactory, {
     proxyFactory: (options: FakeProxyOptions) => {
       const proxy = new FakeProxy(options)
+      const startError = proxyStartErrors[proxies.length]
+      if (startError) proxy.startError = startError
       proxies.push(proxy)
       return proxy
     },
@@ -631,6 +636,48 @@ describe('CodexLaunchPlanner restore-time survivor claims', () => {
     expect(reconciler.dropCalls).toEqual(['ownership-uncoded'])
     expect(reconciler.settleCalls).toEqual([])
     expect(runtime.shutdownCalls).toBe(1)
+  })
+
+  it('retries a failed uncoded-claim sidecar teardown on the next planCreate (review F1)', async () => {
+    const firstRuntime = new FakeRuntime('ws://127.0.0.1:32141', 'thread-claim-teardown')
+    const secondRuntime = new FakeRuntime('ws://127.0.0.1:32142', 'thread-after-retry')
+    const runtimes = [firstRuntime, secondRuntime]
+    firstRuntime.shutdownError = new Error('transient candidate teardown failure')
+    const candidate = survivorCandidate('ownership-claim-teardown', 'thread-resume', 'ws://127.0.0.1:32141')
+    const reconciler = new FakeClaimSource([candidate])
+    const proxies: FakeProxy[] = []
+    // The attach succeeds, then the FIRST proxy's start fails uncoded; the claim is dropped and
+    // the candidate sidecar's teardown runs — and that teardown itself fails.
+    const planner = createPlanner(
+      () => runtimes.shift()! as any,
+      proxies,
+      reconciler,
+      [new Error('proxy start exploded')],
+    )
+
+    const rejection = await planner.planCreate({ resumeSessionId: 'thread-resume' })
+      .catch((caught: unknown) => caught)
+
+    expect(rejection).toMatchObject({ codexSidecarTeardownFailed: true })
+    expect((rejection as Error).message).toContain('transient candidate teardown failure')
+    expect(reconciler.dropCalls).toEqual(['ownership-claim-teardown'])
+    expect(firstRuntime.attachCalls).toEqual([{ ownershipId: 'ownership-claim-teardown', sessionId: 'thread-resume' }])
+    expect(firstRuntime.shutdownCalls).toBe(1)
+
+    firstRuntime.shutdownError = undefined
+
+    // Review F1 parity with the spawn path: the candidate entered activeSidecars BEFORE its
+    // teardown attempt, so the failed shutdown sits in failedSidecarShutdowns AND is reachable by
+    // retryFailedSidecarShutdownsBeforePlan — the next planCreate retries (and now succeeds at)
+    // the teardown before falling through to a fresh spawn.
+    const plan = await planner.planCreate({ resumeSessionId: 'thread-resume' })
+
+    expect(firstRuntime.shutdownCalls).toBe(2)
+    expect(reconciler.claimCalls).toEqual(['thread-resume', 'thread-resume'])
+    expect(plan.sessionId).toBe('thread-resume')
+    expect(secondRuntime.ensureReadyCalls).toBe(1)
+
+    await plan.sidecar.shutdown()
   })
 
   it('never consults the reconciler for fresh plans even when one is installed', async () => {

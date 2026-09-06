@@ -299,8 +299,13 @@ export class CodexLaunchPlanner {
         // Uncoded failure (e.g. proxy start or planner shutdown raced the attach): the candidate
         // is consumed-then-unowned. Drop the claim, run the existing catch path's ownership-gated
         // teardown of whatever the runtime built/attached, and rethrow the original error so
-        // planCodexLaunchWithRetry's fresh-spawn semantics stay unchanged.
+        // planCodexLaunchWithRetry's fresh-spawn semantics stay unchanged. The candidate enters
+        // activeSidecars BEFORE the teardown attempt (review F1): a failed shutdown lands in
+        // failedSidecarShutdowns, which retryFailedSidecarShutdownsBeforePlan only retries for
+        // sidecars that remain planner-owned — the spawn-path catch relies on the same ordering.
+        // A successful shutdown self-removes from both sets.
         reconciler.dropClaim(candidate.metadata.ownershipId)
+        this.activeSidecars.add(candidateSidecar)
         try {
           await candidateSidecar.shutdown()
         } catch (shutdownError) {

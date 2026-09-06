@@ -141,6 +141,11 @@ export class CodexSidecarReconciler {
    * - `identity`/`unreachable`: reap the verified-but-unusable survivor through the same
    *   conservative ownership-gated teardown the reaper uses, then drop the claim. A teardown
    *   refusal (self/indeterminate) keeps the file for the hourly reaper to retry from disk.
+   *
+   * Never throws (review F2): teardownOwnedProcessGroup contractually returns false on refusals
+   * but can still throw on internal errors. Propagating that throw would strand the candidate in
+   * inFlightClaims (permanently sweep-protected) and substitute the original attach error at the
+   * claim loop, so a thrown teardown is warn-logged and still ends with dropClaim bookkeeping.
    */
   async settleFailedClaim(
     ownership: HeldCodexSidecarOwnership,
@@ -150,11 +155,18 @@ export class CodexSidecarReconciler {
       this.inFlightClaims.delete(ownership.metadata.ownershipId)
       return
     }
-    const removed = await teardownOwnedProcessGroup(ownership, DEFAULT_TERMINATE_GRACE_MS)
-    if (!removed) {
+    try {
+      const removed = await teardownOwnedProcessGroup(ownership, DEFAULT_TERMINATE_GRACE_MS)
+      if (!removed) {
+        this.log.warn(
+          { ownershipId: ownership.metadata.ownershipId, code, metadataPath: ownership.metadataPath },
+          'Failed-claim survivor teardown was refused; the hourly reaper will retry the record from disk',
+        )
+      }
+    } catch (error) {
       this.log.warn(
-        { ownershipId: ownership.metadata.ownershipId, code, metadataPath: ownership.metadataPath },
-        'Failed-claim survivor teardown was refused; the hourly reaper will retry the record from disk',
+        { err: error, ownershipId: ownership.metadata.ownershipId, code, metadataPath: ownership.metadataPath },
+        'Failed-claim survivor teardown threw; dropping the claim and leaving the record for the hourly reaper',
       )
     }
     this.dropClaim(ownership.metadata.ownershipId)

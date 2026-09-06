@@ -683,6 +683,55 @@ describeWithLinuxProc('CodexSidecarReconciler settleFailedClaim', () => {
     // … but its claim was consumed: it never re-enters this session index.
     expect(reconciler.claimForSession('thr-not-writer')).toBeNull()
   })
+
+  it('never throws when the survivor teardown throws; the claim leaves held and in-flight (review F2)', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'settle-teardown-throws',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-teardown-throws',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const log = createReconcilerLog()
+    const reconciler = new CodexSidecarReconciler({ log })
+    expect(await reconciler.hold(ownership)).toBe('held')
+    const claimed = reconciler.claimForSession('thr-teardown-throws')
+    expect(claimed).not.toBeNull()
+
+    // Force the ownership-gated teardown to throw through the same process.kill seam the reaper
+    // tests use ("isolates process-group signaling failures…"): a throwing settle must still
+    // resolve and finish its bookkeeping instead of stranding the candidate in-flight.
+    const originalKill = process.kill
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((killPid: number, signal?: NodeJS.Signals | number) => {
+      if (killPid === -pid && signal === 'SIGTERM') {
+        const error = new Error('simulated SIGTERM failure') as NodeJS.ErrnoException
+        error.code = 'EPERM'
+        throw error
+      }
+      return originalKill(killPid, signal as any)
+    }) as typeof process.kill)
+
+    try {
+      await expect(reconciler.settleFailedClaim(claimed!, 'codex_survivor_unreachable')).resolves.toBeUndefined()
+    } finally {
+      killSpy.mockRestore()
+    }
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ ownershipId: 'settle-teardown-throws', code: 'codex_survivor_unreachable' }),
+      expect.any(String),
+    )
+    // dropClaim-equivalent bookkeeping ran despite the throw: the id is neither held nor in-flight,
+    // so sweepProtectionSet can never protect a stranded claim. The record stays on disk (the
+    // throw happened AT the signal), where the hourly reaper retries it.
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set())
+    expect(await isProcessGroupAlive(pid)).toBe(true)
+    await expect(fsp.stat(ownership.metadataPath)).resolves.toBeDefined()
+  })
 })
 
 describeWithLinuxProc('CodexSidecarReconciler sweep protection and grace', () => {
