@@ -1030,6 +1030,68 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootClaudeLane(page, 'freshclaude')
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneSessionId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(paneSessionId, 'the pane bridge session id must be known before the send').toBeTruthy()
+
+      // Change the permission mode BETWEEN sends through the pane's real
+      // settings gear: freshclaude's registry default is 'default', so picking
+      // 'acceptEdits' is a REAL change the next send must apply.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('acceptEdits')
+      await page.keyboard.press('Escape')
+      await expect
+        .poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.permissionMode ?? null)
+        .toBe('acceptEdits')
+
+      await sendComposerText(page, 'settings probe')
+
+      // Canonical machinery: the settings-bearing send routes through
+      // configure_for_send, which writes a `configure` frame and awaits the
+      // sidecar's ack BEFORE the user message frame — the stdin audit proves
+      // strict ordering (the knobs provably land before the turn starts).
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+        'configure frame carrying permissionMode:acceptEdits',
+      )
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'send' && f?.text === 'settings probe',
+        'send frame for "settings probe"',
+      )
+      const frames = readStdinFrames(lane.stdinLog)
+      const configureIdx = frames.findIndex(
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+      )
+      const sendIdx = frames.findIndex((f) => f?.type === 'send' && f?.text === 'settings probe')
+      expect(configureIdx, 'the per-send configure frame must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(sendIdx, 'the probe send must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(configureIdx, 'configure must land strictly BEFORE the send it applies to').toBeLessThan(sendIdx)
+
+      // The fake sidecar answers with sdk.configured carrying the applied
+      // settings (the ack configure_for_send awaits): the wire-row proves the
+      // ack as well as the ordering.
+      const ack = await waitForLogEntry(
+        lane.eventsLog,
+        (e) => e.kind === 'wire'
+          && e.frame?.type === 'sdk.configured'
+          && e.frame?.ok === true
+          && e.frame?.settings?.permissionMode === 'acceptEdits'
+          && e.frame?.sessionId === paneSessionId,
+        'sdk.configured wire row acknowledging permissionMode:acceptEdits',
+      )
+      expect(ack.frame.ok).toBe(true)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1660,6 +1722,67 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
         .toBe(true)
       sourceRestartWs.close()
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // Turn 1 rides the pane's untouched defaults.
+      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
+
+      // Change model + effort BETWEEN sends through the real settings UI:
+      // gear popover → Model row ("Change…") → the two-column model dialog →
+      // pick GPT-5.4 Flash, stage its `low` thinking level, commit.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      const popover = page.getByRole('dialog', { name: 'Agent settings' })
+      await expect(popover).toBeVisible({ timeout: 10_000 })
+      await popover.getByRole('button', { name: /Change/ }).click()
+      const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await expect(dialog).toBeVisible({ timeout: 10_000 })
+      await dialog.getByRole('option', { name: 'GPT-5.4 Flash' }).click()
+      const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+      await expect(levelsList).toBeVisible()
+      await levelsList.getByRole('option', { name: 'low', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }).click()
+      await expect(dialog).toHaveCount(0)
+      // The commit leaves the settings popover open behind the dialog; close it.
+      await page.keyboard.press('Escape')
+      await expect(popover).toHaveCount(0, { timeout: 10_000 })
+      await expect
+        .poll(async () => {
+          const content = (await paneLeaf(lane.harness, lane.tabId))?.content
+          return content ? `${content.model ?? ''}|${content.effort ?? ''}` : ''
+        })
+        .toBe('gpt-5.4-flash|low')
+
+      // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
+      // msg.settings over the session baseline before turn/start).
+      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+
+      // Ground truth: the fake's recorded-turns file under the lane's isolated
+      // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
+      // turn carries its captured turn/start params additively under `start` —
+      // turn 2 carries the per-send selection while turn 1 kept the defaults
+      // (gpt-5.5 / the default 'max' effort, wire-mapped 'xhigh' by
+      // to_codex_reasoning_effort).
+      const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
+      await expect(async () => {
+        const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
+        expect(turns, 'exactly the two recorded turns').toHaveLength(2)
+        expect(turns[1]?.start?.model).toBe('gpt-5.4-flash')
+        expect(turns[1]?.start?.effort).toBe('low')
+        expect(turns[0]?.start?.model).toBe('gpt-5.5')
+        expect(turns[0]?.start?.effort).toBe('xhigh')
+        expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
+        expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)
+      }).toPass({ timeout: 15_000 })
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

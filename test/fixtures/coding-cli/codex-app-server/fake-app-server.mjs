@@ -102,7 +102,7 @@ function persistRecordedTurns(threadId, turns) {
   fs.writeFileSync(file, JSON.stringify(turns))
 }
 
-function makeRecordedTurn(turnId, promptText) {
+function makeRecordedTurn(turnId, promptText, startParams) {
   const nowSec = Math.floor(Date.now() / 1000)
   return {
     id: turnId,
@@ -116,6 +116,15 @@ function makeRecordedTurn(turnId, promptText) {
     startedAt: nowSec,
     completedAt: nowSec + 1,
     durationMs: 1000,
+    // kata z7j7 ADDITIVE: the turn/start params this turn was launched with —
+    // lets specs assert that per-send settings changed EXACTLY one turn
+    // (model/effort/sandbox/permission flow through).
+    start: startParams ? {
+      model: startParams.model,
+      effort: startParams.effort,
+      sandboxPolicy: startParams.sandboxPolicy,
+      approvalPolicy: startParams.approvalPolicy,
+    } : undefined,
   }
 }
 
@@ -311,7 +320,7 @@ function successResult(method, params) {
       const promptText = Array.isArray(params?.input)
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
-      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText)
+      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
       turns.push(turn)
       recordedTurnsByThread.set(threadId, turns)
       persistRecordedTurns(threadId, turns)
