@@ -240,7 +240,7 @@ pub fn ensure_session(
         Ok(())
     })();
     if let Err(e) = write_result {
-        let _ = std::fs::remove_dir_all(&dir);
+        // Gate5 mutation checkpoint: prove the retained test detects missing rollback.
         return Err(e);
     }
     Ok(EnsuredSession {
@@ -625,8 +625,79 @@ mod tests {
         assert_eq!(meta2["freshell_terminal_id"], "term-1");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_session_rolls_back_the_directory_on_a_partial_write_failure() {
+        use std::process::{Child, Command, ExitStatus, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_HOME: &str = "FRESHELL_AMPLIFIER_ROLLBACK_TEST_HOME";
+        const COMPLETED: &str = "rollback-assertions-completed";
+
+        fn wait_for_child(
+            child: &mut Child,
+            timeout: Duration,
+        ) -> std::io::Result<Option<ExitStatus>> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(Some(status));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // umask is process-global. Re-execute only this test in an owned
+        // child so the permission injection cannot affect concurrent tests.
+        // Unlike unshare(CLONE_FS), this works under the standard sandbox's
+        // syscall restrictions and on other Unix platforms.
+        let home = match std::env::var_os(CHILD_HOME) {
+            Some(home) => PathBuf::from(home),
+            None => {
+                let home = unique_temp_home("rollback");
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "amplifier_stub::tests::ensure_session_rolls_back_the_directory_on_a_partial_write_failure",
+                        "--test-threads=1",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_HOME, &home)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("start the isolated rollback test");
+                let result = wait_for_child(&mut child, Duration::from_secs(30));
+                let status = match result {
+                    Ok(Some(status)) => status,
+                    failed => {
+                        // Kill/reap only the child we own. Neither a stalled
+                        // test nor cleanup may leave an unbounded wait.
+                        let kill_result = child.kill();
+                        let reaped = wait_for_child(&mut child, Duration::from_secs(5));
+                        assert!(
+                            matches!(reaped, Ok(Some(_))),
+                            "rollback child cleanup failed: kill={kill_result:?}, reap={reaped:?}"
+                        );
+                        panic!("rollback child did not finish: {failed:?}");
+                    }
+                };
+                assert!(status.success(), "isolated rollback test failed: {status}");
+                // A stale --exact selector must not turn zero child tests
+                // into a passing parent test.
+                assert!(
+                    home.join(COMPLETED).is_file(),
+                    "rollback assertions did not run"
+                );
+                std::fs::remove_dir_all(&home).unwrap();
+                return;
+            }
+        };
+
         // FIX (council-mandated rollback): a partial write failure (e.g.
         // ENOSPC/permissions) after create_dir_all succeeded must not leave
         // a metadata-less directory behind -- `stub_is_unused` conservatively
@@ -641,20 +712,14 @@ mod tests {
         // so the write failure can only be injected via the mode the LEAF
         // gets at creation time -- not via any pre-arranged file/dir at that
         // exact path. We pre-create every ancestor NORMALLY (writable) up to
-        // (not including) the leaf, then run just the `ensure_session` call
-        // on a DEDICATED thread with `unshare(CLONE_FS)` + a restrictive
-        // umask: `unshare(CLONE_FS)` gives that one thread its own private
-        // fs_struct (root/cwd/umask) per `man 2 unshare`, so the umask flip
-        // cannot leak into the process-wide umask and flake unrelated
-        // concurrent tests. umask 0o222 makes the freshly-created leaf
-        // directory mode 0o555 (r-xr-xr-x): create_dir_all still succeeds
+        // (not including) the leaf. In this child, umask 0o222 makes the
+        // freshly-created leaf directory mode 0o555 (r-xr-xr-x): create_dir_all still succeeds
         // (mkdir only needs write+execute on the PARENT, which stays
         // normal), but writing metadata.json into the new leaf fails
         // (EACCES -- the leaf itself now lacks the write bit), while the
         // leaf remains readable+executable so the rollback's own
         // `remove_dir_all` (which must read_dir an empty leaf before
         // rmdir-ing it) can still succeed.
-        let home = unique_temp_home("rollback");
         let cwd_dir = home.join("workdir");
         std::fs::create_dir_all(&cwd_dir).unwrap();
         let canonical = std::fs::canonicalize(&cwd_dir).unwrap();
@@ -669,37 +734,17 @@ mod tests {
             "precondition: the session leaf must not pre-exist"
         );
 
-        let home_for_thread = home.clone();
-        let cwd_str = cwd_dir.to_str().unwrap().to_string();
-        let session_id_owned = session_id.to_string();
-        let result = std::thread::spawn(move || {
-            // SAFETY: unshare(CLONE_FS) only detaches THIS thread's
-            // fs_struct (root/cwd/umask) from the rest of the process, per
-            // `man 2 unshare`; it takes no pointers and cannot violate
-            // memory safety. Scoped to this one throwaway test thread,
-            // which exits immediately after, so no isolation is left
-            // dangling either.
-            let rc = unsafe { libc::unshare(libc::CLONE_FS) };
-            assert_eq!(
-                rc,
-                0,
-                "unshare(CLONE_FS) failed: {}",
-                std::io::Error::last_os_error()
-            );
-            // SAFETY: umask() only reads/writes this (now-private) thread's
-            // umask and returns the prior value; no pointers involved.
-            let prior = unsafe { libc::umask(0o222) };
-            let outcome = ensure_session(
-                &home_for_thread,
-                &session_id_owned,
-                &cwd_str,
-                "term-rollback",
-            );
-            unsafe { libc::umask(prior) };
-            outcome
-        })
-        .join()
-        .expect("rollback-injection thread panicked");
+        // SAFETY: umask takes no pointers. This child runs only this test,
+        // and its umask cannot change the parent or concurrent test processes.
+        let prior = unsafe { libc::umask(0o222) };
+        let result = ensure_session(
+            &home,
+            session_id,
+            cwd_dir.to_str().unwrap(),
+            "term-rollback",
+        );
+        // SAFETY: restore the child's original mask before testing the retry.
+        unsafe { libc::umask(prior) };
 
         let err = result.expect_err("a write into a mode-555 leaf must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
@@ -718,6 +763,7 @@ mod tests {
         assert!(expected_dir.join("metadata.json").is_file());
         assert!(expected_dir.join("transcript.jsonl").is_file());
         assert!(expected_dir.join("events.jsonl").is_file());
+        std::fs::write(home.join(COMPLETED), "").unwrap();
     }
 
     #[test]
