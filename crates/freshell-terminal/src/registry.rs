@@ -42,7 +42,7 @@
 //! this crate keeps its no-tokio boundary (`freshell-ws` backs the sink with a tokio
 //! mpsc sender feeding the socket).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -572,6 +572,66 @@ fn session_ref_key(locator: &SessionLocator) -> String {
     format!("{}\u{0}{}", locator.provider, locator.session_id)
 }
 
+/// Cap on [`TerminalRegistry::restart_retiring_terminals`]. Kill-path restarts
+/// emit no CrashEvent, so their tombstones are abandoned by design — nothing
+/// ever calls [`TerminalRegistry::consume_restart_retiring`] for them. The cap
+/// bounds that abandonment; well under one entry per plausible restart storm
+/// in a boot.
+const MAX_RESTART_RETIRING_TOMBSTONES: usize = 4_096;
+
+/// Boot-scoped restart-retirement tombstones with FIFO bounding: `set`
+/// answers membership, `order` tracks insertion order so an insert past
+/// [`MAX_RESTART_RETIRING_TOMBSTONES`] evicts the OLDEST entry. Consume-time
+/// removal is a positional [`VecDeque::remove`] — O(n) but capped at 4,096
+/// entries, chosen deliberately over `swap_remove_*` (and over a rebuild) so
+/// eviction order survives any pattern of out-of-order consumes
+/// (implementer's-choice note, plan task 10).
+#[derive(Debug, Default)]
+struct RestartRetiringSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RestartRetiringSet {
+    /// Insert a tombstone, evicting the OLDEST one (loudly) when the cap is
+    /// exceeded. A re-marked id keeps its original position — no later event
+    /// for that id could have superseded the queued CrashEvent it fences.
+    fn insert(&mut self, terminal_id: &str) {
+        if !self.set.insert(terminal_id.to_string()) {
+            return;
+        }
+        self.order.push_back(terminal_id.to_string());
+        while self.order.len() > MAX_RESTART_RETIRING_TOMBSTONES {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if self.set.remove(&evicted) {
+                tracing::warn!(
+                    terminal_id = %evicted,
+                    cap = MAX_RESTART_RETIRING_TOMBSTONES,
+                    "terminal.restart_retiring_tombstone_evicted"
+                );
+            }
+        }
+    }
+
+    /// Read-only membership probe ([`TerminalRegistry::is_restart_retiring`]).
+    fn contains(&self, terminal_id: &str) -> bool {
+        self.set.contains(terminal_id)
+    }
+
+    /// Remove a tombstone; `true` iff it was present (consume-once).
+    fn remove(&mut self, terminal_id: &str) -> bool {
+        if !self.set.remove(terminal_id) {
+            return false;
+        }
+        if let Some(pos) = self.order.iter().position(|id| id == terminal_id) {
+            self.order.remove(pos);
+        }
+        true
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -644,8 +704,18 @@ pub struct TerminalRegistry {
     /// registry row: a natural-exit CrashEvent may already be queued when the
     /// restart begins and wake after `kill()` removes the predecessor. Terminal
     /// ids are never reused within a boot, so retaining the id is the only
-    /// fail-closed answer; the set resets with the process.
-    restart_retiring_terminals: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// fail-closed answer; the set resets with the process. A tombstone is
+    /// CONSUMED at the first suppression point that fences its queued
+    /// CrashEvent (the exit hook's expected-exit branch in `freshell-ws`,
+    /// `auto_resume::resumable_session_ref`, `auto_resume::pre_respawn_guard`)
+    /// via [`Self::consume_restart_retiring`]; tombstones whose restart never
+    /// queues a consumable CrashEvent (the kill path emits none) are abandoned
+    /// and FIFO-bounded at [`MAX_RESTART_RETIRING_TOMBSTONES`]. Safety:
+    /// because ids are never reused within a boot, and post-commit stale
+    /// events are separately fenced by `pre_respawn_guard`'s
+    /// `session_owned_live` check, consuming at the first suppression point
+    /// cannot un-fence a later event for the same id.
+    restart_retiring_terminals: Arc<Mutex<RestartRetiringSet>>,
 }
 
 impl Default for TerminalRegistry {
@@ -786,7 +856,7 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
-            restart_retiring_terminals: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            restart_retiring_terminals: Arc::new(Mutex::new(RestartRetiringSet::default())),
         }
     }
 
@@ -1729,6 +1799,11 @@ impl TerminalRegistry {
     /// Returns `false` only for an unknown terminal. The row may already have
     /// reached `Exited` in a natural-exit race; it is still fenced because its
     /// CrashEvent may be waiting in the auto-resume queue.
+    ///
+    /// If the table is at [`MAX_RESTART_RETIRING_TOMBSTONES`] the OLDEST
+    /// tombstone is evicted (FIFO) with a
+    /// `terminal.restart_retiring_tombstone_evicted` warn — the
+    /// abandoned-entry bound for kill-path restarts that emit no CrashEvent.
     pub fn mark_restart_retiring(&self, terminal_id: &str) -> bool {
         let exists = self
             .inner
@@ -1742,17 +1817,34 @@ impl TerminalRegistry {
         self.restart_retiring_terminals
             .lock()
             .expect("restart-retiring terminals lock")
-            .insert(terminal_id.to_string());
+            .insert(terminal_id);
         true
     }
 
     /// Whether auto-resume and the PTY exit hook must treat `terminal_id` as
     /// owned by an explicit restart transaction rather than a natural crash.
+    /// Read-only probe — tests, diagnostics, and multi-decision sites that
+    /// must not consume; the suppression points use
+    /// [`Self::consume_restart_retiring`].
     pub fn is_restart_retiring(&self, terminal_id: &str) -> bool {
         self.restart_retiring_terminals
             .lock()
             .expect("restart-retiring terminals lock")
             .contains(terminal_id)
+    }
+
+    /// Consume the tombstone at a suppression point (the exit hook's
+    /// expected-exit branch, `auto_resume::resumable_session_ref`, and
+    /// `auto_resume::pre_respawn_guard`): the queued CrashEvent the tombstone
+    /// exists to fence has been fenced, so it must not linger for the process
+    /// lifetime. Returns `true` iff the tombstone was present — consume-once;
+    /// a second consume is an idempotent `false`, so whichever suppression
+    /// point wins the race owns the removal.
+    pub fn consume_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .remove(terminal_id)
     }
 
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
@@ -3579,6 +3671,91 @@ mod tests {
              before restart cannot auto-resume after the backoff"
         );
         assert!(!reg.mark_restart_retiring("T-missing"));
+    }
+
+    #[test]
+    fn consume_restart_retiring_removes_the_tombstone_once() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-1", "S-1");
+        assert!(reg.mark_restart_retiring("T-1"));
+        assert!(reg.is_restart_retiring("T-1"));
+
+        assert!(
+            reg.consume_restart_retiring("T-1"),
+            "the first consume removes the tombstone and reports the removal"
+        );
+        assert!(
+            !reg.is_restart_retiring("T-1"),
+            "a consumed tombstone no longer fences CrashEvents"
+        );
+        assert!(
+            !reg.consume_restart_retiring("T-1"),
+            "consume is idempotent: the second consume is a no-op false"
+        );
+        assert!(
+            !reg.consume_restart_retiring("T-never-marked"),
+            "consuming an id that was never marked is a no-op false"
+        );
+    }
+
+    #[test]
+    fn abandoned_restart_retiring_tombstones_are_fifo_bounded() {
+        // Kill-path restarts emit no CrashEvent, so nothing ever consumes
+        // their tombstones -- the set must not grow for the whole process
+        // lifetime. Past the cap the OLDEST entry is evicted (FIFO), loudly.
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let newest = format!("T-{MAX_RESTART_RETIRING_TOMBSTONES}");
+        for i in 0..=MAX_RESTART_RETIRING_TOMBSTONES {
+            let id = format!("T-{i}");
+            reg.insert_headless(&id, &format!("S-{i}"));
+            assert!(reg.mark_restart_retiring(&id));
+        }
+
+        {
+            let tombstones = reg.restart_retiring_terminals.lock().unwrap();
+            assert_eq!(
+                tombstones.set.len(),
+                MAX_RESTART_RETIRING_TOMBSTONES,
+                "the set is clamped to the cap"
+            );
+            assert_eq!(
+                tombstones.order.len(),
+                MAX_RESTART_RETIRING_TOMBSTONES,
+                "the insertion-order queue is clamped to the same cap"
+            );
+            assert_eq!(
+                tombstones.order.front().map(String::as_str),
+                Some("T-1"),
+                "the oldest surviving entry sits at the queue front (FIFO)"
+            );
+            assert_eq!(
+                tombstones.order.back().map(String::as_str),
+                Some(newest.as_str()),
+                "the newest entry sits at the queue back"
+            );
+        }
+        assert!(
+            !reg.is_restart_retiring("T-0"),
+            "the oldest tombstone is evicted once the cap is exceeded"
+        );
+        assert!(reg.is_restart_retiring("T-1"));
+        assert!(reg.is_restart_retiring(&newest));
+
+        let captured = events.lock().unwrap();
+        let evictions: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message == "terminal.restart_retiring_tombstone_evicted")
+            .collect();
+        assert_eq!(
+            evictions.len(),
+            1,
+            "exactly one entry crossed the cap in this test, and the eviction is loud"
+        );
+        assert_eq!(
+            evictions[0].fields.get("terminal_id").map(String::as_str),
+            Some("T-0")
+        );
     }
 
     #[test]

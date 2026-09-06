@@ -2398,6 +2398,14 @@ pub(crate) fn build_pty_exit_hook(
                 lifetime_ms,
             });
         } else if finished {
+            // The expected-exit suppression just fenced this terminal's one
+            // queued CrashEvent — consume the tombstone so it cannot linger
+            // for the process lifetime. Idempotent against the auto-resume
+            // consume sites (`resumable_session_ref` /
+            // `pre_respawn_guard`): whichever suppression point fires first
+            // owns the removal, and post-commit stale events are separately
+            // fenced by `session_owned_live`.
+            deps.registry.consume_restart_retiring(&terminal_id);
             tracing::info!(
                 terminal_id = %terminal_id,
                 exit_code,
@@ -6915,6 +6923,11 @@ mod cli_create_helper_tests {
         assert!(
             auto_resume_rx.try_recv().is_err(),
             "a proxy-triggered expected exit during restart must not become a CrashEvent"
+        );
+        assert!(
+            !registry.is_restart_retiring("T-restarting"),
+            "the expected-exit suppression must consume the tombstone so it \
+             cannot linger for the process lifetime"
         );
 
         let unrelated_hook = build_pty_exit_hook(
