@@ -43,6 +43,7 @@ import {
   readMeminfo,
   readNetDev,
   readPidCount,
+  readPidsConstraint,
   readPidsLimit,
   readPsi,
   readSelfFdCount,
@@ -628,8 +629,14 @@ export class HostStatsService {
     const procRoot = this.procRoot ?? '/proc'
     const fdsUsed = readSelfFdCount(procRoot)
     const fdsMax = readSelfLimitsFdsMax(procRoot)
-    const pidsUsed = readPidCount(procRoot)
-    const pidsMax = readPidsLimit(procRoot, this.cgroupRoot)
+    // The binding pids constraint (leaf→root chain, highest-utilization node)
+    // yields a coherent same-node pair. The legacy fallback (system-wide
+    // count paired with a leaf/threads-max limit) is incoherent when an
+    // ancestor slice carries the real TasksMax — the WSL/systemd aggregate
+    // shape that motivated the constraint walk.
+    const pidsConstraint = readPidsConstraint(procRoot, this.cgroupRoot)
+    const pidsUsed = pidsConstraint ? pidsConstraint.current : readPidCount(procRoot)
+    const pidsMax = pidsConstraint ? pidsConstraint.max : readPidsLimit(procRoot, this.cgroupRoot)
     const tcp = readTcpStateCounts(procRoot)
     const ports = readEphemeralPortRange(procRoot)
     const timeWait = tcp ? tcp.timeWait : null

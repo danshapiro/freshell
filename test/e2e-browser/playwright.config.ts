@@ -171,7 +171,7 @@ export const MATRIX_SPECS = [
   // docs/development/rename-scope-contract.md); legacy remains the true
   // parity control. See title-sync-convergence.spec.ts.
   /title-sync-convergence\.spec\.ts$/,
-  // HOST-STATS (host-pressure-pane plan, Task 10) — Host Stats pane smoke:
+  // HOST-STATS (host-pressure-pane plan, Task 10) — System Status pane smoke:
   // picker create, verdict strip/CPU tile, refresh interaction (Collecting
   // state + age label), Disks fallback em-dash contract, tab-switch liveness,
   // reload restore. Assertions are backend-agnostic (the Rust lane renders

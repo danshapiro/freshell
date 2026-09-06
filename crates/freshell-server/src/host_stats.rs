@@ -664,8 +664,19 @@ impl CollectorCtx {
         let proc_root = &self.cfg.proc_root;
         let fds_used = readers::read_self_fd_count(proc_root);
         let fds_max = readers::read_self_limits_fds_max(proc_root);
-        let pids_used = readers::read_pid_count(proc_root);
-        let pids_max = readers::read_pids_limit(proc_root, &self.cfg.cgroup_root());
+        // The binding pids constraint (leaf->root chain, highest-utilization
+        // node) yields a coherent same-node pair. The legacy fallback
+        // (system-wide count paired with a leaf/threads-max limit) is
+        // incoherent when an ancestor slice carries the real TasksMax —
+        // the WSL/systemd aggregate shape that motivated the constraint walk.
+        let pids_constraint = readers::read_pids_constraint(proc_root, &self.cfg.cgroup_root());
+        let (pids_used, pids_max) = match pids_constraint {
+            Some(constraint) => (Some(constraint.current), Some(constraint.max)),
+            None => (
+                readers::read_pid_count(proc_root),
+                readers::read_pids_limit(proc_root, &self.cfg.cgroup_root()),
+            ),
+        };
         let time_wait = readers::read_tcp_state_counts(proc_root).map(|t| t.time_wait);
         let ephemeral_ports =
             readers::read_ephemeral_port_range(proc_root).map(|r| r.end - r.start + 1);
@@ -1642,6 +1653,184 @@ mod tests {
             readers::read_pids_limit(&pid_max_only, &cgroup_fixture()),
             None
         );
+    }
+
+    /// Write `<root>/<rel>` creating parent dirs; the pids-constraint tmp
+    /// overlays below build their trees with it (Node suite parity:
+    /// test/unit/server/host-stats/readers.test.ts beforeAll writeFile).
+    fn write_rel(root: &Path, rel: &str, content: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn host_stats_pids_constraint_binds_leaf_pair_and_chain_walk() {
+        // Committed v2 tree: the leaf is the only constrained node.
+        assert_eq!(
+            readers::read_pids_constraint(&procmini_fixture(), &cgroup_fixture()),
+            Some(readers::PidsConstraint {
+                current: 42,
+                max: 10854
+            })
+        );
+        // Chain walk (WSL/systemd aggregate shape): leaf 'max', the real
+        // TasksMax lives on an ANCESTOR slice.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(
+            &proc_root,
+            "self/cgroup",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service\n",
+        );
+        write_rel(
+            &cgroup_root,
+            "user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service/pids.max",
+            "max\n",
+        );
+        write_rel(&cgroup_root, "user.slice/user-1000.slice/pids.max", "678924\n");
+        write_rel(
+            &cgroup_root,
+            "user.slice/user-1000.slice/pids.current",
+            "16240\n",
+        );
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 16240,
+                max: 678924
+            })
+        );
+        // A process at the cgroup2 root has no leaf -> None (no fs-root reads).
+        let tmp2 = tempfile::tempdir().unwrap();
+        write_rel(&tmp2.path().join("proc"), "self/cgroup", "0::/\n");
+        assert_eq!(
+            readers::read_pids_constraint(&tmp2.path().join("proc"), &cgroup_fixture()),
+            None
+        );
+        // No cgroup data at all -> None (never a panic).
+        assert_eq!(
+            readers::read_pids_constraint(&missing(), &cgroup_fixture()),
+            None
+        );
+    }
+
+    #[test]
+    fn host_stats_pids_constraint_binds_highest_utilization_node() {
+        // Leaf 90/100 (0.9) beats ancestor 500/1000 (0.5).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "0::/slices/a.service\n");
+        write_rel(&cgroup_root, "slices/a.service/pids.max", "100\n");
+        write_rel(&cgroup_root, "slices/a.service/pids.current", "90\n");
+        write_rel(&cgroup_root, "slices/pids.max", "1000\n");
+        write_rel(&cgroup_root, "slices/pids.current", "500\n");
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint { current: 90, max: 100 })
+        );
+
+        // Ancestor 600/1000 (0.6) beats leaf 400/1000 (0.4).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "0::/slices/b.service\n");
+        write_rel(&cgroup_root, "slices/b.service/pids.max", "1000\n");
+        write_rel(&cgroup_root, "slices/b.service/pids.current", "400\n");
+        write_rel(&cgroup_root, "slices/pids.max", "1000\n");
+        write_rel(&cgroup_root, "slices/pids.current", "600\n");
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 600,
+                max: 1000
+            })
+        );
+
+        // No constrained node anywhere (leaf 'max', no ancestor files) -> None.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "0::/slices/c.service\n");
+        write_rel(&cgroup_root, "slices/c.service/pids.max", "max\n");
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            None
+        );
+
+        // A finite pids.max without pids.current cannot form a same-node pair.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "0::/slices/d.service\n");
+        write_rel(&cgroup_root, "slices/d.service/pids.max", "max\n");
+        write_rel(&cgroup_root, "slices/pids.max", "500\n");
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            None
+        );
+    }
+
+    #[test]
+    fn host_stats_pids_constraint_v1_chain() {
+        // v1 pids controller: leaf 50/777 (0.06) loses to ancestor 900/1000 (0.9).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "3:pids:/limited.slice/svc.service\n");
+        write_rel(&cgroup_root, "pids/limited.slice/svc.service/pids.max", "777\n");
+        write_rel(
+            &cgroup_root,
+            "pids/limited.slice/svc.service/pids.current",
+            "50\n",
+        );
+        write_rel(&cgroup_root, "pids/limited.slice/pids.max", "1000\n");
+        write_rel(&cgroup_root, "pids/limited.slice/pids.current", "900\n");
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 900,
+                max: 1000
+            })
+        );
+    }
+
+    #[test]
+    fn host_stats_limits_section_prefers_binding_pids_pair() {
+        // Service wiring: a resolved constraint pair replaces the system-wide
+        // count + leaf limit in the limits section (the legacy pair is
+        // incoherent when an ancestor slice carries the real TasksMax).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let sys_root = tmp.path().join("sys");
+        write_rel(
+            &proc_root,
+            "self/cgroup",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service\n",
+        );
+        write_rel(
+            &sys_root,
+            "fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service/pids.max",
+            "max\n",
+        );
+        write_rel(
+            &sys_root,
+            "fs/cgroup/user.slice/user-1000.slice/pids.max",
+            "678924\n",
+        );
+        write_rel(
+            &sys_root,
+            "fs/cgroup/user.slice/user-1000.slice/pids.current",
+            "16240\n",
+        );
+        let interest = HostStatsInterestRegistry::default();
+        let collector = test_collector(proc_root, sys_root, &interest);
+        let limits = collector.ctx.read_limits_section();
+        assert!(limits.available);
+        assert_eq!(limits.pids_used, Some(16240));
+        assert_eq!(limits.pids_max, Some(678924));
     }
 
     #[test]

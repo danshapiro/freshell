@@ -514,7 +514,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
         onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
         onRefresh={handleRefresh}
-        onDoubleClickTitle={() => startRename(node.id, paneTitle)}
+        onDoubleClickTitle={
+          node.content.kind === 'host-stats' ? undefined : () => startRename(node.id, paneTitle)
+        }
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
       </Pane>
@@ -865,7 +867,7 @@ function renderContent(
 
   if (content.kind === 'host-stats') {
     return (
-      <ErrorBoundary key={paneId} label="Host Stats">
+      <ErrorBoundary key={paneId} label="System Status">
         <HostStatsPane tabId={tabId} paneId={paneId} />
       </ErrorBoundary>
     )

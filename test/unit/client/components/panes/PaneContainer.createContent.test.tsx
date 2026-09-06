@@ -562,7 +562,7 @@ describe('createContentForType with ext: prefix', () => {
       </Provider>,
     )
 
-    const hostStatsButton = document.querySelector('[aria-label="Host Stats"]') as HTMLElement
+    const hostStatsButton = document.querySelector('[aria-label="System Status"]') as HTMLElement
     expect(hostStatsButton).not.toBeNull()
     fireEvent.click(hostStatsButton)
     fireEvent.transitionEnd(getPickerContainer())
@@ -588,6 +588,6 @@ describe('createContentForType with ext: prefix', () => {
       </Provider>,
     )
 
-    expect(document.querySelector('[aria-label="Host Stats"]')).toBeNull()
+    expect(document.querySelector('[aria-label="System Status"]')).toBeNull()
   })
 })

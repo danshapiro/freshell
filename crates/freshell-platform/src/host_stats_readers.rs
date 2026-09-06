@@ -694,6 +694,73 @@ pub fn read_pids_limit(proc_root: &Path, cgroup_root: &Path) -> Option<u64> {
     read_number_file(&proc_root.join("sys").join("kernel").join("threads-max"))
 }
 
+/// A same-node cgroup pids reading: the constraint a fork would hit first
+/// (Node `PidsConstraint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidsConstraint {
+    pub current: u64,
+    pub max: u64,
+}
+
+/// The BINDING pids constraint (Node `readPidsConstraint`): walk THIS
+/// process's cgroup chain from the leaf toward the root and return the
+/// `{current, max}` pair of the node whose finite `pids.max` has the HIGHEST
+/// utilization (`current`/`max`) — the limit a fork would actually hit first.
+/// This is the WSL/systemd aggregate shape: the leaf is often 'max' while an
+/// ANCESTOR slice (e.g. `user-1000.slice`) carries the real TasksMax, which
+/// the leaf-only [`read_pids_limit`] never sees. A node qualifies only when
+/// BOTH `pids.max` (finite, >0 — matching [`read_pids_limit`]'s convention)
+/// and `pids.current` read, so the returned pair is always a consistent
+/// same-node reading. No qualified node -> `None` (callers fall back to the
+/// system-wide `read_pid_count`/`read_pids_limit` pair). Deepest node wins
+/// ties (deterministic).
+///
+/// The cgroup fs root has NO limit files by design; [`resolve_cgroup_leaf`]
+/// already yields `None` for a process sitting at the cgroup2 root.
+///
+/// NOTE (frozen contract): parameter order here is (proc_root, cgroup_root)
+/// — the opposite of [`read_cgroup_memory`]. Callers: read the signatures,
+/// do not assume.
+pub fn read_pids_constraint(proc_root: &Path, cgroup_root: &Path) -> Option<PidsConstraint> {
+    let leaf = resolve_cgroup_leaf(proc_root, "pids")?;
+    // Deepest-first chain; the fs-root segment is never read (no limit files).
+    let segments: Vec<&str> = match &leaf {
+        CgroupLeaf::V2(path) | CgroupLeaf::V1(path) => {
+            path.split('/').filter(|segment| !segment.is_empty()).collect()
+        }
+    };
+    let mut best: Option<PidsConstraint> = None;
+    let mut best_ratio = -1.0_f64;
+    for depth in (1..=segments.len()).rev() {
+        let node_path = segments[..depth].join("/");
+        let dir = match &leaf {
+            CgroupLeaf::V2(_) => cgroup_root.join(&node_path),
+            CgroupLeaf::V1(_) => cgroup_root.join("pids").join(&node_path),
+        };
+        let Some(max_text) = safe_read(&dir.join("pids.max")) else {
+            continue;
+        };
+        let Some(max) = parse_cgroup_limit(&max_text) else {
+            continue; // 'max'/garbage: unlimited, not binding
+        };
+        if max == 0 {
+            continue; // matches read_pids_limit's limit > 0 convention
+        }
+        let Some(current_text) = safe_read(&dir.join("pids.current")) else {
+            continue; // no readable same-node pair
+        };
+        let Ok(current) = current_text.trim().parse::<u64>() else {
+            continue;
+        };
+        let ratio = current as f64 / max as f64;
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            best = Some(PidsConstraint { current, max });
+        }
+    }
+    best
+}
+
 /// `Max open files` SOFT limit from `/proc/self/limits` ('unlimited' ->
 /// `None`) (Node `readSelfLimitsFdsMax`).
 pub fn read_self_limits_fds_max(proc_root: &Path) -> Option<u64> {

@@ -52,7 +52,7 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
   }
 
   if (content.kind === 'host-stats') {
-    return 'Host Stats'
+    return 'System Status'
   }
 
   // Terminal content — coding-agent (non-shell) terminals name by working directory

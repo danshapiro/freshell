@@ -9,6 +9,16 @@ const mockExtensions: ClientExtensionEntry[] = [
 ]
 
 describe('deriveTabName', () => {
+  it('returns System Status for a host-stats pane', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: { kind: 'host-stats' },
+    }
+
+    expect(deriveTabName(layout)).toBe('System Status')
+  })
+
   it('returns provider label for codex terminal', () => {
     const layout: PaneNode = {
       type: 'leaf',

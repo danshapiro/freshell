@@ -224,7 +224,7 @@ export function paneKindLabel(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'editor') return 'Editor'
   if (kind === 'fresh-agent' || kind === 'claude-chat') return 'Agent'
   if (kind === 'extension') return 'Extension'
-  if (kind === 'host-stats') return 'Host Stats'
+  if (kind === 'host-stats') return 'System Status'
   return kind
 }
 

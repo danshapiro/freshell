@@ -38,6 +38,7 @@ vi.mock('../../../../server/host-stats/readers.js', () => {
     readSelfLimitsFdsMax: vi.fn(),
     readPidCount: vi.fn(),
     readPidsLimit: vi.fn(),
+    readPidsConstraint: vi.fn(),
     readCpuFreqMHz: vi.fn(),
     readMachineInfo: vi.fn(),
     readSelfInotifyStats: vi.fn(),
@@ -151,6 +152,7 @@ const SLOW_READERS = [
   'readSelfLimitsFdsMax',
   'readPidCount',
   'readPidsLimit',
+  'readPidsConstraint',
   'readCpuFreqMHz',
 ] as const
 
@@ -186,6 +188,7 @@ beforeEach(() => {
   vi.mocked(readersMock.readSelfLimitsFdsMax).mockReturnValue(1_048_576)
   vi.mocked(readersMock.readPidCount).mockReturnValue(900)
   vi.mocked(readersMock.readPidsLimit).mockReturnValue(4_194_304)
+  vi.mocked(readersMock.readPidsConstraint).mockReturnValue(null)
   vi.mocked(readersMock.readCpuFreqMHz).mockReturnValue(3400)
   vi.mocked(readersMock.readSelfInotifyStats).mockReturnValue({ instances: 3, watches: 420 })
   vi.mocked(readersMock.readInotifyLimits).mockReturnValue({ maxUserWatches: 1_048_576, maxUserInstances: 128 })
@@ -300,6 +303,7 @@ describe('start/stop (contract points 1, 5)', () => {
     expect(readerFn('readDiskStats')).toHaveBeenCalledWith(PROC)
     expect(readerFn('readCpuFreqMHz')).toHaveBeenCalledWith(SYS)
     expect(readerFn('readPidsLimit')).toHaveBeenCalledWith(PROC, CGROUP)
+    expect(readerFn('readPidsConstraint')).toHaveBeenCalledWith(PROC, CGROUP)
     vi.advanceTimersByTime(10000) // t=16000: fast at 8/10/12/14/16, slow at 10/15
     expect(readerFn('readCpuTimes')).toHaveBeenCalledTimes(9)
     expect(readerFn('readDiskStats')).toHaveBeenCalledTimes(3)
@@ -420,6 +424,38 @@ describe('delta-rate computation (contract point 1)', () => {
       rxErrorsTotal: 5, txErrorsTotal: 3, rxDroppedTotal: 3, txDroppedTotal: 5,
       rxErrorsDelta: 2, txErrorsDelta: 2, rxDroppedDelta: 1, txDroppedDelta: 1,
     })
+  })
+})
+
+describe('pids constraint (binding cgroup pair)', () => {
+  it('a resolved constraint pair replaces the system-wide count and leaf limit', () => {
+    vi.mocked(readersMock.readPidsConstraint).mockReturnValue({ current: 16_240, max: 678_924 })
+    const service = makeService()
+    service.start()
+    vi.advanceTimersByTime(5000) // first slow tick
+    expect(service.getSnapshot().live.limits).toEqual({
+      available: true,
+      fdsUsed: 128, fdsMax: 1_048_576,
+      pidsUsed: 16_240, pidsMax: 678_924,
+      timeWait: 42, ephemeralPorts: 28_232, // 60999 - 32768 + 1
+    })
+    // The pair short-circuits the legacy readers: mixing a system-wide count
+    // with a cgroup-scoped limit would be an incoherent ratio.
+    expect(readerFn('readPidCount')).not.toHaveBeenCalled()
+    expect(readerFn('readPidsLimit')).not.toHaveBeenCalled()
+  })
+
+  it('a null constraint falls back to the legacy system-wide pair', () => {
+    const service = makeService()
+    service.start()
+    vi.advanceTimersByTime(5000) // first slow tick
+    expect(service.getSnapshot().live.limits).toEqual({
+      available: true,
+      fdsUsed: 128, fdsMax: 1_048_576,
+      pidsUsed: 900, pidsMax: 4_194_304,
+      timeWait: 42, ephemeralPorts: 28_232,
+    })
+    expect(readerFn('readPidsConstraint')).toHaveBeenCalledTimes(1)
   })
 })
 

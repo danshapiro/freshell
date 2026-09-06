@@ -42,7 +42,7 @@ const nonShellOptions: PickerOption[] = [
 
 // Host pressure dashboard (plan-pane-types §3c): the server-derived flag
 // already encodes platform support; the platform clause is belt-and-braces.
-const hostStatsOption: PickerOption = { type: 'host-stats', label: 'Host Stats', icon: Gauge, shortcut: 'H' }
+const hostStatsOption: PickerOption = { type: 'host-stats', label: 'System Status', icon: Gauge, shortcut: 'H' }
 
 const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}

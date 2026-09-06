@@ -36,6 +36,7 @@ import {
   readMeminfo,
   readNetDev,
   readPidCount,
+  readPidsConstraint,
   readPidsLimit,
   readPsi,
   readSelfFdCount,
@@ -71,6 +72,17 @@ let v1Cgroup: string
 let pidMaxOnlyProc: string
 let tcpOnlyProc: string
 let noOomProc: string
+let pidsChainProc: string
+let pidsChainCgroup: string
+let pidsMultiLeafWinsProc: string
+let pidsMultiLeafWinsCgroup: string
+let pidsMultiAncestorWinsProc: string
+let pidsMultiAncestorWinsCgroup: string
+let pidsNoCurrentProc: string
+let pidsNoCurrentCgroup: string
+let pidsRootCgroupProc: string
+let v1ChainProc: string
+let v1ChainCgroup: string
 
 function writeFile(root: string, rel: string, content: string): void {
   const full = path.join(root, rel)
@@ -147,6 +159,68 @@ beforeAll(() => {
   // vmstat without oom_kill (older kernels) -> oomKill null.
   noOomProc = path.join(tmp, 'no-oom', 'proc')
   writeFile(noOomProc, 'vmstat', 'pswpin 10\npswpout 20\npgmajfault 30\n')
+
+  // pids CHAIN: the v2 leaf pids.max is 'max' (unlimited) but an ANCESTOR
+  // slice carries a finite TasksMax — the WSL/systemd aggregate-limit shape.
+  // readPidsConstraint must walk the chain and bind to the ancestor pair.
+  pidsChainProc = path.join(tmp, 'pids-chain', 'proc')
+  pidsChainCgroup = path.join(tmp, 'pids-chain', 'cgroup')
+  writeFile(
+    pidsChainProc,
+    'self/cgroup',
+    '0::/user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service\n',
+  )
+  writeFile(pidsChainProc, 'sys/kernel/threads-max', '999999\n')
+  writeFile(
+    pidsChainCgroup,
+    'user.slice/user-1000.slice/user@1000.service/app.slice/freshell.service/pids.max',
+    'max\n',
+  )
+  writeFile(pidsChainCgroup, 'user.slice/user-1000.slice/pids.max', '678924\n')
+  writeFile(pidsChainCgroup, 'user.slice/user-1000.slice/pids.current', '16240\n')
+
+  // TWO constrained nodes; the LEAF has the higher utilization (0.9 vs 0.5)
+  // -> the leaf is the binding constraint and must win.
+  pidsMultiLeafWinsProc = path.join(tmp, 'pids-multi-leaf', 'proc')
+  pidsMultiLeafWinsCgroup = path.join(tmp, 'pids-multi-leaf', 'cgroup')
+  writeFile(pidsMultiLeafWinsProc, 'self/cgroup', '0::/slices/a.service\n')
+  writeFile(pidsMultiLeafWinsCgroup, 'slices/a.service/pids.max', '100\n')
+  writeFile(pidsMultiLeafWinsCgroup, 'slices/a.service/pids.current', '90\n')
+  writeFile(pidsMultiLeafWinsCgroup, 'slices/pids.max', '1000\n')
+  writeFile(pidsMultiLeafWinsCgroup, 'slices/pids.current', '500\n')
+
+  // TWO constrained nodes; the ANCESTOR has the higher utilization
+  // (0.6 vs 0.4) -> the ancestor must win over the leaf.
+  pidsMultiAncestorWinsProc = path.join(tmp, 'pids-multi-ancestor', 'proc')
+  pidsMultiAncestorWinsCgroup = path.join(tmp, 'pids-multi-ancestor', 'cgroup')
+  writeFile(pidsMultiAncestorWinsProc, 'self/cgroup', '0::/slices/b.service\n')
+  writeFile(pidsMultiAncestorWinsCgroup, 'slices/b.service/pids.max', '1000\n')
+  writeFile(pidsMultiAncestorWinsCgroup, 'slices/b.service/pids.current', '400\n')
+  writeFile(pidsMultiAncestorWinsCgroup, 'slices/pids.max', '1000\n')
+  writeFile(pidsMultiAncestorWinsCgroup, 'slices/pids.current', '600\n')
+
+  // A finite pids.max whose pids.current is unreadable cannot form a
+  // same-node pair: the node must be skipped (no ratio -> not binding).
+  pidsNoCurrentProc = path.join(tmp, 'pids-no-current', 'proc')
+  pidsNoCurrentCgroup = path.join(tmp, 'pids-no-current', 'cgroup')
+  writeFile(pidsNoCurrentProc, 'self/cgroup', '0::/slices/c.service\n')
+  writeFile(pidsNoCurrentCgroup, 'slices/c.service/pids.max', 'max\n')
+  writeFile(pidsNoCurrentCgroup, 'slices/pids.max', '500\n')
+
+  // Process sits AT the cgroup2 root ('0::/'): no limit files exist there
+  // and resolveCgroupLeaf yields null -> no binding constraint.
+  pidsRootCgroupProc = path.join(tmp, 'pids-root-cgroup', 'proc')
+  writeFile(pidsRootCgroupProc, 'self/cgroup', '0::/\n')
+
+  // v1 pids controller chain: leaf pair finite but low utilization,
+  // ancestor pair higher -> the ancestor must win.
+  v1ChainProc = path.join(tmp, 'v1-chain', 'proc')
+  v1ChainCgroup = path.join(tmp, 'v1-chain', 'cgroup')
+  writeFile(v1ChainProc, 'self/cgroup', '3:pids:/limited.slice/svc.service\n')
+  writeFile(v1ChainCgroup, 'pids/limited.slice/svc.service/pids.max', '777\n')
+  writeFile(v1ChainCgroup, 'pids/limited.slice/svc.service/pids.current', '50\n')
+  writeFile(v1ChainCgroup, 'pids/limited.slice/pids.max', '1000\n')
+  writeFile(v1ChainCgroup, 'pids/limited.slice/pids.current', '900\n')
 })
 
 afterAll(() => {
@@ -395,6 +469,57 @@ describe('readPidsLimit', () => {
 
   it('never uses /proc/sys/kernel/pid_max (wrap boundary, not a process cap)', () => {
     expect(readPidsLimit(pidMaxOnlyProc, CGROUP)).toBeNull()
+  })
+})
+
+describe('readPidsConstraint', () => {
+  it('returns the leaf pair when the leaf is the binding constraint', () => {
+    // procmini leaf: pids.max 10854, pids.current 42 — the only constrained
+    // node in the committed tree.
+    expect(readPidsConstraint(PROMINI, CGROUP)).toEqual({ current: 42, max: 10854 })
+  })
+
+  it('walks the ancestor chain when the leaf is unlimited (WSL aggregate TasksMax)', () => {
+    expect(readPidsConstraint(pidsChainProc, pidsChainCgroup)).toEqual({
+      current: 16240,
+      max: 678924,
+    })
+  })
+
+  it('binds the highest-utilization constrained node (leaf wins)', () => {
+    expect(readPidsConstraint(pidsMultiLeafWinsProc, pidsMultiLeafWinsCgroup)).toEqual({
+      current: 90,
+      max: 100,
+    })
+  })
+
+  it('binds the highest-utilization constrained node (ancestor wins)', () => {
+    expect(readPidsConstraint(pidsMultiAncestorWinsProc, pidsMultiAncestorWinsCgroup)).toEqual({
+      current: 600,
+      max: 1000,
+    })
+  })
+
+  it('returns null when no node in the chain is constrained', () => {
+    // v2LimitedProc: leaf pids.max = 'max', no ancestor pids files at all.
+    expect(readPidsConstraint(v2LimitedProc, v2LimitedCgroup)).toBeNull()
+  })
+
+  it('returns null when a finite pids.max lacks pids.current (no same-node pair)', () => {
+    expect(readPidsConstraint(pidsNoCurrentProc, pidsNoCurrentCgroup)).toBeNull()
+  })
+
+  it('reads the cgroup v1 pids controller chain', () => {
+    // leaf 50/777 (0.06) loses to ancestor 900/1000 (0.9).
+    expect(readPidsConstraint(v1ChainProc, v1ChainCgroup)).toEqual({ current: 900, max: 1000 })
+  })
+
+  it('returns null at the cgroup2 root (no limit files exist there)', () => {
+    expect(readPidsConstraint(pidsRootCgroupProc, CGROUP)).toBeNull()
+  })
+
+  it('returns null when there is no cgroup data', () => {
+    expect(readPidsConstraint(missing, CGROUP)).toBeNull()
   })
 })
 

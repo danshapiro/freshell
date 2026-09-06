@@ -675,40 +675,40 @@ describe('PanePicker', () => {
     })
   })
 
-  // Host Stats option gating (mirrors 'platform-specific shell options'):
+  // System Status option gating (mirrors 'platform-specific shell options'):
   // gate = featureFlags.hostStatsAvailable === true && platform !== 'win32'.
   describe('host stats pane option', () => {
-    it('hides Host Stats when the hostStatsAvailable feature flag is absent', () => {
+    it('hides System Status when the hostStatsAvailable feature flag is absent', () => {
       renderPicker({ platform: 'linux' })
-      expect(screen.queryByRole('button', { name: 'Host Stats' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'System Status' })).not.toBeInTheDocument()
     })
 
-    it('hides Host Stats when hostStatsAvailable is false', () => {
+    it('hides System Status when hostStatsAvailable is false', () => {
       renderPicker({ platform: 'linux', featureFlags: { hostStatsAvailable: false } })
-      expect(screen.queryByRole('button', { name: 'Host Stats' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'System Status' })).not.toBeInTheDocument()
     })
 
-    it('hides Host Stats on win32 even when the flag is true', () => {
+    it('hides System Status on win32 even when the flag is true', () => {
       renderPicker({ platform: 'win32', featureFlags: { hostStatsAvailable: true } })
-      expect(screen.queryByRole('button', { name: 'Host Stats' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'System Status' })).not.toBeInTheDocument()
       // Sanity: the platform-specific windows shells still render in this state.
       expect(screen.getByText('PowerShell')).toBeInTheDocument()
     })
 
-    it('shows Host Stats with an accessible button name and Gauge icon when the flag is true on linux', () => {
+    it('shows System Status with an accessible button name and Gauge icon when the flag is true on linux', () => {
       renderPicker({ platform: 'linux', featureFlags: { hostStatsAvailable: true } })
-      expect(screen.getByRole('button', { name: 'Host Stats' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'System Status' })).toBeInTheDocument()
       expect(screen.getByTestId('gauge-icon')).toBeInTheDocument()
     })
 
-    it('calls onSelect with host-stats when Host Stats is clicked', () => {
+    it('calls onSelect with host-stats when System Status is clicked', () => {
       const { onSelect } = renderPicker({ platform: 'linux', featureFlags: { hostStatsAvailable: true } })
-      fireEvent.click(screen.getByRole('button', { name: 'Host Stats' }))
+      fireEvent.click(screen.getByRole('button', { name: 'System Status' }))
       completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('host-stats')
     })
 
-    it('uses the H shortcut for Host Stats', () => {
+    it('uses the H shortcut for System Status', () => {
       const { onSelect } = renderPicker({ platform: 'linux', featureFlags: { hostStatsAvailable: true } })
       fireEvent.keyDown(getContainer(), { key: 'h' })
       completeFadeAnimation()

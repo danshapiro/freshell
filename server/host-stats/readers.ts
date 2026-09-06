@@ -452,6 +452,63 @@ export function readPidsLimit(procRoot: string = PROC_ROOT, cgroupRoot: string =
   }
 }
 
+/** A same-node cgroup pids reading: the constraint a fork would hit first. */
+export type PidsConstraint = { current: number; max: number }
+
+/**
+ * The BINDING pids constraint: walks THIS process's cgroup chain from the leaf
+ * toward the root and returns the {current, max} pair of the node whose finite
+ * pids.max has the HIGHEST utilization (current/max) — the limit a fork would
+ * actually hit first. This is the WSL/systemd aggregate shape: the leaf is
+ * often 'max' while an ANCESTOR slice (e.g. user-1000.slice) carries the real
+ * TasksMax, which the leaf-only readPidsLimit never sees. A node qualifies
+ * only when BOTH pids.max (finite, >0 — matching readPidsLimit's convention)
+ * and pids.current read, so the returned pair is always a consistent same-node
+ * reading. No qualified node -> null (callers fall back to the system-wide
+ * readPidCount/readPidsLimit pair). Deepest node wins ties (deterministic).
+ *
+ * The cgroup fs root has NO limit files by design; resolveCgroupLeaf already
+ * yields null for a process sitting at the cgroup2 root.
+ *
+ * NOTE (frozen contract): parameter order here is (procRoot, cgroupRoot) — the
+ * opposite of readCgroupMemory(cgroupRoot, procRoot). Callers: read the
+ * signatures, do not assume.
+ */
+export function readPidsConstraint(
+  procRoot: string = PROC_ROOT,
+  cgroupRoot: string = CGROUP_ROOT,
+): PidsConstraint | null {
+  try {
+    const leaf = resolveCgroupLeaf(procRoot, 'pids')
+    if (!leaf) return null
+    // Deepest-first chain; the fs-root segment is never read (no limit files).
+    const segments = leaf.path.split('/').filter((segment) => segment.length > 0)
+    let best: PidsConstraint | null = null
+    let bestRatio = -1
+    for (let depth = segments.length; depth >= 1; depth--) {
+      const nodePath = segments.slice(0, depth).join('/')
+      const dir =
+        leaf.version === 'v2' ? path.join(cgroupRoot, nodePath) : path.join(cgroupRoot, 'pids', nodePath)
+      const maxText = safeRead(path.join(dir, 'pids.max'))
+      if (maxText === null) continue
+      const max = parseCgroupLimit(maxText)
+      if (max === null || max <= 0) continue // 'max'/garbage: unlimited, not binding
+      const currentText = safeRead(path.join(dir, 'pids.current'))
+      if (currentText === null) continue // no readable same-node pair
+      const current = Number(currentText.trim())
+      if (!Number.isFinite(current) || current < 0) continue
+      const ratio = current / max
+      if (ratio > bestRatio) {
+        bestRatio = ratio
+        best = { current, max }
+      }
+    }
+    return best
+  } catch {
+    return null
+  }
+}
+
 /** 'Max open files' SOFT limit from '/proc/self/limits' ('unlimited' -> null). */
 export function readSelfLimitsFdsMax(procRoot: string = PROC_ROOT): number | null {
   const text = safeRead(path.join(procRoot, 'self', 'limits'))

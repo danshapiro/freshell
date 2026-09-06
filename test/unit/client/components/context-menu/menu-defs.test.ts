@@ -180,6 +180,33 @@ describe('buildMenuItems — pane context menu', () => {
     const separatorAfterSplit = items[splitDownIdx + 1]
     expect(separatorAfterSplit?.type).toBe('separator')
   })
+
+  it('rename pane is disabled for a host-stats pane (the pane is always named by the app)', () => {
+    const mockActions = createMockActions()
+    const mockContext = createMockContext(mockActions)
+    mockContext.paneLayouts = {
+      tab1: {
+        type: 'leaf',
+        id: 'pane1',
+        content: { kind: 'host-stats' },
+      },
+    }
+    const target: ContextTarget = { kind: 'pane', tabId: 'tab1', paneId: 'pane1' }
+    const items = buildMenuItems(target, mockContext)
+    const rename = items.find(i => i.type === 'item' && i.id === 'rename-pane')
+    expect(rename).toBeDefined()
+    if (rename?.type === 'item') expect(rename.disabled).toBe(true)
+  })
+
+  it('rename pane stays enabled for a terminal pane', () => {
+    const mockActions = createMockActions()
+    const mockContext = createMockContext(mockActions)
+    const target: ContextTarget = { kind: 'pane', tabId: 'tab1', paneId: 'pane1' }
+    const items = buildMenuItems(target, mockContext)
+    const rename = items.find(i => i.type === 'item' && i.id === 'rename-pane')
+    expect(rename).toBeDefined()
+    if (rename?.type === 'item') expect(rename.disabled).not.toBe(true)
+  })
 })
 
 describe('buildMenuItems — fresh-agent context', () => {
