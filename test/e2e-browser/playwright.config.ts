@@ -312,6 +312,48 @@ export const RUST_ONLY_SPECS = [
   // Reconnect-revive acceptance: socket-drop/freeze revival; drives
   // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
   /reconnect-revive-rust\.spec\.ts$/,
+  // AMPLIFIER-RESTORE (docs/plans/2026-07-18-amplifier-restore-spec.md):
+  // KNOWN DIVERGENCE -- legacy predates upstream #514 and has NO amplifier
+  // provider registered; a genuinely rust-only feature (see the spec's doc
+  // comment and the rust-chromium testMatch entry).
+  /amplifier-restore-rust\.spec\.ts$/,
+  // Opencode terminal restore: KNOWN DIVERGENCE -- legacy has no opencode
+  // terminal<->session association (see the spec's doc comment).
+  /opencode-terminal-restore-rust\.spec\.ts$/,
+  // CODEX-BOUNCE (2026-07-22 incident regression): the resume-derivation bug
+  // was in the Rust WS create path; the legacy anchor was correct -- rust-only
+  // (see the rust-chromium testMatch entry and spec doc comment).
+  /codex-terminal-bounce-rust\.spec\.ts$/,
+  // MCP bridge pin: the unmodified legacy MCP stdio binary against an owned,
+  // ephemeral Rust server; rust-only (see the rust-chromium testMatch entry).
+  /mcp-bridge-rust\.spec\.ts$/,
+  // MCP QA smoke: the full mode-matrix payoff of the MCP QA lever; rust-only
+  // (see the rust-chromium testMatch entry + spec doc comment).
+  /mcp-qa-smoke-rust\.spec\.ts$/,
+  // TERM-28: Rust portable-pty PATH-only bare-command resolution fix; legacy
+  // node-pty is unaffected (see the rust-chromium testMatch entry).
+  /term28-path-shadow-rust\.spec\.ts$/,
+  // REST-TAB-PERSISTENCE (client tab-poisoning incident evidence): the
+  // `amplifier` mode trigger has no legacy provider -- the same KNOWN
+  // DIVERGENCE as amplifier-restore-rust above (see the rust-chromium
+  // testMatch entry).
+  /rest-tab-persistence\.spec\.ts$/,
+  // DIAG-03 -- rotation limits are a deliberate Rust-only hardening feature;
+  // the frozen legacy server has no equivalent (see the spec's doc comment).
+  /diag03-rotation-redaction-rust\.spec\.ts$/,
+  // RECONCILE-HANDSHAKE (PW-RUST, design §9.2): raw-WS synthetic-client proof
+  // of the reconciliation-on-connect handshake against the REAL Rust server.
+  // Was registered in NEITHER list (zero tests collected under rust-chromium;
+  // wrongly collected by the match-all chromium project).
+  /reconcile-handshake-rust\.spec\.ts$/,
+  // Remote status rings Task 5 e2e pin (docs/plans/2026-08-10-remote-status-rings.md):
+  // owns a RustServer (ephemeral port) + raw-WS second-device tabs.sync.push.
+  // Was registered in NEITHER list. See the spec's doc comment.
+  /sidebar-remote-status-rings-rust\.spec\.ts$/,
+  // Sidebar status-tier sort (sibling of sidebar-remote-status-rings-rust):
+  // against the REAL Rust server, same raw-WS second-device harness; landed
+  // upstream unregistered (silent false green) — registered here.
+  /sidebar-status-tier-sort-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -565,6 +607,16 @@ export default defineConfig({
         // Reconnect-revive acceptance: socket-drop/freeze revival; drives
         // RustServer + forceDisconnect + SIGSTOP (see RUST_ONLY_SPECS entry).
         /reconnect-revive-rust\.spec\.ts$/,
+        // Reconcile handshake (PW-RUST design §9.2): synthetic raw-WS client
+        // proof of the reconciliation-on-connect handshake against the REAL
+        // Rust server (see the RUST_ONLY_SPECS entry + spec doc comment).
+        /reconcile-handshake-rust\.spec\.ts$/,
+        // Remote status rings Task 5 e2e pin (see the RUST_ONLY_SPECS entry
+        // + spec doc comment; owns its RustServer on an ephemeral port).
+        /sidebar-remote-status-rings-rust\.spec\.ts$/,
+        // Sidebar status-tier sort e2e pin (see the RUST_ONLY_SPECS entry + the
+        // spec's doc comment; owns its RustServer on an ephemeral port).
+        /sidebar-status-tier-sort-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
