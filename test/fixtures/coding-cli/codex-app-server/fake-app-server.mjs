@@ -76,6 +76,14 @@ function getRolloutSessionDir() {
 // separate fake process) reads the same history the parent process recorded —
 // fork durability is cross-process, like the rollout files themselves.
 // Default OFF: every legacy consumer (static makeTurn world) is untouched.
+// AGENT-12 additive capture (per-send settings e2e): each recorded turn ALSO
+// carries `start: { model, effort, sandboxPolicy, approvalPolicy }` — the
+// EXACT per-turn knobs the caller's turn/start params presented (absent knobs
+// recorded as null) — so specs prove a between-sends settings change
+// measurably alters exactly that turn's payload. Every pre-existing key (id,
+// status, itemsView, items, error, startedAt, completedAt, durationMs) keeps
+// its shape and value; consumers reading only id/items (the fork tests) are
+// unaffected by the appended key.
 const recordedTurnsByThread = new Map()
 
 function recordedTurnsPath(threadId) {
@@ -102,7 +110,7 @@ function persistRecordedTurns(threadId, turns) {
   fs.writeFileSync(file, JSON.stringify(turns))
 }
 
-function makeRecordedTurn(turnId, promptText) {
+function makeRecordedTurn(turnId, promptText, startParams) {
   const nowSec = Math.floor(Date.now() / 1000)
   return {
     id: turnId,
@@ -116,6 +124,15 @@ function makeRecordedTurn(turnId, promptText) {
     startedAt: nowSec,
     completedAt: nowSec + 1,
     durationMs: 1000,
+    // AGENT-12 additive key (see the recordTurns comment above): the exact
+    // per-turn knobs this turn/start presented, or null when the caller
+    // omitted the field entirely. Existing keys above stay byte-unchanged.
+    start: {
+      model: startParams?.model ?? null,
+      effort: startParams?.effort ?? null,
+      sandboxPolicy: startParams?.sandboxPolicy ?? null,
+      approvalPolicy: startParams?.approvalPolicy ?? null,
+    },
   }
 }
 
@@ -311,7 +328,7 @@ function successResult(method, params) {
       const promptText = Array.isArray(params?.input)
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
-      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText)
+      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
       turns.push(turn)
       recordedTurnsByThread.set(threadId, turns)
       persistRecordedTurns(threadId, turns)

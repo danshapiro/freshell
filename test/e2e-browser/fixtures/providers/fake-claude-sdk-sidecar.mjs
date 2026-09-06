@@ -12,6 +12,10 @@
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
 //        {"type":"permission.respond",sessionId,requestId,decision}
 //        {"type":"question.respond",sessionId,requestId,answers}
+//        {"type":"settings.update",sessionId,model?,permissionMode?,effort?}
+//        (AGENT-12 mid-session knobs — the Rust server writes it immediately
+//        BEFORE the send it applies to; the fake merges the presented knobs
+//        onto the fake session state and echoes sdk.session.metadata)
 //        out: {"type":"created",requestId,sessionId} FIRST (claude.rs read_created
 //        discards any earlier line), then sdk.* frames:
 //        sdk.session.init {cliSessionId: CANONICAL UUID}, sdk.status,
@@ -22,6 +26,9 @@
 //        sdk.permission.cancelled / sdk.question.cancelled (interrupt-time
 //        pending cancellation, the real sidecar's cancelPending —
 //        index.mjs:289-295), sdk.turn.waiting (0→≥1 pending edge),
+//        sdk.session.metadata {sessionId, cliSessionId, model} (the post-apply
+//        settings.update echo — the Rust consumer re-normalizes it to
+//        freshAgent.session.metadata),
 //        sdk.session.snapshot (resume).
 //
 // Turn semantics: `send` ALWAYS opens with sdk.status running (bookkeeping the
@@ -99,7 +106,10 @@ const program = loadProgram(env)
 // fixture's own parse to prove what the server wrote.
 const STDIN_LOG = env.FRESHELL_FAKE_STDIN
 
-// bridge sessionId -> { cliSessionId, cwd, pending, pendingEntries }
+// bridge sessionId -> { cliSessionId, cwd, model, permissionMode, effort, pending, pendingEntries }
+// (model/permissionMode/effort are the settings knob baseline: seeded at
+// create, merged per settings.update — an absent knob carries the stored
+// baseline forward, so the echoed sdk.session.metadata never fabricates a value)
 const sessions = new Map()
 let activeSessionId = null
 let createCounter = 0
@@ -284,7 +294,15 @@ async function handleInput(line) {
     activeSessionId = sessionId
     const cliSessionId = msg.resumeSessionId ?? program.sessionId ?? randomUUID()
     const cwd = msg.cwd ?? process.cwd()
-    sessions.set(sessionId, { cliSessionId, cwd, pending: 0, pendingEntries: [] })
+    sessions.set(sessionId, {
+      cliSessionId,
+      cwd,
+      model: msg.model ?? 'fixture-model',
+      permissionMode: msg.permissionMode,
+      effort: msg.effort,
+      pending: 0,
+      pendingEntries: [],
+    })
     // A durable transcript EXISTS from create on (the reload-while-pending
     // snapshot route reads it before any turn completes) — touch, no bogus row.
     const transcript = transcriptPath(cliSessionId, cwd)
@@ -327,6 +345,31 @@ async function handleInput(line) {
     resolvePending(msg.sessionId, kind, msg.requestId)
     const emitted = await engine.handleMessage(msg)
     if (emitted.has('crash')) return
+  } else if (msg.type === 'settings.update') {
+    // AGENT-12 mid-session knobs (per-send settings): the Rust server writes
+    // this frame immediately BEFORE the send it applies to (stdin line order
+    // + the serialized per-session op chain are the ordering guarantee).
+    // Merge the presented knobs onto the fake session state — an omitted knob
+    // carries the stored baseline forward — then echo the real sidecar's
+    // post-apply sdk.session.metadata over stdout (the Rust consumer
+    // re-normalizes it to freshAgent.session.metadata). The echo rides emit(),
+    // so it lands in the FRESHELL_FAKE_EVENTS ledger as a kind:'wire' row —
+    // the spec asserts on what actually crossed stdout. An unknown session id
+    // is a lose-safe no-op (same posture as an unknown respond). Every OTHER
+    // unknown type still falls through silently below.
+    activeSessionId = msg.sessionId ?? activeSessionId
+    const st = sessions.get(msg.sessionId)
+    if (st) {
+      if (typeof msg.model === 'string') st.model = msg.model
+      if (typeof msg.permissionMode === 'string') st.permissionMode = msg.permissionMode
+      if (typeof msg.effort === 'string') st.effort = msg.effort
+      emit({
+        type: 'sdk.session.metadata',
+        sessionId: msg.sessionId,
+        cliSessionId: st.cliSessionId,
+        model: st.model,
+      })
+    }
   } else if (msg.type === 'interrupt') {
     activeSessionId = msg.sessionId ?? activeSessionId
     const st = sessions.get(msg.sessionId)
