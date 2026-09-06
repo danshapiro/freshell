@@ -66,6 +66,13 @@ pub struct BootScanReport {
     /// [`KILL_TOMBSTONE_TTL_MS`] — the same protective horizon as the close
     /// fences it carries.
     pub pane_closes_swept: Vec<String>,
+    /// Directory-walk faults hit by the quarantine rescan (`"<path>: <os
+    /// error>"`; read-dir faults carry the helper's `read <path>:` prefix,
+    /// each already ERROR-logged at fault time). An ENABLED ledger's store
+    /// was fully readable at construction (kata qzka), so any entry here
+    /// means the store DEGRADED between construction and this pass — always
+    /// loud, never silently skipped.
+    pub scan_errors: Vec<String>,
 }
 
 impl PaneLedger {
@@ -943,57 +950,119 @@ impl PaneLedger {
     }
 
     fn quarantine_unparsable(&self, root: &Path, now_ms: i64, report: &mut BootScanReport) {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
-            for provider in providers.flatten() {
-                if let Ok(files) = std::fs::read_dir(provider.path()) {
-                    candidates.extend(files.flatten().map(|f| f.path()));
+        // Scan-level fault policy, one notch weaker than `load_index`'s
+        // (kata qzka): the walk never dies per-store — a fault is
+        // ERROR-logged and recorded on the report (the OS-error text
+        // carries the errno), then the walk continues. `NotFound` = absent
+        // = not a fault (a first-boot store writes nothing before the boot
+        // scan runs). The record names the faulted path exactly once:
+        // `read_dir_existing` errors already carry their path, raw
+        // entry-iteration errors do not.
+        fn scan_fault(
+            log_path: &Path,
+            record: String,
+            err: &std::io::Error,
+            report: &mut BootScanReport,
+        ) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %log_path.display(),
+                error = %err,
+                "pane_ledger_scan_fault: quarantine walk could not fully read the store"
+            );
+            report.scan_errors.push(record);
+        }
+        // Collect row candidates from every store region. Providered regions
+        // walk <root>/<region>/<provider>/*.json; flat regions walk
+        // <root>/<region>/*.json.
+        fn collect_from(
+            dir: &Path,
+            providered: bool,
+            report: &mut BootScanReport,
+            candidates: &mut Vec<PathBuf>,
+        ) {
+            let Some(entries) = (match PaneLedger::read_dir_existing(dir) {
+                Ok(some) => some,
+                Err(err) => {
+                    scan_fault(dir, format!("{err}"), &err, report);
+                    None
+                }
+            }) else {
+                return; // absent region or recorded fault — nothing to scan here
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        scan_fault(dir, format!("{}: {err}", dir.display()), &err, report);
+                        continue;
+                    }
+                };
+                if !providered {
+                    candidates.push(entry.path());
+                    continue;
+                }
+                let provider_dir = entry.path();
+                let Some(files) = (match PaneLedger::read_dir_existing(&provider_dir) {
+                    Ok(some) => some,
+                    Err(err) => {
+                        scan_fault(&provider_dir, format!("{err}"), &err, report);
+                        None
+                    }
+                }) else {
+                    continue; // vanished mid-scan (absent) or recorded fault
+                };
+                for file in files {
+                    match file {
+                        Ok(f) => candidates.push(f.path()),
+                        Err(err) => {
+                            scan_fault(
+                                &provider_dir,
+                                format!("{}: {err}", provider_dir.display()),
+                                &err,
+                                report,
+                            );
+                        }
+                    }
                 }
             }
         }
-        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
-            candidates.extend(files.flatten().map(|f| f.path()));
-        }
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        collect_from(&Self::bindings_dir(root), true, report, &mut candidates);
+        collect_from(&Self::pending_dir(root), false, report, &mut candidates);
         // kata 1wxv: the rollback subtree participates in per-row quarantine.
         // Its payloads are OPAQUE to the ledger (no ledgerVersion gate, no
         // typed-parse check) — the schema is owned by
         // freshell_freshagent::rollback_record and version-gated in that
         // crate's sink layer — so health here is JSON-parseability, nothing
         // more.
-        if let Ok(providers) = std::fs::read_dir(Self::rollback_dir(root)) {
-            for provider in providers.flatten() {
-                if let Ok(files) = std::fs::read_dir(provider.path()) {
-                    candidates.extend(files.flatten().map(|f| f.path()));
-                }
-            }
-        }
+        collect_from(&Self::rollback_dir(root), true, report, &mut candidates);
         // Focused-ep5-r1 Finding 2: the kill-tombstone subtree participates
         // in per-row quarantine (typed rows, version-gated like bindings).
-        if let Ok(providers) = std::fs::read_dir(Self::kill_tombstone_dir(root)) {
-            for provider in providers.flatten() {
-                if let Ok(files) = std::fs::read_dir(provider.path()) {
-                    candidates.extend(files.flatten().map(|f| f.path()));
-                }
-            }
-        }
+        collect_from(
+            &Self::kill_tombstone_dir(root),
+            true,
+            report,
+            &mut candidates,
+        );
         // Focused-ep5-r5 Finding 2: the alias-tombstone subtree participates
         // the same way (typed rows, version-gated).
-        if let Ok(providers) = std::fs::read_dir(Self::alias_tombstone_dir(root)) {
-            for provider in providers.flatten() {
-                if let Ok(files) = std::fs::read_dir(provider.path()) {
-                    candidates.extend(files.flatten().map(|f| f.path()));
-                }
-            }
-        }
+        collect_from(
+            &Self::alias_tombstone_dir(root),
+            true,
+            report,
+            &mut candidates,
+        );
         // Delta-r6-r2 / delta-r6-r4: BOTH close-record subtrees participate
         // the same way (typed rows, version-gated) — the legacy
         // `close-records/` pane records and the close-envelope journal files.
-        if let Ok(files) = std::fs::read_dir(Self::pane_close_dir(root)) {
-            candidates.extend(files.flatten().map(|f| f.path()));
-        }
-        if let Ok(files) = std::fs::read_dir(Self::close_envelope_dir(root)) {
-            candidates.extend(files.flatten().map(|f| f.path()));
-        }
+        collect_from(&Self::pane_close_dir(root), false, report, &mut candidates);
+        collect_from(
+            &Self::close_envelope_dir(root),
+            false,
+            report,
+            &mut candidates,
+        );
         let rollback_root = Self::rollback_dir(root);
         let kill_tombstone_root = Self::kill_tombstone_dir(root);
         let alias_tombstone_root = Self::alias_tombstone_dir(root);
