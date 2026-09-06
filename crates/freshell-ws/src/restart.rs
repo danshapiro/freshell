@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use freshell_protocol::{
@@ -486,6 +487,17 @@ pub struct RestartCoordinator {
     #[allow(dead_code)] // read only by the kernel (record-lock lifetime)
     persistence_lock: Option<Arc<PersistenceLock>>,
     persistence_fault: Option<Arc<String>>,
+    /// Set when a journal write landed its rename but failed the parent
+    /// directory sync: the destination holds the new bytes now, yet power-loss
+    /// durability is unproven. While set, `persist_locked` re-syncs the
+    /// directory (see `reprove_journal_dir_sync`) before paying for another
+    /// write. Shared across clones like the rest of the persistence state.
+    journal_dir_sync_dirty: Arc<AtomicBool>,
+    /// Parent-directory sync used by every journal write. Production uses the
+    /// platform default (a real fsync on unix, a no-op elsewhere — so
+    /// `Indeterminate` cannot arise off-unix); tests inject latched failures
+    /// through `new_persistent_with_test_parent_sync`.
+    sync_parent: JournalParentSync,
     session_locks: Arc<Mutex<HashMap<RestartSessionKey, Arc<tokio::sync::Mutex<()>>>>>,
     session_lock_order: Arc<Mutex<VecDeque<RestartSessionKey>>>,
     request_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -538,6 +550,43 @@ impl Drop for LockRetentionGuard<'_> {
     }
 }
 
+/// Durability of one committed-or-retained transaction write, as observed by
+/// [`RestartCoordinator::try_update_ownership`]. `Indeterminate` means the
+/// journal rename landed but the parent-directory sync failed: disk may or
+/// may not survive a power loss, so the coordinator applied the fail-closed
+/// union merge (candidate wholesale, pending-row membership old ∪ candidate)
+/// instead of either discarding the candidate or pretending the commit is
+/// proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateDurability {
+    Committed,
+    Indeterminate,
+}
+
+/// What to emit when a failure-record write proves `Indeterminate` (see
+/// [`RestartCoordinator::persisted_outcome`]).
+enum IndeterminateEmit {
+    /// The write only refreshed `last_failure` on a row that survives in
+    /// every world; the already-built retryable recovery-pending frame
+    /// remains accurate.
+    KeepExisting,
+    /// The write was a terminal store that removes the durable row only when
+    /// committed; an indeterminate write retains the row (fail-closed union),
+    /// so the terminal frame is reframed as recovery-pending instead of final.
+    ReframeTerminal,
+}
+
+/// Why a replacement commit could not be confirmed durable.
+enum ReplacementCommitError {
+    /// The commit write never landed; memory still owns the pre-commit world.
+    NotCommitted(std::io::Error),
+    /// The commit write landed but its durability is unproven; the fail-closed
+    /// union merge already adopted the candidate's bindings/results and
+    /// retained the pending rows, so server-owned recovery (not this caller)
+    /// owns convergence.
+    Indeterminate(std::io::Error),
+}
+
 impl Default for RestartCoordinator {
     fn default() -> Self {
         Self::new()
@@ -560,6 +609,8 @@ impl RestartCoordinator {
             persistence_path: None,
             persistence_lock: None,
             persistence_fault: None,
+            journal_dir_sync_dirty: Arc::new(AtomicBool::new(false)),
+            sync_parent: default_journal_parent_sync(),
             session_locks: Arc::new(Mutex::new(HashMap::new())),
             session_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             request_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -584,6 +635,33 @@ impl RestartCoordinator {
         ownership_limit: usize,
         lock_limit: usize,
     ) -> std::io::Result<Self> {
+        Self::new_persistent_inner(
+            path,
+            ownership_limit,
+            lock_limit,
+            default_journal_parent_sync(),
+        )
+    }
+
+    /// Test seam: identical to [`Self::new_persistent_with_limits`] except the
+    /// journal parent-directory sync is the supplied injection, so tests can
+    /// latch the post-rename fsync failure that makes a write `Indeterminate`.
+    #[doc(hidden)]
+    pub fn new_persistent_with_test_parent_sync(
+        path: impl Into<PathBuf>,
+        ownership_limit: usize,
+        lock_limit: usize,
+        sync_parent: JournalParentSync,
+    ) -> std::io::Result<Self> {
+        Self::new_persistent_inner(path, ownership_limit, lock_limit, sync_parent)
+    }
+
+    fn new_persistent_inner(
+        path: impl Into<PathBuf>,
+        ownership_limit: usize,
+        lock_limit: usize,
+        sync_parent: JournalParentSync,
+    ) -> std::io::Result<Self> {
         let path = path.into();
         let ownership_limit = ownership_limit.max(1);
         let lock_limit = lock_limit.max(1);
@@ -594,6 +672,8 @@ impl RestartCoordinator {
             persistence_path: Some(Arc::new(path)),
             persistence_lock: Some(Arc::new(persistence_lock)),
             persistence_fault: None,
+            journal_dir_sync_dirty: Arc::new(AtomicBool::new(false)),
+            sync_parent,
             session_locks: Arc::new(Mutex::new(HashMap::new())),
             session_lock_order: Arc::new(Mutex::new(VecDeque::new())),
             request_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -846,15 +926,23 @@ impl RestartCoordinator {
         })
     }
 
-    fn persist_locked(&self, ownership: &RuntimeOwnership) -> std::io::Result<()> {
+    fn persist_locked(&self, ownership: &RuntimeOwnership) -> JournalWriteOutcome {
         if let Some(error) = &self.persistence_fault {
-            return Err(std::io::Error::other(error.as_str()));
+            return JournalWriteOutcome::NotCommitted(std::io::Error::other(error.as_str()));
         }
         let Some(path) = self.persistence_path.as_deref() else {
-            return Ok(());
+            return JournalWriteOutcome::Committed;
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                return JournalWriteOutcome::NotCommitted(error);
+            }
+            if let Err(error) = self.reprove_journal_dir_sync(parent) {
+                // The directory is still unproven, so the newest candidate
+                // never even stages: the outcome stays indeterminate and no
+                // further rename piles onto an unsynced directory.
+                return JournalWriteOutcome::Indeterminate(error);
+            }
         }
         let state = PersistedOwnership {
             generations: ownership
@@ -885,23 +973,63 @@ impl RestartCoordinator {
                 .collect(),
             pending_recoveries: ownership.pending_recoveries.values().cloned().collect(),
         };
-        let bytes = serde_json::to_vec_pretty(&state)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let bytes = match serde_json::to_vec_pretty(&state) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return JournalWriteOutcome::NotCommitted(std::io::Error::other(error.to_string()))
+            }
+        };
         let temp = path.with_extension(format!(
             "tmp-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        atomic_write_restart_journal(path, &temp, &bytes)
+        let outcome =
+            atomic_write_restart_journal_with_parent_sync(path, &temp, &bytes, |parent| {
+                (self.sync_parent)(parent)
+            });
+        if matches!(outcome, JournalWriteOutcome::Indeterminate(_)) {
+            self.journal_dir_sync_dirty.store(true, Ordering::SeqCst);
+        }
+        outcome
+    }
+
+    /// Re-prove the journal directory after an indeterminate write. A no-op
+    /// unless the dirty flag is set; on success the flag clears and every
+    /// rename already in the directory stands proven durable.
+    fn reprove_journal_dir_sync(&self, parent: &Path) -> std::io::Result<()> {
+        if !self.journal_dir_sync_dirty.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        (self.sync_parent)(parent)?;
+        self.journal_dir_sync_dirty.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Test-only probe for the fail-closed journal dirty flag (see
+    /// `persist_locked`); production callers never branch on it.
+    #[cfg(test)]
+    pub(crate) fn journal_dir_sync_dirty(&self) -> bool {
+        self.journal_dir_sync_dirty.load(Ordering::SeqCst)
     }
 
     fn persist_or_log(&self, ownership: &RuntimeOwnership, operation: &'static str) {
-        if let Err(error) = self.persist_locked(ownership) {
-            tracing::error!(
-                error = %error,
-                operation,
-                "agent.restart.persistence.failed"
-            );
+        match self.persist_locked(ownership) {
+            JournalWriteOutcome::Committed => {}
+            JournalWriteOutcome::NotCommitted(error) => {
+                tracing::error!(
+                    error = %error,
+                    operation,
+                    "agent.restart.persistence.failed"
+                );
+            }
+            JournalWriteOutcome::Indeterminate(error) => {
+                tracing::error!(
+                    error = %error,
+                    operation,
+                    "agent.restart.persistence.indeterminate"
+                );
+            }
         }
     }
 
@@ -909,18 +1037,45 @@ impl RestartCoordinator {
         &self,
         operation: &'static str,
         update: impl FnOnce(&mut RuntimeOwnership) -> T,
-    ) -> std::io::Result<T> {
+    ) -> std::io::Result<(T, UpdateDurability)> {
         let mut ownership = self.ownership.lock().expect("restart ownership lock");
         let mut candidate = ownership.clone();
         let output = update(&mut candidate);
-        self.persist_locked(&candidate).map_err(|error| {
-            tracing::error!(
-                error = %error,
-                operation,
-                "agent.restart.persistence.failed"
-            );
-            error
-        })?;
+        let durability = match self.persist_locked(&candidate) {
+            JournalWriteOutcome::Committed => UpdateDurability::Committed,
+            JournalWriteOutcome::NotCommitted(error) => {
+                tracing::error!(
+                    error = %error,
+                    operation,
+                    "agent.restart.persistence.failed"
+                );
+                return Err(error);
+            }
+            JournalWriteOutcome::Indeterminate(error) => {
+                tracing::error!(
+                    error = %error,
+                    operation,
+                    "agent.restart.persistence.indeterminate"
+                );
+                UpdateDurability::Indeterminate
+            }
+        };
+        if durability == UpdateDurability::Indeterminate {
+            // Fail-closed merge: the rename landed, so the candidate owns the
+            // destination NOW — but a power loss could still revert the
+            // directory entry to the pre-write journal. Apply the candidate
+            // wholesale EXCEPT pending-row membership, which takes the union
+            // old ∪ candidate (the candidate's row content wins when both have
+            // it), so no reservation that either world could contain is ever
+            // dropped: every retained row stays reserved in memory and is
+            // driven by the always-on recovery driver.
+            for (key, row) in &ownership.pending_recoveries {
+                candidate
+                    .pending_recoveries
+                    .entry(key.clone())
+                    .or_insert_with(|| row.clone());
+            }
+        }
         // A newly-inserted pending row is the runtime wake for the always-on
         // recovery driver. Waking only on INSERT (not on every write that
         // leaves rows present) is load-bearing: the driver's own
@@ -931,7 +1086,10 @@ impl RestartCoordinator {
         // session lock through its whole transaction, so any woken pass
         // observes that transaction's final committed state. `notify_one`
         // stores a permit when nobody is parked, so a row committed before
-        // the driver first parks is not lost.
+        // the driver first parks is not lost. The indeterminate merge above
+        // preserves this rule exactly: unioned-in rows were already present,
+        // and a genuinely new candidate row wakes the driver in both worlds
+        // (durable now, or durable after a power loss reverts the rename).
         let new_pending_row = candidate
             .pending_recoveries
             .keys()
@@ -940,7 +1098,7 @@ impl RestartCoordinator {
         if new_pending_row {
             self.recovery_notify.notify_one();
         }
-        Ok(output)
+        Ok((output, durability))
     }
 
     fn insert_result_locked(
@@ -2043,28 +2201,48 @@ impl RestartCoordinator {
             kind: request.kind,
             runtime: expected.clone(),
         });
-        if let Err(error) = self.try_update_ownership("record_shutdown_pending", |ownership| {
-            ownership.pending_recoveries.insert(
-                request.request_id.clone(),
-                PendingRestartRecovery {
-                    request_id: request.request_id.clone(),
-                    request: request.clone(),
-                    followers: Vec::new(),
-                    old_runtime: expected.clone(),
-                    retirement_pending: true,
-                    resume_context,
-                    retirement_fence,
-                    replacement_fence: None,
-                    last_failure: None,
-                },
+        let boundary_durability =
+            match self.try_update_ownership("record_shutdown_pending", |ownership| {
+                ownership.pending_recoveries.insert(
+                    request.request_id.clone(),
+                    PendingRestartRecovery {
+                        request_id: request.request_id.clone(),
+                        request: request.clone(),
+                        followers: Vec::new(),
+                        old_runtime: expected.clone(),
+                        retirement_pending: true,
+                        resume_context,
+                        retirement_fence,
+                        replacement_fence: None,
+                        last_failure: None,
+                    },
+                );
+            }) {
+                Ok(((), durability)) => durability,
+                Err(error) => {
+                    // Preflight may reserve provider-side state (notably the
+                    // shared OpenCode session). If the durable journal boundary
+                    // cannot be recorded, teardown must not begin and that
+                    // non-destructive reservation must be released before
+                    // returning.
+                    runtime.abort_preflight(&request, &plan).await;
+                    let outcome = self.persistence_failure(&request, expected, error);
+                    emit(&outcome.messages[0]);
+                    return outcome;
+                }
+            };
+        if boundary_durability == UpdateDurability::Indeterminate {
+            // The rename landed, so the row may be durable — and it is
+            // retained in memory by the fail-closed union merge. The row now
+            // owns the preflight reservation: do NOT abort it and do NOT begin
+            // teardown this pass. The always-on recovery driver re-drives the
+            // retained row without any browser resend.
+            let outcome = self.durability_indeterminate_outcome(
+                &request,
+                expected,
+                true,
+                "transaction boundary durability is unproven (post-rename journal directory sync failed)",
             );
-        }) {
-            // Preflight may reserve provider-side state (notably the shared
-            // OpenCode session). If the durable journal boundary cannot be
-            // recorded, teardown must not begin and that non-destructive
-            // reservation must be released before returning.
-            runtime.abort_preflight(&request, &plan).await;
-            let outcome = self.persistence_failure(&request, expected, error);
             emit(&outcome.messages[0]);
             return outcome;
         }
@@ -2113,13 +2291,17 @@ impl RestartCoordinator {
                     self.insert_result_locked(ownership, &request, terminal.clone());
                 })
             };
-            let mut outcome = match persisted {
-                Ok(()) => RestartOutcome {
-                    messages: vec![terminal],
-                    replayed: false,
+            let mut outcome = self.persisted_outcome(
+                &request,
+                expected,
+                terminal,
+                persisted,
+                if failure.retryable {
+                    IndeterminateEmit::KeepExisting
+                } else {
+                    IndeterminateEmit::ReframeTerminal
                 },
-                Err(error) => self.persistence_failure_with_phase(&request, expected, error, true),
-            };
+            );
             emit(&outcome.messages[0]);
             outcome.messages.insert(0, started);
             return outcome;
@@ -2192,15 +2374,13 @@ impl RestartCoordinator {
                             }
                         },
                     );
-                    let mut outcome = match persisted {
-                        Ok(()) => RestartOutcome {
-                            messages: vec![ServerMessage::AgentRestartFailed(failed)],
-                            replayed: false,
-                        },
-                        Err(error) => {
-                            self.persistence_failure_with_phase(&request, expected, error, true)
-                        }
-                    };
+                    let mut outcome = self.persisted_outcome(
+                        &request,
+                        expected,
+                        ServerMessage::AgentRestartFailed(failed),
+                        persisted,
+                        IndeterminateEmit::KeepExisting,
+                    );
                     emit(&outcome.messages[0]);
                     outcome.messages.insert(0, started);
                     return outcome;
@@ -2224,15 +2404,13 @@ impl RestartCoordinator {
                             self.insert_result_locked(ownership, &request, terminal.clone());
                         },
                     );
-                    let mut outcome = match persisted {
-                        Ok(()) => RestartOutcome {
-                            messages: vec![terminal],
-                            replayed: false,
-                        },
-                        Err(error) => {
-                            self.persistence_failure_with_phase(&request, expected, error, true)
-                        }
-                    };
+                    let mut outcome = self.persisted_outcome(
+                        &request,
+                        expected,
+                        terminal,
+                        persisted,
+                        IndeterminateEmit::ReframeTerminal,
+                    );
                     emit(&outcome.messages[0]);
                     outcome.messages.insert(0, started);
                     return outcome;
@@ -2265,13 +2443,13 @@ impl RestartCoordinator {
                         recovery.last_failure = Some(failed.clone());
                     }
                 });
-            let mut outcome = match persisted {
-                Ok(()) => RestartOutcome {
-                    messages: vec![ServerMessage::AgentRestartFailed(failed)],
-                    replayed: false,
-                },
-                Err(error) => self.persistence_failure_with_phase(&request, expected, error, true),
-            };
+            let mut outcome = self.persisted_outcome(
+                &request,
+                expected,
+                ServerMessage::AgentRestartFailed(failed),
+                persisted,
+                IndeterminateEmit::KeepExisting,
+            );
             emit(&outcome.messages[0]);
             outcome.messages.insert(0, started);
             return outcome;
@@ -2282,7 +2460,7 @@ impl RestartCoordinator {
                 Ok(committed) => committed,
                 Err(error) => {
                     let mut outcome =
-                        self.persistence_failure_with_phase(&request, expected, error, true);
+                        self.commit_persist_failure_outcome(&request, &expected, error);
                     emit(&outcome.messages[0]);
                     outcome.messages.insert(0, started);
                     return outcome;
@@ -2329,7 +2507,7 @@ impl RestartCoordinator {
         let fence = RestartReplacementFence {
             ownership_id: uuid::Uuid::new_v4().to_string(),
         };
-        let persisted =
+        let (persisted, _durability) =
             self.try_update_ownership("record_replacement_spawn_fence", |ownership| {
                 let pending = ownership
                     .pending_recoveries
@@ -2344,8 +2522,8 @@ impl RestartCoordinator {
                     pending.replacement_fence = Some(fence.clone());
                 }
                 Ok::<_, std::io::Error>(pending.replacement_fence.clone())
-            })??;
-        Ok((persisted, false))
+            })?;
+        Ok((persisted?, false))
     }
 
     fn join_completed_replacement(&self, request: &AgentRestart) -> Option<RestartOutcome> {
@@ -2469,13 +2647,18 @@ impl RestartCoordinator {
                         }
                     })
                 };
-                let terminal = match persisted {
-                    Ok(()) => ServerMessage::AgentRestartFailed(failed),
-                    Err(error) => self
-                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
-                        .messages
-                        .remove(0),
-                };
+                let mut outcome = self.persisted_outcome(
+                    &request,
+                    pending.old_runtime,
+                    ServerMessage::AgentRestartFailed(failed),
+                    persisted,
+                    if failure.retryable {
+                        IndeterminateEmit::KeepExisting
+                    } else {
+                        IndeterminateEmit::ReframeTerminal
+                    },
+                );
+                let terminal = outcome.messages.remove(0);
                 emit(&terminal);
                 return RestartOutcome {
                     messages: vec![started, terminal],
@@ -2591,7 +2774,7 @@ impl RestartCoordinator {
                 Ok((_replacement, terminal)) => terminal,
                 Err(error) => {
                     let terminal = self
-                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
+                        .commit_persist_failure_outcome(&request, &pending.old_runtime, error)
                         .messages
                         .remove(0);
                     emit(&terminal);
@@ -2654,18 +2837,16 @@ impl RestartCoordinator {
                             }
                         },
                     );
-                    let terminal = match persisted {
-                        Ok(()) => ServerMessage::AgentRestartFailed(failed),
-                        Err(error) => self
-                            .persistence_failure_with_phase(
-                                &request,
-                                pending.old_runtime,
-                                error,
-                                true,
-                            )
-                            .messages
-                            .remove(0),
-                    };
+                    let terminal = self
+                        .persisted_outcome(
+                            &request,
+                            pending.old_runtime,
+                            ServerMessage::AgentRestartFailed(failed),
+                            persisted,
+                            IndeterminateEmit::KeepExisting,
+                        )
+                        .messages
+                        .remove(0);
                     emit(&terminal);
                     return RestartOutcome {
                         messages: vec![started, terminal],
@@ -2749,13 +2930,20 @@ impl RestartCoordinator {
                         }
                     })
                 };
-                let terminal = match persisted {
-                    Ok(()) => ServerMessage::AgentRestartFailed(failed),
-                    Err(error) => self
-                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
-                        .messages
-                        .remove(0),
-                };
+                let terminal = self
+                    .persisted_outcome(
+                        &request,
+                        pending.old_runtime,
+                        ServerMessage::AgentRestartFailed(failed),
+                        persisted,
+                        if failure.retryable {
+                            IndeterminateEmit::KeepExisting
+                        } else {
+                            IndeterminateEmit::ReframeTerminal
+                        },
+                    )
+                    .messages
+                    .remove(0);
                 emit(&terminal);
                 return RestartOutcome {
                     messages: vec![started, terminal],
@@ -2789,13 +2977,16 @@ impl RestartCoordinator {
                         recovery.last_failure = Some(failed.clone());
                     }
                 });
-            let terminal = match persisted {
-                Ok(()) => ServerMessage::AgentRestartFailed(failed),
-                Err(error) => self
-                    .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
-                    .messages
-                    .remove(0),
-            };
+            let terminal = self
+                .persisted_outcome(
+                    &request,
+                    pending.old_runtime,
+                    ServerMessage::AgentRestartFailed(failed),
+                    persisted,
+                    IndeterminateEmit::KeepExisting,
+                )
+                .messages
+                .remove(0);
             emit(&terminal);
             return RestartOutcome {
                 messages: vec![started, terminal],
@@ -2807,7 +2998,7 @@ impl RestartCoordinator {
             Ok((_replacement, terminal)) => terminal,
             Err(error) => {
                 let terminal = self
-                    .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
+                    .commit_persist_failure_outcome(&request, &pending.old_runtime, error)
                     .messages
                     .remove(0);
                 emit(&terminal);
@@ -2857,7 +3048,7 @@ impl RestartCoordinator {
                 Ok((_replacement, terminal)) => terminal,
                 Err(error) => {
                     let terminal = self
-                        .persistence_failure_with_phase(&request, pending.old_runtime, error, true)
+                        .commit_persist_failure_outcome(&request, &pending.old_runtime, error)
                         .messages
                         .remove(0);
                     emit(&terminal);
@@ -2879,11 +3070,11 @@ impl RestartCoordinator {
         request: &AgentRestart,
         old_runtime: &RuntimeDescriptor,
         replacement_id: String,
-    ) -> std::io::Result<(RuntimeDescriptor, ServerMessage)> {
+    ) -> Result<(RuntimeDescriptor, ServerMessage), ReplacementCommitError> {
         if replacement_id == old_runtime.runtime_id {
-            return Err(std::io::Error::other(
+            return Err(ReplacementCommitError::NotCommitted(std::io::Error::other(
                 "replacement reported the retired runtime id",
-            ));
+            )));
         }
         let locator = RuntimeLocator::from_request(request);
         let replacement = {
@@ -2910,7 +3101,7 @@ impl RestartCoordinator {
             old_runtime: OldRuntimeDescriptor::from(old_runtime.clone()),
             runtime: replacement.clone(),
         });
-        let committed = self.try_update_ownership("commit_replacement", |ownership| {
+        let (committed, durability) = match self.try_update_ownership("commit_replacement", |ownership| {
             if ownership.pending_recoveries.values().any(|pending| {
                 pending.retirement_pending && Self::same_durable_session(&pending.request, request)
             }) {
@@ -2980,7 +3171,10 @@ impl RestartCoordinator {
             }
             Self::prune_ownership_locked(ownership, self.ownership_limit);
             true
-        })?;
+        }) {
+            Ok(committed) => committed,
+            Err(error) => return Err(ReplacementCommitError::NotCommitted(error)),
+        };
         if !committed {
             tracing::error!(
                 request_id = %request.request_id,
@@ -2990,9 +3184,21 @@ impl RestartCoordinator {
                 old_generation = old_runtime.generation,
                 "agent.restart.recovery.adoption_blocked_by_pending_retirement"
             );
-            return Err(std::io::Error::new(
+            return Err(ReplacementCommitError::NotCommitted(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "replacement adoption is blocked until predecessor retirement completes",
+            )));
+        }
+        if durability == UpdateDurability::Indeterminate {
+            // The fail-closed union merge already adopted the candidate
+            // (bindings and results) and retained the pending rows. Do NOT
+            // surface a `replaced` frame whose durability is unproven:
+            // convergence belongs to the always-on recovery driver through the
+            // adoption path.
+            return Err(ReplacementCommitError::Indeterminate(
+                std::io::Error::other(
+                    "post-rename journal directory sync failed at replacement commit",
+                ),
             ));
         }
         tracing::info!(
@@ -3067,6 +3273,109 @@ impl RestartCoordinator {
         }
     }
 
+    /// A journal write whose rename landed but whose directory sync failed
+    /// leaves the transaction record durable-maybe. The fail-closed union
+    /// merge already retained the pending row, so the client is told
+    /// `recovery_pending: true` and server-owned recovery converges the row.
+    /// `retryable` tracks the phase: add-side writes admit a client retry as
+    /// an alternative driver; post-commit ones forbid redundant client action.
+    fn durability_indeterminate_outcome(
+        &self,
+        request: &AgentRestart,
+        descriptor: RuntimeDescriptor,
+        retryable: bool,
+        detail: &str,
+    ) -> RestartOutcome {
+        RestartOutcome {
+            messages: vec![ServerMessage::AgentRestartFailed(AgentRestartFailed {
+                request_id: request.request_id.clone(),
+                provider: request.provider.clone(),
+                session_id: request.session_id.clone(),
+                kind: request.kind,
+                runtime: descriptor,
+                code: AgentRestartFailureCode::PreflightFailed,
+                message: format!(
+                    "{detail}; journal durability is indeterminate — the transaction is retained \
+                     and reconciled by server recovery"
+                ),
+                retryable,
+                recovery_pending: true,
+            })],
+            replayed: false,
+        }
+    }
+
+    /// A terminal failure whose pending row survived an indeterminate write is
+    /// not final: reframe it as non-retryable (a redundant client retry adds
+    /// nothing the recovery driver will not do) and `recovery_pending: true`.
+    fn reframe_recovery_pending(terminal: ServerMessage) -> ServerMessage {
+        match terminal {
+            ServerMessage::AgentRestartFailed(mut failed) => {
+                failed.retryable = false;
+                failed.recovery_pending = true;
+                failed.message = format!(
+                    "{} (journal durability indeterminate — reconciled by server recovery)",
+                    failed.message
+                );
+                ServerMessage::AgentRestartFailed(failed)
+            }
+            other => other,
+        }
+    }
+
+    /// Shared outcome for the failure-record writes: a committed write emits
+    /// its frame unchanged, a not-committed write maps to the existing
+    /// retryable persistence failure, and an indeterminate write follows the
+    /// per-site [`IndeterminateEmit`] policy.
+    fn persisted_outcome(
+        &self,
+        request: &AgentRestart,
+        descriptor: RuntimeDescriptor,
+        terminal: ServerMessage,
+        persisted: std::io::Result<((), UpdateDurability)>,
+        on_indeterminate: IndeterminateEmit,
+    ) -> RestartOutcome {
+        match persisted {
+            Ok(((), UpdateDurability::Committed)) => RestartOutcome {
+                messages: vec![terminal],
+                replayed: false,
+            },
+            Ok(((), UpdateDurability::Indeterminate)) => RestartOutcome {
+                messages: vec![match on_indeterminate {
+                    IndeterminateEmit::KeepExisting => terminal,
+                    IndeterminateEmit::ReframeTerminal => Self::reframe_recovery_pending(terminal),
+                }],
+                replayed: false,
+            },
+            Err(error) => self.persistence_failure_with_phase(request, descriptor, error, true),
+        }
+    }
+
+    /// Map a replacement-commit persistence failure to its outcome frame. A
+    /// `NotCommitted` write keeps the pre-commit world (the existing retryable
+    /// persistence failure); an `Indeterminate` one already adopted the merged
+    /// bindings/results and retained the pending row, so the frame is a
+    /// non-retryable `recovery_pending` failure — never `replaced` — and the
+    /// recovery driver owns convergence.
+    fn commit_persist_failure_outcome(
+        &self,
+        request: &AgentRestart,
+        old_runtime: &RuntimeDescriptor,
+        error: ReplacementCommitError,
+    ) -> RestartOutcome {
+        match error {
+            ReplacementCommitError::NotCommitted(error) => {
+                self.persistence_failure_with_phase(request, old_runtime.clone(), error, true)
+            }
+            ReplacementCommitError::Indeterminate(error) => self.durability_indeterminate_outcome(
+                request,
+                old_runtime.clone(),
+                false,
+                &format!("replacement commit durability is unproven ({error})"),
+            ),
+        }
+    }
+
     fn request_conflict(&self, request: &AgentRestart) -> RestartOutcome {
         let runtime = self
             .runtime_for_locator(&RuntimeLocator::from_request(request))
@@ -3137,7 +3446,10 @@ impl RestartCoordinator {
         match self.try_update_ownership("store_terminal_failure", |ownership| {
             self.insert_result_locked(ownership, &request, terminal.clone());
         }) {
-            Ok(()) => RestartOutcome {
+            // Pre-row terminal failures (preflight/stale/not-found) own no
+            // pending row in any world, so an indeterminate write changes
+            // nothing about the terminal frame's phase flags.
+            Ok(((), _durability)) => RestartOutcome {
                 messages: vec![terminal],
                 replayed,
             },
@@ -4620,23 +4932,47 @@ impl freshell_freshagent::FreshRuntimeRegistry for RestartCoordinator {
     }
 }
 
-fn atomic_write_restart_journal(
-    destination: &Path,
-    temporary: &Path,
-    bytes: &[u8],
-) -> std::io::Result<()> {
+/// Shared parent-directory sync seam for the restart journal. Production uses
+/// the platform default (a real fsync on unix, a no-op elsewhere); tests
+/// inject latched failures through
+/// [`RestartCoordinator::new_persistent_with_test_parent_sync`].
+#[doc(hidden)]
+pub type JournalParentSync = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+/// The platform default journal parent-directory sync: a real fsync on unix
+/// (the only place durability-after-rename is provable), a no-op elsewhere —
+/// so the `Indeterminate` outcome cannot arise off-unix and behavior there is
+/// unchanged.
+fn default_journal_parent_sync() -> JournalParentSync {
     #[cfg(unix)]
     {
-        atomic_write_restart_journal_with_parent_sync(destination, temporary, bytes, |parent| {
-            std::fs::File::open(parent)?.sync_all()
-        })
+        Arc::new(|parent: &Path| std::fs::File::open(parent)?.sync_all())
     }
     #[cfg(not(unix))]
     {
-        atomic_write_restart_journal_with_parent_sync(destination, temporary, bytes, |_parent| {
-            Ok(())
-        })
+        Arc::new(|_parent: &Path| Ok(()))
     }
+}
+
+/// Outcome of one atomic restart-journal write. The three-way split exists
+/// because the post-rename parent-directory sync failure is NOT a clean
+/// "definitely not committed": the rename already landed, so disk holds the
+/// new bytes now while power-loss durability is unproven.
+#[derive(Debug)]
+pub enum JournalWriteOutcome {
+    /// Temp write, fsync, rename, and parent-directory sync all succeeded:
+    /// the new journal is durable.
+    Committed,
+    /// The write failed before or at the atomic rename; the previously
+    /// committed journal (if any) still owns the destination and the
+    /// candidate was discarded.
+    NotCommitted(std::io::Error),
+    /// The atomic rename landed but the parent-directory sync failed, so the
+    /// destination holds the new bytes NOW while durability across a power
+    /// loss is unproven. Fail-closed callers retain the transaction (never
+    /// roll the destination back) and re-sync the directory before the next
+    /// write.
+    Indeterminate(std::io::Error),
 }
 
 fn atomic_write_restart_journal_with_parent_sync(
@@ -4644,27 +4980,29 @@ fn atomic_write_restart_journal_with_parent_sync(
     temporary: &Path,
     bytes: &[u8],
     sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> std::io::Result<()> {
+) -> JournalWriteOutcome {
     use std::io::Write;
 
-    let parent = destination.parent().ok_or_else(|| {
-        std::io::Error::new(
+    let Some(parent) = destination.parent() else {
+        return JournalWriteOutcome::NotCommitted(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "restart journal destination has no parent: {}",
                 destination.display()
             ),
-        )
-    })?;
+        ));
+    };
     if temporary.parent() != Some(parent) {
-        return Err(std::io::Error::new(
+        return JournalWriteOutcome::NotCommitted(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "restart journal temporary file must be a sibling of the destination",
         ));
     }
-    std::fs::create_dir_all(parent)?;
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        return JournalWriteOutcome::NotCommitted(error);
+    }
 
-    let write_result = (|| {
+    let staged = (|| -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -4672,13 +5010,22 @@ fn atomic_write_restart_journal_with_parent_sync(
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(temporary, destination)?;
-        sync_parent(parent)
+        Ok(())
     })();
-    if write_result.is_err() {
+    if let Err(error) = staged {
         let _ = std::fs::remove_file(temporary);
+        return JournalWriteOutcome::NotCommitted(error);
     }
-    write_result
+    if let Err(error) = std::fs::rename(temporary, destination) {
+        let _ = std::fs::remove_file(temporary);
+        return JournalWriteOutcome::NotCommitted(error);
+    }
+    // The rename has landed: the destination holds the new bytes. From here a
+    // failure is indeterminate — remove nothing and never attempt a rollback.
+    match sync_parent(parent) {
+        Ok(()) => JournalWriteOutcome::Committed,
+        Err(error) => JournalWriteOutcome::Indeterminate(error),
+    }
 }
 
 #[cfg(test)]
@@ -4687,20 +5034,26 @@ mod persistence_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn parent_directory_sync_failure_after_rename_is_propagated() {
+    fn parent_directory_sync_failure_after_rename_is_indeterminate() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("restart-transactions.json");
         let temporary = temp.path().join("restart-transactions.test-tmp");
 
-        let error = atomic_write_restart_journal_with_parent_sync(
+        let outcome = atomic_write_restart_journal_with_parent_sync(
             &destination,
             &temporary,
             br#"{"generations":[],"results":[],"pendingRecoveries":[]}"#,
             |_parent| Err(std::io::Error::other("injected directory sync failure")),
-        )
-        .unwrap_err();
+        );
 
-        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert!(
+            matches!(
+                outcome,
+                JournalWriteOutcome::Indeterminate(ref error)
+                    if error.to_string() == "injected directory sync failure"
+            ),
+            "a post-rename directory sync failure is indeterminate, not 'definitely not committed': {outcome:?}"
+        );
         assert!(
             destination.exists(),
             "the injected failure occurs after the atomic rename"
@@ -4709,6 +5062,81 @@ mod persistence_tests {
             !temporary.exists(),
             "no staging file survives a post-rename directory sync failure"
         );
+    }
+
+    #[test]
+    fn dirty_dir_sync_blocks_committed_status_until_a_clean_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restart-state.json");
+        let latched_failures = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::clone(&latched_failures);
+        let injected_sync: JournalParentSync = Arc::new(move |_parent: &Path| {
+            if gate
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        });
+        let coordinator = RestartCoordinator::new_persistent_with_test_parent_sync(
+            path.clone(),
+            16,
+            16,
+            injected_sync,
+        )
+        .unwrap();
+        assert!(
+            !coordinator.journal_dir_sync_dirty(),
+            "a fresh coordinator starts with a proven journal directory"
+        );
+
+        // First write with one latched fault: the rename lands, the injected
+        // sync failure flips the outcome to Indeterminate, and the coordinator
+        // marks the directory unproven instead of discarding anything.
+        latched_failures.store(1, Ordering::SeqCst);
+        coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "dirty-gate-a"),
+            "term-dirty-gate-a",
+        );
+        assert!(
+            coordinator.journal_dir_sync_dirty(),
+            "a post-rename sync failure leaves the journal directory dirty"
+        );
+
+        // While dirty, the pre-write re-sync consumes the next latched fault
+        // and the candidate write never happens: the destination still holds
+        // only the first locator.
+        latched_failures.store(1, Ordering::SeqCst);
+        coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "dirty-gate-b"),
+            "term-dirty-gate-b",
+        );
+        assert!(
+            coordinator.journal_dir_sync_dirty(),
+            "a failed re-sync keeps the journal directory dirty"
+        );
+        let journal = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !journal.contains("dirty-gate-b"),
+            "an unproven directory must block the next write entirely"
+        );
+
+        // With faults exhausted, the pre-write re-sync clears the dirty flag
+        // and the following write commits both pending registrations.
+        coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "dirty-gate-c"),
+            "term-dirty-gate-c",
+        );
+        assert!(
+            !coordinator.journal_dir_sync_dirty(),
+            "a clean re-sync plus a clean write proves the directory again"
+        );
+        let journal = std::fs::read_to_string(&path).unwrap();
+        assert!(journal.contains("dirty-gate-b"));
+        assert!(journal.contains("dirty-gate-c"));
     }
 
     struct HistoricalRecoveryRuntime {

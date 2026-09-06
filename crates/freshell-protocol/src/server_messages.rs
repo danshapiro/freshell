@@ -360,7 +360,10 @@ pub struct AgentRestartFailed {
     pub retryable: bool,
     /// True only when the server durably retained a post-retirement
     /// transaction that the same request (or a correlated follower) can
-    /// continue. Clients must not infer this phase from a separately delivered
+    /// continue, or when durability of the transaction record itself is
+    /// indeterminate (the journal rename landed but the parent-directory sync
+    /// failed) so the retained row is reconciled by server recovery. Clients
+    /// must not infer this phase from a separately delivered
     /// `agent.restart.started` edge because reconnect can reorder delivery.
     #[serde(default)]
     pub recovery_pending: bool,

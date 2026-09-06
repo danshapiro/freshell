@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,10 +13,10 @@ use freshell_protocol::{
     TerminalOutput, TerminalRunStatus, TerminalSessionAssociated,
 };
 use freshell_ws::restart::{
-    run_restart_recovery_driver, ProductionFreshResumePlan, ProductionFreshRuntime,
-    RestartCoordinator, RestartFailure, RestartOutcome, RestartReplacementFence,
-    RestartResumeContext, RestartRetirementAction, RestartRetirementFence, RestartRuntime,
-    RuntimeLocator,
+    run_restart_recovery_driver, JournalParentSync, ProductionFreshResumePlan,
+    ProductionFreshRuntime, RestartCoordinator, RestartFailure, RestartOutcome,
+    RestartReplacementFence, RestartResumeContext, RestartRetirementAction, RestartRetirementFence,
+    RestartRuntime, RuntimeLocator,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -5181,4 +5182,358 @@ async fn recovery_driver_stops_when_shutdown_precedes_spawn() {
     );
     drop(reopened);
     std::fs::remove_dir_all(restart_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Indeterminate durable-commit semantics (fix 3). A journal rename that lands
+// but whose parent-directory fsync fails leaves the transaction record
+// durable-maybe: the coordinator must stay fail-closed (retain the pending
+// row through the fail-closed union merge), report `recovery_pending: true`
+// without proceeding, and let the always-on driver converge the retained row
+// once the directory can be re-synced.
+// ---------------------------------------------------------------------------
+
+/// Parent-directory sync injection for the indeterminate-commit tests: every
+/// invocation consumes one latched failure; with an empty budget the sync
+/// succeeds. Tests arm the budget at the exact phase they want to fault.
+struct ParentSyncFault {
+    latched: AtomicUsize,
+}
+
+impl ParentSyncFault {
+    fn latch(&self, failures: usize) {
+        self.latched.store(failures, Ordering::SeqCst);
+    }
+
+    fn gate(self: &Arc<Self>) -> JournalParentSync {
+        let this = Arc::clone(self);
+        Arc::new(move |_parent: &Path| {
+            if this
+                .latched
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Records the lifecycle calls a fail-closed indeterminate write must and must
+/// not make. The default recovery seams re-drive preflight/shutdown/create, so
+/// the same recorder serves the direct pass and the driver's convergence pass.
+struct IndeterminateRecorderRuntime {
+    aborts: AtomicUsize,
+    shutdowns: AtomicUsize,
+    creates: AtomicUsize,
+    replacement_id: &'static str,
+    arm_on_create: Option<Arc<ParentSyncFault>>,
+}
+
+impl IndeterminateRecorderRuntime {
+    fn new(replacement_id: &'static str) -> Self {
+        Self {
+            aborts: AtomicUsize::new(0),
+            shutdowns: AtomicUsize::new(0),
+            creates: AtomicUsize::new(0),
+            replacement_id,
+            arm_on_create: None,
+        }
+    }
+
+    /// Latch exactly one sync fault at replacement-creation time, so the very
+    /// next journal write — the replacement commit — is the indeterminate one.
+    fn arming_on_create(mut self, fault: &Arc<ParentSyncFault>) -> Self {
+        self.arm_on_create = Some(Arc::clone(fault));
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for IndeterminateRecorderRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn abort_preflight(&self, _request: &AgentRestart, _plan: &()) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        if let Some(fault) = &self.arm_on_create {
+            fault.latch(1);
+        }
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        Ok(self.replacement_id.to_string())
+    }
+}
+
+#[tokio::test] // real time, bounded (drives the always-on recovery driver)
+async fn indeterminate_journal_write_during_record_shutdown_pending_keeps_row_and_reports_recovery_pending(
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let fault = Arc::new(ParentSyncFault {
+        latched: AtomicUsize::new(0),
+    });
+    let coordinator = RestartCoordinator::new_persistent_with_test_parent_sync(
+        path.clone(),
+        16,
+        16,
+        fault.gate(),
+    )
+    .unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(IndeterminateRecorderRuntime::new(
+        "term-after-indeterminate-add",
+    ));
+    let _registration = coordinator.set_runtime(runtime.clone());
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+
+    // The fault is latched for exactly the add-side write (the registration
+    // above committed clean against an empty budget).
+    fault.latch(1);
+    let request = restart("indeterminate-add-r1", "term-1", 1);
+    let outcome = coordinator
+        .execute_registered(request, move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+
+    // One durable-maybe frame and no phase progression: the rename landed, so
+    // the row is retained (fail-closed) instead of the candidate being
+    // discarded, and teardown must not begin this pass.
+    assert!(
+        matches!(
+            outcome.messages.as_slice(),
+            [ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == "indeterminate-add-r1"
+                    && failed.retryable
+                    && failed.recovery_pending
+        ),
+        "the add-side indeterminate write must surface one retryable recovery-pending failure: {:?}",
+        outcome.messages
+    );
+    assert!(
+        !outcome.messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::AgentRestartStarted(_) | ServerMessage::AgentRestartReplaced(_)
+        )),
+        "no started/replaced phase may be emitted for an indeterminate add"
+    );
+    assert_eq!(
+        runtime.aborts.load(Ordering::SeqCst),
+        0,
+        "the preflight reservation must NOT be aborted: the retained row owns it"
+    );
+    assert_eq!(
+        runtime.shutdowns.load(Ordering::SeqCst),
+        0,
+        "teardown must not begin while the boundary write is indeterminate"
+    );
+    // Fail-closed on both sides: the row is in memory AND on disk (the rename
+    // landed even though the directory sync failed).
+    let pending = coordinator.pending_recoveries();
+    assert!(
+        pending
+            .iter()
+            .any(|row| row.request_id == "indeterminate-add-r1" && row.retirement_pending),
+        "the indeterminate add must retain the pending row in memory: {pending:?}"
+    );
+    let journal = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        journal.contains("indeterminate-add-r1"),
+        "the rename landed, so the journal already names the retained row"
+    );
+
+    // The always-on driver re-drives the retained row with no browser resend;
+    // the single latched fault is spent, so recovery commits clean.
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let driver_sink = Arc::clone(&emitted);
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        coordinator.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        move |message| driver_sink.lock().unwrap().push(message.clone()),
+    ));
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || coordinator
+            .pending_recoveries()
+            .is_empty())
+        .await,
+        "the driver must drain the retained row once the fault is spent"
+    );
+    assert_eq!(
+        runtime.shutdowns.load(Ordering::SeqCst),
+        1,
+        "recovery runs teardown exactly once for the retained row"
+    );
+    assert_eq!(runtime.aborts.load(Ordering::SeqCst), 0);
+    assert!(
+        wait_until(std::time::Duration::from_secs(1), || {
+            emitted.lock().unwrap().iter().any(|message| {
+                matches!(
+                    message,
+                    ServerMessage::AgentRestartReplaced(replaced)
+                        if replaced.request_id == "indeterminate-add-r1"
+                            && replaced.runtime.runtime_id == "term-after-indeterminate-add"
+                )
+            })
+        })
+        .await,
+        "recovery convergence delivers the replaced frame through the driver sink"
+    );
+
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("driver exits on shutdown")
+        .expect("driver task did not panic");
+    drop(_registration);
+}
+
+#[tokio::test] // real time, bounded (drives the always-on recovery driver)
+async fn indeterminate_journal_write_during_commit_keeps_pending_row_and_defers_replaced_frame() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let fault = Arc::new(ParentSyncFault {
+        latched: AtomicUsize::new(0),
+    });
+    let coordinator = RestartCoordinator::new_persistent_with_test_parent_sync(
+        path.clone(),
+        16,
+        16,
+        fault.gate(),
+    )
+    .unwrap();
+    coordinator.register_initial(locator(), "term-1");
+    let runtime = Arc::new(
+        IndeterminateRecorderRuntime::new("term-after-indeterminate-commit")
+            .arming_on_create(&fault),
+    );
+    let _registration = coordinator.set_runtime(runtime.clone());
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+
+    // The add-side and retirement writes commit clean; `create_replacement`
+    // latches the fault so exactly the commit write is indeterminate.
+    let request = restart("indeterminate-commit-r1", "term-1", 1);
+    let outcome = coordinator
+        .execute_registered(request.clone(), move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+
+    // The replacement exists, but its commit is durable-maybe: the client gets
+    // a recovery-pending failure — never a `replaced` frame we cannot prove.
+    assert!(
+        matches!(
+            outcome.messages.as_slice(),
+            [ServerMessage::AgentRestartStarted(_), ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == "indeterminate-commit-r1"
+                    && !failed.retryable
+                    && failed.recovery_pending
+        ),
+        "the commit-side indeterminate write must end in a non-retryable recovery-pending failure: {:?}",
+        outcome.messages
+    );
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.creates.load(Ordering::SeqCst), 1);
+    // Fail-closed union merge: the candidate's bindings/results were adopted
+    // (the replacement is registered) while the pending row was retained.
+    let pending = coordinator.pending_recoveries();
+    assert!(
+        pending
+            .iter()
+            .any(|row| row.request_id == "indeterminate-commit-r1"),
+        "the indeterminate commit must retain the pending row in memory: {pending:?}"
+    );
+    assert_eq!(
+        coordinator.runtime_for_locator(&locator()),
+        Some(RuntimeDescriptor {
+            runtime_id: "term-after-indeterminate-commit".to_string(),
+            generation: 2,
+        }),
+        "the fail-closed merge adopts the candidate's replacement binding"
+    );
+
+    // The always-on driver converges the retained row through the adoption
+    // path (no second teardown, no second spawn).
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let driver_sink = Arc::clone(&emitted);
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        coordinator.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        move |message| driver_sink.lock().unwrap().push(message.clone()),
+    ));
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || coordinator
+            .pending_recoveries()
+            .is_empty())
+        .await,
+        "the driver must converge the retained row through adoption"
+    );
+    assert_eq!(
+        runtime.creates.load(Ordering::SeqCst),
+        1,
+        "convergence adopts the registered replacement instead of spawning again"
+    );
+    assert_eq!(runtime.shutdowns.load(Ordering::SeqCst), 1);
+    assert!(
+        wait_until(std::time::Duration::from_secs(1), || {
+            emitted.lock().unwrap().iter().any(|message| {
+                matches!(
+                    message,
+                    ServerMessage::AgentRestartReplaced(replaced)
+                        if replaced.request_id == "indeterminate-commit-r1"
+                            && replaced.runtime.runtime_id == "term-after-indeterminate-commit"
+                )
+            })
+        })
+        .await,
+        "the deferred replaced frame arrives only after a clean commit"
+    );
+
+    // A duplicate of the same request now replays the committed terminal
+    // result (the adoption flow's idempotent-convergence contract of
+    // pending_retry_adopts_registered_replacement_after_ambiguous_durable_commit).
+    let replay = coordinator.execute_registered(request, |_| {}).await;
+    assert!(replay.replayed);
+    assert!(matches!(
+        replay.messages.as_slice(),
+        [ServerMessage::AgentRestartReplaced(replaced)]
+            if replaced.request_id == "indeterminate-commit-r1"
+                && replaced.runtime.runtime_id == "term-after-indeterminate-commit"
+    ));
+
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("driver exits on shutdown")
+        .expect("driver task did not panic");
+    drop(_registration);
 }
