@@ -698,28 +698,13 @@ mod tests {
             }
         };
 
-        // FIX (council-mandated rollback): a partial write failure (e.g.
-        // ENOSPC/permissions) after create_dir_all succeeded must not leave
-        // a metadata-less directory behind -- `stub_is_unused` conservatively
-        // KEEPS an unparseable/missing metadata.json forever (never
-        // GC-able), and a LATER `ensure_session` call for the same id would
-        // silently ADOPT such a half-written dir via the bare
-        // `candidate.is_dir()` "found" check above, treating broker litter
-        // as a legitimate session.
-        //
-        // Injection: this function's "found" check treats ANY pre-existing
-        // directory at the session leaf as legitimate (see the test above),
-        // so the write failure can only be injected via the mode the LEAF
-        // gets at creation time -- not via any pre-arranged file/dir at that
-        // exact path. We pre-create every ancestor NORMALLY (writable) up to
-        // (not including) the leaf. In this child, umask 0o222 makes the
-        // freshly-created leaf directory mode 0o555 (r-xr-xr-x): create_dir_all still succeeds
-        // (mkdir only needs write+execute on the PARENT, which stays
-        // normal), but writing metadata.json into the new leaf fails
-        // (EACCES -- the leaf itself now lacks the write bit), while the
-        // leaf remains readable+executable so the rollback's own
-        // `remove_dir_all` (which must read_dir an empty leaf before
-        // rmdir-ing it) can still succeed.
+        // A failed write must not leave a metadata-less session directory:
+        // GC would keep it, and a later ensure_session would adopt it.
+        // Pre-create only the writable ancestors so ensure_session must
+        // create the leaf itself. In this child, umask 0o222 gives the new
+        // leaf mode 0o555: mkdir succeeds using the writable parent, but
+        // writing metadata.json fails with EACCES. The leaf stays readable
+        // and searchable, so remove_dir_all can roll it back via its parent.
         let cwd_dir = home.join("workdir");
         std::fs::create_dir_all(&cwd_dir).unwrap();
         let canonical = std::fs::canonicalize(&cwd_dir).unwrap();
