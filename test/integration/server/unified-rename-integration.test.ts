@@ -291,6 +291,58 @@ describe('Unified rename cascade — integration', () => {
     expect(Object.keys(row)).not.toContain('titleOverride')
     expect(Object.keys(row)).not.toContain('titleSource')
   })
+
+  // ────────────────────────────────────────────────────────────
+  // Test 7: A title-only session PATCH preserves stored archived:true
+  // ────────────────────────────────────────────────────────────
+  it('a title-only session PATCH preserves stored archived:true', async () => {
+    const provider: CodingCliProviderName = 'claude'
+    const sessionId = 'session-title-keeps-archive'
+    const compositeKey = makeSessionKey(provider, sessionId)
+
+    // Seed an archive flag directly (the state a sidebar "Archive" action leaves).
+    await configStore.patchSessionOverride(compositeKey, { archived: true })
+
+    // A title-only patch never mentions `archived`: the absent key must leave
+    // the stored value untouched. ConfigStore merges {...existing, ...patch}
+    // and the JSON save drops keys spread as undefined, so an unconditional
+    // `archived` spread in the route would erase it.
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'New Name' })
+      .expect(200)
+
+    const stored = await configStore.getSessionOverride(compositeKey)
+    expect(stored?.archived).toBe(true)
+    expect(stored?.titleOverride).toBe('New Name')
+    expect(stored?.titleSource).toBe('user')
+  })
+
+  // ────────────────────────────────────────────────────────────
+  // Test 8: A title-only session PATCH does not resurrect deleted:true
+  // ────────────────────────────────────────────────────────────
+  it('a title-only session PATCH does not resurrect deleted:true', async () => {
+    const provider: CodingCliProviderName = 'claude'
+    const sessionId = 'session-title-keeps-delete'
+    const compositeKey = makeSessionKey(provider, sessionId)
+
+    // Seed a soft delete (the state the DELETE endpoint leaves).
+    await configStore.patchSessionOverride(compositeKey, { deleted: true })
+
+    // A title-only patch never mentions `deleted`: spreading it as undefined
+    // would drop the key on save and resurrect the session in listings.
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'X' })
+      .expect(200)
+
+    const stored = await configStore.getSessionOverride(compositeKey)
+    expect(stored?.deleted).toBe(true)
+    expect(stored?.titleOverride).toBe('X')
+    expect(stored?.titleSource).toBe('user')
+  })
 })
 
 // ────────────────────────────────────────────────────────────────
@@ -341,17 +393,22 @@ function buildTestApp(
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
     const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
 
-    const { titleOverride, archived } = req.body || {}
+    const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = req.body || {}
+    const clean = (v: unknown) => (typeof v === 'string' ? v.trim() || undefined : undefined)
+    // Mirror production: every field is key-presence guarded — an absent key
+    // leaves the stored value untouched instead of spreading undefined over it.
+    const touched = (key: string) => Object.prototype.hasOwnProperty.call(req.body ?? {}, key)
     const next = await configStore.patchSessionOverride(compositeKey, {
-      ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, 'titleOverride')
+      ...(touched('titleOverride')
         ? {
-            titleOverride: typeof titleOverride === 'string' ? titleOverride.trim() || undefined : undefined,
-            titleSource: typeof titleOverride === 'string' && titleOverride.trim() ? ('user' as const) : undefined,
+            titleOverride: clean(titleOverride),
+            titleSource: clean(titleOverride) ? ('user' as const) : undefined,
           }
         : {}),
-      // Mirror production: archived passes through only when present, so an
-      // absent titleOverride key leaves any existing title override untouched.
-      ...(archived !== undefined ? { archived: Boolean(archived) } : {}),
+      ...(touched('summaryOverride') ? { summaryOverride: clean(summaryOverride) } : {}),
+      ...(touched('deleted') ? { deleted } : {}),
+      ...(touched('archived') ? { archived } : {}),
+      ...(touched('createdAtOverride') ? { createdAtOverride } : {}),
     })
 
     // session→terminal cascade (unchanged, inlined from cascadeSessionRenameToTerminal)
