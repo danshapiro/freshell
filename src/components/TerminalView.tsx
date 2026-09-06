@@ -152,6 +152,7 @@ import {
   type TerminalRuntime,
 } from '@/components/terminal/terminal-runtime'
 import { createLayoutScheduler } from '@/components/terminal/layout-scheduler'
+import { shouldYieldProgrammaticTerminalFocus } from '@/components/terminal/focus-policy'
 import {
   createTerminalWriteQueue,
   type TerminalWriteQueue,
@@ -1290,9 +1291,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     requestAnimationFrame(() => {
       if (termRef.current !== term) return
+      // kata r49m: a stale activation frame must not steal focus from an
+      // inline editor (e.g. the pane-rename input); the diverted keystrokes
+      // would be consumed by xterm and lost.
+      if (shouldYieldProgrammaticTerminalFocus()) {
+        log.debug('programmatic terminal focus yielded to inline editor', { paneId, tabId, source: 'active-pane-effect' })
+        return
+      }
       term.focus()
     })
-  }, [isTerminal, shouldFocusActiveTerminal])
+    // paneId/tabId are mount-stable props; listed only so the debug-log
+    // payload above satisfies exhaustive-deps without new warnings.
+  }, [isTerminal, shouldFocusActiveTerminal, paneId, tabId])
 
   useEffect(() => {
     lastSessionActivityAtRef.current = 0
@@ -1733,9 +1743,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       try { term.scrollToBottom() } catch { /* disposed */ }
     }
     if (shouldFocus) {
-      term.focus()
+      // kata r49m: same yield policy for the coalesced layout flush.
+      if (shouldYieldProgrammaticTerminalFocus()) {
+        log.debug('programmatic terminal focus yielded to inline editor', { paneId: paneIdRef.current, tabId, source: 'layout-flush' })
+      } else {
+        term.focus()
+      }
     }
-  }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws])
+    // tabId is a mount-stable prop; listed only so the debug-log payload
+    // above satisfies exhaustive-deps without new warnings.
+  }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws, tabId])
 
   const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
     if (!data) return false
