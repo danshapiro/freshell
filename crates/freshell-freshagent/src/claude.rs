@@ -10055,6 +10055,81 @@ rl.on('line', (line) => {
         pid
     }
 
+    /// A one-page pipe must provide the same parked compact-write window as
+    /// a larger pipe. Exercise the real fixture and handler, then verify that
+    /// the request reaches the reader only after it resumes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_small_fixture_pipe_blocks_compact_until_the_reader_resumes() {
+        use std::os::fd::AsRawFd as _;
+
+        let (st, _rx) = state_with_bus();
+        let stdin_log =
+            insert_rollback_fixture_session_no_probe(&st, "rb-small-pipe", "dur-small-pipe").await;
+        {
+            let guard = st.sessions.lock().await;
+            let session = guard.get("rb-small-pipe").expect("tracked session");
+            // Only this test's empty, owned pipe changes. Linux rounds the
+            // request up to one page, including on hosts with larger pages.
+            let capacity = unsafe { libc::fcntl(session.stdin.as_raw_fd(), libc::F_SETPIPE_SZ, 1) };
+            assert!(
+                capacity > 0,
+                "shrink the owned pipe: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(capacity as libc::c_long, unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE)
+            });
+        }
+        let pid = freeze_fixture_stdin(&st, "rb-small-pipe").await;
+        let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-small-pipe").await;
+        {
+            // Keep polling the SAME future after the timeout: cancellation
+            // must not restart the compact or submit a duplicate request.
+            let compact = st.handle_compact(compact_msg("rb-small-pipe", None));
+            tokio::pin!(compact);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut compact)
+                    .await
+                    .is_err(),
+                "the real compact write stays pending while the reader is stopped"
+            );
+            assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                turn_tracker.lock().expect("turn tracker lock").running,
+                Some(TrackedOp::Compact),
+                "the compact reached its write await after arming the tracker"
+            );
+            assert!(
+                st.sessions.try_lock().is_err(),
+                "the pending write holds the session lock"
+            );
+            assert_eq!(std::fs::read(&stdin_log).unwrap_or_default(), b"");
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+            tokio::time::timeout(Duration::from_secs(15), &mut compact)
+                .await
+                .expect("the compact write completes once the owned reader resumes");
+        }
+
+        // Close the writer and reap this fixture before reading its complete
+        // byte log. kill_on_drop also owns cleanup if an earlier assert fails.
+        let mut session = st.sessions.lock().await.remove("rb-small-pipe").unwrap();
+        drop(session.stdin);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(15), session.child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let received = std::fs::read_to_string(stdin_log).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(received.trim_start_matches('x')).unwrap(),
+            json!({ "type": "send", "sessionId": "rb-small-pipe", "text": "/compact" }),
+            "the reader receives exactly one complete compact request after the fill bytes"
+        );
+    }
+
     /// ep1-r3 F3 CORE — the arm/await race: the stdout consumer folds terminal
     /// events WITHOUT the turn lock, so the queued compact's tracker MUST be
     /// armed BEFORE the sidecar write await — otherwise the prior turn's
