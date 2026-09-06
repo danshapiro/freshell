@@ -1940,6 +1940,9 @@ fn capture_terminal_restart_launch(
 /// seam as `RespawnError::LaunchUnresolvable`. Restore-class callers thread
 /// their per-connection cancel watch; the WS interactive and auto-resume
 /// doors pass `None` (never-fired watch minted in the manager).
+/// Restart adds `+restart_launch`/`+replacement_ownership_id` — same idiom as
+/// the three other attributed functions in this file.
+#[allow(clippy::too_many_arguments)]
 async fn plan_codex_managed_launch(
     state: &WsState,
     mode: &str,

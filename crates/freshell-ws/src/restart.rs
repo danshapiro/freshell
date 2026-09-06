@@ -4959,7 +4959,7 @@ fn default_journal_parent_sync() -> JournalParentSync {
 /// "definitely not committed": the rename already landed, so disk holds the
 /// new bytes now while power-loss durability is unproven.
 #[derive(Debug)]
-pub enum JournalWriteOutcome {
+pub(crate) enum JournalWriteOutcome {
     /// Temp write, fsync, rename, and parent-directory sync all succeeded:
     /// the new journal is durable.
     Committed,
@@ -4969,7 +4969,9 @@ pub enum JournalWriteOutcome {
     NotCommitted(std::io::Error),
     /// The atomic rename landed but the parent-directory sync failed, so the
     /// destination holds the new bytes NOW while durability across a power
-    /// loss is unproven. Fail-closed callers retain the transaction (never
+    /// loss is unproven — OR the directory was still unproven from an earlier
+    /// Indeterminate write, so this write was never attempted (no fresh
+    /// rename happened). Fail-closed callers retain the transaction (never
     /// roll the destination back) and re-sync the directory before the next
     /// write.
     Indeterminate(std::io::Error),
