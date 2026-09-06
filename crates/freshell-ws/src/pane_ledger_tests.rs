@@ -7950,11 +7950,13 @@ fn reattach_never_moves_attribution_backwards() {
 
 #[cfg(unix)]
 #[test]
-fn load_index_dir_io_errors_are_loud_not_silently_empty() {
-    // H2 (kata s52d companion): an I/O failure while listing the store must
-    // NEVER surface as a silently-empty index. `bindings` forged as a
+fn load_index_dir_io_errors_disable_the_ledger_loudly() {
+    // H2→qzka evolution: an I/O failure while listing the store must never
+    // surface as a silently-empty index — and since qzka it must also never
+    // leave a blind ENABLED ledger: the scan fault DISABLES the ledger with
+    // one loud `pane_ledger_scan_unavailable` event. `bindings` forged as a
     // REGULAR FILE makes read_dir deterministic-ENOTDIR on any uid (chmod
-    // tricks are root-skip-flaky); same for `pending`.
+    // tricks are root-skip-flaky).
     let root = temp_root("load-loud-dir");
     std::fs::write(root.join("bindings"), b"not a dir").unwrap();
     std::fs::write(root.join("pending"), b"not a dir").unwrap();
@@ -7966,19 +7968,23 @@ fn load_index_dir_io_errors_are_loud_not_silently_empty() {
         .iter()
         .filter(|e| {
             e.target == "freshell_ws::pane_ledger"
-                && e.message.contains("pane_ledger_load_index_dir_unreadable")
+                && e.message.contains("pane_ledger_scan_unavailable")
         })
         .collect();
     assert_eq!(
         hits.len(),
-        2,
-        "one ERROR per unreadable top-level dir (bindings + pending); got: {events:?}"
+        1,
+        "exactly one constructor ERROR for the scan fault; got: {events:?}"
     );
-    assert!(hits.iter().all(|h| h.fields.contains_key("path")));
+    assert!(hits[0].fields.contains_key("root"));
     drop(events);
     assert!(
+        !ledger.is_enabled(),
+        "a store that exists but cannot be read comes up DISABLED, never blind"
+    );
+    assert!(
         !ledger.ever_bound("claude", "anything"),
-        "index correctly empty; loudness is the contract"
+        "a disabled ledger's reads answer empty"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -8018,5 +8024,119 @@ fn load_index_row_io_errors_are_loud_per_row() {
     assert_eq!(hits[0].fields.get("path"), Some(&want_path));
     drop(events);
     assert!(ledger.list_bindings().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+/// kata qzka: a scan-level fault must NEVER yield a blind ENABLED ledger —
+/// `bindings` as a regular FILE fails read_dir with ENOTDIR on every
+/// platform (uid-independent, no chmod).
+#[test]
+fn new_comes_up_disabled_when_bindings_dir_is_unreadable() {
+    let root = temp_root("new-blind");
+    std::fs::write(root.join("bindings"), b"not a directory").unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(
+        !ledger.is_enabled(),
+        "a store whose bindings dir cannot be read must come up DISABLED, \
+         never ENABLED-and-blind"
+    );
+    assert!(
+        !ledger.ever_bound("claude", "s1"),
+        "a disabled ledger's reads answer empty"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The kata's headline scenario: a REAL, durably-written store exists; the
+/// restarted process cannot read it. Pre-change the restart came up ENABLED
+/// and blind to s1; now it comes up DISABLED (loud). gen1 uses the lock-free
+/// constructor so this test performs exactly ONE flock acquisition (gen2) —
+/// no drop/re-acquire ordering involved (f3wp flake lesson).
+#[test]
+fn new_locked_comes_up_disabled_when_bindings_dir_is_unreadable() {
+    let root = temp_root("locked-blind");
+    let gen1 = PaneLedger::new(Some(root.clone()));
+    gen1.record_binding(&write("claude", "s1", "t1", 1))
+        .unwrap();
+    assert!(gen1.ever_bound("claude", "s1"));
+    let bindings = root.join("bindings");
+    let stash = root.join("bindings.stash");
+    std::fs::rename(&bindings, &stash).unwrap();
+    std::fs::write(&bindings, b"not a directory").unwrap();
+    let gen2 = PaneLedger::new_locked(Some(root.clone()));
+    assert!(
+        !gen2.is_enabled(),
+        "restart over an unreadable bindings dir must come up DISABLED \
+         (loud), not ENABLED-and-blind to the durably-written s1"
+    );
+    assert!(!gen2.ever_bound("claude", "s1"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Same policy for the pending region of the scan.
+#[test]
+fn new_comes_up_disabled_when_pending_dir_is_unreadable() {
+    let root = temp_root("new-blind-pending");
+    std::fs::write(root.join("pending"), b"not a directory").unwrap();
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(
+        !ledger.is_enabled(),
+        "an unreadable pending dir is a scan-level fault: DISABLED, never blind"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The other half of the kata's distinction: "no index yet" (first boot — the
+/// scan dirs are simply absent) is NOT a fault. NotFound must map to an
+/// ENABLED empty index, or every first boot would self-disable. (Regression
+/// pin: passes before AND after the change.)
+#[test]
+fn new_locked_first_boot_absent_dirs_is_enabled_and_empty() {
+    let root = temp_root("first-boot");
+    let ledger = PaneLedger::new_locked(Some(root.clone()));
+    assert!(
+        ledger.is_enabled(),
+        "absent bindings/pending dirs (first boot) is not a fault"
+    );
+    assert!(ledger.list_bindings().is_empty());
+    assert!(!ledger.ever_bound("claude", "s1"));
+    // ...and the ENABLED first-boot ledger is fully functional.
+    ledger
+        .record_binding(&write("claude", "s1", "t1", 1))
+        .unwrap();
+    assert!(ledger.ever_bound("claude", "s1"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// kata qzka: the quarantine walk must never silently skip a store region —
+/// a region that turned unreadable AFTER construction is recorded in the
+/// report (and ERROR-logged), while healthy regions still get their per-row
+/// quarantine (never per-store).
+#[test]
+fn boot_scan_records_scan_faults_and_still_quarantines_each_bad_row() {
+    let root = temp_root("scan-fault-report");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    assert!(ledger.is_enabled());
+    // Healthy region: a corrupt PENDING row to quarantine.
+    let pending_dir = root.join("pending");
+    std::fs::create_dir_all(&pending_dir).unwrap();
+    std::fs::write(pending_dir.join("t-bad.json"), b"not json").unwrap();
+    // Faulted region: bindings becomes unreadable after construction.
+    std::fs::write(root.join("bindings"), b"not a directory").unwrap();
+    let never_absent = |_: &str, _: &str| false;
+    let report = ledger.boot_scan(2_000, &never_absent, None);
+    assert!(
+        report.scan_errors.iter().any(|e| e.contains("bindings")),
+        "scan_errors must name the faulted bindings dir, got: {:?}",
+        report.scan_errors
+    );
+    assert_eq!(
+        report.quarantined.len(),
+        1,
+        "the healthy pending region's corrupt row must still be quarantined"
+    );
+    assert!(
+        !pending_dir.join("t-bad.json").exists(),
+        "the corrupt row was renamed aside"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
