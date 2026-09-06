@@ -1159,6 +1159,13 @@ async fn main() -> ExitCode {
                 "pane_ledger_boot: rows quarantined (see per-row errors above)"
             );
         }
+        if !report.scan_errors.is_empty() {
+            tracing::error!(
+                count = report.scan_errors.len(),
+                "pane_ledger_boot: store scan faults during boot hygiene \
+                 (see per-path pane_ledger_scan_fault errors above)"
+            );
+        }
     }
 
     // Codex sidecar boot reconcile (Task 10, katas ynfn/da92): load the

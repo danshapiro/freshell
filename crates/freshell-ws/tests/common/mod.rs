@@ -382,16 +382,37 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
 }
 
 /// [`spawn_server_with_specs`], with the auto-resume hub SPAWNED (Task 5) on
-/// an injected backoff schedule. Delays ride the spawn helper — NOT the
+/// an injected backoff schedule, plus the harness-default identity-grace
+/// schedule (`vec![25, 25]` — tiny, so a genuinely identity-less crashing
+/// pane still exercises the grace path cheaply; claude-driven tests never
+/// engage it because their preallocated identity is present at the crash
+/// decision). Delays ride the spawn helper — NOT the
 /// `FRESHELL_AUTO_RESUME_DELAYS_MS` env — because the harness is in-process
 /// and a `std::env::set_var` would leak across parallel tests in the same
 /// binary. Task 2's event tests keep using
 /// [`spawn_server_with_specs_and_auto_resume_rx`] (hub OFF, rx taken by the
-/// test).
+/// test). Thin wrapper over [`spawn_server_with_specs_hub_and_state`]
+/// dropping the returned state.
 pub async fn spawn_server_with_specs_and_auto_resume_hub(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
     delays: Vec<u64>,
 ) -> (String, freshell_terminal::TerminalRegistry) {
+    let (url, registry, _state) =
+        spawn_server_with_specs_hub_and_state(cli_commands, delays, vec![25, 25]).await;
+    (url, registry)
+}
+
+/// [`spawn_server_with_specs`], with the auto-resume hub SPAWNED on injected
+/// backoff AND identity-grace schedules (kata kmbs, Task 2), additionally
+/// handing back a CLONE of the `WsState` (the
+/// [`spawn_server_with_specs_and_state`] precedent) so tests can drive
+/// connection-independent server-side seams directly — the grace-success e2e
+/// upserts `state.identity` mid-grace. Same env-leak rationale as above.
+pub async fn spawn_server_with_specs_hub_and_state(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    delays: Vec<u64>,
+    identity_grace_delays: Vec<u64>,
+) -> (String, freshell_terminal::TerminalRegistry, WsState) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -455,13 +476,14 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    freshell_ws::auto_resume::spawn_auto_resume_hub_with_delays(
+    freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(
         state.clone(),
         auto_resume_rx,
         delays,
+        identity_grace_delays,
     );
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -470,7 +492,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws", addr = addr), registry)
+    (format!("ws://{addr}/ws", addr = addr), registry, state)
 }
 
 /// [`spawn_server_with_specs`], additionally handing back a CLONE of the

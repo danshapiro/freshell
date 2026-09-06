@@ -5,7 +5,10 @@
 //! loopback port (shared `common` harness convention). The claude CLI command
 //! is a plain-`sh` shim (the `auto_resume_respawn.rs` convention): one
 //! variant crashes every generation (retry-exhaustion path), one crashes only
-//! its FIRST generation (the reconcile-after-replacement pin).
+//! its FIRST generation (the reconcile-after-replacement pin). A codex-mode
+//! crash-once shim (codex preallocates NO identity — the registry starts
+//! EMPTY for the created terminal, the mechanism-B precondition) drives the
+//! kata-kmbs identity-grace pins.
 
 mod common;
 
@@ -123,9 +126,8 @@ fn format_ignored_frames(ignored: &std::collections::VecDeque<String>) -> String
 /// is RECORDED (its `type` plus `tid`/`status`/`code`/`reason`/`attempt`/
 /// `sessionRef` when present, last 10 in a ring — the settle-diagnostic field
 /// set widened at delta-r2 plan addition #5(a) so every future mechanism-B
-/// occurrence self-names its settle tail for the follow-up task, and `tid`
-/// added at delta-r6 so the waiver classifier can correlate the settle frame
-/// to the crashed terminal) and dumped
+/// occurrence self-names its settle tail, and `tid` added at delta-r6 so a
+/// settle frame in the ring correlates to the crashed terminal) and dumped
 /// into BOTH panic arms — the catch-all `other` arm (which
 /// fires on the final `Err(Elapsed)` when the peer simply stops sending, the
 /// exact mechanism-B receipt shape; delta-review r1) and the end-of-loop
@@ -149,12 +151,10 @@ async fn wait_frame_matching(
     // those fields (the wire TerminalStatus settle/recovering shapes carry
     // `reason`/`attempt`; error frames carry `code`; `terminal.replaced`
     // carries `oldTerminalId`/`newTerminalId`, rendered as oldTid/newTid —
-    // delta-r7, the waiver classifier's same-terminal replacement guard).
-    // `tid` (delta-review r6):
-    // the mechanism-B waiver classifier
-    // (scripts/classify-resume-waiver.ts) must correlate a settle frame to
-    // its terminal — without `terminalId` the ring cannot distinguish the
-    // crashed terminal's settle tail from an unrelated terminal's frames.
+    // delta-r7's same-terminal replacement guard).
+    // `tid` (delta-review r6): without `terminalId` the ring cannot
+    // distinguish the crashed terminal's settle tail from an unrelated
+    // terminal's frames.
     let mut ignored: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -171,10 +171,9 @@ async fn wait_frame_matching(
                     // delta-r7: `terminal.replaced` frames carry neither
                     // `terminalId` nor `status` — their identifiers are
                     // `oldTerminalId`/`newTerminalId` (server_messages.rs
-                    // TerminalReplaced). Without these, the waiver classifier
-                    // could never correlate an arrived replacement to the
-                    // settled terminal and the "no recovery" half of the
-                    // mechanism-B signature was unenforceable.
+                    // TerminalReplaced). Without these, the ring could never
+                    // correlate an arrived replacement to the settled
+                    // terminal.
                     if let Some(old_tid) = value.get("oldTerminalId") {
                         summary.push_str(&format!(" oldTid={old_tid}"));
                     }
@@ -428,6 +427,435 @@ async fn reconcile_after_replacement_attaches_to_the_new_terminal() {
 
     // Cleanup: reap the surviving replacement PTY.
     registry.kill(&new_tid);
+}
+
+// ── Task 2 (kata kmbs): identity-grace e2e pins over the real WS surface ──
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+/// Captured tracing event for the grace-entry proof
+/// (pane_ledger_tests.rs shape): the event's OWN message + fields — the hub
+/// records `terminal_id` ON the event (auto_resume.rs
+/// `identity_grace_entered`), so no span merge is needed.
+#[derive(Debug, Clone, Default)]
+pub struct CapturedEvent {
+    pub message: String,
+    pub fields: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct CapVisitor {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for CapVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+}
+
+struct CaptureLayer {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S> Layer<S> for CaptureLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = CapVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+    }
+}
+
+/// Process-global capture for the grace-entry proof — the hub task runs on
+/// tokio workers, where a thread-local default dispatcher is blind (kata
+/// e08g's cross-thread miss). Same OnceLock-install semantics as
+/// diag01_lifecycle_events.rs:163-184: first caller installs; every event in
+/// the binary lands in the shared vec, so reads MUST filter by the
+/// freshly-minted terminal id (captured start-index + tid field). This
+/// binary installs no other global subscriber; a future second installer
+/// panics loudly instead of silently capturing nothing.
+static GRACE_EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> =
+    std::sync::OnceLock::new();
+
+fn grace_event_capture() -> (Arc<Mutex<Vec<CapturedEvent>>>, usize) {
+    let events = GRACE_EVENTS
+        .get_or_init(|| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("this test binary installs exactly one global subscriber");
+            events
+        })
+        .clone();
+    let start_index = events.lock().expect("capture lock").len();
+    (events, start_index)
+}
+
+/// Codex-mode crash-once shim — caller passes a PER-TEST marker path (tests
+/// in one binary share std::process::id()). Protocol: absent marker -> touch
+/// marker, sleep 1200ms, exit 1 (the sleep window lets the test synchronize
+/// its upsert INSIDE the grace reliably); marker present -> `exec sleep 30`
+/// (the respawned generation survives). No `create_session_args`: codex has
+/// no preallocation, so the identity registry starts EMPTY for the created
+/// terminal (mechanism-B precondition). resume_args follow
+/// codex_session_ref_resume.rs's codex_cli_spec shape
+/// (["resume", "{{sessionId}}"]).
+fn crash_once_codex_spec(marker: &std::path::Path) -> freshell_platform::CliCommandSpec {
+    // The SCRIPT path is per-test too (derived from the marker name): two
+    // tests in one binary share std::process::id(), and a shared script
+    // would pin BOTH servers' terminals to whichever marker lost the write
+    // race (cross-test marker mixup — a generation meant to crash takes the
+    // survivor branch, or vice versa).
+    let marker_tag = marker
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("marker path has a utf-8 file name");
+    let script_path = std::env::temp_dir().join(format!(
+        "freshell-auto-resume-e2e-grace-codex-shim-{marker_tag}-{}.sh",
+        std::process::id()
+    ));
+    let script = format!(
+        "#!/bin/sh\nif [ -e \"{marker}\" ]; then exec sleep 30; fi\n: > \"{marker}\"\nsleep 1.2\nexit 1\n",
+        marker = marker.display()
+    );
+    write_executable(&script_path, &script);
+    freshell_platform::CliCommandSpec {
+        name: "codex".to_string(),
+        label: "Codex CLI".to_string(),
+        env_var: None,
+        default_cmd: script_path.to_string_lossy().to_string(),
+        base_args: vec![],
+        base_env: std::collections::BTreeMap::new(),
+        resume_args: Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]),
+        // Codex has NO preallocation path — `create_session_args` stays None,
+        // the shipped-spec shape.
+        create_session_args: None,
+        model_args: None,
+        sandbox_args: None,
+        permission_mode_args: None,
+    }
+}
+
+/// Fresh codex `terminal.create` — like `create_claude_terminal` but codex
+/// carries NO preallocated sessionRef; only the terminalId is returned.
+async fn create_codex_terminal(ws: &mut common::TestWs, request_id: &str) -> String {
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": request_id,
+        "mode": "codex",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string()))
+        .await
+        .expect("send terminal.create");
+    let created = next_frame_of_type(ws, "terminal.created").await;
+    created["terminalId"]
+        .as_str()
+        .expect("terminal.created carries terminalId")
+        .to_string()
+}
+
+/// Wait for the replaced frame for `old_tid` while enforcing the in-flight
+/// contract: ANY terminal.status{exited} naming old_tid fails the test with
+/// the offending frame quoted, and the replaced frame is only accepted after
+/// a recovering frame for old_tid has been seen (both frames carry
+/// terminalId per terminal.rs emit_recovering/broadcast_settled_frame).
+/// Returns the replaced frame. Never discards silently: every consumed frame
+/// is either matched, asserted-against, or the deadline expires with the
+/// same ring-style dump idiom this file already uses (duplicated here — the
+/// kmbs pins keep `wait_frame_matching` itself byte-equivalent).
+async fn wait_recovered_or_fail_on_exited(
+    ws: &mut common::TestWs,
+    old_tid: &str,
+    deadline: tokio::time::Instant,
+) -> serde_json::Value {
+    let mut recovering_seen = false;
+    let mut ignored: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if value["type"] == "terminal.status"
+                        && value["status"] == "exited"
+                        && value["terminalId"] == old_tid
+                    {
+                        panic!(
+                            "terminal.status{{exited}} arrived for {old_tid} while waiting for its replacement: {value}"
+                        );
+                    }
+                    if value["type"] == "terminal.status"
+                        && value["status"] == "recovering"
+                        && value["terminalId"] == old_tid
+                    {
+                        recovering_seen = true;
+                        continue;
+                    }
+                    if value["type"] == "terminal.replaced" && value["oldTerminalId"] == old_tid {
+                        assert!(
+                            recovering_seen,
+                            "terminal.replaced for {old_tid} arrived before any recovering frame: {value}"
+                        );
+                        return value;
+                    }
+                    // Same summary shape as `wait_frame_matching`'s ring.
+                    let mut summary = format!("type={}", value["type"]);
+                    if let Some(tid) = value.get("terminalId") {
+                        summary.push_str(&format!(" tid={tid}"));
+                    }
+                    if let Some(old_tid) = value.get("oldTerminalId") {
+                        summary.push_str(&format!(" oldTid={old_tid}"));
+                    }
+                    if let Some(new_tid) = value.get("newTerminalId") {
+                        summary.push_str(&format!(" newTid={new_tid}"));
+                    }
+                    if let Some(status) = value.get("status") {
+                        summary.push_str(&format!(" status={status}"));
+                    }
+                    if let Some(code) = value.get("code") {
+                        summary.push_str(&format!(" code={code}"));
+                    }
+                    if let Some(reason) = value.get("reason") {
+                        summary.push_str(&format!(" reason={reason}"));
+                    }
+                    if let Some(attempt) = value.get("attempt") {
+                        summary.push_str(&format!(" attempt={attempt}"));
+                    }
+                    if let Some(session_ref) = value.get("sessionRef") {
+                        summary.push_str(&format!(" sessionRef={session_ref}"));
+                    }
+                    if ignored.len() == 10 {
+                        ignored.pop_front();
+                    }
+                    ignored.push_back(summary);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!(
+                "stream ended while waiting for terminal.replaced(old:{old_tid}): {other:?}; {}",
+                format_ignored_frames(&ignored)
+            ),
+        }
+    }
+    panic!(
+        "terminal.replaced(old:{old_tid}) never arrived before the deadline; {}",
+        format_ignored_frames(&ignored)
+    );
+}
+
+/// Explicit negative assertion: read frames for `dur`; FAIL with the frame
+/// quoted if any terminal.status{exited} names `tid`. Consumes and inspects
+/// every frame in the window — this is not a silent sleep.
+async fn assert_no_exited_settle_for(ws: &mut common::TestWs, tid: &str, dur: Duration) {
+    let deadline = tokio::time::Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if value["type"] == "terminal.status"
+                        && value["status"] == "exited"
+                        && value["terminalId"] == tid
+                    {
+                        panic!(
+                            "terminal.status{{exited}} for {tid} inside the {dur:?} negative window: {value}"
+                        );
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(err))) => panic!("ws error inside the negative window: {err:?}"),
+            Ok(None) => panic!("stream ended inside the negative window"),
+            Err(_) => return, // the window elapsed with no offending frame
+        }
+    }
+}
+
+/// Local millisecond clock (mirror of resume_validation_gate.rs:79);
+/// freshell_ws::terminal::now_ms is pub(crate), unreachable from tests.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_millis() as i64
+}
+
+/// Mechanism-B regression pin (kata kmbs): identity landing DURING the grace
+/// converts the no_resumable_identity settle into a normal resume.
+/// Synchronization: the shim touches its marker then sleeps 1.2s before
+/// exiting; the test polls the marker, then upserts 250ms after the shim's
+/// own exit instant — comfortably inside the 2s-first grace step, with the
+/// grace-entry log assertion proving (never silently vacating) engagement.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn crash_with_identity_arriving_during_grace_is_resumed() {
+    // Plain-CLI codex, not the managed app-server launch (default-on; opt-out
+    // is exactly "0", terminal.rs:1706-1808 — read per create, so a
+    // same-binary set_var is safe; precedent codex_session_ref_resume.rs:350).
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let marker = std::env::temp_dir().join(format!(
+        "freshell-e2e-grace-resume-marker-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker); // stale-marker absorb (PID reuse)
+    let (events, capture_start) = grace_event_capture();
+    let (url, _registry, state) = common::spawn_server_with_specs_hub_and_state(
+        vec![crash_once_codex_spec(&marker)],
+        vec![50, 100],
+        vec![2_000, 2_000],
+    )
+    .await;
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+
+    let create_request_id = "req-e2e-grace-resume";
+    let old_tid = create_codex_terminal(&mut ws, create_request_id).await;
+
+    // Poll for the shim marker (crash imminent), then upsert INSIDE the
+    // grace: query#1 happens at the shim's exit (~marker+1.2s); the upsert
+    // lands at ~marker+1.45s — ~250ms of lower margin after the shim's exit
+    // instant (grace must already be engaged), ~2s of upper margin inside
+    // the first grace step, against ordinary load skew.
+    let marker_seen = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shim marker never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        tokio::time::Instant::now()
+    };
+    tokio::time::sleep_until(
+        marker_seen + Duration::from_millis(1_200) + Duration::from_millis(250),
+    )
+    .await;
+    // NoIndexProbe::default() -> Unknown for codex -> respawn gate fails open
+    // (resume_validation passthrough), so this fabricated thread id is
+    // sufficient — the same authority the locator-adoption path upserts.
+    state.identity.upsert(
+        &old_tid,
+        Some("codex"),
+        Some("thread-grace-1"),
+        None,
+        now_ms(),
+    );
+
+    // Engagement proof (the anti-vacuity gate): the hub logged grace entry
+    // for THIS terminal. A pathological stall that let the upsert beat
+    // query#1 makes THIS assertion fail loudly — never a silent green.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = {
+                let evs = events.lock().expect("capture lock");
+                evs[capture_start..].iter().any(|e| {
+                    e.message.contains("identity_grace_entered")
+                        && e.fields
+                            .get("terminal_id")
+                            .map(|v| v.contains(old_tid.as_str()))
+                            .unwrap_or(false)
+                })
+            };
+            if found {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grace-entry log never captured for {old_tid}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    wait_recovered_or_fail_on_exited(
+        &mut ws,
+        &old_tid,
+        tokio::time::Instant::now() + common::FRAME_BUDGET,
+    )
+    .await;
+    assert_no_exited_settle_for(&mut ws, &old_tid, Duration::from_millis(500)).await;
+}
+
+/// Grace exhaustion: identity never resolves — the SAME loud settle frame as
+/// pre-grace behavior, bounded-late. The pre-boundary negative window fails
+/// RED if the fix regresses to an immediate settle.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn crash_with_identity_never_arriving_settles_exited_after_grace() {
+    // Plain-CLI codex (see the grace-success test; the same-binary "0" set is
+    // idempotent).
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let marker = std::env::temp_dir().join(format!(
+        "freshell-e2e-grace-exhaust-marker-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let (url, _registry, _state) = common::spawn_server_with_specs_hub_and_state(
+        vec![crash_once_codex_spec(&marker)],
+        vec![50, 100],
+        vec![2_000, 2_000],
+    )
+    .await;
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+
+    let create_request_id = "req-e2e-grace-exhaust";
+    let old_tid = create_codex_terminal(&mut ws, create_request_id).await;
+
+    // Pre-boundary negative: with a 2s+2s grace and the shim's 1.2s exit
+    // sleep, no legal settle can exist inside the first 2s after create. An
+    // immediate-settle regression is caught here, not just "eventually".
+    assert_no_exited_settle_for(&mut ws, &old_tid, Duration::from_millis(2_000)).await;
+
+    wait_frame_matching(
+        &mut ws,
+        "terminal.status{status:exited, reason:no_resumable_identity}",
+        tokio::time::Instant::now() + common::FRAME_BUDGET,
+        |v| {
+            v["type"] == "terminal.status"
+                && v["status"] == "exited"
+                && v["reason"] == "no_resumable_identity"
+                && v["terminalId"] == old_tid
+        },
+    )
+    .await;
 }
 
 /// Loopback WS harness for the `wait_frame_matching` panic-path pins

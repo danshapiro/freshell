@@ -96,7 +96,18 @@
 //!
 //! Corruption policy: fail loud PER-ROW, never per-store — an unparsable row
 //! is quarantined (renamed aside + logged), never silently dropped, and never
-//! causes healthy rows to be skipped.
+//! causes healthy rows to be skipped. STORE-level faults are the mirror
+//! image (kata qzka): a scan directory that exists but cannot be fully read
+//! disables the ledger loudly at construction
+//! (`pane_ledger_scan_unavailable`) — an ENABLED ledger ALWAYS guarantees a
+//! complete construction scan, and a blind ENABLED ledger is never
+//! constructed (this subsumes the older H2 log-and-continue policy, whose
+//! `pane_ledger_load_index_dir_unreadable` merely warned while the index
+//! silently lost rows). First boot is not a fault: absent scan dirs map to
+//! an ENABLED empty index. ROW-level I/O failures still log a structured
+//! ERROR per row (`pane_ledger_load_index_row_unreadable`) at load; only
+//! parse/wrong-version rows stay silent for the boot scan to quarantine
+//! loudly.
 //!
 //! Write-failure policy: a ledger write failure never blocks the
 //! create/identity event, but it is never silent — see
@@ -108,7 +119,12 @@
 //! at 21ms@1k / 426ms@20k rows; TTL math yields 1.2k-12k rows). Files stay
 //! the durable source of truth; this process is the only writer
 //! (single-writer flock, [`PaneLedger::new_locked`]), so write-through
-//! invalidation is trivial. Reads never touch the fs and may run inline on
+//! invalidation is trivial. H1: the flock's *acquisition* tolerates the
+//! inheritance-mediated transient holder class — the fork→exec open-file-
+//! description handoff can leave `<root>/lock` momentarily held through a
+//! forked child's pre-exec window — via a bounded EWOULDBLOCK-only retry
+//! (see [`LOCK_RETRY_MAX_ATTEMPTS`]); a genuine second writer still
+//! degrades loudly. Reads never touch the fs and may run inline on
 //! async paths; WRITES fsync (~15ms p50 on this host) and must be wrapped in
 //! `spawn_blocking` at async call sites (the `terminal.rs:1369-1379`
 //! PTY-spawn precedent) — the sync API here stays call-site-agnostic.
@@ -126,6 +142,21 @@ pub use pane_ledger_scan::{BootScanReport, QuarantinedRow, PENDING_MARKER_ORPHAN
 /// Gates schema migration (spec §4.2): rows with a different version are
 /// quarantined loudly at boot, never silently reinterpreted.
 pub const LEDGER_VERSION: u32 = 1;
+
+/// H1: a *transient* holder window — the fork→exec open-file-description
+/// inheritance handoff (a forked child transiently carries a reference to
+/// the lock's OFD; std opens O_CLOEXEC, so the window ends AT exec, proven
+/// by validator PoC arm b2 / N6) — can leave `<root>/lock` momentarily held
+/// when `new_locked` runs; single-shot `LOCK_NB` then converted a µs-scale
+/// window (no-fork release measured ~13µs, PoC arm a) into a process-
+/// lifetime DISABLED ledger (deflake kata s52d). Acquisition retries ONLY
+/// on EWOULDBLOCK with a fixed budget: generous vs the measured window
+/// class, small at the one-shot boot call site, and loud-unchanged for a
+/// genuine persistent second writer (same ERROR, ~275ms later).
+#[cfg(unix)]
+const LOCK_RETRY_MAX_ATTEMPTS: u32 = 12;
+#[cfg(unix)]
+const LOCK_RETRY_DELAY_MS: u64 = 25;
 
 /// Bound rows not observed within this TTL are expired TO TOMBSTONES
 /// (`retired/gc_expired`), never deleted (spec §4.2 lifecycle).
@@ -1300,38 +1331,101 @@ pub struct PaneLedger {
 }
 
 impl PaneLedger {
+    /// Read a scan directory, mapping `NotFound` to "absent" (`Ok(None)`) and
+    /// propagating every other error with the faulted path attached. The
+    /// `std::io::Error` `Display` already carries the errno text (f3wp lesson:
+    /// the errno is what names the mechanism), so both `kind()` and the OS
+    /// detail survive the wrap. Shared by `load_index` (propagates) and the
+    /// boot-scan quarantine walk (records + continues).
+    fn read_dir_existing(dir: &Path) -> std::io::Result<Option<std::fs::ReadDir>> {
+        match std::fs::read_dir(dir) {
+            Ok(rd) => Ok(Some(rd)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(std::io::Error::new(
+                err.kind(),
+                format!("read {}: {err}", dir.display()),
+            )),
+        }
+    }
+
     /// Lock-free construction — tests and the integration harness use this
     /// (verification handles over a live server's dir must not fight the
     /// server's flock). Production uses [`PaneLedger::new_locked`].
+    ///
+    /// An ENABLED ledger guarantees its index reflects a COMPLETE
+    /// construction scan of the on-disk store: a store region that exists
+    /// but cannot be fully read (I/O error, unreadable subdir, errored
+    /// entry) logs a loud structured ERROR and comes up DISABLED — never
+    /// silently ENABLED-but-blind (kata qzka; a blind `None` from
+    /// `bound_session_ref_for_terminal` is indistinguishable from
+    /// "retired", which is why [`PaneLedger::is_enabled`] gates the
+    /// auto-resume guard). A store whose scan dirs are simply ABSENT is the
+    /// expected first-boot shape: ENABLED with an empty index.
     pub fn new(root: Option<PathBuf>) -> Self {
-        let index = root
-            .as_ref()
-            .map(|r| Self::load_index(r))
-            .unwrap_or_default();
-        Self {
-            root,
-            index: Mutex::new(index),
-            lock_file: None,
-            quarantined: RwLock::new(Vec::new()),
-            #[cfg(test)]
-            binding_write_failures: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            close_envelope_write_failures: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            close_envelope_land_failures: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            resolve_gate: Mutex::new(None),
+        let Some(r) = root else {
+            return Self {
+                root: None,
+                index: Mutex::new(LedgerIndex::default()),
+                lock_file: None,
+                quarantined: RwLock::new(Vec::new()),
+                #[cfg(test)]
+                binding_write_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                close_envelope_write_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                close_envelope_land_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                resolve_gate: Mutex::new(None),
+            };
+        };
+        match Self::load_index(&r) {
+            Ok(index) => Self {
+                root: Some(r),
+                index: Mutex::new(index),
+                lock_file: None,
+                quarantined: RwLock::new(Vec::new()),
+                #[cfg(test)]
+                binding_write_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                close_envelope_write_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                close_envelope_land_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                resolve_gate: Mutex::new(None),
+            },
+            Err(err) => {
+                tracing::error!(
+                    target: "freshell_ws::pane_ledger",
+                    root = %r.display(),
+                    error = %err,
+                    "pane_ledger_scan_unavailable: store exists but could not \
+                     be fully read; ledger DISABLED (never a blind ledger)"
+                );
+                Self::new(None)
+            }
         }
     }
 
     /// Production construction (V2.md single-writer guard): acquire an
     /// exclusive advisory `flock(2)` on `<root>/lock` (the `ConfigLock`
-    /// pattern, `settings_store.rs:385-417`). If another process holds it,
-    /// log a loud structured ERROR and come up DISABLED (no-op) — never two
-    /// writers on one store. Non-unix: no flock primitive is wired;
-    /// construct normally (ConfigLock's non-unix parity).
+    /// pattern, `settings_store.rs:385-417`). Acquisition retries
+    /// EWOULDBLOCK-only on a fixed budget (see `LOCK_RETRY_MAX_ATTEMPTS`)
+    /// so a transient holder window — the fork→exec open-file-description
+    /// inheritance handoff — cannot downgrade this process to a
+    /// lifetime-DISABLED ledger; a persistent second writer still degrades
+    /// loudly. If another process holds it past the budget, log a loud
+    /// structured ERROR and come up DISABLED (no-op) — never two writers
+    /// on one store. The scan then runs under [`PaneLedger::new`]'s
+    /// completeness guarantee: a store that EXISTS but cannot be fully read
+    /// also comes up DISABLED with a loud structured ERROR
+    /// (`pane_ledger_scan_unavailable`), while an absent (first-boot) store
+    /// comes up ENABLED and empty — absence is not a fault. Non-unix: no
+    /// flock primitive is wired; construct normally (ConfigLock's non-unix
+    /// parity).
     pub fn new_locked(root: Option<PathBuf>) -> Self {
         let Some(r) = root.clone() else {
             return Self::new(None);
@@ -1357,10 +1451,35 @@ impl PaneLedger {
 
     #[cfg(unix)]
     fn acquire_store_lock(root: &Path) -> std::io::Result<Option<std::fs::File>> {
+        let mut attempt = 0u32;
+        loop {
+            match Self::flock_once(root) {
+                Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                    attempt += 1;
+                    if attempt >= LOCK_RETRY_MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+                    // Sync sleep is deliberate: this is the one-shot boot-time
+                    // constructor path, never a hot path, and the wait only
+                    // happens while a (transient) holder is actually observed.
+                    std::thread::sleep(std::time::Duration::from_millis(LOCK_RETRY_DELAY_MS));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn flock_once(root: &Path) -> std::io::Result<Option<std::fs::File>> {
         use std::os::unix::io::AsRawFd;
         std::fs::create_dir_all(root)?;
         // Content irrelevant (only existence + flock state matter);
         // truncate(false) avoids clippy's suspicious_open_options.
+        //
+        // O_CLOEXEC: `std::fs::File` opens close-on-exec by DEFAULT — KEEP it
+        // that way: flock state rides the open file description, so a lock fd
+        // carried across exec by a detached child would keep holding the flock
+        // after this process dies (sidecar_store.rs V6.md NA-3 precedent).
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1518,38 +1637,78 @@ impl PaneLedger {
     }
 
     /// The ONE directory scan — construction-time only (V1.md).
-    fn load_index(root: &Path) -> LedgerIndex {
+    ///
+    /// Scan-level fault policy (kata qzka): a scan directory that exists
+    /// but cannot be read, a provider subdirectory that cannot be read, or
+    /// an entry that errors mid-iteration is a STORE-LEVEL fault and
+    /// propagates as `Err`; the constructors turn it into a loudly-logged
+    /// DISABLED ledger (`pane_ledger_scan_unavailable`), never a blind
+    /// ENABLED one. This subsumes the older H2 log-and-continue policy:
+    /// `pane_ledger_load_index_dir_unreadable` warned while the index
+    /// silently lost rows. `NotFound` maps to "absent" — the expected
+    /// first-boot shape — and contributes nothing. Anything under a store
+    /// region that is not a readable directory of row files is therefore
+    /// also a fault. ROW-level faults stay per-row: a row whose READ fails
+    /// with an I/O error still logs a structured per-row ERROR at load
+    /// (`pane_ledger_load_index_row_unreadable`); parse/wrong-version skips
+    /// stay silent BY POLICY — the boot scan (`quarantine_unparsable`) is
+    /// their loud path, and a row that vanishes between listing and read
+    /// (Missing) is benign TOCTOU residue.
+    fn load_index(root: &Path) -> std::io::Result<LedgerIndex> {
+        fn entry_err(err: std::io::Error, dir: &Path) -> std::io::Error {
+            std::io::Error::new(err.kind(), format!("list {}: {err}", dir.display()))
+        }
+        fn unreadable_row(path: &std::path::Path, err: &RowLoadError) {
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %path.display(),
+                error = %err,
+                "pane_ledger_load_index_row_unreadable: this row is ABSENT from the in-memory index (boot-scan quarantine cannot repair an unreadable file)"
+            );
+        }
         let mut index = LedgerIndex::default();
-        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
-            for provider in providers.flatten() {
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
-                    continue;
+        if let Some(providers) = Self::read_dir_existing(&Self::bindings_dir(root))? {
+            for provider in providers {
+                let provider = provider.map_err(|err| entry_err(err, &Self::bindings_dir(root)))?;
+                let provider_dir = provider.path();
+                let Some(files) = Self::read_dir_existing(&provider_dir)? else {
+                    continue; // provider dir vanished mid-scan — absent
                 };
-                for file in files.flatten() {
+                for file in files {
+                    let file = file.map_err(|err| entry_err(err, &provider_dir))?;
                     let path = file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue; // *.tmp-* and *.quarantined-* residue
                     }
-                    if let Ok(row) = load_row::<BindingRow>(&path) {
-                        if row.ledger_version == LEDGER_VERSION {
-                            index
-                                .bindings
-                                .insert((row.provider.clone(), row.session_id.clone()), row);
+                    match load_row::<BindingRow>(&path) {
+                        Ok(row) => {
+                            if row.ledger_version == LEDGER_VERSION {
+                                index
+                                    .bindings
+                                    .insert((row.provider.clone(), row.session_id.clone()), row);
+                            }
                         }
+                        Err(RowLoadError::Io(err)) => unreadable_row(&path, &RowLoadError::Io(err)),
+                        Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
                     }
                 }
             }
         }
-        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
-            for file in files.flatten() {
+        if let Some(files) = Self::read_dir_existing(&Self::pending_dir(root))? {
+            for file in files {
+                let file = file.map_err(|err| entry_err(err, &Self::pending_dir(root)))?;
                 let path = file.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(marker) = load_row::<PendingMarker>(&path) {
-                    if marker.ledger_version == LEDGER_VERSION {
-                        index.pending.insert(marker.terminal_id.clone(), marker);
+                match load_row::<PendingMarker>(&path) {
+                    Ok(marker) => {
+                        if marker.ledger_version == LEDGER_VERSION {
+                            index.pending.insert(marker.terminal_id.clone(), marker);
+                        }
                     }
+                    Err(RowLoadError::Io(err)) => unreadable_row(&path, &RowLoadError::Io(err)),
+                    Err(RowLoadError::Missing) | Err(RowLoadError::Parse(_)) => {}
                 }
             }
         }
@@ -1557,16 +1716,19 @@ impl PaneLedger {
         // (provider, sessionId) key comes from the PATH — decoded with the
         // inverse of `encode_segment`. JSON-unparsable rows are skipped here
         // silently; the boot scan quarantines them loudly (fail per-row).
-        if let Ok(providers) = std::fs::read_dir(Self::rollback_dir(root)) {
-            for provider in providers.flatten() {
+        if let Some(providers) = Self::read_dir_existing(&Self::rollback_dir(root))? {
+            for provider in providers {
+                let provider = provider.map_err(|err| entry_err(err, &Self::rollback_dir(root)))?;
                 let Some(provider_name) = provider.file_name().to_str().and_then(decode_segment)
                 else {
                     continue;
                 };
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
+                let provider_dir = provider.path();
+                let Some(files) = Self::read_dir_existing(&provider_dir)? else {
                     continue;
                 };
-                for file in files.flatten() {
+                for file in files {
+                    let file = file.map_err(|err| entry_err(err, &provider_dir))?;
                     let path = file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue;
@@ -1595,12 +1757,16 @@ impl PaneLedger {
         // pre-journal files' fences alive; `legacy_tombstone_keys` tracks
         // their provenance so the record sweep's un-feed never drops what a
         // real file still carries.
-        if let Ok(providers) = std::fs::read_dir(Self::kill_tombstone_dir(root)) {
-            for provider in providers.flatten() {
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
+        if let Some(providers) = Self::read_dir_existing(&Self::kill_tombstone_dir(root))? {
+            for provider in providers {
+                let provider =
+                    provider.map_err(|err| entry_err(err, &Self::kill_tombstone_dir(root)))?;
+                let provider_dir = provider.path();
+                let Some(files) = Self::read_dir_existing(&provider_dir)? else {
                     continue;
                 };
-                for file in files.flatten() {
+                for file in files {
+                    let file = file.map_err(|err| entry_err(err, &provider_dir))?;
                     let path = file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue; // *.tmp-* / *.quarantined-* residue
@@ -1623,12 +1789,16 @@ impl PaneLedger {
         // discipline — every clean current-version record loads (expiry is
         // the sweep's call, never the loader's: a still-Bound row's record
         // answers at any age).
-        if let Ok(providers) = std::fs::read_dir(Self::alias_tombstone_dir(root)) {
-            for provider in providers.flatten() {
-                let Ok(files) = std::fs::read_dir(provider.path()) else {
+        if let Some(providers) = Self::read_dir_existing(&Self::alias_tombstone_dir(root))? {
+            for provider in providers {
+                let provider =
+                    provider.map_err(|err| entry_err(err, &Self::alias_tombstone_dir(root)))?;
+                let provider_dir = provider.path();
+                let Some(files) = Self::read_dir_existing(&provider_dir)? else {
                     continue;
                 };
-                for file in files.flatten() {
+                for file in files {
+                    let file = file.map_err(|err| entry_err(err, &provider_dir))?;
                     let path = file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue; // *.tmp-* / *.quarantined-* residue
@@ -1653,8 +1823,9 @@ impl PaneLedger {
         // their `pane:<terminalId>` key, their `kills` feeding the fence
         // index exactly like a journal record's. Retention is the sweep's
         // call, never the loader's.
-        if let Ok(files) = std::fs::read_dir(Self::pane_close_dir(root)) {
-            for file in files.flatten() {
+        if let Some(files) = Self::read_dir_existing(&Self::pane_close_dir(root))? {
+            for file in files {
+                let file = file.map_err(|err| entry_err(err, &Self::pane_close_dir(root)))?;
                 let path = file.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue; // *.tmp-* / *.quarantined-* residue
@@ -1681,8 +1852,9 @@ impl PaneLedger {
         // The close-envelope journal subtree (delta-r6-r4): every clean
         // current-version record loads; the map key comes from the FILENAME
         // (encoded `pane:<terminalId>` / `<provider>:<addressedSessionId>`).
-        if let Ok(files) = std::fs::read_dir(Self::close_envelope_dir(root)) {
-            for file in files.flatten() {
+        if let Some(files) = Self::read_dir_existing(&Self::close_envelope_dir(root))? {
+            for file in files {
+                let file = file.map_err(|err| entry_err(err, &Self::close_envelope_dir(root)))?;
                 let path = file.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue; // *.tmp-* / *.quarantined-* residue
@@ -1701,7 +1873,7 @@ impl PaneLedger {
                 }
             }
         }
-        index
+        Ok(index)
     }
 
     /// Poison-tolerant lock (the `with_persist_lock` idiom) over the
