@@ -69,20 +69,11 @@ check "Dockerfile contains 'chown' for node ownership" grep -q 'chown.*node' "$D
 # Check 13: Dockerfile sets PLAYWRIGHT_BROWSERS_PATH before the existing install
 check "Dockerfile contains 'PLAYWRIGHT_BROWSERS_PATH'" grep -q 'PLAYWRIGHT_BROWSERS_PATH' "$DOCKERFILE"
 
-# Check 14: the entrypoint COPY pins the mode explicitly (COPY --chmod=755),
-# and USER node comes AFTER that COPY (not before). COPY --chmod is
-# load-bearing: COPY preserves the context file's mode, and umask-0077
-# checkouts bake 0700 (no group/other READ) — `RUN chmod +x` only ORs
-# execute bits (0700|0111=0711), and a script must be READABLE to execute,
-# so the non-root runtime hit "Permission denied" at container start.
-ENTRYPOINT_COPY_LINE=$(grep -n 'COPY --chmod=755 docker/cloud-run/entrypoint.sh' "$DOCKERFILE" | tail -1 | cut -d: -f1)
-USER_LINE=$(grep -n 'USER node' "$DOCKERFILE" | tail -1 | cut -d: -f1)
-if [ -n "$ENTRYPOINT_COPY_LINE" ] && [ -n "$USER_LINE" ] && [ "$USER_LINE" -gt "$ENTRYPOINT_COPY_LINE" ]; then
-  echo "PASS: USER node (line $USER_LINE) is after the --chmod=755 entrypoint COPY (line $ENTRYPOINT_COPY_LINE)"
-else
-  echo "FAIL: USER node (line ${USER_LINE:-N/A}) is not after the --chmod=755 entrypoint COPY (line ${ENTRYPOINT_COPY_LINE:-N/A}) — COPY must pin the entrypoint mode before switching to USER node"
-  FAILURES=$((FAILURES + 1))
-fi
+# Check 14: moved to the behavioral suite — the entrypoint COPY mode pin is
+# verified by scripts/test/cloud-run-entrypoint-mode.test.sh, which builds
+# the actual Dockerfile from a 0700-entrypoint context and asserts the
+# non-root runtime user can read+execute the entrypoint (a text grep here
+# cannot fail when that behavior breaks).
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
