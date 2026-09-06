@@ -18,6 +18,7 @@
 
 mod ai_router;
 mod ai_title;
+mod attachments;
 mod auto_title;
 mod auto_title_sweep;
 mod boot;
@@ -1623,6 +1624,17 @@ async fn main() -> ExitCode {
         home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
     };
 
+    // `POST /api/fresh-agent/attachments` (`fresh-agent-extras-router.ts:260-287`):
+    // the paperclip upload route the fresh-agent composer POSTs raw file bytes
+    // to before every attachment-bearing send. `home` is the SAME boot-resolved
+    // value as checkpoints above (uploads live under
+    // `<home>/.freshell/attachments/`) -- a `None` home falls back to the
+    // cwd-relative `.` likewise.
+    let attachments_state = attachments::AttachmentsApiState {
+        auth_token: Arc::clone(&auth_token),
+        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+    };
+
     // SAFE-02: the global authenticated API rate limiter (checklist:
     // `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:539`).
     // ONE process-wide token bucket, wired below as the outermost-but-one
@@ -1653,6 +1665,7 @@ async fn main() -> ExitCode {
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
         .merge(session_metadata::router(session_metadata_state))
         .merge(checkpoints::router(checkpoints_state))
+        .merge(attachments::router(attachments_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.
