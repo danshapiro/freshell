@@ -973,11 +973,15 @@ Expected: FAIL — the current `persist_syncable_terminal_rename` calls the fake
    its doc comment (:940-1003).
 5. `git mv crates/freshell-freshagent/src/rename_cascade_tests.rs
    crates/freshell-freshagent/src/rename_route_tests.rs`; update the `#[path]`
-   attribute + `mod` name at `lib.rs:3920-3921`; strip the fake wiring lines
-   from the two new pins (delete `RecordingPersistence`/`RenamePersistence`/
-   `with_rename_persistence` and the empty-fake assertions — the structural
-   absence is the GREEN) plus the now-dead `AtomicI64`/`Ordering` imports in
-   that test file, delete the three removed-behavior tests
+   attribute + `mod` name at `lib.rs:3920-3921`. In the two new pins, strip ONLY
+   the fake-specific wiring and assertions (`RecordingPersistence`,
+   `RenamePersistence`, `.with_rename_persistence(...)`, the
+   `fake.*_calls.is_empty()` assertions) plus the now-dead `AtomicI64`/`Ordering`
+   imports — but KEEP the frame assertions in the GREEN form so the pins stay
+   non-vacuous: each rename yields exactly one `ui.command{pane.rename}` frame
+   and zero `terminals.changed` frames (with a real `TerminalRegistry` wired and
+   a pane bound to a `sessionRef`, the absence of any cascade is observable).
+   Finally, delete the three removed-behavior tests
    (`rename_pane_cascades_to_syncable_terminal_via_injected_persistence`,
    `rename_pane_shell_pane_never_cascades` — the mode distinction is gone,
    `rename_pane_cascades_via_registry_session_binding_without_pane_content_session_fields`);
@@ -1226,7 +1230,12 @@ git commit -m "feat(session-directory): expose title override provenance for res
 
 Per Entry point parity with Rename: the item lives in BOTH the sidebar session
 menu (`menu-defs.ts:610-652`) and the history session menu (:670-683). Gating:
-the row's `titleOverridden === true` (Task 6). Confirm dialog:
+`session.titleOverridden === true` AND `session.titleOverrideSource` is NOT
+`'first-message'` and NOT `'dir'` (Tasks 6). The two exclusions prevent offering
+a no-op reset that the auto-title sweep would instantly re-apply (the sweep's
+only rungs), while still serving every user/ai/legacy/sourced-or-source-less
+override — including accidental pane-era overrides with no recorded source.
+Confirm dialog:
 `ConfirmModal`-driven (`ContextMenuProvider`'s existing `setConfirmState`
 pattern), body previewing current vs provider-native title; confirm issues
 `PATCH /api/sessions/:key {titleOverride: null}` then refreshes the session
@@ -1299,6 +1308,18 @@ describe('buildMenuItems — session reset-to-provider-title gating (b5fb)', () 
     expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(false)
   })
 
+  it('omits the reset item for sweep-rung overrides the sweep would instantly re-apply', () => {
+    const { ctx } = ctxWithSession({ titleOverridden: true, titleOverrideSource: 'first-message', providerTitle: 'Native title' })
+    const items = buildMenuItems(target, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(false)
+  })
+
+  it('offers the reset item for historical overrides with NO recorded source (pane-era accidents)', () => {
+    const { ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title' })
+    const items = buildMenuItems(target, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(true)
+  })
+
   it('offers the same item on the history-session menu', () => {
     const { ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title' })
     const historyTarget = { kind: 'history-session', sessionId: 's1', provider: 'claude' } as ContextTarget
@@ -1344,6 +1365,8 @@ export async function clearSessionTitleOverride(provider: string, sessionId: str
 
 ```ts
 ...(sessionInfo?.session.titleOverridden
+    && sessionInfo.session.titleOverrideSource !== 'first-message'
+    && sessionInfo.session.titleOverrideSource !== 'dir'
   ? [{
       type: 'item' as const,
       id: 'session-reset-title',
@@ -1543,7 +1566,9 @@ test('explicit rename can be reset to the provider title from the context menu',
   await dialog.getByRole('button', { name: 'Reset title' }).click()
 
   await expect(row).toContainText('convergence eta reset journey', { timeout: 15_000 })
-  // The reset affordance disappears once nothing is overridden.
+  // Deterministic close-out: the sweep may re-apply a 'first-message' override
+  // within ~2s, but the menu gate excludes that rung (Task 7), so the item
+  // stays absent regardless of sweep timing.
   await row.click({ button: 'right' })
   await expect(page.getByRole('menuitem', { name: 'Reset to provider title' })).toHaveCount(0)
 })
@@ -1664,7 +1689,9 @@ Hard rules:
    Node here since b5fb; the older pane-rename cascade divisions EDEV-10 and
    EDEV-11 were removed, and `persistSyncableTerminalRename` is gone.
 4. **Reset to provider title** (sidebar/history context menu, shown when the
-   directory row reports `titleOverridden`): previews current vs
+   directory row reports `titleOverridden` and the override's source is not a
+   sweep rung (`first-message`/`dir` — those would be re-applied instantly)):
+   previews current vs
    provider-native title, then issues `{titleOverride: null}`. The directory
    wire carries `titleOverridden`, `providerTitle`, `titleOverrideSource` for
    this flow (Task 6/Task 7 of the b5fb plan). Reset does NOT rewrite any
