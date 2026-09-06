@@ -307,10 +307,15 @@ git commit -m "refactor(client): make pane/tab renames layout-local (b5fb)"
 - Modify: `server/agent-api/router.ts` (drop `SYNCABLE_TERMINAL_MODES` at :43,
   `persistSyncableTerminalRename` at :641-685, the snapshot read at :1407, and
   the cascade call at :1412; drop the `makeSessionKey` import at :16 — verified
-  its only other use was inside the deleted function)
-- Modify: `test/server/agent-panes-write.test.ts` (rewrite the six cascade
-  tests at :681-922 into no-side-effect pins; keep the validation/broadcast
-  tests)
+  its only other use was inside the deleted function); ALSO remove
+  `terminalMetadata` and `codingCliIndexer` from the factory-parameter
+  destructuring at :498-500 (their ONLY uses are inside the deleted cascade —
+  `noUnusedLocals` would fail the build; keep both in the options interface at
+  :509-511 so call sites still compile; `configStore` stays — other routes use it
+  for provider settings)
+- Modify: `test/server/agent-panes-write.test.ts` (rewrite the seven
+  old-contract pins: the six cascade tests at :681-922 plus the
+  attach-then-rename test at ~:471-522 — see below)
 - Modify: `test/server/agent-tabs-write.test.ts` (add one layout-only pin for
   `PATCH /api/tabs/:id`)
 
@@ -320,11 +325,17 @@ git commit -m "refactor(client): make pane/tab renames layout-local (b5fb)"
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Replace the six cascade tests in `test/server/agent-panes-write.test.ts`
-(681-922: "persists syncable coding CLI pane renames…", both "falls back…"
-tests, "does not fail the pane rename when coding CLI session cascade refresh
-fails", "does not fail the pane rename when terminal override persistence
-fails") with these two pins:
+Replace the old-contract pins in `test/server/agent-panes-write.test.ts`:
+the six cascade tests at :681-922 ("persists syncable coding CLI pane
+renames…", both "falls back…" tests, "does not fail the pane rename when coding
+CLI session cascade refresh fails", "does not fail the pane rename when
+terminal override persistence fails") PLUS the attach-then-rename test at
+~:471-522 (`preserves coding CLI mode across attach so a later rename-pane
+persists overrides`). For the attach test: keep the attach/mode-preservation
+assertions (attach must still carry the resolved mode) and invert the rename
+half — after the PATCH, `patchTerminalOverride`/`patchSessionOverride`/
+`updateTitle`/`refresh`/`broadcastTerminalsChanged` are all NOT called. Use the
+same harness shape. The two replacement pins for the cascade cluster:
 
 ```ts
 it('persists NOTHING beyond the layout store for a syncable coding-CLI pane rename (b5fb)', async () => {
@@ -831,7 +842,7 @@ spelled out in Step 1 notes.
 **Files:**
 - Delete: `crates/freshell-freshagent/src/rename_persistence.rs` (whole module)
 - Modify: `crates/freshell-freshagent/src/lib.rs` — remove `pub mod rename_persistence;` (:49), `pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};` (:73), the `rename_persistence` field + its doc (:311-316), the `rename_persistence: None` init (:446), the `with_rename_persistence` builder (:632-634), and in `rename_pane`: the pre-rename `get_pane_snapshot` read (:2149) + `persist_syncable_terminal_rename` call (:2161-2163) + doc-comment steps 2/4 mentioning the cascade (:2117/:2120-2121)
-- Modify: `crates/freshell-server/src/main.rs` — delete `struct SettingsRenamePersistence` + its `impl freshell_freshagent::RenamePersistence` (:94-147) and the `.with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))` chain call (:641)
+- Modify: `crates/freshell-server/src/main.rs` — delete `struct SettingsRenamePersistence` + its `impl freshell_freshagent::RenamePersistence` (:94-147), the `.with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))` chain call (:641), and the neighboring `.with_shared_terminals_revision(Arc::clone(&terminals_revision))` chain call + its shared-counter comment (:638-643 region: the comment covers both cascade wirings; rewrite it to cover only the remaining builder calls). NOTE: the load-bearing check confirmed `FreshAgentState::terminals_revision` (field `lib.rs:319-322`, init :447, builder `with_shared_terminals_revision` :648-654, the dangling rustdoc link at :641's doc comment) is read ONLY by the deleted `rename_persistence.rs` — remove field + init + builder + doc comments too, or clippy `-D warnings` fails on the never-read field
 - Modify: `crates/freshell-server/src/auto_title_sweep.rs` — delete the obsolete `pane_rename_cascade_before_finalization_survives_next_sweep_pass` test + its doc block (:940-1003; its premise — the pane-rename cascade — no longer exists)
 - Rename + rewrite: `crates/freshell-freshagent/src/rename_cascade_tests.rs` → `crate::rename_route_tests.rs` (update the `#[path]` decl at `lib.rs:3920-3921`)
 
@@ -855,11 +866,9 @@ async fn rename_pane_never_cascades_for_a_syncable_claude_terminal() {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
     let registry = freshell_terminal::TerminalRegistry::new();
     let fake = Arc::new(RecordingPersistence::default());
-    let revision = Arc::new(AtomicI64::new(0));
     let state = state_with(tx.clone())
         .with_terminal_registry(registry.clone())
-        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>)
-        .with_shared_terminals_revision(Arc::clone(&revision));
+        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>);
 
     let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
     seed_layout(
@@ -896,7 +905,6 @@ async fn rename_pane_never_cascades_for_a_syncable_claude_terminal() {
     );
     assert!(frames.iter().any(|f| f["type"] == json!("ui.command")
         && f["command"] == json!("pane.rename")), "pane.rename still broadcast: {frames:?}");
-    assert_eq!(revision.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -904,11 +912,9 @@ async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
     let registry = freshell_terminal::TerminalRegistry::new();
     let fake = Arc::new(RecordingPersistence::default());
-    let revision = Arc::new(AtomicI64::new(0));
     let state = state_with(tx.clone())
         .with_terminal_registry(registry.clone())
-        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>)
-        .with_shared_terminals_revision(Arc::clone(&revision));
+        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>);
 
     let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
     let mut rx = tx.subscribe();
@@ -931,7 +937,6 @@ async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
         "no durable session writes across pane reuse: {:?}",
         fake.session_calls.lock().unwrap()
     );
-    assert_eq!(revision.load(Ordering::SeqCst), 0);
 }
 ```
 
@@ -960,7 +965,8 @@ Expected: FAIL — the current `persist_syncable_terminal_rename` calls the fake
    attribute + `mod` name at `lib.rs:3920-3921`; strip the fake wiring lines
    from the two new pins (delete `RecordingPersistence`/`RenamePersistence`/
    `with_rename_persistence` and the empty-fake assertions — the structural
-   absence is the GREEN), delete the three removed-behavior tests
+   absence is the GREEN) plus the now-dead `AtomicI64`/`Ordering` imports in
+   that test file, delete the three removed-behavior tests
    (`rename_pane_cascades_to_syncable_terminal_via_injected_persistence`,
    `rename_pane_shell_pane_never_cascades` — the mode distinction is gone,
    `rename_pane_cascades_via_registry_session_binding_without_pane_content_session_fields`);
@@ -1003,6 +1009,13 @@ pre-override title, when it exists), `titleOverrideSource` (the stored
 **Files:**
 - Modify: `shared/read-models.ts` — extend `SessionDirectoryItemSchema` (:49-74)
 - Modify: `src/store/types.ts` — extend client `CodingCliSession` (:90-113)
+- Modify: `src/lib/api.ts` — the client allowlist mappers are NOT pass-through:
+  `groupDirectoryItemsAsProjects` (:646-665) and `searchSessions`' results map
+  (:757-774) pick fields one-by-one, and `SearchResult` (:551-574) is a separate
+  type — ALL must forward the three new fields or they never reach Redux
+  (load-bearing finding F1)
+- Modify: `src/store/sessionsThunks.ts` — `searchResultsToProjects` (:74-118) is
+  another explicit allowlist; forward the same three fields
 - Modify: `server/coding-cli/types.ts` — extend server `CodingCliSession` (:173-196)
 - Modify: `server/coding-cli/session-indexer.ts` — `applyOverride` (:222-238)
 - Modify: `server/session-directory/projection.ts` — `toSessionDirectoryComparableItem` (:36-54) + `comparableItemsEqual` (:13-34)
@@ -1010,6 +1023,10 @@ pre-override title, when it exists), `titleOverrideSource` (the stored
 - Test: `crates/freshell-server/src/session_directory.rs` (overlay test mod, e.g. near :2707-3003)
 - Test: `test/unit/server/coding-cli/session-indexer.test.ts` (provenance attach)
 - Test: `test/integration/server/session-directory-router.test.ts` (wire passthrough; ensure revision/signature still fires on provenance change)
+- Test: `test/unit/client/store/sessionsThunks.test.ts` (Redux-level pin: a
+  directory refresh whose items carry the three fields lands them in
+  `ctx.sessions` rows — follow this file's `fetchSidebarSessionsSnapshot`
+  partial-mock convention at :22-29)
 
 **Interfaces:**
 - Consumes: existing override rows (`titleOverride`, `titleSource`), parsed titles, `title_source` (parsed guard).
@@ -1128,6 +1145,17 @@ function applyOverride(session, ov, titleSource?) {
 `server/session-directory/projection.ts`: add the three fields to
 `toSessionDirectoryComparableItem`'s return object AND to `comparableItemsEqual`
 (provenance changes must bump the directory revision so `sessions.changed` fires).
+
+`src/lib/api.ts` — in BOTH mappers, forward the fields:
+
+```ts
+...(item.titleOverridden ? { titleOverridden: true } : {}),
+...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
+...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
+```
+
+`SearchResult` gains the same three optional fields. Same three forwards inside
+`src/store/sessionsThunks.ts` `searchResultsToProjects` (against `result.*`).
 
 `crates/freshell-server/src/session_directory.rs`:
 - `DirItem` += `title_overridden: bool`, `provider_title: Option<String>`,
@@ -1513,18 +1541,23 @@ test('explicit rename can be reset to the provider title from the context menu',
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 The spec rewrite lands after Tasks 1-7, so demonstrate RED by temporarily
-reverting the production side only (test file stays):
+reverting the production side only (test file stays). Keep `crates/` OUT of the
+stash: this worktree lacks `target/release/freshell-server` and the
+rust-chromium harness auto-builds it (`e2e-browser/helpers/rust-server.ts`), so
+reverting crates would cost two full release builds. The legacy-chromium leg
+(Node server) produces the RED with zero Rust involvement:
 
 ```bash
-git stash push -- src server crates && \
-npx playwright test --config test/e2e-browser/playwright.config.ts title-sync-convergence; \
+git stash push -- src server shared && \
+npx playwright test --config test/e2e-browser/playwright.config.ts title-sync-convergence --project=legacy-chromium; \
 git stash pop
 ```
 
 Expected under the stash: FAIL on inverted Tests 1/3/5/6 (the old
 cascades/sync flip the sidebar row to the organization label) and on Test 7
 (the reset menu item does not exist). Tests 2/4 were session-scope and keep
-passing. Record this RED evidence in the task ledger, then restore.
+passing. Record this RED evidence in the task ledger, then restore. GREEN then
+runs the full matched matrix without `--project` flags.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
