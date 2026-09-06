@@ -418,7 +418,7 @@ async function main() {
       },
     ]),
   })
-  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
+  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }), { reconciler: codexSidecarReconciler })
   const wsHandler = new WsHandler(
     server,
     registry,
