@@ -9908,11 +9908,6 @@ rl.on('line', (line) => {
         mark_compact_candidate(&in_turn, &turn_tracker);
         confirm_compact_candidate(&in_turn, &turn_tracker, true);
 
-        // Let the fixture `tee` fully drain the pipe before freezing — a
-        // partially-consumed pipe would park the fill loop short of the
-        // helper's full-buffer assertion (its 64KiB threshold assumes an empty
-        // pipe: armrace/armfail freeze before any handler write).
-        tokio::time::sleep(Duration::from_millis(300)).await;
         // Park C2's write mid-window.
         let pid = freeze_fixture_stdin(&st, "rb-armfail-gar").await;
         let driver = {
@@ -10016,7 +10011,7 @@ rl.on('line', (line) => {
         arm_turn_op(&s.in_turn, &s.turn_tracker, TrackedOp::Turn);
     }
 
-    /// ep1-r3 F3 rig: SIGSTOP the fixture's `tee` and FILL its stdin pipe, so
+    /// ep1-r3 F3 rig: SIGSTOP the fixture's reader and FILL its stdin pipe, so
     /// the next `write_line` parks INSIDE the write await (a deterministic,
     /// harness-pausable "mid-write" window) until the child resumes. Returns
     /// the child's pid for the later SIGCONT/SIGKILL.
@@ -10030,27 +10025,42 @@ rl.on('line', (line) => {
             0,
             "SIGSTOP the fixture child"
         );
-        // A stopped reader never drains: fill the kernel pipe buffer until a
-        // write parks (the elbow timeout elapses) — the NEXT write_line parks
-        // INSIDE the write await. (ChildStdin has no userspace buffer, so a
-        // parked write means the KERNEL pipe is full; the per-iteration
-        // timeout IS the full-pipe signal — deterministic, no guessing.)
+        // A stopped reader never drains. Fill in chunks first, then exhaust
+        // any residual space one byte at a time: a blocked chunk alone does
+        // not prove that the smaller compact request cannot fit. ChildStdin
+        // has no userspace buffer, and a timed-out single-byte write proves
+        // backpressure without assuming the pipe's capacity or initial fill.
+        // `write` is cancellation-safe and reports partial writes; a cancelled
+        // `write_all` could instead hide bytes accepted before the timeout.
         use tokio::io::AsyncWriteExt as _;
         let junk = [b'x'; 4096];
-        let mut filled = 0usize;
         loop {
-            match tokio::time::timeout(Duration::from_millis(100), session.stdin.write_all(&junk))
-                .await
+            match tokio::time::timeout(Duration::from_millis(100), session.stdin.write(&junk)).await
             {
-                Ok(Ok(())) => filled += junk.len(),
-                Ok(Err(e)) => panic!("the stdin fill failed: {e}"),
-                Err(_elapsed) => break,
+                Ok(Ok(n)) if n > 0 => {}
+                result => {
+                    assert!(
+                        result.is_err(),
+                        "the chunk fill must stop on backpressure: {result:?}"
+                    );
+                    break;
+                }
             }
         }
-        assert!(
-            filled >= 65536,
-            "the classic 64KiB pipe accepted a full buffer before refusing ({filled})"
-        );
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), session.stdin.write(&junk[..1]))
+                .await
+            {
+                Ok(Ok(1)) => {}
+                result => {
+                    assert!(
+                        result.is_err(),
+                        "even a one-byte write must be blocked: {result:?}"
+                    );
+                    break;
+                }
+            }
+        }
         drop(guard);
         pid
     }
