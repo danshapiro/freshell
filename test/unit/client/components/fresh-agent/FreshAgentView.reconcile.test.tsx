@@ -344,9 +344,12 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
       runtimeGeneration: 8,
     })
     expect(sentOfType('freshAgent.create')).toHaveLength(0)
+    // The resumed runtime identifies itself by the canonical sessionRef; the
+    // legacy resumeSessionId wire field is no longer sent in attach frames
+    // (every server resume door resolves from sessionRef).
     expect(sentOfType('freshAgent.attach')).toEqual([expect.objectContaining({
       sessionId: DURABLE,
-      resumeSessionId: DURABLE,
+      sessionType: 'freshclaude',
       sessionRef: { provider: 'claude', sessionId: DURABLE },
     })])
   })
