@@ -9,8 +9,9 @@
 # built from such checkouts crashed under USER node with:
 #   bash: /usr/local/bin/e2e-entrypoint.sh: Permission denied
 # The fix pins the mode in the COPY itself (COPY --chmod=755). This test
-# deterministically reproduces the bad source mode, builds the ACTUAL
-# Dockerfile, and asserts — against the exact image this build produced:
+# builds the ACTUAL Dockerfile from an ISOLATED copy of the working tree
+# with the entrypoint restricted to 0700 in that private copy, and asserts
+# — against the exact image this build produced:
 #   0. the image's configured runtime user is the non-root user (uid 1000)
 #   1. that user can read AND execute the entrypoint
 #   2. the container starts through its configured ENTRYPOINT (--dry-run
@@ -18,13 +19,13 @@
 # It fails against the pre-fix Dockerfile (COPY + 'RUN chmod +x') and passes
 # against the fixed one.
 #
-# Concurrency: the 0700 fixture mutates the shared source file's mode in
-# place, so the chmod→build→restore window is guarded by a per-worktree
-# lock (overlapping invocations would otherwise save/restore modes under
-# each other's builds). Every assertion runs against the built image's
-# IMMUTABLE id (captured via --iidfile), never the mutable tag — tags are
-# shared across worktrees, so a concurrent rebuild could otherwise swap the
-# image between this build and its assertions.
+# Isolation: the fixture never mutates the shared source tree — the context
+# is a disposable copy under mktemp, so there is nothing to restore on
+# success, failure, or cancellation, and concurrent invocations (same or
+# different worktrees) cannot interfere. Every assertion runs against the
+# built image's IMMUTABLE id (captured via --iidfile), never the mutable
+# tag — tags are shared across worktrees, so a concurrent rebuild could
+# otherwise swap the image between this build and its assertions.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,32 +49,48 @@ fail() {
 }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+CTX="$WORK/context"
 IIDFILE="$WORK/image-id"
-BUILD_LOG="$SCRIPT_DIR/.entrypoint-mode-build.log"
-# Per-worktree lock (same realpath -> same lock), outside the repo so it
-# never litters the tree.
-BUILD_LOCK="/tmp/freshell-entrypoint-mode-$(printf %s "$ROOT" | md5sum | cut -d' ' -f1).lock"
+BUILD_LOG="$WORK/build.log"
+trap 'rm -rf "$WORK"' EXIT
 
-# --- Reproduce the bad source mode deterministically, build, restore --------
-# A fresh git checkout under umask 0077 lands at 0700 anyway; forcing it
-# makes the test independent of the invoking shell's umask. The whole
-# chmod→build→restore window is one critical section under the worktree
-# lock, and the build's image id is captured for the assertions below.
-BUILD_STATUS=0
-(
-  flock 9
-  ORIG_MODE="$(stat -c %a "$EP")"
-  chmod 700 "$EP"
-  docker build -f "$DOCKERFILE" --iidfile "$IIDFILE" -t "$IMAGE_TAG" . \
-    >"$BUILD_LOG" 2>&1 || BUILD_STATUS=1
-  chmod "$ORIG_MODE" "$EP"
-  exit "$BUILD_STATUS"
-) 9>"$BUILD_LOCK" || {
-  fail "docker build failed (see $BUILD_LOG)"
+# --- Build the isolated context ---------------------------------------------
+# Full copy of the working tree; the builder still applies the tree's own
+# committed .dockerignore to this directory context, so the excludes here
+# only bound the copy cost. The fixture then restricts the entrypoint in
+# the PRIVATE copy and verifies the mode before building (a setup failure
+# must abort, never silently build the wrong fixture).
+echo "Preparing isolated 0700-entrypoint build context..."
+mkdir -p "$CTX"
+tar -cf - \
+  --exclude=./node_modules \
+  --exclude=./dist \
+  --exclude=./target \
+  --exclude=./.git \
+  --exclude=./.worktrees \
+  --exclude=./coverage \
+  --exclude=./test-results \
+  --exclude=./playwright-report \
+  --exclude=./.env \
+  --exclude=./.env.local \
+  . | tar -xf - -C "$CTX"
+
+chmod 700 "$CTX/$EP"
+FIXTURE_MODE="$(stat -c %a "$CTX/$EP")"
+if [ "$FIXTURE_MODE" != "700" ]; then
+  fail "fixture setup failed: context entrypoint mode is $FIXTURE_MODE, expected 700"
+  exit 1
+fi
+
+# --- Build the ACTUAL Dockerfile from the restricted context ----------------
+echo "Building $DOCKERFILE with a 0700-entrypoint context (this may take a while on a cold cache)..."
+if ! docker build -f "$CTX/$DOCKERFILE" --iidfile "$IIDFILE" -t "$IMAGE_TAG" "$CTX" \
+  >"$BUILD_LOG" 2>&1; then
+  cp "$BUILD_LOG" "$SCRIPT_DIR/.entrypoint-mode-build.log"
+  fail "docker build failed (see $SCRIPT_DIR/.entrypoint-mode-build.log)"
   tail -30 "$BUILD_LOG"
   exit 1
-}
+fi
 echo "PASS: docker build succeeded (mode-0700 entrypoint context)"
 
 if [ ! -s "$IIDFILE" ]; then
