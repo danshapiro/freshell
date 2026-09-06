@@ -103,6 +103,10 @@ import {
   CodexAppServerRuntime,
   runCodexStartupReaper,
 } from './coding-cli/codex-app-server/runtime.js'
+import {
+  CodexSidecarReconciler,
+  resolveCodexSidecarReapGraceMs,
+} from './coding-cli/codex-app-server/sidecar-reattach.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import { startCodexObservability } from './coding-cli/codex-observability.js'
 import { installCodexChildExitHandlers, snapshotCodexChildren } from './coding-cli/codex-child-registry.js'
@@ -283,16 +287,28 @@ async function main() {
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
+  // 4g2a: the boot reconciler holds verified prior-generation sidecars claimable for restore
+  // (planner wiring lands with it); the hourly observability tick sweeps whatever stays
+  // unclaimed once the grace window expires.
+  const codexSidecarReconciler = new CodexSidecarReconciler({
+    reapGraceMs: resolveCodexSidecarReapGraceMs(process.env.FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS),
+  })
   try {
-    await runCodexStartupReaper({ serverInstanceId })
+    await runCodexStartupReaper({ serverInstanceId, holdReconciler: codexSidecarReconciler })
   } catch (err) {
     // I4: boot must never die in the reaper. Unresolved records are retried by the hourly
     // observability tick and on the next boot.
     log.warn({ err }, 'Codex startup reaper failed; continuing startup (fail-open)')
   }
+  // One structured boot line: survivors held claimable, claims in flight, and the grace window.
+  log.info(
+    { codexSidecarReconciler: codexSidecarReconciler.snapshot() },
+    'Codex sidecar reconciler state after the boot reaper pass',
+  )
   // Boot + hourly codex-log-db line (WAL size, holder count, quarantine count), hourly retry of
-  // pending reaper records, and the quarantine rescan trigger. Observation-only; unref()'d timer.
-  const codexObservability = startCodexObservability({ serverInstanceId })
+  // pending reaper records, the reconciler sweep, and the quarantine rescan trigger.
+  // Observation-only; unref()'d timer.
+  const codexObservability = startCodexObservability({ serverInstanceId, reconciler: codexSidecarReconciler })
   const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
@@ -408,7 +424,7 @@ async function main() {
       },
     ]),
   })
-  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
+  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }), { reconciler: codexSidecarReconciler })
   // Host pressure service: constructed provider-less (sources need the handler, which
   // needs the service) and wired via setSources after wsHandler exists below.
   const hostStats = new HostStatsService()
