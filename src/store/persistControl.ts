@@ -87,7 +87,7 @@ export function buildTerminalDurableSessionRefUpdate({
   }
 }
 
-type SessionIdentityState = {
+export type SessionIdentityState = {
   historySessionId?: string
   cliSessionId?: string
 } | undefined

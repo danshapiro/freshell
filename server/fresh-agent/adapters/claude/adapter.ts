@@ -24,6 +24,7 @@ type ClaudeBridgePort = Pick<
   | 'createSession'
   | 'subscribe'
   | 'sendUserMessage'
+  | 'configureSession'
   | 'interrupt'
   | 'killSession'
   | 'respondQuestion'
@@ -39,7 +40,7 @@ export type ClaudeFreshAgentAdapterDeps = {
 }
 
 function toClaudeEffort(value: FreshAgentCreateRequest['effort']) {
-  if (value === undefined || value === 'low' || value === 'medium' || value === 'high' || value === 'max') {
+  if (value === undefined || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max') {
     return value
   }
   throw new Error(`Freshclaude does not support reasoning effort "${value}".`)
@@ -96,6 +97,7 @@ function assertFreshAgentRevision(currentRevision: number, requestedRevision?: n
 }
 
 export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps): FreshAgentRuntimeAdapter {
+  const pendingSends = new Map<string, Promise<void>>()
   const historyService = deps.historyService ?? (
     deps.agentHistorySource
       ? createClaudeFreshAgentHistoryService({ agentHistorySource: deps.agentHistorySource })
@@ -151,13 +153,23 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     },
 
     send(sessionId, input) {
-      const images = input.images?.flatMap((image) => image.kind === 'data'
-        ? [{ mediaType: image.mediaType, data: image.data }]
-        : [])
-      mapMissingResult(
-        deps.sdkBridge.sendUserMessage(sessionId, input.text, images),
-        `Claude session ${sessionId} is not available`,
-      )
+      const prior = pendingSends.get(sessionId) ?? Promise.resolve()
+      const send = prior.then(async () => {
+        if (input.settings) await deps.sdkBridge.configureSession(sessionId, input.settings)
+        const images = input.images?.flatMap((image) => image.kind === 'data'
+          ? [{ mediaType: image.mediaType, data: image.data }]
+          : [])
+        mapMissingResult(
+          deps.sdkBridge.sendUserMessage(sessionId, input.text, images),
+          `Claude session ${sessionId} is not available`,
+        )
+      })
+      // A failed submission must not prevent the next attempt from running.
+      const settled = send.catch(() => {}).finally(() => {
+        if (pendingSends.get(sessionId) === settled) pendingSends.delete(sessionId)
+      })
+      pendingSends.set(sessionId, settled)
+      return send
     },
 
     interrupt(sessionId) {

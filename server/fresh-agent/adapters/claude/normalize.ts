@@ -60,9 +60,11 @@ export type FreshAgentClaudeSnapshot = {
     approvals: boolean
     questions: boolean
     fork: boolean
+    settingScopes?: import('../../../../shared/fresh-agent-contract.js').FreshAgentSettingScopes
   }
   settings: {
     model?: string
+    effort?: string
     permissionMode?: string
     plugins: string[]
   }
@@ -80,6 +82,7 @@ export type FreshAgentClaudeSnapshot = {
   turns: FreshAgentNormalizedTurn[]
   extensions: {
     claude: {
+      statusFromLiveState?: boolean
       historySessionId?: string
       liveSessionId?: string
       cliSessionId?: string
@@ -233,9 +236,21 @@ export function normalizeClaudeThreadSnapshot(input: {
       approvals: normalizePendingApprovals(input.liveSession).length > 0,
       questions: normalizePendingQuestions(input.liveSession).length > 0,
       fork: false,
+      // kata z7j7: model/effort/permissionMode apply per-send via the
+      // adapter's send -> configureSession hook (adapter.ts:155-160 →
+      // sdk-bridge.ts:934 setModel / applyFlagSettings / setPermissionMode,
+      // busy-gated; only cwd is create-only and has no scope slot).
+      // Sandbox has no claude-side concept.
+      settingScopes: {
+        model: 'per-send',
+        effort: 'per-send',
+        permissionMode: 'per-send',
+        sandbox: 'unsupported',
+      },
     },
     settings: {
       ...(input.liveSession?.model ? { model: input.liveSession.model } : {}),
+      ...(input.liveSession?.effort ? { effort: input.liveSession.effort } : {}),
       ...(input.liveSession?.permissionMode ? { permissionMode: input.liveSession.permissionMode } : {}),
       plugins: input.liveSession?.plugins ? [...input.liveSession.plugins] : [],
     },
@@ -251,6 +266,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     turns,
     extensions: {
       claude: {
+        statusFromLiveState: input.liveSession !== undefined,
         historySessionId: input.resolved.timelineSessionId,
         liveSessionId: input.resolved.liveSessionId,
         cliSessionId: input.liveSession?.cliSessionId,

@@ -1,0 +1,6 @@
+pos:	0
+flags:	02004000
+mnt_id:	15
+ino:	1234
+inotify wd:1 ino:600001 sdev:800013 mask:800afce ignored_mask:0 fhandle-bytes:8 fhandle-type:1 f_handle:0106a000743b0200
+inotify wd:2 ino:600002 sdev:800013 mask:800afce ignored_mask:0 fhandle-bytes:8 fhandle-type:1 f_handle:0206a000743b0200

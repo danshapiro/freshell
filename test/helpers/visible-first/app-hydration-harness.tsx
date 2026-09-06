@@ -54,6 +54,7 @@ type RequestLogEntry = {
 
 type WsStub = {
   send: ReturnType<typeof vi.fn>
+  sendTerminalInterest: ReturnType<typeof vi.fn>
   connect: ReturnType<typeof vi.fn>
   onMessage: ReturnType<typeof vi.fn>
   onReconnect: ReturnType<typeof vi.fn>
@@ -214,6 +215,9 @@ function createWsStub(options: AppHydrationHarnessOptions['network']) {
 
   const ws: WsStub = {
     send: vi.fn(),
+    // Presentation interest is transient/negotiated; the harness does not
+    // exercise it, so pretend every snapshot was refused (not sent).
+    sendTerminalInterest: vi.fn(() => false),
     connect: vi.fn(() => {
       connectCalls += 1
       if (!connectPromise) {

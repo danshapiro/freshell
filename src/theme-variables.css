@@ -4,6 +4,10 @@
   --foreground: 240 10% 10%;
   --card: 0 0% 98%;
   --card-foreground: 240 10% 10%;
+  /* Floating overlay surfaces (menus, popovers) — kept at card parity so all
+   * app menus share one look. */
+  --popover: 0 0% 98%;
+  --popover-foreground: 240 10% 10%;
   --muted: 240 5% 96%;
   --muted-foreground: 240 4% 46%;
   --accent: 240 5% 96%;
@@ -43,6 +47,9 @@
   --foreground: 0 0% 98%;
   --card: 240 6% 10%;
   --card-foreground: 0 0% 98%;
+  /* Floating overlay surfaces (menus, popovers) — card parity, see :root. */
+  --popover: 240 6% 10%;
+  --popover-foreground: 0 0% 98%;
   --muted: 240 4% 16%;
   --muted-foreground: 240 5% 65%;
   --accent: 240 4% 16%;

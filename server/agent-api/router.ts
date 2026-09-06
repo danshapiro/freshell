@@ -13,7 +13,6 @@ import {
   normalizeCodexSandboxSetting,
 } from '../coding-cli/codex-launch-config.js'
 import { INVALID_RAW_CODEX_RESUME_MESSAGE } from '../coding-cli/codex-app-server/restore-decision.js'
-import { makeSessionKey } from '../coding-cli/types.js'
 import { terminalIdFromCreateError, UnknownTerminalModeError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
 import { buildSessionIdentityMismatchDetails, terminalMatchesExpectedSession } from '../terminal-session-identity.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
@@ -38,9 +37,9 @@ import {
   FreshAgentStaleThreadRevisionError,
   FreshAgentUnsupportedCapabilityError,
 } from '../fresh-agent/runtime-manager.js'
+import { ClaudeFreshAgentHistoryResolutionError } from '../fresh-agent/history/claude/history-service.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
-const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const log = logger.child({ component: 'agent-api' })
 const CODEX_INPUT_READY_WAIT_TIMEOUT_MS = 60_000
 
@@ -496,8 +495,6 @@ export function createAgentApiRouter({
   registry,
   wsHandler,
   configStore,
-  terminalMetadata,
-  codingCliIndexer,
   codexActivityTracker,
   codexLaunchPlanner,
   assertTerminalCreateAccepted,
@@ -638,58 +635,12 @@ export function createAgentApiRouter({
     return { tabId: requestedTabId, splitId: rawTarget, message: 'split not found' }
   }
 
-  const persistSyncableTerminalRename = async (paneSnapshot: any, title: string) => {
-    const paneContent = paneSnapshot?.paneContent
-    const terminalId = typeof paneContent?.terminalId === 'string' ? paneContent.terminalId : undefined
-    const meta = terminalId
-      ? terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
-      : undefined
-    const resumeSessionId = typeof paneContent?.resumeSessionId === 'string'
-      ? paneContent.resumeSessionId
-      : undefined
-    const modeCandidates = [
-      typeof paneContent?.mode === 'string' ? paneContent.mode : undefined,
-      terminalId ? registry.get?.(terminalId)?.mode : undefined,
-      typeof meta?.provider === 'string' ? meta.provider : undefined,
-    ]
-    const mode = modeCandidates.find((candidate) => (
-      typeof candidate === 'string' && SYNCABLE_TERMINAL_MODES.has(candidate)
-    ))
-
-    if (!terminalId || !mode || !SYNCABLE_TERMINAL_MODES.has(mode) || !configStore) {
-      return
-    }
-
-    try {
-      await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
-      registry.updateTitle?.(terminalId, title)
-
-      const sessionProvider = typeof meta?.provider === 'string' ? meta.provider : mode
-      const sessionId = typeof meta?.sessionId === 'string' ? meta.sessionId : resumeSessionId
-      if (sessionProvider && sessionId) {
-        try {
-          await configStore.patchSessionOverride?.(makeSessionKey(sessionProvider as any, sessionId), {
-            titleOverride: title,
-          })
-          await codingCliIndexer?.refresh?.()
-        } catch {
-          // Match terminals-router semantics: terminal rename persistence is authoritative,
-          // but session-title cascade/index refresh is best-effort.
-        }
-      }
-
-      wsHandler?.broadcastTerminalsChanged?.()
-    } catch {
-      // Pane rename is authoritative for orchestration; syncable terminal persistence is best-effort.
-    }
-  }
-
   router.post('/tabs', async (req, res) => {
     // ejh6 (finding 3): door-top presence check BEFORE any branch (agent/browser/editor/terminal).
     if (req.body?.resumeSessionId !== undefined) {
       return res.status(400).json(fail(INVALID_RAW_CODEX_RESUME_MESSAGE))
     }
-    const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
+    const { name, mode, shell, cwd, browser, editor, hostStats, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
     const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
     if (typeof req.body?.agent === 'string') {
       const handled = await createFreshAgentPane(
@@ -703,6 +654,7 @@ export function createAgentApiRouter({
       ).catch((err: any) => { res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to create fresh-agent tab')); return true })
       if (handled) return
     }
+    const wantsHostStats = !!hostStats
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let launch: ResolvedSpawnProviderSettings | undefined
@@ -713,7 +665,9 @@ export function createAgentApiRouter({
       let paneContent: any
       let terminalId: string | undefined
 
-      if (wantsBrowser) {
+      if (wantsHostStats) {
+        paneContent = { kind: 'host-stats' }
+      } else if (wantsBrowser) {
         paneContent = { kind: 'browser', url: browser, devToolsOpen: false }
       } else if (wantsEditor) {
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true }
@@ -733,7 +687,7 @@ export function createAgentApiRouter({
           { cwd, resumeSessionId: requestedResumeSessionId, codexLaunchPlanner, assertTerminalCreateAccepted: assertTerminalAdmission },
         )
         assertTerminalAdmission()
-        const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
+        const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor, hostStats })
         createdTabId = tabId
         const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedResumeSessionId)
         assertTerminalAdmission()
@@ -789,7 +743,7 @@ export function createAgentApiRouter({
         return
       }
 
-      const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
+      const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor, hostStats })
       createdTabId = tabId
       layoutStore.attachPaneContent(tabId, paneId, paneContent)
 
@@ -915,6 +869,15 @@ export function createAgentApiRouter({
         })
         return res.type('text/plain').send(renderFreshAgentTranscript(snapshot))
       } catch (err: any) {
+        // A RESTORE_NOT_FOUND resolution means no session by this id exists on
+        // this server (a legacy/foreign layout-sync pane): answer with the
+        // generic pane-kind validation gate wording instead of an unhandled
+        // 500. Every other failure keeps its documented status mapping.
+        if (err instanceof ClaudeFreshAgentHistoryResolutionError && err.code === 'RESTORE_NOT_FOUND') {
+          return res.status(422).json(
+            fail(`pane kind "${paneSnapshot.kind}" does not support capture-pane; use screenshot-pane`),
+          )
+        }
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent capture failed'))
       }
     }
@@ -1284,9 +1247,10 @@ export function createAgentApiRouter({
         if (handled) return
       }
       const direction = req.body?.direction || 'horizontal'
+      const wantsHostStats = !!req.body?.hostStats
       const wantsBrowser = !!req.body?.browser
       const wantsEditor = !!req.body?.editor
-      const splitMode = !wantsBrowser && !wantsEditor ? req.body?.mode || 'shell' : undefined
+      const splitMode = !wantsHostStats && !wantsBrowser && !wantsEditor ? req.body?.mode || 'shell' : undefined
       const requestedSessionRef = splitMode ? sanitizeSessionRef(req.body?.sessionRef) : undefined
       const acceptedSessionRef = splitMode
         ? acceptedSessionRefForMode(requestedSessionRef, splitMode)
@@ -1298,7 +1262,7 @@ export function createAgentApiRouter({
           req.body?.resumeSessionId,
         )
         : undefined
-      if (!wantsBrowser && !wantsEditor) {
+      if (!wantsHostStats && !wantsBrowser && !wantsEditor) {
         assertTerminalAdmission()
       }
 
@@ -1307,6 +1271,7 @@ export function createAgentApiRouter({
         direction,
         browser: wantsBrowser ? req.body?.browser : undefined,
         editor: wantsEditor ? req.body?.editor : undefined,
+        hostStats: wantsHostStats ? true : undefined,
       })
 
       if (!result?.tabId || !result?.newPaneId) {
@@ -1319,7 +1284,9 @@ export function createAgentApiRouter({
 
       let content: any
       let terminalId: string | undefined
-      if (wantsBrowser) {
+      if (wantsHostStats) {
+        content = { kind: 'host-stats' }
+      } else if (wantsBrowser) {
         content = { kind: 'browser', url: req.body.browser, devToolsOpen: false }
       } else if (wantsEditor) {
         content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true }
@@ -1381,7 +1348,7 @@ export function createAgentApiRouter({
         },
       })
 
-      const message = wantsBrowser || wantsEditor ? 'pane split (non-terminal)' : 'pane split'
+      const message = wantsHostStats || wantsBrowser || wantsEditor ? 'pane split (non-terminal)' : 'pane split'
       createdTerminalId = undefined
       res.json(ok({ paneId: newPaneId, terminalId }, message))
     } catch (err: any) {
@@ -1404,13 +1371,10 @@ export function createAgentApiRouter({
       const resolved = resolvePaneTarget(req.params.id)
       if (rejectPaneTargetError(res, resolved)) return
       const paneId = resolved.paneId || req.params.id
-      const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
       const result = layoutStore.renamePane(paneId, name)
       let responseData = result
 
       if (result?.tabId) {
-        await persistSyncableTerminalRename(paneSnapshot, name)
-
         const tabRenamed = (layoutStore.listPanes?.(result.tabId) || []).length === 1
         responseData = { ...result, tabRenamed }
 

@@ -1,5 +1,6 @@
 import type { CodingCliProviderName } from './coding-cli-types'
 import type { TokenSummary } from '@shared/ws-protocol'
+import type { TitleSource } from '@shared/title-source'
 import {
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
@@ -570,6 +571,12 @@ export type SearchResult = {
   liveTerminalOnly?: boolean
   /** STATUS-STRIP: live token usage from the server read model. */
   tokenUsage?: TokenSummary
+  /** b5fb: true exactly when a stored titleOverride currently applies to this row. */
+  titleOverridden?: boolean
+  /** b5fb: the parsed pre-override (provider-native) title, when one was parsed. */
+  providerTitle?: string
+  /** b5fb: the applied override row's recorded titleSource, when it recorded one. */
+  titleOverrideSource?: TitleSource
 }
 
 export type SearchResponse = {
@@ -661,6 +668,11 @@ function groupDirectoryItemsAsProjects(
       // STATUS-STRIP: window rows carry live usage so the fresh-agent strip
       // context meter reads the same data the sidebar fetches.
       ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
+      // b5fb: the reviewed reset flow's provenance fields (allowlist mapper —
+      // forward explicitly or they never reach Redux).
+      ...(item.titleOverridden ? { titleOverridden: true } : {}),
+      ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
+      ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
     })),
   }))
 }
@@ -774,6 +786,10 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
       runningTerminalId: item.runningTerminalId,
       liveTerminalOnly: item.liveTerminalOnly,
       ...(item.tokenUsage ? { tokenUsage: item.tokenUsage } : {}),
+      // b5fb: forward the reset-flow provenance fields (allowlist mapper).
+      ...(item.titleOverridden ? { titleOverridden: true } : {}),
+      ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
+      ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
     })),
     tier,
     query,

@@ -1803,11 +1803,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     expect(e2eServerKind).toBe('rust')
     // P1.8+P1.9 (D3, §4.2) LANDED -- pin flipped: the claude binding row is
     // written durably to the pane-identity ledger BEFORE the PTY spawn, so a
-    // SIGKILL moments after spawn (before any snapshot cadence) still leaves
-    // a recoverable row. After browser-state loss the recovery inventory
-    // reports it (recoverable: true) and the "recover my panes" offer
-    // (data-testid="recovery-offer-panel") surfaces it -- the poll below
-    // accepts either an auto-restored pane or the visible offer.
+    // SIGKILL the moment the row lands (ahead of any snapshot cadence) still
+    // leaves a recoverable row. After browser-state loss the recovery
+    // inventory reports it (recoverable: true) and the "recover my panes"
+    // offer (data-testid="recovery-offer-panel") surfaces it -- the poll
+    // below accepts either an auto-restored pane or the visible offer, and
+    // the tail after it pins WHERE the offered row lands (D8 placement).
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-5s-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -1817,9 +1818,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       'claude',
       path.join(sharedRoot, 'bin'),
     )
+    let capturedHome = ''
     const { server, harness, info } = await bootWall(page, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
-      setupHome: seedWallConfig({ providers: ['claude'] }),
+      setupHome: async (homeDir) => {
+        capturedHome = homeDir
+        await seedWallConfig({ providers: ['claude'] })(homeDir)
+      },
     })
     try {
       await selectShellIfPickerShowing(page)
@@ -1838,29 +1843,37 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await dirInput.fill(projectDir)
       await dirInput.press('Enter')
 
-      // Server-minted identity exists the moment the CLI spawns: the fake
-      // appends its argv line synchronously at spawn, so the first
-      // --session-id entry marks the pane's t=0. UI creation is slower than
-      // a REST call, so the poll gets a UI-scale timeout; the "within 5s of
-      // creation" premise is anchored on the SPAWN instead -- SIGKILL is
-      // issued immediately after the entry appears (moments after spawn,
-      // well inside any snapshot cadence).
+      // Server-minted identity exists BEFORE the CLI spawns: P1.8/P1.9 write
+      // the claude binding row to the pane-identity ledger durably ahead of
+      // the PTY spawn, so the row file's appearance marks the pane's t=0 and
+      // the "within 5s of creation" premise anchors there -- the SIGKILL
+      // lands moments later, far inside any 5s snapshot cadence. (Whether the
+      // association stamp's instant registry push beat the kill is a race the
+      // evidence shaping below settles deterministically.) UI creation is
+      // slower than a REST call, so this poll gets a UI-scale timeout.
+      const bindingsDir = path.join(capturedHome, '.freshell', 'pane-ledger', 'bindings', 'claude')
       const preallocatedId: string = await expect
         .poll(async () => {
-          const entries = await readArgvLog(argLogPath)
-          const withId = entries.find((e) => e.argv.includes('--session-id'))
-          return withId ? withId.argv[withId.argv.indexOf('--session-id') + 1] ?? null : null
+          const names = await fs.readdir(bindingsDir).catch(() => [] as string[])
+          const rowFile = names.find((n) => n.endsWith('.json'))
+          return rowFile ? rowFile.slice(0, -'.json'.length) : null
         }, { timeout: 20_000 })
         .not.toBeNull()
         .then(async () => {
-          const entries = await readArgvLog(argLogPath)
-          const withId = entries.find((e) => e.argv.includes('--session-id'))!
-          return withId.argv[withId.argv.indexOf('--session-id') + 1]!
+          const names = await fs.readdir(bindingsDir)
+          return names.find((n) => n.endsWith('.json'))!.slice(0, -'.json'.length)
         })
 
-      // ...and the SIGKILL lands immediately after the spawn -- before any
-      // snapshot cadence could have persisted the binding. Then the browser
-      // loses its state. TWO deviations from the naive clear+reload
+      // ...and the SIGKILL lands immediately after the identity row is
+      // durably on disk -- no snapshot cadence could have observed it. The
+      // browser dies FIRST (about:blank): the compound loss the offer exists
+      // for is a dead browser AND a dead server -- and it is load-bearing for
+      // determinism, not just fidelity: if the old page survived the restart
+      // it would reconnect and force-push its (possibly sessionRef-stamped)
+      // live registry (pushNow(true) on 'ready', tabRegistrySync.ts:470-473),
+      // re-referencing the row AFTER the shaping below had pruned it. Then
+      // the browser loses its state. TWO deviations from the naive
+      // clear+reload
       // (observed hang, run of 2026-07-24, DEBUG=pw:api):
       //   (1) an evaluate-time localStorage.clear() is racy -- the persist
       //       middleware re-writes the whole state on the next store update
@@ -1872,7 +1885,44 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       //       hung to the 180s test timeout (setup hang, not the contract
       //       red). Re-enter through the token URL instead -- the same door a
       //       user who lost their browser state walks back in through.
+      await page.goto('about:blank')
       await server.restartAbrupt()
+
+      // POST-KILL EVIDENCE SHAPING (deterministic placement discrimination):
+      // the client pushes its tab registry on EVERY store change
+      // (tabRegistrySync.ts), and the association stamp reaches it at bind
+      // time -- so whether a sessionRef-stamped generation persisted in the
+      // sub-second between the row write and the SIGKILL is a race no
+      // test-side observation can close. Close it HERE instead: delete every
+      // retained generation that references the claude session id. The
+      // surviving newest generation then carries the tab (with the shell
+      // pane) but provably never heard of this session -- exactly the
+      // evidence shape a within-cadence loss leaves behind in production
+      // (older generations are pruned there by retention the same way,
+      // MAX_SNAPSHOT_GENERATIONS=5, tabs_persist.rs:14). The ledger row is
+      // now deterministically unreferenced: it reaches the offer as
+      // ledgerOnly, and the placement tail below discriminates the plan-time
+      // join rather than a won-or-lost stamp race.
+      const snapshotsRoot = path.join(capturedHome, '.freshell', 'tabs-snapshots')
+      let keptSessionFreeGeneration = false
+      for (const deviceDirName of await fs.readdir(snapshotsRoot).catch(() => [] as string[])) {
+        const deviceDir = path.join(snapshotsRoot, deviceDirName)
+        const generationFiles = (await fs.readdir(deviceDir))
+          .filter((n) => n.endsWith('.json'))
+        for (const name of generationFiles) {
+          const filePath = path.join(deviceDir, name)
+          if ((await fs.readFile(filePath, 'utf8')).includes(preallocatedId)) {
+            await fs.rm(filePath)
+          } else {
+            keptSessionFreeGeneration = true
+          }
+        }
+      }
+      expect(
+        keptSessionFreeGeneration,
+        'evidence shaping must leave a session-free generation behind (the shell-pane push)',
+      ).toBe(true)
+
       await page.addInitScript(() => {
         try {
           localStorage.clear()
@@ -1905,6 +1955,53 @@ test.describe('Restore Contract Wall (P0.1)', () => {
           return recoverOffer
         }, { timeout: 30_000 })
         .toBe(true)
+
+      // D8 PLACEMENT TAIL (unconditional, review-round-3): the init-script
+      // storage clear means this boot has NO persisted layout, so auto-restore
+      // is unreachable and the offer is the only reachable evidence for the
+      // kill-window row. Hard-expect it here: if the offer ever fails to
+      // appear, the kill-window keep rule regressed -- fail loud, never skip.
+      const offerPanel = page.getByTestId('recovery-offer-panel')
+      await expect(
+        offerPanel,
+        'the recovery offer must appear after browser-state loss (kill-window keep rule)',
+      ).toBeVisible()
+      await offerPanel.getByTestId('recovery-accept').click()
+
+      // (a) The restored claude pane lands in the SAME restored tab as the
+      // boot shell pane: the row is unreferenced by construction (the shaping
+      // above deleted every generation that ever learned this session id),
+      // so it reaches the plan as a ledgerOnly row and must be JOINED at plan
+      // time via its stamped tabKey; never dumped into a separate tab.
+      await expect
+        .poll(async () => {
+          const state = await harness.getState()
+          const layouts = state?.panes?.layouts ?? {}
+          const tabs = state?.tabs?.tabs ?? []
+          return tabs.some((tab: { id: string }) => {
+            const leaves = collectLeaves(layouts[tab.id])
+            return (
+              leaves.some((l) => l?.content?.sessionRef?.sessionId === preallocatedId)
+              && leaves.some(
+                (l) => l?.content?.kind === 'terminal' && (l?.content?.mode ?? 'shell') === 'shell',
+              )
+            )
+          })
+        }, {
+          timeout: 30_000,
+          message:
+            'the restored claude pane must share a restored tab with the shell pane (not a trailing dump tab)',
+        })
+        .toBe(true)
+      // (b) No trailing 'Recovered sessions' tab: the only kept row joined
+      // its original tab, so the trailing tab never forms.
+      const postAcceptState = await harness.getState()
+      const tabTitles = ((postAcceptState?.tabs?.tabs ?? []) as Array<{ title: string }>).map(
+        (t) => t.title,
+      )
+      expect(tabTitles, 'no trailing Recovered sessions tab may exist').not.toContain(
+        'Recovered sessions',
+      )
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })

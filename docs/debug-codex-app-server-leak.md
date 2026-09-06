@@ -272,6 +272,7 @@ Use red-green-refactor. Add process-level tests where process behavior is the re
 - wrapper identity read failure after spawn is the direct startup failure: force identity lookup to return null without also forcing initialize failure, then assert the owned process group is torn down before retry and startup does not proceed with empty wrapper identity metadata
 - inherited ownership id is visible on the fake native child
 - startup reaper ignores legacy records, does not signal current-process-group records, and blocks startup for any unreaped new-schema record that is not explicitly verified as handled
+- (2026-09-06, kata 4g2a) posture update: where a hold reconciler is installed (default boot path), verified-owned prior-generation survivors are HELD claimable for restore-time reattach instead of killed (design and rationale in the 4g2a landing commit message's `## Plan` section); the bullets below describe the pre-4g2a kill-at-boot posture for non-held/unproven records
 - startup reaper removes only verified stale new-schema groups
 - startup fails when the new-schema reaper returns unreaped active/skipped ownership records, including live `ownerServerPid` and current-process-group cases
 - startup fails when the new-schema reaper throws from ownership verification, process-group signaling, waiting, or metadata removal

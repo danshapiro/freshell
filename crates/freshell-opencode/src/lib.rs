@@ -52,6 +52,6 @@ pub use model::{
 pub use serve::{
     is_healthy_response, CreatedSession, Endpoint, EventSource, EventStreamHandle, ForkedSession,
     OpencodeServeManager, PortAllocator, ProcessSpawner, Route, ServeConfig, ServeDeps, ServeError,
-    ServeHttp, ServeHttpRequest, ServeHttpResponse, ServeProcess, SessionSignal, SpawnRequest,
-    OPENCODE_SIDECAR_OWNERSHIP_ENV,
+    ServeHttp, ServeHttpError, ServeHttpRequest, ServeHttpResponse, ServeProcess, SessionSignal,
+    SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
 };

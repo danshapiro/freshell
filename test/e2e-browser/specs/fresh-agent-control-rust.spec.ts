@@ -79,6 +79,7 @@ import {
 } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -233,7 +234,7 @@ class WsCapture {
     this.ws = new WebSocket(wsUrl)
     this.opened = new Promise((resolve, reject) => {
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 7, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: WS_PROTOCOL_VERSION, token }))
         resolve()
       })
       this.ws.on('error', reject)
@@ -911,7 +912,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await sendComposerText(page, 'RAISE_QUESTION_OTHER')
       await expect(banner).toBeVisible({ timeout: 15_000 })
       await banner.getByRole('button', { name: 'Other' }).click()
-      const otherInput = banner.getByRole('textbox', { name: 'Type your answer...' })
+      const otherInput = banner.getByRole('textbox', { name: 'Free text', exact: true })
       await otherInput.fill('Something custom')
       await banner.getByRole('button', { name: 'Submit' }).click()
       await expect
@@ -1024,6 +1025,68 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         'claude capabilities.fork=false hides /fork from the menu',
       ).toHaveCount(0)
       await page.keyboard.press('Escape')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootClaudeLane(page, 'freshclaude')
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneSessionId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(paneSessionId, 'the pane bridge session id must be known before the send').toBeTruthy()
+
+      // Change the permission mode BETWEEN sends through the pane's real
+      // settings gear: freshclaude's registry default is 'default', so picking
+      // 'acceptEdits' is a REAL change the next send must apply.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('acceptEdits')
+      await page.keyboard.press('Escape')
+      await expect
+        .poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.permissionMode ?? null)
+        .toBe('acceptEdits')
+
+      await sendComposerText(page, 'settings probe')
+
+      // Canonical machinery: the settings-bearing send routes through
+      // configure_for_send, which writes a `configure` frame and awaits the
+      // sidecar's ack BEFORE the user message frame — the stdin audit proves
+      // strict ordering (the knobs provably land before the turn starts).
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+        'configure frame carrying permissionMode:acceptEdits',
+      )
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'send' && f?.text === 'settings probe',
+        'send frame for "settings probe"',
+      )
+      const frames = readStdinFrames(lane.stdinLog)
+      const configureIdx = frames.findIndex(
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+      )
+      const sendIdx = frames.findIndex((f) => f?.type === 'send' && f?.text === 'settings probe')
+      expect(configureIdx, 'the per-send configure frame must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(sendIdx, 'the probe send must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(configureIdx, 'configure must land strictly BEFORE the send it applies to').toBeLessThan(sendIdx)
+
+      // The fake sidecar answers with sdk.configured carrying the applied
+      // settings (the ack configure_for_send awaits): the wire-row proves the
+      // ack as well as the ordering.
+      const ack = await waitForLogEntry(
+        lane.eventsLog,
+        (e) => e.kind === 'wire'
+          && e.frame?.type === 'sdk.configured'
+          && e.frame?.ok === true
+          && e.frame?.settings?.permissionMode === 'acceptEdits'
+          && e.frame?.sessionId === paneSessionId,
+        'sdk.configured wire row acknowledging permissionMode:acceptEdits',
+      )
+      expect(ack.frame.ok).toBe(true)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1235,13 +1298,14 @@ function projectSlugOf(cwd: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
-async function bootCodexLane(page: Page): Promise<{
+async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {}): Promise<{
   server: RustServer
   info: TestServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
   opLogPath: string
+  responseLogPath: string
   tabId: string
 }> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agentctl-codex-'))
@@ -1249,6 +1313,7 @@ async function bootCodexLane(page: Page): Promise<{
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const opLogPath = path.join(sharedRoot, 'codex-ops.jsonl')
+    const responseLogPath = path.join(sharedRoot, 'codex-responses.jsonl')
     const { server, info, harness } = await bootWall(page, {
       env: {
         // Whitespace-split by spawn_sidecar (codex.rs): interpreter + script.
@@ -1258,6 +1323,8 @@ async function bootCodexLane(page: Page): Promise<{
           // REAL per-thread turn recording (fixture opt-in): thread/read
           // answers the recorded history, so forks provably diverge at the pin.
           recordTurns: true,
+          appendClientResponseLogPath: responseLogPath,
+          ...behavior,
         }),
       },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
@@ -1268,7 +1335,7 @@ async function bootCodexLane(page: Page): Promise<{
     const tabId = (await harness.getActiveTabId())!
     expect(tabId).toBeTruthy()
     await createFreshAgentPane(page, /^Freshcodex$/, 'Freshcodex', projectDir)
-    return { server, info, harness, sharedRoot, projectDir, opLogPath, tabId }
+    return { server, info, harness, sharedRoot, projectDir, opLogPath, responseLogPath, tabId }
   } catch (error) {
     await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     throw error
@@ -1337,6 +1404,46 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
+
+  test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
+      'Approve tests': { id: 501, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
+      'Ask a question': { id: 'question-501', method: 'item/tool/requestUserInput', params: { isBlocking: true, questions: [{ id: 'color', header: 'Color', question: 'Choose a color', options: [{ label: 'Blue', description: 'Use blue' }] }] } },
+      'Deny an edit': { id: 502, method: 'item/fileChange/requestApproval', params: { reason: 'Change the file', grantRoot: '/tmp/example' } },
+    } })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendComposerText(page, 'Approve tests')
+      const approval = page.getByRole('alert', { name: 'Permission request for Bash' })
+      await expect(approval).toBeVisible()
+      expect(readJsonl(lane.responseLogPath)).toHaveLength(0)
+      await page.reload()
+      await expect(approval).toHaveCount(1)
+      await expect(approval).toBeVisible()
+      await approval.getByRole('button', { name: 'Allow tool use', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 501, result: { decision: 'accept' } })
+      await expect(approval).toBeHidden()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendComposerText(page, 'Ask a question')
+      const question = page.getByRole('region', { name: 'Question from Codex' })
+      await expect(question).toBeVisible()
+      await question.getByRole('button', { name: 'Blue', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 'question-501', result: { answers: { color: { answers: ['Blue'] } } } })
+      await expect(question).toBeHidden()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await sendComposerText(page, 'Deny an edit')
+      const edit = page.getByRole('alert', { name: 'Permission request for Edit' })
+      await expect(edit).toBeVisible()
+      await edit.getByRole('button', { name: 'Deny tool use', exact: true }).click()
+      await expect.poll(() => readJsonl(lane.responseLogPath)).toContainEqual({ id: 502, result: { decision: 'decline' } })
+      await expect(edit).toBeHidden()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 
   test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
@@ -1620,6 +1727,67 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // Turn 1 rides the pane's untouched defaults.
+      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
+
+      // Change model + effort BETWEEN sends through the real settings UI:
+      // gear popover → Model row ("Change…") → the two-column model dialog →
+      // pick GPT-5.4 Flash, stage its `low` thinking level, commit.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      const popover = page.getByRole('dialog', { name: 'Agent settings' })
+      await expect(popover).toBeVisible({ timeout: 10_000 })
+      await popover.getByRole('button', { name: /Change/ }).click()
+      const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await expect(dialog).toBeVisible({ timeout: 10_000 })
+      await dialog.getByRole('option', { name: 'GPT-5.4 Flash' }).click()
+      const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+      await expect(levelsList).toBeVisible()
+      await levelsList.getByRole('option', { name: 'low', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }).click()
+      await expect(dialog).toHaveCount(0)
+      // The commit leaves the settings popover open behind the dialog; close it.
+      await page.keyboard.press('Escape')
+      await expect(popover).toHaveCount(0, { timeout: 10_000 })
+      await expect
+        .poll(async () => {
+          const content = (await paneLeaf(lane.harness, lane.tabId))?.content
+          return content ? `${content.model ?? ''}|${content.effort ?? ''}` : ''
+        })
+        .toBe('gpt-5.4-flash|low')
+
+      // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
+      // msg.settings over the session baseline before turn/start).
+      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+
+      // Ground truth: the fake's recorded-turns file under the lane's isolated
+      // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
+      // turn carries its captured turn/start params additively under `start` —
+      // turn 2 carries the per-send selection while turn 1 kept the defaults
+      // (gpt-5.5 / the default 'max' effort, wire-mapped 'xhigh' by
+      // to_codex_reasoning_effort).
+      const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
+      await expect(async () => {
+        const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
+        expect(turns, 'exactly the two recorded turns').toHaveLength(2)
+        expect(turns[1]?.start?.model).toBe('gpt-5.4-flash')
+        expect(turns[1]?.start?.effort).toBe('low')
+        expect(turns[0]?.start?.model).toBe('gpt-5.5')
+        expect(turns[0]?.start?.effort).toBe('xhigh')
+        expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
+        expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)
+      }).toPass({ timeout: 15_000 })
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1719,9 +1887,9 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
       )
       expect(summarize.sessionId).toBe(sessionId)
       // The strict 1.18.18 schema: exactly {providerID, modelID}, derived from
-      // the pane's default catalog model (opencode-go/glm-5.2).
+      // the fake provider's configured default model (/config).
       expect(summarize.bodyKeys).toEqual(['modelID', 'providerID'])
-      expect(summarize.body).toEqual({ providerID: 'opencode-go', modelID: 'glm-5.2' })
+      expect(summarize.body).toEqual({ providerID: 'opencode', modelID: 'fake-opencode' })
 
       // Usable afterward: a follow-up turn materializes another prompt.
       await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode post-compact turn', 2, lane.auditLogPath)

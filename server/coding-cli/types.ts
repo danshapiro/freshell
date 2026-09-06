@@ -1,4 +1,5 @@
 import type { CodingCliProviderName } from '../../shared/ws-protocol.js'
+import type { TitleSource } from '../../shared/title-source.js'
 export type { CodingCliProviderName }
 
 /**
@@ -193,6 +194,15 @@ export interface CodingCliSession {
   isNonInteractive?: boolean
   sessionType?: string
   codexTaskEvents?: CodexTaskEventSnapshot
+  /**
+   * b5fb provenance exposure for the reviewed reset flow: set by
+   * `applyOverride` exactly when a stored titleOverride currently applies to
+   * this row — `providerTitle` is the parsed pre-override title,
+   * `titleOverrideSource` the override row's recorded titleSource.
+   */
+  titleOverridden?: boolean
+  providerTitle?: string
+  titleOverrideSource?: TitleSource
 }
 
 export const FIRST_USER_MESSAGE_MAX_CHARS = 4000

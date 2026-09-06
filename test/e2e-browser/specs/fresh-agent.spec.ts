@@ -293,6 +293,37 @@ async function seedIndexedClaudeContextUsage(
 }
 
 test.describe('Fresh Agent', () => {
+  test('preserves queued follow-ups after exit and lets users review and cancel them', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000099'
+    await stubFreshclaudeThread(page, sessionId)
+    await installFreshclaudeStripPane(page, sessionId)
+    const input = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(input).toBeEnabled()
+    const setStatus = async (status: 'running' | 'exited') => page.evaluate(({ sessionId, status }) => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'freshAgent/setSessionStatus',
+        payload: { sessionId, sessionType: 'freshclaude', provider: 'claude', status },
+      })
+    }, { sessionId, status })
+    await setStatus('running')
+    await input.fill('Review the first change')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await input.fill('Review the second change')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    const queued = page.getByRole('status', { name: 'Queued messages' })
+    await expect(queued).toHaveText('2 queued')
+    await setStatus('exited')
+    await expect(input).toBeDisabled()
+    await expect(queued).toHaveText('2 queued')
+    await page.getByRole('button', { name: 'Show queued messages' }).click()
+    await expect(page.getByText('Review the second change', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Remove queued message 2' }).click()
+    await expect(queued).toHaveText('1 queued')
+    await expect(page.getByText('Review the first change', { exact: true })).toBeVisible()
+    await expect(page.getByText('Review the second change', { exact: true })).toHaveCount(0)
+  })
+
   test('shows the session status strip in the unknown state (chip + muted context lug, no meter)', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     await stubFreshclaudeThread(page, '63333000-0000-4333-8333-000000000001')
@@ -571,6 +602,48 @@ test.describe('Fresh Agent', () => {
     const monoFont = await readTurnHeaderFontFamily()
     expect(monoFont).toMatch(/mono/i)
     expect(monoFont).not.toBe(defaultFont)
+  })
+
+  test('turn context menu renders on an opaque popover surface', async ({ freshellPage: _freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000006'
+    await stubFreshclaudeThread(page, sessionId, [
+      {
+        id: 'turn-menu-user',
+        turnId: 'turn-menu-user',
+        role: 'user',
+        summary: 'Summarize the menu surface.',
+        items: [{ id: 'item-menu-user', kind: 'text', text: 'Summarize the menu surface.' }],
+      },
+    ])
+    await installFreshclaudeStripPane(page, sessionId)
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    const turnText = paneRoot.getByText('Summarize the menu surface.', { exact: true })
+    await expect(turnText).toBeVisible({ timeout: 10_000 })
+    await turnText.click({ button: 'right' })
+
+    // Fine-pointer desktop: right-clicking a turn opens the floating turn menu.
+    const menu = page.getByRole('menu', { name: 'Turn context menu' })
+    await expect(menu).toBeVisible()
+
+    // Regression pin: bg-popover previously resolved to no rule at all (the
+    // popover tokens were missing from the tailwind config/theme variables),
+    // so the menu floated over the transcript with a transparent background.
+    const backgroundColor = await menu.evaluate((el) => getComputedStyle(el).backgroundColor)
+    expect(backgroundColor, 'turn context menu must not be transparent').not.toBe('rgba(0, 0, 0, 0)')
+    expect(backgroundColor).not.toBe('transparent')
+
+    // And it must be the popover surface token itself, not accidental inheritance.
+    const expectedSurface = await page.evaluate(() => {
+      const probe = document.createElement('div')
+      probe.style.backgroundColor = 'hsl(var(--popover))'
+      document.body.appendChild(probe)
+      const value = getComputedStyle(probe).backgroundColor
+      probe.remove()
+      return value
+    })
+    expect(backgroundColor).toBe(expectedSurface)
   })
 
   test('pane picker hides fresh clients by default even when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {

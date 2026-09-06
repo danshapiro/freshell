@@ -19,6 +19,7 @@ import amplifierActivityReducer from './amplifierActivitySlice'
 import opencodeActivityReducer from './opencodeActivitySlice'
 import freshAgentReducer from './freshAgentSlice'
 import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
+import hostStatsReducer from './hostStatsSlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
 import extensionsReducer from './extensionsSlice'
@@ -65,6 +66,8 @@ export const store = configureStore({
     opencodeActivity: opencodeActivityReducer,
     freshAgent: freshAgentReducer,
     paneRuntimeActivity: paneRuntimeActivityReducer,
+    // Ephemeral live host metrics — never persisted (allowlist rule)
+    hostStats: hostStatsReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
     extensions: extensionsReducer,

@@ -86,6 +86,8 @@ const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
   connect: vi.fn(),
   onMessage: vi.fn(),
+  // Interest is transient and negotiated; this suite does not exercise it.
+  sendTerminalInterest: vi.fn(() => false),
   onReconnect: vi.fn().mockReturnValue(() => {}),
   onDisconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
@@ -98,12 +100,19 @@ const terminalRestoreMocks = vi.hoisted(() => ({
   addTerminalRestoreRequestId: vi.fn(),
   addTerminalFreshRecoveryRequestId: vi.fn(),
   setPaneReconcileActive: vi.fn(),
+  // Batch-6 arm/consume pair (restore offer live-reattach): a full-module
+  // mock must carry every export TerminalView imports, or the create path
+  // throws inside the mock and vitest reports an unhandled rejection.
+  armRecoveredLiveTerminalTarget: vi.fn(),
+  consumeRecoveredLiveTerminalTarget: vi.fn(() => undefined),
 }))
 
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: terminalRestoreMocks.addTerminalRestoreRequestId,
   addTerminalFreshRecoveryRequestId: terminalRestoreMocks.addTerminalFreshRecoveryRequestId,
   setPaneReconcileActive: terminalRestoreMocks.setPaneReconcileActive,
+  armRecoveredLiveTerminalTarget: terminalRestoreMocks.armRecoveredLiveTerminalTarget,
+  consumeRecoveredLiveTerminalTarget: terminalRestoreMocks.consumeRecoveredLiveTerminalTarget,
 }))
 
 let messageHandler: ((msg: any) => void) | null = null
@@ -113,6 +122,7 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsMocks.send,
     connect: wsMocks.connect,
+    sendTerminalInterest: wsMocks.sendTerminalInterest,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     onDisconnect: wsMocks.onDisconnect,

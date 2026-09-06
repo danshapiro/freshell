@@ -6,8 +6,9 @@
 //! (`TerminalRegistry`), and REAL `tokio-tungstenite` WS clients -- one that
 //! deliberately stops reading while a terminal floods output (the slow
 //! client), and one that keeps reading throughout (the fast client). This
-//! exercises the actual `ConnectionOutputQueue` wired into
-//! `crate::terminal::run`, not a mock.
+//! exercises the actual per-connection byte-fair delivery queue owned by the
+//! connection socket writer (`crate::terminal`'s `connection_writer`), not a
+//! mock.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +79,7 @@ async fn spawn_server(term09: Term09Config) -> String {
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),

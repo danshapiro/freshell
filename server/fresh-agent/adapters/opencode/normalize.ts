@@ -459,6 +459,14 @@ export function normalizeOpencodeSnapshot(input: {
       worktrees: false,
       diffs: true,
       childThreads: false,
+      // kata z7j7: model/effort are per-send (re-sent in the prompt_async body);
+      // sandbox/permissionMode have no opencode wire concept.
+      settingScopes: {
+        model: 'per-send',
+        effort: 'per-send',
+        sandbox: 'unsupported',
+        permissionMode: 'unsupported',
+      },
     },
     settings: {
       ...(sessionModel ? { model: sessionModel } : {}),

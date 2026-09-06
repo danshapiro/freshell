@@ -159,6 +159,42 @@ describe('files-router path validation', () => {
     })
   })
 
+  describe('GET /api/files/raw', () => {
+    it('requires a path query parameter', async () => {
+      const res = await request(app).get('/api/files/raw')
+      expect(res.status).toBe(400)
+      expect(res.body).toEqual({ error: 'path query parameter required' })
+    })
+
+    it('rejects paths outside allowedFilePaths with 403', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/allowed-root'] })
+      const res = await request(app)
+        .get('/api/files/raw')
+        .query({ path: '/elsewhere/secret.png' })
+      expect(res.status).toBe(403)
+      expect(res.body).toEqual({ error: 'Path not allowed' })
+      expect(mockStat).not.toHaveBeenCalled()
+    })
+
+    it('returns 404 for a missing file', async () => {
+      mockStat.mockRejectedValue(Object.assign(new Error('nope'), { code: 'ENOENT' }))
+      const res = await request(app)
+        .get('/api/files/raw')
+        .query({ path: '/home/user/missing.png' })
+      expect(res.status).toBe(404)
+      expect(res.body).toEqual({ error: 'File not found' })
+    })
+
+    it('returns 400 for a directory', async () => {
+      mockStat.mockResolvedValue({ isDirectory: () => true })
+      const res = await request(app)
+        .get('/api/files/raw')
+        .query({ path: '/home/user/dir' })
+      expect(res.status).toBe(400)
+      expect(res.body).toEqual({ error: 'Cannot read directory' })
+    })
+  })
+
   describe('POST /api/files/write', () => {
     it('allows writing when allowedFilePaths is undefined', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })

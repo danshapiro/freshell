@@ -10,6 +10,7 @@ import {
   reapOrphanedCodexAppServerSidecars,
   rescanCodexReaperQuarantine,
 } from './codex-app-server/runtime.js'
+import type { CodexSidecarReconciler } from './codex-app-server/sidecar-reattach.js'
 
 // Stage 1c observability (plan §7.5): one structured `codex-log-db:` line at boot and then hourly,
 // plus the hourly retry of pending reaper records and the quarantine rescan trigger.
@@ -46,6 +47,12 @@ export type CodexReaperMaintenanceOptions = {
   metadataDir?: string
   terminateGraceMs?: number
   log?: CodexObservabilityLogger
+  /**
+   * Boot reconciler holding verified survivors (kata 4g2a): drives the grace-gated sweep — once
+   * its grace window expires with survivors still held, the tick re-runs the reaper with the
+   * reconciler's protection set, then forgets whatever was reaped.
+   */
+  reconciler?: CodexSidecarReconciler
 }
 
 export type CodexObservabilityOptions = CodexReaperMaintenanceOptions & {
@@ -221,14 +228,23 @@ export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintena
   try {
     const { promotedRecords } = await rescanCodexReaperQuarantine(options.metadataDir)
     const due = await hasDueCodexReaperRetries(options.metadataDir)
-    if (promotedRecords.length === 0 && !due) return
-    await reapOrphanedCodexAppServerSidecars({
+    const reconciler = options.reconciler
+    // 4g2a sweep: an expired reconciler with survivors still held regains the reaper's full
+    // authority (kill + unlink) over anything unclaimed and not in flight.
+    const sweepDue = reconciler?.hasExpired() === true && reconciler.snapshot().held > 0
+    if (promotedRecords.length === 0 && !due && !sweepDue) return
+    const result = await reapOrphanedCodexAppServerSidecars({
       serverInstanceId: options.serverInstanceId,
       // m2: per-record backoff gating — only due records are re-attempted (and re-counted).
       respectRetryBackoff: true,
       ...(options.metadataDir !== undefined ? { metadataDir: options.metadataDir } : {}),
       ...(options.terminateGraceMs !== undefined ? { terminateGraceMs: options.terminateGraceMs } : {}),
+      // Function form: the reaper re-consults the protection set PER RECORD, so a claim that
+      // lands mid-pass is honored by every record scanned after it (review Minor 1).
+      ...(reconciler !== undefined ? { skipOwnershipIds: () => reconciler.sweepProtectionSet() } : {}),
     })
+    // Killed records must leave the held maps (else sweepDue stays true forever over ghost ids).
+    reconciler?.forget(result.reapedOwnershipIds)
   } catch (error) {
     try {
       log.warn({ err: error }, 'codex reaper hourly retry tick failed')

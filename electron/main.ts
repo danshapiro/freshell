@@ -5,6 +5,7 @@
 export interface ElectronApp {
   whenReady(): Promise<void>
   on(event: string, callback: (...args: any[]) => void): void
+  listenerCount(event: string): number
   quit(): void
   requestSingleInstanceLock(): boolean
 }
@@ -17,16 +18,30 @@ export interface MainProcessDeps {
   platform: NodeJS.Platform
 }
 
-export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
-  const { app, minimizeToTray } = deps
-
-  // Single-instance lock
+/**
+ * Acquire the single-instance lock for this process's userData dir. When
+ * entry.ts has namespaced userData per profile, each profile holds its own
+ * lock. Call BEFORE any boot side effects (provisioning, server spawn).
+ * Returns true when the lock is held; on failure the app quits and this
+ * returns false. `onDenied` (optional) runs immediately BEFORE app.quit() —
+ * entry.ts uses it to lift the wizard-phase `will-quit` veto for the denied
+ * duplicate, which never enters the wizard.
+ */
+export function acquireInstanceLock(app: ElectronApp, onDenied?: () => void): boolean {
   const gotLock = app.requestSingleInstanceLock()
   if (!gotLock) {
+    onDenied?.()
     app.quit()
-    return
+    return false
   }
+  return true
+}
 
+export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
+  // The caller must hold the instance lock already (see acquireInstanceLock)
+  // and install the canonical `second-instance` surfacing handler (entry.ts
+  // registers it right after the lock gate, covering every boot phase).
+  const { app, minimizeToTray } = deps
   let mainWindow: any = null
   let isQuitting = false
 
@@ -56,16 +71,6 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
   app.on('activate', () => {
     if (mainWindow) {
       mainWindow.show()
-    }
-  })
-
-  // Second instance: focus existing window
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized?.()) {
-        mainWindow.restore?.()
-      }
-      mainWindow.focus?.()
     }
   })
 

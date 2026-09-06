@@ -74,7 +74,9 @@ enum Entry {
         /// `terminal_create_duplicate_in_flight` warn line (council
         /// observability follow-up, PR #552): a duplicate arriving against
         /// a MINUTES-old sentinel is a wedged create, not a race.
-        started: Instant,
+        // Allocation identity is also the cleanup generation; equal clock
+        // readings must not make two attempts interchangeable.
+        started: Arc<Instant>,
     },
     /// The create settled: replay this exact `terminal.created` frame.
     Settled {
@@ -158,7 +160,7 @@ impl CreateDedupe {
         sink: &FrameSink,
         origin: &FrameSink,
         waiters: &mut Vec<Waiter>,
-        started: &Instant,
+        started: &Arc<Instant>,
         conn_id: u64,
     ) {
         let already_known =
@@ -181,7 +183,7 @@ impl CreateDedupe {
         Entry::InFlight {
             origin: Arc::clone(sink),
             waiters: Vec::new(),
-            started: Instant::now(),
+            started: Arc::new(Instant::now()),
         }
     }
 
@@ -412,9 +414,35 @@ impl CreateDedupe {
     /// This is what lets the client's 2s RATE_LIMITED retry (same
     /// requestId) proceed as a fresh create.
     pub fn clear_if_in_flight(&self, request_id: &str) {
+        self.clear_in_flight_generation(request_id, None);
+    }
+
+    /// Capture immediately after begin returned Proceed, before launching the
+    /// work. The Arc identity is unique even if two Instant readings are equal.
+    pub(crate) fn in_flight_generation(&self, request_id: &str) -> Option<Arc<Instant>> {
+        let map = self.entries.lock().expect("create_dedupe lock");
+        match map.get(request_id) {
+            Some(Entry::InFlight { started, .. }) => Some(Arc::clone(started)),
+            _ => None,
+        }
+    }
+
+    /// A completed worker must not clear a newer attempt which began after
+    /// its settle (e.g. the same requestId with a changed restore flag).
+    pub(crate) fn clear_matching_generation(&self, request_id: &str, generation: &Arc<Instant>) {
+        self.clear_in_flight_generation(request_id, Some(generation));
+    }
+
+    fn clear_in_flight_generation(&self, request_id: &str, generation: Option<&Arc<Instant>>) {
         let removed = {
             let mut map = self.entries.lock().expect("create_dedupe lock");
-            if matches!(map.get(request_id), Some(Entry::InFlight { .. })) {
+            let matches = match map.get(request_id) {
+                Some(Entry::InFlight { started, .. }) => {
+                    generation.is_none_or(|expected| Arc::ptr_eq(started, expected))
+                }
+                _ => false,
+            };
+            if matches {
                 map.remove(request_id)
             } else {
                 None
@@ -431,6 +459,10 @@ impl CreateDedupe {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "create_dedupe_generation_tests.rs"]
+mod generation_tests;
 
 #[cfg(test)]
 mod tests {

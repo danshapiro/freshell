@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 import pino, { type DestinationStream, type LevelWithSilent } from 'pino'
 import { createStream, type RotatingFileStream } from 'rotating-file-stream'
-import { getFreshellHomeDir } from './freshell-home.js'
+import { getFreshellConfigDir } from './freshell-home.js'
 
 const env = process.env.NODE_ENV || 'development'
 const level = process.env.LOG_LEVEL || 'debug'
@@ -94,7 +94,7 @@ export function getLogContext(): LogContext | undefined {
 
 export function resolveDebugLogPath(
   envVars: NodeJS.ProcessEnv = process.env,
-  homeDir: string = getFreshellHomeDir(envVars),
+  homeDir?: string,
   argv: string[] = process.argv,
 ): string | null {
   const explicitPath = envVars.LOG_DEBUG_PATH?.trim()
@@ -102,14 +102,18 @@ export function resolveDebugLogPath(
   if (isTestRuntime(envVars)) return null
 
   const logDirOverride = envVars.FRESHELL_LOG_DIR?.trim()
-  const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
+  const logDir = logDirOverride
+    ? path.resolve(logDirOverride)
+    : homeDir !== undefined
+      ? path.join(homeDir, '.freshell', 'logs')
+      : path.join(getFreshellConfigDir(envVars), 'logs')
   const filename = resolveDebugLogFilename(envVars, argv)
   return path.join(logDir, filename)
 }
 
 export function resolveSessionLifecycleLogPath(
   envVars: NodeJS.ProcessEnv = process.env,
-  homeDir: string = getFreshellHomeDir(envVars),
+  homeDir?: string,
   argv: string[] = process.argv,
 ): string | null {
   const explicitPath = envVars.LOG_SESSION_LIFECYCLE_PATH?.trim()
@@ -117,7 +121,11 @@ export function resolveSessionLifecycleLogPath(
   if (isTestRuntime(envVars)) return null
 
   const logDirOverride = envVars.FRESHELL_LOG_DIR?.trim()
-  const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
+  const logDir = logDirOverride
+    ? path.resolve(logDirOverride)
+    : homeDir !== undefined
+      ? path.join(homeDir, '.freshell', 'logs')
+      : path.join(getFreshellConfigDir(envVars), 'logs')
   const mode = resolveDebugLogMode(envVars, argv)
   const instance = resolveDebugInstanceTag(envVars)
   return path.join(
@@ -128,7 +136,7 @@ export function resolveSessionLifecycleLogPath(
 
 export function resolveFreshAgentObservabilityLogPath(
   envVars: NodeJS.ProcessEnv = process.env,
-  homeDir: string = getFreshellHomeDir(envVars),
+  homeDir?: string,
   argv: string[] = process.argv,
 ): string | null {
   const explicitPath = envVars.LOG_FRESH_AGENT_PATH?.trim()
@@ -136,7 +144,11 @@ export function resolveFreshAgentObservabilityLogPath(
   if (isTestRuntime(envVars)) return null
 
   const logDirOverride = envVars.FRESHELL_LOG_DIR?.trim()
-  const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
+  const logDir = logDirOverride
+    ? path.resolve(logDirOverride)
+    : homeDir !== undefined
+      ? path.join(homeDir, '.freshell', 'logs')
+      : path.join(getFreshellConfigDir(envVars), 'logs')
   const mode = resolveDebugLogMode(envVars, argv)
   const instance = resolveDebugInstanceTag(envVars)
   return path.join(
