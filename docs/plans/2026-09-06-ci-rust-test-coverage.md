@@ -21,7 +21,7 @@ Per-PR CI runs the Rust cargo test suites and the Tauri app-bound Rust server-sp
   - `claude::tests::the_prior_turns_terminal_edge_during_the_compact_write_window_folds_against_the_armed_tracker` (freshell-freshagent) — timing-sensitive, passes in isolation
   - `ETXTBSY` race in `sleeper_cli_spec` (freshell-ws/tests/common/mod.rs:92) — `std::fs::write` to a `{name}-{pid}` shared path fails when another parallel test is executing the script. Observed on CI (PR #699 run 33943201442, 2026-09-05). Retry procedure: re-run the failed job (GitHub Actions "Re-run failed jobs" button). Fixing the race (unique path per call) is a separate task, not in scope for this PR.
 - Making the new `rust-test` check a required merge gate requires a post-merge ruleset amendment (ruleset 14473229, precedent: clippy-debt plan Task 9 Step 5) — documented here but is a separate user follow-up, not part of this PR
-- Open PR #699 ("Retire the Node server in favor of Rust", 100 files, CONFLICTING/DIRTY, failing clippy, no reviews) also modifies `.github/workflows/rust-clippy.yml` to add `cargo test --workspace --locked` and the Tauri smoke. This PR extracts just the CI workflow change so it lands independently and quickly. When PR #699 eventually merges, it should drop `rust-clippy.yml` from its diff (the changes will already be on main). The user should be aware of this overlap.
+- Open PR #699 ("Retire the Node server in favor of Rust", 1000+ files, CONFLICTING/DIRTY, clippy check fails at the "Rust workspace tests" step due to the ETXTBSY race, no reviews) also modifies `.github/workflows/rust-clippy.yml` to add `cargo test --workspace --locked` and the Tauri smoke. This PR extracts just the CI workflow change so it lands independently and quickly. When PR #699 eventually merges, it should drop `rust-clippy.yml` from its diff (the changes will already be on main). The user should be aware of this overlap.
 
 **Goal:** Every PR runs the full Rust workspace test suite (`cargo test --workspace --locked`) and the Tauri app-bound server-spawn smoke test in CI, as a parallel job alongside the existing clippy gate.
 
@@ -32,9 +32,9 @@ Per-PR CI runs the Rust cargo test suites and the Tauri app-bound Rust server-sp
 ## Global Constraints
 
 - **Toolchain pin:** Rust 1.96.0 via `dtolnay/rust-toolchain@master` — must match the existing `clippy` job and workspace `rust-version`.
-- **Cache:** `Swatinem/rust-cache@v2` — keys on the job id by default (`add-job-id-key: true`), so `rust-test` gets its own cache separate from `clippy` (correct: clippy check artifacts and test codegen artifacts differ). No `shared-key` override needed.
-- **Tauri system deps:** The exact same 8 apt packages as the `clippy` job (`libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev pkg-config build-essential`) — needed to compile `freshell-tauri`. `libdbus-1-dev` (added by PR #699) is not needed on origin/main (the `dbus` crate is a transitive dep of tauri, but the existing clippy job compiles without it — it's pre-installed on ubuntu-latest).
-- **Node.js:** `actions/setup-node@v4` with `node-version: 22` and `cache: npm` — needed because `freshell-freshagent` tests spawn MCP servers that resolve `tsx` from `node_modules/.bin/tsx`. Without `npm ci`, 24 of 825 `freshell-freshagent` tests fail with `Unable to resolve MCP dependency "tsx"`.
+- **Cache:** `Swatinem/rust-cache@v2` — keys on the job id by default (`add-job-id-key: true`), so `rust-test` gets its own cache separate from `clippy` (correct: clippy check artifacts and test codegen artifacts differ). No `shared-key` override needed. Set `cache-on-failure: true` so the cold build is cached even if the ETXTBSY flake triggers — without it, "Re-run failed jobs" pays the cold build again.
+- **Tauri system deps:** The exact same 8 apt packages as the `clippy` job (`libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev pkg-config build-essential`) — needed to compile `freshell-tauri`. `libdbus-1-dev` (added by PR #699) is not needed because it arrives as a transitive apt dependency of `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, and `libayatana-appindicator3-dev` (the `dbus` crate via tauri/tao needs `libdbus-sys`, which pkg-config resolves against the system dbus headers pulled in by those apt packages).
+- **Node.js:** `actions/setup-node@v4` with `node-version: 22` and `cache: npm` — needed because `freshell-freshagent` tests spawn MCP servers that resolve `tsx` from `node_modules/.bin/tsx`. Without `npm ci`, `freshell-freshagent` tests fail with `Unable to resolve MCP dependency "tsx"`.
 - **`--locked`:** Must use `cargo test --workspace --locked` and `cargo build -p freshell-server --locked` for reproducibility parity with `port-contract.yml`.
 - **`RUST_BACKTRACE=1`:** Set as an env var on the test step so runner-only failures are diagnosable.
 - **Timeout:** 60 minutes — the first run has a cold, job-keyed cache and must do full test-profile codegen of the Tauri tree. PR #699's warm-cache workspace tests took 7-8 minutes after build; cold first runs will be longer.
@@ -73,7 +73,7 @@ Local baseline verification (already completed during workspace setup):
 ```bash
 # Verifies the test suite that CI will run is green locally
 cargo test --workspace --locked
-# Expected: all tests pass (825 freshell-freshagent + all other crates; pre-existing flaky timing tests may fail on first run but pass on re-run)
+# Expected: all tests pass (all crates; pre-existing flaky timing tests may fail on first run but pass on re-run)
 ```
 
 - [ ] **Step 3: Verify the intended failure**
@@ -103,6 +103,8 @@ Add a `rust-test` job to `.github/workflows/rust-clippy.yml`, after the existing
           toolchain: 1.96.0
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # freshell-tauri needs GTK+WebKit system libs to compile (same set as clippy job).
       - name: Install Tauri system dependencies
@@ -120,7 +122,7 @@ Add a `rust-test` job to `.github/workflows/rust-clippy.yml`, after the existing
           cache: npm
 
       - name: Install Node dependencies
-        run: npm ci --no-audit --no-fund
+        run: npm ci
 
       # Build the server binary explicitly so the Tauri smoke can never soft-skip.
       # The smoke's discover_server_binary() probes ancestor dirs of the test exe;
@@ -139,10 +141,15 @@ Add a `rust-test` job to `.github/workflows/rust-clippy.yml`, after the existing
       # Dedicated Tauri smoke with --nocapture so the CI log visibly shows
       # "using server binary:" (confirming the test exercised the real binary,
       # not soft-skipped). --exact matches the single test function name.
+      # The grep enforces non-vacuity: if the binary is ever missing (drift,
+      # rename, profile change), the smoke soft-skips with a SKIP notice and
+      # the grep fails, turning CI red instead of silently green.
       - name: Tauri app-bound server spawn smoke
         env:
           FRESHELL_SERVER_BIN: ${{ github.workspace }}/target/debug/freshell-server
-        run: cargo test -p freshell-tauri --locked --test server_spawn_smoke app_bound_spawn_health_reap_end_to_end -- --exact --nocapture
+        run: |
+          cargo test -p freshell-tauri --locked --test server_spawn_smoke app_bound_spawn_health_reap_end_to_end -- --exact --nocapture 2>&1 | tee /tmp/smoke.log
+          grep -q 'using server binary:' /tmp/smoke.log
 ```
 
 - [ ] **Step 5: Commit and push**
@@ -160,7 +167,7 @@ The workflow triggers on `push:main` and `pull_request`. Pushing a feature branc
 Ask the user for PR approval. Once approved:
 
 ```bash
-GH_ACCOUNT=danshapiro gh pr create \
+GH_TOKEN="$(gh auth token --user danshapiro)" gh pr create \
   --base main \
   --head the-usual/ci-rust-test-coverage \
   --title "ci: add rust-test job for per-PR Rust test coverage" \
@@ -172,12 +179,12 @@ GH_ACCOUNT=danshapiro gh pr create \
 After the PR is open, the workflow triggers. Verify:
 
 ```bash
-GH_ACCOUNT=danshapiro gh run list --workflow rust-clippy.yml --branch the-usual/ci-rust-test-coverage --limit 1
+GH_TOKEN="$(gh auth token --user danshapiro)" gh run list --workflow rust-clippy.yml --branch the-usual/ci-rust-test-coverage --limit 1
 # Expected: a run triggered by the PR, with both `clippy` and `rust-test` jobs
 
-GH_ACCOUNT=danshapiro gh run watch <run-id>
-# Expected: both jobs pass. The rust-test job log should show:
-#   - "using server binary: .../target/debug/freshell-server" (Tauri smoke non-vacuous)
+GH_TOKEN="$(gh auth token --user danshapiro)" gh run watch <run-id> --exit-status
+# Expected: exits 0 (both jobs pass). The rust-test job log should show:
+#   - "using server binary: .../target/debug/freshell-server" (Tauri smoke non-vacuous, enforced by grep)
 #   - "test result: ok" for all test suites
 ```
 
@@ -206,7 +213,7 @@ After the PR is merged and the `rust-test` check has run successfully on `main`,
 
 ```bash
 # Get the current ruleset (note: use /rulesets/<id>, not /rules/branches/main filtered by id)
-GH_ACCOUNT=danshapiro gh api repos/danshapiro/freshell/rulesets/14473229
+GH_TOKEN="$(gh auth token --user danshapiro)" gh api repos/danshapiro/freshell/rulesets/14473229
 
 # Add "rust-test" to the required_status_checks array (alongside "clippy" and "typecheck-client")
 # using a PUT to ruleset 14473229 with integration_id 15368
