@@ -17,6 +17,7 @@ import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fre
 import { getFreshAgentLabel, normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentPaneCreateEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
+import { renamePaneWithMirrorRetry } from '@/lib/pane-rename'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
@@ -287,22 +288,26 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       return
     }
     if (node.type !== 'leaf') return
-    api.patch(`/api/panes/${encodeURIComponent(paneId)}`, {
-      name: trimmed,
-    }).then((response: { data?: { paneId?: string; tabRenamed?: boolean }; message?: string } | null | undefined) => {
-      if (response?.data?.paneId !== paneId) {
-        throw new Error(response?.message || 'Failed to rename pane')
+    void (async () => {
+      try {
+        const result = await renamePaneWithMirrorRetry(paneId, trimmed, {
+          patch: (path, body) => api.patch(path, body),
+        })
+        if (!result.ok) {
+          setRenameError(result.message)
+          return
+        }
+        dispatch(applyPaneRename({ tabId, paneId, title: trimmed }))
+        setRenameError(null)
+        setRenamingPaneId(null)
+        setRenameValue('')
+      } catch (error: any) {
+        const message = typeof error?.message === 'string' && error.message
+          ? error.message
+          : 'Failed to rename pane'
+        setRenameError(message)
       }
-      dispatch(applyPaneRename({ tabId, paneId, title: trimmed }))
-      setRenameError(null)
-      setRenamingPaneId(null)
-      setRenameValue('')
-    }).catch((error: any) => {
-      const message = typeof error?.message === 'string' && error.message
-        ? error.message
-        : 'Failed to rename pane'
-      setRenameError(message)
-    })
+    })()
   }, [dispatch, tabId, renamingPaneId, renameValue, node])
 
   const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
