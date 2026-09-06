@@ -2244,6 +2244,12 @@ pub(crate) struct ExitHookDeps {
     /// -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
     /// rename cascade still resolves after this terminal's process has exited.
     pub identity: crate::identity::TerminalIdentityRegistry,
+    /// Fix 8 descriptor unpin: on EVERY exit path (natural or kill — the hook
+    /// fires once either way) the terminal identity retires, and its runtime
+    /// descriptor moves out of the pinned live store into the coordinator's
+    /// bounded retired history, so the live store pins only live runtimes
+    /// while late output/exit frames stay fenced.
+    pub restart: crate::restart::RestartCoordinator,
     /// P1.8 exit hygiene: the pending-marker delete rides the same hook.
     pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
     /// Restore-across-restart fix (opencode): disarm the locator, so an exited
@@ -2305,6 +2311,12 @@ pub(crate) fn build_pty_exit_hook(
         // the race without classifying an unrelated natural crash.
         let restart_retiring = deps.registry.is_restart_retiring(&terminal_id);
         deps.identity.retire(&terminal_id);
+        // Fix 8: the runtime identity behind this terminal id is finally gone
+        // (natural exit AND kill both funnel through this hook) — unpin its
+        // descriptor into the bounded retired history. Idempotent; a terminal
+        // the coordinator never observed is a no-op.
+        deps.restart
+            .unpin_descriptor(freshell_protocol::AgentRuntimeKind::Terminal, &terminal_id);
         // DEV-0008 closure (Task 18): retire the META record + broadcast the
         // removal on NATURAL exit (see ExitHookDeps::terminal_meta).
         if deps.terminal_meta.retire(&terminal_id, now_ms()) {
@@ -3744,6 +3756,7 @@ async fn handle_create_with_restart_launch(
         ExitHookDeps {
             registry: state.registry.clone(),
             identity: state.identity.clone(),
+            restart: state.restart.clone(),
             pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
@@ -4607,6 +4620,7 @@ pub async fn respawn_agent_terminal(
         ExitHookDeps {
             registry: state.registry.clone(),
             identity: state.identity.clone(),
+            restart: state.restart.clone(),
             pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
@@ -6884,6 +6898,7 @@ mod cli_create_helper_tests {
             ExitHookDeps {
                 registry: registry.clone(),
                 identity: identity.clone(),
+                restart: crate::restart::RestartCoordinator::new(),
                 pane_ledger: std::sync::Arc::clone(&ledger),
                 opencode_locator: None,
                 codex_locator: None,
@@ -6906,6 +6921,7 @@ mod cli_create_helper_tests {
             ExitHookDeps {
                 registry,
                 identity,
+                restart: crate::restart::RestartCoordinator::new(),
                 pane_ledger: ledger,
                 opencode_locator: None,
                 codex_locator: None,

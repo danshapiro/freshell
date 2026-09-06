@@ -1144,6 +1144,13 @@ impl FreshCodexState {
             if !g.complete(&thread_id) {
                 let mut stopped = true;
                 if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                    // Fix 8: the torn-down session's runtime is finally gone —
+                    // unpin its descriptor into the bounded retired history.
+                    self.runtime_identity.unregister(
+                        PROVIDER,
+                        &thread_id,
+                        &session.runtime.runtime_id,
+                    );
                     stopped = stop_codex_session(session).await;
                 }
                 if stopped {
@@ -2034,6 +2041,14 @@ impl FreshCodexState {
             Some(session) => stop_codex_session(session).await,
             None => true,
         };
+        // Fix 8: a killed session's runtime is finally gone — unpin its
+        // descriptor into the bounded retired history (late frames for it
+        // stay fenced). A quarantined session observes `removed = None` here;
+        // its retirement's `Stopped` path owns the unpin.
+        if let Some(runtime) = &killed_runtime {
+            self.runtime_identity
+                .unregister(PROVIDER, &session_id, &runtime.runtime_id);
+        }
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
         // also clears it; idempotent -- this covers watcher-less test sessions too).
         // LB-04 parity: a session pinned by an UNFINISHED restart retirement keeps
@@ -2203,6 +2218,12 @@ impl FreshCodexState {
             return crate::RestartShutdownOutcome::RetirementIncomplete { message };
         }
         self.finalize_restart_retirement(&retirement).await;
+        // Fix 8: the retirement reached `Stopped` — the predecessor runtime is
+        // finally gone, so its descriptor unpins into the bounded retired
+        // history. (The restart transaction's own coordinator-side retirement
+        // usually got there first; this call is idempotent.)
+        self.runtime_identity
+            .unregister(PROVIDER, &retirement.session_id, &retirement.runtime_id);
         crate::RestartShutdownOutcome::Stopped
     }
 
@@ -3669,6 +3690,13 @@ impl FreshCodexState {
                 // reopen the key -- never keep a session a contender may replace.
                 let mut stopped = true;
                 if let Some(session) = self.sessions.lock().await.remove(thread_id) {
+                    // Fix 8: the torn-down session's runtime is finally gone —
+                    // unpin its descriptor into the bounded retired history.
+                    self.runtime_identity.unregister(
+                        PROVIDER,
+                        thread_id,
+                        &session.runtime.runtime_id,
+                    );
                     stopped = stop_codex_session(session).await;
                 }
                 if stopped {

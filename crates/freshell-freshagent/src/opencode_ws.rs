@@ -1107,6 +1107,14 @@ impl FreshOpencodeState {
             }
         }
 
+        // Fix 8: a killed session's runtime is finally gone — unpin its
+        // descriptor into the bounded retired history (late frames for it
+        // stay fenced).
+        if let Some(runtime) = &killed_runtime {
+            self.runtime_identity
+                .unregister(PROVIDER, &msg.session_id, &runtime.runtime_id);
+        }
+
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`) -- a later
         // duplicate `create` for the same requestId must genuinely mint a fresh
@@ -1281,6 +1289,12 @@ impl FreshOpencodeState {
             .lock()
             .await
             .remove(expected_runtime_id);
+        // Fix 8: the retirement reached `Stopped` — the predecessor runtime is
+        // finally gone, so its descriptor unpins into the bounded retired
+        // history. (The restart transaction's own coordinator-side retirement
+        // usually got there first; this call is idempotent.)
+        self.runtime_identity
+            .unregister(PROVIDER, session_id, expected_runtime_id);
         crate::RestartShutdownOutcome::Stopped
     }
 

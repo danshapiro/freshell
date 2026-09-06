@@ -222,15 +222,24 @@ struct PersistedOwnership {
 struct RuntimeOwnership {
     by_locator: HashMap<RuntimeLocator, RuntimeDescriptor>,
     locator_order: VecDeque<RuntimeLocator>,
-    /// Exact descriptor for every observed live runtime id, including retired
-    /// generations whose already-queued output/exit frames still need fencing.
+    /// Exact descriptor for every LIVE runtime id. Live descriptors are PINNED
+    /// while their runtime is registered: capacity pruning NEVER evicts from
+    /// this store, so an active pane's output/exit frames can always be
+    /// enriched and delivered (fix 8). A descriptor leaves this store only
+    /// when its runtime retires (replacement commit, restart teardown, PTY
+    /// exit, fresh-agent end), moving into `retired_descriptors`.
     descriptor_by_live: HashMap<(AgentRuntimeKind, String), RuntimeDescriptor>,
-    descriptor_order: VecDeque<(AgentRuntimeKind, String)>,
+    /// Retired generations whose already-queued output/exit frames still need
+    /// fencing. This is the ONLY descriptor store capacity pruning applies to.
+    retired_descriptors: HashMap<(AgentRuntimeKind, String), RuntimeDescriptor>,
+    /// Admission/retirement order of descriptor keys, bounding the retired
+    /// history: when this queue exceeds the ownership limit the oldest key is
+    /// popped and its RETIRED descriptor (if any) is evicted. A popped key
+    /// that is still live keeps its pinned descriptor and simply discards the
+    /// queue slot; retirement re-queues the key at the back so a just-retired
+    /// runtime always gets a full late-frame window.
+    retired_descriptor_order: VecDeque<(AgentRuntimeKind, String)>,
     locator_by_live: HashMap<(AgentRuntimeKind, String), RuntimeLocator>,
-    /// Distinguishes a genuinely never-bound terminal from a predecessor whose
-    /// locator was deliberately removed during replacement. Retired entries
-    /// remain for the same bounded late-frame window as their descriptors.
-    retired_live: HashSet<(AgentRuntimeKind, String)>,
     fresh_event_aliases: HashMap<(String, String), RuntimeDescriptor>,
     fresh_alias_order: VecDeque<(String, String)>,
     last_generation: HashMap<RuntimeLocator, u64>,
@@ -653,7 +662,10 @@ impl Drop for InFlightRequestRegistration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedOwnershipCounts {
+    /// Pinned LIVE descriptors (unpruned while their runtime is registered).
     pub descriptors: usize,
+    /// Retired descriptors riding the bounded late-frame history FIFO.
+    pub retired_descriptors: usize,
     pub live_locators: usize,
     pub current_locators: usize,
     pub fresh_aliases: usize,
@@ -1986,30 +1998,56 @@ impl RestartCoordinator {
     }
 
     fn touch_descriptor_locked(ownership: &mut RuntimeOwnership, key: (AgentRuntimeKind, String)) {
-        Self::touch_key(&mut ownership.descriptor_order, &key);
+        Self::touch_key(&mut ownership.retired_descriptor_order, &key);
+    }
+
+    /// Move a descriptor out of the pinned live store into the bounded retired
+    /// history. Re-queues the key at the back of the retired window so a
+    /// just-retired runtime fences its late frames for a full window. When the
+    /// live store no longer holds the key (already retired), the stored
+    /// descriptor is left untouched; when neither store knows the key the
+    /// caller-provided descriptor is recorded so retirement stays exact.
+    fn retire_descriptor_locked(
+        ownership: &mut RuntimeOwnership,
+        key: (AgentRuntimeKind, String),
+        descriptor: RuntimeDescriptor,
+    ) {
+        let descriptor = ownership
+            .descriptor_by_live
+            .remove(&key)
+            .unwrap_or(descriptor);
+        ownership
+            .retired_descriptors
+            .entry(key.clone())
+            .or_insert(descriptor);
+        Self::touch_descriptor_locked(ownership, key);
     }
 
     fn prune_ownership_locked(ownership: &mut RuntimeOwnership, limit: usize) {
-        while ownership.descriptor_order.len() > limit {
-            let Some(key) = ownership.descriptor_order.pop_front() else {
+        // Capacity pruning applies ONLY to the retired descriptor history
+        // (fix 8): live descriptors are pinned for as long as their runtime
+        // is registered, so an active pane's output can always be enriched.
+        while ownership.retired_descriptor_order.len() > limit {
+            let Some(key) = ownership.retired_descriptor_order.pop_front() else {
                 break;
             };
-            let removed = ownership.descriptor_by_live.remove(&key);
-            ownership.retired_live.remove(&key);
+            let Some(removed) = ownership.retired_descriptors.remove(&key) else {
+                // A still-live key keeps its pinned descriptor; its queue slot
+                // is inert and simply discarded here.
+                continue;
+            };
             if let Some(locator) = ownership.locator_by_live.remove(&key) {
-                if ownership.by_locator.get(&locator) == removed.as_ref() {
+                if ownership.by_locator.get(&locator) == Some(&removed) {
                     ownership.by_locator.remove(&locator);
                     ownership.locator_order.retain(|entry| entry != &locator);
                 }
             }
-            if let Some(removed) = removed {
-                ownership
-                    .fresh_event_aliases
-                    .retain(|_, descriptor| descriptor != &removed);
-                ownership
-                    .fresh_alias_order
-                    .retain(|alias| ownership.fresh_event_aliases.contains_key(alias));
-            }
+            ownership
+                .fresh_event_aliases
+                .retain(|_, descriptor| descriptor != &removed);
+            ownership
+                .fresh_alias_order
+                .retain(|alias| ownership.fresh_event_aliases.contains_key(alias));
         }
         while ownership.locator_order.len() > limit {
             let Some(locator) = ownership.locator_order.pop_front() else {
@@ -2060,6 +2098,7 @@ impl RestartCoordinator {
         let ownership = self.ownership.lock().expect("restart ownership lock");
         RetainedOwnershipCounts {
             descriptors: ownership.descriptor_by_live.len(),
+            retired_descriptors: ownership.retired_descriptors.len(),
             live_locators: ownership.locator_by_live.len(),
             current_locators: ownership.by_locator.len(),
             fresh_aliases: ownership.fresh_event_aliases.len(),
@@ -2082,15 +2121,12 @@ impl RestartCoordinator {
                 return existing.clone();
             }
         }
+        let live_key = (locator.kind, runtime_id.clone());
         if let Some(existing) = ownership
             .descriptor_by_live
             .get(&(locator.kind, runtime_id.clone()))
             .cloned()
         {
-            let live_key = (locator.kind, runtime_id.clone());
-            if ownership.retired_live.contains(&live_key) {
-                return existing;
-            }
             let was_unbound = !ownership.locator_by_live.contains_key(&live_key);
             let existing = if was_unbound {
                 let generation = ownership
@@ -2121,6 +2157,11 @@ impl RestartCoordinator {
             Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
             self.persist_or_log(&ownership, "bind_existing_runtime");
             return existing;
+        }
+        // A RETIRED id re-observed answers from the retired history without
+        // rebinding (a retired generation must not resurrect live).
+        if let Some(retired) = ownership.retired_descriptors.get(&live_key) {
+            return retired.clone();
         }
         let generation = ownership
             .last_generation
@@ -2164,9 +2205,11 @@ impl RestartCoordinator {
         }
         if let Some(previous_runtime) = ownership.by_locator.insert(locator, descriptor.clone()) {
             if previous_runtime.runtime_id != runtime_id {
-                let previous_key = (live_key.0, previous_runtime.runtime_id);
+                let previous_key = (live_key.0, previous_runtime.runtime_id.clone());
                 ownership.locator_by_live.remove(&previous_key);
-                ownership.retired_live.insert(previous_key);
+                // The superseded predecessor retires into the bounded history:
+                // its late frames stay fenced without pinning the live store.
+                Self::retire_descriptor_locked(ownership, previous_key, previous_runtime);
             }
         }
         let bound_locator = ownership
@@ -2175,7 +2218,8 @@ impl RestartCoordinator {
             .cloned()
             .expect("locator inserted above");
         Self::touch_key(&mut ownership.locator_order, &bound_locator);
-        ownership.retired_live.remove(&live_key);
+        // A freshly bound live id leaves the retired history (disjoint stores).
+        ownership.retired_descriptors.remove(&live_key);
         ownership
             .descriptor_by_live
             .insert(live_key.clone(), descriptor);
@@ -2207,6 +2251,8 @@ impl RestartCoordinator {
     }
 
     /// Descriptor lookup used to stamp runtime-addressed lifecycle surfaces.
+    /// Live descriptors win; a retired descriptor still answers so late
+    /// output/exit frames stay fenced for the bounded retired window.
     pub fn runtime_for_live(
         &self,
         kind: AgentRuntimeKind,
@@ -2217,6 +2263,35 @@ impl RestartCoordinator {
             .descriptor_by_live
             .get(&(kind, runtime_id.to_string()))
             .cloned()
+            .or_else(|| {
+                ownership
+                    .retired_descriptors
+                    .get(&(kind, runtime_id.to_string()))
+                    .cloned()
+            })
+    }
+
+    /// Move a live runtime's descriptor into the bounded retired history
+    /// (fix 8). Called when the runtime itself is finally gone — the PTY exit
+    /// hook for terminal runtimes, and the fresh-agent final-teardown seams
+    /// (kill, revoked-lease teardown, sidecar consumer-exit eviction, restart
+    /// retirement `Stopped`) via
+    /// [`freshell_freshagent::FreshRuntimeRegistry::unregister_runtime`]
+    /// implemented below. Idempotent: an absent or already-retired id is a
+    /// no-op, and the move keeps late frames fenced exactly as before.
+    pub fn unpin_descriptor(&self, kind: AgentRuntimeKind, runtime_id: &str) {
+        let mut ownership = self.ownership.lock().expect("restart ownership lock");
+        let key = (kind, runtime_id.to_string());
+        let Some(descriptor) = ownership.descriptor_by_live.get(&key).cloned() else {
+            return;
+        };
+        tracing::debug!(
+            kind = ?kind,
+            runtime_id = %runtime_id,
+            "agent.restart.descriptor_retired_to_bounded_history"
+        );
+        Self::retire_descriptor_locked(&mut ownership, key, descriptor);
+        Self::prune_ownership_locked(&mut ownership, self.ownership_limit);
     }
 
     pub fn runtime_for_locator(&self, locator: &RuntimeLocator) -> Option<RuntimeDescriptor> {
@@ -3043,9 +3118,13 @@ impl RestartCoordinator {
                 .is_some_and(|current| current == &expected)
             {
                 ownership.by_locator.remove(&locator);
-                ownership
-                    .retired_live
-                    .insert((request.kind, expected.runtime_id.clone()));
+                // The retired predecessor leaves the pinned live store for the
+                // bounded retired history; its late frames stay fenced.
+                Self::retire_descriptor_locked(
+                    &mut ownership,
+                    (request.kind, expected.runtime_id.clone()),
+                    expected.clone(),
+                );
                 ownership.locator_order.retain(|entry| entry != &locator);
             }
         }
@@ -3623,9 +3702,13 @@ impl RestartCoordinator {
                 .is_some_and(|current| current == &pending.old_runtime)
             {
                 ownership.by_locator.remove(&locator);
-                ownership
-                    .retired_live
-                    .insert((request.kind, pending.old_runtime.runtime_id.clone()));
+                // Recovery retires the persisted predecessor the same way:
+                // pinned live store -> bounded retired history.
+                Self::retire_descriptor_locked(
+                    &mut ownership,
+                    (request.kind, pending.old_runtime.runtime_id.clone()),
+                    pending.old_runtime.clone(),
+                );
                 ownership.locator_order.retain(|entry| entry != &locator);
             }
         }
@@ -3899,6 +3982,9 @@ impl RestartCoordinator {
                 correlated_requests.dedup_by(|left, right| left.0.request_id == right.0.request_id);
 
                 let replacement_key = (request.kind, replacement.runtime_id.clone());
+                // The replacement pins in the live store (disjoint: a re-used
+                // id leaves the retired history).
+                ownership.retired_descriptors.remove(&replacement_key);
                 ownership
                     .descriptor_by_live
                     .insert(replacement_key.clone(), replacement.clone());
@@ -5731,6 +5817,16 @@ impl freshell_freshagent::FreshRuntimeRegistry for RestartCoordinator {
             RuntimeLocator::new(AgentRuntimeKind::FreshAgent, provider, durable_session_id),
             live_runtime_id,
         )
+    }
+
+    fn unregister_runtime(&self, provider: &str, durable_session_id: &str, live_runtime_id: &str) {
+        tracing::debug!(
+            provider = %provider,
+            session_id = %durable_session_id,
+            runtime_id = %live_runtime_id,
+            "agent.restart.fresh_runtime_unpinned"
+        );
+        self.unpin_descriptor(AgentRuntimeKind::FreshAgent, live_runtime_id);
     }
 }
 

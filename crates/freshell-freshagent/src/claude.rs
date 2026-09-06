@@ -730,6 +730,13 @@ impl FreshClaudeState {
                     let _ = child.start_kill();
                     reap_owned_claude_sidecars(&session.ownership_id);
                 }
+                // Fix 8: the torn-down session's runtime is finally gone —
+                // unpin its descriptor into the bounded retired history.
+                self.runtime_identity.unregister(
+                    PROVIDER,
+                    durable_runtime_key,
+                    &runtime.runtime_id,
+                );
                 if let Some(sid) = resume_sid.as_deref() {
                     self.cli_index
                         .lock()
@@ -904,6 +911,13 @@ impl FreshClaudeState {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&session.ownership_id);
         }
+        // Fix 8: a killed session's runtime is finally gone — unpin its
+        // descriptor into the bounded retired history (late frames for it
+        // stay fenced).
+        if let Some(runtime) = &killed_runtime {
+            self.runtime_identity
+                .unregister(PROVIDER, &session_id, &runtime.runtime_id);
+        }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`) -- a later duplicate `create` for the
@@ -1062,6 +1076,15 @@ impl FreshClaudeState {
         }
 
         self.finalize_restart_retirement(&retirement).await;
+        // Fix 8: the retirement reached `Stopped` — the predecessor runtime is
+        // finally gone, so its descriptor unpins into the bounded retired
+        // history. (The restart transaction's own coordinator-side retirement
+        // usually got there first; this call is idempotent.)
+        self.runtime_identity.unregister(
+            PROVIDER,
+            &retirement.durable_session_id,
+            &retirement.runtime_id,
+        );
         crate::RestartShutdownOutcome::Stopped
     }
 
@@ -1917,6 +1940,11 @@ impl FreshClaudeState {
                     let _ = child.start_kill();
                     reap_owned_claude_sidecars(&session.ownership_id);
                 }
+                // Fix 8: the torn-down attach-resume session's runtime is
+                // finally gone — unpin its descriptor into the bounded
+                // retired history.
+                self.runtime_identity
+                    .unregister(PROVIDER, durable, &runtime.runtime_id);
                 self.cli_index
                     .lock()
                     .await
@@ -2142,6 +2170,13 @@ impl FreshClaudeState {
                 for durable in &removed_durables {
                     state.leases.clear_binding(PROVIDER, durable);
                 }
+                // Fix 8 (death-without-rebind): this sidecar's runtime is
+                // finally gone with no replacement bound — unpin its
+                // descriptor into the bounded retired history. A re-registered
+                // successor has a different descriptor and stays pinned.
+                state
+                    .runtime_identity
+                    .unregister(PROVIDER, &session_id, &runtime.runtime_id);
                 // Adapter-asymmetry fix (bug-hunt pbh-20260807): an UNREQUESTED sidecar
                 // death must never be TOTAL SILENCE. The codex sibling broadcasts its
                 // crash self-heal `exited` status (`codex.rs spawn_exit_watcher`) and

@@ -3222,7 +3222,12 @@ fn coordinator_bounds_runtime_identity_and_generation_retention() {
     }
 
     let counts = coordinator.retained_ownership_counts();
-    assert!(counts.descriptors <= 2, "{counts:?}");
+    // Fix 8: live descriptors are PINNED while their runtime is registered —
+    // capacity pruning applies ONLY to the retired descriptor window. All
+    // eight registrations above are still live (none retired/unpinned), so
+    // the live store holds all eight; the retired window stays bounded.
+    assert_eq!(counts.descriptors, 8, "{counts:?}");
+    assert!(counts.retired_descriptors <= 2, "{counts:?}");
     assert!(counts.live_locators <= 2, "{counts:?}");
     assert!(counts.current_locators <= 2, "{counts:?}");
     assert!(counts.fresh_aliases <= 2, "{counts:?}");
@@ -3257,6 +3262,205 @@ async fn retired_descriptor_fences_late_frames_only_for_the_bounded_window() {
         None,
         "the oldest retired fence is eventually evicted instead of leaking forever"
     );
+}
+
+/// Fix 8: a LIVE descriptor is pinned separately from the bounded retired
+/// window. Once more than 1,024 register/retire transitions churn through the
+/// coordinator, an ACTIVE terminal pane's descriptor must still be found —
+/// otherwise `observe_server_message` leaves `runtime: None` and the contract
+/// gate black-holes every output/exit frame for that pane.
+#[tokio::test]
+async fn live_descriptor_survives_more_than_1024_retired_transitions_and_output_is_delivered() {
+    let coordinator =
+        RestartCoordinator::new_with_limits(1_024, 1_024, RestartIngressLimits::default());
+    // One long-lived ACTIVE terminal runtime: this is the pane whose output
+    // must never fall out of the enrichment path.
+    let live = coordinator.register_live(AgentRuntimeKind::Terminal, "term-live-target");
+
+    // 1,100 full register->retire cycles for OTHER ids through the
+    // coordinator's real registration/retirement seams. Each cycle admits the
+    // retired predecessor and its live replacement, so the descriptor window
+    // overflows 1,024 several times over.
+    for index in 0..1_100usize {
+        let session_id = format!("churn-session-{index}");
+        let old_id = format!("term-churn-{index}-old");
+        let new_id: &'static str = Box::leak(format!("term-churn-{index}-new").into_boxed_str());
+        let old = coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "churn", &session_id),
+            old_id.clone(),
+        );
+        coordinator
+            .execute(
+                AgentRestart {
+                    request_id: format!("churn-restart-{index}"),
+                    provider: "churn".to_string(),
+                    session_id,
+                    kind: AgentRuntimeKind::Terminal,
+                    live_id: old_id,
+                    expected_generation: old.generation,
+                },
+                &FakeRuntime::resumable(new_id),
+            )
+            .await;
+    }
+
+    // The ACTIVE pane's descriptor survived the churn: enrichment fills the
+    // frame and the contract gate passes it for delivery.
+    assert_eq!(
+        coordinator.runtime_for_live(AgentRuntimeKind::Terminal, "term-live-target"),
+        Some(live.clone()),
+        "a live runtime's descriptor must be pinned apart from the retired window"
+    );
+    let mut output = ServerMessage::TerminalOutput(TerminalOutput {
+        terminal_id: "term-live-target".to_string(),
+        stream_id: "stream-live".to_string(),
+        data: "still alive".to_string(),
+        seq_start: 0,
+        seq_end: 1,
+        attach_request_id: None,
+        source: None,
+        runtime: None,
+    });
+    coordinator.observe_server_message(&mut output);
+    let ServerMessage::TerminalOutput(output) = &output else {
+        unreachable!()
+    };
+    assert_eq!(
+        output.runtime,
+        Some(live),
+        "the enrichment path must fill the live runtime even after >1,024 retired transitions"
+    );
+    assert!(
+        RestartCoordinator::restart_runtime_contract_satisfied(&ServerMessage::TerminalOutput(
+            output.clone()
+        )),
+        "the contract gate must pass the enriched output frame"
+    );
+
+    // The retired HALF still rides the bounded 1,024 FIFO: the oldest
+    // retired generations are evicted (no leak), recent retirements still
+    // fence late frames.
+    assert_eq!(
+        coordinator.runtime_for_live(AgentRuntimeKind::Terminal, "term-churn-0-old"),
+        None,
+        "the bounded retired window evicts its oldest entries instead of leaking"
+    );
+    assert_eq!(
+        coordinator.runtime_for_live(AgentRuntimeKind::Terminal, "term-churn-1090-old"),
+        Some(RuntimeDescriptor {
+            runtime_id: "term-churn-1090-old".to_string(),
+            generation: 1,
+        }),
+        "a recently retired descriptor still fences its late frames"
+    );
+}
+
+/// Fix 8: a PTY exit is the terminal identity's final retirement — the exit
+/// hook must MOVE its descriptor into the bounded retired store (late frames
+/// still fenced) instead of pinning the live store forever.
+#[tokio::test]
+async fn pty_exit_unpins_descriptor_into_the_bounded_retired_store() {
+    let (url, registry, mut state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("amplifier")])
+            .await;
+    state.session_existence = Arc::new(PresentSessions);
+    let _runtime_registration = state.restart.set_runtime(Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::new(state.clone()),
+    ));
+    let (mut ws, _) = common::connect_and_capture_inventory_with_capabilities(
+        &url,
+        Some(serde_json::json!({ "agentRestartV1": true })),
+    )
+    .await;
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "unpin-create",
+            "mode": "amplifier",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let created = common::next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let generation = created["runtime"]["generation"].as_u64().unwrap();
+
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&ClientMessage::AgentRestart(AgentRestart {
+            request_id: "unpin-restart".to_string(),
+            provider: "amplifier".to_string(),
+            session_id,
+            kind: AgentRuntimeKind::Terminal,
+            live_id: terminal_id.clone(),
+            expected_generation: generation,
+        }))
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
+    common::next_frame_of_type(&mut ws, "agent.restart.started").await;
+    let replaced = common::next_frame_of_type(&mut ws, "agent.restart.replaced").await;
+    let replacement_id = replaced["runtimeId"].as_str().unwrap().to_string();
+    let replacement_generation = replaced["generation"].as_u64().unwrap();
+    assert!(registry.is_live(&replacement_id));
+
+    // Kill the replacement PTY: its exit hook retires the descriptor.
+    registry.kill(&replacement_id);
+
+    // Once the exit hook ran, neither generation may still be pinned in the
+    // live descriptor store: the original was retired by the restart itself
+    // and the replacement was retired by its observed exit.
+    let mut drained = None;
+    for _ in 0..100 {
+        let counts = state.restart.retained_ownership_counts();
+        if counts.descriptors == 0 {
+            drained = Some(counts);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let counts = drained.expect(
+        "PTY exit must unpin the descriptor from the live store instead of pinning it forever",
+    );
+    assert_eq!(counts.descriptors, 0, "{counts:?}");
+
+    // Late in-flight frames for the exited PTY stay fenced by its retired
+    // descriptor: enrichment still fills `runtime` and the contract gate
+    // still passes the frame.
+    let mut late = ServerMessage::TerminalOutput(TerminalOutput {
+        terminal_id: replacement_id.clone(),
+        stream_id: "stream-exited".to_string(),
+        data: "late".to_string(),
+        seq_start: 0,
+        seq_end: 1,
+        attach_request_id: None,
+        source: None,
+        runtime: None,
+    });
+    state.restart.observe_server_message(&mut late);
+    let ServerMessage::TerminalOutput(late) = &late else {
+        unreachable!()
+    };
+    assert_eq!(
+        late.runtime,
+        Some(RuntimeDescriptor {
+            runtime_id: replacement_id,
+            generation: replacement_generation,
+        }),
+        "a late frame for the exited PTY is still fenced by the retired descriptor"
+    );
+    assert!(RestartCoordinator::restart_runtime_contract_satisfied(
+        &ServerMessage::TerminalOutput(late.clone())
+    ));
+    registry.kill_all();
 }
 
 struct ContextRecoveryRuntime {
