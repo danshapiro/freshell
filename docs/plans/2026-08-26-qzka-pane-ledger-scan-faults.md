@@ -455,7 +455,7 @@ ledger-touching integration test — `pane_ledger_triggers.rs`,
 `freshell-server` consumer of `new_locked` is
 `recovery_inventory_tests.rs` (server lib tests).
 
-Run: `cargo test -p freshell-ws && cargo test -p freshell-server --lib && cargo clippy -p freshell-ws --all-targets -- -D warnings && cargo fmt --all --check`
+Run: `cargo test -p freshell-ws && cargo test -p freshell-server --bins && cargo clippy -p freshell-ws --all-targets -- -D warnings && cargo fmt --all --check`
 
 Expected: PASS (all four commands, zero exit).
 
@@ -572,7 +572,12 @@ Rewrite the candidate-collection front of
 `PaneLedger::quarantine_unparsable` in
 `crates/freshell-ws/src/pane_ledger_scan.rs` (the per-row body after it is
 unchanged), same policy as `load_index` one notch weaker — record + log +
-continue, never die per-store:
+continue, never die per-store. (Owner amendment recorded at execution-brief
+time: the record strings name the faulted path exactly once — the helper
+takes `log_path` for the log field and a prebuilt `record` string, so
+`read_dir_existing` errors, which already carry their path in the wrapped
+message, record `format!("{err}")` while raw entry-iteration errors record
+`format!("{}: {err}", dir.display())`.)
 
 ```rust
     fn quarantine_unparsable(&self, root: &Path, now_ms: i64, report: &mut BootScanReport) {
@@ -581,15 +586,22 @@ continue, never die per-store:
         // ERROR-logged and recorded on the report (the OS-error text
         // carries the errno), then the walk continues. `NotFound` = absent
         // = not a fault (a first-boot store writes nothing before the boot
-        // scan runs).
-        fn scan_fault(what: &Path, err: &std::io::Error, report: &mut BootScanReport) {
+        // scan runs). The record names the faulted path exactly once:
+        // `read_dir_existing` errors already carry their path, raw
+        // entry-iteration errors do not.
+        fn scan_fault(
+            log_path: &Path,
+            record: String,
+            err: &std::io::Error,
+            report: &mut BootScanReport,
+        ) {
             tracing::error!(
                 target: "freshell_ws::pane_ledger",
-                path = %what.display(),
+                path = %log_path.display(),
                 error = %err,
                 "pane_ledger_scan_fault: quarantine walk could not fully read the store"
             );
-            report.scan_errors.push(format!("{}: {err}", what.display()));
+            report.scan_errors.push(record);
         }
         let mut candidates: Vec<PathBuf> = Vec::new();
         match read_dir_existing(&Self::bindings_dir(root)) {
@@ -598,38 +610,54 @@ continue, never die per-store:
                     let provider = match provider {
                         Ok(p) => p,
                         Err(err) => {
-                            scan_fault(&Self::bindings_dir(root), &err, report);
+                            scan_fault(
+                                &Self::bindings_dir(root),
+                                format!("{}: {err}", Self::bindings_dir(root).display()),
+                                &err,
+                                report,
+                            );
                             continue;
                         }
                     };
-                    match read_dir_existing(&provider.path()) {
+                    let provider_dir = provider.path();
+                    match read_dir_existing(&provider_dir) {
                         Ok(Some(files)) => {
                             for file in files {
                                 match file {
                                     Ok(f) => candidates.push(f.path()),
-                                    Err(err) => scan_fault(&provider.path(), &err, report),
+                                    Err(err) => scan_fault(
+                                        &provider_dir,
+                                        format!("{}: {err}", provider_dir.display()),
+                                        &err,
+                                        report,
+                                    ),
                                 }
                             }
                         }
                         Ok(None) => {} // provider dir vanished mid-scan — absent
-                        Err(err) => scan_fault(&provider.path(), &err, report),
+                        Err(err) => scan_fault(&provider_dir, err.to_string(), &err, report),
                     }
                 }
             }
             Ok(None) => {} // no bindings dir — nothing to scan
-            Err(err) => scan_fault(&Self::bindings_dir(root), &err, report),
+            Err(err) => scan_fault(&Self::bindings_dir(root), err.to_string(), &err, report),
         }
         match read_dir_existing(&Self::pending_dir(root)) {
             Ok(Some(files)) => {
                 for file in files {
                     match file {
                         Ok(f) => candidates.push(f.path()),
-                        Err(err) => scan_fault(&Self::pending_dir(root), &err, report),
+                        Err(err) => scan_fault(
+                            &Self::pending_dir(root),
+                            format!("{}: {err}", Self::pending_dir(root).display()),
+                            &err,
+                            report,
+                        ),
                     }
                 }
             }
             Ok(None) => {} // no pending dir — nothing to scan
-            Err(err) => scan_fault(&Self::pending_dir(root), &err, report),
+            Err(err) => scan_fault(&Self::pending_dir(root), err.to_string(), &err, report),
         }
         for path in candidates {
             // ... existing per-row body (orphan-tmp reap, quarantine rename)
@@ -670,7 +698,7 @@ Impacted set: `BootScanReport` consumers (`boot_scan`/`gc` callers across
 tests as Task 1; `main.rs` changed, so the `freshell-server` crate must
 recompile cleanly and its lib tests pass.
 
-Run: `cargo test -p freshell-ws && cargo test -p freshell-server --lib && cargo clippy -p freshell-ws --all-targets -- -D warnings && cargo clippy -p freshell-server --all-targets -- -D warnings && cargo fmt --all --check`
+Run: `cargo test -p freshell-ws && cargo test -p freshell-server --bins && cargo clippy -p freshell-ws --all-targets -- -D warnings && cargo clippy -p freshell-server --all-targets -- -D warnings && cargo fmt --all --check`
 
 Expected: PASS (all five commands, zero exit).
 
