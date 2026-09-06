@@ -1,4 +1,9 @@
-import type { CodexAppServerRuntime } from './runtime.js'
+import {
+  getCodexSurvivorAttachErrorCode,
+  type CodexAppServerRuntime,
+  type CodexSurvivorAttachErrorCode,
+  type HeldCodexSidecarOwnership,
+} from './runtime.js'
 import type { CodexThreadLifecycleEvent, CodexThreadLifecycleLossEvent, CodexTurnEvent } from './client.js'
 import type {
   CodexThreadTurnReadParams,
@@ -7,6 +12,7 @@ import type {
   CodexThreadTurnsListResult,
 } from './protocol.js'
 import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
+import { logger } from '../../logger.js'
 import {
   CodexRemoteProxy,
   type CodexApprovalRequestEvent,
@@ -25,10 +31,23 @@ type CodexRuntimeLike = Pick<
   | 'unwatchPath'
   | 'readThreadTurn'
   | 'listThreadTurns'
+  | 'attachToSurvivingSidecar'
 >
+
+/**
+ * Restore-time survivor claim seam (kata 4g2a), implemented by CodexSidecarReconciler in
+ * sidecar-reattach.ts. Declared structurally here: this module never imports the reconciler, so
+ * the only import edges stay launch-planner.ts → runtime.ts and sidecar-reattach.ts → runtime.ts.
+ */
+export type CodexSidecarClaimSource = {
+  claimForSession(sessionId: string): HeldCodexSidecarOwnership | null
+  dropClaim(ownershipId: string): void
+  settleFailedClaim(ownership: HeldCodexSidecarOwnership, code: CodexSurvivorAttachErrorCode): Promise<void>
+}
 
 export type CodexLaunchSidecar = {
   adopt(input: { terminalId: string; generation: number }): Promise<void>
+  noteSessionId?(sessionId: string): Promise<void>
   markCandidatePersisted?(): void
   pauseCandidateCapture?(reason: string): void
   resumeCandidateCapture?(reason: string): void
@@ -92,6 +111,7 @@ type CodexLaunchProxy = Pick<
 
 type CodexLaunchPlannerOptions = {
   proxyFactory?: (options: CodexLaunchProxyOptions) => CodexLaunchProxy
+  reconciler?: CodexSidecarClaimSource
 }
 
 function errorMessage(error: unknown): string {
@@ -114,6 +134,7 @@ export class CodexLaunchPlanner {
   private readonly failedSidecarShutdowns = new Set<CodexLaunchSidecar>()
   private readonly runtimeFactory: () => CodexRuntimeLike
   private readonly proxyFactory: (options: CodexLaunchProxyOptions) => CodexLaunchProxy
+  private readonly reconciler?: CodexSidecarClaimSource
   private shutdownStarted = false
   private shutdownPromise: Promise<void> | null = null
 
@@ -125,12 +146,18 @@ export class CodexLaunchPlanner {
       ? runtimeOrFactory
       : () => runtimeOrFactory
     this.proxyFactory = options.proxyFactory ?? ((proxyOptions) => new CodexRemoteProxy(proxyOptions))
+    this.reconciler = options.reconciler
   }
 
   async planCreate(input: PlanCreateInput): Promise<CodexLaunchPlan> {
     this.assertAcceptingPlans()
     await this.retryFailedSidecarShutdownsBeforePlan()
     this.assertAcceptingPlans()
+
+    if (input.resumeSessionId) {
+      const claimedPlan = await this.tryPlanSurvivorClaim(input)
+      if (claimedPlan) return claimedPlan
+    }
 
     const runtime = this.runtimeFactory()
     let proxy: CodexLaunchProxy | undefined
@@ -140,6 +167,11 @@ export class CodexLaunchPlanner {
     try {
       if (input.resumeSessionId) {
         const ready = await runtime.ensureReady(input.cwd)
+        await runtime.updateOwnershipMetadata({ sessionId: input.resumeSessionId }).catch((error) => {
+          // Stamp loss must never break a working resume; it only forfeits this
+          // sidecar as a future restore claim candidate.
+          logger.warn({ err: error }, 'Codex sidecar ownership session stamp failed; restore-claim for this sidecar is degraded')
+        })
         proxy = this.proxyFactory({
           upstreamWsUrl: ready.wsUrl,
           requireCandidatePersistence: false,
@@ -205,6 +237,88 @@ export class CodexLaunchPlanner {
     }
   }
 
+  /**
+   * Restore-time survivor claim seam (kata 4g2a da92 parity): a resume-keyed plan claims a
+   * verified prior-generation sidecar held by the boot reconciler before falling back to the
+   * spawn path. Returns null when no reconciler is installed or no claim can produce a plan, so
+   * the caller spawns fresh (Task 1 then stamps the resume session id onto the new record).
+   * Coded attach failures settle back through the reconciler and advance to the next candidate;
+   * uncoded errors (e.g. proxy start or planner shutdown raced the attach) run the same
+   * ownership-gated teardown contract as planCreate's catch and rethrow unchanged.
+   */
+  private async tryPlanSurvivorClaim(input: PlanCreateInput): Promise<CodexLaunchPlan | null> {
+    const sessionId = input.resumeSessionId
+    const reconciler = this.reconciler
+    if (!sessionId || !reconciler) return null
+
+    // One candidate at a time through claimForSession; an empty claim returns null so the caller
+    // falls through to the spawn path unchanged.
+    for (;;) {
+      const candidate = reconciler.claimForSession(sessionId)
+      if (!candidate) return null
+
+      const candidateRuntime = this.runtimeFactory()
+      let candidateProxy: CodexLaunchProxy | undefined
+      const candidateSidecar = this.createSidecar(candidateRuntime, () => candidateProxy)
+      try {
+        const attached = await candidateRuntime.attachToSurvivingSidecar(candidate, { sessionId })
+        candidateProxy = this.proxyFactory({
+          upstreamWsUrl: attached.wsUrl,
+          requireCandidatePersistence: false,
+        })
+        const proxyReady = await candidateProxy.start()
+        this.assertAcceptingPlans()
+        this.activeSidecars.add(candidateSidecar)
+        reconciler.dropClaim(candidate.metadata.ownershipId)
+        logger.info(
+          { ownershipId: candidate.metadata.ownershipId, sessionId, wsUrl: attached.wsUrl },
+          'Codex restore claimed a surviving sidecar',
+        )
+        return {
+          sessionId,
+          remote: {
+            wsUrl: proxyReady.wsUrl,
+          },
+          sidecar: candidateSidecar,
+        }
+      } catch (error) {
+        const code = getCodexSurvivorAttachErrorCode(error)
+        if (code) {
+          // Coded survivor failure: the candidate runtime is provably inert
+          // (attachToSurvivingSidecar throws before any retitle/ready-state mutation and closes
+          // its own client), so the sidecar never enters activeSidecars and needs no shutdown —
+          // settling the claim with the reconciler owns the survivor's fate.
+          await candidateProxy?.close()
+          await reconciler.settleFailedClaim(candidate, code)
+          logger.warn(
+            { err: error, ownershipId: candidate.metadata.ownershipId, sessionId, code },
+            'Codex survivor claim failed; trying the next candidate or falling back to a fresh spawn',
+          )
+          continue
+        }
+        // Uncoded failure (e.g. proxy start or planner shutdown raced the attach): the candidate
+        // is consumed-then-unowned. Drop the claim, run the existing catch path's ownership-gated
+        // teardown of whatever the runtime built/attached, and rethrow the original error so
+        // planCodexLaunchWithRetry's fresh-spawn semantics stay unchanged. The candidate enters
+        // activeSidecars BEFORE the teardown attempt (review F1): a failed shutdown lands in
+        // failedSidecarShutdowns, which retryFailedSidecarShutdownsBeforePlan only retries for
+        // sidecars that remain planner-owned — the spawn-path catch relies on the same ordering.
+        // A successful shutdown self-removes from both sets.
+        reconciler.dropClaim(candidate.metadata.ownershipId)
+        this.activeSidecars.add(candidateSidecar)
+        try {
+          await candidateSidecar.shutdown()
+        } catch (shutdownError) {
+          throw codexSidecarTeardownError(
+            `Codex launch sidecar teardown failed after planning error: ${errorMessage(shutdownError)}`,
+            shutdownError,
+          )
+        }
+        throw error
+      }
+    }
+  }
+
   private async retryFailedSidecarShutdownsBeforePlan(): Promise<void> {
     const failedSidecars = [...this.failedSidecarShutdowns]
       .filter((sidecar) => this.activeSidecars.has(sidecar))
@@ -244,6 +358,9 @@ export class CodexLaunchPlanner {
         assertAdoptable()
         this.activeSidecars.delete(sidecar)
         this.failedSidecarShutdowns.delete(sidecar)
+      },
+      noteSessionId: async (sessionId) => {
+        await runtime.updateOwnershipMetadata({ sessionId })
       },
       markCandidatePersisted: () => getProxy()?.markCandidatePersisted(),
       pauseCandidateCapture: (reason) => getProxy()?.pauseCandidateCapture(reason),

@@ -92,6 +92,7 @@ function createFakeSidecar(options: {
     adopt: vi.fn(options.adopt ?? (async () => undefined)),
     shutdown: vi.fn(options.shutdown ?? (async () => undefined)),
     markCandidatePersisted: vi.fn(),
+    noteSessionId: vi.fn(async (_sessionId: string) => undefined),
     pauseCandidateCapture: vi.fn(),
     resumeCandidateCapture: vi.fn(),
     watchPath: vi.fn(async (targetPath: string) => ({ path: targetPath })),
@@ -264,6 +265,45 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
 
       expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'written' })
       expect(mockPtyProcess.instances[0].write).toHaveBeenCalledWith('hello\r')
+    } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('stamps the captured candidate thread id onto the sidecar ownership record via noteSessionId', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        envContext: { tabId: 'tab-1', paneId: 'pane-1' },
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_started_notification',
+        thread: {
+          id: '019e2a0c-7cef-7281-94df-d0d05d7b9ac3',
+          path: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(sidecar.noteSessionId).toHaveBeenCalledTimes(1))
+      expect(sidecar.noteSessionId).toHaveBeenCalledWith('019e2a0c-7cef-7281-94df-d0d05d7b9ac3')
+      // The stamp lands with the persisted durability identity, not before it.
+      expect(registry.get(term.terminalId)!.codexDurability).toMatchObject({
+        candidate: { candidateThreadId: '019e2a0c-7cef-7281-94df-d0d05d7b9ac3' },
+      })
     } finally {
       await removeTempDir(durabilityDir)
     }
@@ -994,6 +1034,54 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         sessionRef: { provider: 'codex', sessionId: 'thread-child' },
       }))
       expect(unboundEvents).toEqual([])
+    } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('stamps the fork handoff candidate thread id onto the sidecar ownership record via noteSessionId', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-parent',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      await store.write({
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+        terminalId: term.terminalId,
+        serverInstanceId: 'srv-test',
+        updatedAt: 100,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-child',
+          path: path.join(durabilityDir, 'fork-child.jsonl'),
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(sidecar.noteSessionId).toHaveBeenCalledTimes(1))
+      expect(sidecar.noteSessionId).toHaveBeenCalledWith('thread-child')
+      expect((registry.get(term.terminalId) as any).codexForkHandoff).toMatchObject({
+        state: 'fork_handoff_staged',
+        candidate: { candidateThreadId: 'thread-child' },
+      })
     } finally {
       await removeTempDir(durabilityDir)
     }
