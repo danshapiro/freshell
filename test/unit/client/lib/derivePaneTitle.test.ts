@@ -48,6 +48,17 @@ describe('derivePaneTitle', () => {
     ).toBe('example.com')
   })
 
+  it('returns "Browser" for a raw-file URL with malformed percent escapes', () => {
+    expect(
+      derivePaneTitle({
+        kind: 'browser',
+        browserInstanceId: 'bx',
+        url: '/api/files/raw?path=%zz',
+        devToolsOpen: false,
+      }),
+    ).toBe('Browser')
+  })
+
   it('returns "Shell" for shell mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',

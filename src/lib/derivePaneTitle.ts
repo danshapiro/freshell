@@ -32,8 +32,12 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
     // 'Browser' (these relative URLs have no hostname).
     const rawMatch = content.url.match(/^\/(?:api\/files\/raw|local-file)\?path=([^&]+)/)
     if (rawMatch) {
-      const segment = basenameSegment(decodeURIComponent(rawMatch[1]))
-      return segment ?? 'Browser'
+      try {
+        const segment = basenameSegment(decodeURIComponent(rawMatch[1]))
+        return segment ?? 'Browser'
+      } catch {
+        return 'Browser'
+      }
     }
     try {
       const url = new URL(content.url)
