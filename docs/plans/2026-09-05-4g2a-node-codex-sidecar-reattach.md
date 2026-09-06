@@ -208,7 +208,7 @@ Semantics, in order: (1) refuse if shutdown requested / already ready / attach-o
 
 New file `sidecar-reattach.test.ts` (server-config vitest; helpers below mirror `runtime.test.ts` patterns — real fixture spawns with `command: process.execPath`, temp `metadataDir`, `REAL_STARTUP`-style timeouts):
 
-1. **attach succeeds against a live fixture survivor**: reuse the existing helpers for an AUTHENTIC record — spawn fixture A with a first `createRuntime`-built runtime (`runtime1.ensureReady()` after `runtime1.updateOwnershipMetadata({ sessionId: 'thr-1' })`, so its record carries a real `wrapperIdentity` plus the claim key), then `markOwnershipRecordStale(...)` to simulate the dead owner and hand the record (read back from the temp metadata dir) to a SECOND fresh runtime's `attachToSurvivingSidecar(held, { sessionId: 'thr-1' })`. The test never calls `runtime1.shutdown()` (the abduction stand-in for runtime1's death); `afterEach` group-kills every tracked fixture pid exactly as `runtime.test.ts` does. Call `attachToSurvivingSidecar(ownership, { sessionId: 'thr-live' })` on a fresh runtime; expect a `ReadyState` whose `wsUrl` is the survivor's, `processPid` the survivor pid; record on disk now has `ownerServerPid === process.pid`; `runtime.shutdown()` afterwards kills the group (pid gone) and unlinks the record.
+1. **attach succeeds against a live fixture survivor**: reuse the existing helpers for an AUTHENTIC record — spawn fixture A with a first `createRuntime`-built runtime (`runtime1.ensureReady()` after `runtime1.updateOwnershipMetadata({ sessionId: 'thr-1' })`, so its record carries a real `wrapperIdentity` plus the claim key), then `markOwnershipRecordStale(...)` to simulate the dead owner and hand the record (read back from the temp metadata dir) to a SECOND fresh runtime's `attachToSurvivingSidecar(held, { sessionId: 'thr-1' })`. Fixture A is spawned with `env: { ...defaults, FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({ loadedThreadIds: ['thr-1'] }) }` (the `createRuntime` env merge preserves this), so the survivor's `listLoadedThreads()` answers `['thr-1']` and the writer check has something true to find. The test never calls `runtime1.shutdown()` (the abduction stand-in for runtime1's death); `afterEach` group-kills every tracked fixture pid exactly as `runtime.test.ts` does. Call `attachToSurvivingSidecar(ownership, { sessionId: 'thr-live' })` on a fresh runtime; expect a `ReadyState` whose `wsUrl` is the survivor's, `processPid` the survivor pid; record on disk now has `ownerServerPid === process.pid`; `runtime.shutdown()` afterwards kills the group (pid gone) and unlinks the record.
 2. **identity failure refuses without signaling**: spawn a short-lived fixture child, record its pid, let it exit, then write the ownership record against that dead pid (`wrapperIdentity` captured before exit) — classification is `gone`. Expect code `codex_survivor_identity`, the record file still on disk (disposal belongs to the reconciler's settler, not the runtime), and — the safety assertion — a second, still-live fixture process sharing nothing with that record remains alive and unsignaled.
 3. **unreachable listener**: record classifies `owned` (live fixture process, authentic identity from the same two-runtime rig as test 1) but the handed-over record's `wsUrl` is rewritten to a port held by the inert `http.Server` from the existing `occupyLoopbackPort` helper (TCP accepts, protocol never answers) → the probe can only time out ⇒ expect `codex_survivor_unreachable`, and the whole attach stays inside the single shared probe deadline (~3s, asserted with the fake-real clock pattern used elsewhere in this suite or simply elapsed-time < budget×1.5).
 4. **not-writer survivor kept**: fixture live and listening, `loadedThreadIds: ['thr-other']`, claim `sessionId: 'thr-live'` → expect `codex_survivor_not_writer`; fixture still alive afterwards; record NOT retitled (ownerServerPid unchanged on disk).
@@ -251,6 +251,9 @@ async function withProbeBudget<T>(label: string, promise: Promise<T>, budgetMs: 
     }),
   ])
 }
+// NOTE: the budget argument handed to the two probe calls below is the SHARED remaining time
+// (`const probeDeadlineMs = Date.now() + budgetMs; ... = probeDeadlineMs - Date.now()` at each call),
+// never a fresh full budgetMs, so initialize + listLoadedThreads together stay inside one ~3s deadline.
 ```
 
 Class changes:
@@ -276,6 +279,7 @@ Class changes:
     }
 
     const budgetMs = options.probeBudgetMs ?? CODEX_REATTACH_PROBE_BUDGET_MS
+    const probeDeadlineMs = Date.now() + budgetMs  // one shared deadline across both probes
     const client = new CodexAppServerClient(
       { wsUrl: metadata.wsUrl },
       this.requestTimeoutMs ? { requestTimeoutMs: this.requestTimeoutMs } : {},
@@ -284,8 +288,8 @@ Class changes:
     this.client = client
     let initialized: CodexInitializeResult
     try {
-      initialized = await withProbeBudget('survivor initialize', client.initialize(), budgetMs)
-      const loaded = await withProbeBudget('survivor thread/loaded/list', client.listLoadedThreads(), budgetMs)
+      initialized = await withProbeBudget('survivor initialize', client.initialize(), probeDeadlineMs - Date.now())
+      const loaded = await withProbeBudget('survivor thread/loaded/list', client.listLoadedThreads(), Math.max(0, probeDeadlineMs - Date.now()))
       if (!loaded.includes(options.sessionId)) {
         throw codexSurvivorAttachError('codex_survivor_not_writer',
           `Codex survivor sidecar ${metadata.ownershipId} is reachable but is not the writer of ${options.sessionId}`)
@@ -437,7 +441,7 @@ Semantics:
       }
       // …existing budget check + teardownOwnedProcessGroup branch, unchanged…
 ```
-  (`CodexSidecarHoldSink = { hold(ownership): Promise<CodexSidecarHoldVerdict> }` is declared structurally in `runtime.ts` so `runtime.ts` never imports the new module — no import cycle; `sidecar-reattach.ts` imports `runtime.ts`.)
+  (`CodexSidecarHoldSink = { hold(ownership: ActiveOwnership): Promise<'held' | 'removed-unowned' | 'kept-unproven'> }` is declared structurally in `runtime.ts` with the LITERAL union — `runtime.ts` never imports the new module, not even a type-only import of the named `CodexSidecarHoldVerdict`, so the direction of the edge `sidecar-reattach.ts` → `runtime.ts` stays the only import edge.)
 - Boot wiring (`server/index.ts`): construct `new CodexSidecarReconciler({ reapGraceMs: resolveCodexSidecarReapGraceMs(process.env.FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS) })` before the existing `runCodexStartupReaper` call; pass `{ serverInstanceId, holdReconciler: reconciler }`; after it, log one structured line with `reconciler.snapshot()`; keep the existing fail-open try/catch unchanged.
 - Sweep wiring (`server/coding-cli/codex-observability.ts` `runCodexReaperMaintenanceTick`): after the existing quarantine/due gating computes `due`, also compute `const sweepDue = options.reconciler?.hasExpired() === true && options.reconciler.snapshot().held > 0`; the early-return condition becomes `if (promotedRecords.length === 0 && !due && !sweepDue) return`; the `reapOrphanedCodexAppServerSidecars` call gains `skipOwnershipIds: options.reconciler?.sweepProtectionSet()` (spread like the other optional fields), and its result is consumed so killed records leave the held maps (`options.reconciler?.forget(result.reapedOwnershipIds)` — otherwise `sweepDue` would stay true forever over ghost ids). `startCodexObservability` passes `options.reconciler` through from its own options.
 
