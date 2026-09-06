@@ -350,6 +350,10 @@ export const RUST_ONLY_SPECS = [
   // owns a RustServer (ephemeral port) + raw-WS second-device tabs.sync.push.
   // Was registered in NEITHER list. See the spec's doc comment.
   /sidebar-remote-status-rings-rust\.spec\.ts$/,
+  // Sidebar status-tier sort (sibling of sidebar-remote-status-rings-rust):
+  // against the REAL Rust server, same raw-WS second-device harness; landed
+  // upstream unregistered (silent false green) — registered here.
+  /sidebar-status-tier-sort-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -610,6 +614,9 @@ export default defineConfig({
         // Remote status rings Task 5 e2e pin (see the RUST_ONLY_SPECS entry
         // + spec doc comment; owns its RustServer on an ephemeral port).
         /sidebar-remote-status-rings-rust\.spec\.ts$/,
+        // Sidebar status-tier sort e2e pin (see the RUST_ONLY_SPECS entry + the
+        // spec's doc comment; owns its RustServer on an ephemeral port).
+        /sidebar-status-tier-sort-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
