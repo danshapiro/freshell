@@ -744,6 +744,39 @@ describe('FreshAgentSettingsButton', () => {
     expect(screen.queryByText(CREATE_ONLY_COPY)).not.toBeInTheDocument()
   })
 
+  it('drops fetched scopes back to the legacy hint when the reopened pane no longer resolves a snapshot thread', async () => {
+    getFreshAgentThreadSnapshotSpy.mockResolvedValue(threadSnapshotWithScopes(CREATE_ONLY_SCOPES))
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+      sessionId: LIVE_CLAUDE_SESSION_ID,
+    })
+
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    expect(await screen.findAllByText(CREATE_ONLY_COPY)).toHaveLength(3)
+
+    // close the popover, then swap the pane's identity to a runtime-only
+    // (non-UUID, no sessionRef) session id: the snapshot thread no longer
+    // resolves, so the no-threadId early-return branch runs on reopen
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    store.dispatch(mergePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      updates: { sessionId: 'thread-settings' },
+    }))
+    getFreshAgentThreadSnapshotSpy.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+
+    // no thread to fetch from — the previously fetched scopes must NOT stick
+    expect(getFreshAgentThreadSnapshotSpy).not.toHaveBeenCalled()
+    expect(screen.queryByText(CREATE_ONLY_COPY)).not.toBeInTheDocument()
+    expect(screen.getAllByText(PER_SEND_COPY)).toHaveLength(3)
+  })
+
   it('keeps the legacy copy when the thread snapshot fetch rejects (older server contract)', async () => {
     getFreshAgentThreadSnapshotSpy.mockRejectedValue(new Error('snapshot route missing'))
     const store = createStore()

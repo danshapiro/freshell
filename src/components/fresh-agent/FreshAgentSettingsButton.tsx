@@ -224,9 +224,18 @@ export function FreshAgentSettingsButton({
   // absent scopes (older server, fetch failure, pre-create pane) fall through
   // to settingScopeHint's legacy per-send copy.
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      // Popover closed: drop fetched scopes so a later open never displays
+      // scopes fetched against a previous pane identity / thread.
+      setSettingScopes(undefined)
+      return
+    }
     const threadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
-    if (!threadId) return
+    if (!threadId) {
+      // No snapshot thread resolves: any previously fetched scopes are stale.
+      setSettingScopes(undefined)
+      return
+    }
     let cancelled = false
     void getFreshAgentThreadSnapshot(paneContent.sessionType, paneContent.provider, threadId)
       .then((snapshot) => {
