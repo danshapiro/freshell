@@ -155,6 +155,20 @@ afterEach(() => {
 })
 
 describe('FreshAgentSettingsButton', () => {
+  it('offers valid Codex approval policies without implying sandbox access', () => {
+    const store = createStore()
+    seedPane(store, { sessionType: 'freshcodex', provider: 'codex', permissionMode: 'on-request', sandbox: 'read-only' })
+    renderButton(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    const permissions = screen.getByRole('combobox', { name: 'Permission mode' })
+    fireEvent.change(permissions, { target: { value: 'untrusted' } })
+    expect(readPaneContent(store).permissionMode).toBe('untrusted')
+    expect(screen.getByRole('option', { name: 'Ask for untrusted commands' })).toBeInTheDocument()
+    fireEvent.change(permissions, { target: { value: 'never' } })
+    expect(readPaneContent(store).permissionMode).toBe('never')
+    expect(readPaneContent(store).sandbox).toBe('read-only')
+    expect(screen.getByRole('option', { name: 'Never ask' })).toBeInTheDocument()
+  })
   it('keeps the simple model radio list and Thinking dropdown for freshclaude', () => {
     const store = createStore()
     seedPane(store, {

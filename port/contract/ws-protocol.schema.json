@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 68,
+  "schemaCount": 82,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -530,6 +530,10 @@
                   "const": true,
                   "type": "boolean"
                 },
+                "terminalInterestV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "terminalOutputBatchV1": {
                   "type": "boolean"
                 },
@@ -548,8 +552,14 @@
               },
               "type": "object"
             },
+            "clientInstanceId": {
+              "type": "string"
+            },
+            "deviceId": {
+              "type": "string"
+            },
             "protocolVersion": {
-              "const": 7,
+              "const": 10,
               "type": "number"
             },
             "sessions": {
@@ -941,6 +951,10 @@
               "minimum": 2,
               "type": "integer"
             },
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "expectedSessionRef": {
               "additionalProperties": false,
               "properties": {
@@ -992,6 +1006,10 @@
             "surfaceReset": {
               "type": "boolean"
             },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "terminalId": {
               "minLength": 1,
               "type": "string"
@@ -1007,6 +1025,47 @@
             "intent",
             "cols",
             "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "focusedTerminalId": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "revision": {
+              "maximum": 9007199254740991,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": {
+              "const": "terminal.interest",
+              "type": "string"
+            },
+            "visibleTerminalIds": {
+              "items": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 1024,
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "visibleTerminalIds"
           ],
           "type": "object"
         },
@@ -1043,6 +1102,96 @@
           "required": [
             "type",
             "terminalId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "terminalId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "pane.closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "createRequestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "panes": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "createRequestId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "terminalId": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "createRequestId"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "panes.closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "tabId",
+            "panes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "pane.opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "createRequestId",
+            "tabId"
           ],
           "type": "object"
         },
@@ -1137,6 +1286,14 @@
         {
           "additionalProperties": false,
           "properties": {
+            "createRequestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "terminalId": {
               "minLength": 1,
               "type": "string"
@@ -1215,6 +1372,50 @@
             },
             "type": {
               "const": "amplifier.activity.list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "hoststats.subscribe",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "hoststats.unsubscribe",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "hoststats.refresh",
               "type": "string"
             }
           },
@@ -1612,6 +1813,10 @@
                 "kilroy",
                 "freshopencode"
               ],
+              "type": "string"
+            },
+            "tabId": {
+              "minLength": 1,
               "type": "string"
             },
             "type": {
@@ -2073,6 +2278,10 @@
               ],
               "type": "string"
             },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "type": {
               "const": "freshAgent.fork",
               "type": "string"
@@ -2080,6 +2289,118 @@
           },
           "required": [
             "type",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.undo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.redo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
             "sessionId",
             "sessionType",
             "provider"
@@ -2770,6 +3091,10 @@
               ],
               "type": "string"
             },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "type": {
               "const": "freshAgent.create",
               "type": "string"
@@ -3229,6 +3554,10 @@
               ],
               "type": "string"
             },
+            "tabId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "type": {
               "const": "freshAgent.fork",
               "type": "string"
@@ -3236,6 +3565,118 @@
           },
           "required": [
             "type",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.undo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "sessionId",
+            "sessionType",
+            "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "step",
+                "toTurn"
+              ],
+              "type": "string"
+            },
+            "provider": {
+              "enum": [
+                "claude",
+                "codex",
+                "opencode"
+              ],
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionType": {
+              "enum": [
+                "freshclaude",
+                "freshcodex",
+                "kilroy",
+                "freshopencode"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "freshAgent.redo",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
             "sessionId",
             "sessionType",
             "provider"
@@ -3403,6 +3844,10 @@
           ],
           "type": "string"
         },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "type": {
           "const": "freshAgent.create",
           "type": "string"
@@ -3452,6 +3897,10 @@
             "kilroy",
             "freshopencode"
           ],
+          "type": "string"
+        },
+        "tabId": {
+          "minLength": 1,
           "type": "string"
         },
         "type": {
@@ -3614,6 +4063,63 @@
       ],
       "type": "object"
     },
+    "FreshAgentRedoSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "step",
+            "toTurn"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.redo",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "provider"
+      ],
+      "type": "object"
+    },
     "FreshAgentSendSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3713,6 +4219,63 @@
       ],
       "type": "object"
     },
+    "FreshAgentUndoSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "step",
+            "toTurn"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "claude",
+            "codex",
+            "opencode"
+          ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionType": {
+          "enum": [
+            "freshclaude",
+            "freshcodex",
+            "kilroy",
+            "freshopencode"
+          ],
+          "type": "string"
+        },
+        "turnId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "freshAgent.undo",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "sessionId",
+        "sessionType",
+        "provider"
+      ],
+      "type": "object"
+    },
     "HelloSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3725,6 +4288,10 @@
               "type": "boolean"
             },
             "paneReconcileV1": {
+              "const": true,
+              "type": "boolean"
+            },
+            "terminalInterestV1": {
               "const": true,
               "type": "boolean"
             },
@@ -3746,8 +4313,14 @@
           },
           "type": "object"
         },
+        "clientInstanceId": {
+          "type": "string"
+        },
+        "deviceId": {
+          "type": "string"
+        },
         "protocolVersion": {
-          "const": 7,
+          "const": 10,
           "type": "number"
         },
         "sessions": {
@@ -3803,6 +4376,2367 @@
       "required": [
         "type",
         "protocolVersion"
+      ],
+      "type": "object"
+    },
+    "HostStatsLiveSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "freqMHz": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "perCorePct": {
+              "items": {
+                "maximum": 100,
+                "minimum": 0,
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "stealPct": {
+              "anyOf": [
+                {
+                  "maximum": 100,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "usagePct": {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "available",
+            "usagePct",
+            "stealPct",
+            "perCorePct",
+            "freqMHz"
+          ],
+          "type": "object"
+        },
+        "diskIo": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "readBps": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "utilPct": {
+              "anyOf": [
+                {
+                  "maximum": 100,
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "weightedAwaitMs": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "writeBps": {
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "available",
+            "readBps",
+            "writeBps",
+            "utilPct",
+            "weightedAwaitMs"
+          ],
+          "type": "object"
+        },
+        "freshell": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "eventLoopLagP99Ms": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ptysMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ptysRunning": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rssBytes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "enum": [
+                "node",
+                "rust"
+              ],
+              "type": "string"
+            },
+            "uptimeSec": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "wsClients": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "wsClientsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "available",
+            "source",
+            "ptysRunning",
+            "ptysMax",
+            "wsClients",
+            "wsClientsMax",
+            "eventLoopLagP99Ms",
+            "rssBytes",
+            "uptimeSec"
+          ],
+          "type": "object"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "ephemeralPorts": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fdsMax": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fdsUsed": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pidsMax": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pidsUsed": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "timeWait": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "available",
+            "fdsUsed",
+            "fdsMax",
+            "pidsUsed",
+            "pidsMax",
+            "timeWait",
+            "ephemeralPorts"
+          ],
+          "type": "object"
+        },
+        "load": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "cores": {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            "load1": {
+              "type": "number"
+            },
+            "load15": {
+              "type": "number"
+            },
+            "load5": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "available",
+            "load1",
+            "load5",
+            "load15",
+            "cores"
+          ],
+          "type": "object"
+        },
+        "machine": {
+          "additionalProperties": false,
+          "properties": {
+            "batteryPresent": {
+              "type": "boolean"
+            },
+            "cgroup": {
+              "enum": [
+                "v1",
+                "v2",
+                "none"
+              ],
+              "type": "string"
+            },
+            "cores": {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            "gpu": {
+              "const": "none",
+              "type": "string"
+            },
+            "hostname": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kernel": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "memTotalBytes": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "platform": {
+              "type": "string"
+            },
+            "psi": {
+              "type": "boolean"
+            },
+            "thermalCount": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "wsl": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "cores",
+            "memTotalBytes",
+            "platform",
+            "wsl",
+            "kernel",
+            "hostname",
+            "psi",
+            "cgroup",
+            "thermalCount",
+            "batteryPresent",
+            "gpu"
+          ],
+          "type": "object"
+        },
+        "memory": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "availableBytes": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "cgroupLimitBytes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "enum": [
+                "host",
+                "cgroup",
+                "processes"
+              ],
+              "type": "string"
+            },
+            "swapTotalBytes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "swapUsedBytes": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "totalBytes": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "usedBytes": {
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "available",
+            "source",
+            "totalBytes",
+            "usedBytes",
+            "availableBytes",
+            "cgroupLimitBytes",
+            "swapTotalBytes",
+            "swapUsedBytes"
+          ],
+          "type": "object"
+        },
+        "network": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "rxBps": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "rxDroppedDelta": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rxDroppedTotal": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rxErrorsDelta": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rxErrorsTotal": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "txBps": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "txDroppedDelta": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "txDroppedTotal": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "txErrorsDelta": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "txErrorsTotal": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "available",
+            "rxBps",
+            "txBps",
+            "rxErrorsTotal",
+            "txErrorsTotal",
+            "rxDroppedTotal",
+            "txDroppedTotal",
+            "rxErrorsDelta",
+            "txErrorsDelta",
+            "rxDroppedDelta",
+            "txDroppedDelta"
+          ],
+          "type": "object"
+        },
+        "paging": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "majFaultsPerSec": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "oomKillsDelta": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "oomKillsTotal": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapInKbps": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "swapOutKbps": {
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "available",
+            "swapInKbps",
+            "swapOutKbps",
+            "majFaultsPerSec",
+            "oomKillsDelta",
+            "oomKillsTotal"
+          ],
+          "type": "object"
+        },
+        "psi": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "cpuSome10": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ioFull10": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ioSome10": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "memFull10": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "memSome10": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "available",
+            "cpuSome10",
+            "memSome10",
+            "memFull10",
+            "ioSome10",
+            "ioFull10"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "machine",
+        "cpu",
+        "load",
+        "memory",
+        "paging",
+        "psi",
+        "diskIo",
+        "network",
+        "limits",
+        "freshell"
+      ],
+      "type": "object"
+    },
+    "HostStatsMachineSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "batteryPresent": {
+          "type": "boolean"
+        },
+        "cgroup": {
+          "enum": [
+            "v1",
+            "v2",
+            "none"
+          ],
+          "type": "string"
+        },
+        "cores": {
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "type": "integer"
+        },
+        "gpu": {
+          "const": "none",
+          "type": "string"
+        },
+        "hostname": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kernel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memTotalBytes": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "psi": {
+          "type": "boolean"
+        },
+        "thermalCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wsl": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cores",
+        "memTotalBytes",
+        "platform",
+        "wsl",
+        "kernel",
+        "hostname",
+        "psi",
+        "cgroup",
+        "thermalCount",
+        "batteryPresent",
+        "gpu"
+      ],
+      "type": "object"
+    },
+    "HostStatsManualSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "disks": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "list": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "freeBytes": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "inodesFree": {
+                    "anyOf": [
+                      {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "inodesTotal": {
+                    "anyOf": [
+                      {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "mount": {
+                    "type": "string"
+                  },
+                  "totalBytes": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "usedPct": {
+                    "maximum": 100,
+                    "minimum": 0,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "mount",
+                  "totalBytes",
+                  "freeBytes",
+                  "usedPct",
+                  "inodesTotal",
+                  "inodesFree"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "available",
+            "list"
+          ],
+          "type": "object"
+        },
+        "inotify": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "instances": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "maxUserInstances": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "maxUserWatches": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "watches": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "available",
+            "instances",
+            "watches",
+            "maxUserWatches",
+            "maxUserInstances"
+          ],
+          "type": "object"
+        },
+        "processHealth": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "dState": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "zombies": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "available",
+            "zombies",
+            "dState",
+            "total"
+          ],
+          "type": "object"
+        },
+        "sectionErrors": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "thermals": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "battery": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "pct": {
+                      "maximum": 100,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    "status": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pct",
+                    "status"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "zones": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "celsius": {
+                    "type": "number"
+                  },
+                  "label": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "label",
+                  "celsius"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "available",
+            "zones",
+            "battery"
+          ],
+          "type": "object"
+        },
+        "topProcesses": {
+          "additionalProperties": false,
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "dwellMs": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "list": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "cpuPct": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "pid": {
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "type": "integer"
+                  },
+                  "rssBytes": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "state": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pid",
+                  "name",
+                  "cpuPct",
+                  "rssBytes",
+                  "state"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "available",
+            "dwellMs",
+            "list"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "topProcesses",
+        "processHealth",
+        "inotify",
+        "disks",
+        "thermals",
+        "sectionErrors"
+      ],
+      "type": "object"
+    },
+    "HostStatsRefreshResponseSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        },
+        "manual": {
+          "additionalProperties": false,
+          "properties": {
+            "disks": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "list": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "freeBytes": {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      "inodesFree": {
+                        "anyOf": [
+                          {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "inodesTotal": {
+                        "anyOf": [
+                          {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "mount": {
+                        "type": "string"
+                      },
+                      "totalBytes": {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      "usedPct": {
+                        "maximum": 100,
+                        "minimum": 0,
+                        "type": "number"
+                      }
+                    },
+                    "required": [
+                      "mount",
+                      "totalBytes",
+                      "freeBytes",
+                      "usedPct",
+                      "inodesTotal",
+                      "inodesFree"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "available",
+                "list"
+              ],
+              "type": "object"
+            },
+            "inotify": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "instances": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "maxUserInstances": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "maxUserWatches": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "watches": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "instances",
+                "watches",
+                "maxUserWatches",
+                "maxUserInstances"
+              ],
+              "type": "object"
+            },
+            "processHealth": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "dState": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "total": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "zombies": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "available",
+                "zombies",
+                "dState",
+                "total"
+              ],
+              "type": "object"
+            },
+            "sectionErrors": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "thermals": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "battery": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "pct": {
+                          "maximum": 100,
+                          "minimum": 0,
+                          "type": "number"
+                        },
+                        "status": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "pct",
+                        "status"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "zones": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "celsius": {
+                        "type": "number"
+                      },
+                      "label": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "label",
+                      "celsius"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "available",
+                "zones",
+                "battery"
+              ],
+              "type": "object"
+            },
+            "topProcesses": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "dwellMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "list": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "cpuPct": {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "pid": {
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991,
+                        "type": "integer"
+                      },
+                      "rssBytes": {
+                        "minimum": 0,
+                        "type": "number"
+                      },
+                      "state": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "pid",
+                      "name",
+                      "cpuPct",
+                      "rssBytes",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "available",
+                "dwellMs",
+                "list"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "topProcesses",
+            "processHealth",
+            "inotify",
+            "disks",
+            "thermals",
+            "sectionErrors"
+          ],
+          "type": "object"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "hoststats.refresh.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "ok"
+      ],
+      "type": "object"
+    },
+    "HostStatsRefreshSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "hoststats.refresh",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId"
+      ],
+      "type": "object"
+    },
+    "HostStatsSnapshotSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "live": {
+          "additionalProperties": false,
+          "properties": {
+            "cpu": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "freqMHz": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "perCorePct": {
+                  "items": {
+                    "maximum": 100,
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "type": "array"
+                },
+                "stealPct": {
+                  "anyOf": [
+                    {
+                      "maximum": 100,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "usagePct": {
+                  "maximum": 100,
+                  "minimum": 0,
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "usagePct",
+                "stealPct",
+                "perCorePct",
+                "freqMHz"
+              ],
+              "type": "object"
+            },
+            "diskIo": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "readBps": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "utilPct": {
+                  "anyOf": [
+                    {
+                      "maximum": 100,
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "weightedAwaitMs": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "writeBps": {
+                  "minimum": 0,
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "readBps",
+                "writeBps",
+                "utilPct",
+                "weightedAwaitMs"
+              ],
+              "type": "object"
+            },
+            "freshell": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "eventLoopLagP99Ms": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ptysMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "ptysRunning": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "rssBytes": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "enum": [
+                    "node",
+                    "rust"
+                  ],
+                  "type": "string"
+                },
+                "uptimeSec": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "wsClients": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "wsClientsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "available",
+                "source",
+                "ptysRunning",
+                "ptysMax",
+                "wsClients",
+                "wsClientsMax",
+                "eventLoopLagP99Ms",
+                "rssBytes",
+                "uptimeSec"
+              ],
+              "type": "object"
+            },
+            "limits": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "ephemeralPorts": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "fdsMax": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "fdsUsed": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pidsMax": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pidsUsed": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "timeWait": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "fdsUsed",
+                "fdsMax",
+                "pidsUsed",
+                "pidsMax",
+                "timeWait",
+                "ephemeralPorts"
+              ],
+              "type": "object"
+            },
+            "load": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "cores": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "type": "integer"
+                },
+                "load1": {
+                  "type": "number"
+                },
+                "load15": {
+                  "type": "number"
+                },
+                "load5": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "load1",
+                "load5",
+                "load15",
+                "cores"
+              ],
+              "type": "object"
+            },
+            "machine": {
+              "additionalProperties": false,
+              "properties": {
+                "batteryPresent": {
+                  "type": "boolean"
+                },
+                "cgroup": {
+                  "enum": [
+                    "v1",
+                    "v2",
+                    "none"
+                  ],
+                  "type": "string"
+                },
+                "cores": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "type": "integer"
+                },
+                "gpu": {
+                  "const": "none",
+                  "type": "string"
+                },
+                "hostname": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "kernel": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "memTotalBytes": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "platform": {
+                  "type": "string"
+                },
+                "psi": {
+                  "type": "boolean"
+                },
+                "thermalCount": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "wsl": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "cores",
+                "memTotalBytes",
+                "platform",
+                "wsl",
+                "kernel",
+                "hostname",
+                "psi",
+                "cgroup",
+                "thermalCount",
+                "batteryPresent",
+                "gpu"
+              ],
+              "type": "object"
+            },
+            "memory": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "availableBytes": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "cgroupLimitBytes": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "enum": [
+                    "host",
+                    "cgroup",
+                    "processes"
+                  ],
+                  "type": "string"
+                },
+                "swapTotalBytes": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "swapUsedBytes": {
+                  "anyOf": [
+                    {
+                      "minimum": 0,
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "totalBytes": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "usedBytes": {
+                  "minimum": 0,
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "source",
+                "totalBytes",
+                "usedBytes",
+                "availableBytes",
+                "cgroupLimitBytes",
+                "swapTotalBytes",
+                "swapUsedBytes"
+              ],
+              "type": "object"
+            },
+            "network": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "rxBps": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "rxDroppedDelta": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "rxDroppedTotal": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "rxErrorsDelta": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "rxErrorsTotal": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "txBps": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "txDroppedDelta": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "txDroppedTotal": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "txErrorsDelta": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "txErrorsTotal": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "available",
+                "rxBps",
+                "txBps",
+                "rxErrorsTotal",
+                "txErrorsTotal",
+                "rxDroppedTotal",
+                "txDroppedTotal",
+                "rxErrorsDelta",
+                "txErrorsDelta",
+                "rxDroppedDelta",
+                "txDroppedDelta"
+              ],
+              "type": "object"
+            },
+            "paging": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "majFaultsPerSec": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "oomKillsDelta": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "oomKillsTotal": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapInKbps": {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                "swapOutKbps": {
+                  "minimum": 0,
+                  "type": "number"
+                }
+              },
+              "required": [
+                "available",
+                "swapInKbps",
+                "swapOutKbps",
+                "majFaultsPerSec",
+                "oomKillsDelta",
+                "oomKillsTotal"
+              ],
+              "type": "object"
+            },
+            "psi": {
+              "additionalProperties": false,
+              "properties": {
+                "available": {
+                  "type": "boolean"
+                },
+                "cpuSome10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ioFull10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ioSome10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "memFull10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "memSome10": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "available",
+                "cpuSome10",
+                "memSome10",
+                "memFull10",
+                "ioSome10",
+                "ioFull10"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "machine",
+            "cpu",
+            "load",
+            "memory",
+            "paging",
+            "psi",
+            "diskIo",
+            "network",
+            "limits",
+            "freshell"
+          ],
+          "type": "object"
+        },
+        "manual": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "disks": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "list": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "freeBytes": {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "inodesFree": {
+                            "anyOf": [
+                              {
+                                "minimum": 0,
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "inodesTotal": {
+                            "anyOf": [
+                              {
+                                "minimum": 0,
+                                "type": "number"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "mount": {
+                            "type": "string"
+                          },
+                          "totalBytes": {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "usedPct": {
+                            "maximum": 100,
+                            "minimum": 0,
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "mount",
+                          "totalBytes",
+                          "freeBytes",
+                          "usedPct",
+                          "inodesTotal",
+                          "inodesFree"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "list"
+                  ],
+                  "type": "object"
+                },
+                "inotify": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "instances": {
+                      "anyOf": [
+                        {
+                          "maximum": 9007199254740991,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "maxUserInstances": {
+                      "anyOf": [
+                        {
+                          "maximum": 9007199254740991,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "maxUserWatches": {
+                      "anyOf": [
+                        {
+                          "maximum": 9007199254740991,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "watches": {
+                      "anyOf": [
+                        {
+                          "maximum": 9007199254740991,
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "instances",
+                    "watches",
+                    "maxUserWatches",
+                    "maxUserInstances"
+                  ],
+                  "type": "object"
+                },
+                "processHealth": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "dState": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "total": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "zombies": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "zombies",
+                    "dState",
+                    "total"
+                  ],
+                  "type": "object"
+                },
+                "sectionErrors": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "thermals": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "battery": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "pct": {
+                              "maximum": 100,
+                              "minimum": 0,
+                              "type": "number"
+                            },
+                            "status": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "pct",
+                            "status"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "zones": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "celsius": {
+                            "type": "number"
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label",
+                          "celsius"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "zones",
+                    "battery"
+                  ],
+                  "type": "object"
+                },
+                "topProcesses": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "dwellMs": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "list": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "cpuPct": {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "pid": {
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991,
+                            "type": "integer"
+                          },
+                          "rssBytes": {
+                            "minimum": 0,
+                            "type": "number"
+                          },
+                          "state": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "pid",
+                          "name",
+                          "cpuPct",
+                          "rssBytes",
+                          "state"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "dwellMs",
+                    "list"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "topProcesses",
+                "processHealth",
+                "inotify",
+                "disks",
+                "thermals",
+                "sectionErrors"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "manualAt": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": {
+          "const": "hoststats.snapshot",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "at",
+        "live",
+        "manualAt",
+        "manual"
+      ],
+      "type": "object"
+    },
+    "HostStatsSubscribeSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "hoststats.subscribe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "HostStatsUnsubscribeSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "hoststats.unsubscribe",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
       ],
       "type": "object"
     },
@@ -3981,6 +6915,53 @@
         "type",
         "upsert",
         "remove"
+      ],
+      "type": "object"
+    },
+    "PaneClosedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.closed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "createRequestId"
+      ],
+      "type": "object"
+    },
+    "PaneOpenedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.opened",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "createRequestId",
+        "tabId"
       ],
       "type": "object"
     },
@@ -4219,6 +7200,52 @@
       ],
       "type": "object"
     },
+    "PanesClosedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "panes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "createRequestId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "createRequestId"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "panes.closed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "tabId",
+        "panes"
+      ],
+      "type": "object"
+    },
     "PingSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4242,6 +7269,10 @@
           "type": "boolean"
         },
         "paneReconcileV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "terminalInterestV1": {
           "const": true,
           "type": "boolean"
         }
@@ -4408,6 +7439,10 @@
           "minimum": 2,
           "type": "integer"
         },
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "expectedSessionRef": {
           "additionalProperties": false,
           "properties": {
@@ -4458,6 +7493,10 @@
         },
         "surfaceReset": {
           "type": "boolean"
+        },
+        "tabId": {
+          "minLength": 1,
+          "type": "string"
         },
         "terminalId": {
           "minLength": 1,
@@ -4834,10 +7873,60 @@
       ],
       "type": "object"
     },
+    "TerminalInterestSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "focusedTerminalId": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "type": {
+          "const": "terminal.interest",
+          "type": "string"
+        },
+        "visibleTerminalIds": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "revision",
+        "visibleTerminalIds"
+      ],
+      "type": "object"
+    },
     "TerminalKillSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "terminalId": {
           "minLength": 1,
           "type": "string"
@@ -5539,5 +8628,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell WebSocket wire protocol — frozen contract",
-  "wsProtocolVersion": 7
+  "wsProtocolVersion": 10
 }

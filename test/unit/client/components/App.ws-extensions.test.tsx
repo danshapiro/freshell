@@ -12,6 +12,7 @@ import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
+import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import {
   composeResolvedSettings,
@@ -47,6 +48,8 @@ const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
   connect: vi.fn(),
   onMessage: vi.fn(),
+  // Interest is transient and negotiated; this suite does not exercise it.
+  sendTerminalInterest: vi.fn(() => false),
   onReconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
   isReady: false,
@@ -65,6 +68,7 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsMocks.send,
     connect: wsMocks.connect,
+    sendTerminalInterest: wsMocks.sendTerminalInterest,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
@@ -191,6 +195,36 @@ describe('App WS extension messages', () => {
 
   afterEach(() => {
     cleanup()
+  })
+
+  it('stamps the hello extension with the connection provenance identity (D8)', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.setHelloExtensionProvider).toHaveBeenCalled()
+    })
+
+    // The provider is re-invoked per (re)connect; its return rides the hello
+    // frame. The pinned fields are what the server's D8 recovery judgment
+    // stamps onto connection-scoped ledger bind rows. The bootstrap's device
+    // meta load may rotate the preloaded id, so pin the LOAD-BEARING link:
+    // the hello's deviceId must equal the registry's (the id the snapshot
+    // pushes persist under).
+    const provider = wsMocks.setHelloExtensionProvider.mock.calls.at(-1)?.[0] as () => Record<string, unknown>
+    const ext = provider()
+    expect(ext.deviceId).toBe(store.getState().tabRegistry.deviceId)
+    expect(typeof ext.deviceId).toBe('string')
+    expect((ext.deviceId as string).length).toBeGreaterThan(0)
+    // MUST equal the id tabs.sync.push frames carry — the tabRegistrySync getter.
+    expect(ext.clientInstanceId).toBe(getCurrentTabRegistryClientInstanceId())
+    expect(typeof ext.clientInstanceId).toBe('string')
+    expect((ext.clientInstanceId as string).length).toBeGreaterThan(0)
   })
 
   it('dispatches setRegistry when receiving extensions.registry WS message', async () => {

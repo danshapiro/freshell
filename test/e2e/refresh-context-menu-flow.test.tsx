@@ -13,6 +13,7 @@ import PaneLayout from '@/components/panes/PaneLayout'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { PaneNode } from '@/store/paneTypes'
+import { installPaneGeometry } from '../helpers/pane-geometry'
 
 const wsMocks = {
   send: vi.fn(),
@@ -160,6 +161,15 @@ function renderFlow(store: ReturnType<typeof createStore>) {
   )
 }
 
+const paneGeometry: { current: ReturnType<typeof installPaneGeometry> | null } = { current: null }
+beforeEach(() => {
+  paneGeometry.current = installPaneGeometry()
+})
+afterEach(() => {
+  paneGeometry.current?.restore()
+  paneGeometry.current = null
+})
+
 describe('refresh context menu flow (e2e)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -176,45 +186,64 @@ describe('refresh context menu flow (e2e)', () => {
 
   it('Refresh tab exits zoom and refreshes all browser panes in the stored layout', async () => {
     vi.mocked(api.post).mockImplementation(() => new Promise(() => {}))
+    let reloadCount = 0
+    const contentWindowSpy = vi.spyOn(window.HTMLIFrameElement.prototype, 'contentWindow', 'get').mockImplementation(() => {
+      return {
+        location: {
+          reload: () => {
+            reloadCount += 1
+          },
+        },
+      } as any
+    })
 
-    const layout: PaneNode = {
-      type: 'split',
-      id: 'split-1',
-      direction: 'horizontal',
-      sizes: [50, 50],
-      children: [
-        createBrowserLeaf('pane-1', 'browser-1', 'http://127.0.0.1:3000'),
-        createBrowserLeaf('pane-2', 'browser-2', 'http://127.0.0.1:3001'),
-      ],
+    try {
+      const layout: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          createBrowserLeaf('pane-1', 'browser-1', 'http://127.0.0.1:3000'),
+          createBrowserLeaf('pane-2', 'browser-2', 'http://127.0.0.1:3001'),
+        ],
+      }
+      const store = createStore(layout, { zoomedPaneId: 'pane-1' })
+      const user = userEvent.setup()
+      const { container } = renderFlow(store)
+
+      // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's
+      // own port so the HTTP proxy skips it; pane-2 uses the same-origin
+      // /api/proxy path and never posts. The forward promise never resolves,
+      // so pane-1 has no iframe and one in-flight forward.
+      await waitFor(() => {
+        expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
+      })
+      vi.mocked(api.post).mockClear()
+
+      await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
+      await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
+
+      await waitFor(() => {
+        expect(store.getState().panes.zoomedPane['tab-1']).toBeUndefined()
+      })
+      await waitFor(() => {
+        expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
+      })
+      // Zoom exit keeps BOTH panes mounted (the stable surface layer — the old
+      // recursive tree remounted the zoomed sibling). pane-1's refresh takes
+      // the recover path: still no iframe (forward never resolved), so it
+      // retries the forward exactly once. pane-2 reloads its iframe in place.
+      await waitFor(() => {
+        expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
+      })
+      expect(reloadCount).toBe(1)
+      await waitFor(() => {
+        expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
+      })
+    } finally {
+      contentWindowSpy.mockRestore()
     }
-    const store = createStore(layout, { zoomedPaneId: 'pane-1' })
-    const user = userEvent.setup()
-    const { container } = renderFlow(store)
-
-    await waitFor(() => {
-      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
-    })
-    vi.mocked(api.post).mockClear()
-
-    await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
-
-    await waitFor(() => {
-      expect(store.getState().panes.zoomedPane['tab-1']).toBeUndefined()
-    })
-    await waitFor(() => {
-      expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
-    })
-    // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's own
-    // port so the HTTP proxy skips it. Pane-2 (port 3001) is proxied through
-    // /api/proxy/http/3001/ (same-origin) instead.  Each TCP-forwarded pane
-    // triggers one api.post for the initial render plus one for the refresh.
-    await waitFor(() => {
-      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(2)
-    })
-    await waitFor(() => {
-      expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
-    })
   })
 
   it('Refresh pane from the pane shell queues and consumes a matching browser refresh request', async () => {

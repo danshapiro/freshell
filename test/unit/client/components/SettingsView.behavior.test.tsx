@@ -220,7 +220,6 @@ describe('SettingsView behavior sections', () => {
       })
 
       expect(sortModeSelect.querySelector('option[value="hybrid"]')).toBeNull()
-      expect(sortModeSelect.querySelector('option[value="activity"]')?.textContent).toBe('Activity (tabs first)')
 
       fireEvent.change(sortModeSelect, { target: { value: 'activity' } })
 

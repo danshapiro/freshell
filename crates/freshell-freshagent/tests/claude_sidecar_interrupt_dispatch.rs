@@ -67,6 +67,11 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         real_sidecar_source("permission-channel.mjs"),
     )
     .expect("copy real permission-channel.mjs verbatim");
+    std::fs::write(
+        dir.path().join("session-settings.mjs"),
+        real_sidecar_source("session-settings.mjs"),
+    )
+    .expect("copy real session-settings.mjs verbatim");
     let sdk_dir = dir
         .path()
         .join("node_modules/@anthropic-ai/claude-agent-sdk");

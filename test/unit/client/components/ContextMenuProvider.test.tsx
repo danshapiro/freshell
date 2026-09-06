@@ -42,13 +42,57 @@ const clipboardMocks = vi.hoisted(() => ({
   copyText: vi.fn().mockResolvedValue(undefined),
 }))
 
-const wsMocks = vi.hoisted(() => ({
-  send: vi.fn(),
-  connect: vi.fn().mockResolvedValue(undefined),
-  onMessage: vi.fn().mockReturnValue(() => {}),
-  onReconnect: vi.fn().mockReturnValue(() => {}),
-  setHelloExtensionProvider: vi.fn(),
-}))
+const wsMocks = vi.hoisted(() => {
+  const handlers = new Set<(msg: unknown) => void>()
+  return {
+    send: vi.fn(),
+    connect: vi.fn().mockResolvedValue(undefined),
+    handlers,
+    onMessage: vi.fn((handler: (msg: unknown) => void) => {
+      handlers.add(handler)
+      return () => {
+        handlers.delete(handler)
+      }
+    }),
+    onReconnect: vi.fn().mockReturnValue(() => {}),
+    setHelloExtensionProvider: vi.fn(),
+  }
+})
+
+/** Answer every in-flight pane.closed with a success result (delta-r7-r3, F2: the healthy-server close acknowledgment). */
+function ackPendingPaneCloses() {
+  for (const [msg] of wsMocks.send.mock.calls) {
+    const m = msg as { type?: string; createRequestId?: string }
+    if (m?.type === 'pane.closed' && m.createRequestId) {
+      for (const handler of [...wsMocks.handlers]) {
+        handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+      }
+    }
+  }
+}
+
+/** Answer every in-flight kill the provider sent with a successful durable close. */
+function ackPendingKills() {
+  for (const [msg] of wsMocks.send.mock.calls) {
+    const m = msg as { type?: string; requestId?: string; terminalId?: string; sessionId?: string; sessionType?: string; provider?: string }
+    if (m?.type === 'terminal.kill' && m.requestId && m.terminalId) {
+      for (const handler of [...wsMocks.handlers]) {
+        handler({ type: 'terminal.killed', requestId: m.requestId, terminalId: m.terminalId, success: true })
+      }
+    }
+    if (m?.type === 'freshAgent.kill' && m.sessionId) {
+      for (const handler of [...wsMocks.handlers]) {
+        handler({
+          type: 'freshAgent.killed',
+          sessionId: m.sessionId,
+          sessionType: m.sessionType,
+          provider: m.provider,
+          success: true,
+        })
+      }
+    }
+  }
+}
 
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn().mockResolvedValue([]),
@@ -593,6 +637,7 @@ function createStoreWithTerminalPane() {
               mode: 'shell',
               status: 'running',
               terminalId: 'term-1',
+              createRequestId: 'req-replace-1',
             },
           },
         },
@@ -1005,10 +1050,16 @@ describe('ContextMenuProvider', () => {
       )
     })
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-1' })
+      expect(wsMocks.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'terminal.kill', terminalId: 'term-1' }),
+      )
     })
+    // The replacement conversation starts only once the old one's durable
+    // close is acknowledged (focused-episode-6 round 2 close-and-replace).
+    ackPendingKills()
 
-    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
       type: 'leaf',
       content: {
         kind: 'fresh-agent',
@@ -1021,6 +1072,7 @@ describe('ContextMenuProvider', () => {
         },
         initialCwd: '/test/project',
       },
+    })
     })
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
       [`claude:${VALID_SESSION_ID}`]: {
@@ -1091,18 +1143,23 @@ describe('ContextMenuProvider', () => {
         provider: 'claude',
       })
     })
+    // As above: the replacement starts only once the old fresh-agent
+    // session's durable close is acknowledged.
+    ackPendingKills()
 
-    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
-      type: 'leaf',
-      content: {
-        kind: 'terminal',
-        mode: 'claude',
-        sessionRef: {
-          provider: 'claude',
-          sessionId: VALID_SESSION_ID,
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          },
+          initialCwd: '/test/project',
         },
-        initialCwd: '/test/project',
-      },
+      })
     })
     expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
       [`claude:${VALID_SESSION_ID}`]: {
@@ -1250,18 +1307,21 @@ describe('ContextMenuProvider', () => {
         cwd: '/repo/session-state',
       })
     })
+    ackPendingKills()
 
-    expect(store.getState().panes.layouts['tab-1']).toMatchObject({
-      type: 'leaf',
-      content: {
-        kind: 'terminal',
-        mode: 'opencode',
-        sessionRef: {
-          provider: 'opencode',
-          sessionId: OPENCODE_SESSION_ID,
+    await waitFor(() => {
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'opencode',
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: OPENCODE_SESSION_ID,
+          },
+          initialCwd: '/repo/session-state',
         },
-        initialCwd: '/repo/session-state',
-      },
+      })
     })
   })
 
@@ -2489,7 +2549,21 @@ describe('ContextMenuProvider', () => {
 
       await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
 
-      // Verify terminal.detach was sent via the actual handler
+      // F2 (delta-r7-r3): the gate sends the close evidence and AWAITS the
+      // correlated server answer BEFORE the pane becomes a picker.
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'pane.closed',
+        createRequestId: 'req-replace-1',
+        terminalId: 'term-1',
+      })
+      ackPendingPaneCloses()
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts['tab-1']
+        expect(layout.type === 'leaf' && layout.content.kind === 'picker').toBe(true)
+      })
+
+      // Verify the plain identity-driven terminal.detach was sent (F1: the
+      // close evidence now rides its own pane.closed message, above)
       expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
 
       // Verify pane content is now picker
@@ -2529,10 +2603,25 @@ describe('ContextMenuProvider', () => {
 
       await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
 
+      ackPendingPaneCloses()
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts['tab-1']
+        expect(layout.type === 'leaf' && layout.content.kind === 'picker').toBe(true)
+      })
+
       const detachMessages = wsMocks.send.mock.calls
         .map(([msg]) => msg as { type?: string; terminalId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
       expect(detachMessages).toHaveLength(1)
+      // Exactly ONE pane-close evidence message keyed by the replaced pane:
+      // the gate's acknowledged send is THE send (the middleware belt skips
+      // it via the one-shot confirmation mark — delta-r7-r3, F2).
+      const paneClosedMessages = wsMocks.send.mock.calls
+        .map(([msg]) => msg as { type?: string; createRequestId?: string })
+        .filter((msg) => msg?.type === 'pane.closed')
+      expect(paneClosedMessages).toEqual([
+        { type: 'pane.closed', createRequestId: 'req-replace-1', terminalId: 'term-1' },
+      ])
     })
 
   })
