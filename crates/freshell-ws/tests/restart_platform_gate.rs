@@ -169,7 +169,7 @@ async fn preflight_rejects_restart_when_platform_gate_closed() {
 
 /// Linux positive control: with the knob absent (the production posture) the
 /// gate is the bare cfg check, so the advertisement flows when the client
-/// opts in. Also guards the EnvGuard contract — a `Drop` that failed to
+/// opts in. Also guards the EnvGate contract — a `Drop` that failed to
 /// restore would close the gate here and fail this test.
 #[cfg(target_os = "linux")]
 #[tokio::test]

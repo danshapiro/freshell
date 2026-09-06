@@ -819,6 +819,7 @@ export type AgentRestartFailureCode =
   | 'PREFLIGHT_FAILED'
   | 'SHUTDOWN_FAILED'
   | 'REPLACEMENT_FAILED'
+  | 'UNSUPPORTED_PLATFORM'
 
 export type AgentRestartStartedMessage = {
   type: 'agent.restart.started'
