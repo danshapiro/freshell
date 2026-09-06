@@ -6472,6 +6472,291 @@ async fn indeterminate_journal_write_during_commit_keeps_pending_row_and_defers_
     drop(_registration);
 }
 
+/// Wraps the production restart adapter so the commit-write parent-sync fault
+/// can be armed at the exact boundary the coordinator will hit NEXT: a
+/// SUCCESSFUL replacement creation. Arming inside the create flow would risk
+/// an entrant write consuming the latched fault before the commit write runs;
+/// arming after an Ok return guarantees the next journal parent sync IS the
+/// commit write (matching `IndeterminateRecorderRuntime::arming_on_create`).
+/// Every other trait method delegates untouched, and the fault is one-shot so
+/// a later recovery create cannot re-arm it.
+struct CommitIndeterminateProductionRuntime {
+    inner: Arc<freshell_ws::restart::ProductionRestartRuntime>,
+    fault: Arc<ParentSyncFault>,
+    unspent: AtomicBool,
+}
+
+impl CommitIndeterminateProductionRuntime {
+    fn new(
+        inner: Arc<freshell_ws::restart::ProductionRestartRuntime>,
+        fault: Arc<ParentSyncFault>,
+    ) -> Self {
+        Self {
+            inner,
+            fault,
+            unspent: AtomicBool::new(true),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RestartRuntime for CommitIndeterminateProductionRuntime {
+    type ResumePlan = ();
+
+    async fn preflight(&self, request: &AgentRestart) -> Result<Self::ResumePlan, RestartFailure> {
+        RestartRuntime::preflight(self.inner.as_ref(), request).await
+    }
+
+    async fn abort_preflight(&self, request: &AgentRestart, plan: &Self::ResumePlan) {
+        RestartRuntime::abort_preflight(self.inner.as_ref(), request, plan).await;
+    }
+
+    async fn on_terminal_outcome(&self, request: &AgentRestart) {
+        RestartRuntime::on_terminal_outcome(self.inner.as_ref(), request).await;
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        request: &AgentRestart,
+        plan: &Self::ResumePlan,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::shutdown_for_restart(self.inner.as_ref(), request, plan).await
+    }
+
+    async fn create_replacement(
+        &self,
+        request: &AgentRestart,
+        plan: Self::ResumePlan,
+    ) -> Result<String, RestartFailure> {
+        let created = RestartRuntime::create_replacement(self.inner.as_ref(), request, plan).await;
+        if created.is_ok() && self.unspent.swap(false, Ordering::SeqCst) {
+            self.fault.latch(1);
+        }
+        created
+    }
+
+    fn requires_replacement_fence(&self) -> bool {
+        RestartRuntime::requires_replacement_fence(self.inner.as_ref())
+    }
+
+    async fn create_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        plan: Self::ResumePlan,
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        let created =
+            RestartRuntime::create_replacement_fenced(self.inner.as_ref(), request, plan, fence)
+                .await;
+        if created.is_ok() && self.unspent.swap(false, Ordering::SeqCst) {
+            self.fault.latch(1);
+        }
+        created
+    }
+
+    fn persisted_resume_context(
+        &self,
+        request: &AgentRestart,
+        plan: &Self::ResumePlan,
+    ) -> Option<RestartResumeContext> {
+        RestartRuntime::persisted_resume_context(self.inner.as_ref(), request, plan)
+    }
+
+    fn persisted_retirement_fence(
+        &self,
+        request: &AgentRestart,
+        plan: &Self::ResumePlan,
+    ) -> Option<RestartRetirementFence> {
+        RestartRuntime::persisted_retirement_fence(self.inner.as_ref(), request, plan)
+    }
+
+    async fn recover_replacement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+    ) -> Result<String, RestartFailure> {
+        RestartRuntime::recover_replacement(self.inner.as_ref(), request, context).await
+    }
+
+    async fn recover_ambiguous_replacement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: &RestartReplacementFence,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::recover_ambiguous_replacement(self.inner.as_ref(), request, context, fence)
+            .await
+    }
+
+    async fn recover_replacement_fenced(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: Option<&RestartReplacementFence>,
+    ) -> Result<String, RestartFailure> {
+        RestartRuntime::recover_replacement_fenced(self.inner.as_ref(), request, context, fence)
+            .await
+    }
+
+    async fn recover_retirement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::recover_retirement(self.inner.as_ref(), request, context).await
+    }
+
+    async fn recover_persisted_retirement(
+        &self,
+        request: &AgentRestart,
+        context: Option<&RestartResumeContext>,
+        fence: Option<&RestartRetirementFence>,
+    ) -> Result<(), RestartFailure> {
+        RestartRuntime::recover_persisted_retirement(self.inner.as_ref(), request, context, fence)
+            .await
+    }
+}
+
+/// Indeterminate durable commit is NOT a terminal outcome (Task 5 / fix 3): the
+/// pending row AND the active plan are retained for cross-boot recovery, so
+/// the OpenCode preflight reservation must NOT be released at the ambiguous
+/// boundary (Task-8 review Minor pin). Only when the always-on driver later
+/// converges the retained row to a clean commit does the reservation release
+/// fire — exactly once, with the exact tuple.
+#[tokio::test] // real time, bounded (drives the always-on recovery driver)
+async fn indeterminate_commit_keeps_plan_and_reservation_until_driver_converges() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("restart-state.json");
+    let fault = Arc::new(ParentSyncFault {
+        latched: AtomicUsize::new(0),
+    });
+    let (_url, registry, mut state) = common::spawn_server_with_specs_and_state(vec![]).await;
+    state.session_existence = Arc::new(PresentSessions);
+    let coordinator = RestartCoordinator::new_persistent_with_test_parent_sync(
+        path.clone(),
+        16,
+        16,
+        RestartIngressLimits::default(),
+        fault.gate(),
+    )
+    .unwrap();
+    // Re-home the test server state on the faulted coordinator BEFORE the
+    // production adapter is built, so every internal reference agrees.
+    state.restart = coordinator.clone();
+
+    let durable_id = "durable-indeterminate-release".to_string();
+    let old_runtime_id = "fresh-opencode-indeterminate-old".to_string();
+    let locator = RuntimeLocator::new(AgentRuntimeKind::FreshAgent, "opencode", durable_id.clone());
+    let old = coordinator.register_initial(locator, &old_runtime_id);
+    let fresh_runtime = Arc::new(ReservationRecordingFreshRuntime::new(
+        coordinator.clone(),
+        Arc::clone(&state.broadcast_tx),
+    ));
+    fresh_runtime.enroll_live_session("opencode", &durable_id, &old_runtime_id);
+    let production = Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::with_fresh_runtime(
+            state.clone(),
+            fresh_runtime.clone(),
+        ),
+    );
+    let fragile = Arc::new(CommitIndeterminateProductionRuntime::new(
+        production.clone(),
+        fault.clone(),
+    ));
+    let _registration = coordinator.set_runtime(fragile);
+    let request = AgentRestart {
+        request_id: "indeterminate-release".to_string(),
+        provider: "opencode".to_string(),
+        session_id: durable_id.clone(),
+        kind: AgentRuntimeKind::FreshAgent,
+        live_id: old_runtime_id.clone(),
+        expected_generation: old.generation,
+    };
+
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let emit_sink = Arc::clone(&emitted);
+    let outcome = coordinator
+        .execute_registered(request.clone(), move |message| {
+            emit_sink.lock().unwrap().push(message.clone());
+        })
+        .await;
+
+    // Same immediate shape as the recorder test: started, then a non-retryable
+    // recovery-pending failure — never a `replaced` frame.
+    assert!(
+        matches!(
+            outcome.messages.as_slice(),
+            [ServerMessage::AgentRestartStarted(_), ServerMessage::AgentRestartFailed(failed)]
+                if failed.request_id == "indeterminate-release"
+                    && !failed.retryable
+                    && failed.recovery_pending
+        ),
+        "the indeterminate commit must end in a non-retryable recovery-pending failure: {:?}",
+        outcome.messages
+    );
+
+    // THE PIN: the ambiguous boundary is NOT terminal — the reservation is NOT
+    // released and the active plan is NOT removed (cross-boot recovery owns both).
+    assert!(
+        fresh_runtime.releases().is_empty(),
+        "an indeterminate commit must NOT release the preflight reservation: {:?}",
+        fresh_runtime.releases()
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_some(),
+        "an indeterminate commit must retain the active plan"
+    );
+    assert!(
+        coordinator
+            .pending_recoveries()
+            .iter()
+            .any(|row| row.request_id == "indeterminate-release"),
+        "the pending row is retained for recovery"
+    );
+
+    // The driver converges the retained row to a clean commit (fault spent);
+    // only then does the single terminal-outcome release fire.
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let driver_sink = Arc::clone(&emitted);
+    let driver = tokio::spawn(run_restart_recovery_driver(
+        coordinator.clone(),
+        shutdown_started.clone(),
+        shutdown_notify.clone(),
+        move |message| driver_sink.lock().unwrap().push(message.clone()),
+    ));
+    assert!(
+        wait_until(std::time::Duration::from_secs(5), || coordinator
+            .pending_recoveries()
+            .is_empty())
+        .await,
+        "the driver must converge the retained row to a clean commit"
+    );
+    assert_eq!(
+        fresh_runtime.releases(),
+        vec![(
+            freshell_protocol::AgentProvider::Opencode,
+            durable_id.clone(),
+            old_runtime_id.clone(),
+            format!("restart-preflight:{}", request.request_id),
+        )],
+        "the reservation is released exactly once, on the converged terminal commit"
+    );
+    assert!(
+        RestartRuntime::persisted_resume_context(production.as_ref(), &request, &()).is_none(),
+        "the converged commit removes the active plan"
+    );
+
+    shutdown_started.store(true, Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("driver exits on shutdown")
+        .expect("driver task did not panic");
+    drop(_registration);
+    registry.kill_all();
+}
+
 // ---------------------------------------------------------------------------
 // Shutdown interlock (fix 1): the coordinator latches restart ingress at
 // graceful shutdown, owns every registered in-flight transaction in a JoinSet
