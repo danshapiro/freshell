@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 60,
+  "messageCount": 64,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2420,6 +2420,59 @@
       ],
       "type": "object"
     },
+    "pane.closed.result": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createRequestId": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.closed.result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createRequestId",
+        "success",
+        "type"
+      ],
+      "type": "object"
+    },
+    "pane.opened.result": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createRequestId": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "pane.opened.result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createRequestId",
+        "success",
+        "type"
+      ],
+      "type": "object"
+    },
     "pane.reconcile.result": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -2499,6 +2552,31 @@
         "serverInstanceId",
         "type",
         "verdicts"
+      ],
+      "type": "object"
+    },
+    "panes.closed.result": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "panes.closed.result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "success",
+        "type"
       ],
       "type": "object"
     },
@@ -3827,6 +3905,35 @@
       ],
       "type": "object"
     },
+    "terminal.killed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.killed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "success",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
     "terminal.meta.updated": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4393,5 +4500,5 @@
   },
   "source": "shared/ws-protocol.ts",
   "title": "freshell server→client message shapes — frozen contract",
-  "wsProtocolVersion": 8
+  "wsProtocolVersion": 10
 }

@@ -9,6 +9,7 @@ import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 /**
  * Codex status completeness (Rust only) — wire-level proof that codex panes
@@ -64,7 +65,7 @@ class WsCapture {
     this.ws = new WebSocket(wsUrl)
     this.opened = new Promise((resolve, reject) => {
       this.ws.on('open', () => {
-        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: 8, token }))
+        this.ws.send(JSON.stringify({ type: 'hello', protocolVersion: WS_PROTOCOL_VERSION, token }))
         resolve()
       })
       this.ws.on('error', reject)

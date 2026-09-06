@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 36 discriminants).
+//! Client → server messages (`ClientMessage`, 39 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -36,6 +36,21 @@ pub enum ClientMessage {
     TerminalAutoResumeCancel(TerminalAutoResumeCancel),
     #[serde(rename = "terminal.detach")]
     TerminalDetach(TerminalDetach),
+    /// Delta-r7-r2 (Findings F1+F2): the dedicated durable pane-close
+    /// evidence message (see [`PaneClosed`]). Additive.
+    #[serde(rename = "pane.closed")]
+    PaneClosed(PaneClosed),
+    /// Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
+    /// batch envelope (see [`PanesClosed`]). Additive with the protocol
+    /// version bump 9 → 10 (the client gates on the answer).
+    #[serde(rename = "panes.closed")]
+    PanesClosed(PanesClosed),
+    /// Focused-episode-7 round 3 (Finding F2): the durable open re-assertion
+    /// for a still-present pane (see [`PaneOpened`]). Answered by the
+    /// correlated `pane.opened.result` (focused-episode-7 round 5, F3) — the
+    /// client's listen is bounded and non-blocking.
+    #[serde(rename = "pane.opened")]
+    PaneOpened(PaneOpened),
     #[serde(rename = "terminal.input")]
     TerminalInput(TerminalInput),
     #[serde(rename = "terminal.resize")]
@@ -97,7 +112,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 37] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 40] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -121,7 +136,10 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 37] = [
     "hoststats.subscribe",
     "hoststats.unsubscribe",
     "opencode.activity.list",
+    "pane.closed",
+    "pane.opened",
     "pane.reconcile.request",
+    "panes.closed",
     "ping",
     "sessions.prefs",
     "terminal.attach",
@@ -192,6 +210,16 @@ pub struct Hello {
     pub sessions: Option<HelloSessions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidebar_open_sessions: Option<Vec<SessionLocator>>,
+    /// D8 (restore-open-sessions-only): the client's stable device id — the
+    /// same value its `tabs.sync.push` frames carry — letting connection-scoped
+    /// ledger bind lanes stamp row provenance. Additive optional: absent on
+    /// older clients, stripped-tolerant on older servers (no version bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// D8: this browser tab-session's client instance id (page reloads mint a
+    /// new one; same value `tabs.sync.push` carries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_instance_id: Option<String>,
 }
 
 /// Full presentation-interest snapshot for this connection. Validation of
@@ -326,12 +354,103 @@ pub struct TerminalAttach {
     pub priority: Option<TerminalAttachPriority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_seq: Option<i64>,
+    /// The attaching pane's createRequestId (delta-r7-r2, Finding F3): when
+    /// present, the server re-stamps the terminal's Bound ledger row onto
+    /// THIS pane's identity BEFORE the attach is observable (a sidebar
+    /// reattach becomes the row's pane key, so the OLD pane's close record
+    /// keeps covering only the old pane). Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
+    /// The attaching pane's tab id (delta-r7-r2, Finding F3): composes the
+    /// re-stamp's provenance `tabKey`, so the row's attribution can ADVANCE
+    /// to the attach's true tab and receipt time under the full-triple rule.
+    /// Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalDetach {
     pub terminal_id: String,
+}
+
+/// Delta-r7-r2 (Findings F1+F2) — the dedicated durable pane-close evidence
+/// message. EVERY user- or system-initiated pane removal (pane-X,
+/// replace-pane, whole-tab close) sends ONE per removed terminal-pane
+/// identity, keyed by the pane's `createRequestId` (present from creation —
+/// never absent), `terminalId` carried when the pane has one (absent on the
+/// in-flight-create close shape). The server journals ONE durable,
+/// NON-retiring pane-close record per message (`pane-detach:<crid>` — the
+/// session survives: nothing is fenced or retired). The detach channel
+/// itself stays identity-driven: detach is about the terminal, never the
+/// pane.
+///
+/// Focused-episode-7 round 3 (Finding F1): this stays the DEGENERATE
+/// envelope for single-pane removals (pane-X, replace-pane); the whole-tab
+/// close carries its full pane set in ONE [`PanesClosed`] message instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneClosed {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// Focused-episode-7 round 3 (Finding F1) — the whole-tab BATCH close. The
+/// gated `closeTab` sends ONE `panes.closed` carrying the tab's full
+/// terminal-pane identity set, and the server journals ONE durable
+/// NON-retiring envelope record (`pane-detach-batch:<tabId>`) covering the
+/// whole set in ONE atomic write, then answers ONE correlated
+/// `panes.closed.result{requestId, success}` — a partial per-pane durable
+/// outcome is impossible by construction (the finding's mechanism: a pane-A
+/// ack + pane-B failure pair could leave pane A durably closed under a
+/// still-standing tab). `requestId` is the close op's own correlation key
+/// (the batch answers the OP, not a pane — terminal.kill's precedent).
+/// Additive with the protocol version bump 9 → 10: the client gates tab
+/// removal on the answer, so a server that predates the frame fails the
+/// strict hello handshake instead of silently dropping it (see
+/// `shared/ws-version.ts` for the mixed-version note).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosed {
+    pub request_id: String,
+    pub tab_id: String,
+    pub panes: Vec<PanesClosedPane>,
+}
+
+/// One pane's identity inside the batch close (`panes` member of
+/// [`PanesClosed`]): the pane's createRequestId (never absent), terminalId
+/// when the pane has one (absent on the in-flight-create shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosedPane {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// Focused-episode-7 round 3 (Finding F2) — the durable OPEN re-assertion.
+/// Sent by the client for a pane it is STILL DISPLAYING after its close
+/// evidence failed to confirm (a server-answered failure, or the ambiguous
+/// timeout whose record may have committed durably with the ack lost on the
+/// wire). The server consumes the pane's standing `pane-detach[-batch]`
+/// close record durably (the claim lifecycle's fence consumption carried to
+/// the detach family) and re-asserts the row's attribution from the
+/// connection identity + this `tabId`, so the recovery judgment and the
+/// server state re-agree with the layout the client is displaying: a
+/// close-covered-by-consumed-record pane reads OPEN again. Queued by the
+/// client's send path until `ready`, so a socket-down close replays the
+/// close BEFORE this re-assertion on the returned socket (the ordering is
+/// the fix, not a race). Idempotent and replayed on every reconnect until
+/// consumed; answered by the correlated [`crate::PaneOpenedResult`]
+/// (focused-episode-7 round 5, F3) so a failed consume is retried by the
+/// client on its next sweep tick rather than sitting server-log-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneOpened {
+    pub create_request_id: String,
+    pub tab_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,6 +476,14 @@ pub struct TerminalResize {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalKill {
     pub terminal_id: String,
+    /// Close-result correlation (delta-r6-r3): present ⇒ the server answers
+    /// with `terminal.killed{requestId,…}`; absent ⇒ legacy error frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The closing pane's createRequestId — the durable close envelope's key
+    /// when the registry probe cannot answer (reaper race / stale pane).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
 }
 
 // --- *.activity.list --------------------------------------------------------
@@ -581,6 +708,12 @@ pub struct FreshAgentCreate {
     pub sandbox: Option<Sandbox>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// D8 (restore-open-sessions-only): the creating tab's client-side id.
+    /// Connection-scoped create lanes compose the ledger row's `tabKey` as
+    /// `deviceId:tabId` (matching `src/lib/tab-registry-snapshot.ts`). Additive
+    /// optional; conn-less (REST/MCP) creates omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -711,6 +844,14 @@ pub struct FreshAgentFork {
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// D8 (restore-open-sessions-only, focused-ep1-r5 Finding 1): the forking
+    /// tab's client-side id. Fork is always connection-initiated, so the
+    /// child row's provenance resolves from the FORKING connection (hello
+    /// identity + this tab id, `deviceId:tabId`) ahead of the parent's parked
+    /// stamps. Additive optional; older clients omit it (the child row then
+    /// stamps the connection's identity without a tabKey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

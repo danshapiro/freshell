@@ -16,6 +16,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
 
 const STORM_CLIENTS = 2
 const CREATES_PER_CLIENT = 15 // > the 10/10s limit: succeeding proves restore bypass
@@ -58,7 +59,7 @@ class SyntheticClient {
     const client = new SyntheticClient(ws)
     client.send({
       type: 'hello',
-      protocolVersion: 8,
+      protocolVersion: WS_PROTOCOL_VERSION,
       token: info.token,
     })
     await client.waitFor((f) => f.type === 'ready')

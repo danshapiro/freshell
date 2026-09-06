@@ -235,6 +235,7 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `GEMINI_CMD` | No | Gemini CLI command override |
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
+| `FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS` | No | Comma-separated identity-grace recheck delays before a crashed agent pane settles (default: `2500,2500` — 5s total); set to empty to disable |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
 
 ### Coding CLI Providers

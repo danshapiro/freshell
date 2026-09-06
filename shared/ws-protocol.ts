@@ -428,6 +428,11 @@ export const HelloSchema = z.object({
     visible: z.array(z.string()).optional(),
     background: z.array(z.string()).optional(),
   }).optional(),
+  /** D8 (restore-open-sessions-only): additive optional connection provenance — the
+   * same values `tabs.sync.push` carries; the Rust server stores them per-connection
+   * and stamps connection-scoped ledger rows. Both servers tolerate their absence. */
+  deviceId: z.string().optional(),
+  clientInstanceId: z.string().optional(),
 })
 
 export const PingSchema = z.object({
@@ -506,6 +511,17 @@ export const TerminalAttachSchema = z.object({
    * servers accept-and-strip it (WS_PROTOCOL_VERSION deliberately not
    * bumped — additive optional, all four old/new quadrants valid). */
   surfaceReset: z.boolean().optional(),
+  /** The attaching pane's createRequestId (delta-r7-r2, Finding F3): when an
+   * attach carries it, the server re-stamps the terminal's Bound ledger row
+   * onto THIS pane's identity (a sidebar reattach becomes the row's new pane
+   * key, so a stale pane-close record for the OLD pane's createRequestId can
+   * never suppress the genuinely re-opened session). Additive optional. */
+  createRequestId: z.string().min(1).optional(),
+  /** The attaching pane's tab id (delta-r7-r2, Finding F3): composes the
+   * re-stamp's provenance `tabKey` (`deviceId:tabId`), so the row's
+   * attribution advances to the attach's true tab and assertion time under
+   * the existing full-triple advance rule. Additive optional. */
+  tabId: z.string().min(1).optional(),
   intent: TerminalAttachIntentSchema,
   priority: TerminalAttachPrioritySchema.optional(),
   cols: z.number().int().min(2).max(1000),
@@ -515,6 +531,83 @@ export const TerminalAttachSchema = z.object({
 export const TerminalDetachSchema = z.object({
   type: z.literal('terminal.detach'),
   terminalId: z.string().min(1),
+})
+
+/** Delta-r7-r2 (Findings F1+F2) — the dedicated durable pane-close evidence
+ * message. EVERY user- or system-initiated action that removes a pane from
+ * the layout (pane-X, replace-pane, whole-tab close) sends ONE per removed
+ * terminal-pane identity, keyed by the pane's createRequestId (present from
+ * creation — never absent) and carrying the pane's terminalId when it
+ * exists. The server journals a durable NON-retiring pane-close record (the
+ * session survives — nothing is fenced or retired). The detach channel
+ * itself stays identity-driven: detach is about the terminal, never the
+ * pane.
+ *
+ * Delta-r7-r3 (focused-episode-7 round 2, Findings F2+F4): the close is
+ * ACKNOWLEDGED — the server answers one `pane.closed.result` per message
+ * once the journal write resolves, and the client's close gate awaits it
+ * (never an unconfirmed drop). Because a pre-result server silently DROPS
+ * unknown typed messages at its deserialization boundary, this shape ships
+ * WITH the protocol version bump 8 → 9: the strict hello handshake rejects
+ * a mixed-version pair with PROTOCOL_MISMATCH, so a client that gates on
+ * the answer can only ever connect to a server that speaks it (see
+ * `shared/ws-version.ts` for the full mixed-version note). */
+export const PaneClosedSchema = z.object({
+  type: z.literal('pane.closed'),
+  createRequestId: z.string().min(1),
+  terminalId: z.string().min(1).optional(),
+})
+
+/** Focused-episode-7 round 3 (Finding F1) — the whole-tab BATCH close. The
+ * gated `closeTab` sends ONE `panes.closed` carrying the tab's full
+ * terminal-pane identity set; the server journals ONE durable NON-retiring
+ * envelope record (`pane-detach-batch:<tabId>`) covering the whole set in
+ * ONE atomic write, then answers ONE correlated
+ * `panes.closed.result{requestId, success}` (handled by the same types as
+ * `pane.closed.result`'s floor). A partial per-pane durable outcome is
+ * impossible by construction — the finding's mechanism was a pane-A ack +
+ * pane-B failure pair leaving pane A durably closed under a still-standing
+ * tab. `requestId` is the close op's own correlation key (the batch answers
+ * the OP, not a pane — terminal.kill's precedent). Additive with the
+ * protocol version bump 9 → 10: the client gates tab removal on the answer,
+ * so a server that predates the frame fails the strict hello handshake
+ * instead of silently dropping it (see `shared/ws-version.ts`).
+ * The single-pane removals (pane-X, replace-pane) keep the degenerate
+ * per-pane `pane.closed` envelope above; BOTH route through the same
+ * server-side envelope writer. */
+export const PanesClosedSchema = z.object({
+  type: z.literal('panes.closed'),
+  requestId: z.string().min(1),
+  tabId: z.string().min(1),
+  panes: z.array(z.object({
+    createRequestId: z.string().min(1),
+    terminalId: z.string().min(1).optional(),
+  })).min(1),
+})
+
+/** Focused-episode-7 round 3 (Finding F2) — the durable OPEN re-assertion.
+ * Sent for a pane the client is STILL DISPLAYING after its close evidence
+ * failed to confirm (a server-answered failure, or the ambiguous timeout
+ * whose record may have committed durably with the ack lost on the wire).
+ * The server consumes the pane's standing `pane-detach[-batch]` close
+ * record durably and re-asserts the row's attribution from the connection
+ * identity + this tabId, so the recovery judgment re-agrees with the
+ * displayed layout (a consumed close reads the pane OPEN again). The
+ * client's send path queues it until `ready`, so a socket-down close
+ * replays BEFORE this re-assertion on the returned socket — the ordering is
+ * the fix, not a race.
+ *
+ * Focused-episode-7 round 5 (Finding F3): answered by ONE correlated
+ * `pane.opened.result{createRequestId, success, error?}` once the consume
+ * resolved (a failed consume is marked client-side and retried on the next
+ * sweep tick — never server-log-only). The client never GATES on the answer
+ * (the per-ready sweep re-asserts every displayed pane regardless), so the
+ * frame is additive with NO protocol bump: a predated server degrades to the
+ * pre-answer behavior the sweep already heals — see `shared/ws-version.ts`. */
+export const PaneOpenedSchema = z.object({
+  type: z.literal('pane.opened'),
+  createRequestId: z.string().min(1),
+  tabId: z.string().min(1),
 })
 
 export const TerminalAutoResumeCancelSchema = z.object({
@@ -542,6 +635,28 @@ export const TerminalResizeSchema = z.object({
 export const TerminalKillSchema = z.object({
   type: z.literal('terminal.kill'),
   terminalId: z.string().min(1),
+  /**
+   * Close-result correlation (delta-r6-r3 / focused-episode-6 round 2): when
+   * present, the server answers the kill with a `terminal.killed` frame
+   * carrying THIS id (`success:false` means the durable close failed and the
+   * terminal was left untouched; `success:true` covers the already-gone
+   * terminal too — missing registry entry is not a close failure). When
+   * absent, the legacy error-frame answers stand as-is. Additive optional:
+   * newer clients against older servers simply never get the frame (their
+   * wait falls back to `terminal.exit` / INVALID_TERMINAL_ID), older clients
+   * never send it — WS_PROTOCOL_VERSION deliberately not bumped.
+   */
+  requestId: z.string().min(1).optional(),
+  /**
+   * The closing pane's createRequestId — the durable close envelope's
+   * createRequestId key when the registry probe can no longer answer (the
+   * reaper beat the kill, or a post-restart stale pane: the registry row is
+   * gone but the stale snapshot must still receive its closed verdict). The
+   * registry stamp wins when present (server-side truth); this field only
+   * fills the registry-less gap. Additive optional, tolerated by older
+   * servers (accept-and-strip inbound).
+   */
+  createRequestId: z.string().min(1).optional(),
 })
 
 export const CodexActivityListSchema = z.object({
@@ -653,6 +768,9 @@ export const FreshAgentCreateSchema = z.object({
   modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
   effort: z.string().trim().min(1).optional(),
   plugins: z.array(z.string()).optional(),
+  /** D8: the creating tab's client-side id; the server composes the ledger row's
+   * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
+  tabId: z.string().min(1).optional(),
 })
 
 export const FreshAgentAttachSchema = z.object({
@@ -740,6 +858,10 @@ export const FreshAgentForkSchema = z.object({
   provider: z.enum(['claude', 'codex', 'opencode']),
   cwd: z.string().optional(),
   input: z.record(z.string(), z.unknown()).optional(),
+  /** D8 (focused-ep1-r5): the forking tab's client-side id — the fork child
+   * row's provenance stamps from the forking connection, `deviceId:tabId`.
+   * Non-strict schema — tolerated by older servers. */
+  tabId: z.string().min(1).optional(),
 })
 
 const freshAgentRollbackShape = {
@@ -883,6 +1005,9 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalInterestSchema,
   TerminalAutoResumeCancelSchema,
   TerminalDetachSchema,
+  PaneClosedSchema,
+  PanesClosedSchema,
+  PaneOpenedSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
@@ -998,6 +1123,98 @@ export type TerminalStreamChangedMessage = {
 export type TerminalDetachedMessage = {
   type: 'terminal.detached'
   terminalId: string
+}
+
+/**
+ * The correlated `terminal.kill` answer (delta-r6-r3 / focused-episode-6
+ * round 2 Findings 6+7): sent ONLY when the kill carried `requestId`
+ * (older clients keep the legacy error-frame answers), once the kill's
+ * durable close envelope is resolved one way or the other.
+ * `success: true` = the pane close is durably recorded AND the terminal is
+ * gone (an already-absent registry entry — reaper race / stale pane — counts
+ * as gone, the close envelope was still written). `success: false` = the
+ * durable close failed, the terminal was left untouched, and `error`
+ * explains it; the closing client must NOT drop the pane. server→client
+ * only, additive — WS_PROTOCOL_VERSION stays.
+ */
+export type TerminalKilledMessage = {
+  type: 'terminal.killed'
+  requestId: string
+  terminalId: string
+  success: boolean
+  error?: string
+}
+
+/**
+ * The correlated `pane.closed` answer (delta-r7-round-3 / focused-episode-7
+ * round 2, Finding F2): sent once per `pane.closed`, AFTER the durable
+ * pane-close journal write resolved one way or the other, so the closing
+ * client can await the evidence's durability before dropping the pane (the
+ * kill lane's close-ack rule). Correlated by the pane identity — the close
+ * is keyed by `createRequestId` end to end, no separate request id.
+ * `terminalId` echoes the message's when present (absent on the
+ * in-flight-create close shape). `success: false` (with `error`) means the
+ * durable record could NOT be written — the client keeps the pane and shows
+ * the failure on it; a persisted-despite-reported-error record answers
+ * `success: true` (the evidence IS durable).
+ *
+ * server→client only. Introduced WITH the protocol version bump 8 → 9
+ * (Finding F4): a server that predates this frame's schema drops unknown
+ * typed messages silently, so the client awaits the answer ONLY from a
+ * server the strict hello already proved speaks v10 — see
+ * `shared/ws-version.ts` for the full mixed-version note.
+ */
+export type PaneClosedResultMessage = {
+  type: 'pane.closed.result'
+  createRequestId: string
+  terminalId?: string
+  success: boolean
+  error?: string
+}
+
+/**
+ * The correlated `panes.closed` answer (focused-episode-7 round 3, Finding
+ * F1): sent ONCE per batch close, AFTER the ONE durable batch envelope write
+ * resolved, so the closing client can await the whole tab's close evidence
+ * before dropping the tab. Correlated by the close op's own `requestId`
+ * (the batch answers the op, not a pane — terminal.kill's precedent).
+ * `success: false` (with `error`) means NOTHING of the set is durable — the
+ * client keeps the whole tab and shows the failure on every gated pane.
+ *
+ * server→client only. Introduced WITH the protocol version bump 9 → 10 —
+ * see `shared/ws-version.ts` for the mixed-version note.
+ */
+export type PanesClosedResultMessage = {
+  type: 'panes.closed.result'
+  requestId: string
+  success: boolean
+  error?: string
+}
+
+/**
+ * The correlated `pane.opened` answer (focused-episode-7 round 5, Finding
+ * F3): sent once per `pane.opened`, AFTER the durable consume/re-assert
+ * resolved one way or the other, correlated by the pane identity (the
+ * re-assertion is keyed by `createRequestId` end to end — no separate
+ * request id, the `pane.closed.result` precedent). `success: false` (with
+ * `error`) means the consume could NOT be journaled durably — the client
+ * marks the pane and retries the re-assertion on the next sweep tick (the
+ * standing close record is untouched — fail loud, never pretend).
+ *
+ * server→client only. Additive with NO protocol version bump: the client
+ * never GATES on this answer (its listen is bounded and non-blocking — an
+ * unanswered re-assertion is exactly the pre-frame behavior the per-ready
+ * sweep already heals), so a server that predates the frame degrades
+ * harmlessly. Contrast `pane.closed.result`/`panes.closed.result`, which the
+ * close gates AWAIT (the version-bump rule: an awaited answer a predated
+ * server silently drops must never ship unversioned — see
+ * `shared/ws-version.ts`).
+ */
+export type PaneOpenedResultMessage = {
+  type: 'pane.opened.result'
+  createRequestId: string
+  success: boolean
+  error?: string
 }
 
 export type TerminalExitMessage = {
@@ -1370,6 +1587,10 @@ export type ServerMessage =
   | TerminalModesSyncMessage
   | TerminalStreamChangedMessage
   | TerminalDetachedMessage
+  | TerminalKilledMessage
+  | PaneClosedResultMessage
+  | PanesClosedResultMessage
+  | PaneOpenedResultMessage
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalReplacedMessage

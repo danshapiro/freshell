@@ -28,15 +28,27 @@ pub(super) struct Job {
     request_id: String,
     generation: Option<Arc<std::time::Instant>>,
     state: WsState,
+    // Restore-exactness (restore-open-sessions-only): the pane-ledger stamp
+    // rides the job. Captured at message RECEIPT (never at dequeue — queue
+    // latency must not fabricate attribution freshness).
+    conn_identity: crate::terminal::ConnectionIdentity,
+    asserted_at: i64,
 }
 
 impl Job {
-    pub(super) fn new(create: TerminalCreate, state: &WsState) -> Self {
+    pub(super) fn new(
+        create: TerminalCreate,
+        state: &WsState,
+        conn_identity: &crate::terminal::ConnectionIdentity,
+        asserted_at: i64,
+    ) -> Self {
         Self {
             generation: state.create_dedupe.in_flight_generation(&create.request_id),
             request_id: create.request_id.clone(),
             create: Some(create),
             state: state.clone(),
+            conn_identity: conn_identity.clone(),
+            asserted_at,
         }
     }
 }
@@ -178,6 +190,8 @@ pub(super) fn spawn(
                         conn_id,
                         pane_reconcile_v1,
                         &mut limiter,
+                        &job.conn_identity,
+                        job.asserted_at,
                     )
                     .await;
                     // Shutdown can snapshot running terminals while this create is

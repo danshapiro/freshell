@@ -249,7 +249,14 @@ async fn a_create_dequeued_after_shutdown_started_is_skipped_without_a_reply() {
         "cwd": "/tmp", "sessionRef": null
     }))
     .unwrap();
-    tx.send(Job::new(create, &state)).await.unwrap();
+    tx.send(Job::new(
+        create,
+        &state,
+        &crate::terminal::ConnectionIdentity::default(),
+        0,
+    ))
+    .await
+    .unwrap();
     drop(tx);
     bounded(task).await.unwrap();
     assert!(

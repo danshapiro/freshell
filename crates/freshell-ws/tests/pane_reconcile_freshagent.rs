@@ -722,6 +722,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             permission_mode: None,
             effort: None,
             supersedes: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: now,
         })
         .unwrap();
@@ -738,6 +739,7 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             permission_mode: None,
             effort: None,
             supersedes: Some("old-t"),
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: now + 1,
         })
         .unwrap();

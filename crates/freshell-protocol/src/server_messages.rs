@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 60 discriminants).
+//! Server → client messages (`ServerMessage`, 63 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -123,6 +123,27 @@ pub enum ServerMessage {
     TerminalInputBlocked(TerminalInputBlocked),
     #[serde(rename = "terminal.inventory")]
     TerminalInventory(TerminalInventory),
+    // Additive (delta-r6-r3, focused-episode-6 round 2): the correlated
+    // `terminal.kill` answer — see [`TerminalKilled`].
+    #[serde(rename = "terminal.killed")]
+    TerminalKilled(TerminalKilled),
+    // Additive (delta-r7-r3, focused-episode-7 round 2): the correlated
+    // `pane.closed` answer — see [`PaneClosedResult`]. Introduced WITH the
+    // protocol version bump 8 → 9 (the client now depends on the answer —
+    // see `shared/ws-version.ts`).
+    #[serde(rename = "pane.closed.result")]
+    PaneClosedResult(PaneClosedResult),
+    // Additive (focused-episode-7 round 3, Finding F1): the correlated
+    // `panes.closed` batch answer — see [`PanesClosedResult`]. Introduced
+    // WITH the protocol version bump 9 → 10.
+    #[serde(rename = "panes.closed.result")]
+    PanesClosedResult(PanesClosedResult),
+    // Additive (focused-episode-7 round 5, Finding F3): the correlated
+    // `pane.opened` answer — see [`PaneOpenedResult`]. NO version bump: the
+    // client never awaits it (the bounded non-blocking listen degrades to
+    // the per-ready sweep's healing on a predated server).
+    #[serde(rename = "pane.opened.result")]
+    PaneOpenedResult(PaneOpenedResult),
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated(TerminalMetaUpdated),
     #[serde(rename = "terminal.modes.sync")]
@@ -153,7 +174,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -183,7 +204,10 @@ pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
     "hoststats.snapshot",
     "opencode.activity.list.response",
     "opencode.activity.updated",
+    "pane.closed.result",
+    "pane.opened.result",
     "pane.reconcile.result",
+    "panes.closed.result",
     "perf.logging",
     "pong",
     "ready",
@@ -201,6 +225,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 60] = [
     "terminal.idle",
     "terminal.input.blocked",
     "terminal.inventory",
+    "terminal.killed",
     "terminal.meta.updated",
     "terminal.modes.sync",
     "terminal.output",
@@ -368,6 +393,80 @@ pub enum ScrollInputPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalIdOnly {
     pub terminal_id: String,
+}
+
+/// The correlated `terminal.kill` answer (delta-r6-r3 / focused-episode-6
+/// round 2): sent only when the kill carried `requestId`. `success: false`
+/// (with `error`) = the durable close failed and the terminal was left
+/// untouched — the closing client must not drop the pane; `success: true`
+/// covers the already-gone terminal too (the close envelope was still
+/// written — a missing registry entry is not a close failure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalKilled {
+    pub request_id: String,
+    pub terminal_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `pane.closed` answer (delta-r7-round-3, focused-episode-7
+/// round 2, Finding F2): sent once per `pane.closed`, AFTER the durable
+/// pane-close journal write resolved, so the closing client can await the
+/// evidence's durability before dropping the pane (the kill lane's
+/// close-ack rule). Correlated by the pane identity itself — the close is
+/// keyed by `createRequestId` end to end, so no separate request id exists.
+/// `terminalId` echoes the message's when present (absent on the
+/// in-flight-create close shape). `success: false` (with `error`) means the
+/// durable record could NOT be written — the pane must stay open and the
+/// failure must surface on it; a persisted-despite-reported-error record
+/// still answers `success: true` (the evidence IS durable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneClosedResult {
+    pub create_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `panes.closed` answer (focused-episode-7 round 3, Finding
+/// F1): sent ONCE per batch close, AFTER the ONE durable batch envelope
+/// write resolved, so the closing client can await the whole tab's close
+/// evidence before dropping the tab. Correlated by the close op's own
+/// `requestId` (the batch answers the op, not a pane — terminal.kill's
+/// precedent; a cross-device retry of the same tab is an idempotent
+/// re-journal). `success: false` (with `error`) means NOTHING of the set is
+/// durable — the client keeps the whole tab and shows the failure on every
+/// gated pane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanesClosedResult {
+    pub request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The correlated `pane.opened` answer (focused-episode-7 round 5, Finding
+/// F3): sent once per `pane.opened`, AFTER the durable consume/re-assert
+/// resolved — correlated by the pane identity (the re-assertion is keyed by
+/// `createRequestId` end to end, the `pane.closed.result` precedent).
+/// `success: false` (with `error`) means the consume could NOT be journaled
+/// durably: the standing close record is untouched (fail loud, never
+/// pretend), the client marks the pane and retries on its next sweep tick.
+/// Additive, no version bump — the client never awaits this answer (see
+/// `shared/ws-version.ts`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneOpenedResult {
+    pub create_request_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Payloads carrying only `{ name }` (extension.server.starting / stopped).

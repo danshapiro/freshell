@@ -1324,6 +1324,7 @@ mod tests {
                 effort: None,
                 supersedes: None,
                 now_ms: 1,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
             })
             .expect("seed fresh-agent ledger row");
 

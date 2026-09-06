@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
+import { installPaneGeometry } from '@test/helpers/pane-geometry'
 
 // Hoist mock functions so vi.mock can reference them
 const { mockSend, mockTerminalView } = vi.hoisted(() => ({
@@ -193,11 +194,16 @@ describe('PaneLayout', () => {
       y: 0,
       toJSON: () => {},
     }))
+    // jsdom reports 0-area geometry and has no ResizeObserver, so the stable
+    // surface layer would keep every pane unmounted. Install the shared
+    // harness (uniform positive rects + drivable observer).
+    installPaneGeometry()
   })
 
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   describe('layout initialization', () => {
@@ -268,6 +274,34 @@ describe('PaneLayout', () => {
       const state = store.getState().panes
       // The active pane should be the same as the layout's pane id
       expect(state.activePane[tabId]).toBe(state.layouts[tabId].id)
+    })
+  })
+
+  describe('malformed persistence', () => {
+    it('fails loudly on duplicate pane ids instead of looping or ambiguity', () => {
+      const dup = {
+        type: 'split' as const,
+        id: 's',
+        direction: 'horizontal' as const,
+        sizes: [50, 50] as [number, number],
+        children: [
+          { type: 'leaf' as const, id: 'same', content: createTerminalContent() },
+          { type: 'leaf' as const, id: 'same', content: createTerminalContent() },
+        ],
+      }
+      // React logs the thrown render error through console.error on purpose;
+      // the suite's console guard must allow THIS expected failure.
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+      const store = createStore({
+        layouts: { 'tab-1': dup },
+        activePane: { 'tab-1': 'same' },
+      })
+      expect(() =>
+        renderWithStore(
+          <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+          store
+        )
+      ).toThrow(/Duplicate pane ID/)
     })
   })
 
