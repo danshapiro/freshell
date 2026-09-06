@@ -120,15 +120,31 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
       expect(typeof capture).toBe('string')
       expect(capture).toContain(marker)
 
-      // -- list-panes: our pane is present, correctly cross-referenced to tab + terminal --
+      // -- list-panes: our pane is present in the bare listing, correctly
+      // cross-referenced to its terminal. The pinned row contract is the
+      // Node-exact `{id, index, kind?, terminalId?, title?}` — deliberately
+      // WITHOUT a per-row `tabId` (the df1->main sync merge adopted main's
+      // evolved Node-exact listPanes row contract; see
+      // docs/plans/df1-evidence/MAIN-SYNC-MERGE.md "Gate record"). The frozen
+      // MCP binary types the same five fields (`PaneSummary`,
+      // server/mcp/freshell-tool.ts) and never reads `tabId`. Tab membership
+      // is cross-referenced the way this surface actually offers it: the
+      // `?tabId=` filter, exercised via the MCP tool's `target` param below.
       const listPanes = await mcp.callFreshellAction('list-panes')
       expect(listPanes.status).toBe('ok')
-      const ourPane = (listPanes.data.panes as Array<{ id: string; tabId: string; terminalId: string }>).find(
-        (p) => p.id === paneId,
-      )
+      const ourPane = (
+        listPanes.data.panes as Array<{ id: string; index: number; kind?: string; terminalId?: string }>
+      ).find((p) => p.id === paneId)
       expect(ourPane).toBeTruthy()
-      expect(ourPane?.tabId).toBe(tabId)
       expect(ourPane?.terminalId).toBe(terminalId)
+      expect(ourPane?.kind).toBe('terminal')
+      expect(ourPane?.index).toBe(0)
+
+      // -- list-panes with the tab as target: the pane<->tab membership edge --
+      const tabPanes = await mcp.callFreshellAction('list-panes', { target: tabId })
+      expect(tabPanes.status).toBe('ok')
+      const tabPaneIds = (tabPanes.data.panes as Array<{ id: string }>).map((p) => p.id)
+      expect(tabPaneIds).toContain(paneId)
     } finally {
       await mcp.close()
       await server.stop()
