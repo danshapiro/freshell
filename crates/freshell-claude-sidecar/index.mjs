@@ -156,12 +156,16 @@ const SIDECAR_PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermi
 // surface must surface an sdk.error and RELEASE the op chain, never wedge it.
 const CONTROL_CALL_TIMEOUT_MS = 10_000
 function withControlCallTimeout(promise, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${CONTROL_CALL_TIMEOUT_MS}ms`)), CONTROL_CALL_TIMEOUT_MS),
-    ),
-  ])
+  let timer
+  const bounded = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${CONTROL_CALL_TIMEOUT_MS}ms`)), CONTROL_CALL_TIMEOUT_MS)
+  })
+  // Once the race settles, drop the pending bound: a settled control call must
+  // not leave a 10s timer alive (its eventual reject on an already-settled race
+  // would be a no-op, but the timer itself is dead weight). On the timeout path
+  // the timer has already fired, so clearing it is a no-op and that path's
+  // behavior is unchanged.
+  return Promise.race([promise, bounded]).finally(() => clearTimeout(timer))
 }
 
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──

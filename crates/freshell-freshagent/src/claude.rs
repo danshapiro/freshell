@@ -787,13 +787,15 @@ impl FreshClaudeState {
     /// session-scoped `freshAgent.error` channel (the banner-visible one — a
     /// top-level `Error` frame is silently cleaned up client-side for fresh-agent
     /// sends, FreshAgentView.tsx:1785-1838) and writes NOTHING to the sidecar.
-    /// A valid knob set merges over the session's stored baseline (the merged
-    /// values become the NEW baseline), refreshes the durable-ledger row (so a
-    /// post-restart resume doesn't silently revert the change), then writes
-    /// `settings.update` BEFORE the `send` frame — line order on stdin plus the
-    /// sidecar's serialized per-session op chain (`enqueue`) guarantee the
-    /// update is fully applied before the user turn enters the SDK input
-    /// stream. Sends whose settings carry only `cwd`/no knobs take the
+    /// A valid knob set is first merged COMPUTATIONALLY over the session's
+    /// stored baseline, then `settings.update` is written BEFORE the `send`
+    /// frame — line order on stdin plus the sidecar's serialized per-session
+    /// op chain (`enqueue`) guarantee the update is fully applied before the
+    /// user turn enters the SDK input stream. Only once that write LANDS does
+    /// the merged set become the NEW baseline (a failed write mutates nothing,
+    /// keeping the in-memory baseline in lockstep with the sidecar), and the
+    /// durable-ledger row is refreshed (so a post-restart resume doesn't
+    /// silently revert the change). Sends whose settings carry only `cwd`/no knobs take the
     /// pre-existing plain-send path untouched (single `send` frame).
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
@@ -828,18 +830,35 @@ impl FreshClaudeState {
                 self.emit_fresh_agent_error(&session_id, session_type, code, &message);
                 return;
             }
-            // Merge over the stored baseline; the merged values ARE the new
-            // baseline (echoed back by the sidecar's post-apply
-            // `sdk.session.metadata`, which the client folds into the status chip).
-            if let Some(model) = &settings.model {
-                session.model = Some(model.clone());
+            // Compute the merged baseline WITHOUT mutating the session record
+            // yet: an omitted knob carries the stored baseline forward, and a
+            // failed `settings.update` write below (dead sidecar pipe) must
+            // leave the in-memory baseline in lockstep with the sidecar —
+            // which never saw the update (Review M1: mutating first would
+            // silently desync the baseline from the actually-running session,
+            // and a top-level CLAUDE_SEND_FAILED is quietly cleaned up
+            // client-side for fresh-agent sends).
+            let merged_model = settings.model.clone().or_else(|| session.model.clone());
+            let merged_permission_mode = settings
+                .permission_mode
+                .clone()
+                .or_else(|| session.permission_mode.clone());
+            let merged_effort = settings.effort.clone().or_else(|| session.effort.clone());
+            // The settings.update frame goes BEFORE the send (ordering guarantee
+            // in the fn doc), addressed by the SIDECAR's session id — NEVER the
+            // map key (the two differ for resumed-on-attach sessions, Task 6).
+            let update_req = settings_update_frame(&session.sidecar_session_id, settings);
+            if let Err(err) = write_line(&mut session.stdin, &update_req).await {
+                drop(guard);
+                self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
+                return;
             }
-            if let Some(permission_mode) = &settings.permission_mode {
-                session.permission_mode = Some(permission_mode.clone());
-            }
-            if let Some(effort) = &settings.effort {
-                session.effort = Some(effort.clone());
-            }
+            // The write landed — the merged values ARE the new baseline (echoed
+            // back by the sidecar's post-apply `sdk.session.metadata`, which the
+            // client folds into the status chip).
+            session.model = merged_model;
+            session.permission_mode = merged_permission_mode;
+            session.effort = merged_effort;
             // Arm the durable-ledger refresh (flushed after the sidecar writes
             // leave the lock — never an awaited fsync under the sessions map).
             // Keyed by the DURABLE cliSessionId: unknown until `sdk.session.init`
@@ -865,15 +884,6 @@ impl FreshClaudeState {
                     None
                 }
             };
-            // The settings.update frame goes BEFORE the send (ordering guarantee
-            // in the fn doc), addressed by the SIDECAR's session id — NEVER the
-            // map key (the two differ for resumed-on-attach sessions, Task 6).
-            let update_req = settings_update_frame(&session.sidecar_session_id, settings);
-            if let Err(err) = write_line(&mut session.stdin, &update_req).await {
-                drop(guard);
-                self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
-                return;
-            }
         }
 
         // Address the sidecar by ITS id for this session (== the map key for created

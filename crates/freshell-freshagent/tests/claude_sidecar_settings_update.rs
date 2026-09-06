@@ -270,10 +270,11 @@ fn poll_stub_log(
 }
 
 /// The core proof (acceptance 1): the SDK control calls land BEFORE the user
-/// message. A `settings.update {model, permissionMode, effort}` drives
-/// `setPermissionMode`/`setModel`/`applyFlagSettings` on the serialized
-/// per-session op chain, all strictly ahead of the pushed user turn; the
-/// post-apply `sdk.session.metadata` echoes the new baseline.
+/// message, in the sidecar's exact production apply order. A `settings.update
+/// {model, permissionMode, effort}` drives `setPermissionMode` → `setModel` →
+/// `applyFlagSettings` on the serialized per-session op chain, all strictly
+/// ahead of the pushed user turn (asserted as the stub log's full ordered
+/// sequence); the post-apply `sdk.session.metadata` echoes the new baseline.
 #[test]
 fn settings_update_control_calls_land_before_the_user_message() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -300,20 +301,24 @@ fn settings_update_control_calls_land_before_the_user_message() {
     );
 
     let rows = poll_stub_log(&sc.stub_log, 4, Duration::from_secs(30));
-    let position = |needle: &serde_json::Value| {
-        rows.iter()
-            .position(|r| r == needle)
-            .unwrap_or_else(|| panic!("row {needle} never logged; rows: {rows:?}"))
-    };
-    let set_mode = position(&serde_json::json!({"call":"setPermissionMode","mode":"plan"}));
-    let set_model = position(&serde_json::json!({"call":"setModel","model":"opus-y"}));
-    let apply_settings = position(
-        &serde_json::json!({"call":"applyFlagSettings","settings":{"effortLevel":"xhigh"}}),
-    );
-    let input = position(&serde_json::json!({"input":"hello"}));
-    assert!(
-        set_mode < input && set_model < input && apply_settings < input,
-        "every control call must land BEFORE the user message; rows: {rows:?}"
+    // Assert the FULL stub-log sequence, exactly and in order — not merely
+    // "every control call precedes the input". The relative control-call
+    // order asserted here is the production-implemented apply order in
+    // index.mjs's `handleSettingsUpdate` op: setPermissionMode → setModel →
+    // applyFlagSettings (each 10s-bounded on the per-session serialized
+    // chain), THEN the user message crosses the prompt boundary. A silent
+    // reorder of the control calls is a behavior change and must fail here,
+    // not pass as a refactor.
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({"call":"setPermissionMode","mode":"plan"}),
+            serde_json::json!({"call":"setModel","model":"opus-y"}),
+            serde_json::json!({"call":"applyFlagSettings","settings":{"effortLevel":"xhigh"}}),
+            serde_json::json!({"input":"hello"}),
+        ],
+        "control calls must land in the production-implemented order \
+         (setPermissionMode → setModel → applyFlagSettings), all before the user message"
     );
 
     let metadata = await_stdout_type(
