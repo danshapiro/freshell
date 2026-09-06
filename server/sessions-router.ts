@@ -176,9 +176,16 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
     const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
+    const titleTouched = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'titleOverride')
+    const cleanTitle = cleanString(titleOverride)
     const next = await configStore.patchSessionOverride(compositeKey, {
-      titleOverride: cleanString(titleOverride),
-      ...(cleanString(titleOverride) ? { titleSource: 'user' as const } : {}),
+      // b5fb scope contract: touching the title requires the KEY present. An
+      // explicit null/blank clear removes the source rung too, so the ladder is
+      // unblocked afterwards (a leftover titleSource:'user' was a permanent
+      // freeze). A patch that never mentioned the title leaves it untouched.
+      ...(titleTouched
+        ? { titleOverride: cleanTitle, titleSource: cleanTitle ? ('user' as const) : undefined }
+        : {}),
       summaryOverride: cleanString(summaryOverride),
       deleted,
       archived,
@@ -186,7 +193,6 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     })
 
     // Cascade: if this session is running in a terminal, also rename the terminal
-    const cleanTitle = cleanString(titleOverride)
     let cascadedTerminalId: string | undefined
     if (cleanTitle && deps.terminalMetadata) {
       try {

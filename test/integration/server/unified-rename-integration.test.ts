@@ -31,20 +31,22 @@ import { makeSessionKey, type CodingCliProviderName } from '../../../server/codi
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
 /**
- * Integration test for the unified rename cascade.
+ * Integration test for the rename scope contract (kata freshell#b5fb).
  *
  * Verifies the full round-trip:
- *  - Terminal rename  =>  session override is written
+ *  - Terminal rename  =>  terminal scope ONLY: no session override is written
  *  - Session rename   =>  terminal override is written (with cascadedTerminalId)
+ *  - Session clear    =>  {titleOverride: null} removes titleOverride AND titleSource
  *
  * Uses a real ConfigStore (backed by a temp directory) and real
  * TerminalMetadataService, wired into minimal Express apps that mirror
- * the production PATCH routes in server/index.ts.
+ * the production PATCH routes in server/terminals-router.ts and
+ * server/sessions-router.ts.
  *
- * Note: We inline the cascade logic rather than calling cascadeTerminalRenameToSession
- * / cascadeSessionRenameToTerminal, because those functions import the module-level
- * singleton configStore. In this integration test we need all operations to flow through
- * the same ConfigStore instance so assertions read the correct data.
+ * Note: We inline the session→terminal mirror logic rather than calling
+ * cascadeSessionRenameToTerminal, because that function imports the module-level
+ * singleton configStore. In this integration test we need all operations to flow
+ * through the same ConfigStore instance so assertions read the correct data.
  */
 describe('Unified rename cascade — integration', () => {
   let configStore: ConfigStore
@@ -85,10 +87,10 @@ describe('Unified rename cascade — integration', () => {
     delete process.env.AUTH_TOKEN
   })
 
-  // ────────────────────────────────────────────
-  // Test 1: Terminal rename cascades to session
-  // ────────────────────────────────────────────
-  it('terminal rename cascades to session override', async () => {
+  // ────────────────────────────────────────────────────────────
+  // Test 1: Terminal rename does NOT write a session override (live)
+  // ────────────────────────────────────────────────────────────
+  it('terminal rename does NOT write a session override (live)', async () => {
     const terminalId = 'term_cascade_1'
     const provider: CodingCliProviderName = 'claude'
     const sessionId = 'session-abc-123'
@@ -106,21 +108,20 @@ describe('Unified rename cascade — integration', () => {
     const res = await request(app)
       .patch(`/api/terminals/${terminalId}`)
       .set('x-auth-token', TEST_AUTH_TOKEN)
-      .send({ titleOverride: 'My Renamed Session' })
+      .send({ titleOverride: 'My Renamed Terminal' })
       .expect(200)
 
-    expect(res.body.titleOverride).toBe('My Renamed Session')
+    expect(res.body.titleOverride).toBe('My Renamed Terminal')
 
-    // Verify the session override was written via the cascade
-    const sessionOverride = await configStore.getSessionOverride(compositeKey)
-    expect(sessionOverride).toBeDefined()
-    expect(sessionOverride!.titleOverride).toBe('My Renamed Session')
+    // b5fb scope contract: a pane/terminal rename is terminal scope only — it
+    // must not write a durable session override.
+    expect(await configStore.getSessionOverride(compositeKey)).toBeUndefined()
   })
 
   // ────────────────────────────────────────────────────────────
-  // Test 2: Terminal rename cascades AFTER terminal process exits
+  // Test 2: Terminal rename does NOT write a session override (retired)
   // ────────────────────────────────────────────────────────────
-  it('terminal rename cascades to session after process exit (retired metadata)', async () => {
+  it('terminal rename does NOT write a session override (retired)', async () => {
     const terminalId = 'term_cascade_exit'
     const provider: CodingCliProviderName = 'claude'
     const sessionId = 'session-exited-123'
@@ -141,7 +142,7 @@ describe('Unified rename cascade — integration', () => {
     expect(terminalMetadata.list().find((m) => m.terminalId === terminalId)).toBeUndefined()
     expect(terminalMetadata.get(terminalId)?.provider).toBe(provider)
 
-    // PATCH terminal with a new title — cascade should still work
+    // PATCH terminal with a new title — same scope rule as a live pane
     const res = await request(app)
       .patch(`/api/terminals/${terminalId}`)
       .set('x-auth-token', TEST_AUTH_TOKEN)
@@ -150,10 +151,9 @@ describe('Unified rename cascade — integration', () => {
 
     expect(res.body.titleOverride).toBe('Renamed After Exit')
 
-    // Verify the session override was written via the cascade
-    const sessionOverride = await configStore.getSessionOverride(compositeKey)
-    expect(sessionOverride).toBeDefined()
-    expect(sessionOverride!.titleOverride).toBe('Renamed After Exit')
+    // A stopped pane with a retained sessionRef follows the same scope rule:
+    // no durable session override may be written.
+    expect(await configStore.getSessionOverride(compositeKey)).toBeUndefined()
   })
 
   // ────────────────────────────────────────────
@@ -188,12 +188,51 @@ describe('Unified rename cascade — integration', () => {
     expect(terminalOverride).toBeDefined()
     expect(terminalOverride!.titleOverride).toBe('Renamed From History')
   })
+
+  // ────────────────────────────────────────────────────────────
+  // Test 4: Clearing an explicit session rename removes title and source
+  // ────────────────────────────────────────────────────────────
+  it('clearing an explicit session rename removes title and source', async () => {
+    const provider: CodingCliProviderName = 'claude'
+    const sessionId = 'session-clear-789'
+    const compositeKey = makeSessionKey(provider, sessionId)
+
+    // Explicit durable session rename writes the 'user' rung.
+    const setRes = await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'Kept' })
+      .expect(200)
+    expect(setRes.body.titleOverride).toBe('Kept')
+
+    const stored = await configStore.getSessionOverride(compositeKey)
+    expect(stored?.titleOverride).toBe('Kept')
+    expect(stored?.titleSource).toBe('user')
+
+    // An explicit null clear must remove title AND source — otherwise the
+    // leftover titleSource:'user' rung permanently freezes the title-source
+    // ladder (provider/auto titles can never land again).
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: null })
+      .expect(200)
+
+    // Assert on the RAW config row (Object.keys, not just undefined values):
+    // neither key may be present at all.
+    const raw = JSON.parse(await fsp.readFile(path.join(tempDir, '.freshell', 'config.json'), 'utf8'))
+    const row = raw.sessionOverrides?.[compositeKey]
+    expect(row).toBeDefined()
+    expect(Object.keys(row)).not.toContain('titleOverride')
+    expect(Object.keys(row)).not.toContain('titleSource')
+  })
 })
 
 // ────────────────────────────────────────────────────────────────
 // Minimal Express app that mirrors the production PATCH routes
-// from server/index.ts, using inlined cascade logic so all
-// operations flow through the same ConfigStore instance.
+// from server/terminals-router.ts and server/sessions-router.ts,
+// using inlined session→terminal mirror logic so all operations
+// flow through the same ConfigStore instance.
 // ────────────────────────────────────────────────────────────────
 
 function buildTestApp(
@@ -215,7 +254,7 @@ function buildTestApp(
     next()
   })
 
-  // PATCH /api/terminals/:terminalId  (mirrors server/index.ts)
+  // PATCH /api/terminals/:terminalId  (mirrors server/terminals-router.ts)
   app.patch('/api/terminals/:terminalId', async (req, res) => {
     const terminalId = req.params.terminalId
     const { titleOverride, descriptionOverride, deleted } = req.body || {}
@@ -226,36 +265,29 @@ function buildTestApp(
       deleted,
     })
 
-    // Cascade: if this terminal has a coding CLI session, also rename the session.
-    // Uses get() with fallback to list().find() so the cascade works even after
-    // the terminal process has exited (retired entries are preserved via get()).
-    if (typeof titleOverride === 'string' && titleOverride.trim()) {
-      const meta = terminalMetadata.get(terminalId)
-        ?? terminalMetadata.list().find((m) => m.terminalId === terminalId)
-      if (meta?.provider && meta.sessionId) {
-        const compositeKey = makeSessionKey(meta.provider as CodingCliProviderName, meta.sessionId)
-        await configStore.patchSessionOverride(compositeKey, { titleOverride: titleOverride.trim() })
-      }
-    }
+    // b5fb scope contract: terminal scope only — no session cascade.
 
     res.json(next)
   })
 
-  // PATCH /api/sessions/:sessionId  (mirrors server/index.ts)
+  // PATCH /api/sessions/:sessionId  (mirrors server/sessions-router.ts)
   app.patch('/api/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
     const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
 
     const { titleOverride } = req.body || {}
-    const cleanTitle = typeof titleOverride === 'string' ? titleOverride.trim() || undefined : undefined
-
     const next = await configStore.patchSessionOverride(compositeKey, {
-      titleOverride: cleanTitle,
+      ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, 'titleOverride')
+        ? {
+            titleOverride: typeof titleOverride === 'string' ? titleOverride.trim() || undefined : undefined,
+            titleSource: typeof titleOverride === 'string' && titleOverride.trim() ? ('user' as const) : undefined,
+          }
+        : {}),
     })
 
-    // Cascade: if this session is running in a terminal, also rename the terminal
-    // (inlined from cascadeSessionRenameToTerminal to use the test's configStore)
+    // session→terminal cascade (unchanged, inlined from cascadeSessionRenameToTerminal)
+    const cleanTitle = typeof titleOverride === 'string' ? titleOverride.trim() || undefined : undefined
     let cascadedTerminalId: string | undefined
     if (cleanTitle) {
       const parts = compositeKey.split(':')
