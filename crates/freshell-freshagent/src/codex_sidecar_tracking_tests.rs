@@ -88,21 +88,25 @@ async fn create_tracked_session_with_resume(
     request_id: &str,
     resume_session_id: Option<&str>,
 ) -> String {
-    st.handle_create(FreshAgentCreate {
-        request_id: request_id.to_string(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        provider: Some(freshell_protocol::AgentProvider::Codex),
-        cwd: None,
-        legacy_restore_context: None,
-        resume_session_id: resume_session_id.map(str::to_string),
-        session_ref: None,
-        model: None,
-        model_selection: None,
-        permission_mode: None,
-        sandbox: None,
-        effort: None,
-        plugins: None,
-    })
+    st.handle_create(
+        FreshAgentCreate {
+            request_id: request_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: resume_session_id.map(str::to_string),
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+            tab_id: None,
+        },
+        None,
+    )
     .await;
     let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
@@ -212,21 +216,25 @@ async fn failed_spawn_leaves_no_record() {
     let guard = TrackingStoreGuard::install();
     let (st, mut rx) = tracking_state();
 
-    st.handle_create(FreshAgentCreate {
-        request_id: "req-wfah-t2-fail".to_string(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        provider: Some(freshell_protocol::AgentProvider::Codex),
-        cwd: None,
-        legacy_restore_context: None,
-        resume_session_id: None,
-        session_ref: None,
-        model: None,
-        model_selection: None,
-        permission_mode: None,
-        sandbox: None,
-        effort: None,
-        plugins: None,
-    })
+    st.handle_create(
+        FreshAgentCreate {
+            request_id: "req-wfah-t2-fail".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+            tab_id: None,
+        },
+        None,
+    )
     .await;
     let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
@@ -408,21 +416,25 @@ async fn create_bail_after_spawn_leaves_no_record() {
     let guard = TrackingStoreGuard::install();
     let (st, mut rx) = tracking_state();
 
-    st.handle_create(FreshAgentCreate {
-        request_id: "req-wfah-t3-bail".to_string(),
-        session_type: freshell_protocol::SessionType::Freshcodex,
-        provider: Some(freshell_protocol::AgentProvider::Codex),
-        cwd: None,
-        legacy_restore_context: None,
-        resume_session_id: None,
-        session_ref: None,
-        model: None,
-        model_selection: None,
-        permission_mode: None,
-        sandbox: None,
-        effort: None,
-        plugins: None,
-    })
+    st.handle_create(
+        FreshAgentCreate {
+            request_id: "req-wfah-t3-bail".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+            tab_id: None,
+        },
+        None,
+    )
     .await;
     let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {

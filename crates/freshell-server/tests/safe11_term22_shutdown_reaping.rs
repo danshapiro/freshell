@@ -597,7 +597,9 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     send_json(
         &mut ws,
         &serde_json::json!({
-            "type": "hello", "protocolVersion": 7, "token": AUTH_TOKEN,
+            "type": "hello",
+                "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+                "token": AUTH_TOKEN,
         }),
     )
     .await;
