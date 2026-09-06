@@ -15,7 +15,9 @@ import {
   reapOrphanedCodexAppServerSidecars,
   rescanCodexReaperQuarantine,
   runCodexStartupReaper,
+  type CodexSidecarHoldSink,
 } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
+import { CodexSidecarReconciler } from '../../../../../server/coding-cli/codex-app-server/sidecar-reattach.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../../../../server/local-port.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -2382,5 +2384,114 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
+  })
+
+  describe('boot reaper hold/skip integration (kata 4g2a task 3)', () => {
+    it('holds a verified prior-generation survivor through the holdReconciler sink instead of killing it', async () => {
+      const metadataDir = await makeTempDir()
+      const runtime = createRuntime({
+        metadataDir,
+        serverInstanceId: 'srv-previous',
+      })
+      const ready = await runtime.ensureReady()
+      await runtime.updateOwnershipMetadata({ sessionId: 'thr-held-boot' })
+      await markOwnershipRecordStale(ready.metadataPath)
+      const reconciler = new CodexSidecarReconciler()
+
+      const result = await runCodexStartupReaper({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+        holdReconciler: reconciler,
+      })
+
+      // The dead-owner verified survivor is held claimable, not killed: group alive, record kept.
+      expect(result.heldOwnershipIds).toContain(ready.ownershipId)
+      expect(result.reapedOwnershipIds).not.toContain(ready.ownershipId)
+      expect(result.retriedOwnershipIds).not.toContain(ready.ownershipId)
+      expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+
+      // The held record is claimable by its Task-1 session id — exactly once.
+      const claimed = reconciler.claimForSession('thr-held-boot')
+      expect(claimed?.metadata.ownershipId).toBe(ready.ownershipId)
+      expect(reconciler.claimForSession('thr-held-boot')).toBeNull()
+    }, 20_000)
+
+    it('skips skipOwnershipIds records before the budget/teardown tail on a no-sink pass, leaving the group alive', async () => {
+      const metadataDir = await makeTempDir()
+      const runtime = createRuntime({
+        metadataDir,
+        serverInstanceId: 'srv-previous',
+      })
+      const ready = await runtime.ensureReady()
+      await markOwnershipRecordStale(ready.metadataPath)
+
+      const result = await reapOrphanedCodexAppServerSidecars({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+        skipOwnershipIds: new Set([ready.ownershipId]),
+      })
+
+      // The skip set is honored BEFORE the teardown tail: no signal, no retry bookkeeping.
+      expect(result.skippedActiveOwnershipIds).toContain(ready.ownershipId)
+      expect(result.reapedOwnershipIds).not.toContain(ready.ownershipId)
+      expect(result.retriedOwnershipIds).not.toContain(ready.ownershipId)
+      expect(result.heldOwnershipIds).not.toContain(ready.ownershipId)
+      expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+      await expect(fsp.stat(`${ready.metadataPath}.reaper.json`)).rejects.toMatchObject({ code: 'ENOENT' })
+    }, 20_000)
+
+    it('routes hold-sink verdicts to held/reaped/retried buckets and unlinks the retry sidecar only on removed-unowned', async () => {
+      const metadataDir = await makeTempDir()
+      const runtimeHeld = createRuntime({ metadataDir, serverInstanceId: 'srv-previous' })
+      const runtimeRemoved = createRuntime({ metadataDir, serverInstanceId: 'srv-previous' })
+      const runtimeKept = createRuntime({ metadataDir, serverInstanceId: 'srv-previous' })
+      const readyHeld = await runtimeHeld.ensureReady()
+      const readyRemoved = await runtimeRemoved.ensureReady()
+      const readyKept = await runtimeKept.ensureReady()
+      await markOwnershipRecordStale(readyHeld.metadataPath)
+      await markOwnershipRecordStale(readyRemoved.metadataPath)
+      await markOwnershipRecordStale(readyKept.metadataPath)
+      // The removed-unowned branch must clear stale retry bookkeeping left from an earlier pass.
+      const staleRetryPath = `${readyRemoved.metadataPath}.reaper.json`
+      await fsp.writeFile(staleRetryPath, JSON.stringify({ firstSeen: new Date().toISOString(), attempts: 1 }), { mode: 0o600 })
+
+      const verdicts = new Map<string, 'held' | 'removed-unowned' | 'kept-unproven'>([
+        [readyHeld.ownershipId, 'held'],
+        [readyRemoved.ownershipId, 'removed-unowned'],
+        [readyKept.ownershipId, 'kept-unproven'],
+      ])
+      const sink: CodexSidecarHoldSink = {
+        // The stub never touches processes or files; the reaper itself must route/report/clean up.
+        hold: async (ownership) => verdicts.get(ownership.metadata.ownershipId) ?? 'kept-unproven',
+      }
+
+      const result = await reapOrphanedCodexAppServerSidecars({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+        holdReconciler: sink,
+      })
+
+      expect(result.heldOwnershipIds).toEqual([readyHeld.ownershipId])
+      expect(result.reapedOwnershipIds).toEqual([readyRemoved.ownershipId])
+      expect(result.retriedOwnershipIds).toEqual([readyKept.ownershipId])
+      expect(result.skippedActiveOwnershipIds).toEqual([])
+      expect(result.failedOwnershipIds).toEqual([])
+      // Verdict routing is the SINK's contract: the reaper only unlinks retry bookkeeping on
+      // removal — the record's own fate (already settled by the sink) is not re-touched.
+      await expect(fsp.stat(staleRetryPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fsp.stat(readyRemoved.metadataPath)).resolves.toBeDefined()
+      // kept-unproven retried in place: backoff sidecar recorded, record kept, group alive.
+      const retryState = JSON.parse(await fsp.readFile(`${readyKept.metadataPath}.reaper.json`, 'utf8'))
+      expect(retryState.attempts).toBe(1)
+      for (const ready of [readyHeld, readyRemoved, readyKept]) {
+        await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+        expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      }
+    }, 30_000)
   })
 })

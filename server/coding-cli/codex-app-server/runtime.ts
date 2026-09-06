@@ -172,6 +172,16 @@ class CodexAppServerStartupError extends Error {
   }
 }
 
+/**
+ * Structural sink for the boot reaper's owner-dead branch (kata 4g2a), implemented by
+ * CodexSidecarReconciler in sidecar-reattach.ts. Declared here with the LITERAL verdict union:
+ * this module never imports the reconciler (not even a type-only import of its named verdict), so
+ * the only import edge stays sidecar-reattach.ts → runtime.ts.
+ */
+export type CodexSidecarHoldSink = {
+  hold(ownership: HeldCodexSidecarOwnership): Promise<'held' | 'removed-unowned' | 'kept-unproven'>
+}
+
 export type ReapOrphanedSidecarsOptions = {
   metadataDir?: string
   serverInstanceId: string
@@ -188,6 +198,18 @@ export type ReapOrphanedSidecarsOptions = {
    * log). Passed by the hourly maintenance tick; boot passes always attempt every record.
    */
   respectRetryBackoff?: boolean
+  /**
+   * Boot-hold sink (kata 4g2a): with a sink present, each owner-dead record is offered to it
+   * instead of the teardown tail. Verified survivors are held claimable for restore; the sink
+   * settles every other verdict through the same conservative ownership-gated teardown.
+   */
+  holdReconciler?: CodexSidecarHoldSink
+  /**
+   * Ownership ids the reaper must skip this pass, checked before the budget/teardown tail. The
+   * hourly sweep passes the reconciler's protection set here (held survivors before grace expiry;
+   * in-flight claims always).
+   */
+  skipOwnershipIds?: ReadonlySet<string>
   /** Clock seam for the teardown budget (tests only). */
   nowFn?: () => number
 }
@@ -196,6 +218,8 @@ export type ReapOrphanedSidecarsResult = {
   reapedOwnershipIds: string[]
   ignoredLegacyRecords: string[]
   skippedActiveOwnershipIds: string[]
+  /** Verified survivors held claimable by the hold sink this pass (kata 4g2a boot reconcile). */
+  heldOwnershipIds: string[]
   /** Records that hit an unexpected per-record error; retained in place and retried next pass. */
   failedOwnershipIds: string[]
   /** Record files that could not be read (permissions, torn write); retained in place. */
@@ -227,7 +251,8 @@ export type CodexReaperRetryState = {
 const DEFAULT_STARTUP_ATTEMPT_LIMIT = 2
 const DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3_000
 const STARTUP_POLL_MS = 50
-const DEFAULT_TERMINATE_GRACE_MS = 1_000
+// Exported for the sidecar reattach reconciler's failed-claim settle path (kata 4g2a).
+export const DEFAULT_TERMINATE_GRACE_MS = 1_000
 const OWNERSHIP_SCHEMA_VERSION = 1
 const LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP = 100
 const LAUNCH_DIAGNOSTIC_METADATA_RECORD_MAX_BYTES = 16 * 1024
@@ -589,9 +614,11 @@ async function isProcessGroupGone(processGroupId: number): Promise<boolean> {
   return false
 }
 
-type OwnedProcessGroupStatus = 'gone' | 'self' | 'owned' | 'foreign' | 'indeterminate'
+// Exported for the sidecar reattach reconciler's hold classification (kata 4g2a).
+export type OwnedProcessGroupStatus = 'gone' | 'self' | 'owned' | 'foreign' | 'indeterminate'
 
-async function classifyOwnedProcessGroup(
+// Exported for the sidecar reattach reconciler's hold classification (kata 4g2a).
+export async function classifyOwnedProcessGroup(
   metadata: CodexSidecarOwnershipMetadata,
 ): Promise<OwnedProcessGroupStatus> {
   if (await isProcessGroupGone(metadata.processGroupId)) return 'gone'
@@ -737,8 +764,11 @@ async function waitForProcessGroupGone(processGroupId: number, timeoutMs: number
   return isProcessGroupGone(processGroupId)
 }
 
-async function teardownOwnedProcessGroup(
-  ownership: ActiveOwnership,
+// Exported for the sidecar reattach reconciler's hold/settle teardown (kata 4g2a). The parameter
+// is annotated with the exported HeldCodexSidecarOwnership alias (type-identical to the internal
+// ActiveOwnership) so declaration emit never needs the private name.
+export async function teardownOwnedProcessGroup(
+  ownership: HeldCodexSidecarOwnership,
   terminateGraceMs: number,
 ): Promise<boolean> {
   const confirmedGone = await teardownOwnedProcessGroupCore(ownership, terminateGraceMs)
@@ -1208,6 +1238,7 @@ export async function reapOrphanedCodexAppServerSidecars(
     reapedOwnershipIds: [],
     ignoredLegacyRecords: [],
     skippedActiveOwnershipIds: [],
+    heldOwnershipIds: [],
     failedOwnershipIds: [],
     unreadableRecords: [],
     quarantinedRecords: [],
@@ -1373,6 +1404,42 @@ export async function reapOrphanedCodexAppServerSidecars(
       }
 
       const ownership: ActiveOwnership = { metadataDir, metadataPath, metadata }
+      // 4g2a: the reconciler's protection set is honored BEFORE the budget/teardown tail — no
+      // signal, no retry bookkeeping for swept-over held or in-flight ids.
+      if (options.skipOwnershipIds?.has(metadata.ownershipId)) {
+        result.skippedActiveOwnershipIds.push(metadata.ownershipId)
+        continue
+      }
+      // 4g2a boot reconcile: with a hold sink present, verified survivors are HELD claimable for
+      // restore instead of killed; every non-owned verdict settles through the same conservative
+      // teardown the un-sunk path uses (the sink owns that call).
+      if (options.holdReconciler) {
+        const verdict = await options.holdReconciler.hold(ownership)
+        if (verdict === 'held') {
+          result.heldOwnershipIds.push(metadata.ownershipId)
+          continue
+        }
+        if (verdict === 'removed-unowned') {
+          result.reapedOwnershipIds.push(metadata.ownershipId)
+          await fsp.unlink(reaperRetrySidecarPath(metadataPath)).catch(() => undefined)
+          continue
+        }
+        // kept-unproven: identical to today's teardown-refusal branch (in-place retry, never
+        // quarantine).
+        const state = await recordCodexReaperRetryAttempt(metadataPath)
+        logCodexReaperRetry(
+          {
+            ownershipId: metadata.ownershipId,
+            metadataPath,
+            wrapperPid: metadata.wrapperPid,
+            processGroupId: metadata.processGroupId,
+          },
+          state,
+          'sidecar group ownership could not be verified for a boot hold',
+        )
+        result.retriedOwnershipIds.push(metadata.ownershipId)
+        continue
+      }
       // M2: once the pass's teardown budget is exhausted, skip the signal-and-wait teardown for
       // the remaining records. They keep retry state (so they surface in the boot summary and the
       // hourly tick re-attempts them) and are marked deferred — never dropped.

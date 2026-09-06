@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import fsp from 'node:fs/promises'
@@ -13,6 +13,11 @@ import {
   type HeldCodexSidecarOwnership,
   type ReadyState,
 } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
+import {
+  CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS,
+  CodexSidecarReconciler,
+  resolveCodexSidecarReapGraceMs,
+} from '../../../../../server/coding-cli/codex-app-server/sidecar-reattach.js'
 import type { LoopbackServerEndpoint } from '../../../../../server/local-port.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -127,6 +132,13 @@ async function readWrapperIdentityForTest(pid: number) {
     cwd,
     startTimeTicks: Number.isFinite(startTimeTicks) ? startTimeTicks : null,
   }
+}
+
+async function getOwnProcessGroupId(): Promise<number> {
+  const stat = await fsp.readFile('/proc/self/stat', 'utf8')
+  const closeParen = stat.lastIndexOf(')')
+  const fields = stat.slice(closeParen + 2).trim().split(/\s+/)
+  return Number(fields[2])
 }
 
 function createRuntime(options: ConstructorParameters<typeof CodexAppServerRuntime>[0] = {}): CodexAppServerRuntime {
@@ -387,5 +399,348 @@ describeWithLinuxProc('CodexAppServerRuntime.attachToSurvivingSidecar', () => {
     expect(record.ownerServerIdentity).toEqual(held.metadata.ownerServerIdentity)
     expect(record.updatedAt).toBe(held.metadata.updatedAt)
     expect(attachRuntime.status()).toBe('stopped')
+  })
+})
+
+// --- Task 3: CodexSidecarReconciler (boot hold + grace-gated sweep) ---
+
+// Raw detached fixture children used as lightweight survivor process groups for the reconciler
+// unit tests. afterEach kills only what these tests spawned (pgid-targeted).
+const rawChildren = new Set<number>()
+
+async function spawnRawSurvivingChild(): Promise<{ pid: number; identity: CodexSidecarOwnershipMetadata['wrapperIdentity'] }> {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+    detached: true,
+    stdio: 'ignore',
+  })
+  child.unref()
+  const pid = child.pid
+  if (!pid) throw new Error('raw fixture child did not expose a pid')
+  rawChildren.add(pid)
+  const identity = await readWrapperIdentityForTest(pid)
+  return { pid, identity: identity as CodexSidecarOwnershipMetadata['wrapperIdentity'] }
+}
+
+async function spawnShortLivedChild(): Promise<{ pid: number; identity: CodexSidecarOwnershipMetadata['wrapperIdentity'] }> {
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 50)'], {
+    detached: true,
+    stdio: 'ignore',
+  })
+  const pid = child.pid
+  if (!pid) throw new Error('short-lived fixture child did not expose a pid')
+  const identity = await readWrapperIdentityForTest(pid)
+  await new Promise<void>((resolve, reject) => {
+    child.once('exit', () => resolve())
+    child.once('error', reject)
+  })
+  await waitForProcessExit(pid)
+  return { pid, identity: identity as CodexSidecarOwnershipMetadata['wrapperIdentity'] }
+}
+
+afterEach(async () => {
+  await Promise.all([...rawChildren].map(async (pid) => {
+    rawChildren.delete(pid)
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+    }
+    await waitForProcessExit(pid).catch(() => undefined)
+  }))
+})
+
+function buildHeldRecord(overrides: Record<string, unknown> = {}): CodexSidecarOwnershipMetadata {
+  const now = new Date().toISOString()
+  return {
+    schemaVersion: 1,
+    ownershipId: `held-${Math.random().toString(36).slice(2)}`,
+    serverInstanceId: 'srv-previous',
+    ownerServerPid: 999_999_999,
+    terminalId: null,
+    generation: null,
+    wsUrl: 'ws://127.0.0.1:1',
+    wrapperPid: 999_999_998,
+    processGroupId: 999_999_997,
+    wrapperIdentity: { commandLine: ['codex'], cwd: '/tmp', startTimeTicks: 1 },
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  } as CodexSidecarOwnershipMetadata
+}
+
+async function writeHeldRecord(
+  metadataDir: string,
+  metadata: CodexSidecarOwnershipMetadata,
+): Promise<HeldCodexSidecarOwnership> {
+  const metadataPath = path.join(metadataDir, `${metadata.ownershipId}.json`)
+  await fsp.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 })
+  return { metadataDir, metadataPath, metadata }
+}
+
+function createReconcilerLog() {
+  return { info: vi.fn(), warn: vi.fn() }
+}
+
+describeWithLinuxProc('CodexSidecarReconciler hold verdicts', () => {
+  it('holds a verified-owned survivor claimable by its session id, leaving the group and record in place', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'hold-owned',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-owned',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const log = createReconcilerLog()
+    const reconciler = new CodexSidecarReconciler({ log })
+
+    const verdict = await reconciler.hold(ownership)
+
+    expect(verdict).toBe('held')
+    // The survivor is never signaled by the hold: the group stays alive and its record stays.
+    expect(await isProcessGroupAlive(pid)).toBe(true)
+    await expect(fsp.stat(ownership.metadataPath)).resolves.toBeDefined()
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 1, inFlightClaims: 0 })
+    expect(log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ ownershipId: 'hold-owned', sessionId: 'thr-owned', wsUrl: metadata.wsUrl }),
+      expect.any(String),
+    )
+    const claimed = reconciler.claimForSession('thr-owned')
+    expect(claimed?.metadata.ownershipId).toBe('hold-owned')
+  })
+
+  it('removes a record whose process group is gone without signaling, returning removed-unowned', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnShortLivedChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'hold-gone',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-gone',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+
+    const verdict = await reconciler.hold(ownership)
+
+    expect(verdict).toBe('removed-unowned')
+    await expect(fsp.stat(ownership.metadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    // Nothing was indexed: the record is gone from disk and from the reconciler's maps.
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.claimForSession('thr-gone')).toBeNull()
+  })
+
+  it('refuses a record pointing at the test process own group, keeping the file (kept-unproven)', async () => {
+    const metadataDir = await makeTempDir()
+    const selfGroupId = await getOwnProcessGroupId()
+    const metadata = buildHeldRecord({
+      ownershipId: 'hold-self',
+      wrapperPid: process.pid,
+      processGroupId: selfGroupId,
+      wrapperIdentity: await readWrapperIdentityForTest(process.pid),
+      sessionId: 'thr-self',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+
+    const verdict = await reconciler.hold(ownership)
+
+    expect(verdict).toBe('kept-unproven')
+    // Refusal keeps the record on disk and indexes nothing.
+    await expect(fsp.stat(ownership.metadataPath)).resolves.toBeDefined()
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.claimForSession('thr-self')).toBeNull()
+  })
+
+  it('holds a record without a session id as held but not claimable', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'hold-no-session',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+
+    const verdict = await reconciler.hold(ownership)
+
+    expect(verdict).toBe('held')
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.claimForSession('thr-anything')).toBeNull()
+  })
+})
+
+describeWithLinuxProc('CodexSidecarReconciler claims', () => {
+  it('claims a held survivor exactly once per session id, newest-updatedAt first', async () => {
+    const metadataDir = await makeTempDir()
+    const older = await spawnRawSurvivingChild()
+    const newer = await spawnRawSurvivingChild()
+    const olderOwnership = await writeHeldRecord(metadataDir, buildHeldRecord({
+      ownershipId: 'claim-older',
+      wrapperPid: older.pid,
+      processGroupId: older.pid,
+      wrapperIdentity: older.identity,
+      sessionId: 'thr-shared',
+      updatedAt: new Date(Date.now() - 60_000).toISOString(),
+    }))
+    const newerOwnership = await writeHeldRecord(metadataDir, buildHeldRecord({
+      ownershipId: 'claim-newer',
+      wrapperPid: newer.pid,
+      processGroupId: newer.pid,
+      wrapperIdentity: newer.identity,
+      sessionId: 'thr-shared',
+    }))
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    expect(await reconciler.hold(olderOwnership)).toBe('held')
+    expect(await reconciler.hold(newerOwnership)).toBe('held')
+
+    const first = reconciler.claimForSession('thr-shared')
+    expect(first?.metadata.ownershipId).toBe('claim-newer')
+    expect(reconciler.snapshot()).toMatchObject({ held: 2, claimableSessions: 1, inFlightClaims: 1 })
+    const second = reconciler.claimForSession('thr-shared')
+    expect(second?.metadata.ownershipId).toBe('claim-older')
+    // Both claims are consumed and in flight: the session key has no claimable candidate left.
+    expect(reconciler.claimForSession('thr-shared')).toBeNull()
+    expect(reconciler.snapshot()).toMatchObject({ held: 2, claimableSessions: 0, inFlightClaims: 2 })
+  })
+})
+
+describeWithLinuxProc('CodexSidecarReconciler settleFailedClaim', () => {
+  it('settles a codex_survivor_unreachable failure by reaping the verified group and unlinked record', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'settle-unreachable',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-unreachable',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    expect(await reconciler.hold(ownership)).toBe('held')
+    const claimed = reconciler.claimForSession('thr-unreachable')
+    expect(claimed).not.toBeNull()
+
+    await reconciler.settleFailedClaim(claimed!, 'codex_survivor_unreachable')
+
+    // The verified-but-unusable survivor is conservatively reaped and unlinked (da92 parity).
+    expect(await isProcessGroupAlive(pid)).toBe(false)
+    await expect(fsp.stat(ownership.metadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+  })
+
+  it('settles a codex_survivor_not_writer failure by keeping the survivor alive and held', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const metadata = buildHeldRecord({
+      ownershipId: 'settle-not-writer',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-not-writer',
+    })
+    const ownership = await writeHeldRecord(metadataDir, metadata)
+    const reconciler = new CodexSidecarReconciler({ log: createReconcilerLog() })
+    expect(await reconciler.hold(ownership)).toBe('held')
+    const claimed = reconciler.claimForSession('thr-not-writer')
+    expect(claimed).not.toBeNull()
+
+    await reconciler.settleFailedClaim(claimed!, 'codex_survivor_not_writer')
+
+    // The sidecar may be the writer of another thread: it stays alive, held, and un-signaled …
+    expect(await isProcessGroupAlive(pid)).toBe(true)
+    await expect(fsp.stat(ownership.metadataPath)).resolves.toBeDefined()
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 0 })
+    // … but its claim was consumed: it never re-enters this session index.
+    expect(reconciler.claimForSession('thr-not-writer')).toBeNull()
+  })
+})
+
+describeWithLinuxProc('CodexSidecarReconciler sweep protection and grace', () => {
+  it('protects held ids plus in-flight claims before expiry and only in-flight claims after', async () => {
+    let now = 1_000_000
+    const metadataDir = await makeTempDir()
+    const claimed = await spawnRawSurvivingChild()
+    const idle = await spawnRawSurvivingChild()
+    const claimedOwnership = await writeHeldRecord(metadataDir, buildHeldRecord({
+      ownershipId: 'sweep-claimed',
+      wrapperPid: claimed.pid,
+      processGroupId: claimed.pid,
+      wrapperIdentity: claimed.identity,
+      sessionId: 'thr-sweep',
+    }))
+    const idleOwnership = await writeHeldRecord(metadataDir, buildHeldRecord({
+      ownershipId: 'sweep-idle',
+      wrapperPid: idle.pid,
+      processGroupId: idle.pid,
+      wrapperIdentity: idle.identity,
+    }))
+    const reconciler = new CodexSidecarReconciler({
+      reapGraceMs: 30_000,
+      nowFn: () => now,
+      log: createReconcilerLog(),
+    })
+    expect(await reconciler.hold(claimedOwnership)).toBe('held')
+    expect(await reconciler.hold(idleOwnership)).toBe('held')
+
+    expect(reconciler.hasExpired()).toBe(false)
+    expect(reconciler.claimForSession('thr-sweep')?.metadata.ownershipId).toBe('sweep-claimed')
+    // Before expiry the reaper must skip everything the reconciler knows about.
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set(['sweep-claimed', 'sweep-idle']))
+
+    now += 30_000
+    expect(reconciler.hasExpired()).toBe(true)
+    // After expiry only the in-flight claim stays protected: an attacher must never be swept.
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set(['sweep-claimed']))
+
+    reconciler.dropClaim('sweep-claimed')
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set())
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 0 })
+  })
+
+  it('forget drops ids another actor removed from disk across every reconciler map', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnRawSurvivingChild()
+    const ownership = await writeHeldRecord(metadataDir, buildHeldRecord({
+      ownershipId: 'forget-me',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-forget',
+    }))
+    let now = 2_000_000
+    const reconciler = new CodexSidecarReconciler({ nowFn: () => now, log: createReconcilerLog() })
+    expect(await reconciler.hold(ownership)).toBe('held')
+
+    reconciler.forget(['forget-me'])
+
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.claimForSession('thr-forget')).toBeNull()
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set())
+    now += Number.MAX_SAFE_INTEGER
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set())
+  })
+})
+
+describe('resolveCodexSidecarReapGraceMs', () => {
+  it('parses undefined to the default, honors 0, and warns into the default on garbage', () => {
+    expect(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS).toBe(30 * 60 * 1000)
+    const log = createReconcilerLog()
+
+    expect(resolveCodexSidecarReapGraceMs(undefined)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
+    expect(resolveCodexSidecarReapGraceMs('0', log)).toBe(0)
+    expect(log.warn).not.toHaveBeenCalled()
+    expect(resolveCodexSidecarReapGraceMs('90000', log)).toBe(90_000)
+    expect(log.warn).not.toHaveBeenCalled()
+    expect(resolveCodexSidecarReapGraceMs('nonsense', log)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
+    expect(log.warn).toHaveBeenCalledTimes(1)
+    expect(resolveCodexSidecarReapGraceMs('-5', log)).toBe(CODEX_SIDECAR_REAP_GRACE_DEFAULT_MS)
+    expect(log.warn).toHaveBeenCalledTimes(2)
   })
 })
