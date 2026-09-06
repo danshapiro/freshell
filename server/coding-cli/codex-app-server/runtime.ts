@@ -58,6 +58,8 @@ export type CodexSidecarOwnershipMetadata = {
   createdAt: string
   updatedAt: string
   codexHome?: string
+  /** Codex thread id — the restore-time claim key (kata 4g2a); absent on pre-feature records. */
+  sessionId?: string
 }
 
 export type ReadyState = {
@@ -74,6 +76,12 @@ type ActiveOwnership = {
   metadataPath: string
   metadata: CodexSidecarOwnershipMetadata
 }
+
+/**
+ * A verified survivor sidecar record handed to `CodexAppServerRuntime.attachToSurvivingSidecar`
+ * by the boot reconciler (kata 4g2a): the record's directory/path plus its parsed metadata.
+ */
+export type HeldCodexSidecarOwnership = ActiveOwnership
 
 type SpawnProcess = typeof spawn
 type ChildProcessHandle = ReturnType<SpawnProcess>
@@ -164,6 +172,16 @@ class CodexAppServerStartupError extends Error {
   }
 }
 
+/**
+ * Structural sink for the boot reaper's owner-dead branch (kata 4g2a), implemented by
+ * CodexSidecarReconciler in sidecar-reattach.ts. Declared here with the LITERAL verdict union:
+ * this module never imports the reconciler (not even a type-only import of its named verdict), so
+ * the only import edge stays sidecar-reattach.ts → runtime.ts.
+ */
+export type CodexSidecarHoldSink = {
+  hold(ownership: HeldCodexSidecarOwnership): Promise<'held' | 'removed-unowned' | 'kept-unproven'>
+}
+
 export type ReapOrphanedSidecarsOptions = {
   metadataDir?: string
   serverInstanceId: string
@@ -180,6 +198,20 @@ export type ReapOrphanedSidecarsOptions = {
    * log). Passed by the hourly maintenance tick; boot passes always attempt every record.
    */
   respectRetryBackoff?: boolean
+  /**
+   * Boot-hold sink (kata 4g2a): with a sink present, each owner-dead record is offered to it
+   * instead of the teardown tail. Verified survivors are held claimable for restore; the sink
+   * settles every other verdict through the same conservative ownership-gated teardown.
+   */
+  holdReconciler?: CodexSidecarHoldSink
+  /**
+   * Ownership ids the reaper must skip, checked before the budget/teardown tail. The hourly
+   * sweep passes the reconciler's protection set here (held survivors before grace expiry;
+   * in-flight claims always). The function form is re-consulted PER RECORD, so a claim that
+   * lands mid-pass protects every record scanned after it — a static set would snapshot the
+   * protection at pass start and could reap a survivor claimed during the pass.
+   */
+  skipOwnershipIds?: ReadonlySet<string> | (() => ReadonlySet<string>)
   /** Clock seam for the teardown budget (tests only). */
   nowFn?: () => number
 }
@@ -188,6 +220,8 @@ export type ReapOrphanedSidecarsResult = {
   reapedOwnershipIds: string[]
   ignoredLegacyRecords: string[]
   skippedActiveOwnershipIds: string[]
+  /** Verified survivors held claimable by the hold sink this pass (kata 4g2a boot reconcile). */
+  heldOwnershipIds: string[]
   /** Records that hit an unexpected per-record error; retained in place and retried next pass. */
   failedOwnershipIds: string[]
   /** Record files that could not be read (permissions, torn write); retained in place. */
@@ -219,7 +253,8 @@ export type CodexReaperRetryState = {
 const DEFAULT_STARTUP_ATTEMPT_LIMIT = 2
 const DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3_000
 const STARTUP_POLL_MS = 50
-const DEFAULT_TERMINATE_GRACE_MS = 1_000
+// Exported for the sidecar reattach reconciler's failed-claim settle path (kata 4g2a).
+export const DEFAULT_TERMINATE_GRACE_MS = 1_000
 const OWNERSHIP_SCHEMA_VERSION = 1
 const LAUNCH_DIAGNOSTIC_METADATA_RECORD_CAP = 100
 const LAUNCH_DIAGNOSTIC_METADATA_RECORD_MAX_BYTES = 16 * 1024
@@ -583,9 +618,11 @@ async function isProcessGroupGone(processGroupId: number): Promise<boolean> {
   return false
 }
 
-type OwnedProcessGroupStatus = 'gone' | 'self' | 'owned' | 'foreign' | 'indeterminate'
+// Exported for the sidecar reattach reconciler's hold classification (kata 4g2a).
+export type OwnedProcessGroupStatus = 'gone' | 'self' | 'owned' | 'foreign' | 'indeterminate'
 
-async function classifyOwnedProcessGroup(
+// Exported for the sidecar reattach reconciler's hold classification (kata 4g2a).
+export async function classifyOwnedProcessGroup(
   metadata: CodexSidecarOwnershipMetadata,
 ): Promise<OwnedProcessGroupStatus> {
   if (await isProcessGroupGone(metadata.processGroupId)) return 'gone'
@@ -731,8 +768,11 @@ async function waitForProcessGroupGone(processGroupId: number, timeoutMs: number
   return isProcessGroupGone(processGroupId)
 }
 
-async function teardownOwnedProcessGroup(
-  ownership: ActiveOwnership,
+// Exported for the sidecar reattach reconciler's hold/settle teardown (kata 4g2a). The parameter
+// is annotated with the exported HeldCodexSidecarOwnership alias (type-identical to the internal
+// ActiveOwnership) so declaration emit never needs the private name.
+export async function teardownOwnedProcessGroup(
+  ownership: HeldCodexSidecarOwnership,
   terminateGraceMs: number,
 ): Promise<boolean> {
   const confirmedGone = await teardownOwnedProcessGroupCore(ownership, terminateGraceMs)
@@ -836,6 +876,7 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
     || !isWrapperIdentity(candidate.wrapperIdentity)
     || typeof candidate.createdAt !== 'string'
     || typeof candidate.updatedAt !== 'string'
+    || (candidate.sessionId !== undefined && typeof candidate.sessionId !== 'string')
   ) {
     return { kind: 'malformedNewSchema', ownershipId }
   }
@@ -1201,6 +1242,7 @@ export async function reapOrphanedCodexAppServerSidecars(
     reapedOwnershipIds: [],
     ignoredLegacyRecords: [],
     skippedActiveOwnershipIds: [],
+    heldOwnershipIds: [],
     failedOwnershipIds: [],
     unreadableRecords: [],
     quarantinedRecords: [],
@@ -1366,6 +1408,47 @@ export async function reapOrphanedCodexAppServerSidecars(
       }
 
       const ownership: ActiveOwnership = { metadataDir, metadataPath, metadata }
+      // 4g2a: the reconciler's protection set is honored BEFORE the budget/teardown tail — no
+      // signal, no retry bookkeeping for swept-over held or in-flight ids. The function form is
+      // resolved PER RECORD so a claim that lands mid-pass still protects every record scanned
+      // after it.
+      const skipOwnershipIds = typeof options.skipOwnershipIds === 'function'
+        ? options.skipOwnershipIds()
+        : options.skipOwnershipIds
+      if (skipOwnershipIds?.has(metadata.ownershipId)) {
+        result.skippedActiveOwnershipIds.push(metadata.ownershipId)
+        continue
+      }
+      // 4g2a boot reconcile: with a hold sink present, verified survivors are HELD claimable for
+      // restore instead of killed; every non-owned verdict settles through the same conservative
+      // teardown the un-sunk path uses (the sink owns that call).
+      if (options.holdReconciler) {
+        const verdict = await options.holdReconciler.hold(ownership)
+        if (verdict === 'held') {
+          result.heldOwnershipIds.push(metadata.ownershipId)
+          continue
+        }
+        if (verdict === 'removed-unowned') {
+          result.reapedOwnershipIds.push(metadata.ownershipId)
+          await fsp.unlink(reaperRetrySidecarPath(metadataPath)).catch(() => undefined)
+          continue
+        }
+        // kept-unproven: identical to today's teardown-refusal branch (in-place retry, never
+        // quarantine).
+        const state = await recordCodexReaperRetryAttempt(metadataPath)
+        logCodexReaperRetry(
+          {
+            ownershipId: metadata.ownershipId,
+            metadataPath,
+            wrapperPid: metadata.wrapperPid,
+            processGroupId: metadata.processGroupId,
+          },
+          state,
+          'sidecar group ownership could not be verified for a boot hold',
+        )
+        result.retriedOwnershipIds.push(metadata.ownershipId)
+        continue
+      }
       // M2: once the pass's teardown budget is exhausted, skip the signal-and-wait teardown for
       // the remaining records. They keep retry state (so they surface in the boot summary and the
       // hourly tick re-attempts them) and are marked deferred — never dropped.
@@ -1454,6 +1537,41 @@ function summarizeCodexStartupReaperResult(result: ReapOrphanedSidecarsResult): 
     },
     'Codex startup reaper completed with unresolved ownership records; continuing boot (fail-open)',
   )
+}
+
+/**
+ * Total wall-clock budget for the survivor reattach probes (kata 4g2a): `initialize` and
+ * `thread/loaded/list` share ONE deadline computed from this budget, so a wedged survivor
+ * fails fast back to the fresh-spawn fallback (the da92 lane's 3s bound).
+ */
+export const CODEX_REATTACH_PROBE_BUDGET_MS = 3_000
+
+export type CodexSurvivorAttachErrorCode =
+  | 'codex_survivor_identity'
+  | 'codex_survivor_unreachable'
+  | 'codex_survivor_not_writer'
+
+export function getCodexSurvivorAttachErrorCode(error: unknown): CodexSurvivorAttachErrorCode | null {
+  const code = (error as { code?: unknown } | null | undefined)?.code
+  return code === 'codex_survivor_identity' || code === 'codex_survivor_unreachable' || code === 'codex_survivor_not_writer' ? code : null
+}
+
+function codexSurvivorAttachError(code: CodexSurvivorAttachErrorCode, message: string, cause?: unknown): Error {
+  const error = new Error(message, cause !== undefined ? { cause } : undefined)
+  ;(error as Error & { code: CodexSurvivorAttachErrorCode }).code = code
+  return error
+}
+
+// Races one probe against the REMAINING share of the attach deadline: each probe call in
+// `attachToSurvivingSidecar` is handed `probeDeadlineMs - Date.now()`, never a fresh full
+// budget, so initialize + thread/loaded/list together stay inside one ~3s deadline.
+async function withProbeBudget<T>(label: string, promise: Promise<T>, budgetMs: number, totalBudgetMs: number = budgetMs): Promise<T> {
+  return await Promise.race([
+    promise,
+    sleep(budgetMs).then(() => {
+      throw codexSurvivorAttachError('codex_survivor_unreachable', `${label} did not finish within its remaining ${budgetMs}ms slice of the ${totalBudgetMs}ms reattach probe budget`)
+    }),
+  ])
 }
 
 export class CodexAppServerRuntime {
@@ -1549,6 +1667,109 @@ export class CodexAppServerRuntime {
     return this.ready
   }
 
+  /**
+   * Bind this FRESH runtime instance to an already-running sidecar that survived a previous
+   * server's unclean exit (kata 4g2a restore-reattach, the da92 claim semantics): re-verify the
+   * recorded process group, probe its listener and thread-writer claim inside ONE shared
+   * deadline, retitle its ownership record to this server, and adopt its live state. This path
+   * never spawns. On any coded failure the survivor is never signaled and its record is left
+   * unmodified — disposal/settling belongs to the reconciler.
+   */
+  async attachToSurvivingSidecar(
+    ownership: HeldCodexSidecarOwnership,
+    options: { sessionId: string; probeBudgetMs?: number },
+  ): Promise<ReadyState> {
+    if (this.shutdownRequested) {
+      throw new Error('Codex app-server sidecar is shutting down.')
+    }
+    if (this.ready || this.ensureReadyPromise) {
+      throw new Error('Codex app-server sidecar already has a starting or running sidecar; it cannot attach to a survivor.')
+    }
+    await this.assertNoBlockedOwnership('attach to a surviving Codex app-server sidecar')
+
+    const metadata = ownership.metadata
+    // Fresh claim-time identity re-verification: anything but `owned` refuses AND never signals
+    // (the recorded group may be reused/foreign, or evidence may be unreadable — all refuse).
+    const classification = await classifyOwnedProcessGroup(metadata)
+    if (classification !== 'owned') {
+      throw codexSurvivorAttachError('codex_survivor_identity',
+        `Codex survivor sidecar ${metadata.ownershipId} failed ownership re-verification at claim time (${classification}); refusing to signal it`)
+    }
+
+    const budgetMs = options.probeBudgetMs ?? CODEX_REATTACH_PROBE_BUDGET_MS
+    const probeDeadlineMs = Date.now() + budgetMs // one shared deadline across both probes
+    const client = new CodexAppServerClient(
+      { wsUrl: metadata.wsUrl },
+      this.requestTimeoutMs ? { requestTimeoutMs: this.requestTimeoutMs } : {},
+    )
+    this.bindClientEventFanout(client)
+    this.client = client
+    let initialized: CodexInitializeResult
+    try {
+      initialized = await withProbeBudget('survivor initialize', client.initialize(), probeDeadlineMs - Date.now(), budgetMs)
+      const loaded = await withProbeBudget('survivor thread/loaded/list', client.listLoadedThreads(), Math.max(0, probeDeadlineMs - Date.now()), budgetMs)
+      if (!loaded.includes(options.sessionId)) {
+        // Reachable but not the writer for this claim key: keep the survivor alive — it may be
+        // the writer of another key's thread.
+        throw codexSurvivorAttachError('codex_survivor_not_writer',
+          `Codex survivor sidecar ${metadata.ownershipId} is reachable but is not the writer of ${options.sessionId}`)
+      }
+    } catch (error) {
+      if (this.client === client) this.client = null
+      await client.close().catch(() => undefined)
+      if (getCodexSurvivorAttachErrorCode(error)) throw error
+      throw codexSurvivorAttachError('codex_survivor_unreachable',
+        `Codex survivor sidecar ${metadata.ownershipId} was not reachable at its recorded listener`, error)
+    }
+
+    const ownerServerIdentity = await this.processIdentityReader(process.pid)
+    if (!isCompleteWrapperIdentity(ownerServerIdentity)) {
+      if (this.client === client) this.client = null
+      await client.close().catch(() => undefined)
+      throw codexSurvivorAttachError('codex_survivor_unreachable',
+        `Codex survivor sidecar ${metadata.ownershipId} could not be retitled: owner identity unreadable`)
+    }
+
+    this.ownership = {
+      metadataDir: ownership.metadataDir,
+      metadataPath: ownership.metadataPath,
+      metadata: {
+        ...metadata,
+        ownerServerPid: process.pid,
+        ownerServerIdentity,
+        updatedAt: new Date().toISOString(),
+      },
+    }
+    try {
+      await this.writeOwnershipRecord(this.ownership)
+    } catch (error) {
+      // Fail-soft (da92's write_record_loudly parity): a persistence hiccup must not murder a
+      // working sidecar — log loudly once and continue with the in-memory ownership.
+      logger.warn(
+        { err: error, ownershipId: metadata.ownershipId, metadataPath: ownership.metadataPath },
+        'Codex survivor ownership retitle write failed; continuing with in-memory ownership (log-and-continue parity)',
+      )
+    }
+    // Same registration shape as startRuntime's: this server process now owns exit-time reaping
+    // of the survivor's process group, so the group must be tracked from here on.
+    registerCodexChild({
+      pid: metadata.wrapperPid,
+      pgid: metadata.processGroupId,
+      kind: 'app-server',
+      envMarker: { name: 'FRESHELL_CODEX_SIDECAR_ID', value: metadata.ownershipId },
+    })
+    this.ready = {
+      wsUrl: metadata.wsUrl,
+      processPid: metadata.wrapperPid,
+      codexHome: initialized.codexHome,
+      ownershipId: metadata.ownershipId,
+      processGroupId: metadata.processGroupId,
+      metadataPath: ownership.metadataPath,
+    }
+    this.statusValue = 'running'
+    return this.ready
+  }
+
   async startThread(
     params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
   ): Promise<{ threadId: string; wsUrl: string }> {
@@ -1614,6 +1835,7 @@ export class CodexAppServerRuntime {
     terminalId?: string | null
     generation?: number | null
     codexHome?: string
+    sessionId?: string
   }): Promise<void> {
     await this.assertNoBlockedOwnership('update Codex app-server ownership metadata')
     if (!this.ownership) {
@@ -1624,6 +1846,7 @@ export class CodexAppServerRuntime {
       ...(input.terminalId !== undefined ? { terminalId: input.terminalId } : {}),
       ...(input.generation !== undefined ? { generation: input.generation } : {}),
       ...(input.codexHome !== undefined ? { codexHome: input.codexHome } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
       updatedAt: new Date().toISOString(),
     }
     await atomicWriteJson(this.ownership.metadataPath, this.ownership.metadata)
@@ -1809,6 +2032,49 @@ export class CodexAppServerRuntime {
     }
   }
 
+  // The single client event fanout shared verbatim by `startRuntime` and
+  // `attachToSurvivingSidecar` (kata 4g2a): an attached survivor's client feeds the same
+  // lifecycle/turn/loss handlers as a spawned sidecar's, with identical disconnect semantics
+  // (ignored while shutting down; otherwise surfaced as 'app_server_client_disconnect').
+  private bindClientEventFanout(client: CodexAppServerClient): void {
+    client.onThreadLifecycleLoss((event) => {
+      for (const handler of this.lifecycleLossHandlers) {
+        handler(event)
+      }
+    })
+    client.onThreadStarted((thread) => {
+      for (const handler of this.threadStartedHandlers) {
+        handler(thread)
+      }
+    })
+    client.onThreadLifecycle((event) => {
+      for (const handler of this.threadLifecycleHandlers) {
+        handler(event)
+      }
+    })
+    client.onFsChanged((event) => {
+      for (const handler of this.fsChangedHandlers) {
+        handler(event)
+      }
+    })
+    client.onTurnStarted((event) => {
+      for (const handler of this.turnStartedHandlers) {
+        handler(event)
+      }
+    })
+    client.onTurnCompleted((event) => {
+      for (const handler of this.turnCompletedHandlers) {
+        handler(event)
+      }
+    })
+    client.onDisconnect((event) => {
+      if (this.shutdownRequested) return
+      for (const handler of this.exitHandlers) {
+        handler(event.error, 'app_server_client_disconnect')
+      }
+    })
+  }
+
   private async startRuntime(cwd: CodexAppServerLaunchCwd): Promise<ReadyState> {
     await assertProcOwnershipProofAvailable()
     await assertCodexAppServerLaunchCwdReachable(cwd)
@@ -1901,42 +2167,7 @@ export class CodexAppServerRuntime {
           { wsUrl },
           this.requestTimeoutMs ? { requestTimeoutMs: this.requestTimeoutMs } : {},
         )
-        client.onThreadLifecycleLoss((event) => {
-          for (const handler of this.lifecycleLossHandlers) {
-            handler(event)
-          }
-        })
-        client.onThreadStarted((thread) => {
-          for (const handler of this.threadStartedHandlers) {
-            handler(thread)
-          }
-        })
-        client.onThreadLifecycle((event) => {
-          for (const handler of this.threadLifecycleHandlers) {
-            handler(event)
-          }
-        })
-        client.onFsChanged((event) => {
-          for (const handler of this.fsChangedHandlers) {
-            handler(event)
-          }
-        })
-        client.onTurnStarted((event) => {
-          for (const handler of this.turnStartedHandlers) {
-            handler(event)
-          }
-        })
-        client.onTurnCompleted((event) => {
-          for (const handler of this.turnCompletedHandlers) {
-            handler(event)
-          }
-        })
-        client.onDisconnect((event) => {
-          if (this.shutdownRequested) return
-          for (const handler of this.exitHandlers) {
-            handler(event.error, 'app_server_client_disconnect')
-          }
-        })
+        this.bindClientEventFanout(client)
         this.client = client
 
         const initialized = await this.waitForInitialize(client, child, childErrorPromise)
