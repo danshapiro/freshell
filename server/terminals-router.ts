@@ -69,7 +69,6 @@ export interface TerminalsRouterDeps {
     broadcastTerminalsChanged?: () => void
   }
   terminalMetadata?: { list: () => TerminalMeta[]; get?: (terminalId: string) => TerminalMeta | undefined }
-  codingCliIndexer?: { refresh: () => Promise<void> }
   terminalViewService?: TerminalViewService
   readModelScheduler?: ReadModelWorkScheduler
 }

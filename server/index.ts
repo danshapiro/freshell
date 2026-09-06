@@ -806,7 +806,6 @@ async function main() {
     registry,
     wsHandler,
     terminalMetadata,
-    codingCliIndexer,
     terminalViewService: createTerminalViewService({ configStore, registry }),
   }))
 

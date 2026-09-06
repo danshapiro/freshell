@@ -226,6 +226,71 @@ describe('Unified rename cascade — integration', () => {
     expect(Object.keys(row)).not.toContain('titleOverride')
     expect(Object.keys(row)).not.toContain('titleSource')
   })
+
+  // ────────────────────────────────────────────────────────────
+  // Test 5: An archive-only session PATCH preserves an existing title override
+  // ────────────────────────────────────────────────────────────
+  it('an archive-only session PATCH preserves an existing title override', async () => {
+    const provider: CodingCliProviderName = 'claude'
+    const sessionId = 'session-archive-keep'
+    const compositeKey = makeSessionKey(provider, sessionId)
+
+    // Explicit durable session rename writes the 'user' rung.
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'Kept' })
+      .expect(200)
+
+    // An archive-only patch never mentions the title: the absent titleOverride
+    // key must leave the existing override (and its source rung) untouched.
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ archived: true })
+      .expect(200)
+
+    const stored = await configStore.getSessionOverride(compositeKey)
+    expect(stored?.titleOverride).toBe('Kept')
+    expect(stored?.titleSource).toBe('user')
+    expect(stored?.archived).toBe(true)
+  })
+
+  // ────────────────────────────────────────────────────────────
+  // Test 6: A whitespace-only session title clears titleOverride AND titleSource
+  // ────────────────────────────────────────────────────────────
+  it('a whitespace-only session title clears titleOverride AND titleSource', async () => {
+    const provider: CodingCliProviderName = 'claude'
+    const sessionId = 'session-whitespace-clear'
+    const compositeKey = makeSessionKey(provider, sessionId)
+
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'Kept' })
+      .expect(200)
+
+    const stored = await configStore.getSessionOverride(compositeKey)
+    expect(stored?.titleOverride).toBe('Kept')
+    expect(stored?.titleSource).toBe('user')
+
+    // A whitespace-only title is a clear: like an explicit null clear, it must
+    // remove BOTH keys — a leftover titleSource:'user' rung permanently freezes
+    // the title-source ladder (provider/auto titles can never land again).
+    await request(app)
+      .patch(`/api/sessions/${compositeKey}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: '   ' })
+      .expect(200)
+
+    // Assert on the RAW config row (Object.keys, not just undefined values):
+    // neither key may be present at all.
+    const raw = JSON.parse(await fsp.readFile(path.join(tempDir, '.freshell', 'config.json'), 'utf8'))
+    const row = raw.sessionOverrides?.[compositeKey]
+    expect(row).toBeDefined()
+    expect(Object.keys(row)).not.toContain('titleOverride')
+    expect(Object.keys(row)).not.toContain('titleSource')
+  })
 })
 
 // ────────────────────────────────────────────────────────────────
@@ -276,7 +341,7 @@ function buildTestApp(
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
     const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
 
-    const { titleOverride } = req.body || {}
+    const { titleOverride, archived } = req.body || {}
     const next = await configStore.patchSessionOverride(compositeKey, {
       ...(Object.prototype.hasOwnProperty.call(req.body ?? {}, 'titleOverride')
         ? {
@@ -284,6 +349,9 @@ function buildTestApp(
             titleSource: typeof titleOverride === 'string' && titleOverride.trim() ? ('user' as const) : undefined,
           }
         : {}),
+      // Mirror production: archived passes through only when present, so an
+      // absent titleOverride key leaves any existing title override untouched.
+      ...(archived !== undefined ? { archived: Boolean(archived) } : {}),
     })
 
     // session→terminal cascade (unchanged, inlined from cascadeSessionRenameToTerminal)
