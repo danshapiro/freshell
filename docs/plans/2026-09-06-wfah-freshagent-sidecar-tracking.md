@@ -162,6 +162,30 @@ existing Node fake app-server fixture
    lane filter's blast radius is exactly the terminal-pane restore path
    (verification: `grep -rn "claim_for_session" crates/`).
 
+## Stage-2 corrections applied (load-bearing validation, 2026-09-06)
+
+- **LB-1 FALSIFIED → Task 3 amended.** The watcher arms do not cover every
+  reap: between a successful `spawn_sidecar` and watcher construction, every
+  call site has explicit bail arms that `start_kill` +
+  `reap_owned_codex_sidecars` the child directly (thread-RPC failure arms at
+  codex.rs:664-665, :767-768, :787-788, :865-867, :2172-2173, :2193-2194,
+  :2209-2210, :2353-2354, :2930-2931, :2955-2956, and `shut_down_fork_child`
+  :4070-4079). Task 3 now scrubs at every `reap_owned_codex_sidecars` site in
+  the lane and adds `create_bail_after_spawn_leaves_no_record` (behavioral
+  RED). No alive-child-without-watcher hole exists; the scrub extension is
+  litter/invariant discipline, not an orphan-leak fix. Evidence:
+  `<logs_dir>/reports/load-bearing-validator-spawn-and-fixture.md`.
+- LB-2..LB-7 verified as planned: ENV_LOCK reachable (pub(crate) mod tests +
+  static); fixture reports idle/no-loaded-threads by default ⇒ the Task-5
+  orphan sweeps to Reaped; store root `<FRESHELL_HOME>/.freshell/rust-codex-sidecars`
+  (main.rs:417-430); one production claim consumer (runtime_select.rs:32);
+  sandbox unavailable (docker daemon permission denied) ⇒ documented host
+  fallback for Task 5; base cargo receipts recorded in
+  `<logs_dir>/reports/load-bearing-base-cargo.md` (freshagent 115/0, safe11
+  1/0, codex sidecar 33/1 with pre-existing parallel flake
+  `sidecar_store::tests::verify_identity_confirms_own_spawned_child`,
+  isolation-PASS repro receipt therein).
+
 ---
 
 ### Task 1: SidecarLane discriminator + never-claim-freshagent-records
@@ -852,12 +876,28 @@ git commit -m "feat(freshagent): record codex sidecars in the durable store at s
 - Consumes: Task 2's `scrub_sidecar_record`; Task 1's store.
 - Produces: `pub(crate) fn spawn_exit_watcher(...)` (same signature as today); guarantee: after any of `freshAgent.kill`, unrequested exit, or `FreshCodexState::shutdown`, no record for the reaped ownership id remains.
 
-Why the watcher instead of N call sites: every sidecar kill flows through the
-watcher — `handle_kill` sends `kill_tx`, `shutdown` sends `kill_tx` and awaits
-the watcher, and an unrequested exit takes the `child.wait()` arm. Both arms
-already call `reap_owned_codex_sidecars(&ownership_id)`; the record scrub rides
-that exact line. This is also why `spawn_exit_watcher` becomes `pub(crate)`:
-the direct-drive tests need it, and the widening carries zero behavior change.
+Why the watcher instead of every call site: every sidecar kill flows through
+the watcher — `handle_kill` sends `kill_tx`, `shutdown` sends `kill_tx` and
+awaits the watcher, and an unrequested exit takes the `child.wait()` arm. Both
+arms already call `reap_owned_codex_sidecars(&ownership_id)`; the record scrub
+rides that exact line. This is also why `spawn_exit_watcher` becomes
+`pub(crate)`: the direct-drive tests need it, and the widening carries zero
+behavior change.
+
+**Stage-2 correction (LB-1 falsified):** the watcher's two arms do NOT cover
+every reap. Between a successful `spawn_sidecar` return (record already
+written) and watcher construction, every call site has explicit bail arms that
+`start_kill` + `reap_owned_codex_sidecars` the child directly — thread-RPC
+failure arms (six sites at `codex.rs:664-665, :767-768, :787-788, :865-867,
+:2172-2173, :2193-2194, :2209-2210, :2353-2354, :2930-2931, :2955-2956`) and
+`shut_down_fork_child` (`codex.rs:4070-4079`). Those kills leave the freshly
+written record behind (the dead pid is pruned at the next boot, so no orphan
+leak — but litter rows violate this task's "scrub on every reap path"
+invariant). The scrub therefore rides EVERY `reap_owned_codex_sidecars` call
+in the freshagent lane, not just the watcher's. We do NOT put the scrub inside
+`reap_owned_codex_sidecars` itself: that helper lives in `freshell-codex` and
+is shared with the terminal-pane lane, which owns its record lifecycle
+explicitly.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -969,18 +1009,73 @@ async fn shutdown_leaves_no_records() {
         "graceful shutdown reaps the lane's sidecars AND their records"
     );
 }
+
+#[tokio::test]
+async fn create_bail_after_spawn_leaves_no_record() {
+    let _env = ENV_LOCK.lock().await;
+    // thread/start errors AFTER spawn_sidecar returned OK: the lane takes the
+    // pre-watcher bail arm, which kills the child directly. The freshly
+    // written record must not linger.
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        &json!({
+            "overrides": {
+                "thread/start": { "error": { "code": -32000, "message": "forced wfah bail" } }
+            }
+        })
+        .to_string(),
+    );
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let (st, mut rx) = tracking_state();
+
+    st.handle_create(FreshAgentCreate {
+        request_id: "req-wfah-t3-bail".to_string(),
+        session_type: freshell_protocol::SessionType::Freshcodex,
+        provider: Some(freshell_protocol::AgentProvider::Codex),
+        cwd: None,
+        legacy_restore_context: None,
+        resume_session_id: None,
+        session_ref: None,
+        model: None,
+        model_selection: None,
+        permission_mode: None,
+        sandbox: None,
+        effort: None,
+        plugins: None,
+    })
+    .await;
+    let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&rx.recv().await.expect("bus")).expect("json");
+            if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("failure frame within the budget");
+    assert_eq!(frame["type"], "freshAgent.create.failed", "expected the bail: {frame}");
+
+    assert!(
+        guard.records().is_empty(),
+        "a pre-watcher bail must scrub the record it wrote at spawn"
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `cargo test -p freshell-freshagent --lib codex_sidecar_tracking`
 
-Expected: FAIL — `requested_kill_arm_removes_the_record` (and
-`handle_kill_leaves_no_record`, `shutdown_leaves_no_records`) fail because the
-record written at spawn is never removed: nothing in the lane touches the
-store today. (`unrequested_exit_arm_*` does not compile until
-`spawn_exit_watcher` is `pub(crate)` — API-additive red; the kill test carries
-the behavioral red.)
+Expected: FAIL — `requested_kill_arm_removes_the_record`,
+`handle_kill_leaves_no_record`, `shutdown_leaves_no_records`, and
+`create_bail_after_spawn_leaves_no_record` all fail because the record written
+at spawn is removed on NONE of those reap paths today (the watcher's arms do
+not exist yet and the bail arms never scrub). (`unrequested_exit_arm_*` does
+not compile until `spawn_exit_watcher` is `pub(crate)` — API-additive red;
+the kill/bail tests carry the behavioral red.)
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1006,16 +1101,30 @@ In `codex.rs::spawn_exit_watcher`, ride the existing reap lines in both arms:
 Widen the signature: `fn spawn_exit_watcher(` → `pub(crate) fn
 spawn_exit_watcher(` (visibility only; no behavior change).
 
+Then, at EVERY pre-watcher bail arm that reaps a child this lane recorded
+(stage-2 enumeration: the thread-RPC failure arms at `codex.rs:664-665`,
+`:767-768`, `:787-788`, `:865-867`, `:2172-2173`, `:2193-2194`, `:2209-2210`,
+`:2353-2354`, `:2930-2931`, `:2955-2956`, plus `shut_down_fork_child` at
+`:4070-4079`), add the same one-liner immediately after the existing
+`reap_owned_codex_sidecars(&ownership_id)` call:
+
+```rust
+crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+```
+
+(`shut_down_fork_child` carries whatever ownership id it already passes to
+`reap_owned_codex_sidecars`.) Line numbers are guides; the anchor is "each
+`reap_owned_codex_sidecars` call site in the freshagent lane".
+
 - [ ] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-freshagent --lib codex_sidecar_tracking`
 
-Expected: PASS (8 tests total in the file).
+Expected: PASS (9 tests total in the file).
 
 - [ ] **Step 5: Refactor while green**
 
-None expected — two one-line additions plus a visibility change. Confirm there
-is no third reap site left: `grep -n "reap_owned_codex_sidecars" crates/freshell-freshagent/src/` must show only the failure arms (Task 2) and the two watcher arms.
+None expected — two one-line additions plus a visibility change. Confirm coverage: `grep -n "reap_owned_codex_sidecars" crates/freshell-freshagent/src/` — EVERY match must now sit adjacent to a `scrub_sidecar_record` call (failure arms from Task 2, watcher arms and bail arms from Task 3).
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1170,7 +1279,7 @@ In `codex.rs::spawn_exit_watcher`, first statement of the fn body (before
 
 Run: `cargo test -p freshell-freshagent --lib codex_sidecar_tracking`
 
-Expected: PASS (10 tests total).
+Expected: PASS (11 tests total).
 
 - [ ] **Step 5: Refactor while green**
 
