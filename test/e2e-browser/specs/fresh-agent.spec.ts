@@ -604,6 +604,48 @@ test.describe('Fresh Agent', () => {
     expect(monoFont).not.toBe(defaultFont)
   })
 
+  test('turn context menu renders on an opaque popover surface', async ({ freshellPage: _freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-000000000006'
+    await stubFreshclaudeThread(page, sessionId, [
+      {
+        id: 'turn-menu-user',
+        turnId: 'turn-menu-user',
+        role: 'user',
+        summary: 'Summarize the menu surface.',
+        items: [{ id: 'item-menu-user', kind: 'text', text: 'Summarize the menu surface.' }],
+      },
+    ])
+    await installFreshclaudeStripPane(page, sessionId)
+
+    const paneRoot = page.locator('[data-context="fresh-agent"]')
+    const turnText = paneRoot.getByText('Summarize the menu surface.', { exact: true })
+    await expect(turnText).toBeVisible({ timeout: 10_000 })
+    await turnText.click({ button: 'right' })
+
+    // Fine-pointer desktop: right-clicking a turn opens the floating turn menu.
+    const menu = page.getByRole('menu', { name: 'Turn context menu' })
+    await expect(menu).toBeVisible()
+
+    // Regression pin: bg-popover previously resolved to no rule at all (the
+    // popover tokens were missing from the tailwind config/theme variables),
+    // so the menu floated over the transcript with a transparent background.
+    const backgroundColor = await menu.evaluate((el) => getComputedStyle(el).backgroundColor)
+    expect(backgroundColor, 'turn context menu must not be transparent').not.toBe('rgba(0, 0, 0, 0)')
+    expect(backgroundColor).not.toBe('transparent')
+
+    // And it must be the popover surface token itself, not accidental inheritance.
+    const expectedSurface = await page.evaluate(() => {
+      const probe = document.createElement('div')
+      probe.style.backgroundColor = 'hsl(var(--popover))'
+      document.body.appendChild(probe)
+      const value = getComputedStyle(probe).backgroundColor
+      probe.remove()
+      return value
+    })
+    expect(backgroundColor).toBe(expectedSurface)
+  })
+
   test('pane picker hides fresh clients by default even when their CLIs are enabled', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     await page.evaluate(() => {
