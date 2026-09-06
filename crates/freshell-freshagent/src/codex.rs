@@ -187,11 +187,13 @@ pub struct FreshCodexState {
     /// stale runtime.
     restart_retirements: Arc<TokioMutex<HashMap<String, CodexRestartRetirement>>>,
     /// Session ids with an UNFINISHED restart retirement (LB-04). Inserted
-    /// before the retirement's kill request can reach the exit-watcher and
-    /// removed only by [`Self::continue_codex_restart_retirement`]'s `Stopped`
-    /// path — while a session id is pinned here, NEITHER `spawn_exit_watcher`
-    /// arm may release its durable lease binding, so a mid-retirement sidecar
-    /// death can never reopen the durable id to a second writer early. A pin
+    /// atomically with the retirement's removal of the session from the live
+    /// map (before the kill request can reach the exit-watcher) and removed
+    /// only by [`Self::continue_codex_restart_retirement`]'s `Stopped` path —
+    /// while a session id is pinned here, NEITHER `spawn_exit_watcher` arm NOR
+    /// [`Self::handle_kill`]'s quiesced-release may reopen its durable lease
+    /// binding, so a mid-retirement sidecar death or an unfenced cross-lane
+    /// kill can never free the durable id to a second writer early. A pin
     /// outlives its quarantine entry's presence in `restart_retirements` (a
     /// `continue` drive temporarily holds the entry out of the map), which is
     /// exactly the window in which the watcher's terminal step runs.
@@ -1924,7 +1926,12 @@ impl FreshCodexState {
         };
         // Task 12: an explicitly-killed session must reopen its durable id (the watcher
         // also clears it; idempotent -- this covers watcher-less test sessions too).
-        if quiesced {
+        // LB-04 parity: a session pinned by an UNFINISHED restart retirement keeps
+        // its binding until the retirement's `Stopped` path — for a quarantined
+        // session this lane observes `removed = None` (quarantine moved it out of
+        // the map), so `quiesced` is trivially true; without the pin gate an
+        // unfenced cross-lane kill would reopen the durable id mid-retirement.
+        if quiesced && !self.restart_lease_pins.lock().await.contains(&session_id) {
             self.leases.clear_binding(PROVIDER, &session_id);
         }
 
@@ -1987,6 +1994,17 @@ impl FreshCodexState {
             let mut sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
                 Some(session) if session.runtime.runtime_id == expected_runtime_id => {
+                    // LB-04 ordering: pin the durable lease binding BEFORE the
+                    // session leaves the live map (atomically, in this lock
+                    // scope), so NO lane — neither `spawn_exit_watcher` arm nor
+                    // an unfenced `handle_kill`'s quiesced-release — can ever
+                    // observe the session as unquarantined mid-retirement: the
+                    // `Stopped` path of `continue_codex_restart_retirement`
+                    // owns the release.
+                    self.restart_lease_pins
+                        .lock()
+                        .await
+                        .insert(session_id.to_string());
                     sessions.remove(session_id)
                 }
                 _ => None,
@@ -2004,14 +2022,6 @@ impl FreshCodexState {
             ..
         } = session;
         let (captured_tx, captured_rx) = oneshot::channel();
-        // LB-04 ordering: pin the durable lease binding BEFORE the kill request
-        // can reach the exit-watcher, so neither watcher arm (requested kill
-        // nor unrequested exit) can ever release it mid-retirement — the
-        // `Stopped` path of `continue_codex_restart_retirement` owns the release.
-        self.restart_lease_pins
-            .lock()
-            .await
-            .insert(session_id.to_string());
         let capture_rx = kill_tx.and_then(|kill_tx| {
             kill_tx
                 .send(CodexKillRequest {
@@ -5855,11 +5865,13 @@ while true; do read -r -t 1 _ || true; done
         // independently-budgeted quiescence joins (capture/consumer/transport/
         // tree) can legitimately outlast ONE attempt and answer
         // RetirementIncomplete; the same-runtime retry IS the designed
-        // continuation for exactly that outcome. Assert success only on
+        // continuation for exactly that outcome. This loop's only exit is
         // `Stopped` — the load-bearing invariant (restart must never report
-        // success before the captured tree is dead) is unchanged.
+        // success before the captured tree is dead) is carried by the
+        // deadline/`Stale` arms here and the descendant/lease assertions
+        // below.
         let retirement_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        let stopped = loop {
+        loop {
             match st
                 .shutdown_for_restart_detailed(
                     "thread-tree-restart",
@@ -5868,7 +5880,7 @@ while true; do read -r -t 1 _ || true; done
                 .await
             {
                 crate::RestartShutdownOutcome::Stopped => {
-                    break true;
+                    break;
                 }
                 crate::RestartShutdownOutcome::RetirementIncomplete { .. } => {
                     assert!(
@@ -5881,7 +5893,7 @@ while true; do read -r -t 1 _ || true; done
                     panic!("same-runtime retirement must never go Stale while quarantined")
                 }
             }
-        };
+        }
         let descendant_alive = unsafe { libc::kill(descendant_pid, 0) == 0 };
         if descendant_alive {
             // Keep the red regression run from leaking its intentionally stubborn
@@ -5891,10 +5903,6 @@ while true; do read -r -t 1 _ || true; done
             }
         }
 
-        assert!(
-            stopped,
-            "restart must not report success before the captured tree is dead"
-        );
         assert!(
             !descendant_alive,
             "restart success left a reparented SIGTERM-ignoring codex descendant alive"
@@ -6066,14 +6074,22 @@ while true; do read -r -t 1 _ || true; done
 
         // Join the watcher's kill arm deterministically: if the first drive
         // left it in flight, its terminal step must land before the binding
-        // assertion below; the handle lives in the quarantine entry.
+        // assertion below; the handle lives in the quarantine entry. The join
+        // outcome itself is asserted — a timed-out or pre-terminal watcher
+        // would leave the binding merely "not yet released" and make the
+        // assertion below vacuous.
         {
             let mut retirements = st.restart_retirements.lock().await;
             let entry = retirements
                 .get_mut("fresh-runtime-test-thread-restart-bind")
                 .expect("quarantined entry");
             if let Some(watcher) = entry.watcher_handle() {
-                let _ = tokio::time::timeout(Duration::from_secs(5), watcher).await;
+                let joined = tokio::time::timeout(Duration::from_secs(5), watcher).await;
+                assert!(
+                    matches!(joined, Ok(Ok(true))),
+                    "the watcher's kill arm must run to completion before the \
+                     binding assertion, got {joined:?}"
+                );
             }
         }
 
@@ -6094,14 +6110,22 @@ while true; do read -r -t 1 _ || true; done
     /// session is parked in restart quarantine — the unrequested-exit arm runs
     /// before any kill request lands — the watcher must still not release the
     /// durable binding; quarantine owns that edge through the same pin the kill
-    /// arm consults.
+    /// arm consults. Two determinism load-bearers: (1) the kill sender is
+    /// extracted from the dropped session and KEPT ALIVE (never sent) until
+    /// after the final assertion, so `kill_rx` stays pending and the watcher's
+    /// `biased` select can ONLY fire the `child.wait()` arm — otherwise the
+    /// sender would drop with the fixture block, resolve `kill_rx` to Err, and
+    /// the kill-first bias would silently run the kill arm instead; (2) the
+    /// `freshAgent.status{exited}` broadcast is a wait-arm-only side effect
+    /// (the kill arm broadcasts nothing), so observing it proves the lane —
+    /// a bare `Ok(Ok(true))` join cannot, since both arms return `true`.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn restart_quarantine_holds_lease_binding_when_the_sidecar_exits_unrequested() {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let st = state();
-        insert_fake_session(
+        let mut bus_rx = insert_fake_session(
             &st,
             "thread-restart-crash",
             Arc::new(client),
@@ -6126,8 +6150,11 @@ while true; do read -r -t 1 _ || true; done
         // Move the exact runtime into restart quarantine mirroring the
         // production insert in `shutdown_for_restart_detailed` (pin first,
         // entry second) but WITHOUT sending the kill request, so the child's
-        // natural death below drives the watcher's unrequested-exit arm.
-        let root_pid = {
+        // natural death below drives the watcher's unrequested-exit arm. The
+        // kill sender is bound OUT of the destructured session and kept alive
+        // below (never sent): with `kill_rx` pending, the requested-kill
+        // select arm can never become ready.
+        let (root_pid, kill_tx_keepalive) = {
             let session = st
                 .sessions
                 .lock()
@@ -6140,8 +6167,14 @@ while true; do read -r -t 1 _ || true; done
                 client,
                 consumer,
                 watcher,
+                kill_tx,
                 ..
             } = session;
+            assert!(
+                kill_tx.is_some(),
+                "this fixture must hold the open kill channel so only the \
+                 unrequested-exit arm can fire"
+            );
             st.restart_lease_pins
                 .lock()
                 .await
@@ -6161,10 +6194,11 @@ while true; do read -r -t 1 _ || true; done
                     tree_quiesced: false,
                 },
             );
-            root_pid
+            (root_pid, kill_tx)
         };
 
-        // The sidecar dies on its own (never requested): the wait arm reaps it.
+        // The sidecar dies on its own (never requested): with the kill channel
+        // still open and unsent, only the wait arm can reap it.
         unsafe {
             libc::kill(root_pid as i32, libc::SIGKILL);
         }
@@ -6185,6 +6219,23 @@ while true; do read -r -t 1 _ || true; done
             );
         }
 
+        // Wait-arm-only side effect: the unrequested-exit arm broadcasts
+        // `freshAgent.status{exited}` (`CodexAdapterEvent::Status`); the
+        // requested-kill arm deliberately broadcasts nothing (its caller sends
+        // `freshAgent.killed`). Receiving this frame — not merely the join —
+        // proves the lane this fixture drove.
+        let frame: Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(5), bus_rx.recv())
+                .await
+                .expect("the unrequested-exit arm must broadcast the exited status")
+                .expect("broadcast frame"),
+        )
+        .unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["event"]["type"], "freshAgent.status");
+        assert_eq!(frame["event"]["status"], "exited");
+        assert_eq!(frame["event"]["sessionId"], "thread-restart-crash");
+
         assert!(
             matches!(
                 st.leases
@@ -6193,6 +6244,114 @@ while true; do read -r -t 1 _ || true; done
             ),
             "the unrequested-exit arm must hold the durable binding while the \
              session is restart-quarantined"
+        );
+
+        // The kill channel is released only now — the watcher is already done,
+        // so this can never fall through to a requested-kill path.
+        drop(kill_tx_keepalive);
+    }
+
+    /// An UNFENCED `freshAgent.kill` (no `expected_runtime_id`/`expected_generation`
+    /// — the shape pane-close/cleanup lanes send) arriving while a restart
+    /// retirement is parked in quarantine must NOT release the durable lease
+    /// binding: the session was already removed from the live map by
+    /// `shutdown_for_restart_detailed`, so `handle_kill` takes its
+    /// nothing-to-stop (`quiesced = true`) branch, which must consult the same
+    /// `restart_lease_pins` set the watcher arms gate on. The kill frame still
+    /// broadcasts `success:true` (legacy `adapter.kill` parity); only the
+    /// binding release is held until the retirement's `Stopped` path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unfenced_kill_while_restart_quarantined_cannot_release_the_lease_binding() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (st, mut rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-restart-kill-race",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-restart-kill-race",
+        )
+        .await;
+        drop(peer);
+        assert_eq!(
+            st.leases
+                .claim(PROVIDER, "thread-restart-kill-race", "original", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        );
+        assert!(st.leases.complete(
+            PROVIDER,
+            "thread-restart-kill-race",
+            "original",
+            "thread-restart-kill-race"
+        ));
+
+        // Park the retirement mid-flight: the blocked consumer keeps the
+        // retirement Incomplete. The drop guard releases the blocker on every
+        // exit path, including a failed assertion.
+        let blocker_started = Arc::new(tokio::sync::Notify::new());
+        let blocker_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release = ReleaseOnDrop(blocker_release.clone());
+        {
+            let mut sessions = st.sessions.lock().await;
+            let session = sessions
+                .get_mut("thread-restart-kill-race")
+                .expect("inserted session");
+            let started = blocker_started.clone();
+            let release = blocker_release.clone();
+            session.consumer = tokio::task::spawn_blocking(move || {
+                started.notify_one();
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            });
+        }
+        blocker_started.notified().await;
+
+        assert!(matches!(
+            st.shutdown_for_restart_detailed(
+                "thread-restart-kill-race",
+                "fresh-runtime-test-thread-restart-kill-race",
+            )
+            .await,
+            crate::RestartShutdownOutcome::RetirementIncomplete { .. }
+        ));
+        assert!(!st.has_live_session("thread-restart-kill-race").await);
+
+        // Cross-lane kill with NO runtime fence while the retirement is parked.
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-restart-kill-race".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        // Legacy parity preserved: the kill is still acknowledged...
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.killed");
+        assert_eq!(frame["sessionId"], "thread-restart-kill-race");
+        assert_eq!(frame["success"], true);
+
+        // ...but the durable binding must NOT be reopened: the retirement's
+        // Stopped path owns the release, no other lane.
+        assert!(
+            matches!(
+                st.leases.claim(
+                    PROVIDER,
+                    "thread-restart-kill-race",
+                    "replacement-too-early",
+                    2
+                ),
+                crate::session_lease::FreshSessionClaim::BoundLive { .. }
+            ),
+            "an unfenced kill during a quarantined restart retirement must not \
+             release the durable lease binding"
         );
     }
 

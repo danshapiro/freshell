@@ -4081,16 +4081,34 @@ rl.on('line', (line) => {
         let (mut child, _stdin, _stdout, ownership_id) =
             spawn_sidecar(Some(&ownership_tag)).await.unwrap();
         let pid = child.id().expect("sidecar pid");
-        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
-
-        assert!(environ.split(|byte| *byte == 0).any(|variable| {
-            variable
-                == format!(
-                    "{}={ownership_tag}",
-                    crate::RESTART_REPLACEMENT_OWNERSHIP_ENV
-                )
-                .as_bytes()
-        }));
+        // `/proc/<pid>/environ` reads EMPTY between `posix_spawn` returning and
+        // `node`'s execve completing (a CLONE_VM child has no own mm to read),
+        // and whole-suite load stretches that pre-exec window — the previous
+        // single-shot read flaked in most whole-lib runs on this box
+        // (documented in `.dfx/task-001-report.md`). Wait, bounded, for exec
+        // completion; a spawn that genuinely lost its tag still fails, just
+        // at the deadline.
+        let tag = format!(
+            "{}={ownership_tag}",
+            crate::RESTART_REPLACEMENT_OWNERSHIP_ENV
+        );
+        let carries_tag = || {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .map(|environ| {
+                    environ
+                        .split(|byte| *byte == 0)
+                        .any(|variable| variable == tag.as_bytes())
+                })
+                .unwrap_or(false)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !carries_tag() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "spawned sidecar's /proc/{pid}/environ never carried the ownership tag"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let _ = child.start_kill();
         reap_owned_claude_sidecars(&ownership_id);
