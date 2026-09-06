@@ -151,6 +151,12 @@ async fn patch_session(
         // titleSource:'user' only when a non-empty title is present (sessions-router.ts:132-133).
         if title.is_some() {
             patch.push(("titleSource", Some(json!("user"))));
+        } else {
+            // b5fb: an explicit clear removes BOTH keys — a leftover
+            // titleSource:"user" would permanently finalize the row at the top
+            // rung and block every automatic title update afterwards
+            // (migrations.rs:77-81 clears the same pair).
+            patch.push(("titleSource", None));
         }
     }
     if body.get("summaryOverride").is_some() {
