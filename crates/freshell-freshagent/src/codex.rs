@@ -5985,6 +5985,13 @@ while true; do read -r -t 1 _ || true; done
         ));
 
         drop(_release);
+        assert!(
+            st.restart_lease_pins
+                .lock()
+                .await
+                .contains("thread-retirement-incomplete"),
+            "the quarantined retirement must still hold the lease pin before Stopped"
+        );
         assert_eq!(
             st.shutdown_for_restart_detailed(
                 "thread-retirement-incomplete",
@@ -5993,6 +6000,13 @@ while true; do read -r -t 1 _ || true; done
             .await,
             crate::RestartShutdownOutcome::Stopped,
             "same-runtime retry must finish the quarantined retirement"
+        );
+        assert!(
+            !st.restart_lease_pins
+                .lock()
+                .await
+                .contains("thread-retirement-incomplete"),
+            "the Stopped path must drain the restart lease pin (codex.rs:2144)"
         );
         assert_eq!(
             st.leases
