@@ -111,9 +111,17 @@ async fn upload_attachment(
     body: Bytes,
 ) -> Response {
     // Express `typeof req.query.name !== 'string'` parity: `Query<Vec<..>>`
-    // keeps repeated keys, so missing, empty, AND repeated `name` all land here.
+    // keeps repeated keys AND unrelated keys, so first filter to pairs whose
+    // key IS `name` (Node reads `req.query.name`; other keys are ignored),
+    // then require exactly one non-empty value — missing, empty (`?name=`),
+    // and repeated `name` keys all reject.
+    let names: Vec<&String> = names
+        .iter()
+        .filter(|(key, _)| key == "name")
+        .map(|(_, value)| value)
+        .collect();
     let name = match names.as_slice() {
-        [(_, value)] if !value.is_empty() => value.clone(),
+        [value] if !value.is_empty() => (*value).clone(),
         _ => return bad_request("name query parameter required"),
     };
 
@@ -362,6 +370,64 @@ mod tests {
             .await
             .unwrap();
         assert_error(resp, StatusCode::BAD_REQUEST, BODY_MSG).await;
+    }
+
+    /// Node oracle: `req.query.name` is `undefined` for `?foo=bar`, so the
+    /// oracle 400s. The key must BE `name`; a single non-empty pair with a
+    /// different key is not a name.
+    #[tokio::test]
+    async fn rejects_a_single_query_pair_whose_key_is_not_name() {
+        let home = tempfile::tempdir().unwrap();
+        let app = router(state(home.path()));
+        let resp = app
+            .oneshot(post_upload(
+                "?foo=bar",
+                Some("tok"),
+                Some(OCTET_STREAM),
+                b"data".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_error(resp, StatusCode::BAD_REQUEST, NAME_MSG).await;
+
+        let attachments_dir = home.path().join(".freshell").join("attachments");
+        assert!(
+            tokio::fs::metadata(&attachments_dir).await.is_err(),
+            "attachments dir must not be created for a nameless request"
+        );
+    }
+
+    /// Node oracle: `?name=a.txt&other=x` has `req.query.name === 'a.txt'`
+    /// (a string), so the oracle 200s with name `a.txt`; unrelated params
+    /// beside a valid `name` are ignored.
+    #[tokio::test]
+    async fn accepts_a_name_alongside_unrelated_query_params() {
+        let home = tempfile::tempdir().unwrap();
+        let app = router(state(home.path()));
+        let resp = app
+            .oneshot(post_upload(
+                "?name=a.txt&other=x",
+                Some("tok"),
+                Some(OCTET_STREAM),
+                b"data".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+
+        let saved_path = PathBuf::from(value["path"].as_str().unwrap());
+        let attachments_dir = home.path().join(".freshell").join("attachments");
+        assert_eq!(saved_path.parent().unwrap(), attachments_dir.as_path());
+        let basename = saved_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            regex::Regex::new(r"^[0-9a-f]{8}-a\.txt$")
+                .unwrap()
+                .is_match(basename),
+            "unexpected saved basename: {basename}"
+        );
+        let disk = tokio::fs::read(&saved_path).await.unwrap();
+        assert_eq!(disk, b"data");
     }
 
     #[tokio::test]
