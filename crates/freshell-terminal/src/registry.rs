@@ -3759,6 +3759,64 @@ mod tests {
     }
 
     #[test]
+    fn remarking_restart_retiring_keeps_one_entry_and_survives_eviction_cycles() {
+        // Re-marking a live tombstone must not double-book the FIFO order
+        // queue (a duplicate entry would consume an eviction slot twice); a
+        // re-mark AFTER an eviction is a fresh insert that fences again.
+        // (Task-10 review nit pin.) The capture guard is NOT for assertion:
+        // every thread evaluating the eviction `warn!` callsite must hold a
+        // subscriber so the callsite's (process-global) interest is never
+        // rebuilt against a null subscriber mid-run, which would starve the
+        // sibling FIFO test's capture.
+        let (_events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-dup", "S-dup");
+        assert!(reg.mark_restart_retiring("T-dup"));
+        assert!(reg.mark_restart_retiring("T-dup"));
+        {
+            let tombstones = reg.restart_retiring_terminals.lock().unwrap();
+            assert_eq!(
+                tombstones
+                    .order
+                    .iter()
+                    .filter(|id| id.as_str() == "T-dup")
+                    .count(),
+                1,
+                "a re-marked tombstone keeps ONE order entry (no duplicate slot)"
+            );
+        }
+        assert!(
+            reg.consume_restart_retiring("T-dup"),
+            "one consume still removes a double-marked tombstone"
+        );
+        assert!(!reg.is_restart_retiring("T-dup"));
+
+        reg.insert_headless("T-revived", "S-revived");
+        assert!(reg.mark_restart_retiring("T-revived"));
+        for i in 0..MAX_RESTART_RETIRING_TOMBSTONES {
+            let id = format!("T-flood-{i}");
+            reg.insert_headless(&id, &format!("S-flood-{i}"));
+            reg.mark_restart_retiring(&id);
+        }
+        assert!(
+            !reg.is_restart_retiring("T-revived"),
+            "T-revived was evicted by the FIFO flood"
+        );
+        assert!(
+            reg.mark_restart_retiring("T-revived"),
+            "a re-mark after eviction inserts fresh"
+        );
+        assert!(
+            reg.is_restart_retiring("T-revived"),
+            "the revived tombstone fences CrashEvents again"
+        );
+        assert!(
+            reg.consume_restart_retiring("T-revived"),
+            "the revived tombstone is consumable"
+        );
+    }
+
+    #[test]
     fn kill_all_reaps_every_running_terminal_and_notifies_subscribers() {
         // SAFE-11/TERM-22: the shutdown path must reap EVERY tracked terminal
         // (not just the one a caller happens to name), mirroring
