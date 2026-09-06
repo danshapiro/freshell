@@ -203,8 +203,8 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         "third new_locked came up empty despite the lock being acquirable and \
          s1.json on disk ({s1_on_disk}): silent-empty load_index is no longer \
          constructible (qzka), so `next` came up DISABLED — check this run's \
-         stderr for pane_ledger_scan_unavailable (scan fault) or a lock race \
-         with the holder's drop"
+         stderr for pane_ledger_scan_unavailable (scan fault) or \
+         pane_ledger_lock_unavailable (a lock race with the holder's drop)"
     );
     std::fs::remove_dir_all(&root).ok();
 }

@@ -44,7 +44,8 @@ pub struct BootScanReport {
     pub gc_tombstoned: Vec<SessionLocator>,
     pub tombstones_deleted: Vec<SessionLocator>,
     /// Directory-walk faults hit by the quarantine rescan (`"<path>: <os
-    /// error>"`, each already ERROR-logged at fault time). An ENABLED
+    /// error>"`; read-dir faults carry the helper's `read <path>:` prefix,
+    /// each already ERROR-logged at fault time). An ENABLED
     /// ledger's store was fully readable at construction (kata qzka), so any
     /// entry here means the store DEGRADED between construction and this
     /// pass — always loud, never silently skipped.
