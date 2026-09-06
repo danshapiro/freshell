@@ -315,6 +315,8 @@ fn seed_bound_row(ledger: &PaneLedger, provider: &str, session_id: &str) {
             mode: provider,
             cwd: None,
             create_request_id: None,
+            origin_create_request_id: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             now_ms: now_ms(),
         })
         .expect("seed bound ledger row");
@@ -395,6 +397,7 @@ fn respawn_state_with_probe(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(vec![common::sleeper_cli_spec("amplifier")]),

@@ -93,6 +93,7 @@ vi.mock('lucide-react', () => ({
   Bot: ({ className }: { className?: string }) => <svg data-testid="bot-icon" className={className} />,
   Square: ({ className }: { className?: string }) => <svg data-testid="square-icon" className={className} />,
   LayoutGrid: ({ className }: { className?: string }) => <svg data-testid="layout-icon" className={className} />,
+  Gauge: ({ className }: { className?: string }) => <svg data-testid="gauge-icon" className={className} />,
   Globe: ({ className }: { className?: string }) => <svg data-testid="globe-icon" className={className} />,
   FileText: ({ className }: { className?: string }) => <svg data-testid="file-text-icon" className={className} />,
   Search: ({ className }: { className?: string }) => <svg data-testid="search-icon" className={className} />,

@@ -21,7 +21,9 @@ export type BootstrapPayload = {
   platform: unknown
   shell: { authenticated: boolean; ready?: boolean; tasks?: Record<string, boolean> }
   perf?: { logging: boolean }
-  configFallback?: { reason: string; backupExists: boolean }
+  configFallback?: { reason: string; backupExists: boolean; backupPath?: string }
+  /** Effective server config dir (`~/.freshell` or the named profile's dir). */
+  configDir?: string
 }
 
 export const ReadModelPrioritySchema = z.enum(['visible', 'background'])

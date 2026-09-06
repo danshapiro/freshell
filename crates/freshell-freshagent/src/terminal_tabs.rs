@@ -200,6 +200,21 @@ async fn create_terminal_or_content_tab_with_delivery(
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // `hostStats: true` -> stateless host-stats pane (router.ts `wantsHostStats`
+    // branch before browser): no process, no terminal admission.
+    if body
+        .get("hostStats")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return create_content_tab(
+            &state,
+            name,
+            json!({ "kind": "host-stats" }),
+            restore_key.as_deref(),
+            broadcast,
+        );
+    }
     if let Some(url) = body.get("browser").and_then(Value::as_str) {
         // `devToolsOpen` flows into the frozen client verbatim via
         // `paneContent` (ui-commands.ts `tab.create` -> initLayout), so a
@@ -3177,6 +3192,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["data"]["tabId"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn create_host_stats_tab_attaches_host_stats_pane_content_and_no_terminal() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let (status, body) =
+            post(app(state), "/api/tabs", json!({ "hostStats": true }), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["data"]["tabId"].as_str().is_some());
+        assert!(body["data"]["paneId"].as_str().is_some());
+        assert!(body["data"].get("terminalId").is_none());
+
+        let frame = rx.recv().await.expect("ui.command frame broadcast");
+        let msg: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(msg["command"], json!("tab.create"));
+        assert_eq!(msg["payload"]["paneContent"]["kind"], json!("host-stats"));
     }
 
     // ── GET /api/tabs ────────────────────────────────────────────────────────
@@ -6626,5 +6658,54 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("use screenshot-pane"));
+    }
+
+    #[tokio::test]
+    async fn capture_layout_synced_legacy_fresh_agent_pane_is_422() {
+        // Mirrors the e2e kata scenario
+        // (test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts:402-424):
+        // a legacy `agent-chat` pane arrives through the layout sync path, is
+        // normalized to `fresh-agent` by the layout store's migration, and
+        // exists in NO runtime pane map.
+        let state = state_with_registry();
+        state.layout.update_from_ui(
+            &serde_json::from_value::<freshell_protocol::UiLayoutSync>(json!({
+                "tabs": [{ "id": "t1" }],
+                "activeTabId": "t1",
+                "layouts": {
+                    "t1": {
+                        "type": "leaf",
+                        "id": "pane-legacy-agent",
+                        "content": {
+                            "kind": "agent-chat",
+                            "provider": "claude",
+                            "resumeSessionId": "11111111-1111-4111-8111-111111111111"
+                        }
+                    }
+                },
+                "activePane": { "t1": "pane-legacy-agent" },
+                "timestamp": 1
+            }))
+            .expect("UiLayoutSync parses"),
+            "conn-1",
+        );
+        let router = app(state);
+
+        let (status, body) = get(router, "/api/panes/pane-legacy-agent/capture", true).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["message"],
+            json!("pane kind \"fresh-agent\" does not support capture-pane; use screenshot-pane")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_unknown_pane_still_404s_pane_not_found() {
+        // Guard: no layout sync, no runtime maps — the pre-existing unknown-pane
+        // answer is unchanged by the layout consult.
+        let state = state_with_registry();
+        let (status, body) = get(app(state), "/api/panes/nope/capture", true).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["message"], json!("pane not found"));
     }
 }

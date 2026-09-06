@@ -33,6 +33,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
+- Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped at vitest config load by `config/vitest/sanitize-test-env.ts` (imported first by every config EXCEPT the two real-provider smoke configs); local test runs do not need env pre-stripping.
 
 ## Destructive Test Sandbox
 - Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).
@@ -224,7 +225,7 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 
 ### Key Architectural Patterns
 
-**WebSocket Protocol:** Schema-validated messages using Zod. Handshake flow: client sends `hello` with token → server validates → sends `ready`. Message types include `terminal.create/input/resize/detach/attach` and broadcasts like `sessions.updated`.
+**WebSocket Protocol:** Schema-validated messages using Zod. Handshake flow: client sends `hello` with token → server validates → sends `ready`. Message types include `terminal.create/input/resize/detach/attach` and broadcasts like `sessions.updated`. The `ready` frame carries an optional additive `buildId` (the server's artifact-time-baked git commit, `"unknown"` fallback): the client bakes its own at Vite build time (`__FRESHELL_BUILD_ID__`) and, on a mismatch, reloads exactly once per tab session (sessionStorage sentinel `freshell.server-build-reload` records the last attempted server build id; the same id never reloads twice, a different (corrected) deployment re-arms the guard), self-healing stale-client contract errors; `"unknown"` on either side never triggers or clears the guard (`src/lib/server-build-check.ts`). The once-guard is per server identity: an origin fronted by mixed-build servers could oscillate, and a newer client against an older server costs one futile bounded reload per fresh tab session (both accepted for the single-server self-hosted model).
 
 **PTY Lifecycle:** Each terminal has a unique ID. Server maintains 64KB scrollback buffer. On attach, client receives buffer snapshot then streams new output. On detach, process continues running (background session). Configurable idle timeout (15 mins default).
 
@@ -234,7 +235,7 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 
 **Configuration Persistence:** User config stored at `~/.freshell/config.json`. Atomic writes with temp file + rename. Settings changes POST to `/api/settings` and broadcast via WebSocket.
 
-**Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
+**Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status), `browser` (with URL, devtools state), `editor` (file path), and `host-stats` (host pressure dashboard; no per-pane payload).
 
 **Rename scope contract:** pane/tab labels are layout-local; only an explicit session rename writes a durable session title (terminal renames are terminal-scoped). The four name scopes and the reset-to-provider-title flow live in [docs/development/rename-scope-contract.md](docs/development/rename-scope-contract.md).
 

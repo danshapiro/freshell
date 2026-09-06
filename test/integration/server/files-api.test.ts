@@ -99,6 +99,64 @@ describe('Files API Integration', () => {
     })
   })
 
+  describe('GET /api/files/raw', () => {
+    it('serves PNG bytes exactly with an image/png Content-Type', async () => {
+      const pngBytes = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x10,
+      ])
+      const pngPath = path.join(tempDir, 'pixel.png')
+      await fsp.writeFile(pngPath, pngBytes)
+
+      const res = await request(app)
+        .get('/api/files/raw')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .query({ path: pngPath })
+        .buffer(true)
+        .parse((r, cb) => {
+          const chunks: Buffer[] = []
+          r.on('data', (c: Buffer) => chunks.push(c))
+          r.on('end', () => cb(null, Buffer.concat(chunks)))
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.headers['content-type']).toBe('image/png')
+      expect(res.body).toEqual(pngBytes)
+    })
+
+    it('returns 404 JSON for a missing file', async () => {
+      const res = await request(app)
+        .get('/api/files/raw')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .query({ path: path.join(tempDir, 'missing.png') })
+      expect(res.status).toBe(404)
+      expect(res.body).toEqual({ error: 'File not found' })
+    })
+
+    it('expands tilde paths like the read route', async () => {
+      const homeName = `freshell-raw-${process.pid}-${Date.now()}.png`
+      const homePath = path.join(os.homedir(), homeName)
+      const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+      await fsp.writeFile(homePath, bytes)
+      try {
+        const res = await request(app)
+          .get('/api/files/raw')
+          .set('x-auth-token', TEST_AUTH_TOKEN)
+          .query({ path: `~/${homeName}` })
+          .buffer(true)
+          .parse((r, cb) => {
+            const chunks: Buffer[] = []
+            r.on('data', (c: Buffer) => chunks.push(c))
+            r.on('end', () => cb(null, Buffer.concat(chunks)))
+          })
+        expect(res.status).toBe(200)
+        expect(res.headers['content-type']).toBe('image/png')
+        expect(res.body).toEqual(bytes)
+      } finally {
+        await fsp.rm(homePath, { force: true }).catch(() => {})
+      }
+    })
+  })
+
   describe('POST /api/files/write', () => {
     it('writes content to file', async () => {
       const filePath = path.join(tempDir, 'new-file.txt')

@@ -55,7 +55,7 @@ impl ServeHttp for ReqwestServeHttp {
     fn request<'a>(
         &'a self,
         req: ServeHttpRequest,
-    ) -> BoxFuture<'a, Result<ServeHttpResponse, String>> {
+    ) -> BoxFuture<'a, Result<ServeHttpResponse, crate::ServeHttpError>> {
         let client = self.client.clone();
         Box::pin(async move {
             let method = match req.method {
@@ -73,7 +73,18 @@ impl ServeHttp for ReqwestServeHttp {
             if let Some(body) = req.body {
                 builder = builder.body(body);
             }
-            let resp = builder.send().await.map_err(|e| e.to_string())?;
+            // ep1-r3 F2 delivery truth: ONLY a `send()` connect-phase failure
+            // (`is_connect()` — DNS/connect refused before a byte was written)
+            // proves the serve never saw the request; every other `send()`
+            // failure is possibly post-send, and a `bytes()` failure is PROVABLY
+            // post-send (the response headers already arrived).
+            let resp = builder.send().await.map_err(|e| {
+                if e.is_connect() {
+                    crate::ServeHttpError::Undelivered(e.to_string())
+                } else {
+                    crate::ServeHttpError::Ambiguous(e.to_string())
+                }
+            })?;
             let status = resp.status().as_u16();
             let next_cursor = resp
                 .headers()
@@ -81,7 +92,10 @@ impl ServeHttp for ReqwestServeHttp {
                 .and_then(|v| v.to_str().ok())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| crate::ServeHttpError::Ambiguous(e.to_string()))?;
             Ok(ServeHttpResponse {
                 status,
                 body: bytes.to_vec(),

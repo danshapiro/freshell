@@ -37,7 +37,7 @@ pub enum RequestId {
 }
 
 impl RequestId {
-    fn to_json(&self) -> Value {
+    pub fn to_json(&self) -> Value {
         match self {
             RequestId::Int(n) => json!(n),
             RequestId::Str(s) => json!(s),
@@ -71,6 +71,12 @@ impl fmt::Display for RpcError {
 /// One decoded server→client frame (`handleSocketMessage`, `client.ts:567-641`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum IncomingMessage {
+    /// A provider request that needs a user decision, distinct from a notification.
+    Request {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
     /// `{ id, result }` — resolves the pending request `id`.
     Response { id: RequestId, result: Value },
     /// `{ id, error }` — rejects the pending request `id`.
@@ -95,6 +101,11 @@ pub struct CodexTurnEvent {
 /// A classified server→client notification (the fan-out in `client.ts:576-615`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum CodexNotification {
+    ServerRequest {
+        id: RequestId,
+        method: String,
+        params: Value,
+    },
     /// `thread/started` (`protocol.ts:350-355`) — carries the thread handle.
     ThreadStarted { thread: Value },
     /// `thread/closed` (`protocol.ts:359-364`).
@@ -163,11 +174,9 @@ fn parse_rpc_error(value: &Value) -> Option<RpcError> {
     })
 }
 
-/// Decode one server→client frame. Mirrors the reference discrimination: a frame WITH an
-/// `id` key is a response (`{id,result}`) or error (`{id,error}`); a frame WITHOUT an `id`
-/// key is a notification (needs a string `method`). Malformed JSON, non-objects, and a
-/// with-id frame lacking both `result` and `error` all yield `None` (dropped, never fatal —
-/// `client.ts:571-573,631-633`). A `jsonrpc` tag, if present, is ignored (tolerated).
+/// Decode responses, errors, provider requests and notifications. A request carries
+/// both `id` and `method`; retaining it allows the user to answer approval prompts.
+/// Malformed frames are ignored. The optional `jsonrpc` tag is tolerated.
 pub fn parse_incoming_frame(raw: &str) -> Option<IncomingMessage> {
     let value: Value = serde_json::from_str(raw).ok()?;
     let obj = value.as_object()?;
@@ -186,13 +195,31 @@ pub fn parse_incoming_frame(raw: &str) -> Option<IncomingMessage> {
                 error: parse_rpc_error(error)?,
             });
         }
-        // Has id but neither result nor error → not a recognizable envelope; drop.
+        if let Some(method) = obj.get("method").and_then(Value::as_str) {
+            return Some(IncomingMessage::Request {
+                id,
+                method: method.to_string(),
+                params: obj.get("params").cloned().unwrap_or(Value::Null),
+            });
+        }
         return None;
     }
 
     let method = obj.get("method")?.as_str()?.to_string();
     let params = obj.get("params").cloned();
     Some(IncomingMessage::Notification { method, params })
+}
+
+#[cfg(test)]
+#[test]
+fn server_approval_requests_are_not_dropped_as_malformed_responses() {
+    let incoming = parse_incoming_frame(
+        r#"{"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","command":"npm test"}}"#,
+    );
+    assert!(
+        incoming.is_some(),
+        "An approval is a server request that must reach the user"
+    );
 }
 
 /// A client→server frame decoded from the SERVER's perspective — a request
@@ -239,9 +266,17 @@ fn required_string(map: &Map<String, Value>, key: &str) -> Option<String> {
 fn turn_event_from_params(params: Option<&Value>) -> Option<CodexTurnEvent> {
     let obj = params?.as_object()?;
     let thread_id = required_string(obj, "threadId")?;
+    // ep1-r3 F4: the turn id lives in BOTH wire shapes — the PROBED real
+    // app-server's inline `turn.id` (fake-app-server.mjs, codex-adapter.test.ts)
+    // and the legacy-lite flat `turnId` (client.test.ts) — prefer the inline
+    // id, fall back to the flat one. (Pre-F4 this read ONLY the flat key, so
+    // real-shape turn events carried NO id and the
+    // `turn/started`-sets-active-turn fallback was dead for the probed shape.)
     let turn_id = obj
-        .get("turnId")
+        .get("turn")
+        .and_then(|t| t.get("id"))
         .and_then(Value::as_str)
+        .or_else(|| obj.get("turnId").and_then(Value::as_str))
         .map(str::to_string);
     Some(CodexTurnEvent {
         thread_id,
@@ -563,6 +598,35 @@ mod tests {
             ),
         );
         assert!(matches!(inline, CodexNotification::TurnCompleted(_)));
+    }
+
+    #[test]
+    fn classifies_turn_events_read_the_inline_turn_id_shape() {
+        // ep1-r3 F4: the PROBED real app-server carries the turn id at
+        // `params.turn.id` (fake-app-server.mjs) — the extractor must read it
+        // (pre-fix ONLY the flat `turnId` key was read, so real-shape turn
+        // events carried no id — and completion-id ownership could never
+        // match). The flat key remains the fallback for the legacy shape.
+        let started = classify_notification(
+            "turn/started",
+            Some(
+                &json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "inProgress" } }),
+            ),
+        );
+        assert!(
+            matches!(started, CodexNotification::TurnStarted(ref e) if e.turn_id.as_deref() == Some("turn-1")),
+            "{started:?}"
+        );
+        let completed = classify_notification(
+            "turn/completed",
+            Some(
+                &json!({ "threadId": "thread-1", "turn": { "id": "turn-1", "status": "completed" } }),
+            ),
+        );
+        assert!(
+            matches!(completed, CodexNotification::TurnCompleted(ref e) if e.turn_id.as_deref() == Some("turn-1")),
+            "{completed:?}"
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { FreshAgentComposer } from '@/components/fresh-agent/FreshAgentComposer'
+import { createRef } from 'react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { attachmentUploadErrorMessage, FreshAgentComposer, type FreshAgentComposerHandle } from '@/components/fresh-agent/FreshAgentComposer'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 
 const apiGet = vi.fn()
@@ -228,6 +230,8 @@ describe('FreshAgentComposer', () => {
     expect(screen.queryByText('Do not pin my newest message at the bottom')).not.toBeInTheDocument()
     expect(screen.queryByText('Keep this queued follow-up private until expanded')).not.toBeInTheDocument()
 
+    fireEvent.click(screen.getByRole('button', { name: 'Show queued messages' }))
+    expect(screen.getByText('Keep this queued follow-up private until expanded')).toBeVisible()
     const removeButtons = screen.getAllByRole('button', { name: /Remove queued message/ })
     expect(removeButtons).toHaveLength(2)
     fireEvent.click(removeButtons[0])
@@ -444,6 +448,112 @@ describe('FreshAgentComposer', () => {
     })
   })
 
+  describe('attachmentUploadErrorMessage', () => {
+    it.each<[number, { error?: string; message?: string } | null, string, string]>([
+      // 404 = route absent on this server (e.g. Rust build without attachments).
+      [404, { error: 'Not found' }, 'a.txt', 'Attachments are not supported by this server'],
+      // 413 trips the 10 MB cap; express's HTML error body is unparseable, so
+      // the limit is spelled out client-side.
+      [413, null, 'big.txt', '"big.txt" exceeds the 10 MB attachment size limit'],
+      // Anything else: the server's own error/message text wins.
+      [401, { error: 'Unauthorized' }, 'a.txt', 'Unauthorized'],
+      // message worded without error: the message branch is exercised.
+      [500, { message: 'server exploded' }, 'a.txt', 'server exploded'],
+      [500, null, 'a.txt', 'upload failed (500)'],
+    ])('status %i with %s maps to a clear chip message', (status, data, filename, expected) => {
+      expect(attachmentUploadErrorMessage(status, data, filename)).toBe(expected)
+    })
+  })
+
+  describe('attachments', () => {
+    const fetchMock = vi.fn()
+
+    beforeEach(() => {
+      fetchMock.mockReset()
+      vi.stubGlobal('fetch', fetchMock)
+    })
+
+    afterEach(() => {
+      vi.unstubAllGlobals()
+    })
+
+    it('uploads an attachment, shows the stored path on the chip, and sends its path', async () => {
+      const user = userEvent.setup()
+      const onSend = vi.fn()
+      fetchMock.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ path: '/home/u/.freshell/attachments/abcd1234-note.txt', bytes: 16 }),
+      })
+      const { container } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} />)
+
+      await user.upload(
+        container.querySelector('input[type="file"]') as HTMLInputElement,
+        new File(['hello attachment'], 'note.txt', { type: 'text/plain' }),
+      )
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/fresh-agent/attachments?name=note.txt',
+        expect.objectContaining({ method: 'POST' }),
+      )
+
+      const list = await screen.findByRole('list', { name: 'Attachments' })
+      const item = within(list).getByRole('listitem')
+      await waitFor(() => {
+        expect(item).toHaveAttribute('title', '/home/u/.freshell/attachments/abcd1234-note.txt')
+      })
+
+      await user.type(getInput(), 'look at this')
+      await user.click(screen.getByRole('button', { name: 'Send' }))
+      expect(onSend).toHaveBeenCalledWith('look at this', ['/home/u/.freshell/attachments/abcd1234-note.txt'])
+    })
+
+    it('shows a visible error chip when the server lacks the attachments route (404)', async () => {
+      const user = userEvent.setup()
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ error: 'Not found' }),
+      })
+      const { container } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} />)
+
+      await user.upload(
+        container.querySelector('input[type="file"]') as HTMLInputElement,
+        new File(['hello'], 'note.txt', { type: 'text/plain' }),
+      )
+
+      const list = await screen.findByRole('list', { name: 'Attachments' })
+      expect(
+        await within(list).findByText('— Attachments are not supported by this server'),
+      ).toBeInTheDocument()
+    })
+
+    it('shows a visible error chip for an unparsable 413 (express HTML error page)', async () => {
+      const user = userEvent.setup()
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 413,
+        json: async () => { throw new SyntaxError('Unexpected token < in JSON') },
+      })
+      const { container } = render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={vi.fn()} />)
+
+      await user.upload(
+        container.querySelector('input[type="file"]') as HTMLInputElement,
+        new File(['x'.repeat(64)], 'huge.txt', { type: 'text/plain' }),
+      )
+
+      // Fetch WAS called: .txt passes the client-side extension gate, so the
+      // failure provenance is the server, not a pre-fetch client rejection.
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/fresh-agent/attachments?name=huge.txt',
+        expect.objectContaining({ method: 'POST' }),
+      )
+      const list = await screen.findByRole('list', { name: 'Attachments' })
+      expect(
+        await within(list).findByText(/exceeds the 10 MB attachment size limit/),
+      ).toBeInTheDocument()
+    })
+  })
+
   describe('state-aware disabled behavior', () => {
     it('shows the provided placeholder instead of the generic read-only text', () => {
       render(
@@ -475,6 +585,113 @@ describe('FreshAgentComposer', () => {
       fireEvent.click(browse)
       fireEvent.click(screen.getByRole('menuitem', { name: /\/compact/ }))
       expect(onCommand).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('rollback refill + reserved slash names (kata 1wxv)', () => {
+    const UNDO_COMMAND: FreshAgentSlashCommand = {
+      name: 'undo',
+      description: 'Roll back the last turn (conversation only — files stay as they are)',
+      action: 'undo',
+    }
+    const REDO_COMMAND: FreshAgentSlashCommand = {
+      name: 'redo',
+      description: 'Restore the last rolled-back turn',
+      action: 'redo',
+    }
+
+    it('replaceText overwrites the box (decision 4: replace, never append) and focuses', async () => {
+      const ref = createRef<FreshAgentComposerHandle>()
+      render(<FreshAgentComposer ref={ref} storageKey="t-rb" onSend={() => {}} />)
+      act(() => { ref.current?.insertText('old draft') })
+      expect(getInput().value).toBe('old draft')
+
+      act(() => { ref.current?.replaceText('removed prompt') })
+
+      const textarea = getInput()
+      expect(textarea.value).toBe('removed prompt')
+      expect(window.sessionStorage.getItem('t-rb')).toBe('removed prompt')
+      await waitFor(() => {
+        expect(document.activeElement).toBe(textarea)
+        expect(textarea.selectionStart).toBe('removed prompt'.length)
+        expect(textarea.selectionEnd).toBe('removed prompt'.length)
+      })
+    })
+
+    // r3 correction 8: the composer's submit path intercepts RESERVED rollback names
+    // BEFORE catalog resolution, so a capability-filtered-out command never falls
+    // through to onSend (a typed /redo on freshcodex never reaches the model as text).
+    it('typed /redo unresolvable against the catalog calls onReservedRollbackCommand and NEVER onSend', () => {
+      const onSend = vi.fn()
+      const onCommand = vi.fn()
+      const onReservedRollbackCommand = vi.fn()
+      // freshcodex-shaped catalog: /undo present, /redo deliberately omitted
+      // (capability-filtered in shared/fresh-agent-slash-commands.ts, Task 1).
+      render(
+        <FreshAgentComposer
+          commands={{ action: [...COMMANDS, UNDO_COMMAND], session: [] }}
+          onCommand={onCommand}
+          onSend={onSend}
+          onReservedRollbackCommand={onReservedRollbackCommand}
+          historyKey="fresh-agent-prompt-history:reserved-seam"
+        />,
+      )
+
+      // The keyboard path: the open (but empty) slash menu consumes Enter, so the
+      // intercept must fire from the menu's no-selection branch too.
+      fireEvent.change(getInput(), { target: { value: '/redo' } })
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+
+      expect(onReservedRollbackCommand).toHaveBeenCalledTimes(1)
+      expect(onReservedRollbackCommand).toHaveBeenCalledWith('redo')
+      expect(onCommand).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      // The box is cleared and the text pushed to history exactly like a resolved command.
+      expect(getInput().value).toBe('')
+      const history = JSON.parse(window.localStorage.getItem('fresh-agent-prompt-history:reserved-seam') ?? '[]')
+      expect(history[0]).toBe('/redo')
+    })
+
+    it('typed /undo unresolvable against the catalog intercepts on the submit path too', () => {
+      const onSend = vi.fn()
+      const onReservedRollbackCommand = vi.fn()
+      render(
+        <FreshAgentComposer
+          commands={{ action: COMMANDS, session: [] }}
+          onSend={onSend}
+          onReservedRollbackCommand={onReservedRollbackCommand}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/undo' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+      expect(onReservedRollbackCommand).toHaveBeenCalledTimes(1)
+      expect(onReservedRollbackCommand).toHaveBeenCalledWith('undo')
+      expect(onSend).not.toHaveBeenCalled()
+      expect(getInput().value).toBe('')
+    })
+
+    it('typed /redo resolvable against the catalog still dispatches the normal command path', () => {
+      const onSend = vi.fn()
+      const onCommand = vi.fn()
+      const onReservedRollbackCommand = vi.fn()
+      // freshopencode-shaped catalog: /undo AND /redo both resolve.
+      render(
+        <FreshAgentComposer
+          commands={{ action: [...COMMANDS, UNDO_COMMAND, REDO_COMMAND], session: [] }}
+          onCommand={onCommand}
+          onSend={onSend}
+          onReservedRollbackCommand={onReservedRollbackCommand}
+        />,
+      )
+
+      fireEvent.change(getInput(), { target: { value: '/redo' } })
+      fireEvent.keyDown(getInput(), { key: 'Enter' })
+
+      expect(onCommand).toHaveBeenCalledWith(expect.objectContaining({ name: 'redo' }), '')
+      expect(onReservedRollbackCommand).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
     })
   })
 })
