@@ -12,6 +12,7 @@ import {
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
   type FreshAgentSessionCommand,
+  type FreshAgentSettingScopes,
 } from '../../../../shared/fresh-agent-contract.js'
 
 export type FreshAgentNormalizedItem =
@@ -60,6 +61,11 @@ export type FreshAgentClaudeSnapshot = {
     approvals: boolean
     questions: boolean
     fork: boolean
+    /** Task z7j7-3: the honest per-knob scope advertisement (create-only here —
+     *  the Node adapter has no mid-session settings path; that is the Rust
+     *  server's settings.update sidecar frame). Optional: the Rust-served
+     *  snapshot shape shares this closed type and advertises its own truth. */
+    settingScopes?: FreshAgentSettingScopes
   }
   settings: {
     model?: string
@@ -233,6 +239,16 @@ export function normalizeClaudeThreadSnapshot(input: {
       approvals: normalizePendingApprovals(input.liveSession).length > 0,
       questions: normalizePendingQuestions(input.liveSession).length > 0,
       fork: false,
+      // Node claude stays create-only (no mid-session settings path exists on
+      // this stack — per-send application is the Rust server's settings.update
+      // sidecar frame); sandbox is unsupported on claude everywhere. The UI
+      // gates "applies to next send only" vs "session create only" copy on this.
+      settingScopes: {
+        model: 'create-only',
+        effort: 'create-only',
+        permissionMode: 'create-only',
+        sandbox: 'unsupported',
+      },
     },
     settings: {
       ...(input.liveSession?.model ? { model: input.liveSession.model } : {}),

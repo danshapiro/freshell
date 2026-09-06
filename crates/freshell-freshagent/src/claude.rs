@@ -58,7 +58,7 @@ use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
     FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
     FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond,
-    FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
+    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSendSettings, ServerMessage, SessionType,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
@@ -209,6 +209,20 @@ struct ClaudeSession {
     /// the pane keyed on the durable receives events. A shared mutable handle because
     /// the consumer task runs detached from this record.
     broadcast_id: Arc<std::sync::Mutex<String>>,
+    /// The session's stored settings baseline (Task z7j7-3 per-send settings):
+    /// seeded from the create-frame values (or the ledger-recovered snapshot on
+    /// a resume-in-place), merged-forward by every knob-bearing `freshAgent.send`
+    /// (`handle_send`), and read by TWO consumers: the durable-ledger refresh
+    /// after a settings application, and the stdout consumer's `sdk.session.init`
+    /// binding write, which PREFERS these live fields over the create-time
+    /// captured snapshot (a pre-init settings change must survive the durable
+    /// write). Never a projection of the sidecar's confirmed state — the
+    /// sidecar's own baseline copies move only on control-call success.
+    model: Option<String>,
+    /// See [`ClaudeSession::model`].
+    permission_mode: Option<String>,
+    /// See [`ClaudeSession::model`].
+    effort: Option<String>,
     /// The folded pending approval/question set (Task 2) — see [`ClaudePending`].
     pending: Arc<std::sync::Mutex<ClaudePending>>,
     /// The session's tracked status (the stdout consumer's fold: the reference
@@ -549,6 +563,11 @@ impl FreshClaudeState {
                 consumer,
                 sidecar_session_id: created.clone(),
                 cli_session_id: resume_sid.clone(),
+                // Task z7j7-3 baseline: seeded from the SAME values the create
+                // request above actually sent.
+                model: msg.model.clone(),
+                permission_mode: msg.permission_mode.clone(),
+                effort: msg.effort.clone(),
                 broadcast_id,
                 pending,
                 last_status,
@@ -755,10 +774,27 @@ impl FreshClaudeState {
 
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────────────
 
-    /// Handle a `freshAgent.send` for claude: push the user turn into the sidecar's SDK
-    /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer surfaces
-    /// the completion edge (`sdk.result subtype=success` → `freshAgent.turn.complete`).
+    /// Handle a `freshAgent.send` for claude: apply any settings-carried
+    /// model/permissionMode/effort knobs (Task z7j7-3 — the client ships the
+    /// pane's current selection on EVERY send; silently dropping them was the
+    /// bug) via the internal `settings.update` sidecar frame, then push the user
+    /// turn into the sidecar's SDK input stream, then broadcast
+    /// `freshAgent.send.accepted`. The stdout consumer surfaces the completion
+    /// edge (`sdk.result subtype=success` → `freshAgent.turn.complete`).
     /// Claude's send returns void, so NO `submittedTurnId` and NO materialization.
+    ///
+    /// Settings discipline: an INVALID knob refuses the WHOLE send LOUDLY on the
+    /// session-scoped `freshAgent.error` channel (the banner-visible one — a
+    /// top-level `Error` frame is silently cleaned up client-side for fresh-agent
+    /// sends, FreshAgentView.tsx:1785-1838) and writes NOTHING to the sidecar.
+    /// A valid knob set merges over the session's stored baseline (the merged
+    /// values become the NEW baseline), refreshes the durable-ledger row (so a
+    /// post-restart resume doesn't silently revert the change), then writes
+    /// `settings.update` BEFORE the `send` frame — line order on stdin plus the
+    /// sidecar's serialized per-session op chain (`enqueue`) guarantee the
+    /// update is fully applied before the user turn enters the SDK input
+    /// stream. Sends whose settings carry only `cwd`/no knobs take the
+    /// pre-existing plain-send path untouched (single `send` frame).
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
@@ -776,6 +812,70 @@ impl FreshClaudeState {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+
+        // Task z7j7-3: mid-session settings application. Only model/permissionMode/
+        // effort count as knobs (claude has no sandbox concept; cwd is unchanged
+        // mid-session). The frame shape is [`settings_update_frame`].
+        let settings_knobs = msg
+            .settings
+            .as_ref()
+            .filter(|s| s.model.is_some() || s.permission_mode.is_some() || s.effort.is_some());
+        let mut ledger_refresh: Option<(String, crate::identity_sink::FreshAgentSettings)> = None;
+        if let Some(settings) = settings_knobs {
+            // Reject invalid values LOUDLY, before ANY side effect.
+            if let Err((code, message)) = validate_claude_send_settings(settings) {
+                drop(guard);
+                self.emit_fresh_agent_error(&session_id, session_type, code, &message);
+                return;
+            }
+            // Merge over the stored baseline; the merged values ARE the new
+            // baseline (echoed back by the sidecar's post-apply
+            // `sdk.session.metadata`, which the client folds into the status chip).
+            if let Some(model) = &settings.model {
+                session.model = Some(model.clone());
+            }
+            if let Some(permission_mode) = &settings.permission_mode {
+                session.permission_mode = Some(permission_mode.clone());
+            }
+            if let Some(effort) = &settings.effort {
+                session.effort = Some(effort.clone());
+            }
+            // Arm the durable-ledger refresh (flushed after the sidecar writes
+            // leave the lock — never an awaited fsync under the sessions map).
+            // Keyed by the DURABLE cliSessionId: unknown until `sdk.session.init`
+            // lands on a fresh create (moments later that arm's own binding write
+            // carries the live baseline — it reads these same fields), so a miss
+            // here is a debug note, never an alarm.
+            ledger_refresh = match &session.cli_session_id {
+                Some(cli_id) => Some((
+                    cli_id.clone(),
+                    // Claude has no sandbox concept; cwd never changes mid-session
+                    // and is carried over from the previously recorded row at
+                    // flush time (ClaudeSession tracks no cwd).
+                    crate::identity_sink::FreshAgentSettings {
+                        model: session.model.clone(),
+                        sandbox: None,
+                        permission_mode: session.permission_mode.clone(),
+                        effort: session.effort.clone(),
+                        cwd: None,
+                    },
+                )),
+                None => {
+                    tracing::debug!(session = %map_key, "freshagent.claude.settings_ledger_refresh_skipped_no_durable_id");
+                    None
+                }
+            };
+            // The settings.update frame goes BEFORE the send (ordering guarantee
+            // in the fn doc), addressed by the SIDECAR's session id — NEVER the
+            // map key (the two differ for resumed-on-attach sessions, Task 6).
+            let update_req = settings_update_frame(&session.sidecar_session_id, settings);
+            if let Err(err) = write_line(&mut session.stdin, &update_req).await {
+                drop(guard);
+                self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
+                return;
+            }
+        }
+
         // Address the sidecar by ITS id for this session (== the map key for created
         // sessions; differs for resumed-on-attach sessions, Task 6).
         let send_req =
@@ -786,6 +886,46 @@ impl FreshClaudeState {
             return;
         }
         drop(guard);
+
+        // Durable-ledger refresh for the settings application (P1.13 follow-up):
+        // awaited outside the sessions lock, surfaced user-visibly on failure,
+        // and never allowed to block the identity event.
+        if let Some((cli_id, mut settings)) = ledger_refresh {
+            let sink = self.identity_sink();
+            // Carry the previously recorded cwd over (a settings send never
+            // changes it; ClaudeSession tracks no cwd).
+            settings.cwd = sink
+                .as_ref()
+                .and_then(|s| s.load_settings(PROVIDER, &cli_id))
+                .and_then(|row| row.cwd);
+            if let Some(sink) = sink {
+                // No-laundering guard parity (V7/A10): a knob-bearing send always
+                // lands a settings-bearing row, but never write an all-blank
+                // snapshot.
+                if settings != crate::identity_sink::FreshAgentSettings::default() {
+                    if let Err(e) = sink
+                        .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                            provider: PROVIDER.into(),
+                            session_id: cli_id.clone(),
+                            mode: session_type.to_string(),
+                            create_request_id: None,
+                            resolves_pending: None,
+                            supersedes: None,
+                            settings,
+                        })
+                        .await
+                    {
+                        tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
+                        self.emit_fresh_agent_error(
+                            &session_id,
+                            session_type,
+                            "LEDGER_WRITE_FAILED",
+                            "Failed to persist this session's resume record - settings may not survive a server restart.",
+                        );
+                    }
+                }
+            }
+        }
 
         self.broadcast(&ServerMessage::FreshAgentSendAccepted(
             FreshAgentSendAccepted {
@@ -1367,6 +1507,11 @@ impl FreshClaudeState {
                 consumer,
                 sidecar_session_id,
                 cli_session_id: Some(durable.to_string()),
+                // Task z7j7-3 baseline: seeded from the SAME ledger-recovered
+                // snapshot the resume create request above sent.
+                model: rec.model.clone(),
+                permission_mode: rec.permission_mode.clone(),
+                effort: rec.effort.clone(),
                 broadcast_id,
                 pending,
                 last_status: Arc::clone(&last_status),
@@ -1523,24 +1668,59 @@ impl FreshClaudeState {
                             .lock()
                             .await
                             .insert(cli_id.to_string(), session_id.clone());
-                        if let Some(session) = sessions.lock().await.get_mut(&session_id) {
-                            session.cli_session_id = Some(cli_id.to_string());
-                        }
-                        // P1.13: binding row keyed by the DURABLE cliSessionId, with
-                        // the FULL create-settings snapshot — AWAITED here (this arm
-                        // runs on the async consumer task) so the row is durable
-                        // BEFORE the init-driven broadcast below proceeds (V8/A11).
-                        // A failed write is surfaced user-visibly, never
-                        // warn-and-drop, then the identity event proceeds.
+                        // Copy the durable id out AND read the session's LIVE
+                        // settings baseline in the same lock (Task z7j7-3): a
+                        // per-send settings application that landed BEFORE init
+                        // (handle_send's ledger refresh skips cli-id-less
+                        // sessions) must survive the durable write below —
+                        // otherwise a post-restart resume would silently revert
+                        // it.
+                        let live_baseline = {
+                            let mut map = sessions.lock().await;
+                            map.get_mut(&session_id).map(|session| {
+                                session.cli_session_id = Some(cli_id.to_string());
+                                (
+                                    session.model.clone(),
+                                    session.permission_mode.clone(),
+                                    session.effort.clone(),
+                                )
+                            })
+                        };
+                        // P1.13: binding row keyed by the DURABLE cliSessionId. The
+                        // settings snapshot PREFERS the live baseline per knob over
+                        // the create-time captured value (`live.or(captured)`); cwd
+                        // has no mid-session knob, so the captured value stands.
+                        // AWAITED here (this arm runs on the async consumer task)
+                        // so the row is durable BEFORE the init-driven broadcast
+                        // below proceeds (V8/A11). A failed write is surfaced
+                        // user-visibly, never warn-and-drop, then the identity
+                        // event proceeds.
                         // No-laundering guard (V7/A10, parity with codex's
                         // `record_codex_binding`): never persist an all-blank
                         // snapshot — it would make `was_recorded` true while
                         // `load_settings` returns None (the server sink's
                         // blank-snapshot guard), arming a FALSE SETTINGS_RESET
                         // for a legitimately-default create on a later resume.
-                        let recordable = settings
-                            .as_ref()
-                            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default());
+                        let effective = settings.as_ref().map(|captured| {
+                            crate::identity_sink::FreshAgentSettings {
+                                model: live_baseline
+                                    .as_ref()
+                                    .and_then(|b| b.0.clone())
+                                    .or_else(|| captured.model.clone()),
+                                sandbox: captured.sandbox.clone(),
+                                permission_mode: live_baseline
+                                    .as_ref()
+                                    .and_then(|b| b.1.clone())
+                                    .or_else(|| captured.permission_mode.clone()),
+                                effort: live_baseline
+                                    .as_ref()
+                                    .and_then(|b| b.2.clone())
+                                    .or_else(|| captured.effort.clone()),
+                                cwd: captured.cwd.clone(),
+                            }
+                        });
+                        let recordable = effective
+                            .filter(|s| *s != crate::identity_sink::FreshAgentSettings::default());
                         if let (Some(sink), Some(settings)) = (identity_sink.clone(), recordable) {
                             if let Err(e) = sink
                                 .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
@@ -1863,6 +2043,74 @@ fn session_type_str(session_type: SessionType) -> &'static str {
         SessionType::Kilroy => "kilroy",
         _ => "freshclaude",
     }
+}
+
+// ── per-send settings validation + the settings.update frame (Task z7j7-3) ─────────────
+
+/// The effort levels claude accepts mid-session (the vendored SDK 0.3.237
+/// `applyFlagSettings({effortLevel})` surface). EXACTLY the client's offered
+/// set (shared/fresh-agent-models.ts:25, FreshAgentSettingsButton.tsx:44-49) so
+/// no client-offered value can be spuriously rejected.
+const CLAUDE_SEND_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// The permission modes claude accepts mid-session (the SDK's `setPermissionMode`).
+/// EXACTLY the client's offered set (shared/fresh-agent-models.ts:53,
+/// FreshAgentSettingsButton.tsx).
+const CLAUDE_SEND_PERMISSION_MODES: [&str; 4] =
+    ["default", "acceptEdits", "bypassPermissions", "plan"];
+
+/// Validate the knob set of a `freshAgent.send` settings payload (Task z7j7-3).
+/// Returns the `(code, message)` for the FIRST invalid knob — the caller refuses
+/// the WHOLE send loudly (never a partial apply, never a silent drop) on the
+/// session-scoped `freshAgent.error` channel. Knob-less payloads are not this
+/// fn's business (the caller takes the plain-send path for them).
+fn validate_claude_send_settings(
+    settings: &FreshAgentSendSettings,
+) -> Result<(), (&'static str, String)> {
+    if let Some(effort) = settings.effort.as_deref() {
+        if !CLAUDE_SEND_EFFORTS.contains(&effort) {
+            return Err((
+                "INVALID_EFFORT",
+                format!(
+                    "Invalid effort level '{effort}' for claude — expected one of: {}.",
+                    CLAUDE_SEND_EFFORTS.join(", ")
+                ),
+            ));
+        }
+    }
+    if let Some(permission_mode) = settings.permission_mode.as_deref() {
+        if !CLAUDE_SEND_PERMISSION_MODES.contains(&permission_mode) {
+            return Err((
+                "INVALID_PERMISSION_MODE",
+                format!(
+                    "Invalid permission mode '{permission_mode}' for claude — expected one of: {}.",
+                    CLAUDE_SEND_PERMISSION_MODES.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The internal Rust→sidecar `settings.update` frame (Task z7j7-3) — an
+/// INTERNAL protocol frame, deliberately NOT part of the shared WS schema
+/// (`crates/freshell-protocol` / `shared/ws-protocol.ts` stay untouched).
+/// Carries ONLY the knobs the send's settings payload presents (validated by
+/// [`validate_claude_send_settings`] before this is built), addressed by the
+/// sidecar's own session id.
+fn settings_update_frame(sidecar_session_id: &str, settings: &FreshAgentSendSettings) -> Value {
+    let mut frame = Map::new();
+    frame.insert("type".to_string(), json!("settings.update"));
+    frame.insert("sessionId".to_string(), json!(sidecar_session_id));
+    if let Some(model) = &settings.model {
+        frame.insert("model".to_string(), json!(model));
+    }
+    if let Some(permission_mode) = &settings.permission_mode {
+        frame.insert("permissionMode".to_string(), json!(permission_mode));
+    }
+    if let Some(effort) = &settings.effort {
+        frame.insert("effort".to_string(), json!(effort));
+    }
+    Value::Object(frame)
 }
 
 /// The approval/question respond `requestId` as a string (the wire type is
@@ -2214,6 +2462,9 @@ pub(crate) mod tests {
                 consumer,
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
+                model: None,
+                permission_mode: None,
+                effort: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(ClaudePending::default())),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
@@ -3048,6 +3299,15 @@ rl.on('line', (line) => {
       // tests can assert the exact stdin frame shape the compact handler writes.
       fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
     }
+  } else if (msg.type === 'settings.update') {
+    // Task z7j7-3 assertion surface: log the frame VERBATIM (the mid-session
+    // model/permissionMode/effort knobs Rust's handle_send writes ahead of the
+    // send frame) and echo the real sidecar's post-apply sdk.session.metadata
+    // (the stdout consumer normalizes it to freshAgent.session.metadata). The
+    // fake parks nothing — knob application is the REAL sidecar's job; the
+    // crate tests assert the wire shape here.
+    if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
+    process.stdout.write(JSON.stringify({ type: 'sdk.session.metadata', sessionId: msg.sessionId, model: msg.model }) + '\n')
   } else if (msg.type === 'permission.respond' || msg.type === 'question.respond') {
     if (respondLog) fs.appendFileSync(respondLog, `${JSON.stringify(msg)}\n`)
   } else if (msg.type === 'interrupt') {
@@ -3153,6 +3413,14 @@ rl.on('line', (line) => {
     }
 
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
+        send_msg_with_settings(session_id, text, None)
+    }
+
+    fn send_msg_with_settings(
+        session_id: &str,
+        text: &str,
+        settings: Option<FreshAgentSendSettings>,
+    ) -> FreshAgentSend {
         FreshAgentSend {
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
@@ -3161,7 +3429,24 @@ rl.on('line', (line) => {
             cwd: None,
             images: None,
             request_id: None,
-            settings: None,
+            settings,
+        }
+    }
+
+    /// A settings payload carrying ONLY the mid-session knobs the caller lists
+    /// (claude has no sandbox concept; per-send cwd rides the existing field and
+    /// never counts as a settings knob).
+    fn knob_settings(
+        model: Option<&str>,
+        permission_mode: Option<&str>,
+        effort: Option<&str>,
+    ) -> FreshAgentSendSettings {
+        FreshAgentSendSettings {
+            cwd: None,
+            effort: effort.map(str::to_string),
+            model: model.map(str::to_string),
+            permission_mode: permission_mode.map(str::to_string),
+            sandbox: None,
         }
     }
 
@@ -3510,6 +3795,9 @@ rl.on('line', (line) => {
                 consumer,
                 sidecar_session_id: session_id.to_string(),
                 cli_session_id: None,
+                model: None,
+                permission_mode: None,
+                effort: None,
                 broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
                 pending: Arc::new(std::sync::Mutex::new(pending)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
@@ -4560,6 +4848,370 @@ rl.on('line', (line) => {
         assert!(
             !st.sessions.lock().await.contains_key(&session_id),
             "dead session must still be evicted from the sessions map"
+        );
+    }
+
+    // ── freshAgent.send per-send settings (Task z7j7-3: mid-session
+    //    model/effort/permission changes via the internal `settings.update`
+    //    sidecar frame) ──────────────────────────────────────────────────────
+
+    /// A send whose settings carry model/permissionMode/effort knobs writes a
+    /// `settings.update` frame to the sidecar BEFORE the `send` frame — line
+    /// order on stdin + the real sidecar's serialized per-session op chain
+    /// (`enqueue`) guarantee the update is fully applied before the user turn
+    /// enters the SDK input stream. The frame is addressed by the sidecar's
+    /// session id and carries the knobs exactly as sent.
+    #[tokio::test]
+    async fn handle_send_applies_per_send_settings_via_settings_update_frame() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-send-settings"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-send-settings").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_send(send_msg_with_settings(
+            &session_id,
+            "turn two",
+            Some(knob_settings(Some("opus-x"), Some("plan"), Some("low"))),
+        ))
+        .await;
+
+        let frames = env.respond_log_frames(1).await;
+        assert_eq!(
+            frames[0]["type"],
+            json!("settings.update"),
+            "settings.update must be written BEFORE the send frame; got: {frames:?}"
+        );
+        assert_eq!(frames[0]["sessionId"], json!(session_id));
+        assert_eq!(frames[0]["model"], json!("opus-x"));
+        assert_eq!(frames[0]["permissionMode"], json!("plan"));
+        assert_eq!(frames[0]["effort"], json!("low"));
+        let frames = env.respond_log_frames(2).await;
+        assert_eq!(frames[1]["type"], json!("send"), "got: {frames:?}");
+        assert_eq!(frames[1]["sessionId"], json!(session_id));
+        assert_eq!(frames[1]["text"], json!("turn two"));
+        drop(env);
+    }
+
+    /// An invalid effort refuses the WHOLE send LOUDLY on the session-scoped
+    /// `freshAgent.error` channel (the banner-visible one — a top-level `Error`
+    /// frame is silently cleaned up client-side for fresh-agent sends,
+    /// FreshAgentView.tsx:1785-1838). NOTHING is written to the sidecar: never
+    /// a partial apply, never a silent drop.
+    #[tokio::test]
+    async fn handle_send_rejects_invalid_effort_loudly() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-send-bad-effort"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-send-bad-effort").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_send(send_msg_with_settings(
+            &session_id,
+            "this text must never reach the sidecar",
+            Some(knob_settings(None, None, Some("bogus"))),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_EFFORT");
+        assert_eq!(frame["event"]["sessionId"], json!(session_id));
+        assert_eq!(frame["sessionId"], json!(session_id));
+        // handle_send's write_line awaits complete before it returns, so a short
+        // settle makes the absence check deterministic (a buggy implementation's
+        // frame would have landed by now).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a rejected send must write NOTHING to the sidecar; got: {:?}",
+            env.respond_log_frames(0).await
+        );
+        drop(env);
+    }
+
+    /// Same rejection shape for an invalid permissionMode (independent code —
+    /// a send carrying a bogus mode is refused with `INVALID_PERMISSION_MODE`
+    /// and likewise writes nothing).
+    #[tokio::test]
+    async fn handle_send_rejects_invalid_permission_mode_loudly() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-send-bad-permission"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-send-bad-permission").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_send(send_msg_with_settings(
+            &session_id,
+            "this text must never reach the sidecar",
+            Some(knob_settings(None, Some("bogus"), None)),
+        ))
+        .await;
+
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_PERMISSION_MODE");
+        assert_eq!(frame["event"]["sessionId"], json!(session_id));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            env.respond_log_frames(0).await.is_empty(),
+            "a rejected send must write NOTHING to the sidecar; got: {:?}",
+            env.respond_log_frames(0).await
+        );
+        drop(env);
+    }
+
+    /// Preservation pin: a send WITHOUT settings — or whose settings carry no
+    /// model/permissionMode/effort knobs (cwd-only) — takes the pre-existing
+    /// plain-send path untouched (single `send` frame, no `settings.update`).
+    #[tokio::test]
+    async fn handle_send_without_settings_writes_plain_send_only() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-send-nosettings"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-send-nosettings").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_send(send_msg(&session_id, "plain turn")).await;
+        let mut cwd_only = knob_settings(None, None, None);
+        cwd_only.cwd = Some("/tmp/elsewhere".to_string());
+        st.handle_send(send_msg_with_settings(
+            &session_id,
+            "cwd-only turn",
+            Some(cwd_only),
+        ))
+        .await;
+
+        let frames = env.respond_log_frames(2).await;
+        assert_eq!(frames[0]["type"], json!("send"), "got: {frames:?}");
+        assert_eq!(frames[0]["text"], json!("plain turn"));
+        assert_eq!(frames[1]["type"], json!("send"), "got: {frames:?}");
+        assert_eq!(frames[1]["text"], json!("cwd-only turn"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            env.respond_log_frames(0).await.len(),
+            2,
+            "no settings.update frame may accompany a knob-less send; got: {:?}",
+            env.respond_log_frames(0).await
+        );
+        drop(env);
+    }
+
+    /// The applied per-send settings become the session's NEW baseline: a
+    /// follow-up send WITHOUT settings reuses it (the sidecar holds the applied
+    /// state) — a stale/duplicate `settings.update` re-emitted on the plain
+    /// send would be a regression.
+    #[tokio::test]
+    async fn handle_send_settings_update_becomes_the_new_baseline() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-send-baseline"))
+            .await;
+        let created = await_claude_created(&mut rx, "req-send-baseline").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        st.handle_send(send_msg_with_settings(
+            &session_id,
+            "turn one",
+            Some(knob_settings(Some("opus-x"), Some("plan"), None)),
+        ))
+        .await;
+        st.handle_send(send_msg(&session_id, "turn two")).await;
+
+        let frames = env.respond_log_frames(3).await;
+        assert_eq!(
+            frames[0]["type"],
+            json!("settings.update"),
+            "got: {frames:?}"
+        );
+        assert_eq!(frames[1]["type"], json!("send"), "got: {frames:?}");
+        assert_eq!(frames[1]["text"], json!("turn one"));
+        assert_eq!(frames[2]["type"], json!("send"), "got: {frames:?}");
+        assert_eq!(frames[2]["text"], json!("turn two"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            env.respond_log_frames(0).await.len(),
+            3,
+            "the settings-less follow-up must NOT emit another settings.update; got: {:?}",
+            env.respond_log_frames(0).await
+        );
+        drop(env);
+    }
+
+    /// Resumed-on-attach addressing parity (the `handle_interrupt` discipline):
+    /// the settings.update frame is addressed by the SIDECAR's session id,
+    /// NEVER the sessions-map key (the two differ for resumed-on-attach
+    /// sessions — the map key is the CLIENT's original id). Also pins the
+    /// baseline merge hitting the durable-ledger row: the resumed session's
+    /// ledger-seeded model must survive an effort-only settings send, and the
+    /// refresh must re-record the merged baseline under the DURABLE id.
+    #[tokio::test]
+    async fn handle_send_settings_update_addresses_the_sidecar_session_id() {
+        use crate::identity_sink::PaneIdentitySink as _;
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "abababab-abab-4bab-8bab-abababababab";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        sink.seed(
+            "claude",
+            durable,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("seeded-model".to_string()),
+                sandbox: None,
+                permission_mode: Some("default".to_string()),
+                effort: None,
+                cwd: Some("/tmp".to_string()),
+            },
+        );
+        let (st, mut rx) = state_with_bus();
+        st.set_identity_sink(sink.clone());
+        st.handle_attach(attach_msg_with_resume("client-nanoid-settings", durable))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        // Registered under the CLIENT's id; the sidecar answered with its own.
+        assert!(st
+            .sessions
+            .lock()
+            .await
+            .contains_key("client-nanoid-settings"));
+        await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+
+        st.handle_send(send_msg_with_settings(
+            "client-nanoid-settings",
+            "post-resume turn",
+            Some(knob_settings(None, None, Some("medium"))),
+        ))
+        .await;
+
+        let frames = env.respond_log_frames(1).await;
+        assert_eq!(
+            frames[0]["type"],
+            json!("settings.update"),
+            "got: {frames:?}"
+        );
+        let addressed = frames[0]["sessionId"].as_str().unwrap_or_default();
+        assert_ne!(
+            addressed, "client-nanoid-settings",
+            "must never address the sessions-map key"
+        );
+        assert!(
+            addressed.starts_with("fake-claude-session-"),
+            "must address the sidecar's own created id; got {addressed}"
+        );
+        assert_eq!(frames[0]["effort"], json!("medium"));
+        let frames = env.respond_log_frames(2).await;
+        assert_eq!(frames[1]["type"], json!("send"), "got: {frames:?}");
+        assert_eq!(
+            frames[1]["sessionId"].as_str().unwrap_or_default(),
+            addressed,
+            "the send frame is addressed by the same sidecar id"
+        );
+        // The ledger row re-records the MERGED baseline under the durable id:
+        // the ledger-seeded model survives the effort-only send, the row's cwd
+        // is carried over (a settings send never changes cwd).
+        let row = sink
+            .load_settings("claude", durable)
+            .expect("the settings send refreshes the durable ledger row");
+        assert_eq!(row.model.as_deref(), Some("seeded-model"));
+        assert_eq!(row.effort.as_deref(), Some("medium"));
+        assert_eq!(row.cwd.as_deref(), Some("/tmp"));
+        drop(env);
+    }
+
+    /// The stdout consumer's `sdk.session.init` binding write PREFERS the live
+    /// session baseline over the create-time captured snapshot (Task z7j7-3):
+    /// a per-send settings application that landed BEFORE init (handle_send's
+    /// ledger refresh skips cli-id-less sessions) must survive the durable
+    /// ledger write — otherwise a post-restart resume would silently revert it.
+    /// A live-baseline knob that is None falls back to the captured value.
+    #[tokio::test]
+    async fn consumer_init_binding_prefers_the_live_session_baseline_over_the_create_capture() {
+        use crate::identity_sink::PaneIdentitySink as _;
+        let sink = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        let (st, _rx) = state_with_bus();
+        st.set_identity_sink(sink.clone());
+        insert_fake_claude_session(&st, "prefers-live").await;
+        // A pre-init settings application: the live baseline diverges from the
+        // create-time capture.
+        {
+            let mut guard = st.sessions.lock().await;
+            let session = guard.get_mut("prefers-live").expect("session tracked");
+            session.model = Some("model-B".to_string());
+            session.effort = Some("low".to_string());
+        }
+
+        // Script the consumer's stdout: exactly one sdk.session.init, pipe held
+        // open (never EOF — no eviction mid-test).
+        let durable = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "printf '%s\\n' '{{\"type\":\"sdk.session.init\",\"sessionId\":\"prefers-live\",\"cliSessionId\":\"{durable}\",\"model\":\"model-A\",\"cwd\":\"/tmp\",\"tools\":[]}}'; sleep 30"
+            ))
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn scripted stdout child");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let reader = BufReader::new(stdout).lines();
+        let consumer = st.spawn_consumer(
+            reader,
+            "prefers-live".to_string(),
+            "freshclaude".to_string(),
+            "prefers-live".to_string(),
+            Some(crate::identity_sink::FreshAgentSettings {
+                model: Some("model-A".to_string()),
+                sandbox: None,
+                permission_mode: Some("default".to_string()),
+                effort: Some("high".to_string()),
+                cwd: Some("/tmp".to_string()),
+            }),
+            Arc::new(std::sync::Mutex::new("prefers-live".to_string())),
+            Arc::new(std::sync::Mutex::new(ClaudePending::default())),
+            Arc::new(std::sync::Mutex::new("idle".to_string())),
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let row = loop {
+            if let Some(row) = sink.load_settings("claude", durable) {
+                break row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the init binding row was never recorded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        consumer.abort();
+        assert_eq!(
+            row.model.as_deref(),
+            Some("model-B"),
+            "the LIVE baseline wins over the create-time capture"
+        );
+        assert_eq!(
+            row.effort.as_deref(),
+            Some("low"),
+            "the LIVE baseline wins over the create-time capture"
+        );
+        assert_eq!(
+            row.permission_mode.as_deref(),
+            Some("default"),
+            "a knob absent from the live baseline falls back to the capture"
+        );
+        assert_eq!(
+            row.cwd.as_deref(),
+            Some("/tmp"),
+            "cwd has no mid-session knob: the captured value stands"
         );
     }
 }

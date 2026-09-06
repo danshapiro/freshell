@@ -187,6 +187,20 @@ describe('Claude fresh-agent adapter', () => {
       },
       },
     })
+    // Scope truthfulness pin (Task z7j7-3): the NODE claude adapter has no
+    // mid-session settings path (that is the Rust server's settings.update
+    // sidecar frame), so it honestly advertises model/effort/permissionMode as
+    // create-only and sandbox as unsupported.
+    expect(snapshot).toMatchObject({
+      capabilities: {
+        settingScopes: {
+          model: 'create-only',
+          effort: 'create-only',
+          permissionMode: 'create-only',
+          sandbox: 'unsupported',
+        },
+      },
+    })
     expect(snapshot?.turns.map((turn: { source: string }) => turn.source)).toEqual(['live'])
   })
 

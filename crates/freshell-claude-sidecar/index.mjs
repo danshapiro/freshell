@@ -9,6 +9,7 @@
 //   Rust → sidecar (stdin, one JSON per line):
 //     { type:'create',             requestId, cwd?, model?, permissionMode?, effort?, resumeSessionId? }
 //     { type:'send',               sessionId, text }
+//     { type:'settings.update',    sessionId, model?, permissionMode?, effort? }   // mid-session knobs; serialized on the per-session op chain BEFORE any following send
 //     { type:'interrupt',          sessionId }
 //     { type:'permission.respond', sessionId, requestId, decision }   // decision forwarded VERBATIM
 //     { type:'question.respond',   sessionId, requestId, answers }
@@ -18,6 +19,7 @@
 //     { type:'created',                 requestId, sessionId }            // the SDK bridge's BARE nanoid placeholder
 //     { type:'create.failed',           requestId, message }
 //     { type:'sdk.session.init',        sessionId, cliSessionId, model, cwd, tools }  // durable Claude UUID
+//     { type:'sdk.session.metadata',    sessionId, cliSessionId?, model? }            // post-apply settings echo (drives the client status chip)
 //     { type:'sdk.assistant',           sessionId, content, model }
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
@@ -128,8 +130,39 @@ function nextMonotonic(last, now) {
   return last != null && now <= last ? last + 1 : now
 }
 
-/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
+/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, chain:Promise<void>, model?:string, permissionMode?:string, effort?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
 const sessions = new Map()
+
+// ── per-session serialized op chain (Task z7j7-3) ────────────────────────────
+// The stdin dispatch loop's handlers are SYNCHRONOUS, so a naive `await` inside
+// a settings update would let the FOLLOWING `send` line race past the in-flight
+// control requests. `enqueue` re-arms every ordered op (settings application,
+// user-message push) on a per-session promise chain: a user message NEVER
+// overtakes a pending settings application. The chain self-heals — a rejected
+// op is swallowed into the chain state so one failure never wedges the session.
+function enqueue(st, op) {
+  const run = st.chain.then(op, op)
+  st.chain = run.catch(() => {})
+  return st.chain
+}
+
+// The mid-session knob sets — EXACTLY the client's offered values
+// (shared/fresh-agent-models.ts / FreshAgentSettingsButton.tsx; the Rust side
+// validates the same lists before writing the frame).
+const SIDECAR_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+const SIDECAR_PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan'])
+
+// Every SDK control call is bounded (Task z7j7-3): a never-answering SDK
+// surface must surface an sdk.error and RELEASE the op chain, never wedge it.
+const CONTROL_CALL_TIMEOUT_MS = 10_000
+function withControlCallTimeout(promise, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${CONTROL_CALL_TIMEOUT_MS}ms`)), CONTROL_CALL_TIMEOUT_MS),
+    ),
+  ])
+}
 
 // ── SDK message -> sdk.* event (faithful port of SdkBridge.handleSdkMessage) ──
 function handleSdkMessage(sessionId, msg) {
@@ -230,7 +263,17 @@ function handleCreate(req) {
     // session synchronously after cancelPending (LB-04 — a parked canUseTool
     // promise must never be resolved after transport close), and stdin line
     // events (macrotasks) cannot interleave inside that finally.
-    const state = { inputStream: handle, abort, permissionMode: req.permissionMode }
+    // Task z7j7-3: state gains the serialized op chain + the session's settings
+    // baseline copies (seeded from the create frame; handleSettingsUpdate moves
+    // them ONLY on control-call success — no baseline mutation on failure).
+    const state = {
+      inputStream: handle,
+      abort,
+      chain: Promise.resolve(),
+      model: req.model,
+      permissionMode: req.permissionMode,
+      effort: req.effort,
+    }
     sessions.set(sessionId, state)
 
     const sdkQuery = query({
@@ -272,11 +315,60 @@ function handleCreate(req) {
 function handleSend(req) {
   const st = sessions.get(req.sessionId)
   if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found' }); return }
-  st.inputStream.push({
-    type: 'user',
-    message: { role: 'user', content: [{ type: 'text', text: req.text }] },
-    parent_tool_use_id: null,
-    session_id: st.cliSessionId || 'default',
+  // Re-arm the push through the per-session op chain: a user message never
+  // overtakes a pending settings application (Task z7j7-3).
+  enqueue(st, () => {
+    st.inputStream.push({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: req.text }] },
+      parent_tool_use_id: null,
+      session_id: st.cliSessionId || 'default',
+    })
+  })
+}
+
+// Task z7j7-3: mid-session settings application. Validates the incoming knobs
+// BEFORE enqueuing anything (defense in depth on the internal frame — Rust's
+// handle_send validates the same lists first): an invalid knob refuses the
+// WHOLE update loudly on sdk.error and applies nothing. A valid update applies
+// the CHANGED knobs on the serialized op chain (setPermissionMode → setModel →
+// applyFlagSettings, each 10s-bounded), moving each baseline copy ONLY after
+// its control call succeeds — on failure nothing mutates, an sdk.error is
+// emitted, and a later retry of the same knob re-fires its control call
+// (baseline diff). The unchanged-knob skip keeps the client's always-shipped
+// selection from costing three control round-trips per message. On success the
+// fresh baseline echoes back as sdk.session.metadata (the Rust consumer
+// normalizes it to freshAgent.session.metadata → the client status chip).
+function handleSettingsUpdate(req) {
+  const st = sessions.get(req.sessionId)
+  if (!st) { emit({ type: 'sdk.error', sessionId: req.sessionId, message: 'session not found' }); return }
+  if (req.effort != null && !SIDECAR_EFFORT_LEVELS.has(req.effort)) {
+    emit({ type: 'sdk.error', sessionId: req.sessionId, message: `invalid effort level for settings.update: ${req.effort}` })
+    return
+  }
+  if (req.permissionMode != null && !SIDECAR_PERMISSION_MODES.has(req.permissionMode)) {
+    emit({ type: 'sdk.error', sessionId: req.sessionId, message: `invalid permission mode for settings.update: ${req.permissionMode}` })
+    return
+  }
+  enqueue(st, async () => {
+    try {
+      if (req.permissionMode != null && req.permissionMode !== st.permissionMode) {
+        await withControlCallTimeout(st.query.setPermissionMode(req.permissionMode), 'setPermissionMode')
+        st.permissionMode = req.permissionMode
+      }
+      if (req.model != null && req.model !== st.model) {
+        await withControlCallTimeout(st.query.setModel(req.model), 'setModel')
+        st.model = req.model
+      }
+      if (req.effort != null && req.effort !== st.effort) {
+        await withControlCallTimeout(st.query.applyFlagSettings({ effortLevel: req.effort }), 'applyFlagSettings')
+        st.effort = req.effort
+      }
+    } catch (err) {
+      emit({ type: 'sdk.error', sessionId: req.sessionId, message: `settings update failed: ${err?.message || err}` })
+      return
+    }
+    emit({ type: 'sdk.session.metadata', sessionId: req.sessionId, cliSessionId: st.cliSessionId, model: st.model })
   })
 }
 
@@ -315,6 +407,7 @@ rl.on('line', (line) => {
   switch (req?.type) {
     case 'create': handleCreate(req); break
     case 'send': handleSend(req); break
+    case 'settings.update': handleSettingsUpdate(req); break
     case 'interrupt': handleInterrupt(req); break
     case 'permission.respond': {
       const st = sessions.get(req.sessionId)

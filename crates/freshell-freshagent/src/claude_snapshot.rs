@@ -600,6 +600,16 @@ pub(crate) fn build_claude_snapshot_json(
             "approvals": false,
             "questions": false,
             "fork": false,
+            // Task z7j7-3: mid-session model/effort/permissionMode changes ride
+            // the internal settings.update sidecar frame (handle_send applies
+            // them before the user turn; kilroy rides this same claude builder).
+            // sandbox is honestly unsupported — claude has no sandbox concept.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "permissionMode": "per-send",
+                "sandbox": "unsupported",
+            },
         },
         "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
         "pendingApprovals": [],
@@ -955,6 +965,38 @@ mod tests {
         let golden: serde_json::Value =
             serde_json::from_str(GOLDEN_SNAPSHOT).expect("golden parses");
         assert_eq!(built, golden);
+    }
+
+    /// Task z7j7-3 (per-send settings, claude+kilroy share this builder): the
+    /// claude snapshot advertises `capabilities.settingScopes` — model/effort/
+    /// permissionMode are `per-send` (mid-session changes ride the internal
+    /// `settings.update` sidecar frame, applied by `handle_send` before the
+    /// user turn); sandbox is honestly `unsupported` (claude has no sandbox
+    /// concept). The honest per-scope advertisement is what gates the client's
+    /// "applies to next send only" vs "session create only" copy.
+    #[test]
+    fn claude_snapshot_advertises_setting_scopes() {
+        let built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 0);
+        assert_eq!(
+            built["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "permissionMode": "per-send",
+                "sandbox": "unsupported",
+            }),
+        );
+        // kilroy rides the claude provider path — same advertisement.
+        let kilroy = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0);
+        assert_eq!(
+            kilroy["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "permissionMode": "per-send",
+                "sandbox": "unsupported",
+            }),
+        );
     }
 
     #[test]
