@@ -1128,9 +1128,18 @@ fn apply_session_overrides(
                         // `applyOverride`). Capture the pre-overlay
                         // (parsed/provider-native) title into `provider_title`
                         // BEFORE replacing it — left None when the parse had
-                        // no title.
+                        // no title. `title_override_source` re-validates the
+                        // stored row: config.json is hand-editable, and an
+                        // out-of-ladder string would fail the client's z.enum
+                        // page parse (`shared/read-models.ts`) — junk degrades
+                        // to "no source recorded", matching Node's
+                        // `isTitleSource` gate in `applyOverride`.
                         item.title_overridden = true;
-                        item.title_override_source = row_source.map(str::to_string);
+                        item.title_override_source = row_source
+                            .filter(|s| {
+                                matches!(*s, "user" | "ai" | "first-message" | "legacy" | "dir")
+                            })
+                            .map(str::to_string);
                         item.provider_title = item.title.clone();
                         item.title = Some(t.to_string());
                     }
@@ -3150,6 +3159,28 @@ mod tests {
         assert_eq!(v["title"], json!("Provider Title"));
         assert!(v.get("titleOverridden").is_none());
         assert!(v.get("providerTitle").is_none());
+        assert!(v.get("titleOverrideSource").is_none());
+    }
+
+    #[test]
+    fn bogus_stored_title_source_is_dropped_from_the_wire() {
+        // Defensive: config.json is hand-editable, so a stored `titleSource`
+        // can be ANY string. Forwarding an out-of-ladder source would fail the
+        // client's z.enum page parse (`shared/read-models.ts`) and reject the
+        // whole directory page. The override itself must still apply — junk
+        // degrades to "no source recorded", never to a dropped override or a
+        // poisoned page.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "amplifier:s1".to_string(),
+            json!({ "titleOverride": "Hand-edited rename", "titleSource": "bogus-value" }),
+        );
+        let out = apply_session_overrides(vec![guard_item("s1", None)], &overrides);
+        assert_eq!(out.len(), 1);
+        let v = out[0].to_value();
+        assert_eq!(v["title"], json!("Hand-edited rename"));
+        assert_eq!(v["titleOverridden"], json!(true));
+        assert_eq!(v["providerTitle"], json!("Provider Title"));
         assert!(v.get("titleOverrideSource").is_none());
     }
 
