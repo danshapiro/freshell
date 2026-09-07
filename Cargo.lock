@@ -1435,6 +1435,7 @@ dependencies = [
  "freshell-platform",
  "freshell-protocol",
  "freshell-runtime-protocol",
+ "freshell-sessions",
  "freshell-terminal",
  "libc",
  "serde",

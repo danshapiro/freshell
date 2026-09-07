@@ -230,6 +230,15 @@ export class RestrictedDockerBroker {
     }
     if (host.PortBindings && Object.keys(host.PortBindings).length > 0) return { ok: false, reason: 'runtime ports are forbidden' }
 
+    const tmpfs = host.Tmpfs ?? {}
+    if (tmpfs['/tmp'] !== 'rw,noexec,nosuid,nodev,size=128m') return { ok: false, reason: 'runtime /tmp must remain bounded and noexec' }
+    const tmpfsKeys = Object.keys(tmpfs).sort()
+    const allowedTmpfsKeys = tmpfsKeys.includes('/run/opencode-tmp') ? ['/run/opencode-tmp', '/tmp'] : ['/tmp']
+    if (JSON.stringify(tmpfsKeys) !== JSON.stringify(allowedTmpfsKeys)) return { ok: false, reason: `unexpected runtime tmpfs topology: ${tmpfsKeys.join(',')}` }
+    if (tmpfs['/run/opencode-tmp'] !== undefined && tmpfs['/run/opencode-tmp'] !== 'rw,exec,nosuid,nodev,size=64m,mode=1777') {
+      return { ok: false, reason: 'OpenCode exec tmpfs must be bounded and nosuid/nodev' }
+    }
+
     const binds = Array.isArray(host.Binds) ? host.Binds as string[] : []
     if (!terminalWorkload && binds.length !== 2) return { ok: false, reason: `expected exactly two fixture runtime binds, found ${binds.length}` }
     let binaryBind = false

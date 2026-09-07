@@ -59,7 +59,7 @@ export async function runPhase2Gate(
     // Environment-dependent required cases run last so they cannot mask a
     // deterministic runtime failure.
     ['P2-G01', gate01BrowserContinuityReceipt],
-    ['P2-G04', gate04RealClaudeContinuityReceipt],
+    ['P2-G04', gate04RealOpencodeContinuityReceipt],
   ] as const
 
   for (const [caseId, run] of cases) {
@@ -234,26 +234,21 @@ async function gate03SupervisorRestartAdoptsHost(h: RuntimeHarness): Promise<voi
   h.assert(caseId, stop.outcome === 'verified_empty', 'adopted runtime remains authoritatively stoppable')
 }
 
-async function gate04RealClaudeContinuityReceipt(h: RuntimeHarness): Promise<void> {
+async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<void> {
   const caseId = 'P2-G04'
-  const credentialFile = process.env.FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE?.trim()
-  if (!credentialFile || !fs.statSync(credentialFile, { throwIfNoEntry: false })?.isFile()) {
-    throw new RuntimeGateBlockedError(
-      caseId,
-      'real Claude credential file is not available in the gate environment; fixture substitution is forbidden',
-      { claudeVersion: '2.1.263', credentialReference: credentialFile ?? null },
-    )
-  }
   const receipt = requiredExternalReceipt(
     caseId,
-    process.env.FRESHELL_RUNTIME_CLAUDE_RECEIPT,
-    'Run the real-Claude leg of runtime-terminal-continuity-rust.spec.ts and set FRESHELL_RUNTIME_CLAUDE_RECEIPT.',
+    process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT,
+    'Run the real free-tier OpenCode leg of runtime-terminal-continuity-rust.spec.ts and set FRESHELL_RUNTIME_OPENCODE_RECEIPT.',
   )
-  h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'real-Claude receipt is an explicit P2-G04 PASS', receipt)
-  h.assert(caseId, receipt.claudeVersion === '2.1.263', 'gate used the pinned Claude Code version', receipt)
-  h.assert(caseId, receipt.sameNativeSession === true && receipt.sameIncarnation === true, 'native Claude identity and OS incarnation survive web restart', receipt)
+  h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'real-OpenCode receipt is an explicit P2-G04 PASS', receipt)
+  h.assert(caseId, receipt.provider === 'opencode', 'gate used the OpenCode provider', receipt)
+  h.assert(caseId, receipt.opencodeVersion === '1.18.21', 'gate used the pinned OpenCode version', receipt)
+  h.assert(caseId, receipt.model === 'opencode/big-pickle' && receipt.freeTier === true, 'gate used the pinned free-tier OpenCode model', receipt)
+  h.assert(caseId, typeof receipt.nativeSessionId === 'string' && receipt.nativeSessionId.startsWith('ses_'), 'gate captured a native OpenCode session id', receipt)
+  h.assert(caseId, receipt.sameNativeSession === true && receipt.sameIncarnation === true, 'native OpenCode identity and OS incarnation survive web restart', receipt)
   h.assert(caseId, receipt.toolCompletionCount === 1 && receipt.followupSucceeded === true, 'long tool completed once and follow-up succeeded', receipt)
-  h.assert(caseId, receipt.providerLaunchCount === 1, 'restoration hid no replacement Claude launch', receipt)
+  h.assert(caseId, receipt.providerLaunchCount === 1, 'restoration hid no replacement OpenCode launch', receipt)
 }
 
 async function gate05CpuQuota(h: RuntimeHarness): Promise<void> {

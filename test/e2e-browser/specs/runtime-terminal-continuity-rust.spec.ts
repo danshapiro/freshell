@@ -12,7 +12,7 @@ import { test } from '../helpers/fixtures.js'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, P2_OPENCODE_FREE_MODEL, P2_OPENCODE_VERSION } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -143,7 +143,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         expect(view?.containerId).toBe(originalIdentity.containerId)
         expect(view?.hostBootId).toBe(originalIdentity.hostBootId)
         expect(rig.runtime.broker.receipts()).toHaveLength(receiptCount)
-        expect(rig.ownedContainerExec(originalIdentity.containerId, ['sh', '-lc', `kill -0 ${childPid} && echo ALIVE`]).trim()).toBe('ALIVE')
+        expect(rig.ownedContainerHasPid(originalIdentity.containerId, childPid)).toBe(true)
 
         const marker = `P2_WEB_CYCLE_${cycle}_${Date.now()}`
         await terminal.executeCommand(`echo ${marker}`)
@@ -180,15 +180,9 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
     }
   })
 
-  const realProviderEnabled = process.env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS === '1'
-  const realClaudeTest = realProviderEnabled ? test : test.skip
-  realClaudeTest('P2-G04: real Claude tool turn survives web replacement and follow-up stays in one native session', async ({ page, e2eServerKind }) => {
+  test('P2-G04: real free-tier OpenCode tool turn survives web replacement in one native session', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
-    test.setTimeout(300_000)
-    const credentialFile = process.env.FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE?.trim()
-    if (!credentialFile || !fs.statSync(credentialFile, { throwIfNoEntry: false })?.isFile()) {
-      throw new Error('P2-G04 requires FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE pointing at an exact Claude .credentials.json file')
-    }
+    test.setTimeout(420_000)
 
     const rig = new ManagedRuntimeBrowserRig()
     try {
@@ -202,52 +196,68 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       await terminal.waitForPrompt({ timeout: 30_000 })
       const tabId = await harness.getActiveTabId()
       if (!tabId) throw new Error('P2-G04 has no active tab')
-      const before = new Set(leavesByMode(await harness.getPaneLayout(tabId), 'claude').map((leaf) => leaf.id))
+
+      const before = new Set(leavesByMode(await harness.getPaneLayout(tabId), 'opencode').map((leaf) => leaf.id))
       const picker = await openPanePicker(page)
-      await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
-      const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
+      await picker.getByRole('button', { name: /^OpenCode$/i }).click({ force: true })
+      const dirInput = page.getByRole('combobox', { name: /Starting directory for OpenCode/i })
       await expect(dirInput).toBeVisible({ timeout: 15_000 })
       await dirInput.fill(rig.repoRoot)
       await dirInput.press('Enter')
 
-      const claudeLeaf = await expect
+      const opencodeLeaf = await expect
         .poll(async () => {
-          const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'claude').find((candidate) => !before.has(candidate.id))
+          const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((candidate) => !before.has(candidate.id))
           return leaf?.content?.terminalId ? leaf : null
         }, { timeout: 30_000 })
         .not.toBeNull()
-        .then(async () => leavesByMode(await harness.getPaneLayout(tabId), 'claude').find((candidate) => !before.has(candidate.id))!)
-      const paneId: string = claudeLeaf.id
-      const terminalId: string = claudeLeaf.content.terminalId
+        .then(async () => leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((candidate) => !before.has(candidate.id))!)
+      const paneId: string = opencodeLeaf.id
+      const terminalId: string = opencodeLeaf.content.terminalId
       const content = async () => {
-        const leaves = leavesByMode(await harness.getPaneLayout(tabId), 'claude')
+        const leaves = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
         return leaves.find((leaf) => leaf.id === paneId)?.content
       }
-      const sessionId = await expect
-        .poll(async () => (await content())?.sessionRef?.sessionId ?? null, { timeout: 30_000 })
-        .not.toBeNull()
-        .then(async () => (await content())!.sessionRef.sessionId as string)
       const view = await expect
         .poll(() => rig.runningViewForTerminal(terminalId), { timeout: 30_000 })
         .not.toBeNull()
         .then(() => rig.runningViewForTerminal(terminalId))
-      if (!view?.containerId || !view.hostBootId) throw new Error('real Claude managed view missing ownership identity')
-      expect(rig.ownedContainerExec(view.containerId, ['claude', '--version'])).toContain('2.1.263')
+      if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
+      expect(rig.ownedContainerExec(view.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      const processArgs = rig.ownedContainerExec(view.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
+      expect(processArgs).toContain(`--model ${P2_OPENCODE_FREE_MODEL}`)
+      expect(processArgs).toContain('--hostname 127.0.0.1')
+      expect(processArgs).toContain('--port 4096')
 
-      const claudeIndex = Math.max(0, (await page.locator('.xterm').count()) - 1)
-      await terminal.waitForPrompt({ timeout: 45_000, terminalId })
+      const opencodeIndex = Math.max(0, (await page.locator('.xterm').count()) - 1)
+      await terminal.waitForOutput('Ask anything...', { timeout: 45_000, terminalId })
       await terminal.executeCommand(
-        'Use the Bash tool to run exactly: sleep 12; echo P2_CLAUDE_TOOL_DONE >> "$HOME/p2-claude-tool-count". Do not finish your response until that command completes.',
-        claudeIndex,
+        'Use the bash tool to run exactly: echo P2_OPENCODE_FIRST_TURN_DONE > "$HOME/p2-opencode-first-turn". Reply with exactly READY when the command completes.',
+        opencodeIndex,
       )
-      await waitForOwnedProcess(rig, view.containerId, 'sleep 12', 45_000)
+      await expect.poll(() => {
+        return rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true']).trim()
+      }, { timeout: 90_000 }).toBe('P2_OPENCODE_FIRST_TURN_DONE')
+
+      const sessionId = await expect
+        .poll(async () => (await content())?.sessionRef?.sessionId ?? null, { timeout: 45_000 })
+        .not.toBeNull()
+        .then(async () => (await content())!.sessionRef.sessionId as string)
+      expect(sessionId).toMatch(/^ses_/)
+
+      await new Promise((resolve) => setTimeout(resolve, 1_000))
+      await terminal.executeCommand(
+        'Use the bash tool to run exactly: sleep 12; echo P2_OPENCODE_TOOL_DONE >> "$HOME/p2-opencode-tool-count". Do not finish your response until that command completes.',
+        opencodeIndex,
+      )
+      await waitForOwnedProcess(rig, view.containerId, 'sleep 12', 60_000)
 
       await rig.crashAndRestartWeb()
       await harness.waitForConnection()
       const afterLeaf = await expect
-        .poll(async () => leavesByMode(await harness.getPaneLayout(tabId), 'claude').find((leaf) => leaf.id === paneId) ?? null, { timeout: 30_000 })
+        .poll(async () => leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((leaf) => leaf.id === paneId) ?? null, { timeout: 30_000 })
         .not.toBeNull()
-        .then(async () => leavesByMode(await harness.getPaneLayout(tabId), 'claude').find((leaf) => leaf.id === paneId)!)
+        .then(async () => leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((leaf) => leaf.id === paneId)!)
       expect(afterLeaf.content.terminalId).toBe(terminalId)
       await expect.poll(async () => (await content())?.sessionRef?.sessionId ?? null, { timeout: 30_000 }).toBe(sessionId)
       const afterView = await rig.runningViewForTerminal(terminalId)
@@ -257,14 +267,19 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(afterView?.hostBootId).toBe(view.hostBootId)
 
       await expect.poll(() => {
-        const count = rig.ownedContainerExec(view.containerId!, ['sh', '-lc', 'test -f "$HOME/p2-claude-tool-count" && wc -l < "$HOME/p2-claude-tool-count" || echo 0'])
+        const count = rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'test -f /home/freshell/provider/p2-opencode-tool-count && wc -l < /home/freshell/provider/p2-opencode-tool-count || echo 0'])
         return Number(count.trim())
-      }, { timeout: 45_000 }).toBe(1)
+      }, { timeout: 60_000 }).toBe(1)
 
       const afterIndex = Math.max(0, (await page.locator('.xterm').count()) - 1)
-      await terminal.waitForPrompt({ timeout: 45_000, terminalId })
-      await terminal.executeCommand('Reply with exactly P2_CLAUDE_FOLLOWUP', afterIndex)
-      await terminal.waitForOutput('P2_CLAUDE_FOLLOWUP', { timeout: 90_000, terminalId })
+      await new Promise((resolve) => setTimeout(resolve, 1_000))
+      await terminal.executeCommand(
+        'Use the bash tool to run exactly: echo P2_OPENCODE_FOLLOWUP_DONE > "$HOME/p2-opencode-followup". Reply with exactly FOLLOWUP when the command completes.',
+        afterIndex,
+      )
+      await expect.poll(() => {
+        return rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-followup 2>/dev/null || true']).trim()
+      }, { timeout: 90_000 }).toBe('P2_OPENCODE_FOLLOWUP_DONE')
       const runtimeDir = rig.runtime.runtimeDir(rig.supervisor, view.incarnationId)
       const hostState = JSON.parse(fs.readFileSync(path.join(runtimeDir, 'host-state.json'), 'utf8'))
       expect(hostState.workerLaunchCount).toBe(1)
@@ -273,7 +288,10 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const receipt = {
         caseId: 'P2-G04',
         status: 'PASS',
-        claudeVersion: '2.1.263',
+        provider: 'opencode',
+        opencodeVersion: P2_OPENCODE_VERSION,
+        model: P2_OPENCODE_FREE_MODEL,
+        freeTier: true,
         nativeSessionId: sessionId,
         sameNativeSession: true,
         sameIncarnation: true,
@@ -285,9 +303,9 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         followupSucceeded: true,
         providerLaunchCount: hostState.workerLaunchCount,
       }
-      const receiptPath = rig.writeClaudeReceipt(receipt)
+      const receiptPath = rig.writeOpencodeReceipt(receipt)
       // eslint-disable-next-line no-console
-      console.log(`[P2-G04] real Claude continuity receipt: ${receiptPath}`)
+      console.log(`[P2-G04] real OpenCode continuity receipt: ${receiptPath}`)
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

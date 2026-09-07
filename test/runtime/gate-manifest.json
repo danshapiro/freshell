@@ -5,7 +5,7 @@
   "prepared_on": "2026-09-06",
   "inspected_commit": "78b8d9d7ae6c02f81646fe22f11bd7e286f0054c",
   "source_document": "freshell-durable-souls-five-phase-execution-plan.md",
-  "source_document_sha256": "195b1f51af5c850021a5591fd7001c2ab9d6a8b84002b9622aaa86f5fc72ec47",
+  "source_document_sha256": "3c5994c31d3cad7c14a2210ba43f37c0302bc805cc7c25f25a7f257a9a58c961",
   "intended_repository_path": "test/runtime/gate-manifest.json",
   "required_scenario_count": 56,
   "implementation_task_count": 31,
@@ -92,7 +92,7 @@
     ],
     "applicability_rule": "Expand actual supported modes and ingresses from the capability manifest. Explicit capability-negative behavior is tested, not marked as an executed positive resume test.",
     "phase_1": "Real compiled supervisor/host, Docker, OS fixture processes, ownership and fault injection. No external coding-provider substitution is claimed.",
-    "phase_2": "Includes an actual OpenCode CLI/server on its free-tier path and a real browser; fixture loads establish measured resource boundaries. Claude and Codex are subsequent provider lanes governed by the provider test-cost policy.",
+    "phase_2": "Includes OpenCode 1.18.21 with anonymous free-tier model opencode/big-pickle and a real browser; auto-update is disabled and fixture loads establish measured resource boundaries. Claude and Codex are subsequent provider lanes governed by the provider test-cost policy.",
     "phase_3": "Every enabled mode executes real create and native resume; each supported ingress must traverse the production launch path. Error/rare-race variants may use actual fixture processes as specified.",
     "phase_4": "Real browser, server, supervisor and host with enabled real-provider smoke set, plus deterministic multi-soul stress fixtures.",
     "phase_5": "Every enabled family proves automatic native recovery is not loss; actual isolated provider state used for the genuine-loss test, complete live mode/ingress campaign and fixture chaos.",
@@ -283,8 +283,8 @@
         {
           "id": "P2-G04",
           "required": true,
-          "procedure": "Start a real OpenCode coding CLI/server on its free-tier path, complete a synthetic turn, begin a controlled long tool command, restart web while the tool is running, then send a follow-up.",
-          "pass_assertion": "Same OpenCode native session and OS incarnation; original tool completes once; follow-up succeeds; no new OpenCode provider launch hidden behind restoration.",
+          "procedure": "Start OpenCode 1.18.21 with opencode/big-pickle on the anonymous free-tier path, complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
+          "pass_assertion": "Same native ses_* session, soul, OS incarnation, container and host boot; tool effects occur exactly once; provider launch count stays one; no paid-model fallback or CLI auto-update.",
           "status": "NOT_RUN"
         },
         {

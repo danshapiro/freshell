@@ -170,6 +170,7 @@ impl OutputJournal {
             truncated: reset_required || more,
             exited: false,
             exit_code: None,
+            native_session_id: None,
             frames,
         })
     }

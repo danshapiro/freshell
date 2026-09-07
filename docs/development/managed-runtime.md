@@ -180,7 +180,7 @@ a healthy authenticated supervisor is required before the server advertises
 connection. Feature-off, controller-unavailable, Node-server, and non-negotiated
 connections stay byte-for-byte on their legacy ownership path.
 
-The current transitional implementation has negotiated **shell and Claude CLI terminals** using a browser-facing
+Phase 2 now negotiates **shell, Claude CLI, and OpenCode terminals** using a browser-facing
 `TerminalRegistry` facade with no `PtyTerminal`/OS kill handle. The session host
 owns the PTY reader/writer/waiter and continuously drains output into a bounded
 1 MiB in-memory ring plus 64 MiB rotating spool (configurable with bounded
@@ -210,18 +210,13 @@ inside the provider PTY and fails if that boundary changes. Git receives an
 ephemeral process-local `safe.directory` for the already-approved workspace; no
 global git config is modified.
 
-Phase 2 deliberately strips the legacy temporary `--mcp-config` injection for
-managed Claude. That MCP child depends on web-owned `FRESHELL_TOKEN` and would
-violate web-process independence. Phase 3 replaces it with the durable,
-capability-scoped tool router. Fresh-agent providers, Codex/OpenCode terminal
-sidecars, Amplifier, and Node-server routes remain legacy until their Phase 3
-adapters land.
+Phase 2 deliberately strips web-owned MCP/rebind machinery from managed providers. Managed Claude omits the legacy temporary `--mcp-config`; managed OpenCode omits the host rebind plugin, project-local Freshell MCP mutation, host-side SQLite locator, and web-side loopback SSE lane. OpenCode instead runs one pinned 1.18.21 provider per soul on private `127.0.0.1:4096`, with `opencode/big-pickle` as the Phase 2 free-tier gate model and auto-update disabled. A provider-UID helper inside the enclosure reads the soul-local OpenCode SQLite DB and returns only the native `ses_*` identity to the trusted host, which folds it through the normal pane ledger/identity broadcasts. Phase 3 replaces the omitted web-bound MCP behavior with the durable capability-scoped tool router. Fresh-agent providers, Codex terminal sidecars, Amplifier, and Node-server routes remain legacy until their Phase 3 adapters land.
 
 ## Remaining legacy process-ownership sites
 
 The following are the coding-agent/terminal process lifecycle sites still outside
 the supervisor. They are the migration checklist for later phases; Phase 2 does
-not broaden their legacy authority beyond the explicitly managed shell/Claude lane.
+not broaden their legacy authority beyond the explicitly managed shell/Claude/OpenCode lane.
 
 | Runtime family | Current production ownership/spawn/reap seams | Required migration destination |
 |---|---|---|

@@ -491,7 +491,7 @@ async fn run_loop(
                 for terminal_id in state.registry.managed_attached_to(conn_id) {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(500),
-                        state.registry.refresh_managed_output(&terminal_id, 64 * 1024),
+                        refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024),
                     ).await {
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => tracing::warn!(terminal_id = %terminal_id, error = %error,
@@ -2439,6 +2439,22 @@ pub(crate) struct LaunchPrep {
 /// (terminal.rs:1621-1689). Infallible: the only loud reject in the old
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
+fn managed_runtime_mode(mode: &str) -> bool {
+    matches!(mode, "shell" | "claude" | "opencode")
+}
+
+fn managed_opencode_endpoint(
+    mode: &str,
+    use_managed_runtime: bool,
+) -> Option<freshell_opencode::serve::Endpoint> {
+    (use_managed_runtime && mode == "opencode").then(|| freshell_opencode::serve::Endpoint {
+        hostname: "127.0.0.1".to_string(),
+        // Each managed soul has a private network namespace, so this endpoint
+        // is stable across web retries and cannot collide with another soul.
+        port: 4096,
+    })
+}
+
 fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(b"freshell-managed-terminal-v1\0");
@@ -2456,7 +2472,7 @@ fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
 
 #[cfg(test)]
 mod managed_runtime_id_tests {
-    use super::stable_managed_uuid;
+    use super::{managed_opencode_endpoint, managed_runtime_mode, stable_managed_uuid};
 
     #[test]
     fn managed_ids_are_retry_stable_and_domain_separated() {
@@ -2468,6 +2484,25 @@ mod managed_runtime_id_tests {
         assert_ne!(a, stream);
         assert_ne!(a, other);
         assert_eq!(a.get_version_num(), 4);
+    }
+
+    #[test]
+    fn phase2_managed_modes_include_opencode_but_not_other_unmigrated_providers() {
+        assert!(managed_runtime_mode("shell"));
+        assert!(managed_runtime_mode("claude"));
+        assert!(managed_runtime_mode("opencode"));
+        assert!(!managed_runtime_mode("codex"));
+        assert!(!managed_runtime_mode("amplifier"));
+    }
+
+    #[test]
+    fn managed_opencode_uses_private_namespace_fixed_endpoint() {
+        let endpoint = managed_opencode_endpoint("opencode", true)
+            .expect("managed opencode has an in-container endpoint");
+        assert_eq!(endpoint.hostname, "127.0.0.1");
+        assert_eq!(endpoint.port, 4096);
+        assert!(managed_opencode_endpoint("opencode", false).is_none());
+        assert!(managed_opencode_endpoint("shell", true).is_none());
     }
 }
 
@@ -3031,8 +3066,8 @@ pub(crate) async fn handle_create(
     // supervisor's semantic request digest and correctly trip REQUEST_ID_CONFLICT.
     // Derive both ids from the pane's durable createRequestId only for the
     // negotiated managed lane; legacy creates keep their historical randomness.
-    let use_managed_runtime = state.registry.managed_runtime_connection(conn_id)
-        && matches!(mode.as_str(), "shell" | "claude");
+    let use_managed_runtime =
+        state.registry.managed_runtime_connection(conn_id) && managed_runtime_mode(&mode);
     let (terminal_id, stream_id) = if use_managed_runtime {
         let terminal_uuid = stable_managed_uuid(&create.request_id, b"terminal");
         let stream_uuid = stable_managed_uuid(&create.request_id, b"stream");
@@ -3462,18 +3497,21 @@ pub(crate) async fn handle_create(
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
     // `LoopbackPortAllocator` seam (spec §3.3 rev 2.1 — transport.rs:323). The
     // port rides into argv (`--hostname/--port`), which is also its record.
-    let opencode_endpoint = if mode == "opencode" {
-        use freshell_opencode::serve::PortAllocator as _;
-        match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
-            Ok(ep) => Some(ep),
-            Err(e) => {
-                return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
-                    .await
+    let opencode_endpoint =
+        if let Some(endpoint) = managed_opencode_endpoint(&mode, use_managed_runtime) {
+            Some(endpoint)
+        } else if mode == "opencode" {
+            use freshell_opencode::serve::PortAllocator as _;
+            match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
+                Ok(ep) => Some(ep),
+                Err(e) => {
+                    return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                        .await
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // codex `--remote <wsUrl>` (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH` default
     // ON since S5.e): plan the managed app-server launch (`planCodexLaunch`,
@@ -3533,7 +3571,11 @@ pub(crate) async fn handle_create(
 
     // MCP injection (§3.2 IO layer). Reference parity: a throw here propagates out
     // of buildSpawnSpec BEFORE the pty.spawn try — no cleanup call on this path.
-    let mcp_injection = if mode == "shell" {
+    let mcp_injection = if mode == "shell"
+        || (use_managed_runtime && matches!(mode.as_str(), "claude" | "opencode"))
+    {
+        // Phase 2 managed providers must not depend on web-owned MCP files or
+        // project-local mutations. Phase 3 replaces this with the durable tool router.
         McpInjection::default()
     } else {
         match generate_mcp_injection(
@@ -3560,7 +3602,7 @@ pub(crate) async fn handle_create(
     // the IO layer; the pure resolver only reads the result from
     // CliLaunchInputs (mcp_injection precedent). Failure must never block the
     // launch.
-    let opencode_rebind_tui_config = if mode == "opencode" {
+    let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
         opencode_rebind_precompute()
     } else {
         None
@@ -3758,7 +3800,7 @@ pub(crate) async fn handle_create(
 
     // Phase 2 managed-runtime door: ONLY a connection that negotiated the
     // capability, against a server boot with an installed controller, may move
-    // shell/Claude PTY ownership out of the web process. Other providers and
+    // shell/Claude/OpenCode PTY ownership out of the web process. Other providers and
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
@@ -3953,20 +3995,24 @@ pub(crate) async fn handle_create(
     // The endpoint was allocated pre-launch and rode into argv; the hub's
     // OpencodeAttach arm re-checks the tracked mode, so this only arms for
     // opencode panes. Channel-deferred — safe off the dispatch path.
-    if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
-        hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+    if !use_managed_runtime {
+        if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
+            hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+        }
     }
 
     // Restore-across-restart fix (opencode): arm the opencode locator for a
     // FRESH (non-resuming) opencode pane. No-ops for every other mode/resume
     // case.
-    crate::opencode_association::maybe_arm(
-        state,
-        &terminal_id,
-        &mode,
-        resolved_cwd.as_deref(),
-        resume_session_id.as_deref(),
-    );
+    if !use_managed_runtime {
+        crate::opencode_association::maybe_arm(
+            state,
+            &terminal_id,
+            &mode,
+            resolved_cwd.as_deref(),
+            resume_session_id.as_deref(),
+        );
+    }
 
     // Lane B2: arm the codex rollout locator for a FRESH (non-resuming)
     // codex pane. Restore-created panes WITHOUT identity arm too — arm()
@@ -5417,6 +5463,22 @@ async fn maybe_restamp_on_attach(
     crate::pane_ledger::surface_write_failure(state, &attach.terminal_id, result.map(|_| ()))
 }
 
+async fn refresh_managed_output_and_associate(
+    state: &WsState,
+    terminal_id: &str,
+    max_bytes: u64,
+) -> Result<freshell_terminal::registry::ManagedOutputRead, String> {
+    let read = state
+        .registry
+        .refresh_managed_output(terminal_id, max_bytes)
+        .await?;
+    if let Some(session_id) = read.native_session_id.as_deref() {
+        crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
+            .await;
+    }
+    Ok(read)
+}
+
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
 /// connection to it: the registry enqueues `terminal.attach.ready`, replays the
 /// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
@@ -5433,10 +5495,8 @@ async fn handle_attach(
     terminal_output_batch_v1: bool,
 ) -> Option<ServerMessage> {
     if state.registry.is_managed(&attach.terminal_id) {
-        if let Err(error) = state
-            .registry
-            .refresh_managed_output(&attach.terminal_id, 256 * 1024)
-            .await
+        if let Err(error) =
+            refresh_managed_output_and_associate(state, &attach.terminal_id, 256 * 1024).await
         {
             return Some(managed_runtime_error(
                 &attach.terminal_id,

@@ -64,27 +64,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // Persist ONLY an explicit non-secret allowlist — never the web
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
-            let mut env = managed_env_allowlist(&request.env);
-            // Provider state belongs to this soul's Docker volume, not the web
-            // server's inherited HOME. These paths are inside the workload.
-            env.insert("HOME".into(), "/home/freshell/provider".into());
-            env.insert(
-                "CLAUDE_HOME".into(),
-                "/home/freshell/provider/.claude".into(),
-            );
-            env.insert(
-                "CLAUDE_CONFIG_DIR".into(),
-                "/home/freshell/provider/.claude".into(),
-            );
-            env.insert("CODEX_HOME".into(), "/home/freshell/provider/.codex".into());
-            env.insert(
-                "XDG_DATA_HOME".into(),
-                "/home/freshell/provider/.local/share".into(),
-            );
-            env.insert(
-                "XDG_CONFIG_HOME".into(),
-                "/home/freshell/provider/.config".into(),
-            );
+            let env = managed_provider_env(&request.mode, &request.env);
             let launch = LaunchRequest {
                 soul_id: soul_id.clone(),
                 provider: request.mode.clone(),
@@ -220,6 +200,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 retained_from_seq: output.retained_from_seq.min(i64::MAX as u64) as i64,
                 head_seq: output.head_seq.min(i64::MAX as u64) as i64,
                 exit_code: output.exited.then_some(output.exit_code.unwrap_or(0)),
+                native_session_id: output.native_session_id,
                 chunks: output
                     .frames
                     .into_iter()
@@ -258,6 +239,44 @@ fn managed_env_allowlist(
         .collect()
 }
 
+fn managed_provider_env(
+    mode: &str,
+    source: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut env = managed_env_allowlist(source);
+    // Provider state belongs to this soul's Docker volume, not the web
+    // server's inherited HOME. These paths are inside the workload.
+    env.insert("HOME".into(), "/home/freshell/provider".into());
+    env.insert(
+        "CLAUDE_HOME".into(),
+        "/home/freshell/provider/.claude".into(),
+    );
+    env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        "/home/freshell/provider/.claude".into(),
+    );
+    env.insert("CODEX_HOME".into(), "/home/freshell/provider/.codex".into());
+    env.insert(
+        "XDG_DATA_HOME".into(),
+        "/home/freshell/provider/.local/share".into(),
+    );
+    env.insert(
+        "XDG_CONFIG_HOME".into(),
+        "/home/freshell/provider/.config".into(),
+    );
+    if mode == "opencode" {
+        env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
+        // The legacy inline OpenCode config may contain credential-shaped
+        // values. Never persist it in supervisor state. Phase 2 carries only
+        // the invariant Freshell needs for safe conversation rollback.
+        env.insert(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"snapshot":false,"autoupdate":false}"#.to_string(),
+        );
+    }
+    env
+}
+
 fn managed_provider_args(mode: &str, args: Vec<String>) -> Vec<String> {
     if mode != "claude" {
         return args;
@@ -276,46 +295,78 @@ fn managed_provider_args(mode: &str, args: Vec<String>) -> Vec<String> {
 }
 
 fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, String> {
-    if mode != "claude" {
-        return Ok(Vec::new());
+    let (explicit_key, fallbacks): (&str, Vec<PathBuf>) = match mode {
+        "claude" => {
+            let mut paths = Vec::new();
+            if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+                if !dir.trim().is_empty() {
+                    paths.push(PathBuf::from(dir).join(".credentials.json"));
+                }
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                if !home.trim().is_empty() {
+                    paths.push(
+                        PathBuf::from(home)
+                            .join(".claude")
+                            .join(".credentials.json"),
+                    );
+                }
+            }
+            ("FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE", paths)
+        }
+        "opencode" => {
+            let mut paths = Vec::new();
+            if let Ok(data) = std::env::var("XDG_DATA_HOME") {
+                if !data.trim().is_empty() {
+                    paths.push(PathBuf::from(data).join("opencode").join("auth.json"));
+                }
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                if !home.trim().is_empty() {
+                    paths.push(
+                        PathBuf::from(home)
+                            .join(".local")
+                            .join("share")
+                            .join("opencode")
+                            .join("auth.json"),
+                    );
+                }
+            }
+            ("FRESHELL_MANAGED_OPENCODE_AUTH_FILE", paths)
+        }
+        _ => return Ok(Vec::new()),
+    };
+
+    if let Ok(explicit) = std::env::var(explicit_key) {
+        if !explicit.trim().is_empty() {
+            return provider_bootstrap_files_from_candidate(mode, Some(PathBuf::from(explicit)))
+                .map_err(|error| format!("{explicit_key}: {error}"));
+        }
     }
-    let explicit = std::env::var("FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let candidate = explicit
-        .clone()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("CLAUDE_CONFIG_DIR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(PathBuf::from)
-                .map(|dir| dir.join(".credentials.json"))
-        })
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(PathBuf::from)
-                .map(|home| home.join(".claude").join(".credentials.json"))
-        });
+    let candidate = fallbacks.into_iter().find(|path| path.is_file());
+    provider_bootstrap_files_from_candidate(mode, candidate)
+}
+
+fn provider_bootstrap_files_from_candidate(
+    mode: &str,
+    candidate: Option<PathBuf>,
+) -> Result<Vec<ProviderBootstrapFile>, String> {
     let Some(candidate) = candidate else {
         return Ok(Vec::new());
     };
     if !candidate.is_file() {
-        if explicit.is_some() {
-            return Err(format!(
-                "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE is not a readable file: {}",
-                candidate.display()
-            ));
-        }
-        return Ok(Vec::new());
+        return Err(format!("not a readable file: {}", candidate.display()));
     }
+    let provider_relative_path = match mode {
+        "claude" => ".claude/.credentials.json",
+        "opencode" => ".local/share/opencode/auth.json",
+        _ => return Ok(Vec::new()),
+    };
     let canonical = std::fs::canonicalize(&candidate)
-        .map_err(|error| format!("canonicalize Claude credential reference: {error}"))?;
+        .map_err(|error| format!("canonicalize provider bootstrap reference: {error}"))?;
     Ok(vec![ProviderBootstrapFile {
         source_path: canonical.to_string_lossy().into_owned(),
-        provider_relative_path: ".claude/.credentials.json".to_string(),
+        provider_relative_path: provider_relative_path.to_string(),
     }])
 }
 
@@ -418,6 +469,60 @@ mod tests {
         ] {
             assert!(!filtered.contains_key(key), "secret key leaked: {key}");
         }
+    }
+
+    #[test]
+    fn managed_opencode_env_uses_soul_state_and_drops_host_config_paths() {
+        let source = [
+            ("PATH", "/usr/local/bin:/usr/bin"),
+            ("OPENCODE_CONFIG_CONTENT", r#"{"secret":"do-not-persist"}"#),
+            (
+                "OPENCODE_TUI_CONFIG",
+                "/home/user/.freshell/opencode/tui.json",
+            ),
+            ("OPENCODE_API_KEY", "provider-secret"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let env = managed_provider_env("opencode", &source);
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some("/home/freshell/provider")
+        );
+        assert_eq!(
+            env.get("XDG_DATA_HOME").map(String::as_str),
+            Some("/home/freshell/provider/.local/share")
+        );
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME").map(String::as_str),
+            Some("/home/freshell/provider/.config")
+        );
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some(r#"{"snapshot":false,"autoupdate":false}"#)
+        );
+        assert_eq!(
+            env.get("TMPDIR").map(String::as_str),
+            Some("/run/opencode-tmp")
+        );
+        assert!(!env.contains_key("OPENCODE_TUI_CONFIG"));
+        assert!(!env.contains_key("OPENCODE_API_KEY"));
+        assert!(!env.values().any(|value| value.contains("do-not-persist")));
+    }
+
+    #[test]
+    fn opencode_bootstrap_reference_targets_soul_auth_store_without_persisting_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, r#"{"opencode":{"key":"secret-bytes"}}"#).unwrap();
+        let files = provider_bootstrap_files_from_candidate("opencode", Some(auth)).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].provider_relative_path,
+            ".local/share/opencode/auth.json"
+        );
+        assert!(!files[0].source_path.contains("secret-bytes"));
     }
 
     #[test]

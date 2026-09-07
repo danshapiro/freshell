@@ -15,6 +15,10 @@
     "claude": {
       "package": "@anthropic-ai/claude-code",
       "version": "2.1.263"
+    },
+    "opencode": {
+      "package": "opencode-ai",
+      "version": "1.18.21"
     }
   }
 }

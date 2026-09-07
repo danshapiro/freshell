@@ -407,6 +407,7 @@ pub struct ManagedOutputRead {
     pub retained_from_seq: i64,
     pub head_seq: i64,
     pub exit_code: Option<i64>,
+    pub native_session_id: Option<String>,
     pub chunks: Vec<ManagedOutputChunk>,
 }
 
