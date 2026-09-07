@@ -550,6 +550,10 @@ describe('readPidsLimit', () => {
     expect(readPidsLimit(nsMissingProc, nsRootCgroup)).toBe(256)
   })
 
+  it('reads fs-root pids.max for ../-relative v2 membership (never the escape above the root)', () => {
+    expect(readPidsLimit(nsEscapeProc, nsV2Cgroup)).toBe(512)
+  })
+
   it('keeps the threads-max fallback for 0::/ at a real (non-namespaced) fs root', () => {
     expect(readPidsLimit(pidsRootCgroupProc, emptyCgroupRoot)).toBe(4242)
   })

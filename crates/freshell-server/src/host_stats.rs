@@ -1913,6 +1913,10 @@ mod tests {
             })
         );
         assert_eq!(
+            readers::read_pids_limit(&proc_root, &cgroup_root),
+            Some(512)
+        );
+        assert_eq!(
             readers::read_pids_constraint(&proc_root, &cgroup_root),
             Some(readers::PidsConstraint {
                 current: 400,
