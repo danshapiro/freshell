@@ -845,4 +845,15 @@ A green installer build alone is insufficient. Acceptance must launch the packag
 
 ## Execution receipt
 
-Not executed yet. The integration evidence in “Starting state and scope” is the only post-merge evidence available when this plan was written; it is not a substitute for Tasks 1–7.
+### Periodic full gate after Task 5
+
+- Tested SHA: `98920e3d529adf8f987d8586d4b650eab879b87d` (clean detached Git-aware sandbox checkout).
+- Command: `npm run check` with `FRESHELL_VITEST_BACKEND=cloud`, `FRESHELL_E2E_BACKEND=cloud`, and `RUST_TEST_THREADS=2`.
+- Cloud Vitest: status 0; four non-empty Cloud Run shards, 5,986 tests total, zero failures.
+- Source-runtime phase: status 0, including the Rust SPA startup/auth/restart checks.
+- Rust phase: status 0; release/debug builds and `cargo test --workspace --locked` passed. The workspace reported zero failing tests (the two existing host-gated managed-Codex tests remained ignored by their declared host-gating contract).
+- Electron phase: 32 files, 319 tests passed, zero failures.
+- Overall: status 0. Inner receipt: `/home/dan/code/freshell/.worktrees/retire-node-server-v2/dist/pr699-verification/git-input-6rSfi7/receipts/run-mh3U0N/receipt.json`; coordinator receipt: `/home/dan/code/freshell/.worktrees/retire-node-server-v2/dist/pr699-verification/git-input-6rSfi7/receipts/run-mh3U0N/artifacts/coordinator/command-runs.json`; cloud receipt: `/home/dan/code/freshell/.worktrees/retire-node-server-v2/dist/pr699-verification/git-input-6rSfi7/cloud-result.json`.
+- Sandbox cleanup: owned container absent, launcher closed, companion status 0, and the host coordinator reservation released. No production process or user data was touched.
+
+The remaining Task 6 browser scenarios, static checks, and Task 7 native packaged-runtime receipts are still required; this gate is not a substitute for those checks.
