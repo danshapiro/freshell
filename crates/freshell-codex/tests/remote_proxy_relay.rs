@@ -342,6 +342,52 @@ async fn thread_start_response_is_relayed_unchanged_and_yields_a_candidate_event
     proxy.close().await;
 }
 
+// ── 3a. thread/resume response -> candidate (in-TUI /resume identity tracking) ──────
+
+#[tokio::test]
+async fn thread_resume_response_is_relayed_unchanged_and_yields_a_candidate() {
+    let mut upstream = start_fake_upstream().await;
+    let (proxy, mut events) =
+        CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
+            .await
+            .unwrap();
+    let mut tui = connect_tui(proxy.ws_url()).await;
+
+    let request =
+        json!({"id": 9, "method": "thread/resume", "params": {"threadId": "thread-B"}}).to_string();
+    tui.send(Message::Text(request)).await.unwrap();
+    let mut conn = upstream.accept().await;
+    let _ = conn.recv_text().await;
+
+    let response = json!({
+        "id": 9,
+        "result": {"thread": {"id": "thread-B", "path": "/tmp/rollout-B.jsonl", "ephemeral": false}},
+    })
+    .to_string();
+    conn.send_text(response.clone());
+
+    let received = recv_text(&mut tui).await;
+    assert_eq!(
+        received, response,
+        "thread/resume response must relay byte-identical"
+    );
+
+    let received_events = recv_events(&mut events, 1).await;
+    match &received_events[0] {
+        RemoteProxyEvent::Candidate(candidate) => {
+            assert_eq!(candidate.source, CandidateSource::ThreadResumeResponse);
+            assert_eq!(candidate.thread.id, "thread-B");
+            assert_eq!(
+                candidate.thread.path.as_deref(),
+                Some("/tmp/rollout-B.jsonl")
+            );
+        }
+        other => panic!("expected a Candidate event, got {other:?}"),
+    }
+
+    proxy.close().await;
+}
+
 // ── 4. thread/fork request rewrite + response normalization ────────────────────────
 
 #[tokio::test]

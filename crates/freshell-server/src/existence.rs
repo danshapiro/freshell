@@ -1346,12 +1346,15 @@ mod tests {
         // Empty registries: no terminal survives a server restart.
         let registry = TerminalRegistry::new();
         let identity = TerminalIdentityRegistry::new();
+        let empty_gate_answers: std::collections::HashMap<String, SessionExistence> =
+            std::collections::HashMap::new();
         let deps = ReconcileDeps {
             registry: &registry,
             identity: &identity,
             existence: &probe,
             pane_ledger: &ledger,
             fresh_agent: None,
+            codex_gate_answers: &empty_gate_answers,
         };
         let pane = |n: u32, sid: &str| ReconcilePane {
             pane_key: format!("pane-{n}"),

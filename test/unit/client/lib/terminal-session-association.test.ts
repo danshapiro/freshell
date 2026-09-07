@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
-import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
+import { reconcileTerminalSessionRefByTerminalId, updatePaneTitle } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { updateTab } from '@/store/tabsSlice'
 
-function createState(content: Record<string, unknown>, tabOverrides: Record<string, unknown> = {}) {
+function createState(
+  content: Record<string, unknown>,
+  tabOverrides: Record<string, unknown> = {},
+  sessions?: Record<string, unknown>,
+) {
   return {
     panes: {
       layouts: {
@@ -23,6 +27,7 @@ function createState(content: Record<string, unknown>, tabOverrides: Record<stri
         ...tabOverrides,
       }],
     },
+    sessions: sessions ?? { windows: {} },
   } as any
 }
 
@@ -205,6 +210,170 @@ describe('server-authoritative rebind (previousSessionId)', () => {
       'opencode:ses_new': { sessionType: 'opencode', firstUserMessage: 'hello world' },
     })
     expect(dispatched.map((action) => action.type)).toContain(flushPersistedLayoutNow.type)
+  })
+
+  describe('rebind tab title adoption (non-user-set titles only)', () => {
+    const codexPaneBoundToOldThread = {
+      kind: 'terminal' as const,
+      terminalId: 't-1',
+      createRequestId: 'req-1',
+      status: 'running' as const,
+      mode: 'codex' as const,
+      shell: 'system' as const,
+      sessionRef: { provider: 'codex', sessionId: 'old-thread' },
+    }
+    const sessionsWithNewThreadTitle = {
+      windows: {
+        main: {
+          projects: [{
+            projectPath: '/repo',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'new-thread',
+              projectPath: '/repo',
+              lastActivityAt: 1,
+              title: 'Durable thread title',
+            }],
+          }],
+        },
+      },
+    }
+    const rebindReconcile = (dispatch: any, getState: () => any) =>
+      reconcileTerminalSessionAssociation({
+        dispatch,
+        getState,
+        terminalId: 't-1',
+        sessionRef: { provider: 'codex', sessionId: 'new-thread' },
+        previousSessionId: 'old-thread',
+      })
+
+    it('adopts the new session directory title for a non-user-set tab title', () => {
+      const dispatched: any[] = []
+      const dispatch = vi.fn((action) => dispatched.push(action))
+      const getState = () => createState(
+        codexPaneBoundToOldThread,
+        {
+          title: 'Old title',
+          titleSetByUser: undefined,
+          sessionRef: { provider: 'codex', sessionId: 'old-thread' },
+        },
+        sessionsWithNewThreadTitle,
+      )
+      const result = rebindReconcile(dispatch, getState)
+      expect(result).toBe('reconciled')
+      const tabUpdate = dispatched.find((action) => action.type === updateTab.type)
+      expect(tabUpdate).toBeDefined()
+      expect(tabUpdate.payload.updates).toMatchObject({ title: 'Durable thread title' })
+      expect(dispatch).toHaveBeenCalledWith(updatePaneTitle({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        title: 'Durable thread title',
+        setByUser: false,
+      }))
+      expect(dispatch).toHaveBeenCalledWith(flushPersistedLayoutNow())
+    })
+
+    it('never replaces a user-set tab title on rebind', () => {
+      const dispatched: any[] = []
+      const dispatch = vi.fn((action) => dispatched.push(action))
+      const getState = () => createState(
+        codexPaneBoundToOldThread,
+        {
+          title: 'User title',
+          titleSetByUser: true,
+          sessionRef: { provider: 'codex', sessionId: 'old-thread' },
+        },
+        sessionsWithNewThreadTitle,
+      )
+      const result = rebindReconcile(dispatch, getState)
+      expect(result).toBe('reconciled')
+      const tabUpdate = dispatched.find((action) => action.type === updateTab.type)
+      expect(tabUpdate).toBeDefined()
+      expect(tabUpdate.payload.updates).not.toHaveProperty('title')
+      expect(dispatched.some((action) => action.type === updatePaneTitle.type)).toBe(false)
+      expect(dispatch).toHaveBeenCalledWith(flushPersistedLayoutNow())
+    })
+
+    it('leaves the title alone when the directory has no row for the new key', () => {
+      const dispatched: any[] = []
+      const dispatch = vi.fn((action) => dispatched.push(action))
+      const getState = () => createState(
+        codexPaneBoundToOldThread,
+        {
+          title: 'Old title',
+          sessionRef: { provider: 'codex', sessionId: 'old-thread' },
+        },
+        {
+          windows: {
+            main: {
+              projects: [{
+                projectPath: '/repo',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'other-thread',
+                  projectPath: '/repo',
+                  lastActivityAt: 1,
+                  title: 'Someone else\'s title',
+                }],
+              }],
+            },
+          },
+        },
+      )
+      const result = rebindReconcile(dispatch, getState)
+      expect(result).toBe('reconciled')
+      const tabUpdate = dispatched.find((action) => action.type === updateTab.type)
+      expect(tabUpdate).toBeDefined()
+      expect(tabUpdate.payload.updates).not.toHaveProperty('title')
+      expect(dispatched.some((action) => action.type === updatePaneTitle.type)).toBe(false)
+    })
+
+    it('never adopts a title on a first bind (previousSessionId absent)', () => {
+      const dispatched: any[] = []
+      const dispatch = vi.fn((action) => dispatched.push(action))
+      const getState = () => createState(
+        {
+          kind: 'terminal',
+          terminalId: 't-1',
+          createRequestId: 'req-1',
+          status: 'running',
+          mode: 'codex',
+          shell: 'system',
+        },
+        { title: 'First bind title' },
+        sessionsWithNewThreadTitle,
+      )
+      const result = reconcileTerminalSessionAssociation({
+        dispatch,
+        getState,
+        terminalId: 't-1',
+        sessionRef: { provider: 'codex', sessionId: 'new-thread' },
+      })
+      expect(result).toBe('reconciled')
+      const tabUpdate = dispatched.find((action) => action.type === updateTab.type)
+      expect(tabUpdate).toBeDefined()
+      expect(tabUpdate.payload.updates).toMatchObject({
+        sessionRef: { provider: 'codex', sessionId: 'new-thread' },
+      })
+      expect(tabUpdate.payload.updates).not.toHaveProperty('title')
+      expect(dispatched.some((action) => action.type === updatePaneTitle.type)).toBe(false)
+    })
+
+    it('a rebind that the conflict gate refuses never touches titles', () => {
+      const dispatched: any[] = []
+      const dispatch = vi.fn((action) => dispatched.push(action))
+      const getState = () => createState(
+        { ...codexPaneBoundToOldThread, sessionRef: { provider: 'codex', sessionId: 'some-other-thread' } },
+        {
+          title: 'Old title',
+          sessionRef: { provider: 'codex', sessionId: 'some-other-thread' },
+        },
+        sessionsWithNewThreadTitle,
+      )
+      const result = rebindReconcile(dispatch, getState)
+      expect(result).toBe('conflict')
+      expect(dispatch).not.toHaveBeenCalled()
+    })
   })
 })
 

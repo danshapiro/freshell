@@ -33,6 +33,7 @@ pub enum SideEffectError {
     BatchUnsupported,
     EphemeralThread,
     IdNotPendingFork,
+    IdNotPendingThreadResume,
     IdNotPendingThreadStart,
     MalformedJson,
     MissingParentThreadId,
@@ -40,6 +41,7 @@ pub enum SideEffectError {
     MissingThread,
     PathAliasConflict,
     RelativeRolloutPath,
+    ResumeIdMismatch,
     SameAsParent,
     TokenTooLarge,
     UnsafeDuplicateKey,
@@ -73,6 +75,10 @@ pub enum CandidateSource {
     ThreadStartResponse,
     ThreadStartedNotification,
     ThreadForkResponse,
+    /// `thread/resume` response: the TUI switched to an EXISTING thread; the
+    /// response's `result.thread` IS the switched-to thread (resume preserves
+    /// the caller-requested id).
+    ThreadResumeResponse,
 }
 
 /// A captured thread candidate (`CodexRemoteProxyCandidate`, `remote-proxy.ts:31-34`).
@@ -134,6 +140,19 @@ pub struct ThreadStartResponseOptions<'a> {
 pub struct ForkResponseOptions<'a> {
     pub parent_thread_id: Option<&'a str>,
     pub pending_fork_request_ids: &'a std::collections::HashSet<crate::protocol::RequestId>,
+}
+
+/// Pending-request-id / requested-thread attribution options for
+/// [`extract_thread_resume_response_candidate`]. `thread/resume` answers carry
+/// the caller-requested thread id ONLY for threadId-mode resumes — the
+/// protocol crate documents that `params.threadId` is ignored when
+/// experimental `params.history` or a non-empty `params.path` are supplied —
+/// so agreement hard-fails apply only when `enforce_id_agreement` is true.
+pub struct ThreadResumeResponseOptions<'a> {
+    pub requested_thread_id: Option<&'a str>,
+    pub enforce_id_agreement: bool,
+    pub pending_thread_resume_request_ids:
+        &'a std::collections::HashSet<crate::protocol::RequestId>,
 }
 
 // ── shared frame scaffolding ─────────────────────────────────────────────────────────
@@ -430,6 +449,40 @@ pub fn extract_fork_response_candidate(
             path: Some(path),
             ephemeral: extracted.thread.ephemeral,
         },
+    })
+}
+
+// ── extractThreadResumeResponseCandidate (in-TUI /resume identity tracking) ─────────
+
+/// Extract a `thread/resume` response candidate. Fails closed on id-set,
+/// structure, duplicate-key, or request/response disagreement — the router
+/// only ever sees candidates that provably name the thread the TUI asked for.
+pub fn extract_thread_resume_response_candidate(
+    raw: &[u8],
+    options: &ThreadResumeResponseOptions<'_>,
+) -> SideEffectResult<RemoteProxyCandidate> {
+    let root = scan_root_object(raw)?;
+    if has_any_duplicate_key(&root.entries, &["id", "result"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+
+    let id = extract_top_level_id(raw, &root.entries)?;
+    if !options.pending_thread_resume_request_ids.contains(&id) {
+        return Err(SideEffectError::IdNotPendingThreadResume);
+    }
+
+    let extracted = extract_result_thread(raw, &root.entries)?;
+    if options.enforce_id_agreement {
+        if let Some(requested) = options.requested_thread_id {
+            if !requested.is_empty() && extracted.thread.id != requested {
+                return Err(SideEffectError::ResumeIdMismatch);
+            }
+        }
+    }
+
+    Ok(RemoteProxyCandidate {
+        source: CandidateSource::ThreadResumeResponse,
+        thread: extracted.thread,
     })
 }
 
@@ -1043,6 +1096,181 @@ mod tests {
     fn merge_turn(mut turn: serde_json::Value, overrides: serde_json::Value) -> serde_json::Value {
         merge(&mut turn, overrides);
         turn
+    }
+
+    // ── thread/resume response candidates (in-TUI /resume identity tracking) ──
+
+    #[test]
+    fn extracts_a_thread_resume_response_candidate_with_requested_id() {
+        let raw = json!({
+            "id": 21,
+            "result": create_operation_result(create_thread(
+                "thread-B",
+                json!({ "path": ROLLOUT_PATH, "ephemeral": false }),
+            )),
+        })
+        .to_string();
+        let mut pending = HashSet::new();
+        pending.insert(RequestId::Int(21));
+
+        let extracted = extract_thread_resume_response_candidate(
+            raw.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: Some("thread-B"),
+                enforce_id_agreement: true,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect("expected a resume candidate");
+
+        assert_eq!(extracted.source, CandidateSource::ThreadResumeResponse);
+        assert_eq!(extracted.thread.id, "thread-B");
+        assert_eq!(extracted.thread.path.as_deref(), Some(ROLLOUT_PATH));
+        assert!(!extracted.thread.ephemeral);
+    }
+
+    #[test]
+    fn rejects_a_resume_candidate_whose_response_id_was_never_requested() {
+        let raw = json!({
+            "id": 21,
+            "result": create_operation_result(create_thread("thread-B", json!({ "path": ROLLOUT_PATH }))),
+        })
+        .to_string();
+        let pending = HashSet::new();
+        let err = extract_thread_resume_response_candidate(
+            raw.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: Some("thread-B"),
+                enforce_id_agreement: true,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect_err("responses for never-requested ids must not yield candidates");
+        assert_eq!(err, SideEffectError::IdNotPendingThreadResume);
+    }
+
+    #[test]
+    fn rejects_a_resume_candidate_that_disagrees_with_the_requested_thread() {
+        // The request resumed thread-A; a response naming thread-B is a decoy or a
+        // protocol bug — fail closed, never an identity candidate.
+        let raw = json!({
+            "id": 21,
+            "result": create_operation_result(create_thread("thread-B", json!({ "path": ROLLOUT_PATH }))),
+        })
+        .to_string();
+        let mut pending = HashSet::new();
+        pending.insert(RequestId::Int(21));
+        let err = extract_thread_resume_response_candidate(
+            raw.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: Some("thread-A"),
+                enforce_id_agreement: true,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect_err("request/response thread disagreement must fail closed");
+        assert_eq!(err, SideEffectError::ResumeIdMismatch);
+    }
+
+    #[test]
+    fn extracts_a_resume_candidate_when_the_request_carried_no_thread_id() {
+        // `thread/resume` without params.threadId resumes "latest" — nothing to agree with.
+        let raw = json!({
+            "id": 21,
+            "result": create_operation_result(create_thread("thread-B", json!({ "path": ROLLOUT_PATH }))),
+        })
+        .to_string();
+        let mut pending = HashSet::new();
+        pending.insert(RequestId::Int(21));
+        let extracted = extract_thread_resume_response_candidate(
+            raw.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: None,
+                enforce_id_agreement: false,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect("no attribution to check against");
+        assert_eq!(extracted.thread.id, "thread-B");
+    }
+
+    #[test]
+    fn relaxes_id_agreement_for_history_or_path_mode_resumes() {
+        // Protocol reality (validated Stage 2, LB1): when params.history or a
+        // non-empty params.path were supplied, the server IGNORES params.threadId —
+        // a response id differing from the recorded request id is then LEGAL and
+        // must produce a candidate, not ResumeIdMismatch.
+        let raw = json!({
+            "id": 21,
+            "result": create_operation_result(create_thread("thread-Z", json!({ "path": ROLLOUT_PATH }))),
+        })
+        .to_string();
+        let mut pending = HashSet::new();
+        pending.insert(RequestId::Int(21));
+        let extracted = extract_thread_resume_response_candidate(
+            raw.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: Some("thread-A"),
+                enforce_id_agreement: false,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect("history/path-mode resume must not hard-fail on id mismatch");
+        assert_eq!(extracted.thread.id, "thread-Z");
+    }
+
+    #[test]
+    fn emits_an_ephemeral_resume_candidate_with_a_null_path_for_downstream_predicates() {
+        // thread.path is nullable on the wire (null iff ephemeral). The extractor
+        // mirrors the wire faithfully; the ROUTER's bind predicate drops ephemeral /
+        // path-less candidates — do not fuse that decision into the extractor.
+        let raw = json!({
+            "id": 21,
+            "result": create_operation_result(create_thread("thread-eph", json!({ "path": null, "ephemeral": true }))),
+        })
+        .to_string();
+        let mut pending = HashSet::new();
+        pending.insert(RequestId::Int(21));
+        let extracted = extract_thread_resume_response_candidate(
+            raw.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: Some("thread-eph"),
+                enforce_id_agreement: true,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect("ephemeral resume still yields a candidate");
+        assert!(extracted.thread.ephemeral);
+        assert_eq!(extracted.thread.path, None);
+    }
+
+    #[test]
+    fn rejects_resume_frames_with_duplicate_top_level_keys_or_a_missing_result_thread() {
+        let mut pending = HashSet::new();
+        pending.insert(RequestId::Int(21));
+        let dup = br#"{"id":21,"id":22,"result":{"thread":{"id":"thread-B","path":"/x.jsonl"}}}"#;
+        let err = extract_thread_resume_response_candidate(
+            dup,
+            &ThreadResumeResponseOptions {
+                requested_thread_id: None,
+                enforce_id_agreement: false,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect_err("duplicate top-level key");
+        assert_eq!(err, SideEffectError::UnsafeDuplicateKey);
+
+        let no_thread = json!({ "id": 21, "result": { "cwd": "/repo" } }).to_string();
+        let err = extract_thread_resume_response_candidate(
+            no_thread.as_bytes(),
+            &ThreadResumeResponseOptions {
+                requested_thread_id: None,
+                enforce_id_agreement: false,
+                pending_thread_resume_request_ids: &pending,
+            },
+        )
+        .expect_err("result without a thread object");
+        assert_eq!(err, SideEffectError::MissingThread);
     }
 
     #[test]

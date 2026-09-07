@@ -40,6 +40,15 @@ pub struct ReconcileDeps<'a> {
     /// fresh-agent panes; `None` keeps the frozen client's
     /// `invalid{unsupported_kind}` contract.
     pub fresh_agent: Option<&'a crate::reconcile_freshagent::FreshAgentReconcileSnapshot>,
+    /// A13: pre-computed `exists_for_gate` answers for codex panes that
+    /// reach the gate arm (codex + ever_observed + snapshot-Absent). The
+    /// by-id rollout walk (~1s on a real store) is run off the reactor by
+    /// [`build_codex_gate_answers`] (inside `spawn_blocking_in_span`) and
+    /// injected here so the pure derive never calls the probe inline.
+    /// Keyed by `"{provider}:{session_id}"`. A missing entry maps to the
+    /// conservative `Unknown` (index_warming deferral), never a data-loss
+    /// verdict — see [`verdict_for_pane`]'s codex arm.
+    pub codex_gate_answers: &'a std::collections::HashMap<String, SessionExistence>,
 }
 
 /// Derive one verdict per presented pane, 1:1 by `paneKey`, order preserved
@@ -61,6 +70,80 @@ pub fn derive_verdicts(deps: &ReconcileDeps<'_>, panes: &[ReconcilePane]) -> Vec
             verdict_for_pane(deps, pane)
         })
         .collect()
+}
+
+/// A13 pre-pass: pre-compute `exists_for_gate` answers for codex panes that
+/// would reach the gate arm (codex + ever_observed + snapshot-Absent), off
+/// the reactor inside `spawn_blocking_in_span`. The by-id rollout walk is
+/// ~1s on a real store; its trait contract (existence.rs:62-70) requires
+/// `spawn_blocking` — never inline on the async runtime. The pure derive
+/// (verdict_for_pane, inside catch_unwind) is sync, so the handler runs
+/// this pre-pass and injects the answers as a map — mirroring
+/// `reconcile_freshagent::build_snapshot` (the ONE async gathering pass,
+/// injected into the pure derivation). Keyed by `"{provider}:{session_id}"`.
+/// Re-run before each derive (the warming deferral may have published a
+/// new snapshot between the two calls).
+pub(crate) async fn build_codex_gate_answers(
+    state: &crate::WsState,
+    panes: &[ReconcilePane],
+) -> std::collections::HashMap<String, SessionExistence> {
+    let empty: std::collections::HashMap<String, SessionExistence> =
+        std::collections::HashMap::new();
+    let deps = ReconcileDeps {
+        registry: &state.registry,
+        identity: &state.identity,
+        existence: state.session_existence.as_ref(),
+        pane_ledger: &state.pane_ledger,
+        fresh_agent: None,
+        codex_gate_answers: &empty,
+    };
+    // Collect the codex (provider, session_id) pairs that would reach the
+    // gate arm: codex + ever_observed + snapshot-Absent. The walk only
+    // runs on this rare path (the restart-after-switch scenario).
+    let mut needed: Vec<(String, String)> = Vec::new();
+    for pane in panes
+        .iter()
+        .filter(|p| p.kind.as_deref() == Some("terminal"))
+    {
+        let Some(key) = pane
+            .create_request_id
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(sref) = resolve_authoritative_ref(&deps, pane, &key) else {
+            continue;
+        };
+        if sref.provider != "codex" {
+            continue;
+        }
+        if deps.existence.exists(&sref.provider, &sref.session_id) != SessionExistence::Absent {
+            continue;
+        }
+        if !deps
+            .existence
+            .ever_observed(&sref.provider, &sref.session_id)
+        {
+            continue;
+        }
+        needed.push((sref.provider, sref.session_id));
+    }
+    if needed.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let probe = state.session_existence.clone();
+    crate::terminal::spawn_blocking_in_span(move || {
+        let mut map = std::collections::HashMap::new();
+        for (provider, session_id) in &needed {
+            let answer = probe.exists_for_gate(provider, session_id);
+            map.insert(format!("{provider}:{session_id}"), answer);
+        }
+        map
+    })
+    .await
+    .expect("codex gate pre-pass task panicked")
 }
 
 fn invalid(pane: &ReconcilePane, reason: &str) -> PaneVerdict {
@@ -103,7 +186,7 @@ fn corrected_flag(claim: Option<&SessionLocator>, server: Option<&SessionLocator
 /// registry-side `resume_session_id` path for REST-created resumes that never
 /// reached the WS-owned identity registry (design assumption 1's acceptance
 /// check) — then the client's claims, promoted by ONE uniform rule.
-fn resolve_authoritative_ref(
+pub(crate) fn resolve_authoritative_ref(
     deps: &ReconcileDeps<'_>,
     pane: &ReconcilePane,
     key: &str,
@@ -418,10 +501,69 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
                 .existence
                 .ever_observed(&sref.provider, &sref.session_id)
             {
-                PaneVerdict {
-                    session_ref: Some(sref),
-                    reason: Some("session_not_on_disk".to_string()),
-                    ..base(pane, ReconcileVerdict::DeadSession)
+                // D-RESUME restart fix: for codex, `exists()` is SNAPSHOT-ONLY
+                // (the ~1s by-id rollout walk lives only in `exists_for_gate`,
+                // `existence.rs:422-443`). A ledger-bound codex identity whose
+                // rollout EXISTS on disk must never be adjudicated dead_session
+                // merely because the sessions index snapshot lacks it — the
+                // restart-after-switch scenario. Consult the gate variant
+                // before issuing the dead_session verdict: Present rescues to
+                // Respawn (§7.5 respawn_exhausted still applies), Unknown
+                // defers (index_warming), and a positive Absent keeps the
+                // dead_session verdict intact (resume_validation_gate pins
+                // it for genuinely-missing identities). The walk only runs
+                // here — codex + ever_observed + snapshot-Absent — the rare
+                // restart-after-switch path; the common snapshot-hit and the
+                // cold path are unchanged.
+                //
+                // A13: the gate answer is pre-computed off the reactor by
+                // [`build_codex_gate_answers`] (spawn_blocking) and injected
+                // via `ReconcileDeps.codex_gate_answers` — the pure derive
+                // never calls `exists_for_gate` inline. A missing entry
+                // (e.g. the index was cold at pre-pass time) maps to the
+                // conservative `Unknown` (index_warming deferral), never a
+                // data-loss verdict.
+                if sref.provider == "codex" {
+                    let gate_key = format!("{}:{}", sref.provider, sref.session_id);
+                    let gate = deps
+                        .codex_gate_answers
+                        .get(&gate_key)
+                        .copied()
+                        .unwrap_or(SessionExistence::Unknown);
+                    match gate {
+                        SessionExistence::Present => {
+                            if deps.registry.respawn_exhausted(&key) {
+                                return PaneVerdict {
+                                    session_ref: Some(sref),
+                                    reason: Some("respawn_exhausted".to_string()),
+                                    ..base(pane, ReconcileVerdict::DeadSession)
+                                };
+                            }
+                            let corrected = corrected_flag(pane.session_ref.as_ref(), Some(&sref));
+                            PaneVerdict {
+                                session_ref: Some(sref),
+                                corrected,
+                                ..base(pane, ReconcileVerdict::Respawn)
+                            }
+                        }
+                        SessionExistence::Unknown | SessionExistence::ProviderUnavailable => {
+                            PaneVerdict {
+                                reason: Some("index_warming".to_string()),
+                                ..base(pane, ReconcileVerdict::Error)
+                            }
+                        }
+                        SessionExistence::Absent => PaneVerdict {
+                            session_ref: Some(sref),
+                            reason: Some("session_not_on_disk".to_string()),
+                            ..base(pane, ReconcileVerdict::DeadSession)
+                        },
+                    }
+                } else {
+                    PaneVerdict {
+                        session_ref: Some(sref),
+                        reason: Some("session_not_on_disk".to_string()),
+                        ..base(pane, ReconcileVerdict::DeadSession)
+                    }
                 }
             } else {
                 PaneVerdict {
@@ -452,15 +594,37 @@ mod tests {
     use std::sync::Mutex;
 
     /// §5.1 test fake: per-key existence answers + an observed-history set.
+    /// `gate_answers` is a SEPARATE map for [`SessionExistenceProbe::exists_for_gate`]
+    /// — the by-id disk-walk variant — so tests can model the codex split:
+    /// `exists()` (snapshot-only) returns Absent while `exists_for_gate()`
+    /// (rollout walk) returns Present. When no gate answer is set,
+    /// `exists_for_gate` delegates to `exists()` (the trait default shape).
     #[derive(Default)]
     struct FakeProbe {
         answers: Mutex<HashMap<String, SessionExistence>>,
+        gate_answers: Mutex<HashMap<String, SessionExistence>>,
         observed: Mutex<std::collections::HashSet<String>>,
     }
 
     impl FakeProbe {
         fn set(&self, provider: &str, session_id: &str, existence: SessionExistence) {
             self.answers
+                .lock()
+                .unwrap()
+                .insert(format!("{provider}:{session_id}"), existence);
+            if existence == SessionExistence::Present {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .insert(format!("{provider}:{session_id}"));
+            }
+        }
+
+        /// Set the `exists_for_gate` answer separately — models the by-id
+        /// disk walk finding a rollout the snapshot missed (the codex
+        /// restart-after-switch rescue path).
+        fn set_gate(&self, provider: &str, session_id: &str, existence: SessionExistence) {
+            self.gate_answers
                 .lock()
                 .unwrap()
                 .insert(format!("{provider}:{session_id}"), existence);
@@ -496,6 +660,18 @@ mod tests {
                 .unwrap()
                 .contains(&format!("{provider}:{session_id}"))
         }
+
+        fn exists_for_gate(&self, provider: &str, session_id: &str) -> SessionExistence {
+            if let Some(ans) = self
+                .gate_answers
+                .lock()
+                .unwrap()
+                .get(&format!("{provider}:{session_id}"))
+            {
+                return *ans;
+            }
+            self.exists(provider, session_id)
+        }
     }
 
     /// Unique per-fixture ledger root — the same atomic-counter + pid
@@ -515,6 +691,7 @@ mod tests {
         probe: FakeProbe,
         ledger: crate::pane_ledger::PaneLedger,
         ledger_root: std::path::PathBuf,
+        empty_gate_answers: std::collections::HashMap<String, SessionExistence>,
     }
 
     impl Drop for Fixture {
@@ -532,6 +709,7 @@ mod tests {
                 probe: FakeProbe::default(),
                 ledger: crate::pane_ledger::PaneLedger::new(Some(ledger_root.clone())),
                 ledger_root,
+                empty_gate_answers: std::collections::HashMap::new(),
             }
         }
 
@@ -542,6 +720,7 @@ mod tests {
                 existence: &self.probe,
                 pane_ledger: &self.ledger,
                 fresh_agent: None,
+                codex_gate_answers: &self.empty_gate_answers,
             }
         }
 
@@ -573,8 +752,66 @@ mod tests {
             });
         }
 
+        /// Pre-compute codex gate answers for the given panes, mirroring the
+        /// production `build_codex_gate_answers` pre-pass. In tests the
+        /// FakeProbe's `exists_for_gate` is a cheap map lookup (no real disk
+        /// walk), so the A13 spawn_blocking concern does not apply here.
+        fn build_gate_answers(
+            &self,
+            panes: &[ReconcilePane],
+        ) -> std::collections::HashMap<String, SessionExistence> {
+            let empty: std::collections::HashMap<String, SessionExistence> =
+                std::collections::HashMap::new();
+            let deps = ReconcileDeps {
+                registry: &self.registry,
+                identity: &self.identity,
+                existence: &self.probe,
+                pane_ledger: &self.ledger,
+                fresh_agent: None,
+                codex_gate_answers: &empty,
+            };
+            let mut map = std::collections::HashMap::new();
+            for pane in panes
+                .iter()
+                .filter(|p| p.kind.as_deref() == Some("terminal"))
+            {
+                let Some(key) = pane
+                    .create_request_id
+                    .as_deref()
+                    .filter(|k| !k.is_empty())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let Some(sref) = resolve_authoritative_ref(&deps, pane, &key) else {
+                    continue;
+                };
+                if sref.provider != "codex" {
+                    continue;
+                }
+                if self.probe.exists(&sref.provider, &sref.session_id) != SessionExistence::Absent {
+                    continue;
+                }
+                if !self.probe.ever_observed(&sref.provider, &sref.session_id) {
+                    continue;
+                }
+                let answer = self.probe.exists_for_gate(&sref.provider, &sref.session_id);
+                map.insert(format!("{}:{}", sref.provider, sref.session_id), answer);
+            }
+            map
+        }
+
         fn one(&self, pane: ReconcilePane) -> PaneVerdict {
-            let verdicts = derive_verdicts(&self.deps(), &[pane]);
+            let gate_answers = self.build_gate_answers(std::slice::from_ref(&pane));
+            let deps = ReconcileDeps {
+                registry: &self.registry,
+                identity: &self.identity,
+                existence: &self.probe,
+                pane_ledger: &self.ledger,
+                fresh_agent: None,
+                codex_gate_answers: &gate_answers,
+            };
+            let verdicts = derive_verdicts(&deps, &[pane]);
             assert_eq!(verdicts.len(), 1);
             verdicts.into_iter().next().unwrap()
         }
@@ -778,6 +1015,86 @@ mod tests {
         f.probe.mark_observed("claude", "s-gone2");
         let mut p = pane("cr-gone2");
         p.session_ref = Some(sref("claude", "s-gone2"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::DeadSession);
+        assert_eq!(v.reason.as_deref(), Some("session_not_on_disk"));
+    }
+
+    /// D-RESUME restart fix: a codex pane whose ledger binds codex:<id>
+    /// (ever_observed via the durable ledger) and whose rollout EXISTS on
+    /// disk — but the sessions index snapshot misses it (the restart-after-
+    /// switch scenario) — must NEVER be adjudicated dead_session. The
+    /// reconcile path consults `exists_for_gate()` (the by-id rollout walk)
+    /// before issuing the dead_session verdict for codex, and a Present
+    /// gate answer rescues the pane to Respawn. This is the root-cause fix
+    /// for the formerly-failing e2e LEG 3 (session_not_on_disk after
+    /// restart).
+    #[test]
+    fn codex_rollout_on_disk_rescues_dead_session_to_respawn() {
+        let f = Fixture::new();
+        // Ledger binds codex:thread-resumed — ever_observed via the ledger.
+        f.ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "codex",
+                session_id: "thread-resumed",
+                terminal_id: "T-resumed",
+                mode: "codex",
+                cwd: None,
+                create_request_id: Some("cr-resumed"),
+                now_ms: 1_000,
+            })
+            .expect("record binding");
+        // exists() (snapshot-only) returns Absent — the index missed the
+        // resumed rollout (it was switched in-TUI, not started from scratch).
+        f.probe
+            .set("codex", "thread-resumed", SessionExistence::Absent);
+        // exists_for_gate() (by-id rollout walk) returns Present — the
+        // rollout file IS on disk under CODEX_HOME.
+        f.probe
+            .set_gate("codex", "thread-resumed", SessionExistence::Present);
+        let mut p = pane("cr-resumed");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "thread-resumed"));
+        let v = f.one(p);
+        assert_eq!(
+            v.verdict,
+            ReconcileVerdict::Respawn,
+            "a codex identity whose rollout EXISTS on disk must respawn, \
+             never be adjudicated dead_session merely because the snapshot \
+             lacks it"
+        );
+        assert_eq!(v.session_ref, Some(sref("codex", "thread-resumed")));
+    }
+
+    /// Hazard guard (must not regress): a codex identity that is
+    /// GENUINELY absent — both the snapshot AND the by-id rollout walk
+    /// return Absent — stays dead_session. The gate-path rescue must never
+    /// weaken positive denial for genuinely-missing identities
+    /// (resume_validation_gate suite pins this).
+    #[test]
+    fn codex_genuinely_absent_stays_dead_session_after_gate_check() {
+        let f = Fixture::new();
+        f.ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "codex",
+                session_id: "thread-gone",
+                terminal_id: "T-gone",
+                mode: "codex",
+                cwd: None,
+                create_request_id: Some("cr-gone"),
+                now_ms: 1_000,
+            })
+            .expect("record binding");
+        f.probe.mark_observed("codex", "thread-gone");
+        // Both exists() and exists_for_gate() return Absent — the rollout
+        // is genuinely missing from disk.
+        f.probe
+            .set("codex", "thread-gone", SessionExistence::Absent);
+        f.probe
+            .set_gate("codex", "thread-gone", SessionExistence::Absent);
+        let mut p = pane("cr-gone");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "thread-gone"));
         let v = f.one(p);
         assert_eq!(v.verdict, ReconcileVerdict::DeadSession);
         assert_eq!(v.reason.as_deref(), Some("session_not_on_disk"));

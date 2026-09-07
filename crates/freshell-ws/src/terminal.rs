@@ -161,7 +161,7 @@ pub(crate) fn log_create_settled(
 /// into the blocking closure and enters it for the closure's duration --
 /// the canonical correct use of `Span::enter` (a synchronous guard, never
 /// held across an `.await`).
-fn spawn_blocking_in_span<F, R>(f: F) -> tokio::task::JoinHandle<R>
+pub(crate) fn spawn_blocking_in_span<F, R>(f: F) -> tokio::task::JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -4398,19 +4398,31 @@ async fn handle_pane_reconcile(
     // across the deferral await below. The fresh-agent snapshot is NOT
     // rebuilt — it was built once above (rebuilding would double-burn the
     // respawn counter; V9 §3.6) and each rebuilt deps borrows the same one.
-    let derive = || {
+    //
+    // A13: the codex gate-walk (exists_for_gate, ~1s on a real store) is
+    // pre-computed off the reactor via build_codex_gate_answers
+    // (spawn_blocking_in_span) and injected into the pure derive — the
+    // sync derive never calls the probe inline. Re-run before each derive
+    // (the warming deferral may publish a new snapshot between calls).
+    let codex_gate_answers =
+        crate::reconcile::build_codex_gate_answers(state, &request.panes).await;
+    let derive = |codex_gate_answers: &std::collections::HashMap<
+        String,
+        crate::existence::SessionExistence,
+    >| {
         let deps = crate::reconcile::ReconcileDeps {
             registry: &state.registry,
             identity: &state.identity,
             existence: state.session_existence.as_ref(),
             pane_ledger: &state.pane_ledger,
             fresh_agent: fresh_agent_snapshot.as_ref(),
+            codex_gate_answers,
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::reconcile::derive_verdicts(&deps, &request.panes)
         }))
     };
-    let mut verdicts = match derive() {
+    let mut verdicts = match derive(&codex_gate_answers) {
         Ok(verdicts) => verdicts,
         Err(_) => {
             let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
@@ -4445,7 +4457,9 @@ async fn handle_pane_reconcile(
             state.reconcile_deferral_budget_ms,
         ))
         .await;
-        verdicts = match derive() {
+        let codex_gate_answers =
+            crate::reconcile::build_codex_gate_answers(state, &request.panes).await;
+        verdicts = match derive(&codex_gate_answers) {
             Ok(verdicts) => verdicts,
             Err(_) => {
                 let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);

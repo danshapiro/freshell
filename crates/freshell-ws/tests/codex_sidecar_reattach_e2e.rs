@@ -18,8 +18,13 @@
 //! 3. **da92 control**: the scripted `-32600` "active writer" rejection is
 //!    confined to the fresh path — the same `thread/resume` that SUCCEEDS
 //!    against a claimed survivor comes back as the incident-shaped error.
+//! 4. **Disk fork-lane fan-out**: after a proxy-bound pane's in-TUI fork is
+//!    picked up by the DISK lane (`tick_forks` → `rebind_codex_identity`), the
+//!    durable sidecar record's `session_id` (the restart-time
+//!    `claim_for_session` key) must have advanced to the fork child.
 //!
-//! This binary OWNS process env (`CODEX_CMD`, `FAKE_CODEX_APP_SERVER_BEHAVIOR`,
+//! This binary OWNS process env (`CODEX_CMD`, `CODEX_HOME`,
+//! `FAKE_CODEX_APP_SERVER_BEHAVIOR`, `FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES`,
 //! `CODEX_ARGV_CAPTURE_PATH`) — the `resume_validation_gate.rs` convention:
 //! env mutation is process-global, and nothing else in this binary reads
 //! these vars. The codex launch manager global is SET-ONCE per process, so
@@ -48,12 +53,15 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_codex::launch_lifecycle::{
-    set_global_codex_launch_manager_for_tests, CodexTerminalLaunchManager,
+    set_codex_proxy_event_sink, set_global_codex_launch_manager_for_tests,
+    CodexTerminalLaunchManager,
 };
 use freshell_codex::{
-    proc_cmdline, proc_starttime, select_codex_runtime, CodexSidecarRecord, CodexSidecarStore,
-    SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
+    proc_cmdline, proc_starttime, select_codex_runtime, set_codex_sidecar_store,
+    CodexSidecarRecord, CodexSidecarStore, SidecarReconciler, SidecarRecordState,
+    CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
 };
+use freshell_sessions::codex_locator::CodexLocator;
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "e2e-codex-sidecar-reattach-token";
@@ -972,6 +980,502 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
                 .as_str()
                 .is_some_and(|m| m.contains("active writer")),
             "the -32600 message must carry the active-writer signature: {resume_reply}"
+        );
+    });
+}
+
+// ─── scenario 4: the disk fork lane advances the durable sidecar record ───────
+
+/// Compute the canonical rollout path for a thread id under CODEX_HOME,
+/// mirroring the fixture's `getRolloutSessionDir` + `rolloutFilename` (UTC
+/// date, `encodeURIComponent` — a no-op for these ids). Copied with
+/// attribution from `codex_resume_switch_rebind.rs`.
+fn canonical_rollout_path(codex_home: &std::path::Path, thread_id: &str) -> std::path::PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, day) = days_to_ymd((secs / 86400) as i64);
+    codex_home
+        .join("sessions")
+        .join(format!("{year:04}"))
+        .join(format!("{month:02}"))
+        .join(format!("{day:02}"))
+        .join(format!("rollout-{thread_id}.jsonl"))
+}
+
+/// Howard Hinnant's days-from-epoch → (year, month, day) (UTC). Copied with
+/// attribution from `codex_resume_switch_rebind.rs`.
+fn days_to_ymd(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Write a session_meta first line (the shape the real codex rollout writer
+/// produces and the Rust indexer parses — requires `id` + `cwd`). Copied
+/// with attribution from `codex_resume_switch_rebind.rs`.
+fn write_session_meta(path: &std::path::Path, thread_id: &str, cwd: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create rollout dir");
+    }
+    let line = json!({
+        "timestamp": "2026-09-06T12:00:00.000Z",
+        "type": "session_meta",
+        "payload": { "id": thread_id, "session_id": thread_id, "cwd": cwd },
+    })
+    .to_string();
+    std::fs::write(path, format!("{line}\n")).expect("write session_meta");
+}
+
+/// Write the session_meta of an in-TUI USER fork child: `forked_from_id`
+/// lineage + `thread_source: "user"` + `originator: "codex-tui"` — the
+/// verified 019fa613 shape (the locator-tests writer's fork variant,
+/// `write_rollout_full(..., forked_from, Some("user"))`).
+fn write_fork_session_meta(path: &std::path::Path, thread_id: &str, cwd: &str, forked_from: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create rollout dir");
+    }
+    let line = json!({
+        "timestamp": "2026-09-06T12:05:00.000Z",
+        "type": "session_meta",
+        "payload": {
+            "id": thread_id,
+            "session_id": thread_id,
+            "cwd": cwd,
+            "forked_from_id": forked_from,
+            "originator": "codex-tui",
+            "thread_source": "user",
+            "source": "cli",
+        },
+    })
+    .to_string();
+    std::fs::write(path, format!("{line}\n")).expect("write fork session_meta");
+}
+
+/// A plain managed codex create (no restore/sessionRef) through the WS door,
+/// returning the `terminal.created` frame's terminalId. Sibling of
+/// [`create_codex_restore_terminal`] for the fresh-bind flow (the
+/// `codex_resume_switch_rebind.rs::create_codex_terminal` shape).
+async fn create_codex_terminal(ws: &mut TestWs, request_id: &str, cwd: &str) -> String {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "codex",
+            "shell": "system",
+            "cwd": cwd,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, ws.next())
+            .await
+            .expect("terminal.created within timeout")
+            .expect("stream open")
+            .expect("no ws error");
+        if let WsMessage::Text(text) = msg {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+            match value["type"].as_str() {
+                Some("terminal.created") if value["requestId"] == json!(request_id) => {
+                    return value["terminalId"]
+                        .as_str()
+                        .expect("terminal.created carries terminalId")
+                        .to_string();
+                }
+                Some("error") => panic!("terminal.create failed: {value}"),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Dial the pane's `--remote` proxy URL, complete `initialize`/`initialized`,
+/// then send `thread/start` and return its response frame. Copied with
+/// attribution from `codex_resume_switch_rebind.rs`.
+async fn tui_thread_start_via_proxy(proxy_url: &str) -> serde_json::Value {
+    let (mut tui, _) = tokio_tungstenite::connect_async(proxy_url)
+        .await
+        .expect("fake TUI dials the --remote proxy URL");
+    tui.send(WsMessage::Text(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string(),
+    ))
+    .await
+    .expect("send initialize");
+    let init = wait_for_rpc_id(&mut tui, 1).await;
+    assert!(
+        init.get("result").is_some(),
+        "initialize through the relay failed: {init}"
+    );
+    tui.send(WsMessage::Text(
+        json!({"jsonrpc": "2.0", "method": "initialized"}).to_string(),
+    ))
+    .await
+    .expect("send initialized");
+    tui.send(WsMessage::Text(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": {}}).to_string(),
+    ))
+    .await
+    .expect("send thread/start");
+    wait_for_rpc_id(&mut tui, 2).await
+}
+
+/// Scan WS text frames until a `terminal.session.associated` for
+/// `terminal_id` carrying `sessionRef.sessionId == session_id` arrives
+/// (skips associated frames for other sessions). Copied with attribution
+/// from `codex_resume_switch_rebind.rs::next_associated_frame_for_session`.
+async fn next_associated_frame_for_session(
+    ws: &mut TestWs,
+    terminal_id: &str,
+    session_id: &str,
+    label: &str,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if value["type"] == "terminal.session.associated"
+                        && value["terminalId"] == terminal_id
+                        && value["sessionRef"]["sessionId"] == session_id
+                    {
+                        return value;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("[{label}] ws ended/errored/timed out awaiting associated: {other:?}"),
+        }
+    }
+    panic!("[{label}] no terminal.session.associated for {terminal_id}/{session_id} within 20s");
+}
+
+/// Write a `terminal.input` (Enter) through the WS door — the cob/codex
+/// `note_possible_submit` seam feeds `note_fork_submit` on this exact shape.
+/// Copied with attribution from `tests/common/mod.rs::send_input`.
+async fn send_input(ws: &mut TestWs, terminal_id: &str, data: &str) {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "terminal.input",
+            "terminalId": terminal_id,
+            "data": data,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.input");
+}
+
+/// Await the duplicate `terminal.session.associated` for `session_id` that
+/// the fixture's post-`thread/start` `thread/started` broadcast provokes (the
+/// router re-adopts the SAME id — D-03 lets same-id through, the adopt tail
+/// re-runs and re-emits the frame; `codex_resume_switch_rebind.rs`'s
+/// `next_associated_frame_for_session` exists for exactly this duplicate),
+/// then settle a fixed margin so the duplicate adopt's `watch_fork(A)`
+/// RE-REGISTRATION (repoint codex_proxy_route.rs, awaited after the
+/// broadcast within the same route task) has flushed. Each registration
+/// re-snapshots the locator's `known_files`: a fork rollout written before
+/// the LAST registration lands is swallowed into the snapshot and permanently
+/// excluded — never rebinding (observed as a ~50% harness miss pre-fix).
+async fn wait_for_duplicate_adopt_settle(ws: &mut TestWs, terminal_id: &str, session_id: &str) {
+    let _dup =
+        next_associated_frame_for_session(ws, terminal_id, session_id, "fork/dup-adopt").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// Poll the sidecar store until the record owned by `terminal_id` carries a
+/// `session_id`, returning it (`None` on deadline). The fan-out runs beside
+/// the associated broadcast, so the record can lag by a few ms. Copied with
+/// attribution from `codex_resume_switch_rebind.rs`.
+fn poll_sidecar_session_id(
+    store: &CodexSidecarStore,
+    terminal_id: &str,
+    budget: Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let sid = store
+            .load_all()
+            .into_iter()
+            .find(|r| r.terminal_id.as_deref() == Some(terminal_id))
+            .and_then(|r| r.session_id);
+        if sid.is_some() {
+            return sid;
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The registry's `resume_session_id` for a terminal (meta probe). Copied
+/// with attribution from `codex_resume_switch_rebind.rs`.
+fn registry_resume_id(
+    registry: &freshell_terminal::TerminalRegistry,
+    terminal_id: &str,
+) -> Option<String> {
+    registry
+        .identity_probe_rows()
+        .into_iter()
+        .find(|r| r.terminal_id == terminal_id)
+        .unwrap_or_else(|| panic!("registry must list {terminal_id}"))
+        .resume_session_id
+}
+
+/// [`spawn_server`] variant with the disk fork lane live: a real
+/// `CodexLocator` rooted at `codex_sessions_root` (the `<CODEX_HOME>/sessions`
+/// tree), its 150 ms sweep (`spawn_codex_locator_sweep`), and the codex
+/// proxy-event router (candidate → adopt arm → `watch_fork` registration).
+async fn spawn_server_with_locator_and_proxy(
+    codex_sessions_root: &std::path::Path,
+) -> (String, freshell_terminal::TerminalRegistry) {
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let codex_locator = Arc::new(CodexLocator::new(codex_sessions_root.to_path_buf()));
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        layout: Default::default(),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        terminal_meta: Default::default(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-reattach-e2e".to_string()),
+        boot_id: Arc::new("boot-reattach-e2e".to_string()),
+        settings,
+        handshake_settings: Arc::new(tokio::sync::RwLock::new(
+            serde_json::from_value(test_settings_value()).expect("valid settings fixture"),
+        )),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        subagent_interest: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(vec![codex_cli_spec()]),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: Some(Arc::clone(&codex_locator)),
+        activity: None,
+        // `NoIndexProbe` answers Unknown ⇒ the resume-validation gate
+        // proceeds (fail-open), the codex_session_ref_resume.rs handshake
+        // convention.
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    // Install the proxy event channel and spawn the router task (the
+    // candidate → identity routing lane — without it, RemoteProxyEvent::
+    // Candidate is never consumed and no terminal.session.associated frame
+    // is emitted). The sink is process-global and replace-per-call; only
+    // this scenario's router task consumes it in this binary.
+    let (proxy_tx, proxy_rx) = tokio::sync::mpsc::unbounded_channel();
+    set_codex_proxy_event_sink(proxy_tx);
+    let _router_task =
+        freshell_ws::codex_proxy_route::spawn_codex_proxy_router(state.clone(), proxy_rx);
+
+    // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
+    // main.rs's LOCATOR_SWEEP_INTERVAL is private to the server binary.
+    freshell_ws::codex_association::spawn_codex_locator_sweep(
+        state.clone(),
+        Duration::from_millis(150),
+    );
+
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws"), registry)
+}
+
+/// Disk-lane fork rebind must advance the durable sidecar record's
+/// session_id: it is the restart-time claim key (`claim_for_session`).
+#[test]
+fn disk_fork_rebind_advances_the_sidecar_record() {
+    reattach_rt().block_on(async {
+        let _serial = test_lock().lock().await;
+        install_global_manager();
+        ensure_mcp_deps_resolvable();
+        std::env::set_var("CODEX_CMD", codex_dispatcher());
+        // DEV-0006 S5.e: unset = managed launch ON (the sidecar store only
+        // exists in this lane).
+        std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+
+        // Temp CODEX_HOME — the disk fork lane's sessions root.
+        let codex_home = tempfile::tempdir().expect("codex home");
+        std::env::set_var("CODEX_HOME", codex_home.path());
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+
+        const A: &str = "thread-a";
+        // UUID-shaped: the disk lane's identity probe hard-gates on
+        // `is_uuid_shaped` (the proxy candidate path doesn't, so A can keep
+        // the readable label).
+        const B: &str = "019fa613-bbb1-4ccc-8ddd-00000000000b";
+        let cwd = scenario_cwd("forksidecar").to_string_lossy().to_string();
+
+        // Pre-write A's rollout (the fixture echoes its path via
+        // threadStartRolloutPath); the fork watch's registration-time
+        // snapshot then captures it as known — only NEW files are fork
+        // candidates.
+        let rollout_a = canonical_rollout_path(codex_home.path(), A);
+        write_session_meta(&rollout_a, A, &cwd);
+        std::env::set_var(
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            json!({
+                "threadStartThreadId": A,
+                "threadStartRolloutPath": rollout_a.to_string_lossy(),
+            })
+            .to_string(),
+        );
+
+        // Empty reconciler: the claim finds nothing and the selection falls
+        // through to the fresh-spawn path (the sidecar under test).
+        let (_store_dir, store, reconciler) = empty_reconciler();
+        swap_test_reconciler(Some(reconciler), Some(store.clone()));
+        // Set the process-global sidecar store so the SPAWNED runtime writes
+        // durable records into this test's store — without this,
+        // `SpawnedCodexAppServerRuntime::new()` resolves a disabled store and
+        // note_session_id is a no-op (the codex_resume_switch_rebind.rs
+        // convention).
+        set_codex_sidecar_store(store.clone());
+
+        let sessions_root = codex_home.path().join("sessions");
+        let (ws_url, registry) = spawn_server_with_locator_and_proxy(&sessions_root).await;
+        let mut ws = connect_and_handshake(&ws_url).await;
+
+        let capture = capture_path("forkbind");
+        std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+        let terminal_id = create_codex_terminal(&mut ws, "req-forkbind", &cwd).await;
+
+        // 1. Bind A through the proxy: TUI thread/start with the behavior
+        //    knobs (the adopt arm registers watch_fork(A) + note_session_id(A)).
+        let argv = wait_for_captured_argv(&capture);
+        assert_eq!(argv[0], "--remote", "argv: {argv:?}");
+        let proxy_url = argv[1].clone();
+        assert!(
+            proxy_url.starts_with("ws://127.0.0.1:"),
+            "the --remote URL must be the loopback proxy: {proxy_url}"
+        );
+        let start_reply = tui_thread_start_via_proxy(&proxy_url).await;
+        assert!(
+            start_reply.get("result").is_some(),
+            "thread/start must succeed: {start_reply}"
+        );
+        let adopted =
+            next_associated_frame_for_session(&mut ws, &terminal_id, A, "fork/bind-A").await;
+        assert_eq!(
+            adopted["sessionRef"]["sessionId"], A,
+            "thread/start must adopt A: {adopted}"
+        );
+        // Pre-fork baseline: the adopt arm's note_session_id already put A in
+        // the durable record, so the post-fork assertion below can only fail
+        // on the fork lane's own gap.
+        let record_before = poll_sidecar_session_id(&store, &terminal_id, Duration::from_secs(10));
+        assert_eq!(
+            record_before.as_deref(),
+            Some(A),
+            "the adopt arm must already note A in the sidecar record"
+        );
+
+        // 2. Simulate the in-TUI fork the DISK lane owns: await the duplicate
+        //    thread/started re-adopt + settle (its watch re-registration
+        //    re-snapshots known_files — a fork rollout written before the
+        //    last registration lands is excluded forever), send a real Enter
+        //    through the WS door (the Enter-anchored fork-scan window), then
+        //    materialize the fork child rollout — id B, forked_from_id A,
+        //    thread_source "user".
+        wait_for_duplicate_adopt_settle(&mut ws, &terminal_id, A).await;
+        send_input(&mut ws, &terminal_id, "\r").await;
+        let rollout_b = sessions_root
+            .join("2026")
+            .join("07")
+            .join("27")
+            .join(format!("rollout-2026-07-27T12-05-00-{B}.jsonl"));
+        write_fork_session_meta(&rollout_b, B, &cwd, A);
+
+        // 3. Wait out the fork sweep tick: tick_forks → rebind_codex_identity
+        //    moves the pane identity (the pre-existing lane behavior).
+        let rebound =
+            next_associated_frame_for_session(&mut ws, &terminal_id, B, "fork/rebind-B").await;
+        assert_eq!(
+            rebound["sessionRef"]["sessionId"], B,
+            "the rebind must move the pane to the fork child: {rebound}"
+        );
+        assert_eq!(
+            rebound["previousSessionId"], A,
+            "the rebind must carry previousSessionId == A: {rebound}"
+        );
+        assert_eq!(
+            registry_resume_id(&registry, &terminal_id).as_deref(),
+            Some(B),
+            "registry meta resume_session_id must follow the fork rebind to B"
+        );
+
+        // 4. Evidence for the gap under test, collected (non-panicking)
+        //    BEFORE cleanup: the durable sidecar record — the restart-time
+        //    `claim_for_session` key — must have advanced to B.
+        let record_after = poll_sidecar_session_id(&store, &terminal_id, Duration::from_secs(10));
+
+        // Cleanup: kill ONLY pids this test spawned.
+        registry.kill(&terminal_id);
+        let _ = poll_proxy_refused(&proxy_url, Duration::from_secs(8)).await;
+        swap_test_reconciler(None, None);
+        set_codex_sidecar_store(Arc::new(CodexSidecarStore::disabled()));
+        std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES");
+        std::env::remove_var("CODEX_HOME");
+
+        assert_eq!(
+            record_after.as_deref(),
+            Some(B),
+            "the fork lane's rebind must advance the sidecar record's session_id \
+             to the new thread (the restart-time reattach key)"
         );
     });
 }

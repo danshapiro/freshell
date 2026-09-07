@@ -6,7 +6,8 @@
 //! authoritative and the association locator never arms (see
 //! `codex_association::should_arm_codex_locator`); on the SAME terminal, first
 //! bind wins — a later proxy candidate with a different id is ignored here
-//! (identity moves only through the fork rebind lane).
+//! (identity moves only through the fork rebind lane or the D-RESUME arm
+//! below).
 //!
 //! The first-bind check below is router-task check-then-act (accepted
 //! residual, load-bearing ledger A22): safe because this task is the ONLY
@@ -19,7 +20,14 @@
 //! IGNORED — the landed disk fork-watch lane (`watch_fork` → `tick_forks` →
 //! `rebind_codex_identity`, D7/A13/A8 guards) owns fork rebinds. The router
 //! registers `watch_fork` after each adoption so managed fresh panes get the
-//! same coverage resume panes get at create (`terminal.rs:2442-2446`).
+//! same coverage resume panes get at create (`terminal.rs:3382-3388`).
+//!
+//! D-RESUME RULE (recorded; kata 3gvd): a `thread/resume` RESPONSE candidate is
+//! the ONLY source allowed to MOVE an existing binding — it is the TUI's
+//! server-authoritative, request-correlated report of an in-TUI switch. D-03
+//! still governs thread/start and thread/started: first bind wins there.
+//! Resume of the currently bound thread is a no-op (the pane is already
+//! showing exactly that thread).
 
 use std::path::Path;
 
@@ -145,6 +153,84 @@ async fn route_candidate(
             "codex_proxy_candidate_skipped: empty thread id or missing/relative rollout path");
         return;
     }
+    // D-RESUME: a thread/resume response candidate reports an in-TUI switch to
+    // an EXISTING durable thread (request-correlated; the disk fork lane
+    // structurally cannot see resume-to-existing — codex_locator.rs:65
+    // documents CLI resumes APPEND to the existing rollout).
+    if candidate.source == CandidateSource::ThreadResumeResponse {
+        let existing_codex_id: Option<String> = match state.identity.get(terminal_id) {
+            Some(existing) if existing.provider.as_deref() == Some("codex") => {
+                existing.session_id.clone()
+            }
+            _ => None,
+        };
+        match existing_codex_id.as_deref() {
+            // Unbound pane (the kata's incident shape — the startup window
+            // expired unresolved): the resume IS its first identity; fall
+            // through to the adoption tail below.
+            None => {}
+            // Resume of the currently bound thread: nothing moves. A no-op, not
+            // a re-adopt — never re-broadcast a no-change identity move.
+            Some(current) if current == candidate.thread.id => {
+                tracing::debug!(terminal_id = %terminal_id, thread_id = %candidate.thread.id,
+                    "codex_proxy_resume_candidate_noop: terminal already bound to the resumed thread");
+                return;
+            }
+            // A genuine switch: move the binding through the EXISTING rebind
+            // tail (identity store, registry meta, fsynced ledger supersession,
+            // associated+meta.updated frames, activity hub re-key + rollout
+            // re-attach). rebind_codex_identity's guards (D7/A13/A8) own
+            // refusal; a refusal logs its own reason and moves nothing.
+            Some(old_id) => {
+                // Structural guard (F7): the bind predicate above guarantees
+                // Some + absolute, but the safety of `.expect` rested on
+                // code ORDERING — a future edit inserting an early-return
+                // between the predicate and this arm, or relaxing the
+                // predicate for a new source, would silently arm a panic in
+                // the one consumer of the proxy-event channel. The let-else
+                // makes the invariant structural instead of positional.
+                let Some(rollout_path) = candidate
+                    .thread
+                    .path
+                    .as_deref()
+                    .map(Path::new)
+                    .filter(|path| path.is_absolute())
+                else {
+                    tracing::debug!(terminal_id = %terminal_id, thread_id = %candidate.thread.id,
+                        "codex_proxy_resume_candidate_skipped: rollout path missing or relative \
+                         (structural guard — the bind predicate should have caught this)");
+                    return;
+                };
+                let rebound = crate::codex_identity::rebind_codex_identity(
+                    state,
+                    crate::codex_identity::CodexRebind {
+                        terminal_id,
+                        old_session_id: old_id,
+                        new_session_id: &candidate.thread.id,
+                        rollout_path,
+                        cwd,
+                    },
+                )
+                .await;
+                if !rebound {
+                    return;
+                }
+                // Fan-out parity with the adopt tail below:
+                // (1) the resumed id is the durable sidecar record's
+                //     restore-time reattach key — without this, restart-time
+                //     claim_for_session finds the surviving sidecar by the OLD
+                //     id only (verified gap).
+                CodexTerminalLaunchManager::global()
+                    .note_session_id(terminal_id, &candidate.thread.id)
+                    .await;
+                // (2) the disk fork lane must now watch the NEW thread, so a
+                //     fork from it still rebinds (tick_forks auto-advances only
+                //     its own disk-detected forks).
+                repoint_codex_fork_watch(state, terminal_id, &candidate.thread.id).await;
+                return;
+            }
+        }
+    }
     // D-03: first bind wins on this terminal.
     if let Some(existing) = state.identity.get(terminal_id) {
         if let (Some("codex"), Some(existing_id)) =
@@ -185,28 +271,33 @@ async fn route_candidate(
             .note_session_id(terminal_id, &candidate.thread.id)
             .await;
         // D-FORK: give managed panes the disk fork watch resume panes get.
-        // `watch_fork` snapshots the sessions tree (bounded fs walk), so it
-        // runs on the blocking pool like the association sweep's lane -- a
-        // panic there must not kill the proxy-event router task.
-        if let Some(locator) = &state.codex_locator {
-            let watch_locator = std::sync::Arc::clone(locator);
-            let terminal_id = terminal_id.to_string();
-            let thread_id = candidate.thread.id.clone();
-            if let Err(join_error) = tokio::task::spawn_blocking(move || {
-                watch_locator.watch_fork(&terminal_id, &thread_id);
-            })
-            .await
-            {
-                tracing::warn!(
-                    error = %join_error,
-                    "codex_watch_fork_panicked: blocking watch_fork task panicked"
-                );
-            }
-        }
+        repoint_codex_fork_watch(state, terminal_id, &candidate.thread.id).await;
     } else {
         CodexTerminalLaunchManager::global()
             .fail_candidate_capture(terminal_id, "codex candidate refused by identity guards")
             .await;
+    }
+}
+
+/// Repoint the disk fork lane's watch at `thread_id` (adopt arm and D-RESUME
+/// rebind arm) — `watch_fork` does a bounded fs walk, so it runs on the
+/// blocking pool; a panic there must not kill the proxy-event router task.
+/// No-op when no `codex_locator` is wired (the kata's expired-window state).
+async fn repoint_codex_fork_watch(state: &WsState, terminal_id: &str, thread_id: &str) {
+    if let Some(locator) = &state.codex_locator {
+        let watch_locator = std::sync::Arc::clone(locator);
+        let terminal_id = terminal_id.to_string();
+        let thread_id = thread_id.to_string();
+        if let Err(join_error) = tokio::task::spawn_blocking(move || {
+            watch_locator.watch_fork(&terminal_id, &thread_id);
+        })
+        .await
+        {
+            tracing::warn!(
+                error = %join_error,
+                "codex_watch_fork_panicked: blocking watch_fork task panicked"
+            );
+        }
     }
 }
 
@@ -657,6 +748,242 @@ mod tests {
             Some("sess-first".to_string()),
             "D-03: a later different-id proxy candidate must not re-adopt"
         );
+    }
+
+    /// Seed a Running codex registry row with NO backing PTY (the headless
+    /// seam): the D7 rebind guard probes `live_session_owner`, whose identity
+    /// arm requires the owning terminal's registry row to be Running
+    /// (registry.rs's `live_session_owner_finds_identity_bound_running_terminal`
+    /// pins the exact row shape).
+    fn register_running_codex(state: &WsState, terminal_id: &str) {
+        state
+            .registry
+            .register_headless(freshell_terminal::registry::HeadlessTerminal {
+                terminal_id: terminal_id.to_string(),
+                stream_id: format!("s-{terminal_id}"),
+                mode: "codex".to_string(),
+                resume_session_id: None,
+                create_request_id: None,
+                created_at: None,
+            });
+    }
+
+    #[tokio::test]
+    async fn resume_candidate_rebinds_a_bound_terminal_through_the_shared_tail() {
+        // NOTE: register_running_codex supplies the Running row D7's
+        // live_session_owner probes (registry.rs:5548-5565 pins the shape).
+        let state = test_state();
+        register_running_codex(&state, "term-r");
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-r",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "thread-a",
+                    Some("/tmp/rollouts/a.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("term-r").and_then(|i| i.session_id),
+            Some("thread-a".to_string())
+        );
+
+        let mut frames = state.broadcast_tx.subscribe();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-r",
+                candidate(
+                    CandidateSource::ThreadResumeResponse,
+                    "thread-b",
+                    Some("/tmp/rollouts/b.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            state.identity.get("term-r").and_then(|i| i.session_id),
+            Some("thread-b".to_string())
+        );
+        // Pinned order: associated FIRST (with previousSessionId), meta.updated SECOND.
+        let first = frames.recv().await.unwrap();
+        assert!(first.contains("terminal.session.associated"), "{first}");
+        assert!(first.contains("thread-b"), "{first}");
+        assert!(first.contains("previousSessionId"), "{first}");
+        assert!(first.contains("thread-a"), "{first}");
+        let second = frames.recv().await.unwrap();
+        assert!(second.contains("terminal.meta.updated"), "{second}");
+        assert!(second.contains("thread-b"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn resume_candidate_for_the_currently_bound_thread_is_a_noop() {
+        let state = test_state();
+        register_running_codex(&state, "term-n");
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-n",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "thread-a",
+                    Some("/tmp/rollouts/a.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        let mut frames = state.broadcast_tx.subscribe();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-n",
+                candidate(
+                    CandidateSource::ThreadResumeResponse,
+                    "thread-a",
+                    Some("/tmp/rollouts/a.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("term-n").and_then(|i| i.session_id),
+            Some("thread-a".to_string())
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a same-thread resume must not emit identity frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_candidate_on_an_unbound_terminal_adopts_it_as_the_first_identity() {
+        let state = test_state();
+        let mut frames = state.broadcast_tx.subscribe();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-u",
+                candidate(
+                    CandidateSource::ThreadResumeResponse,
+                    "thread-d",
+                    Some("/tmp/rollouts/d.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("term-u").and_then(|i| i.session_id),
+            Some("thread-d".to_string())
+        );
+        let first = frames.recv().await.unwrap();
+        assert!(first.contains("terminal.session.associated"), "{first}");
+        assert!(
+            !first.contains("previousSessionId"),
+            "a first bind carries no previousSessionId: {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rebind_is_refused_when_the_target_thread_is_live_owned_elsewhere() {
+        let state = test_state();
+        register_running_codex(&state, "term-1");
+        register_running_codex(&state, "term-2");
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-1",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "thread-a",
+                    Some("/tmp/rollouts/a.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-2",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "thread-c",
+                    Some("/tmp/rollouts/c.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        let mut frames = state.broadcast_tx.subscribe();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-1",
+                candidate(
+                    CandidateSource::ThreadResumeResponse,
+                    "thread-c",
+                    Some("/tmp/rollouts/c.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        // A13: term-2 live-owns thread-c — term-1's binding must not move.
+        assert_eq!(
+            state.identity.get("term-1").and_then(|i| i.session_id),
+            Some("thread-a".to_string())
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a refused rebind must not emit identity frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn d03_first_bind_wins_still_governs_non_resume_sources() {
+        let state = test_state();
+        register_running_codex(&state, "term-d");
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-d",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "thread-a",
+                    Some("/tmp/rollouts/a.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        let mut frames = state.broadcast_tx.subscribe();
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-d",
+                candidate(
+                    CandidateSource::ThreadStartedNotification,
+                    "thread-z",
+                    Some("/tmp/rollouts/z.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.get("term-d").and_then(|i| i.session_id),
+            Some("thread-a".to_string())
+        );
+        assert!(frames.try_recv().is_err());
     }
 
     #[tokio::test]

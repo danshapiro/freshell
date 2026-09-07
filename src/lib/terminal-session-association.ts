@@ -1,5 +1,5 @@
 import { updateTab } from '@/store/tabsSlice'
-import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
+import { reconcileTerminalSessionRefByTerminalId, updatePaneTitle } from '@/store/panesSlice'
 import {
   buildTerminalDurableSessionRefUpdate,
   flushPersistedLayoutNow,
@@ -10,7 +10,7 @@ import type { CodingCliProviderName } from '@/store/types'
 import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 type Dispatch = (action: any) => unknown
-type SessionAssociationState = Pick<RootState, 'panes' | 'tabs'>
+type SessionAssociationState = Pick<RootState, 'panes' | 'tabs' | 'sessions'>
 
 function collectMatchingTerminalPanes(
   node: PaneNode | undefined,
@@ -57,6 +57,34 @@ function terminalPaneNeedsDurableIdentityUpdate(content: TerminalPaneContent, se
   return false
 }
 
+/**
+ * The session directory's display title for the session key, if any window
+ * knows one. Directory-side provider normalization mirrors sessionsSlice's
+ * `sessionKey` (`provider || 'claude'`). Used ONLY for rebinds: the resumed
+ * session's row still carries that thread's own title, unlike the tab's
+ * migrated sessionMetadataByKey (which the fold re-keys old→new).
+ */
+function findSessionDirectoryTitle(
+  sessions: SessionAssociationState['sessions'],
+  sessionRef: SessionRef,
+): string | undefined {
+  for (const window of Object.values(sessions?.windows ?? {})) {
+    for (const project of window?.projects ?? []) {
+      for (const session of project.sessions ?? []) {
+        if (
+          (session.provider ?? 'claude') === sessionRef.provider
+          && session.sessionId === sessionRef.sessionId
+          && typeof session.title === 'string'
+          && session.title.length > 0
+        ) {
+          return session.title
+        }
+      }
+    }
+  }
+  return undefined
+}
+
 export type TerminalSessionAssociationReconcileStatus = 'ignored' | 'reconciled' | 'conflict'
 
 export function reconcileTerminalSessionAssociation({
@@ -77,24 +105,24 @@ export function reconcileTerminalSessionAssociation({
   if (!sessionRef) return 'ignored'
 
   const state = getState()
+  // A server-authoritative rebind (previousSessionId names the ref being
+  // superseded) is NOT a conflict: the deterministic supersession handshake
+  // -- accept only when the pane's current ref is exactly the superseded one.
+  const isAuthorizedRebind = (content: TerminalPaneContent): boolean =>
+    typeof previousSessionId === 'string'
+    && previousSessionId.length > 0
+    && content.sessionRef?.provider === sessionRef.provider
+    && content.sessionRef?.sessionId === previousSessionId
   let matchedAnyPane = false
   let conflictingPane = false
   let shouldFlush = false
-  const matchedSinglePaneTabs: Array<{ tabId: string; content: TerminalPaneContent }> = []
+  const matchedSinglePaneTabs: Array<{ tabId: string; paneId: string; content: TerminalPaneContent }> = []
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
     const matches: Array<{ paneId: string; content: TerminalPaneContent }> = []
     collectMatchingTerminalPanes(layout, terminalId, matches)
     if (matches.length === 0) continue
 
     matchedAnyPane = true
-    // A server-authoritative rebind (previousSessionId names the ref being
-    // superseded) is NOT a conflict: the deterministic supersession handshake
-    // -- accept only when the pane's current ref is exactly the superseded one.
-    const isAuthorizedRebind = (content: TerminalPaneContent): boolean =>
-      typeof previousSessionId === 'string'
-      && previousSessionId.length > 0
-      && content.sessionRef?.provider === sessionRef.provider
-      && content.sessionRef?.sessionId === previousSessionId
     if (matches.some(({ content }) =>
       content.sessionRef
       && !sessionRefsEqual(content.sessionRef, sessionRef)
@@ -107,7 +135,7 @@ export function reconcileTerminalSessionAssociation({
       shouldFlush = true
     }
     if (isSinglePaneTerminalMatch(layout, terminalId)) {
-      matchedSinglePaneTabs.push({ tabId, content: matches[0].content })
+      matchedSinglePaneTabs.push({ tabId, paneId: matches[0].paneId, content: matches[0].content })
     }
   }
 
@@ -116,7 +144,7 @@ export function reconcileTerminalSessionAssociation({
 
   dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))
 
-  for (const { tabId, content } of matchedSinglePaneTabs) {
+  for (const { tabId, paneId, content } of matchedSinglePaneTabs) {
     const tab = state.tabs.tabs.find((candidate) => candidate.id === tabId)
     if (!tab) continue
 
@@ -134,18 +162,38 @@ export function reconcileTerminalSessionAssociation({
       && tab.codexDurability.durableThreadId === sessionRef.sessionId
       ? tab.codexDurability
       : undefined
+
+    const isRebindForThisTab = isAuthorizedRebind(content)
+
     const tabUpdates = {
       ...(durableIdentityUpdate?.tabUpdates ?? {}),
       ...(tab.codexDurability !== nextTabCodexDurability
         ? { codexDurability: nextTabCodexDurability }
         : {}),
     }
+
+    // Non-user-set tab titles follow a server-authoritative rebind to the
+    // new session's directory title when the client already knows it.
+    // User-set titles are tab-scoped and never migrate.
+    let adoptedTitle: string | undefined
+    if (isRebindForThisTab && !tab.titleSetByUser) {
+      adoptedTitle = findSessionDirectoryTitle(state.sessions, sessionRef)
+      if (adoptedTitle && adoptedTitle !== tab.title) {
+        tabUpdates.title = adoptedTitle
+      } else {
+        adoptedTitle = undefined
+      }
+    }
+
     if (Object.keys(tabUpdates).length > 0) {
       shouldFlush = true
       dispatch(updateTab({
         id: tab.id,
         updates: tabUpdates,
       }))
+    }
+    if (adoptedTitle) {
+      dispatch(updatePaneTitle({ tabId, paneId, title: adoptedTitle, setByUser: false }))
     }
   }
 

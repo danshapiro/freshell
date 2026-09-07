@@ -260,6 +260,10 @@ export const RUST_ONLY_SPECS = [
   /freshclaude-identity-persistence-rust\.spec\.ts$/,
   // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
   /opencode-rebind-rust\.spec\.ts$/,
+  // Codex in-TUI /resume rebind lane exists only on the Rust server
+  // (codex_proxy_route.rs D-RESUME arm); the managed-launch proxy is
+  // rust-only.
+  /codex-resume-switch-rust\.spec\.ts$/,
   // CFG-01 — lossless config.json writes: seed-sentinels/deep-compare per
   // writer. Rust-only: the acceptance is PW-RUST and the Rust writer is a
   // deliberate strict superset of legacy (legacy's normalization rebuild
@@ -491,6 +495,10 @@ export default defineConfig({
         /freshclaude-identity-persistence-rust\.spec\.ts$/,
         // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
         /opencode-rebind-rust\.spec\.ts$/,
+        // Codex in-TUI /resume rebind lane exists only on the Rust server
+        // (codex_proxy_route.rs D-RESUME arm); the managed-launch proxy is
+        // rust-only.
+        /codex-resume-switch-rust\.spec\.ts$/,
         // CFG-01 — lossless config.json writes: seed sentinels + deep-compare
         // after every writer action/restart. Rust-only (superset guarantee —
         // see RUST_ONLY_SPECS entry + the spec's doc comment). Authored under

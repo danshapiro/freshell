@@ -44,7 +44,8 @@ pub(crate) struct CodexAdoption<'a> {
 }
 
 /// A mid-session identity move: the live pane's bound codex session forked
-/// (in-TUI /resume) and the pane now belongs to the fork child.
+/// (in-TUI /resume) or was `/resume`-switched to an existing durable thread
+/// (in-TUI flows), and the pane now belongs to the new thread.
 pub(crate) struct CodexRebind<'a> {
     pub terminal_id: &'a str,
     pub old_session_id: &'a str,
@@ -109,7 +110,7 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
         return false;
     }
     tracing::info!(terminal_id = %r.terminal_id, old = %r.old_session_id, new = %r.new_session_id,
-        "codex_rebind: in-TUI fork detected; moving pane identity");
+        "codex_rebind: in-TUI thread switch detected; moving pane identity");
     apply_codex_identity(
         state,
         r.terminal_id,
