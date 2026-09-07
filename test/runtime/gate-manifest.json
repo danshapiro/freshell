@@ -213,7 +213,7 @@
         "phase-1"
       ],
       "command": "npm run test:runtime -- gate phase-2 --require-live",
-      "command_status": "TO_BE_IMPLEMENTED_IN_PHASE_1",
+      "command_status": "IMPLEMENTED_LIVE_GATE",
       "tasks": [
         {
           "id": "P2.1",

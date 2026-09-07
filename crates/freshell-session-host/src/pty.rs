@@ -144,6 +144,8 @@ impl HostedPty {
             .read(after_seq, max_bytes)
             .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e))?;
         batch.incarnation_id = incarnation_id;
+        batch.exited = self.exited();
+        batch.exit_code = self.exited().then(|| self.exit_code());
         Ok(batch)
     }
 

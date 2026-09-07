@@ -198,14 +198,25 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             let soul = SoulId::parse(terminal.soul_id).map_err(|e| e.to_string())?;
             let output = self
                 .client
-                .read_output(soul, after_seq.max(0) as u64, max_bytes)
+                .read_output(soul.clone(), after_seq.max(0) as u64, max_bytes)
                 .await
                 .map_err(|e| e.to_string())?;
+            if output.exited {
+                match self.client.stop(soul).await.map_err(|e| e.to_string())? {
+                    StopOutcome::VerifiedEmpty => {}
+                    other => {
+                        return Err(format!(
+                            "provider exited but managed enclosure stop was not verified empty: {other:?}"
+                        ))
+                    }
+                }
+            }
             Ok(ManagedOutputRead {
                 reset_required: output.reset_required,
                 truncated: output.truncated,
                 retained_from_seq: output.retained_from_seq.min(i64::MAX as u64) as i64,
                 head_seq: output.head_seq.min(i64::MAX as u64) as i64,
+                exit_code: output.exited.then_some(output.exit_code.unwrap_or(0)),
                 chunks: output
                     .frames
                     .into_iter()

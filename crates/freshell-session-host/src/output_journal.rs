@@ -168,6 +168,8 @@ impl OutputJournal {
             head_seq,
             reset_required,
             truncated: reset_required || more,
+            exited: false,
+            exit_code: None,
             frames,
         })
     }

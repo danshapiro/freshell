@@ -1,9 +1,12 @@
 # Managed agent runtime architecture
 
-This document describes the Phase 1 ownership boundary implemented by
-`freshell-supervisor`, `freshell-session-host`, and
-`freshell-runtime-protocol`. Production agent routes are intentionally not
-switched to it yet.
+This document describes the Phase 1 durable ownership boundary and the Phase 2
+managed-terminal path implemented by `freshell-supervisor`,
+`freshell-session-host`, `freshell-runtime-protocol`, and
+`freshell-runtime-client`. Managed routing is explicit/opt-in: only the Rust
+server built with `managed-runtime-v1`, booted with the runtime controller, and
+a client that negotiated `managedRuntimeV1` can use it. Other routes remain
+legacy.
 
 ## Identity and authority
 
@@ -106,16 +109,22 @@ STOPPING / cleanup=PENDING
 
 ## Isolation boundary
 
-The Phase 1 Docker backend requires:
+The Docker backend requires exact `sha256:` image identity. Phase 1 fixture
+workloads use `NetworkMode=none`; Phase 2 terminal workloads use an isolated
+container bridge network so real providers can reach their upstream services.
+Both require:
 
-- exact `sha256:` image identity;
-- `NetworkMode=none`;
 - private PID namespace;
 - read-only root filesystem with a bounded `/tmp` tmpfs;
 - all Linux capabilities dropped and `no-new-privileges`;
 - explicit CPU, memory, swap, and PID limits;
-- exactly two mounts: the read-only host binary and one incarnation directory;
-- no Docker socket, supervisor registry, admin socket, provider home, or production port exposure.
+- the read-only host binary and one incarnation control directory;
+- for terminals only, canonical same-path workspace/Git-common-dir mounts plus
+  one named provider-home volume per soul;
+- optional provider bootstrap files mounted read-only by exact canonical file
+  reference and copied atomically into the provider volume with mode `0600`;
+- no Docker socket, supervisor registry, admin socket, unrelated home, or
+  production port exposure.
 
 The live test runner owns the real rootless Docker socket. The SUT supervisor
 sees only a restricted Unix-socket proxy. The proxy forwards create/inspect/
@@ -148,30 +157,50 @@ The old environment-tag `/proc` scan remains in legacy cleanup code, but the
 new supervisor never uses it as kill authority. In the hardened sweep the tag
 scan is verification-only after exact recorded-PID handling.
 
-## Production routing is deliberately disabled
+## Phase 2 managed terminal routing
 
-Phase 1 does **not** import `freshell-supervisor` or `freshell-session-host` into
-`freshell-server`, does not add an HTTP/WS/MCP managed-launch route, and does not
-change the current server shutdown behavior. The Rust server reserves the Cargo
-feature `managed-runtime-v1`, but it is disabled by default and intentionally
-has no routing/dependency effect in this phase. The wire capability is not
-advertised. Node remains wholly legacy. Therefore no user launch can silently
-fall back from a failed managed launch to an unmanaged process and no operator
-can obtain the managed guarantees merely by toggling a flag.
+Phase 2 wires `freshell-runtime-client` into the Rust server behind the Cargo
+feature `managed-runtime-v1`. At runtime, `FRESHELL_MANAGED_RUNTIME_V1=1` plus
+a healthy authenticated supervisor is required before the server advertises
+`ready.capabilities.managedRuntimeV1`. The client must opt in on the same
+connection. Feature-off, controller-unavailable, Node-server, and non-negotiated
+connections stay byte-for-byte on their legacy ownership path.
 
-Phase 2/3 may wire the runtime client only after the corresponding live gates
-prove PTY continuity and provider-native resume. Until then the only entrypoint
-into this subsystem is the isolated runtime test harness.
+Negotiated **shell and Claude CLI terminals** use a browser-facing
+`TerminalRegistry` facade with no `PtyTerminal`/OS kill handle. The session host
+owns the PTY reader/writer/waiter and continuously drains output into a bounded
+1 MiB in-memory ring plus 64 MiB rotating spool (configurable with bounded
+explicit runtime settings). Web attach hydrates the existing terminal replay
+format from that host spool. Web shutdown, socket detach, idle cleanup, and
+`kill_all` cannot reap a managed row. Explicit user close first commits the
+pane close, then requires a supervisor `VerifiedEmpty` stop before removing the
+facade. Managed terminal/stream IDs are deterministic from the pane's durable
+`createRequestId`, making web-restart launch retries payload-identical.
+
+Managed terminal specs use an explicit non-secret environment allowlist. Server
+`AUTH_TOKEN`/`FRESHELL_TOKEN`, provider API/OAuth variables, cloud credentials,
+and proxy credentials are never serialized into the supervisor registry. A
+real Claude credential can instead be supplied by exact
+`FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` reference; Docker mounts only that
+file read-only and the host copies its bytes into the soul-owned provider volume.
+The persisted spec contains paths, not secret bytes.
+
+Phase 2 deliberately strips the legacy temporary `--mcp-config` injection for
+managed Claude. That MCP child depends on web-owned `FRESHELL_TOKEN` and would
+violate web-process independence. Phase 3 replaces it with the durable,
+capability-scoped tool router. Fresh-agent providers, Codex/OpenCode terminal
+sidecars, Amplifier, and Node-server routes remain legacy until their Phase 3
+adapters land.
 
 ## Remaining legacy process-ownership sites
 
 The following are the coding-agent/terminal process lifecycle sites still outside
-the supervisor. They are the migration checklist for later phases; Phase 1 does
-not broaden their authority.
+the supervisor. They are the migration checklist for later phases; Phase 2 does
+not broaden their legacy authority beyond the explicitly managed shell/Claude lane.
 
 | Runtime family | Current production ownership/spawn/reap seams | Required migration destination |
 |---|---|---|
-| Rust terminal/PTy | `crates/freshell-terminal/src/pty.rs` (`PtyTerminal::spawn`, process-group kill) and `crates/freshell-terminal/src/registry.rs` (`PtyTerminal::spawn_with_sink`, `kill_all`) | Phase 2 session-host PTY ownership and runtime client facade. |
+| Rust terminal/PTy | Managed shell/Claude use the session-host facade; non-managed modes still use `PtyTerminal::spawn_with_sink` and legacy `kill_all`. | Finish remaining terminal providers in Phase 3; managed rows must stay excluded from legacy kill/idle paths. |
 | Rust FreshClaude/Kilroy | `crates/freshell-freshagent/src/claude.rs` (Node bridge spawn, child kills, `/proc` tag sweep) | Phase 3 per-soul host transport + native provider recovery. |
 | Rust FreshCodex | `crates/freshell-freshagent/src/codex.rs` (app-server spawn/kill/exit watcher) | Phase 3 per-soul host transport + exact native session resume. |
 | Rust fresh-agent lease cleanup | `crates/freshell-freshagent/src/session_lease.rs` (PID/tree SIGTERM/SIGKILL) | Retire for managed sessions in favor of exact enclosure cleanup. |
@@ -195,7 +224,7 @@ This inventory can be refreshed with focused searches for `PtyTerminal::spawn`,
 `libc::kill`, `SIGTERM`, and `SIGKILL` in the files above. New managed ingress
 is not complete until it has zero calls into these legacy ownership paths.
 
-## Phase 1 handoff checklist
+## Phase 2 handoff checklist
 
 - Protocol/types: `crates/freshell-runtime-protocol`.
 - Durable ownership/stop state machine: `crates/freshell-supervisor`.
@@ -205,7 +234,15 @@ is not complete until it has zero calls into these legacy ownership paths.
 - Destructive-test containment: `scripts/sandbox-test.sh --runtime-suite` and
   `scripts/sandbox-selftest.sh`.
 - Legacy R04/R05 hardening: Codex launch lifecycle + sidecar sweep regressions.
-- Production managed routing: **disabled**; no user launch is switched yet.
+- Production managed routing: explicit Rust `managedRuntimeV1` opt-in for shell
+  and Claude CLI; default/Node/non-negotiated routes remain legacy.
+- Pinned workload image: Ubuntu 24.04 + Node 22.23.2 + Claude Code 2.1.263;
+  machine-readable versions in `docker/runtime/provider-versions.json`.
+- Transactional resource admission, named profiles, bounded host replay/spool,
+  durable input request dedupe, provider-home/worktree mounts, and safe
+  credential-file bootstrap are Phase 2 contracts.
+- Browser continuity and real-Claude live receipts are the environment-dependent
+  release gates P2-G01/P2-G04.
 - Gate evidence is intentionally untracked under `.runtime-evidence/<candidate-sha>/<run-id>/`
   so each tested commit carries its own reproducible evidence rather than a
   stale checked-in success claim.
@@ -215,7 +252,7 @@ is not complete until it has zero calls into these legacy ownership paths.
 Run:
 
 ```bash
-npm run test:runtime -- gate phase-1 --require-live
+npm run test:runtime -- gate phase-2 --require-live
 ```
 
 The gate executes `P1-G01` through `P1-G10` and writes reproducible evidence to

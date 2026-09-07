@@ -342,6 +342,10 @@ pub struct RuntimeOutputBatch {
     pub reset_required: bool,
     pub truncated: bool,
     #[serde(default)]
+    pub exited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
     pub frames: Vec<RuntimeOutputFrame>,
 }
 

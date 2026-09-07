@@ -25,3 +25,10 @@ Linux/WSL/macOS hosts.
 containers are intentionally outside Compose. Operational restart commands must
 name `web` or `supervisor`; do not use `docker compose down` for an ordinary
 Freshell restart, because that is a project-wide destruction primitive.
+
+Provider credentials are never placed in the persisted terminal environment.
+For managed Claude, `FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` may point at one
+canonical `.credentials.json` file; the supervisor records only that path,
+Docker mounts only that file read-only, and the session host copies it into the
+soul-owned provider volume with mode `0600`. Phase 2 strips the legacy web-bound
+Freshell MCP config from managed Claude; Phase 3 supplies the durable tool router.
