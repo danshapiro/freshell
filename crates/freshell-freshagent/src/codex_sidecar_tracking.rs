@@ -15,8 +15,13 @@ use freshell_codex::sidecar_store::{
 
 const PROVIDER: &str = "freshcodex";
 
-/// Poll budget for `/proc/<pid>` evidence right after spawn: the fork/exec
-/// window (empty cmdline) closes in milliseconds.
+/// Poll budget for `/proc/<pid>` evidence right after spawn. The fork/exec
+/// window closes in milliseconds, but between fork() and execve()
+/// /proc/<pid>/cmdline mirrors the SPAWNER's argv (not empty!), so "wait for
+/// non-empty" is not enough — the evidence is usable only once it stops
+/// matching our own process's argv (kata w0xf / CI receipt: a record written
+/// mid-window carried the server/test binary's argv and read as Mismatch at
+/// the next boot's reconcile).
 const EVIDENCE_POLL_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
 const EVIDENCE_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -54,12 +59,39 @@ pub(crate) async fn record_spawned_sidecar(ownership_id: &str, pid: u32, ws_url:
         return;
     }
 
+    // Pre-exec /proc mirrors our own argv; accept evidence only after it
+    // differs (exec landed). A sidecar whose real argv equals ours is
+    // impossible: we are freshell-server/test harness, the child is the CLI.
+    // Read our own argv through the SAME parser: proc_cmdline drops empty
+    // args and lossily decodes, while env::args() keeps empties and PANICS on
+    // non-Unicode — a representation mismatch must not recreate the race.
+    let own_argv = proc_cmdline(std::process::id() as i32)
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            std::env::args_os()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        });
     let deadline = std::time::Instant::now() + EVIDENCE_POLL_BUDGET;
     let evidence = loop {
         match (proc_starttime(pid as i32), proc_cmdline(pid as i32)) {
-            (Some(st), Some(cl)) if !cl.is_empty() => break Some((st, cl)),
-            _ if std::time::Instant::now() >= deadline => break None,
-            _ => tokio::time::sleep(EVIDENCE_POLL_STEP).await,
+            (Some(st), Some(cl)) if !cl.is_empty() && cl != own_argv => break Some((st, cl)),
+            // Child vanished pre-evidence (bad binary, spawn raced an exit):
+            // fail fast instead of burning the budget on a dead pid.
+            (None, _) => break None,
+            _ => {
+                // Sleep capped at the remaining budget, and never accept a
+                // sample taken past the deadline — the budget is a ceiling,
+                // not a hint (overrun otherwise unbounded by scheduler delay).
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break None;
+                }
+                tokio::time::sleep(EVIDENCE_POLL_STEP.min(deadline - now)).await;
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+            }
         }
     };
     let Some((starttime, cmdline)) = evidence else {

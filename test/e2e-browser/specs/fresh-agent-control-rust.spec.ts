@@ -1859,18 +1859,18 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Change model + effort BETWEEN sends through the real settings UI:
       // gear popover → Model row ("Change…") → the two-column model dialog →
-      // pick GPT-5.4 Flash, stage its `low` thinking level, commit.
+      // pick GPT-5.6 Sol, stage its `low` thinking level, commit.
       await page.getByRole('button', { name: 'Agent settings' }).click()
       const popover = page.getByRole('dialog', { name: 'Agent settings' })
       await expect(popover).toBeVisible({ timeout: 10_000 })
       await popover.getByRole('button', { name: /Change/ }).click()
       const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
       await expect(dialog).toBeVisible({ timeout: 10_000 })
-      await dialog.getByRole('option', { name: 'GPT-5.4 Flash' }).click()
-      const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+      await dialog.getByRole('option', { name: 'GPT-5.6 Sol' }).click()
+      const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Sol' })
       await expect(levelsList).toBeVisible()
       await levelsList.getByRole('option', { name: 'low', exact: true }).click()
-      await dialog.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }).click()
+      await dialog.getByRole('button', { name: 'Use GPT-5.6 Sol · low' }).click()
       await expect(dialog).toHaveCount(0)
       // The commit leaves the settings popover open behind the dialog; close it.
       await page.keyboard.press('Escape')
@@ -1880,7 +1880,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
           const content = (await paneLeaf(lane.harness, lane.tabId))?.content
           return content ? `${content.model ?? ''}|${content.effort ?? ''}` : ''
         })
-        .toBe('gpt-5.4-flash|low')
+        .toBe('gpt-5.6-sol|low')
 
       // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
       // msg.settings over the session baseline before turn/start).
@@ -1890,15 +1890,15 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
       // turn carries its captured turn/start params additively under `start` —
       // turn 2 carries the per-send selection while turn 1 kept the defaults
-      // (gpt-5.5 / the default 'max' effort, wire-mapped 'xhigh' by
+      // (gpt-6-astra / the default 'max' effort, wire-mapped 'xhigh' by
       // to_codex_reasoning_effort).
       const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
       await expect(async () => {
         const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
         expect(turns, 'exactly the two recorded turns').toHaveLength(2)
-        expect(turns[1]?.start?.model).toBe('gpt-5.4-flash')
+        expect(turns[1]?.start?.model).toBe('gpt-5.6-sol')
         expect(turns[1]?.start?.effort).toBe('low')
-        expect(turns[0]?.start?.model).toBe('gpt-5.5')
+        expect(turns[0]?.start?.model).toBe('gpt-6-astra')
         expect(turns[0]?.start?.effort).toBe('xhigh')
         expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
         expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)

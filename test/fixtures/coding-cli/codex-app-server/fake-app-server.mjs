@@ -792,12 +792,19 @@ wss.on('connection', (socket) => {
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
       const result = override?.result ?? successResult(method, message.params)
+      // Durable witnesses land BEFORE the RPC response (kata rb5h). socket.send copies
+      // the frame into the kernel synchronously, so on a loaded multi-core host a client
+      // on another core can observe the response and assert the witness files while THIS
+      // process is preempted inside a send→append window — that exact interleaving twice
+      // emptied scenario 2's thread-op log on cloud shards even though the append here is
+      // appendFileSync. Persisting first gives tests a real happens-before: a resolved
+      // response implies the witness entry is already on disk.
+      appendThreadOperation(method, message.params, result)
+      maybeWriteRolloutForMethod(method, message.params)
       socket.send(JSON.stringify({
         id: message.id,
         result,
       }))
-      appendThreadOperation(method, message.params, result)
-      maybeWriteRolloutForMethod(method, message.params)
       if (method === 'thread/compact/start') {
         // The compact RPC result is empty; the lifecycle rides notifications.
         await emitCompactNotificationSequence(message.params?.threadId)

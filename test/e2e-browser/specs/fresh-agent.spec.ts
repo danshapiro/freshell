@@ -615,13 +615,45 @@ test.describe('Fresh Agent', () => {
         summary: 'Summarize the menu surface.',
         items: [{ id: 'item-menu-user', kind: 'text', text: 'Summarize the menu surface.' }],
       },
+      {
+        // Assistant turn: assistant text renders as markdown (user text is
+        // never interpreted), so the fenced code block produces the
+        // specialized `.prose pre code` sub-region used by the partition
+        // assertions below.
+        id: 'turn-menu-agent',
+        turnId: 'turn-menu-agent',
+        role: 'assistant',
+        summary: 'Ran the check.',
+        items: [{ id: 'item-menu-agent', kind: 'text', text: 'Here is the check:\n\n```bash\nnpm run test\n```' }],
+      },
     ])
     await installFreshclaudeStripPane(page, sessionId)
 
     const paneRoot = page.locator('[data-context="fresh-agent"]')
+
+    // Specialized sub-region partition: right-clicking the rendered code block
+    // inside a turn opens the PROVIDER's context-sensitive menu — exactly one
+    // menu, containing "Copy code block", and never the whole-turn menu.
+    const codeBlock = paneRoot.locator('article .prose pre code').first()
+    await expect(codeBlock).toBeVisible({ timeout: 10_000 })
+    await codeBlock.click({ button: 'right' })
+    await expect(page.getByRole('menu')).toHaveCount(1)
+    await expect(page.getByRole('menuitem', { name: 'Copy code block' })).toBeVisible()
+    await expect(page.getByRole('menu', { name: 'Turn context menu' })).toHaveCount(0)
+    // Dismiss via a left-click outside the menu (the provider's pointerdown
+    // dismissal); plain turn text has no click behavior of its own.
+    await paneRoot.getByText('Here is the check:', { exact: true }).click()
+    await expect(page.getByRole('menu')).toHaveCount(0)
+
     const turnText = paneRoot.getByText('Summarize the menu surface.', { exact: true })
     await expect(turnText).toBeVisible({ timeout: 10_000 })
     await turnText.click({ button: 'right' })
+
+    // Single-menu invariant: exactly ONE menu may open for a turn gesture.
+    // Before the provider carve-out, right-clicking a turn stacked the global
+    // pane menu and the transcript's turn menu at the same coordinates (the
+    // "popup with blank lines" bug — two overlapping menus).
+    await expect(page.getByRole('menu')).toHaveCount(1)
 
     // Fine-pointer desktop: right-clicking a turn opens the floating turn menu.
     const menu = page.getByRole('menu', { name: 'Turn context menu' })

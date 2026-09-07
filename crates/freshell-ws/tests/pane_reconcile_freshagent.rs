@@ -871,15 +871,33 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
     assert_eq!(verdicts[0]["verdict"], "dead_session");
     assert_eq!(verdicts[0]["reason"], "session_not_on_disk");
 
-    let events = events.lock().expect("capture lock");
-    let hits: Vec<&CapturedEvent> = events
-        .iter()
-        .filter(|e| e.message.contains("pane_reconcile.dead_session"))
-        .collect();
+    // The WARN is emitted before the response frame is sent, but under CI
+    // contention the tracing layer's push can lag the client's read by a
+    // scheduling quantum. Bounded-poll the capture instead of asserting
+    // immediately so the test is resilient to that lag without masking a
+    // genuinely missing log (a 5s budget on a current-thread runtime).
+    let hits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let hits: Vec<CapturedEvent> = {
+                let events = events.lock().expect("capture lock");
+                events
+                    .iter()
+                    .filter(|e| e.message.contains("pane_reconcile.dead_session"))
+                    .cloned()
+                    .collect()
+            };
+            if hits.len() == 1 {
+                return hits;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("dead_session WARN was not captured within 5s");
     assert_eq!(
         hits.len(),
         1,
-        "exactly one dead_session WARN per dead verdict; got {events:?}"
+        "exactly one dead_session WARN per dead verdict; got {hits:?}"
     );
     let fields = &hits[0].fields;
     assert!(

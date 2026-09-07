@@ -50,14 +50,28 @@ export const LONG_PRESS_MOVE_TOLERANCE_PX = 10
 type LongPressHandlers<T extends HTMLElement> = {
   onTouchStart: (event: React.TouchEvent<T>) => void
   onTouchMove: (event: React.TouchEvent<T>) => void
-  onTouchEnd: () => void
+  onTouchEnd: (event: React.TouchEvent<T>) => void
   onTouchCancel: () => void
+  /**
+   * Non-DOM member (never spread onto an element): tell the builder that an
+   * overlay opened during the active touch via a route OTHER than this
+   * long-press timer (e.g. a native contextmenu event mid-gesture). The next
+   * touchend of the gesture is then suppressed the same way the timer route
+   * suppresses it. No-op when no touch is active.
+   */
+  notifyOverlayOpened: () => void
 }
 
 /**
  * Build long-press touch handlers (no hook state — timer lives in a closure
  * owned by the caller's ref object so one instance can serve many elements).
  * Cancels on scroll/drag: any movement beyond the tolerance aborts the press.
+ *
+ * Release suppression: once an overlay opened during the touch (timer
+ * completion or notifyOverlayOpened), the gesture's touchend is
+ * preventDefault'd (when cancelable) so the synthesized compatibility click
+ * cannot dismiss the freshly-opened overlay or activate a row under the
+ * finger. Taps, moved presses, and cancelled presses are never suppressed.
  */
 export function buildLongPressHandlers<T extends HTMLElement>(
   callback: (event: { clientX: number; clientY: number }) => void,
@@ -65,6 +79,8 @@ export function buildLongPressHandlers<T extends HTMLElement>(
   let timer: ReturnType<typeof setTimeout> | null = null
   let startX = 0
   let startY = 0
+  let touchActive = false
+  let overlayOpenedDuringTouch = false
 
   const cancel = () => {
     if (timer !== null) {
@@ -79,9 +95,14 @@ export function buildLongPressHandlers<T extends HTMLElement>(
       const touch = event.touches[0]
       startX = touch.clientX
       startY = touch.clientY
+      touchActive = true
+      overlayOpenedDuringTouch = false
       cancel()
       timer = setTimeout(() => {
         timer = null
+        // The callback opens the overlay; the gesture's release must then be
+        // suppressed (see header comment).
+        overlayOpenedDuringTouch = true
         callback({ clientX: startX, clientY: startY })
       }, LONG_PRESS_MS)
     },
@@ -93,7 +114,20 @@ export function buildLongPressHandlers<T extends HTMLElement>(
       const dy = Math.abs(touch.clientY - startY)
       if (dx > LONG_PRESS_MOVE_TOLERANCE_PX || dy > LONG_PRESS_MOVE_TOLERANCE_PX) cancel()
     },
-    onTouchEnd: cancel,
-    onTouchCancel: cancel,
+    onTouchEnd: (event) => {
+      const suppressRelease = overlayOpenedDuringTouch
+      cancel()
+      touchActive = false
+      overlayOpenedDuringTouch = false
+      if (suppressRelease && event.cancelable) event.preventDefault()
+    },
+    onTouchCancel: () => {
+      cancel()
+      touchActive = false
+      overlayOpenedDuringTouch = false
+    },
+    notifyOverlayOpened: () => {
+      if (touchActive) overlayOpenedDuringTouch = true
+    },
   }
 }

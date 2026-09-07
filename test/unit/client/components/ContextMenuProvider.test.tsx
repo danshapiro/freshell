@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
@@ -773,8 +773,9 @@ describe('ContextMenuProvider', () => {
     await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
     expect(screen.getByRole('menu')).toBeInTheDocument()
 
-    // Wait out the 500ms post-open grace window (this suite uses real
-    // timers by design — do not add fake timers to this file).
+    // Wait out the 500ms post-open grace window (the OUTER suite uses real
+    // timers by design — only the nested 'hybrid-input long-press' describe
+    // uses fake timers, scoped by its own setup/cleanup).
     await new Promise((resolve) => setTimeout(resolve, 550))
 
     act(() => {
@@ -2699,5 +2700,237 @@ describe('ContextMenuProvider', () => {
       expect(call[0]).toEqual({ preventScroll: true })
     }
     focusSpy.mockRestore()
+  })
+})
+
+describe('fresh-agent turn carve-out', () => {
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  function simulateTouch(
+    type: 'touchstart' | 'touchmove' | 'touchend' | 'touchcancel',
+    target: Element,
+    clientX = 100,
+    clientY = 100,
+  ) {
+    const touch = { clientX, clientY, identifier: 0, target }
+    const touchEvent = new TouchEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      touches: type === 'touchend' || type === 'touchcancel' ? [] : [touch as any],
+      changedTouches: [touch as any],
+    })
+    target.dispatchEvent(touchEvent)
+    return touchEvent
+  }
+
+  function renderFreshAgentFixture(turnArticleAttrs: Record<string, string> = {}) {
+    return renderWithProvider(
+      <div
+        data-context={ContextIds.FreshAgent}
+        data-tab-id="tab-1"
+        data-pane-id="pane-1"
+        data-session-id="sess-1"
+        data-provider="claude"
+        data-session-type="freshclaude"
+      >
+        <article data-turn-role="assistant" {...turnArticleAttrs}>
+          <p>Turn body text</p>
+        </article>
+        <div>Pane background</div>
+      </div>,
+    )
+  }
+
+  it('opens no provider menu for contextmenu inside article[data-turn-role]', () => {
+    renderFreshAgentFixture()
+
+    const target = screen.getByText('Turn body text')
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+    act(() => {
+      target.dispatchEvent(event)
+    })
+
+    expect(screen.queryByRole('menu')).toBeNull()
+    // The provider's capture-phase carve-out cancels the event: for a real
+    // article-targeted event the transcript's bubble-phase handler cancels it
+    // too (harmless double cancel), and a late Android contextmenu retargeted
+    // onto the transcript's sheet has no transcript handler at all — the
+    // provider must preventDefault or the browser's native menu opens.
+    expect(event.defaultPrevented).toBe(true)
+  })
+
+  it('still opens the pane menu for contextmenu in the pane container outside any turn article', () => {
+    renderFreshAgentFixture()
+
+    const target = screen.getByText('Pane background')
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+    act(() => {
+      target.dispatchEvent(event)
+    })
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  describe('specialized sub-region partition', () => {
+    function renderSpecializedFixture() {
+      return renderWithProvider(
+        <div
+          data-context={ContextIds.FreshAgent}
+          data-tab-id="tab-1"
+          data-pane-id="pane-1"
+          data-session-id="sess-1"
+          data-provider="claude"
+          data-session-type="freshclaude"
+        >
+          <article data-turn-role="assistant">
+            <div className="prose prose-sm" data-markdown-body="">
+              <pre><code>const answer = 42</code></pre>
+            </div>
+            <pre data-tool-output="">tool output line</pre>
+            <div data-diff="" data-file-path="/tmp/a.ts">
+              <span>diff body</span>
+            </div>
+            <p>Plain turn text</p>
+          </article>
+        </div>,
+      )
+    }
+
+    function rightClick(target: Element) {
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+      act(() => {
+        target.dispatchEvent(event)
+      })
+      return event
+    }
+
+    it('opens the provider context-sensitive menu (not the turn menu) for a right-click on a code block inside a turn', () => {
+      const { container } = renderSpecializedFixture()
+
+      const codeEl = container.querySelector('.prose pre code') as HTMLElement
+      const event = rightClick(codeEl)
+
+      expect(event.defaultPrevented).toBe(true)
+      // Exactly one menu, and it is the PROVIDER's context-sensitive fresh-
+      // agent menu — the whole-turn "Turn context menu" must not open here
+      // (the transcript article yields on specialized sub-regions).
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Copy code block' })).toBeInTheDocument()
+    })
+
+    it('opens the provider context-sensitive menu for tool output inside a turn', () => {
+      const { container } = renderSpecializedFixture()
+
+      const outputEl = container.querySelector('[data-tool-output]') as HTMLElement
+      const event = rightClick(outputEl)
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Copy output' })).toBeInTheDocument()
+    })
+
+    it('opens the provider context-sensitive menu for a diff inside a turn', () => {
+      renderSpecializedFixture()
+
+      const event = rightClick(screen.getByText('diff body'))
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Copy new version' })).toBeInTheDocument()
+    })
+
+    it('keeps the whole-turn carve-out for plain turn text inside the specialized fixture (control)', () => {
+      renderSpecializedFixture()
+
+      const event = rightClick(screen.getByText('Plain turn text'))
+
+      expect(event.defaultPrevented).toBe(true)
+      expect(screen.queryByRole('menu')).toBeNull()
+    })
+  })
+
+  // These two tests drive the provider's 500ms long-press timer, so they need
+  // fake timers. They are scoped to this nested describe ONLY (restore in its
+  // afterEach): the outer suite stays real-timers by design.
+  describe('hybrid-input long-press', () => {
+    let elementFromPointMock: ReturnType<typeof vi.fn>
+    let originalElementFromPoint: typeof document.elementFromPoint
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      originalElementFromPoint = document.elementFromPoint
+      elementFromPointMock = vi.fn().mockReturnValue(null)
+      document.elementFromPoint = elementFromPointMock
+    })
+
+    afterEach(() => {
+      document.elementFromPoint = originalElementFromPoint
+      vi.useRealTimers()
+    })
+
+    it('still opens the provider long-press menu on a turn article WITHOUT data-longpress-owned (iPad-like fallback preserved)', () => {
+      renderFreshAgentFixture()
+
+      const article = screen.getByText('Turn body text').closest('article')!
+      elementFromPointMock.mockReturnValue(article)
+
+      act(() => {
+        simulateTouch('touchstart', article, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(elementFromPointMock).toHaveBeenCalled()
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    })
+
+    it('leaves the whole gesture alone on a turn article WITH data-longpress-owned="true"', () => {
+      renderFreshAgentFixture({ 'data-longpress-owned': 'true' })
+
+      const article = screen.getByText('Turn body text').closest('article')!
+      const outside = screen.getByText('Pane background')
+      elementFromPointMock.mockReturnValue(article)
+
+      act(() => {
+        simulateTouch('touchstart', article, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      // The transcript's own long-press owns this gesture: no probe, no menu,
+      // no release suppression from the provider.
+      expect(elementFromPointMock).not.toHaveBeenCalled()
+      expect(screen.queryByRole('menu')).toBeNull()
+
+      const release = simulateTouch('touchend', article, 100, 100)
+      expect(release.defaultPrevented).toBe(false)
+
+      // The skipped gesture must not corrupt the provider's touch-session
+      // tracking: a following long-press outside the turn works normally.
+      elementFromPointMock.mockReturnValue(outside)
+      act(() => {
+        simulateTouch('touchstart', outside, 100, 100)
+      })
+      act(() => {
+        vi.advanceTimersByTime(500)
+      })
+
+      const menu = screen.getByRole('menu')
+      expect(menu).toBeInTheDocument()
+
+      // That menu's own release suppression still works after the skipped gesture.
+      const secondRelease = simulateTouch('touchend', outside, 100, 100)
+      expect(secondRelease.defaultPrevented).toBe(true)
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+    })
   })
 })

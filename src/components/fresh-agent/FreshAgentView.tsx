@@ -142,10 +142,30 @@ function getTurnKey(turn: FreshAgentTurn): string {
   return getFreshAgentDisplayTurnKey(turn)
 }
 
+/**
+ * Bidirectional text match between the local echo (raw user input) and the
+ * server-normalised turn text. The server may add content (system context,
+ * metadata) or remove content (strip quoting, trim whitespace), so we check
+ * both directions: the turn text contains the echo text, or the echo text
+ * contains the turn text.
+ */
+function echoTextMatchesTurn(echoText: string, needle: string, turnText: string): boolean {
+  if (turnText.includes(needle)) return true
+  const trimmedTurnText = turnText.trim()
+  return trimmedTurnText.length > 0 && echoText.includes(trimmedTurnText)
+}
+
 type LocalEcho = {
   text: string
   requestId: string
   submittedTurnId?: string
+  /** Turn keys captured at send time — used by the echo-landed check to
+   * distinguish the new server turn from pre-existing turns. Unlike the
+   * previous-snapshot turns, these never include the just-sent turn, so
+   * the text-match guard cannot permanently block the echo from clearing
+   * if the first snapshot's text match fails (e.g. the server normalises
+   * the text by stripping quoting). */
+  previousTurnKeys?: readonly string[]
 }
 
 function sameLocalEcho(a: LocalEcho | null | undefined, b: LocalEcho | null | undefined): boolean {
@@ -172,14 +192,12 @@ function localEchoLanded(
   pending?: PendingSendMetadata,
   options: {
     allowTextMatch?: boolean
-    previousTurns?: readonly FreshAgentTurn[]
+    previousTurnKeys?: Set<string> | null
   } = {},
 ): boolean {
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
-  const previousTurnKeys = options.previousTurns
-    ? new Set(options.previousTurns.map(getTurnKey))
-    : null
+  const previousTurnKeys = options.previousTurnKeys ?? null
   const canMatchText = Boolean(needle) && (
     options.allowTextMatch === true
     || pending?.legacyAccepted === true
@@ -193,7 +211,7 @@ function localEchoLanded(
       || (
         canMatchText
         && (!previousTurnKeys || !previousTurnKeys.has(getTurnKey(turn)))
-        && freshAgentTurnText(turn).includes(needle)
+        && echoTextMatchesTurn(echo.text, needle, freshAgentTurnText(turn))
       )
     )
   ))
@@ -844,11 +862,18 @@ export function FreshAgentView({
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
     const current = paneContentRef.current
-    if (sameLocalEcho(current.pendingLocalEcho, next)) return
+    // Strip runtime-only fields (previousTurnKeys) before persisting —
+    // the persisted echo only needs the wire-identity fields. On remount
+    // the echo is restored without previousTurnKeys, which correctly
+    // disables the text-match guard (no send-time turns to compare against).
+    const persisted = next
+      ? { requestId: next.requestId, text: next.text, ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}) }
+      : undefined
+    if (sameLocalEcho(current.pendingLocalEcho, persisted)) return
     dispatch(mergePaneContent({
       tabId,
       paneId,
-      updates: { pendingLocalEcho: next ?? undefined },
+      updates: { pendingLocalEcho: persisted },
     }))
   }, [dispatch, paneId, tabId])
   useEffect(() => {
@@ -2078,7 +2103,7 @@ export function FreshAgentView({
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
-          previousTurns: outgoing.previousTurns,
+          previousTurnKeys: new Set((outgoing.previousTurns ?? []).map(getTurnKey)),
         })
       ) {
         // Reconnect may miss every stream/status event. A current idle snapshot
@@ -2094,7 +2119,7 @@ export function FreshAgentView({
       const landedEcho = echo
         ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
             allowTextMatch: snapshotAccepted,
-            previousTurns: previousSnapshot?.turns,
+            previousTurnKeys: echo.previousTurnKeys ? new Set(echo.previousTurnKeys) : null,
           })
         : false
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
@@ -2543,7 +2568,11 @@ export function FreshAgentView({
         firstMessage: text,
       }))
     }
-    const nextLocalEcho: LocalEcho = { text, requestId }
+    const nextLocalEcho: LocalEcho = {
+      text,
+      requestId,
+      previousTurnKeys: (snapshotRef.current?.turns ?? []).map(getTurnKey),
+    }
     sendFreshAgentSendFrame(requestId, text, routeCwd)
     setLocalEchoState(nextLocalEcho)
     dispatch(mergePaneContent({

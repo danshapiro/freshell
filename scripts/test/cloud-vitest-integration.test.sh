@@ -78,6 +78,14 @@ check "electron fallback attempted after cloud dispatch" \
   grep -q 'electron' "$CLOUD_STDOUT"
 rm -f "$CLOUD_STDOUT"
 
+# Check 7c: Port contract suite is included in the cloud-backend local section
+# The cloud branch blocks on the electron execFileSync for minutes, so the
+# port log line (emitted after electron returns) is not captured by the
+# timeout-bounded process-level test above. A static source check guards
+# against deletion or misconfiguration of the port block in the cloud path.
+check "run-standard-tests.ts cloud path includes port contract suite" \
+  grep -q 'Running port contract suite locally after cloud dispatch' scripts/run-standard-tests.ts
+
 # Check 8: FRESHELL_VITEST_BACKEND=local does NOT invoke vitest-cloud.sh
 # Use a timeout — the local path runs the full test suite which takes minutes.
 # We only need to verify the fake was NOT invoked (checked after the timeout).

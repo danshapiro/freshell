@@ -62,7 +62,7 @@ import type { ContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
 import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
-import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
+import { copyDataset, isFreshAgentSpecializedRegion, isTextInputLike, parseContextTarget } from './context-menu-utils'
 import {
   copyFreshAgentCodeBlock,
   copyFreshAgentToolInput,
@@ -143,6 +143,29 @@ function findContextElement(start: HTMLElement | null): HTMLElement | null {
     node = node.parentElement
   }
   return null
+}
+
+/**
+ * Fresh-agent transcript turn articles (sole producer: FreshAgentTranscript)
+ * own their contextmenu gesture entirely — the transcript always installs a
+ * turn handler per pointer kind (turn menu on fine pointers, action sheet on
+ * coarse). The provider's capture-phase document listener would otherwise
+ * beat that bubble-phase handler and stack its pane menu at the same point.
+ */
+function isFreshAgentTurnTarget(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('article[data-turn-role]')
+}
+
+/**
+ * A turn article carries data-longpress-owned="true" exactly when the
+ * transcript installed its own long-press handlers (coarse pointers). The
+ * provider's long-press carve-out keys on this attribute — NOT bare
+ * data-turn-role — so hybrid-input devices (fine primary pointer, e.g. iPad +
+ * trackpad: the transcript installs no long-press there) keep the provider's
+ * long-press fallback untouched.
+ */
+function isFreshAgentLongPressOwnedTarget(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('article[data-turn-role][data-longpress-owned="true"]')
 }
 
 function resolveContextId(value: string | undefined): ContextId {
@@ -1086,10 +1109,45 @@ export function ContextMenuProvider({
     // handlers so handleContextMenu can coordinate with the touch session.
     let longPressTimer: ReturnType<typeof setTimeout> | null = null
     let touchStartPos: { x: number; y: number } | null = null
+    // The gesture's original touchstart target, persisted for the WHOLE
+    // in-flight gesture on the touchStartPos clearing discipline. A LATE
+    // native Android contextmenu can arrive after the transcript's sheet has
+    // opened; Chromium's fresh hit test then targets the sheet/backdrop, so
+    // handleContextMenu resolves turn ownership against this target instead
+    // (see its carve-out).
+    let touchGestureTarget: HTMLElement | null = null
     let suppressNextTouchEnd = false
 
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
+      // Turn articles own their contextmenu gesture (see predicate comment) —
+      // no openMenu, and we cancel the event on the early return: for an
+      // article-targeted event the transcript's bubble-phase handler cancels
+      // it too (a harmless double cancel — opening the transcript's menu does
+      // not depend on defaultPrevented), while a late sheet-targeted event has
+      // no transcript handler at all, so the provider must cancel it here or
+      // the browser shows its native context menu over the sheet. While a
+      // touch gesture is in flight (the Android-race case-B condition below),
+      // resolve ownership against the gesture's ORIGINAL target, not e.target:
+      // a late native contextmenu retargeted onto the transcript's action
+      // sheet would otherwise bypass this check and stack the provider menu on
+      // top. For non-turn gestures the recorded target fails the predicate
+      // identically to e.target, so their behavior is unchanged.
+      const gestureInFlight = touchStartPos !== null || longPressTimer !== null
+      const ownershipTarget = gestureInFlight ? touchGestureTarget : target
+      // Fine-pointer (no touch gesture in flight) right-clicks into the turn's
+      // specialized sub-regions (markdown code blocks, tool input/output,
+      // diffs) fall through to the normal fresh-agent menu below so their
+      // context-sensitive items ("Copy code block", "Copy output", ...) stay
+      // available — the transcript article yields this gesture to us. A touch
+      // gesture in flight (early or late Android contextmenu) keeps the
+      // carve-out: the transcript's action sheet owns the whole turn on
+      // coarse pointers, which never install specialized-region menus.
+      if (isFreshAgentTurnTarget(ownershipTarget)
+        && !(isFreshAgentSpecializedRegion(ownershipTarget) && !gestureInFlight)) {
+        if (e.cancelable) e.preventDefault()
+        return
+      }
       const contextEl = findContextElement(target)
       const contextId = resolveContextId(contextEl?.dataset.context)
       if (shouldUseNativeMenu(target, contextId, contextEl, e)) return
@@ -1112,7 +1170,7 @@ export function ContextMenuProvider({
       // Chromium, and it hardens against engines reporting drifted or
       // degenerate contextmenu coordinates.
       let position = { x: e.clientX, y: e.clientY }
-      if (touchStartPos !== null || longPressTimer !== null) {
+      if (gestureInFlight) {
         if (touchStartPos) {
           position = { x: touchStartPos.x, y: touchStartPos.y }
         }
@@ -1121,6 +1179,7 @@ export function ContextMenuProvider({
           longPressTimer = null
         }
         touchStartPos = null
+        touchGestureTarget = null
         suppressNextTouchEnd = true
       }
 
@@ -1166,9 +1225,30 @@ export function ContextMenuProvider({
       if (!touch) return
       suppressNextTouchEnd = false
       touchStartPos = { x: touch.clientX, y: touch.clientY }
+      // Capture the gesture target ONCE here: by the time the 500ms timer
+      // fires, a transcript-owned long-press (450ms) has already opened the
+      // action sheet, so a live elementFromPoint probe would hit the sheet.
+      // The same target also carries turn ownership for handleContextMenu
+      // across a late, retargeted native contextmenu (see its carve-out).
+      const gestureTarget = e.target as HTMLElement | null
+      touchGestureTarget = gestureTarget
 
       longPressTimer = setTimeout(() => {
         longPressTimer = null
+        // The transcript's own long-press owns this gesture entirely: no
+        // probe, no haptic, no openMenu, and no suppressNextTouchEnd arming
+        // (the transcript's touch handlers own release suppression). Hybrid-
+        // input devices never set data-longpress-owned, so they keep the
+        // provider fallback below, which stays byte-identical.
+        //
+        // The gesture bookkeeping deliberately SURVIVES this exit (cleared
+        // only on touchend/touchcancel): a LATE native contextmenu can still
+        // arrive while the finger stays down, retargeted onto the just-opened
+        // sheet, and handleContextMenu must still observe this gesture as in
+        // flight so ownership resolves to the gesture's original target.
+        if (isFreshAgentLongPressOwnedTarget(gestureTarget)) {
+          return
+        }
         const startPos = touchStartPos
         if (!startPos) return
         const target = document.elementFromPoint(startPos.x, startPos.y) as HTMLElement | null
@@ -1179,11 +1259,11 @@ export function ContextMenuProvider({
         if (!contextId) return
 
         // Respect native context menu for inputs, links, iframes, etc.
-        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; return }
-        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; return }
-        if (target.tagName === 'IFRAME') { touchStartPos = null; return }
-        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; return }
-        if (target.closest?.('a[href]')) { touchStartPos = null; return }
+        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.tagName === 'IFRAME') { touchStartPos = null; touchGestureTarget = null; return }
+        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; touchGestureTarget = null; return }
+        if (target.closest?.('a[href]')) { touchStartPos = null; touchGestureTarget = null; return }
 
         const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
         const parsed = parseContextTarget(contextId as any, dataset)
@@ -1199,6 +1279,7 @@ export function ContextMenuProvider({
           dataset,
         })
         touchStartPos = null
+        touchGestureTarget = null
       }, 500)
     }
 
@@ -1212,6 +1293,7 @@ export function ContextMenuProvider({
         clearTimeout(longPressTimer)
         longPressTimer = null
         touchStartPos = null
+        touchGestureTarget = null
         suppressNextTouchEnd = false
       }
     }
@@ -1223,6 +1305,7 @@ export function ContextMenuProvider({
         longPressTimer = null
       }
       touchStartPos = null
+      touchGestureTarget = null
       suppressNextTouchEnd = false
       if (shouldSuppressRelease) {
         if (e.cancelable) e.preventDefault()

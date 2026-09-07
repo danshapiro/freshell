@@ -323,6 +323,86 @@ describe('parseSessionContent() - token usage snapshots', () => {
     expect(meta.tokenUsage?.compactPercent).toBe(100)
   })
 
+  it('maps 5th-gen claude models to the 1M context window (kata 9c92)', () => {
+    const content = [
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'uuid-opus5-1m',
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-5',
+          usage: {
+            input_tokens: 50_000,
+            output_tokens: 4_000,
+            cache_read_input_tokens: 45_000,
+            cache_creation_input_tokens: 5_000,
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+
+    expect(meta.tokenUsage?.modelContextWindow).toBe(1_000_000)
+    expect(meta.tokenUsage?.compactThresholdTokens).toBe(950_000)
+    // contextTokens = 50000 + 4000 + 45000 + 5000 = 104000; 104000/950000 ≈ 11
+    expect(meta.tokenUsage?.compactPercent).toBe(Math.round((104_000 / 950_000) * 100))
+  })
+
+  it('elevates the effective window when a served prompt exceeds the mapped window (kata 9c92)', () => {
+    // A 200K-mapped model (claude-sonnet-4-20250514) with a prompt of 388,178 —
+    // only possible if the real window is larger (a true 200K session compacts
+    // at 95% ≈ 190K and can never serve 388K). Elevation lifts to 1M.
+    const content = [
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'uuid-elevated',
+        message: {
+          role: 'assistant',
+          model: 'claude-sonnet-4-20250514',
+          usage: {
+            input_tokens: 2,
+            output_tokens: 8,
+            cache_read_input_tokens: 384_514,
+            cache_creation_input_tokens: 3_662,
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+
+    expect(meta.tokenUsage?.modelContextWindow).toBe(1_000_000)
+    expect(meta.tokenUsage?.compactThresholdTokens).toBe(950_000)
+    // contextTokens = 2 + 8 + 384514 + 3662 = 388186; 388186/950000 ≈ 41
+    expect(meta.tokenUsage?.compactPercent).toBe(Math.round((388_186 / 950_000) * 100))
+  })
+
+  it('does not elevate when the prompt stays within the mapped window', () => {
+    // Same 200K model, prompt 190K (right at the 95% cliff) — no elevation.
+    const content = [
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'uuid-cliff',
+        message: {
+          role: 'assistant',
+          model: 'claude-sonnet-4-20250514',
+          usage: {
+            input_tokens: 190_000,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+
+    expect(meta.tokenUsage?.modelContextWindow).toBe(200_000)
+    expect(meta.tokenUsage?.compactThresholdTokens).toBe(190_000)
+  })
+
   it('supports compact-threshold overrides sourced outside session JSON (e.g. debug logs)', () => {
     const content = [
       JSON.stringify({

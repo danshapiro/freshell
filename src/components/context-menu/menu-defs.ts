@@ -436,7 +436,14 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'split-right', label: 'Split right', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'pane-split-sep' },
-      { type: 'item', id: 'rename-pane', label: 'Rename pane', onSelect: () => actions.renamePane(target.tabId, target.paneId) },
+      {
+        type: 'item',
+        id: 'rename-pane',
+        label: 'Rename pane',
+        onSelect: () => actions.renamePane(target.tabId, target.paneId),
+        // The host-stats pane is always named by the app ('System Status').
+        disabled: paneContent?.kind === 'host-stats',
+      },
       { type: 'separator', id: 'pane-replace-sep' },
       { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]
@@ -737,6 +744,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const hasSelection = !!(selection && selection.toString().trim())
 
     // Detect sub-region from click target using closest()
+    // KEEP IN SYNC: these selectors must mirror isFreshAgentSpecializedRegion
+    // in context-menu-utils.ts EXACTLY — edit both together.
     const codeBlock = clickTarget?.closest?.('.prose pre code') as HTMLElement | null
     const toolInput = clickTarget?.closest?.('[data-tool-input]') as HTMLElement | null
     const toolOutput = clickTarget?.closest?.('[data-tool-output]') as HTMLElement | null

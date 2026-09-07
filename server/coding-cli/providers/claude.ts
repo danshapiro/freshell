@@ -35,6 +35,15 @@ const CLAUDE_DEBUG_AUTOCOMPACT_TAIL_BYTES = 128 * 1024
 const CLAUDE_DEBUG_AUTOCOMPACT_MAX_READ_BYTES = 4 * 1024 * 1024
 
 const CLAUDE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  // kata 9c92: 5th-gen claude sessions run the 1M "context-1m" window (Claude Code's
+  // `opus[1m]`-style models; canonical JSONL ids carry no suffix). Verified on local
+  // corpora: opus-5 prompts up to 579,832 served without prompt-too-long (and
+  // sonnet-5 237K, fable-5 353K, opus-4-8 227K — all beyond any 200K window's 95%
+  // autocompact cliff), so these sessions could only have been served on the 1M beta.
+  'claude-opus-5': 1_000_000,
+  'claude-sonnet-5': 1_000_000,
+  'claude-fable-5': 1_000_000,
+  'claude-opus-4-8': 1_000_000,
   'claude-opus-4-20250514': 200_000,
   'claude-sonnet-4-20250514': 200_000,
   'claude-3-7-sonnet-latest': 200_000,
@@ -47,6 +56,22 @@ const CLAUDE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'claude-3-opus-20240229': 200_000,
   'claude-3-sonnet-20240229': 200_000,
   'claude-3-haiku-20240307': 200_000,
+}
+
+// Window tiers the JSONL can never carry: the transcript records the canonical model id
+// but not the session's effective window. A prompt that was SERVED above the mapped
+// window proves the real window is larger (a true 200K session compacts at 95% ≈ 190K
+// and can never exceed it), so elevate to the smallest tier that covers the observed
+// maximum prompt — never below the table value. This keeps immature 1M sessions honest
+// without overstating immature 200K sessions.
+const CLAUDE_CONTEXT_WINDOW_TIERS: readonly number[] = [200_000, 1_000_000]
+
+function elevateClaudeContextWindow(mappedWindow: number, maxPromptTokens: number): number {
+  if (maxPromptTokens <= mappedWindow) return mappedWindow
+  for (const tier of CLAUDE_CONTEXT_WINDOW_TIERS) {
+    if (tier >= maxPromptTokens) return Math.max(mappedWindow, tier)
+  }
+  return maxPromptTokens
 }
 
 type ClaudeDebugAutocompactSnapshot = {
@@ -339,6 +364,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let model: string | undefined
   let userMessageCount = 0
   const usageSeen = new Set<string>()
+  let maxPromptTokens = 0
   let latestUsage:
     | {
       inputTokens: number
@@ -461,13 +487,17 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       const dedupeKey = assistantUsageDedupKey(obj, line)
       if (!usageSeen.has(dedupeKey)) {
         usageSeen.add(dedupeKey)
+        const inputTokens = toFiniteNumber(usage.input_tokens) ?? 0
+        const cacheReadTokens = toFiniteNumber(usage.cache_read_input_tokens) ?? 0
+        const cacheCreationTokens = toFiniteNumber(usage.cache_creation_input_tokens) ?? 0
         latestUsage = {
-          inputTokens: toFiniteNumber(usage.input_tokens) ?? 0,
+          inputTokens,
           outputTokens: toFiniteNumber(usage.output_tokens) ?? 0,
-          cachedTokens:
-            (toFiniteNumber(usage.cache_read_input_tokens) ?? 0) +
-            (toFiniteNumber(usage.cache_creation_input_tokens) ?? 0),
+          cachedTokens: cacheReadTokens + cacheCreationTokens,
         }
+        // kata 9c92: track the largest SERVED prompt so an unknown/oversized real
+        // window can be self-healed by elevation (see elevateClaudeContextWindow).
+        maxPromptTokens = Math.max(maxPromptTokens, inputTokens + cacheReadTokens + cacheCreationTokens)
       }
     }
   }
@@ -485,7 +515,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   if (latestUsage) {
     const contextTokensFromUsage = latestUsage.inputTokens + latestUsage.outputTokens + latestUsage.cachedTokens
     const contextTokens = options.contextTokens ?? contextTokensFromUsage
-    const modelContextWindow = resolveClaudeContextWindow(model)
+    const modelContextWindow = elevateClaudeContextWindow(resolveClaudeContextWindow(model), maxPromptTokens)
     const compactThresholdTokens =
       options.compactThresholdTokens ??
       Math.round((modelContextWindow * resolveClaudeCompactPercentThreshold()) / 100)

@@ -6,7 +6,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * (docs/plans/2026-08-25-host-pressure-pane.md, Task 10 content block).
  *
  * Authored + standalone-committed in Task 7 with captured RED evidence: the
- * first test fails at the picker click because the 'Host Stats' picker option
+ * first test fails at the picker click because the 'System Status' picker option
  * does not exist until Task 7's GREEN phase lands (this is the only sequence
  * point where absence-RED is reachable). Task 10 registers this spec into
  * MATRIX_SPECS (test/e2e-browser/playwright.config.ts) and re-runs it GREEN
@@ -35,10 +35,10 @@ function findLeafByKind(node: PaneNodeLike | null, kind: string): PaneNodeLike |
   return null
 }
 
-test.describe('Host Stats pane', () => {
+test.describe('System Status pane', () => {
   async function openHostStatsPane(page: any) {
     await openPanePicker(page)
-    const option = page.getByRole('button', { name: /^Host Stats$/ })
+    const option = page.getByRole('button', { name: /^System Status$/ })
     await expect(option).toBeVisible({ timeout: 10_000 })
     await option.click()
     const section = page.getByRole('region', { name: 'Host stats' })
@@ -46,7 +46,7 @@ test.describe('Host Stats pane', () => {
     return section
   }
 
-  test('opens a Host Stats pane from the pane picker', async ({ freshellPage, page, harness }) => {
+  test('opens a System Status pane from the pane picker', async ({ freshellPage, page, harness }) => {
     await openHostStatsPane(page)
 
     const activeTabId = await harness.getActiveTabId()

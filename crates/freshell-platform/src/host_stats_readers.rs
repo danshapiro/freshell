@@ -79,24 +79,51 @@ fn safe_read_dir(dir_path: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Resolve THIS process's cgroup leaf from `<proc_root>/self/cgroup`. The
-/// cgroup fs root has NO limit files by design, so callers must always
-/// resolve the leaf and never read the fs root.
+/// Resolve THIS process's cgroup leaf from `<proc_root>/self/cgroup`.
+///
+/// cgroup v2 namespace contract: a PRIVATE cgroup namespace (Docker's
+/// default on cgroup-v2 hosts) rewrites this process's v2 membership to
+/// `0::/`, and the namespace-visible cgroupfs mount exposes the container's
+/// OWN cgroup at the filesystem root — its memory.current/memory.max/
+/// pids.max live AT `<cgroup_root>` itself. Those limit files only exist at
+/// the root of a namespace-rooted mount: the REAL cgroup2 root of a
+/// non-namespaced host has none of them, so reading at the fs root degrades
+/// to the same `None` fallback as before there. Three v2 shapes therefore
+/// resolve to the fs root (empty path): membership `0::/`, a membership path
+/// that does not exist under `<cgroup_root>`, and a `../`-relative membership
+/// (out-of-namespace per `cgroup_namespaces(7)` — reads at the closest
+/// visible ancestor, never above `<cgroup_root>`). cgroup v1 is unchanged:
+/// v1 has no namespace membership rewrite and the v1 fs root DOES carry
+/// (garbage-sentinel) limit files, so v1 never reads the fs root.
 enum CgroupLeaf {
     V1(String),
+    /// The path may be empty: the cgroup-namespace-visible fs root.
     V2(String),
 }
 
-fn resolve_cgroup_leaf(proc_root: &Path, v1_controller: &str) -> Option<CgroupLeaf> {
+fn resolve_cgroup_leaf(
+    proc_root: &Path,
+    v1_controller: &str,
+    cgroup_root: &Path,
+) -> Option<CgroupLeaf> {
     let text = safe_read(&proc_root.join("self").join("cgroup"))?;
     let lines: Vec<&str> = non_empty_lines(&text).collect();
     // v2 unified hierarchy: a single "0::/path" line.
     for line in &lines {
         if let Some(rest) = line.strip_prefix("0::") {
             let leaf = rest.trim_start_matches('/');
-            if leaf.is_empty() {
-                // process sits at the cgroup2 root: no limit files there
-                return None;
+            // '' is a cgroup-namespace root; a membership path absent from
+            // the mounted cgroupfs is the same namespace shape seen through
+            // /proc; a '../'-relative membership (out-of-namespace) must
+            // never resolve ABOVE the injected root. All three read at the
+            // fs root — the closest visible ancestor; on a real
+            // non-namespaced host the root has no limit files, so the
+            // readers' None fallbacks fire exactly as before.
+            if leaf.is_empty()
+                || leaf.split('/').any(|segment| segment == "..")
+                || !cgroup_root.join(leaf).is_dir()
+            {
+                return Some(CgroupLeaf::V2(String::new()));
             }
             return Some(CgroupLeaf::V2(leaf.to_string()));
         }
@@ -151,10 +178,12 @@ pub struct CpuTimes {
 
 fn parse_proc_stat_cpu_fields(fields: &[f64]) -> Option<(f64, f64, f64)> {
     // user nice system idle iowait irq softirq steal [guest guest_nice]
+    // guest/guest_nice are EXCLUDED from the total: the kernel already charges guest
+    // execution to user/nice (account_guest_time), so summing them double-counts that time.
     if fields.len() < 8 || fields.iter().any(|f| !f.is_finite()) {
         return None;
     }
-    let total: f64 = fields.iter().sum();
+    let total: f64 = fields[..8].iter().sum();
     let busy = total - fields[3] - fields[4]; // idle + iowait
     Some((total, busy, fields[7]))
 }
@@ -279,15 +308,16 @@ pub struct CgroupMemory {
 /// reads its memory files. v2: `0::/path` -> `<cgroup_root>/path/
 /// memory.current` + `memory.max` ('max' -> `None` limit). v1: `memory`
 /// controller line -> `<cgroup_root>/memory/path/usage_in_bytes` +
-/// `limit_in_bytes` (garbage limit >= 2^60 -> `None`). The cgroup fs root has
-/// NO limit files by design, so the leaf is always resolved; the fs root is
-/// never read.
+/// `limit_in_bytes` (garbage limit >= 2^60 -> `None`). A v2 membership of
+/// `0::/` (cgroup-namespace root, Docker's default) or one whose path is not
+/// mounted resolves to the cgroupfs fs root itself; on a non-namespaced host
+/// that root has no limit files, so `None` falls through as before.
 ///
 /// NOTE (frozen contract): parameter order here is (cgroup_root, proc_root)
 /// — the opposite of [`read_pids_limit`]. Callers: read the signatures, do
 /// not assume.
 pub fn read_cgroup_memory(cgroup_root: &Path, proc_root: &Path) -> Option<CgroupMemory> {
-    let leaf = resolve_cgroup_leaf(proc_root, "memory")?;
+    let leaf = resolve_cgroup_leaf(proc_root, "memory", cgroup_root)?;
     match leaf {
         CgroupLeaf::V2(leaf) => {
             let dir = cgroup_root.join(leaf);
@@ -670,13 +700,14 @@ pub fn read_pid_count(proc_root: &Path) -> Option<u64> {
 /// fall back), else cgroup v1 `pids.max`, else
 /// `/proc/sys/kernel/threads-max`. `/proc/sys/kernel/pid_max` is a PID-number
 /// wrap boundary, NOT a creatable-process cap, and is deliberately never used
-/// (validated R3M2).
+/// (validated R3M2). v2 leaf resolution is namespace-aware: see
+/// [`resolve_cgroup_leaf`].
 ///
 /// NOTE (frozen contract): parameter order here is (proc_root, cgroup_root)
 /// — the opposite of [`read_cgroup_memory`]. Callers: read the signatures,
 /// do not assume.
 pub fn read_pids_limit(proc_root: &Path, cgroup_root: &Path) -> Option<u64> {
-    if let Some(leaf) = resolve_cgroup_leaf(proc_root, "pids") {
+    if let Some(leaf) = resolve_cgroup_leaf(proc_root, "pids", cgroup_root) {
         let dir = match &leaf {
             CgroupLeaf::V2(leaf) => cgroup_root.join(leaf),
             CgroupLeaf::V1(leaf) => cgroup_root.join("pids").join(leaf),
@@ -692,6 +723,87 @@ pub fn read_pids_limit(proc_root: &Path, cgroup_root: &Path) -> Option<u64> {
         }
     }
     read_number_file(&proc_root.join("sys").join("kernel").join("threads-max"))
+}
+
+/// A same-node cgroup pids reading: the constraint a fork would hit first
+/// (Node `PidsConstraint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidsConstraint {
+    pub current: u64,
+    pub max: u64,
+}
+
+/// The BINDING pids constraint (Node `readPidsConstraint`): walk THIS
+/// process's cgroup chain from the leaf toward the root and return the
+/// `{current, max}` pair of the node whose finite `pids.max` has the HIGHEST
+/// utilization (`current`/`max`) — the limit a fork would actually hit first.
+/// This is the WSL/systemd aggregate shape: the leaf is often 'max' while an
+/// ANCESTOR slice (e.g. `user-1000.slice`) carries the real TasksMax, which
+/// the leaf-only [`read_pids_limit`] never sees. A node qualifies only when
+/// BOTH `pids.max` (finite, >0 — matching [`read_pids_limit`]'s convention)
+/// and `pids.current` read, so the returned pair is always a consistent
+/// same-node reading. No qualified node -> `None` (callers fall back to the
+/// system-wide `read_pid_count`/`read_pids_limit` pair). Deepest node wins
+/// ties (deterministic).
+///
+/// The v2 chain INCLUDES the fs-root node: under a private cgroup namespace
+/// (Docker's default on v2) [`resolve_cgroup_leaf`] yields an empty path and
+/// that root IS the container's cgroup, with real limit files; on a
+/// non-namespaced host the root carries no pids files, so the depth-0 node is
+/// simply skipped. The v1 walk is unchanged (v1 has no namespace membership
+/// rewrite).
+///
+/// NOTE (frozen contract): parameter order here is (proc_root, cgroup_root)
+/// — the opposite of [`read_cgroup_memory`]. Callers: read the signatures,
+/// do not assume.
+pub fn read_pids_constraint(proc_root: &Path, cgroup_root: &Path) -> Option<PidsConstraint> {
+    let leaf = resolve_cgroup_leaf(proc_root, "pids", cgroup_root)?;
+    // Deepest-first chain. For v2 the chain INCLUDES the fs-root node (depth
+    // 0 -> empty node path -> `<cgroup_root>` itself): under a private cgroup
+    // namespace that root IS the container's cgroup (with limit files); on a
+    // non-namespaced host the root carries no pids files and the depth-0
+    // node is simply skipped. The v1 walk is unchanged (v1 has no namespace
+    // membership rewrite).
+    let segments: Vec<&str> = match &leaf {
+        CgroupLeaf::V2(path) | CgroupLeaf::V1(path) => path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect(),
+    };
+    let mut best: Option<PidsConstraint> = None;
+    let mut best_ratio = -1.0_f64;
+    let min_depth = match &leaf {
+        CgroupLeaf::V2(_) => 0,
+        CgroupLeaf::V1(_) => 1,
+    };
+    for depth in (min_depth..=segments.len()).rev() {
+        let node_path = segments[..depth].join("/");
+        let dir = match &leaf {
+            CgroupLeaf::V2(_) => cgroup_root.join(&node_path),
+            CgroupLeaf::V1(_) => cgroup_root.join("pids").join(&node_path),
+        };
+        let Some(max_text) = safe_read(&dir.join("pids.max")) else {
+            continue;
+        };
+        let Some(max) = parse_cgroup_limit(&max_text) else {
+            continue; // 'max'/garbage: unlimited, not binding
+        };
+        if max == 0 {
+            continue; // matches read_pids_limit's limit > 0 convention
+        }
+        let Some(current_text) = safe_read(&dir.join("pids.current")) else {
+            continue; // no readable same-node pair
+        };
+        let Ok(current) = current_text.trim().parse::<u64>() else {
+            continue;
+        };
+        let ratio = current as f64 / max as f64;
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            best = Some(PidsConstraint { current, max });
+        }
+    }
+    best
 }
 
 /// `Max open files` SOFT limit from `/proc/self/limits` ('unlimited' ->

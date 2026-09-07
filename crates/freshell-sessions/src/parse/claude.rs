@@ -28,6 +28,13 @@ fn claude_model_context_window(model: Option<&str>) -> i64 {
     let normalized = model.to_lowercase();
     let normalized = normalized.trim();
     match normalized {
+        // kata 9c92: 5th-gen claude sessions run the 1M "context-1m" window (Claude
+        // Code's `opus[1m]`-style models; canonical JSONL ids carry no suffix).
+        // Verified on local corpora: opus-5 prompts up to 579,832 served without
+        // prompt-too-long (and sonnet-5 237K, fable-5 353K, opus-4-8 227K — all beyond
+        // any 200K window's 95% autocompact cliff), so these sessions could only have
+        // been served on the 1M beta.
+        "claude-opus-5" | "claude-sonnet-5" | "claude-fable-5" | "claude-opus-4-8" => 1_000_000,
         "claude-opus-4-20250514"
         | "claude-sonnet-4-20250514"
         | "claude-3-7-sonnet-latest"
@@ -42,6 +49,26 @@ fn claude_model_context_window(model: Option<&str>) -> i64 {
         | "claude-3-haiku-20240307" => 200_000,
         _ => CLAUDE_DEFAULT_CONTEXT_WINDOW,
     }
+}
+
+/// Window tiers the JSONL can never carry: the transcript records the canonical model
+/// id but not the session's effective window. A prompt that was SERVED above the
+/// mapped window proves the real window is larger (a true 200K session compacts at
+/// 95% ≈ 190K and can never exceed it), so elevate to the smallest tier that covers
+/// the observed maximum prompt — never below the table value. Parity mirror of
+/// `elevateClaudeContextWindow` in server/coding-cli/providers/claude.ts.
+const CLAUDE_CONTEXT_WINDOW_TIERS: [i64; 2] = [200_000, 1_000_000];
+
+fn elevate_claude_context_window(mapped_window: i64, max_prompt_tokens: i64) -> i64 {
+    if max_prompt_tokens <= mapped_window {
+        return mapped_window;
+    }
+    for tier in CLAUDE_CONTEXT_WINDOW_TIERS {
+        if tier >= max_prompt_tokens {
+            return mapped_window.max(tier);
+        }
+    }
+    max_prompt_tokens
 }
 
 /// `resolveClaudeCompactPercentThreshold` — reads `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`.
@@ -268,6 +295,7 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     let mut user_message_count: i64 = 0;
     let mut usage_seen: HashSet<String> = HashSet::new();
     let mut latest_usage: Option<LatestUsage> = None;
+    let mut max_prompt_tokens: i64 = 0;
 
     for line in &lines {
         let obj: Value = match serde_json::from_str(line) {
@@ -476,6 +504,12 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
                         output_tokens: output as i64,
                         cached_tokens: (cache_read + cache_creation) as i64,
                     });
+                    // kata 9c92: largest SERVED prompt (deduped) drives window
+                    // elevation when the mapped window is provably too small.
+                    let prompt = input + cache_read + cache_creation;
+                    if prompt as i64 > max_prompt_tokens {
+                        max_prompt_tokens = prompt as i64;
+                    }
                 }
             }
         }
@@ -498,7 +532,10 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     let token_usage = latest_usage.map(|u| {
         let context_tokens_from_usage = u.input_tokens + u.output_tokens + u.cached_tokens;
         let context_tokens = options.context_tokens.unwrap_or(context_tokens_from_usage);
-        let model_context_window = claude_model_context_window(model.as_deref());
+        let model_context_window = elevate_claude_context_window(
+            claude_model_context_window(model.as_deref()),
+            max_prompt_tokens,
+        );
         let compact_threshold_tokens = options.compact_threshold_tokens.unwrap_or_else(|| {
             ((model_context_window * resolve_claude_compact_percent_threshold()) as f64 / 100.0)
                 .round() as i64

@@ -27,6 +27,7 @@ import { test, expect } from '../helpers/fixtures.js'
 import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
@@ -2131,6 +2132,17 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
     })
     const contextB = await browser.newContext()
+    // This spec runs file-wide `recoveryOfferHandling: 'manual'` (the wall
+    // owns the recovery-panel assertions), but contextB bypasses the
+    // fixtures' `context` override entirely, so no auto-decline watcher
+    // covers it. B boots with fresh localStorage and is legitimately
+    // offered A's just-opened session (restore-open-sessions semantics);
+    // unanswered, the offer modal intercepts B's sidebar click forever
+    // (no actionTimeout is configured) and the test dies at its 300s
+    // ceiling without ever restarting the server. Adopt the shared watcher
+    // directly — canonical RESTORE-01 pattern (multi-client.spec.ts
+    // newClientContext).
+    installRecoveryOfferAutoDeclineOnContext(contextB)
     const pageB = await contextB.newPage()
     try {
       // Client A opens the seeded session from the sidebar.

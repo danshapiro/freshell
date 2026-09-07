@@ -44,9 +44,16 @@ fn test_settings_value() -> serde_json::Value {
 /// A minimal always-present CLI spec (`/bin/sh` sleeper script) so non-shell
 /// creates genuinely spawn — the same recording-script convention as
 /// `session_identity_frames.rs` (these tests assert on wire frames, not argv).
+///
+/// Each call writes a **unique** script path (PID + atomic counter) so parallel
+/// tests in the same binary never collide with ETXTBSY ("Text file busy") when
+/// one test writes the script while another is executing a prior copy.
+static SLEEPER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    let seq = SLEEPER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-restore-gate-sleeper-{name}-{}.sh",
+        "freshell-restore-gate-sleeper-{name}-{}-{seq}.sh",
         std::process::id()
     ));
     std::fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper script");

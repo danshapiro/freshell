@@ -77,13 +77,16 @@ The contract regenerates only when the **authoring** source
 npm run contract:generate      # tsx port/contract/generate-ws-contract.ts
 ```
 
-Run the drift guard with `npm run test:port`. CI runs it on every PR via
-`.github/workflows/port-contract.yml`, which also regenerates the contract
-(`npm run contract:generate`) and fails on any resulting diff, and runs
-`cargo test -p freshell-protocol` so the Rust T0 surface moves in lockstep.
-When you change `shared/ws-protocol.ts`: run `npm run contract:generate`,
-update `crates/freshell-protocol` (arrays + inventory-test counts), and
-commit the regenerated `port/contract/*.json` in the same PR.
+Run the drift guard with `npm run test:port`. The local default suite
+(`npm test`) also runs it on every local test run, so the TS side of the
+contract is checked before every PR. The drift guard regenerates the contract
+in-memory and asserts byte-equality with the committed files, subsuming the
+`npm run contract:generate` idempotency check. Run
+`cargo test -p freshell-protocol` separately to verify the Rust T0 surface
+moves in lockstep. When you change `shared/ws-protocol.ts`: run
+`npm run contract:generate`, update `crates/freshell-protocol` (arrays +
+inventory-test counts), and commit the regenerated `port/contract/*.json` in
+the same PR.
 
 ## How it is generated
 

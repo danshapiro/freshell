@@ -13,9 +13,10 @@ const vitestEntrypoint = require.resolve('vitest/vitest.mjs')
 const defaultVitestConfig = 'config/vitest/vitest.config.ts'
 const serverVitestConfig = 'config/vitest/vitest.server.config.ts'
 const electronVitestConfig = 'config/vitest/vitest.electron.config.ts'
+const portVitestConfig = 'config/vitest/vitest.port.config.ts'
 
 export type StandardTestMode = 'desktop' | 'aggressive'
-export type SuiteName = 'client' | 'server' | 'electron'
+export type SuiteName = 'client' | 'server' | 'electron' | 'port'
 export type RunPriority = 'normal' | 'background'
 
 export interface StandardTestRun {
@@ -125,6 +126,12 @@ function classifySuitePath(token: string): SuiteName | null {
   ) {
     return 'server'
   }
+  if (
+    normalizedToken.startsWith('test/unit/port/')
+    || normalizedToken.includes('/test/unit/port/')
+  ) {
+    return 'port'
+  }
   if (normalizedToken.startsWith('test/') || normalizedToken.includes('/test/')) {
     return 'client'
   }
@@ -142,7 +149,7 @@ function detectRequestedSuites(forwardedArgs: string[]): SuiteName[] | null {
   if (suites.size === 0) {
     return null
   }
-  return ['client', 'server', 'electron'].filter((suite): suite is SuiteName => suites.has(suite))
+  return ['client', 'server', 'electron', 'port'].filter((suite): suite is SuiteName => suites.has(suite))
 }
 
 export function createStandardTestPlan({
@@ -159,6 +166,7 @@ export function createStandardTestPlan({
       { name: 'client', configPath: defaultVitestConfig, maxWorkers: '50%', priority: 'normal' },
       { name: 'server', configPath: serverVitestConfig, maxWorkers: '50%', priority: 'normal' },
       { name: 'electron', configPath: electronVitestConfig, priority: 'normal' },
+      { name: 'port', configPath: portVitestConfig, priority: 'normal' },
     ]
     return {
       mode: resolvedMode,
@@ -170,6 +178,7 @@ export function createStandardTestPlan({
   const initialStage = filterRuns([
     { name: 'client', configPath: defaultVitestConfig, maxWorkers: workers.clientWorkers, priority: 'background' },
     { name: 'server', configPath: serverVitestConfig, maxWorkers: workers.serverWorkers, priority: 'background' },
+    { name: 'port', configPath: portVitestConfig, priority: 'background' },
   ], requestedSuites)
   const electronStage = filterRuns([
     { name: 'electron', configPath: electronVitestConfig, priority: 'background' },
@@ -354,6 +363,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       })
       try {
         execFileSync(process.execPath, [vitestEntrypoint, ...electronArgs], {
+          stdio: 'inherit',
+          cwd: repoRoot,
+          env: process.env,
+        })
+      } catch {
+        process.exitCode = 1
+        return 1
+      }
+
+      // Port contract drift guard: fast, in-process, no cloud dispatch.
+      const portArgs = buildVitestArgs({
+        configPath: portVitestConfig,
+        forwardedArgs,
+      })
+      log('info', 'Running port contract suite locally after cloud dispatch', {
+        args: portArgs,
+      })
+      try {
+        execFileSync(process.execPath, [vitestEntrypoint, ...portArgs], {
           stdio: 'inherit',
           cwd: repoRoot,
           env: process.env,

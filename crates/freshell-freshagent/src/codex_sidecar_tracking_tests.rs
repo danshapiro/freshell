@@ -57,6 +57,10 @@ fn fake_codex_cmd() -> String {
     )
 }
 
+// Intentionally NO exec barrier here (kata w0xf / delta-round-2 review): the
+// production contract under test is that record_spawned_sidecar is safe to
+// call IMMEDIATELY after spawn — it owns the bounded wait for post-exec
+// /proc identity. A test-side wait would un-cover exactly that contract.
 fn spawn_sleep_child() -> tokio::process::Child {
     let mut cmd = tokio::process::Command::new("sleep");
     cmd.arg("300");

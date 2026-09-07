@@ -1015,7 +1015,7 @@ describe('Codex fresh-agent adapter', () => {
     await adapter.send?.('thread-new-1', {
       requestId: 'send-model-1',
       text: 'Use the small model',
-      settings: { model: 'gpt-5.4-flash' },
+      settings: { model: 'gpt-5.6-sol' },
     })
 
     const snapshot = await adapter.getSnapshot?.({
@@ -1025,8 +1025,8 @@ describe('Codex fresh-agent adapter', () => {
     }, 7) as any
     expect(snapshot.turns).toHaveLength(3)
     expect(snapshot.turns[0]).not.toHaveProperty('model')
-    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.4-flash' })
-    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.4-flash' })
+    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.6-sol' })
+    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.6-sol' })
   })
 
   it('subscribes to Codex lifecycle notifications and projects matching thread updates', async () => {
@@ -1428,7 +1428,7 @@ describe('Codex fresh-agent adapter', () => {
       permissionMode: 'on-request',
       sandbox: 'workspace-write',
       effort: 'max',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
     })
 
     await adapter.send?.('thread-new-1', {
@@ -1446,7 +1446,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       approvalPolicy: 'on-request',
       sandboxPolicy: { type: 'workspaceWrite' },
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       effort: 'xhigh',
     })
     expect(runtime.interruptTurn).toHaveBeenCalledWith({
@@ -1505,18 +1505,21 @@ describe('Codex fresh-agent adapter', () => {
     await expect(adapter.create({
       requestId: 'req-1',
       sessionType: 'freshcodex',
-      model: 'gpt-5.4-flash',
-      effort: 'xhigh',
+      // 'none' is a real level on the 5.6 models but gpt-6-astra does not offer it,
+      // so it must clamp to astra's declared default ('max').
+      model: 'gpt-6-astra',
+      effort: 'none',
     })).resolves.toEqual({ sessionId: 'thread-new-1', sessionRef: { provider: 'codex', sessionId: 'thread-new-1' } })
 
     await adapter.send?.('thread-new-1', { text: 'reply ok' })
 
     expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4-flash',
+      model: 'gpt-6-astra',
     }))
     expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4-flash',
-      effort: 'high',
+      model: 'gpt-6-astra',
+      // 'none' clamped to astra's default ('max'), wire-mapped to codex's top level 'xhigh'.
+      effort: 'xhigh',
     }))
   })
 

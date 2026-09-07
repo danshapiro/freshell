@@ -455,7 +455,7 @@ Pane commands:
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
   respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, resume?, sessionRef?
-  hostStats       Pass hostStats: true on new-tab or split-pane to create a Host Stats pane (CPU/RAM/load metrics) instead of a terminal -- no process is spawned.
+  hostStats       Pass hostStats: true on new-tab or split-pane to create a System Status pane (CPU/RAM/load metrics) instead of a terminal -- no process is spawned.
 
 Terminal I/O:
   send-keys       Send input to a pane. Params: target, keys, literal?, sessionRef?

@@ -4,7 +4,7 @@ import { test, expect } from '../helpers/fixtures.js'
 async function installPane(page: Page, provider: 'claude' | 'codex') {
   const sessionType = provider === 'claude' ? 'freshclaude' : 'freshcodex'
   const sessionId = 'd4430000-0000-4444-8444-000000000001'
-  const model = provider === 'claude' ? 'opus[1m]' : 'gpt-5.5'
+  const model = provider === 'claude' ? 'opus[1m]' : 'gpt-6-astra'
   await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({
     json: {
       sessionType, provider, sessionId, threadId: sessionId,
@@ -67,11 +67,11 @@ test('Codex cancels a staged model change and preserves its current thinking lev
   const chip = page.getByRole('button', { name: /^Model:.*change model$/ })
   await chip.click()
   const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
-  await expect(dialog.getByRole('button', { name: 'Use GPT-5.5 · low' })).toBeVisible()
-  await dialog.getByRole('option', { name: /GPT-5.4 Flash/ }).click()
+  await expect(dialog.getByRole('button', { name: 'Use GPT-6 Astra · low' })).toBeVisible()
+  await dialog.getByRole('option', { name: /GPT-5.6 Sol/ }).click()
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
   await chip.click()
-  await dialog.getByRole('button', { name: 'Use GPT-5.5 · low' }).click()
+  await dialog.getByRole('button', { name: 'Use GPT-6 Astra · low' }).click()
   await page.getByRole('button', { name: 'Agent settings', exact: true }).click()
   const permissions = page.getByRole('combobox', { name: 'Permission mode' })
   await permissions.selectOption('untrusted')

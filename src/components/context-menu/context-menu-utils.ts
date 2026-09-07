@@ -55,6 +55,21 @@ export function isTextInputLike(el: HTMLElement | null): boolean {
   return false
 }
 
+/**
+ * Fresh-agent transcript turns: specialized sub-regions (markdown code
+ * blocks, tool input/output rows, diff views) keep the PROVIDER's
+ * context-sensitive menu on fine pointers instead of the whole-turn menu.
+ * Both `ContextMenuProvider`'s turn carve-out and `FreshAgentTranscript`'s
+ * article onContextMenu key off this predicate.
+ *
+ * KEEP IN SYNC: the selector list must mirror the fresh-agent sub-region
+ * `closest()` selectors in menu-defs.ts ("Detect sub-region from click
+ * target") EXACTLY — edit both together.
+ */
+export function isFreshAgentSpecializedRegion(el: HTMLElement | null): boolean {
+  return !!el?.closest?.('.prose pre code, [data-tool-input], [data-tool-output], [data-diff]')
+}
+
 export function parseContextTarget(contextId: ContextId, data: ContextDataset): ContextTarget | null {
   switch (contextId) {
     case ContextIds.Global:

@@ -552,7 +552,7 @@ describe('Panes Persistence Integration', () => {
     expect(createdLayout.type).toBe('leaf')
     expect(createdLayout.content).toEqual({ kind: 'host-stats' })
     const createdPaneId = createdLayout.id
-    expect(store1.getState().panes.paneTitles[tabId][createdPaneId]).toBe('Host Stats')
+    expect(store1.getState().panes.paneTitles[tabId][createdPaneId]).toBe('System Status')
 
     vi.runAllTimers()
 

@@ -20,6 +20,7 @@ import {
   type FreshAgentTurnContextMenuState,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
+import { isFreshAgentSpecializedRegion } from '@/components/context-menu/context-menu-utils'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
 import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
@@ -728,6 +729,18 @@ type TurnActionProps = {
   onOpenActions?: (turn: FreshAgentTurn) => void
 }
 
+/**
+ * Build the per-article long-press bundle: the raw `buildLongPressHandlers`
+ * product with `notifyOverlayOpened` split out of the DOM spread (it is not a
+ * DOM handler — React warns on unknown DOM props). The wrapper also gives the
+ * transcript a concrete, non-generic `ReturnType` for the ref-persisted
+ * instance below.
+ */
+function buildTurnLongPress(onLongPress: () => void) {
+  const { notifyOverlayOpened, ...handlers } = buildLongPressHandlers<HTMLElement>(onLongPress)
+  return { handlers, notifyOverlayOpened }
+}
+
 function FreshAgentTurnArticle({
   turn,
   actionTurn,
@@ -763,11 +776,28 @@ function FreshAgentTurnArticle({
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
-  const longPress = useMemo(() => (
-    actions.onOpenActions
-      ? buildLongPressHandlers<HTMLElement>(() => actions.onOpenActions?.(actionTurn))
-      : null
-  ), [actions, actionTurn])
+  //
+  // Gesture state must survive transcript rerenders: live snapshot refreshes
+  // rebuild `actions` with fresh identities on ordinary rerenders, and
+  // rebuilding the closure mid-gesture would orphan the armed timer and the
+  // release-suppression flag — the DOM would then call the NEW closure's
+  // onTouchEnd while the OLD closure held the state. The builder is therefore
+  // created at most once per mounted article and reads the LATEST handler and
+  // turn through refs, so gesture state persists while behavior stays current.
+  const openActionsRef = useRef(actions.onOpenActions)
+  openActionsRef.current = actions.onOpenActions
+  const actionTurnRef = useRef(actionTurn)
+  actionTurnRef.current = actionTurn
+  const longPressRef = useRef<ReturnType<typeof buildTurnLongPress> | null>(null)
+  if (longPressRef.current === null && actions.onOpenActions) {
+    longPressRef.current = buildTurnLongPress(() => {
+      openActionsRef.current?.(actionTurnRef.current)
+    })
+  }
+  // Spread + ownership marker key off the CURRENT render's availability: a
+  // coarse→fine pointer flip stops advertising/handling long-press even though
+  // the instance persists for the article's lifetime.
+  const longPress = actions.onOpenActions ? longPressRef.current : null
   return (
     <article
       className={cn(
@@ -778,22 +808,41 @@ function FreshAgentTurnArticle({
       data-turn-role={turn.role}
       data-turn-index={index}
       data-turn-continuation={continuation ? 'true' : 'false'}
+      // Ownership marker for the global ContextMenuProvider: present exactly
+      // when this article's own long-press handlers exist (coarse pointers),
+      // so the provider skips its long-press/probe path for turn gestures.
+      // Fine pointers (incl. hybrid iPad+trackpad) never set it and keep the
+      // provider's long-press fallback.
+      data-longpress-owned={longPress ? 'true' : undefined}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
-        // stopPropagation matters: freshell has a global contextmenu handler
-        // that renders the app menu over ours otherwise (live-test finding).
+        // The global ContextMenuProvider's document listener is capture-phase,
+        // so stopPropagation could never beat it — the real protection today is
+        // the provider's early-return carve-out for article[data-turn-role]
+        // targets. stopPropagation is kept as cheap, correct event hygiene.
         if (actions.onOpenActions) {
           event.preventDefault()
           event.stopPropagation()
+          // The sheet opens mid-touch via this native-contextmenu route (no
+          // long-press timer involved): mark the overlay open so the gesture's
+          // touchend suppresses the synthesized compat click.
+          longPress?.notifyOverlayOpened?.()
           actions.onOpenActions(actionTurn)
           return
         }
         if (!actions.onTurnContextMenu) return
+        // Fine-pointer right-click into a specialized sub-region (markdown
+        // code block, tool input/output, diff): yield WITHOUT cancelling the
+        // event or opening the turn menu — the provider's capture-phase
+        // handler already opened its context-sensitive fresh-agent menu for
+        // this gesture (on coarse pointers the sheet branch above owns the
+        // whole turn and never yields).
+        if (isFreshAgentSpecializedRegion(event.target as HTMLElement | null)) return
         event.preventDefault()
         event.stopPropagation()
         actions.onTurnContextMenu(event, actionTurn)
       }}
-      {...(longPress ?? {})}
+      {...(longPress?.handlers ?? {})}
     >
       <FreshAgentTurnActions
         turn={actionTurn}
@@ -1147,7 +1196,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           title={glomTarget.text}
         >
           <ChevronUp className="h-3 w-3 shrink-0" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate">{glomTarget.text}</span>
+          <span className="min-w-0 flex-1 truncate">{glomTarget.text.split('\n')[0]}</span>
         </button>
       ) : null}
       <FreshAgentTurnContextMenu

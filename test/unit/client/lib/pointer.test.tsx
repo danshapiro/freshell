@@ -29,6 +29,10 @@ function touchEvent(x: number, y: number) {
   return { touches: [{ clientX: x, clientY: y }] } as unknown as React.TouchEvent<HTMLElement>
 }
 
+function touchEndEvent(cancelable = true) {
+  return { cancelable, preventDefault: vi.fn() } as unknown as React.TouchEvent<HTMLElement> & { preventDefault: ReturnType<typeof vi.fn> }
+}
+
 describe('isCoarsePointer / useCoarsePointer', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -78,7 +82,7 @@ describe('buildLongPressHandlers', () => {
     expect(callback).not.toHaveBeenCalled()
 
     handlers.onTouchStart(touchEvent(40, 60))
-    handlers.onTouchEnd()
+    handlers.onTouchEnd(touchEndEvent())
     vi.advanceTimersByTime(LONG_PRESS_MS + 50)
     expect(callback).not.toHaveBeenCalled()
   })
@@ -92,5 +96,83 @@ describe('buildLongPressHandlers', () => {
     handlers.onTouchMove(touchEvent(44, 64))
     vi.advanceTimersByTime(LONG_PRESS_MS)
     expect(callback).toHaveBeenCalledTimes(1)
+  })
+
+  describe('release suppression once an overlay opened during the press', () => {
+    it('preventDefaults the release after a completed press (timer route)', () => {
+      vi.useFakeTimers()
+      const callback = vi.fn()
+      const handlers = buildLongPressHandlers(callback)
+
+      handlers.onTouchStart(touchEvent(40, 60))
+      vi.advanceTimersByTime(LONG_PRESS_MS)
+      expect(callback).toHaveBeenCalledTimes(1)
+
+      const end = touchEndEvent()
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).toHaveBeenCalledTimes(1)
+    })
+
+    it('preventDefaults the release when notifyOverlayOpened fired during an active touch (native-contextmenu route)', () => {
+      vi.useFakeTimers()
+      const handlers = buildLongPressHandlers(vi.fn())
+
+      handlers.onTouchStart(touchEvent(40, 60))
+      handlers.notifyOverlayOpened()
+
+      const end = touchEndEvent()
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).toHaveBeenCalledTimes(1)
+    })
+
+    it('ignores notifyOverlayOpened when no touch is active', () => {
+      const handlers = buildLongPressHandlers(vi.fn())
+
+      handlers.notifyOverlayOpened()
+
+      const end = touchEndEvent()
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).not.toHaveBeenCalled()
+    })
+
+    it('does not preventDefault a non-cancelable release', () => {
+      vi.useFakeTimers()
+      const handlers = buildLongPressHandlers(vi.fn())
+
+      handlers.onTouchStart(touchEvent(40, 60))
+      vi.advanceTimersByTime(LONG_PRESS_MS)
+
+      const end = touchEndEvent(false)
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).not.toHaveBeenCalled()
+    })
+
+    it('never suppresses taps, moved presses, or cancelled presses', () => {
+      vi.useFakeTimers()
+      const callback = vi.fn()
+      const handlers = buildLongPressHandlers(callback)
+
+      // Tap: released before the long-press timer completes.
+      handlers.onTouchStart(touchEvent(40, 60))
+      let end = touchEndEvent()
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).not.toHaveBeenCalled()
+
+      // Moved beyond the tolerance: the press aborted.
+      handlers.onTouchStart(touchEvent(40, 60))
+      handlers.onTouchMove(touchEvent(40, 90))
+      end = touchEndEvent()
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).not.toHaveBeenCalled()
+
+      // Cancelled press.
+      handlers.onTouchStart(touchEvent(40, 60))
+      handlers.onTouchCancel()
+      end = touchEndEvent()
+      handlers.onTouchEnd(end)
+      expect(end.preventDefault).not.toHaveBeenCalled()
+
+      expect(callback).not.toHaveBeenCalled()
+    })
   })
 })
