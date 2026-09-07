@@ -11,7 +11,9 @@
  *
  * start() runs ONE immediate fast tick (a fresh subscriber gets a shaped snapshot at once);
  * the slow tier only ticks on its own interval. stop() halts ALL collection (true zero
- * cost). getSnapshot() never blocks on I/O — ticks write caches, snapshots read caches.
+ * cost) and clears every delta base + the merged live cache, so a restart takes the
+ * null-safe first-sample path like a fresh start. getSnapshot() never blocks on I/O —
+ * ticks write caches, snapshots read caches.
  *
  * refresh() (on-request manual data — process table, disks, inotify, thermals/battery) is
  * single-flight with a 1s post-completion cooldown (connection-agnostic, R3M6). Section
@@ -297,6 +299,18 @@ export class HostStatsService {
     this.slowTimer = undefined
     this.histogram?.disable()
     this.histogram = null
+    // Restart = fresh start (contract point 8: what a fresh subscriber
+    // receives): drop every cumulative-counter delta base so the restart's
+    // immediate tick takes the documented null-safe first-sample path instead
+    // of spanning the whole unwatched interval, and reset the merged live
+    // cache so no stale slow sections survive. The refresh-owned manualCache /
+    // manualAt are request state, not sampled state, and are retained.
+    this.prevCpu = null
+    this.prevDarwinCpu = null
+    this.prevVmstat = null
+    this.prevDisks = null
+    this.prevNet = null
+    this.liveCache = zeroLive(this.machine)
   }
 
   isRunning(): boolean {
