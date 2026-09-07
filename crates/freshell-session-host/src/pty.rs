@@ -62,17 +62,36 @@ impl HostedPty {
             exit_value.store(code, Ordering::SeqCst);
             exit_flag.store(true, Ordering::SeqCst);
         });
+        let mut provider_args = vec![
+            "--reuid".to_string(),
+            launch.run_as_uid.to_string(),
+            "--regid".to_string(),
+            launch.run_as_gid.to_string(),
+            "--clear-groups".to_string(),
+            "--no-new-privs".to_string(),
+            "--".to_string(),
+            launch.program.clone(),
+        ];
+        provider_args.extend(launch.args.clone());
         let spec = SpawnSpec {
-            program: launch.program.clone(),
-            args: launch.args.clone(),
+            program: "/usr/bin/setpriv".to_string(),
+            args: provider_args,
             env_overrides: BTreeMap::new(),
             cwd: Some(launch.cwd.clone()),
             cols: launch.cols,
             rows: launch.rows,
         };
+        let mut provider_env = launch.env.clone();
+        // Rootless Docker maps the host user's bind-mounted workspace to
+        // container uid 0, while the provider intentionally runs as uid
+        // 65534. Tell Git that this one already-approved workspace is safe
+        // without modifying host or provider-global git configuration.
+        provider_env.insert("GIT_CONFIG_COUNT".into(), "1".into());
+        provider_env.insert("GIT_CONFIG_KEY_0".into(), "safe.directory".into());
+        provider_env.insert("GIT_CONFIG_VALUE_0".into(), launch.workspace_path.clone());
         let pty = PtyTerminal::spawn_with_sink(
             &spec,
-            &launch.env,
+            &provider_env,
             &launch.terminal_id,
             &launch.stream_id,
             None,

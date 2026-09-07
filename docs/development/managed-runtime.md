@@ -116,7 +116,7 @@ Both require:
 
 - private PID namespace;
 - read-only root filesystem with a bounded `/tmp` tmpfs;
-- all Linux capabilities dropped and `no-new-privileges`;
+- fixture workloads drop all Linux capabilities; terminal workloads drop all and add only `CHOWN`/`SETUID`/`SETGID` to the trusted host, while the provider PTY runs as uid `65534`, gid `0`, with zero effective/permitted/inheritable/ambient capabilities and `no-new-privileges`;
 - explicit CPU, memory, swap, and PID limits;
 - the read-only host binary and one incarnation control directory;
 - for terminals only, canonical same-path workspace/Git-common-dir mounts plus
@@ -184,6 +184,17 @@ real Claude credential can instead be supplied by exact
 `FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` reference; Docker mounts only that
 file read-only and the host copies its bytes into the soul-owned provider volume.
 The persisted spec contains paths, not secret bytes.
+
+The supported Phase 2 backend is rootless Docker. Its bind-mount ownership maps
+the host user's workspace to container uid/gid 0. Freshell therefore keeps the
+trusted host at uid 0 with only the three privilege-dropping/home-preparation
+capabilities above, and runs the provider as uid `65534`, gid `0`. The mapped
+workspace remains group-writable without changing host modes, while the
+root-owned `0600` incarnation secret and `host.sock` are not readable or
+connectable by the provider. P2-G09 executes the permission/capability probe from
+inside the provider PTY and fails if that boundary changes. Git receives an
+ephemeral process-local `safe.directory` for the already-approved workspace; no
+global git config is modified.
 
 Phase 2 deliberately strips the legacy temporary `--mcp-config` injection for
 managed Claude. That MCP child depends on web-owned `FRESHELL_TOKEN` and would

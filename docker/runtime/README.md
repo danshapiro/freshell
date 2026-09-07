@@ -13,13 +13,18 @@ Each soul receives a separate named provider volume mounted at
 canonical-path bind mounts. Supervisor registry/control state and Docker sockets
 are forbidden from workload mounts.
 
-The image currently runs as container UID 0 because host worktrees in the live
-gate may be owned by different unprivileged UIDs. This does **not** grant host
-root: every managed runtime has its own PID namespace, `CapDrop=ALL`,
-`no-new-privileges`, a read-only image root, bounded tmpfs, explicit CPU/memory/
-PID limits, and no Docker/control socket. This avoids broad host `chmod`/`chown`
-changes. A rootless UID-mapping profile can replace this once it is proven across
-Linux/WSL/macOS hosts.
+The trusted session-host starts as container UID 0, but terminal containers use
+`CapDrop=ALL` and add back only `CHOWN`, `SETUID`, and `SETGID`. Before spawning
+the PTY it prepares the soul-owned provider volume, then launches the actual
+shell/coding CLI through `setpriv` as UID `65534`, GID `0`, with
+`no-new-privileges`. The provider process has zero effective/permitted/
+inheritable/ambient capabilities. Under the supported **rootless Docker**
+backend, the host user's bind-mounted workspace maps to container group 0; the
+repository's group-write permissions therefore remain usable by the provider
+without broad host chmod/chown changes. Root-owned `0600` incarnation secret
+and host-control socket remain unreadable/unconnectable to the provider UID.
+Every runtime still has a private PID namespace, read-only image root, bounded
+tmpfs, explicit CPU/memory/PID limits, and no Docker or supervisor-admin socket.
 
 `compose.yaml` owns only the web and supervisor services. Dynamic session-host
 containers are intentionally outside Compose. Operational restart commands must

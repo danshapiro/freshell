@@ -305,6 +305,11 @@ impl RuntimeBackend for DockerEngineBackend {
                 .map(|value| format!("{key}={value}"))
         })
         .collect();
+        let cap_add: Vec<&str> = if spec.terminal.is_some() {
+            vec!["CHOWN", "SETGID", "SETUID"]
+        } else {
+            Vec::new()
+        };
         let body = json!({
             "Image": spec.image_ref,
             "Env": host_env,
@@ -331,6 +336,7 @@ impl RuntimeBackend for DockerEngineBackend {
                 "ReadonlyRootfs": true,
                 "Privileged": false,
                 "CapDrop": ["ALL"],
+                "CapAdd": cap_add,
                 "SecurityOpt": ["no-new-privileges:true"],
                 "RestartPolicy": {"Name":"no","MaximumRetryCount":0},
                 "NanoCpus": spec.limits.cpu_milli.saturating_mul(1_000_000),
@@ -688,6 +694,30 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         return Err(BackendError::OwnershipMismatch(
             "container became privileged".into(),
         ));
+    }
+    let actual_cap_add = host_config
+        .get("CapAdd")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.trim_start_matches("CAP_").to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let expected_cap_add = if handle.terminal().is_some() {
+        ["CHOWN", "SETGID", "SETUID"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    if actual_cap_add != expected_cap_add {
+        return Err(BackendError::OwnershipMismatch(format!(
+            "runtime capability set changed: {actual_cap_add:?}"
+        )));
     }
     let mounts = value
         .get("Mounts")

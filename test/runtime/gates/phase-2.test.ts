@@ -451,7 +451,14 @@ export async function gate09GitWorktreeProviderPersistence(h: RuntimeHarness): P
     const cleanOutput = stripAnsi(output)
     h.assert(caseId, / M README\.md/.test(cleanOutput) && cleanOutput.includes('v22.23.2') && donePattern.test(cleanOutput), 'real worktree edit, git status, and pinned Node build tool work inside runtime', output.slice(-8000))
     h.assert(caseId, fs.readFileSync(path.join(worktree, 'README.md'), 'utf8').includes('phase2-managed-edit'), 'workspace edit persists on host worktree')
-    h.assert(caseId, h.execOwnedContainerExact(containerId, ['cat', '/home/freshell/provider/provider-marker']).trim() === 'provider-state', 'per-soul provider state volume is writable')
+    await h.adminOk(supervisor, h.terminalInputBody(soulId, `cat "$HOME/provider-marker"; echo PROVIDER_MARKER_READ_1\n`, epoch), { requestId: newRequest() })
+    const providerRead1 = stripAnsi(await waitForOutput(h, supervisor, soulId, epoch, /PROVIDER_MARKER_READ_1/, 20_000))
+    h.assert(caseId, providerRead1.includes('provider-state'), 'per-soul provider state volume is writable/readable by the provider identity', providerRead1.slice(-4000))
+    const securityProgram = `import os,socket,re\nsecret=os.access('/run/freshell/secret',os.R_OK)\nconnected=False\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ntry:\n s.connect('/run/freshell/host.sock'); connected=True\nexcept OSError:\n pass\nfinally:\n s.close()\nstatus=open('/proc/self/status').read()\ncap=re.search(r'^CapEff:\\s*([0-9a-fA-F]+)',status,re.M).group(1)\nprint(f'SECURITY_RESULT uid={os.getuid()} gid={os.getgid()} capeff={cap} secret={int(secret)} connected={int(connected)}',flush=True)\n`
+    const securityEncoded = Buffer.from(securityProgram).toString('base64')
+    await h.adminOk(supervisor, h.terminalInputBody(soulId, `python3 -c "import base64;exec(base64.b64decode('${securityEncoded}'))"\n`, epoch), { requestId: newRequest() })
+    const securityOutput = stripAnsi(await waitForOutput(h, supervisor, soulId, epoch, /SECURITY_RESULT uid=65534 gid=0 capeff=0+ secret=0 connected=0/, 20_000))
+    h.assert(caseId, /SECURITY_RESULT uid=65534 gid=0 capeff=0+ secret=0 connected=0/.test(securityOutput), 'provider PTY is unprivileged and cannot read or connect to host control authority', securityOutput.slice(-4000))
     const safety = h.execOwnedContainerExact(containerId, ['sh', '-lc', 'test ! -S /var/run/docker.sock && test ! -S /run/freshell-supervisor/supervisor.sock && test ! -e /var/lib/freshell-supervisor/runtime.sqlite3 && echo SAFE']).trim()
     h.assert(caseId, safety === 'SAFE', 'workload cannot see Docker socket, supervisor control, or registry')
 
@@ -461,7 +468,9 @@ export async function gate09GitWorktreeProviderPersistence(h: RuntimeHarness): P
     h.assert(caseId, h.isContainerRunning(containerId) && h.isContainerRunning(webB), 'recreating only web leaves the runtime container unchanged')
     const replay = dataOf(await h.adminOk(supervisor, h.launchBody({ soulId, limits: PHASE2_TEST_LIMITS, profile: 'test_fixture', projectKey, provider: 'shell', terminal, expectedControlEpoch: epoch }), { requestId: launchRequestId }), 'launch')
     h.assert(caseId, replay.view.containerId === containerId && replay.hostBootId === launch.hostBootId, 'saved cwd/provider runtime survives web recreation without replacement', { launch, replay })
-    h.assert(caseId, h.execOwnedContainerExact(containerId, ['cat', '/home/freshell/provider/provider-marker']).trim() === 'provider-state', 'provider volume persists through web recreation')
+    await h.adminOk(supervisor, h.terminalInputBody(soulId, `cat "$HOME/provider-marker"; echo PROVIDER_MARKER_READ_2\n`, epoch), { requestId: newRequest() })
+    const providerRead2 = stripAnsi(await waitForOutput(h, supervisor, soulId, epoch, /PROVIDER_MARKER_READ_2/, 20_000))
+    h.assert(caseId, providerRead2.includes('provider-state'), 'provider volume persists through web recreation', providerRead2.slice(-4000))
     const stop = dataOf(await h.adminOk(supervisor, h.stopBody(soulId, epoch)), 'stop')
     h.assert(caseId, stop.outcome === 'verified_empty', 'git-worktree soul stops cleanly')
   } finally {
@@ -616,6 +625,8 @@ function terminalSpec(
       ...options.env,
     },
     cwd,
+    runAsUid: 65_534,
+    runAsGid: 0,
     cols: 100,
     rows: 30,
     projectKey: options.projectKey,
