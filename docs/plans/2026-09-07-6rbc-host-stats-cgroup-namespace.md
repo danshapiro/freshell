@@ -81,7 +81,7 @@ before the container hits its actual cap.
 - Consumes: existing private helpers `safeRead`, `splitLines`, `readNumberFile`, `parseCgroupLimit`; public readers `readCgroupMemory(cgroupRoot, procRoot)`, `readPidsLimit(procRoot, cgroupRoot)`, `readPidsConstraint(procRoot, cgroupRoot)`.
 - Produces: `resolveCgroupLeaf(procRoot, v1Controller, cgroupRoot): { version: 'v1' | 'v2'; path: string } | null` where a v2 `path` may be `''`, intentionally denoting the namespace-visible cgroupfs root. Public reader signatures and return types are unchanged.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 In `test/unit/server/host-stats/readers.test.ts`:
 
@@ -222,7 +222,7 @@ comment updated to the namespace-aware contract; the assertion
 `expect(readPidsConstraint(pidsRootCgroupProc, CGROUP)).toBeNull()` is
 unchanged (the committed cgroup tree has no top-level `pids.max`).
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts --config config/vitest/vitest.server.config.ts -t 'namespace root'`
 
@@ -237,7 +237,7 @@ tests, and the two `../`-relative tests (today the resolver returns the
 999}) — with everything else (including the three fallback-shaped tests)
 still passing.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `server/host-stats/readers.ts`:
 
@@ -388,14 +388,14 @@ export function readPidsConstraint(
 }
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts --config config/vitest/vitest.server.config.ts`
 
 Expected: PASS (all tests in the file, including the previously passing
 committed-fixture tests and the retitled null tests).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Confirm `resolveCgroupLeaf` remains the single place knowing the namespace
 contract (no per-reader duplication of the `''` rule) and that every JSDoc
@@ -403,7 +403,7 @@ mention of the old "never read the fs root" assumption in the touched line
 ranges is revised. No further refactor expected: the change is one helper,
 two resolver branches, and one loop bound.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted surface: `server/host-stats/readers.ts` is consumed by
 `server/host-stats/service.ts` (readers mocked in its tests) and by the
@@ -413,7 +413,7 @@ Run: `env -u FRESHELL_BIND_HOST npm run test:vitest -- run test/unit/server/host
 
 Expected: PASS (both readers.test.ts and service.test.ts green; typecheck clean).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add server/host-stats/readers.ts test/unit/server/host-stats/readers.test.ts
@@ -441,7 +441,7 @@ fallbacks unchanged."
 - Consumes: Task 1's finalized contract ( proves the reference behavior), the existing private helpers `safe_read`, `read_number_file`, `parse_cgroup_limit`, and `write_rel` in the test module.
 - Produces: `resolve_cgroup_leaf(proc_root, v1_controller, cgroup_root) -> Option<CgroupLeaf>` where `CgroupLeaf::V2(String)` may carry an empty `String` denoting the namespace-visible fs root; public function signatures unchanged.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 In `crates/freshell-server/src/host_stats.rs`, add one test after
 `host_stats_pids_constraint_v1_chain` (mirroring Node Task 1 Step 1):
@@ -553,7 +553,7 @@ behavior stays, the stated reason changes):
   the fs root; the committed cgroup tree has no top-level pids files, so no
   node qualifies."* (assertion unchanged).
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-server host_stats_cgroup_v2_namespace_root_reads`
 
@@ -563,7 +563,7 @@ Expected: FAIL because `resolve_cgroup_leaf` returns `None` for `0::/` today
 the old resolver returns the `../escape` leaf and binds the sibling dir's
 `2`/`{1, 999}` values).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `crates/freshell-platform/src/host_stats_readers.rs`:
 
@@ -708,20 +708,20 @@ fn resolve_cgroup_leaf(
 }
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-server host_stats_cgroup_v2_namespace_root_reads && cargo test -p freshell-platform`
 
 Expected: PASS (new test green; the freshell-platform crate's own `#[cfg(test)]` module still green).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Confirm comment/code parity (no remaining "fs root has NO limit files by
 design" claims in the touched files), that the `min_depth` split is the only
 v1/v2 divergence, and run `cargo fmt -p freshell-platform` if the edit
 disturbed formatting (the QA gate runs `cargo fmt --all --check`).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted surface: `read_cgroup_memory` / `read_pids_limit` /
 `read_pids_constraint` are consumed by `freshell-server`'s collector
@@ -732,7 +732,7 @@ Run: `cargo test -p freshell-server host_stats && cargo test -p freshell-platfor
 
 Expected: PASS (the whole host_stats test module plus the platform crate).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-platform/src/host_stats_readers.rs crates/freshell-server/src/host_stats.rs
