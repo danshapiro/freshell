@@ -10,6 +10,10 @@ services:
       - supervisor-registry:/var/lib/freshell-supervisor
       - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # Optional real-Claude bootstrap. Same canonical host path on both
+      # controller services; unset falls back to a harmless non-credential
+      # device/path pair and is never forwarded to a workload.
+      - ${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-/dev/null}:${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-/run/freshell-no-claude-credential}:ro
   web:
     image: ${FRESHELL_WEB_IMAGE:?set a pinned web image}
     restart: unless-stopped
@@ -17,8 +21,10 @@ services:
       FRESHELL_MANAGED_RUNTIME_V1: "1"
       FRESHELL_RUNTIME_CONTROL_SOCKET: /run/freshell-supervisor/supervisor.sock
       FRESHELL_RUNTIME_CONTROL_SECRET_FILE: /run/freshell-supervisor/secret
+      FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE: ${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-}
     volumes:
       - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor:ro
+      - ${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-/dev/null}:${FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE:-/run/freshell-no-claude-credential}:ro
 
 volumes:
   supervisor-registry: {}

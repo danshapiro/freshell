@@ -276,6 +276,15 @@ export class RuntimeHarness {
         args.push('-v', `${root}:${root}:ro`)
       }
     }
+    if (this.phase >= 2) {
+      for (const credentialFile of this.phase2BootstrapFiles()) {
+        // The web/server side records this exact canonical HOST path in the
+        // durable launch spec. A containerized supervisor must therefore see
+        // the same path for validation; mount the single file, never its
+        // parent directory/home.
+        args.push('-v', `${credentialFile}:${credentialFile}:ro`)
+      }
+    }
     if (options.crashPoint) args.push('-e', `FRESHELL_RUNTIME_CRASH_POINT=${options.crashPoint}`)
     if (options.dbFailpoint) args.push('-e', `FRESHELL_RUNTIME_DB_FAILPOINT=${options.dbFailpoint}`)
     for (const [key, value] of Object.entries(options.env ?? {})) args.push('-e', `${key}=${value}`)

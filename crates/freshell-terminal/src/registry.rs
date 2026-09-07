@@ -4714,6 +4714,7 @@ impl TerminalRegistry {
             (subscriber.sink)(exit.clone());
         }
         state.subscribers.clear();
+        drop(state);
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
             at: now_ms(),

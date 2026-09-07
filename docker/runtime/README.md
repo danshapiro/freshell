@@ -32,3 +32,8 @@ canonical `.credentials.json` file; the supervisor records only that path,
 Docker mounts only that file read-only, and the session host copies it into the
 soul-owned provider volume with mode `0600`. Phase 2 strips the legacy web-bound
 Freshell MCP config from managed Claude; Phase 3 supplies the durable tool router.
+
+When web/supervisor are themselves containers, an enabled Claude credential
+reference must be mounted read-only into both controller containers at that
+same canonical host path. `compose.yaml` carries this exact-file mount; it
+never mounts the containing `.claude` directory or host home.
