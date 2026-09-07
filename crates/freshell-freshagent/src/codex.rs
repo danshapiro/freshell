@@ -890,6 +890,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 self.fail_create(&request_id, "CODEX_THREAD_START_FAILED", &err.to_string());
                 return;
             }
@@ -1011,6 +1012,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -1031,6 +1033,7 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
@@ -1190,6 +1193,7 @@ impl FreshCodexState {
             let _ = child.start_kill();
             let _ = child.wait().await;
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             // Own tree confirmed torn down -- releasing the lease is safe.
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -3234,6 +3238,7 @@ impl FreshCodexState {
                 let mut dead_child = child;
                 let _ = dead_child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
                 // a later attach/create against it fails fast instead of repeating this same
                 // spawn-resume-fail cycle.
@@ -3256,6 +3261,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -3272,6 +3278,7 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             tracing::error!(
                 requested = %session_id,
                 returned = %started.thread_id,
@@ -3448,6 +3455,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -3642,6 +3650,14 @@ impl FreshCodexState {
         // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
         drain_child_io(&mut child);
 
+        // wfah: durable tracking BEFORE the handshake — the record must exist
+        // even while this sidecar's 45s startup budget is still running, or an
+        // unclean server death would leave the child untracked.
+        if let Some(pid) = child.id() {
+            crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, &ws_url)
+                .await;
+        }
+
         let deadline = Instant::now() + SIDECAR_START_BUDGET;
 
         // Connect the WS as soon as the listener is up (the app-server binds it after startup).
@@ -3650,6 +3666,7 @@ impl FreshCodexState {
                 Ok(transport) => break Arc::new(transport),
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!(
                             "codex app-server exited before listening: {status}"
                         ));
@@ -3657,6 +3674,7 @@ impl FreshCodexState {
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server WS never came up: {err}"));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3677,6 +3695,7 @@ impl FreshCodexState {
                         client.close().await;
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server initialize failed: {err}"));
                     }
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -4124,6 +4143,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -4149,6 +4169,7 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             tracing::error!(
                 requested = %thread_id,
                 returned = %started.thread_id,
@@ -5207,7 +5228,7 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 ///   the reference's "leave the runtime mapped for lazy restart" invariant.
 /// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
 ///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
-fn spawn_exit_watcher(
+pub(crate) fn spawn_exit_watcher(
     mut child: tokio::process::Child,
     ownership_id: String,
     thread_id: String,
@@ -5216,6 +5237,9 @@ fn spawn_exit_watcher(
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
 ) -> tokio::task::JoinHandle<()> {
+    // wfah: the thread id is fixed by the time the watcher is constructed at
+    // every successful spawn site; enrich the durable record once, here.
+    crate::codex_sidecar_tracking::enrich_record_session_id(&ownership_id, &thread_id);
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -5230,12 +5254,14 @@ fn spawn_exit_watcher(
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Task 12: the bound session is gone -- reopen its durable id.
                 leases.clear_binding(PROVIDER, &thread_id);
                 tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Task 12: a crashed sidecar is no longer a live writer -- reopen the
                 // durable id (the entry stays mapped for PR-4 lazy respawn, which
                 // re-claims through the attach/send seams).
@@ -5494,6 +5520,7 @@ async fn shut_down_fork_child(
     let _ = child.start_kill();
     let _ = child.wait().await;
     reap_owned_codex_sidecars(ownership_id);
+    crate::codex_sidecar_tracking::scrub_sidecar_record(ownership_id);
 }
 
 /// Codex fork's `lastTurnId` normalization (fresh-eyes round-3 F6): the REST snapshot
@@ -13676,9 +13703,10 @@ pub(crate) mod tests {
         )
     }
 
-    const ISOLATED_CODEX_ENV_KEYS: [&str; 5] = [
+    const ISOLATED_CODEX_ENV_KEYS: [&str; 6] = [
         "CODEX_HOME",
         "CODEX_CMD",
+        "FRESHELL_HOME",
         "FAKE_CODEX_APP_SERVER_BEHAVIOR",
         "FAKE_CODEX_APP_SERVER_ARG_LOG",
         "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",

@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::sidecar_store::CodexSidecarRecord;
+use crate::sidecar_store::{proc_cmdline, proc_starttime, CodexSidecarRecord};
 use crate::sidecar_test_support::{
     record_for_child, spawn_own_fake_app_server, spawn_own_fake_app_server_with_behavior,
     spawn_own_sleep_child, store_in, NEVER_SIGNALLED_GRACE, SESSION,
@@ -339,6 +339,58 @@ async fn duplicate_claim_prefers_the_live_writer_over_newer_updated_at() {
         .kill()
         .await
         .expect("cleanup: kill this test's own fixture");
+}
+
+/// wfah: a `lane:"freshAgent"` row carrying valid live identity evidence and a
+/// session id must be HELD (sweep fate) but NEVER indexed/claimable —
+/// terminal-pane restores must not adopt fresh-agent-lane sidecars.
+#[tokio::test]
+async fn boot_reconcile_never_indexes_freshagent_lane_records_for_claim() {
+    let child = spawn_own_sleep_child();
+    let pid = child.0.id();
+    let dir = tempfile::tempdir().expect("temp store root");
+    let store = store_in(&dir);
+    // Hand-written row, exactly as a previous freshagent generation will have
+    // written it. serde ignores unknown fields — including today's missing
+    // `lane` — so RED sees the row as claimable terminal-pane state.
+    std::fs::write(
+        dir.path().join("codex-sidecar-freshagent-lane.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "recordVersion": 1,
+            "ownershipId": "codex-sidecar-freshagent-lane",
+            "pid": pid,
+            "starttime": proc_starttime(pid as i32).expect("live child starttime"),
+            "cmdline": proc_cmdline(pid as i32).expect("live child cmdline"),
+            "wsUrl": "ws://127.0.0.1:9",
+            "sessionId": "thread-from-freshagent",
+            "serverInstanceId": "srv-prev",
+            "createdAt": 1,
+            "updatedAt": 1,
+            "state": { "kind": "active" },
+            "lane": "freshAgent",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let (reconciler, report) = SidecarReconciler::boot_reconcile(store);
+    assert_eq!(
+        report.pruned_dead + report.pruned_mismatch,
+        0,
+        "live evidence is not pruned"
+    );
+    assert_eq!(report.held, 1, "the freshagent row is held for the sweep");
+
+    let claimed = reconciler.claim_for_session("thread-from-freshagent").await;
+    assert!(
+        claimed.is_none(),
+        "freshagent-lane records are never claimable, got {claimed:?}"
+    );
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "still held after the refused claim"
+    );
 }
 
 // ---------------------------------------------------------------------------

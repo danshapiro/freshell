@@ -95,7 +95,7 @@ pub use sidecar_reconcile::{
 #[cfg(feature = "real-transport")]
 pub use sidecar_store::{
     proc_cmdline, proc_starttime, set_codex_sidecar_store, verify_sidecar_identity,
-    CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarRecordState,
+    CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarLane, SidecarRecordState,
     SIDECAR_RECORD_VERSION,
 };
 #[cfg(feature = "real-transport")]
