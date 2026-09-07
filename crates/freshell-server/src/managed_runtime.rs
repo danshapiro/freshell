@@ -2,8 +2,8 @@
 
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
-    LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeLimits, RuntimeProfile, SoulId,
-    StopOutcome, TerminalLaunchSpec,
+    LaunchRequest, LaunchState, ProviderBootstrapFile, RequestId, RuntimeLimits, RuntimeProfile,
+    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
@@ -60,6 +60,19 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             let (run_as_uid, run_as_gid) = (MANAGED_PROVIDER_UID, MANAGED_PROVIDER_GID);
             let git_common_dir = git_common_dir(&workspace);
             let project_key = stable_project_key(&workspace);
+            let inventory = self.client.inventory().await.map_err(|e| e.to_string())?;
+            if let Some(view) = reusable_running_view(&inventory, &soul_id, &request.terminal_id)? {
+                return Ok(ManagedTerminalDescriptor {
+                    soul_id: view.soul_id.to_string(),
+                    incarnation_id: view.incarnation_id.to_string(),
+                    terminal_id: request.terminal_id,
+                    stream_id: request.stream_id,
+                    mode: request.mode,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    resume_session_id: request.resume_session_id,
+                    create_request_id: request.create_request_id,
+                });
+            }
             // Phase 2 persists the launch spec in the supervisor registry.
             // Persist ONLY an explicit non-secret allowlist — never the web
             // server's resolved child environment wholesale (which can carry
@@ -213,6 +226,41 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             })
         })
     }
+}
+
+fn reusable_running_view(
+    views: &[RuntimeView],
+    soul_id: &SoulId,
+    terminal_id: &str,
+) -> Result<Option<RuntimeView>, String> {
+    let matching: Vec<&RuntimeView> = views
+        .iter()
+        .filter(|view| &view.soul_id == soul_id)
+        .collect();
+    if matching.is_empty() {
+        return Ok(None);
+    }
+    let running: Vec<&RuntimeView> = matching
+        .iter()
+        .copied()
+        .filter(|view| view.launch_state == LaunchState::Running)
+        .collect();
+    if running.len() != 1 {
+        return Err(format!(
+            "managed soul {} exists but has {} running incarnations; refusing a replacement launch",
+            soul_id.as_str(),
+            running.len()
+        ));
+    }
+    let view = running[0];
+    if view.terminal_id.as_deref() != Some(terminal_id) {
+        return Err(format!(
+            "managed soul {} is already bound to terminal {:?}, not {terminal_id}",
+            soul_id.as_str(),
+            view.terminal_id
+        ));
+    }
+    Ok(Some(view.clone()))
 }
 
 fn managed_env_allowlist(
@@ -469,6 +517,37 @@ mod tests {
         ] {
             assert!(!filtered.contains_key(key), "secret key leaked: {key}");
         }
+    }
+
+    #[test]
+    fn running_soul_is_reused_before_launch_payload_rehash_and_mismatches_fail_closed() {
+        let soul = SoulId::parse("soul-terminal-test").unwrap();
+        let running = freshell_runtime_protocol::RuntimeView {
+            soul_id: soul.clone(),
+            incarnation_id: freshell_runtime_protocol::IncarnationId::new(),
+            launch_state: freshell_runtime_protocol::LaunchState::Running,
+            cleanup_state: freshell_runtime_protocol::CleanupState::None,
+            intent_revision: 1,
+            container_id: Some("a".repeat(64)),
+            host_boot_id: Some(freshell_runtime_protocol::HostBootId::new()),
+            execution_generation: 1,
+            effective_limits: None,
+            terminal_id: Some("terminal-stable".into()),
+            project_key: Some("project-test".into()),
+            profile: Some(RuntimeProfile::DefaultAgent),
+        };
+        let reused =
+            reusable_running_view(std::slice::from_ref(&running), &soul, "terminal-stable")
+                .unwrap()
+                .expect("running soul should be reused");
+        assert_eq!(reused.incarnation_id, running.incarnation_id);
+
+        assert!(
+            reusable_running_view(std::slice::from_ref(&running), &soul, "terminal-other").is_err()
+        );
+        let mut stopped = running;
+        stopped.launch_state = freshell_runtime_protocol::LaunchState::Stopped;
+        assert!(reusable_running_view(&[stopped], &soul, "terminal-stable").is_err());
     }
 
     #[test]

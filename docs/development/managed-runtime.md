@@ -189,7 +189,12 @@ format from that host spool. Web shutdown, socket detach, idle cleanup, and
 `kill_all` cannot reap a managed row. Explicit user close first commits the
 pane close, then requires a supervisor `VerifiedEmpty` stop before removing the
 facade. Managed terminal/stream IDs are deterministic from the pane's durable
-`createRequestId`, making web-restart launch retries payload-identical.
+`createRequestId`. Before constructing a launch transaction, the web controller
+checks supervisor inventory for that stable soul/terminal pair; an already-
+running incarnation is reattached directly. This is load-bearing once a native
+provider session id has appeared, because restore metadata may be richer than
+the original fresh-create payload. Existing stopped/non-running or mismatched
+souls fail closed rather than being silently replaced.
 
 Managed terminal specs use an explicit non-secret environment allowlist. Server
 `AUTH_TOKEN`/`FRESHELL_TOKEN`, provider API/OAuth variables, cloud credentials,

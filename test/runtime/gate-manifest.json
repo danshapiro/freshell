@@ -5,7 +5,7 @@
   "prepared_on": "2026-09-06",
   "inspected_commit": "78b8d9d7ae6c02f81646fe22f11bd7e286f0054c",
   "source_document": "freshell-durable-souls-five-phase-execution-plan.md",
-  "source_document_sha256": "3c5994c31d3cad7c14a2210ba43f37c0302bc805cc7c25f25a7f257a9a58c961",
+  "source_document_sha256": "d48f853e24e9d15cf3153c6ac4520d91912de65c2203c96e393cc8d52e27456c",
   "intended_repository_path": "test/runtime/gate-manifest.json",
   "required_scenario_count": 56,
   "implementation_task_count": 31,
