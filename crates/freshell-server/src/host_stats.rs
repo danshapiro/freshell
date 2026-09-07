@@ -1624,8 +1624,8 @@ mod tests {
             .expect("v2 leaf resolves");
         assert_eq!(leaf.limit_bytes, None);
         assert_eq!(leaf.current_bytes, 17000000000);
-        // The cgroup fs root has NO limit files by design: a cgroup root that
-        // lacks the leaf tree must NOT fall back to reading the fs root.
+        // The fs-root fallback still finds nothing: a cgroup root that
+        // lacks the leaf tree AND has no top-level limit files yields None.
         let empty = tempfile::tempdir().unwrap();
         assert!(readers::read_cgroup_memory(empty.path(), &procmini_fixture()).is_none());
         // self/cgroup absent -> None (never a panic).
@@ -1706,7 +1706,8 @@ mod tests {
                 max: 678924
             })
         );
-        // A process at the cgroup2 root has no leaf -> None (no fs-root reads).
+        // '0::/' (namespace root) reads the fs root; the committed cgroup
+        // tree has no top-level pids files, so no node qualifies.
         let tmp2 = tempfile::tempdir().unwrap();
         write_rel(&tmp2.path().join("proc"), "self/cgroup", "0::/\n");
         assert_eq!(
@@ -1808,6 +1809,114 @@ mod tests {
             Some(readers::PidsConstraint {
                 current: 900,
                 max: 1000
+            })
+        );
+    }
+
+    #[test]
+    fn host_stats_cgroup_v2_namespace_root_reads() {
+        // 0::/ + namespace-private cgroupfs mount (Docker default on v2
+        // hosts): the container's limit files live AT the fs root.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "0::/\n");
+        write_rel(&proc_root, "sys/kernel/threads-max", "999999\n");
+        write_rel(&cgroup_root, "memory.current", "1073741824\n");
+        write_rel(&cgroup_root, "memory.max", "4294967296\n");
+        write_rel(&cgroup_root, "pids.max", "512\n");
+        write_rel(&cgroup_root, "pids.current", "400\n");
+        assert_eq!(
+            readers::read_cgroup_memory(&cgroup_root, &proc_root),
+            Some(readers::CgroupMemory {
+                limit_bytes: Some(4294967296),
+                current_bytes: 1073741824,
+            })
+        );
+        assert_eq!(
+            readers::read_pids_limit(&proc_root, &cgroup_root),
+            Some(512)
+        );
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 400,
+                max: 512,
+            })
+        );
+
+        // 0::/ at the REAL (non-namespaced) host root: no limit files exist
+        // there, so every reader keeps its existing fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        std::fs::create_dir_all(&cgroup_root).unwrap();
+        write_rel(&proc_root, "self/cgroup", "0::/\n");
+        write_rel(&proc_root, "sys/kernel/threads-max", "4242\n");
+        assert!(readers::read_cgroup_memory(&cgroup_root, &proc_root).is_none());
+        assert!(readers::read_pids_constraint(&proc_root, &cgroup_root).is_none());
+        assert_eq!(
+            readers::read_pids_limit(&proc_root, &cgroup_root),
+            Some(4242)
+        );
+
+        // Membership names a host path that is not mounted under the
+        // cgroupfs mount: read the namespace-visible fs root instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        write_rel(&proc_root, "self/cgroup", "0::/docker/deadbeefcafe\n");
+        write_rel(&cgroup_root, "memory.current", "268435456\n");
+        write_rel(&cgroup_root, "memory.max", "536870912\n");
+        write_rel(&cgroup_root, "pids.max", "256\n");
+        write_rel(&cgroup_root, "pids.current", "10\n");
+        assert_eq!(
+            readers::read_cgroup_memory(&cgroup_root, &proc_root),
+            Some(readers::CgroupMemory {
+                limit_bytes: Some(536870912),
+                current_bytes: 268435456,
+            })
+        );
+        assert_eq!(
+            readers::read_pids_limit(&proc_root, &cgroup_root),
+            Some(256)
+        );
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 10,
+                max: 256
+            })
+        );
+
+        // '../'-relative membership (cgroup_namespaces(7): out-of-namespace):
+        // a sibling dir ABOVE the injected root carries different limits; the
+        // resolver must bind the namespace root, never the escape.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        let escape = tmp.path().join("escape");
+        write_rel(&proc_root, "self/cgroup", "0::/../escape\n");
+        write_rel(&cgroup_root, "memory.current", "1073741824\n");
+        write_rel(&cgroup_root, "memory.max", "4294967296\n");
+        write_rel(&cgroup_root, "pids.max", "512\n");
+        write_rel(&cgroup_root, "pids.current", "400\n");
+        write_rel(&escape, "memory.current", "1\n");
+        write_rel(&escape, "memory.max", "2\n");
+        write_rel(&escape, "pids.max", "999\n");
+        write_rel(&escape, "pids.current", "1\n");
+        assert_eq!(
+            readers::read_cgroup_memory(&cgroup_root, &proc_root),
+            Some(readers::CgroupMemory {
+                limit_bytes: Some(4294967296),
+                current_bytes: 1073741824,
+            })
+        );
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 400,
+                max: 512,
             })
         );
     }
