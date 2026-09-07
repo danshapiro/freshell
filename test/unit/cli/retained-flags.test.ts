@@ -47,6 +47,30 @@ async function invoke(args: string[]) {
   }
 }
 
+it.each([
+  ['new-tab', '--hostStats', true],
+  ['new-tab', '--hostStats=true', true],
+  ['new-tab', '--hostStats=false', false],
+  ['split-pane', '--hostStats', true],
+  ['split-pane', '--hostStats=true', true],
+  ['split-pane', '--hostStats=false', false],
+] as const)('%s forwards Host Stats option %s', async (action, flag, enabled) => {
+  const args = action === 'new-tab'
+    ? [action, flag]
+    : [action, '--target', 'p1', flag]
+  const result = await invoke(args)
+
+  expect(result.code).toBe(0)
+  expect(result.stderr).toBe('')
+  const request = result.requests.at(-1)
+  expect(request).toBeDefined()
+  expect(request!.url).toBe(
+    action === 'new-tab' ? '/api/tabs' : '/api/panes/p1/split',
+  )
+  expect((request!.body as Record<string, unknown>).hostStats)
+    .toBe(enabled ? true : undefined)
+})
+
 it.each(['--resume', '--resumeSessionId'])('resumes an OpenCode agent with %s and no terminal mode', async (flag) => {
   const result = await invoke(['new-tab', '--agent', 'opencode', flag, 'ses_existing'])
   expect(result.stderr).toBe('')
