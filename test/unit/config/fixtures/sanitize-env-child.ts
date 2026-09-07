@@ -1,16 +1,15 @@
-// Fixture for sanitize-test-env.test.ts. `argv[2]` = 'plain' | 'clean'.
-// In 'clean' mode it applies the shared sanitize to its OWN env — exactly what
-// importing config/vitest/sanitize-test-env.ts at config load does. It then
-// spawns an inner plain node child whose one fetch() forces undici's
-// EnvHttpProxyAgent activation (the `[UNDICI-EHPA]` warning is emitted lazily
-// at the first dispatch, not at process start) and reports the inner child's
-// stderr verbatim on stdout as JSON.
+// Fixture for sanitize-test-env.test.ts. argv[2] = plain, clean, or config.
 import { spawnSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 
 const mode = process.argv[2]
 if (mode === 'clean') {
   const { stripAmbientEnvPoisons } = await import('../../../../config/vitest/sanitize-test-env.js')
   stripAmbientEnvPoisons(process.env)
+} else if (mode === 'config') {
+  const configPath = process.argv[3]
+  if (!configPath) throw new Error('config mode requires an absolute config path')
+  await import(pathToFileURL(configPath).href)
 }
 
 const inner = spawnSync(
