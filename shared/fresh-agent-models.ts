@@ -12,7 +12,7 @@ export type FreshAgentModelOption = {
   defaultEffort?: string
 }
 
-export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
+export const FRESHCODEX_DEFAULT_MODEL = 'gpt-6-astra'
 export const FRESHCODEX_DEFAULT_EFFORT = 'max'
 export const FRESHCLAUDE_DEFAULT_EFFORT = 'high'
 export const FRESHOPENCODE_DEFAULT_EFFORT = 'max'
@@ -29,15 +29,27 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
   freshcodex: [
     {
       value: FRESHCODEX_DEFAULT_MODEL,
-      label: 'GPT-5.5',
-      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+      label: 'GPT-6 Astra',
+      thinkingEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
       defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     },
     {
-      value: 'gpt-5.4-flash',
-      label: 'GPT-5.4 Flash',
-      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high'],
-      defaultEffort: 'high',
+      value: 'gpt-5.6-sol',
+      label: 'GPT-5.6 Sol',
+      thinkingEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
+    },
+    {
+      value: 'gpt-5.6-terra',
+      label: 'GPT-5.6 Terra',
+      thinkingEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
+    },
+    {
+      value: 'gpt-5.6-luna',
+      label: 'GPT-5.6 Luna',
+      thinkingEfforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     },
     {
       value: 'gpt-5.3-codex-spark',

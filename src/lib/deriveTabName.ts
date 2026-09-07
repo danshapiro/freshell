@@ -115,7 +115,13 @@ export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntr
     return segment || 'Shell'
   }
 
-  // Priority 5: Picker (when all panes are pickers)
+  // Priority 5: First host-stats pane (always named by the app)
+  const hostStats = contents.find((content) => content.kind === 'host-stats')
+  if (hostStats) {
+    return 'System Status'
+  }
+
+  // Priority 6: Picker (when all panes are pickers)
   const hasOnlyPickers = contents.every(isPicker)
   if (hasOnlyPickers && contents.length > 0) {
     return 'New Tab'

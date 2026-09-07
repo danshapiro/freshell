@@ -14,11 +14,12 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
+import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
-import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
+import { clearPendingCreateFailure, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
@@ -68,6 +69,10 @@ import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import FreshAgentModelDialog from '@/components/fresh-agent/FreshAgentModelDialog'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
 import { isDurableProviderSessionId } from '@shared/session-flavor'
+import {
+  getCanonicalPaneResumeSessionId,
+  getFreshAgentSnapshotThreadId,
+} from '@/lib/fresh-agent-snapshot-thread'
 import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
   checkpointLabelForText,
@@ -87,6 +92,9 @@ import { FreshAgentStatusStrip } from './FreshAgentStatusStrip'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+// Copy for the stuck-notice card (role="alert") shown while the store carries
+// the deadman's 'stuck' status; recovery actions live on the card itself.
+const FRESH_AGENT_STUCK_NOTICE_TEXT = 'Agent appears stuck — no events from the agent process for a while.'
 
 // Task 14: SESSION_RESERVED bounded re-drive. The window must outlast the
 // server lease TTL (20s) with margin -- same arithmetic as TerminalView's
@@ -134,10 +142,30 @@ function getTurnKey(turn: FreshAgentTurn): string {
   return getFreshAgentDisplayTurnKey(turn)
 }
 
+/**
+ * Bidirectional text match between the local echo (raw user input) and the
+ * server-normalised turn text. The server may add content (system context,
+ * metadata) or remove content (strip quoting, trim whitespace), so we check
+ * both directions: the turn text contains the echo text, or the echo text
+ * contains the turn text.
+ */
+function echoTextMatchesTurn(echoText: string, needle: string, turnText: string): boolean {
+  if (turnText.includes(needle)) return true
+  const trimmedTurnText = turnText.trim()
+  return trimmedTurnText.length > 0 && echoText.includes(trimmedTurnText)
+}
+
 type LocalEcho = {
   text: string
   requestId: string
   submittedTurnId?: string
+  /** Turn keys captured at send time — used by the echo-landed check to
+   * distinguish the new server turn from pre-existing turns. Unlike the
+   * previous-snapshot turns, these never include the just-sent turn, so
+   * the text-match guard cannot permanently block the echo from clearing
+   * if the first snapshot's text match fails (e.g. the server normalises
+   * the text by stripping quoting). */
+  previousTurnKeys?: readonly string[]
 }
 
 function sameLocalEcho(a: LocalEcho | null | undefined, b: LocalEcho | null | undefined): boolean {
@@ -164,14 +192,12 @@ function localEchoLanded(
   pending?: PendingSendMetadata,
   options: {
     allowTextMatch?: boolean
-    previousTurns?: readonly FreshAgentTurn[]
+    previousTurnKeys?: Set<string> | null
   } = {},
 ): boolean {
   const needle = echo.text.slice(0, 80)
   const submittedTurnId = echo.submittedTurnId ?? pending?.submittedTurnId
-  const previousTurnKeys = options.previousTurns
-    ? new Set(options.previousTurns.map(getTurnKey))
-    : null
+  const previousTurnKeys = options.previousTurnKeys ?? null
   const canMatchText = Boolean(needle) && (
     options.allowTextMatch === true
     || pending?.legacyAccepted === true
@@ -185,7 +211,7 @@ function localEchoLanded(
       || (
         canMatchText
         && (!previousTurnKeys || !previousTurnKeys.has(getTurnKey(turn)))
-        && freshAgentTurnText(turn).includes(needle)
+        && echoTextMatchesTurn(echo.text, needle, freshAgentTurnText(turn))
       )
     )
   ))
@@ -248,24 +274,14 @@ function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
 
-function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
-  if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
-    return pane.sessionRef.sessionId
-  }
-  if (isValidClaudeSessionId(pane.resumeSessionId)) {
-    return pane.resumeSessionId
-  }
-  if (pane.provider === 'claude' && isValidClaudeSessionId(pane.sessionId)) {
-    return pane.sessionId
-  }
-  return undefined
-}
-
 // Codex fresh-agent threads don't have a UUID-format validator the way Claude
 // does (isValidClaudeSessionId), so this mirrors getCanonicalPaneResumeSessionId's
 // fallback chain (sessionRef -> resumeSessionId -> sessionId) without that
 // claude-specific format check. Used only to let a lost codex session attempt
 // a bounded resume instead of being permanently abandoned (see triggerRecovery).
+// (getCanonicalPaneResumeSessionId and getFreshAgentSnapshotThreadId live in
+// @/lib/fresh-agent-snapshot-thread — shared with the settings popover's
+// settingScopes probe.)
 function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
   if (pane.sessionRef?.provider === 'codex' && pane.sessionRef.sessionId) {
     return pane.sessionRef.sessionId
@@ -277,39 +293,6 @@ function getCanonicalCodexResumeSessionId(pane: FreshAgentPaneContent): string |
     return pane.sessionId
   }
   return undefined
-}
-
-function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: string | undefined): boolean {
-  return pane.provider === 'opencode'
-    && pane.sessionType === 'freshopencode'
-    && typeof sessionId === 'string'
-    && sessionId.startsWith('freshopencode-')
-}
-
-function getFreshAgentSnapshotThreadId(
-  pane: FreshAgentPaneContent,
-  claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
-): string | undefined {
-  if (pane.provider === 'claude') {
-    // Snapshot history is keyed by Claude's durable UUID. Runtime-only live
-    // handles stay interactive through the WS transport, but should not hit
-    // the snapshot route or surface history-load errors.
-    return getCanonicalDurableSessionId(claudeSession)
-      ?? getCanonicalPaneResumeSessionId(pane)
-  }
-  if (EARLY_STATES.has(pane.status)) {
-    // While a new session is still being created, avoid reading an older durable ref.
-    return pane.sessionId
-  }
-  const sessionRefId = pane.sessionRef?.provider === pane.provider ? pane.sessionRef.sessionId : undefined
-  if (!pane.sessionId && isFreshOpencodePlaceholderId(pane, sessionRefId)) {
-    // Legacy Freshopencode panes could persist only the placeholder sessionRef.
-    // Let freshAgent.create/resume repair it before snapshot loading; otherwise
-    // the placeholder 404 races the promotion and marks the pane unrecoverable.
-    return undefined
-  }
-  return pane.sessionId
-    ?? sessionRefId
 }
 
 function getCreatedResumeSessionId(
@@ -873,11 +856,18 @@ export function FreshAgentView({
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
     const current = paneContentRef.current
-    if (sameLocalEcho(current.pendingLocalEcho, next)) return
+    // Strip runtime-only fields (previousTurnKeys) before persisting —
+    // the persisted echo only needs the wire-identity fields. On remount
+    // the echo is restored without previousTurnKeys, which correctly
+    // disables the text-match guard (no send-time turns to compare against).
+    const persisted = next
+      ? { requestId: next.requestId, text: next.text, ...(next.submittedTurnId ? { submittedTurnId: next.submittedTurnId } : {}) }
+      : undefined
+    if (sameLocalEcho(current.pendingLocalEcho, persisted)) return
     dispatch(mergePaneContent({
       tabId,
       paneId,
-      updates: { pendingLocalEcho: next ?? undefined },
+      updates: { pendingLocalEcho: persisted },
     }))
   }, [dispatch, paneId, tabId])
   useEffect(() => {
@@ -1225,42 +1215,65 @@ export function FreshAgentView({
       sandbox: content.sandbox,
       effort: getEffectiveFreshAgentEffort(content, providerDefaults),
       plugins: content.plugins,
+      // D8 (restore-open-sessions-only): the server composes the ledger row's
+      // tabKey as `deviceId:tabId` from the connection identity + this field.
+      tabId,
     } as const
-  }, [providerDefaults, tabRestoreSource])
+  }, [providerDefaults, tabRestoreSource, tabId])
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
-    if (current.sessionId) {
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      sendFreshAgentMessage({
-        type: 'freshAgent.kill',
-        sessionId: current.sessionId,
-        sessionType: current.sessionType,
-        provider: current.provider,
-        ...(cwd ? { cwd } : {}),
-      })
-    }
-    commitSnapshot(null)
-    setLoadError(null)
-    setQueuedMessages([])
-    setLocalEcho(null)
-    alwaysAllowToolsRef.current.clear()
-    pendingAutoTitleBySessionIdRef.current.clear()
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: {
-        ...current,
-        createRequestId: nanoid(),
-        sessionId: undefined,
-        sessionRef: undefined,
-        resumeSessionId: undefined,
-        restoreError: undefined,
-        createError: undefined,
-        status: 'creating',
-        pendingLocalEcho: undefined,
-      },
-    }))
+    // Focused-episode-6 round 2 (Finding 6): a session-bearing conversation
+    // replacement AWAITS the old session's durable close before swapping the
+    // pane — a close the server cannot record is not a close, and dropping
+    // the conversation anyway would leave a live server session open on no
+    // tab. On failure the current conversation stays (the killed fold's
+    // session-error banner — or the await's timeout write — explains it).
+    void (async () => {
+      if (current.sessionId) {
+        const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+        const ack = await sendFreshAgentKillAndAwait(
+          {
+            sessionId: current.sessionId,
+            sessionType: current.sessionType,
+            provider: current.provider,
+            ...(cwd ? { cwd } : {}),
+          },
+          { send: (m) => sendFreshAgentMessage(m as Record<string, unknown>) },
+        )
+        if (!ack.ok) {
+          dispatch(sessionError({
+            sessionId: current.sessionId,
+            sessionType: current.sessionType,
+            provider: current.provider,
+            code: 'KILL_FAILED',
+            message: ack.timedOut ? KILL_ACK_TIMEOUT_MESSAGE : KILL_FAILED_MESSAGE,
+          }))
+          return
+        }
+      }
+      commitSnapshot(null)
+      setLoadError(null)
+      setQueuedMessages([])
+      setLocalEcho(null)
+      alwaysAllowToolsRef.current.clear()
+      pendingAutoTitleBySessionIdRef.current.clear()
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...current,
+          createRequestId: nanoid(),
+          sessionId: undefined,
+          sessionRef: undefined,
+          resumeSessionId: undefined,
+          restoreError: undefined,
+          createError: undefined,
+          status: 'creating',
+          pendingLocalEcho: undefined,
+        },
+      }))
+    })()
   }, [commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
 
   const sendFork = useCallback((atTurnId?: string) => {
@@ -1270,17 +1283,20 @@ export function FreshAgentView({
     // The freshAgent.forked broadcast is matched on createRequestId +
     // parentSessionId by the listener below, which repoints this pane at
     // the forked session. atTurnId is best-effort: providers that can't
-    // fork mid-thread fork from the tip.
+    // fork mid-thread fork from the tip. D8 (focused-ep1-r5): `tabId` lets
+    // the fork child row stamp this forking tab's identity — a forceNew
+    // multi-tab fork must not inherit the OTHER tab's parked attribution.
     sendFreshAgentMessage({
       type: 'freshAgent.fork',
       requestId: current.createRequestId,
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      tabId,
       ...(cwd ? { cwd } : {}),
       ...(atTurnId ? { input: { atTurnId } } : {}),
     })
-  }, [sendFreshAgentMessage])
+  }, [sendFreshAgentMessage, tabId])
 
   // kata 1wxv: rollback requests mint a requestId so the requesting-sink ack
   // (composer refill) and any rollback-flagged refusal route back to THIS pane;
@@ -1447,6 +1463,24 @@ export function FreshAgentView({
       },
     }))
   }, [claudeSession, dispatch, paneId, tabId])
+
+  // Stuck-card recovery: kill the wedged sidecar (same kill-frame shape as
+  // startNewConversation), then re-mint the pane through the existing
+  // triggerRecovery path so the canonical resume id keeps the durable thread.
+  const restartStuckSidecar = useCallback(() => {
+    const current = paneContentRef.current
+    if (current.sessionId) {
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage({
+        type: 'freshAgent.kill',
+        sessionId: current.sessionId,
+        sessionType: current.sessionType,
+        provider: current.provider,
+        ...(cwd ? { cwd } : {}),
+      })
+    }
+    triggerRecovery()
+  }, [sendFreshAgentMessage, triggerRecovery])
 
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane
@@ -2063,7 +2097,7 @@ export function FreshAgentView({
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && localEchoLanded(displaySnapshot.turns, outgoing, pendingSendMetadataRef.current.get(outgoing.requestId), {
           allowTextMatch: true,
-          previousTurns: outgoing.previousTurns,
+          previousTurnKeys: new Set((outgoing.previousTurns ?? []).map(getTurnKey)),
         })
       ) {
         // Reconnect may miss every stream/status event. A current idle snapshot
@@ -2079,7 +2113,7 @@ export function FreshAgentView({
       const landedEcho = echo
         ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata, {
             allowTextMatch: snapshotAccepted,
-            previousTurns: previousSnapshot?.turns,
+            previousTurnKeys: echo.previousTurnKeys ? new Set(echo.previousTurnKeys) : null,
           })
         : false
       // Task 16: 'accepted but not landed' -- the raw input predicate of the
@@ -2528,7 +2562,11 @@ export function FreshAgentView({
         firstMessage: text,
       }))
     }
-    const nextLocalEcho: LocalEcho = { text, requestId }
+    const nextLocalEcho: LocalEcho = {
+      text,
+      requestId,
+      previousTurnKeys: (snapshotRef.current?.turns ?? []).map(getTurnKey),
+    }
     sendFreshAgentSendFrame(requestId, text, routeCwd)
     setLocalEchoState(nextLocalEcho)
     dispatch(mergePaneContent({
@@ -2749,6 +2787,32 @@ export function FreshAgentView({
                 </div>
               ) : null}
               {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
+              {effectiveStatus === 'stuck' ? (
+                <div
+                  className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+                  role="alert"
+                >
+                  <span>{FRESH_AGENT_STUCK_NOTICE_TEXT}</span>
+                  <div className="flex shrink-0 gap-2">
+                    <button
+                      type="button"
+                      className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Restart sidecar and resume session"
+                      onClick={restartStuckSidecar}
+                    >
+                      Restart sidecar
+                    </button>
+                    <button
+                      type="button"
+                      className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                      aria-label="Start new conversation"
+                      onClick={startNewConversation}
+                    >
+                      Start new conversation
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               {sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
@@ -2920,6 +2984,7 @@ export function FreshAgentView({
               open={modelDialogOpen}
               onClose={closeModelDialog}
               onCatalogUnavailable={handleModelCatalogUnavailable}
+              settingScopes={snapshot?.capabilities?.settingScopes}
             />
           </div>
           <FreshAgentSidebar
@@ -2961,6 +3026,7 @@ export function FreshAgentView({
     paneContent,
     pendingCreateFailure,
     queuedMessages,
+    restartStuckSidecar,
     rewindToTurn,
     sessionEnded,
     sessionErrorMessage,

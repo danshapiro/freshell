@@ -1173,6 +1173,38 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
   })
 
+  it('stamps freshAgent.create with the pane tab identity (D8 provenance)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-tabid',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // D8 (restore-open-sessions-only): the server composes the ledger row's
+    // tabKey as `deviceId:tabId` from the hello-stamped connection identity
+    // plus this field; the D8 judgment never offers rows whose parent
+    // evidence cannot see them, so a dropped tabId would silently orphan the
+    // pane's placement on restore.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-tabid',
+      tabId: 'tab-1',
+    }))
+  })
+
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
     const store = createStore()
     store.dispatch(initLayout({
@@ -1198,7 +1230,7 @@ describe('FreshAgentView', () => {
       requestId: 'req-create',
       sessionType: 'freshcodex',
       provider: 'codex',
-      model: 'gpt-5.5',
+      model: 'gpt-6-astra',
       effort: 'max',
     }))
 
@@ -1761,7 +1793,7 @@ describe('FreshAgentView', () => {
 
     wsMock.send.mockClear()
 
-    expect(screen.queryByRole('radio', { name: 'GPT-5.5' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-6 Astra' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
@@ -3961,6 +3993,20 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
     })
+    // The replacement conversation starts only once the durable close is
+    // acknowledged (correlated close waits, focused-episode-6 round 2).
+    const aliasHandlers = wsMock.onMessage.mock.calls.map(([h]) => h).filter(Boolean)
+    act(() => {
+      for (const handler of aliasHandlers) {
+        ;(handler as (msg: unknown) => void)({
+          type: 'freshAgent.killed',
+          sessionId: 'thread-reset-alias',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          success: true,
+        })
+      }
+    })
     await waitFor(() => {
       expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'freshAgent.create',
@@ -4058,6 +4104,115 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('starts the new conversation only once the old session close is durably acknowledged', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-new-ack',
+        sessionId: 'thread-new-ack',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-new-ack' }),
+    )
+    // Ungated before: the pane stays on the OLD conversation until the close lands.
+    const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(before.content).toMatchObject({ sessionId: 'thread-new-ack', status: 'idle' })
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-new-ack',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(after.content).toMatchObject({ status: 'creating' })
+      expect((after.content as { sessionId?: string }).sessionId).toBeUndefined()
+    })
+  })
+
+  it('keeps the current conversation when the new-conversation close is not durably recorded', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-new-fail',
+        sessionId: 'thread-new-fail',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-new-fail',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+      })
+    }
+    await waitFor(() => {
+      // The KILL_FAILED banner state is folded (close flows never drop the
+      // conversation on an unrecorded close).
+      expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-new-fail']?.lastErrorCode).toBe('KILL_FAILED')
+    })
+    const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(after.content).toMatchObject({ sessionId: 'thread-new-fail', status: 'idle' })
+  })
+
   it('routes FreshOpenCode forks through the pane cwd', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
@@ -4102,6 +4257,7 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_fork_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      tabId: 'tab-1',
       cwd: '/repo/route-aware',
       input: { atTurnId: 'turn-route-fork' },
     })
@@ -4119,7 +4275,7 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-flash',
         sessionId: 'thread-flash',
         status: 'idle',
-        model: 'gpt-5.5',
+        model: 'gpt-6-astra',
         effort: 'max',
       },
     }))
@@ -4135,34 +4291,34 @@ describe('FreshAgentView', () => {
     // separate Thinking dropdown. Only the compact Model row remains.
     expect(screen.queryByRole('radiogroup', { name: 'Model' })).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox', { name: 'Thinking level' })).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /GPT-5\.5 · max.*Change/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /GPT-6 Astra · max.*Change/ })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /Change/ }))
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
 
-    // GPT-5.4 Flash declares none..high (no xhigh/max); levels arrive in
+    // GPT-5.6 Luna declares the current GPT-5.6 reasoning levels in
     // canonical order.
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const levelTexts = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
     expect(levelTexts.map((text) => text?.replace(/last used|highest|current|●/g, '').trim())).toEqual(
-      ['none', 'minimal', 'low', 'medium', 'high'],
+      ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · high' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · max' }))
 
     await waitFor(() => {
       const layout = store.getState().panes.layouts['tab-1']
       expect(layout?.type).toBe('leaf')
-      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.4-flash')
-      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.6-luna')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('max')
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
           freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
-            effort: 'high',
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
+            effort: 'max',
           },
         },
       },
@@ -4181,7 +4337,7 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-persist-settings',
         sessionId: 'thread-persist-settings',
         status: 'idle',
-        model: 'gpt-5.4-flash',
+        model: 'gpt-5.6-luna',
         permissionMode: 'on-request',
         effort: 'medium',
       },
@@ -4195,13 +4351,13 @@ describe('FreshAgentView', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
     // Thinking now persists through the Change… dialog, not a retired dropdown.
-    fireEvent.click(screen.getByRole('button', { name: /GPT-5\.4 Flash · medium.*Change/ }))
+    fireEvent.click(screen.getByRole('button', { name: /GPT-5\.6 Luna · medium.*Change/ }))
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     const highOption = Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('high'))
     expect(highOption).toBeDefined()
     fireEvent.click(highOption!)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · high' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · high' }))
     fireEvent.change(screen.getByRole('combobox', { name: 'Permission mode' }), {
       target: { value: 'never' },
     })
@@ -4210,7 +4366,7 @@ describe('FreshAgentView', () => {
       freshAgent: {
         providers: {
           freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
             effort: 'high',
           },
         },
@@ -4237,7 +4393,7 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-style',
         sessionId: 'thread-style',
         status: 'idle',
-        model: 'gpt-5.4-flash',
+        model: 'gpt-5.6-luna',
         effort: 'high',
         style: 'sans',
       },
@@ -5157,6 +5313,104 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.send').at(-1)?.requestId).toBe(requestId)
   })
 
+  it('clears local echo when the server normalizes the submitted text (e.g. strips quoting)', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_echo_normalized',
+        revision: 1,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_echo_normalized',
+        revision: 2,
+        status: 'running',
+        capabilities: { send: false, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-real-user',
+            turnId: 'turn-real-user',
+            role: 'user',
+            summary: 'Do the thing',
+            items: [{ id: 'item-real-user', kind: 'text', text: 'Do the thing' }],
+          },
+          {
+            id: 'turn-real-assistant',
+            turnId: 'turn-real-assistant',
+            role: 'assistant',
+            summary: 'Working',
+            items: [{ id: 'item-real-assistant', kind: 'text', text: 'Working' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-echo-normalized',
+        sessionId: 'ses_echo_normalized',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_echo_normalized' },
+        resumeSessionId: 'ses_echo_normalized',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    // User wraps in quotes; the opencode normalizer strips them server-side
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '"Do the thing"' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    // The local echo shows the raw text (with quotes)
+    expect(screen.getByText('"Do the thing"')).toBeInTheDocument()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_echo_normalized',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId: 'ses_echo_normalized',
+          status: 'running',
+          latestTurnId: 'turn-real-assistant',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Working')).toBeInTheDocument()
+    })
+    // The echo should be cleared — only the server's normalized turn should be visible
+    expect(screen.getAllByText('Do the thing')).toHaveLength(1)
+    expect(screen.queryByText('"Do the thing"')).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+  })
+
   it('keeps local echo when an older snapshot response is ignored after send acceptance', async () => {
     const store = createStore()
     let wsHandler: ((message: any) => void) | undefined
@@ -5283,7 +5537,7 @@ describe('FreshAgentView', () => {
     })
 
     expect(screen.getByText('Codex turn')).toBeInTheDocument()
-    expect(screen.queryByRole('radio', { name: 'GPT-5.5' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: 'GPT-6 Astra' })).not.toBeInTheDocument()
     expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
@@ -5468,7 +5722,7 @@ describe('FreshAgentView', () => {
       sessionId: 'codex-thread-lost',
       sessionType: 'freshcodex',
       provider: 'codex',
-      model: 'gpt-5.5',
+      model: 'gpt-6-astra',
     }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
@@ -6343,6 +6597,76 @@ describe('FreshAgentView transcript font size', () => {
   })
 })
 
+describe('freshcodex wedged-sidecar notice', () => {
+  // Same store-backed render shape as the 'composer focus on pane activation
+  // (0bc6)' harness above: a mounted freshcodex pane whose live status flows
+  // from the freshAgent slice (the stuck card reads the store status, not the
+  // persisted pane content).
+  function renderFocusPane(options?: { sessionId?: string; status?: string }) {
+    const store = createStore()
+    const sessionId = options && 'sessionId' in options ? options.sessionId : 'thread-stuck-1'
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-focus-0bc6',
+            sessionId,
+            status: options?.status ?? 'idle',
+          }}
+        />
+      </Provider>,
+    )
+    return { store }
+  }
+
+  function dispatchStuck(store: ReturnType<typeof createStore>) {
+    act(() => {
+      store.dispatch(setSessionStatus({
+        sessionId: 'thread-stuck-1', sessionType: 'freshcodex', provider: 'codex', status: 'stuck',
+      }))
+    })
+  }
+
+  it('renders the stuck notice with restart and start-new actions', async () => {
+    const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
+    dispatchStuck(store)
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/appears stuck/i)
+    expect(screen.getByRole('button', { name: /restart sidecar and resume session/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
+  })
+
+  it('Restart sidecar kills the wedged session then re-mints a creating pane on the canonical resume id', async () => {
+    const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
+    // Install the spy BEFORE the stuck fold re-renders: the click closure
+    // captures `dispatch` at render time (react-redux useDispatch), so a spy
+    // installed after the last render would observe nothing.
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    dispatchStuck(store)
+    await screen.findByRole('alert')
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-stuck-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    const remints = dispatchSpy.mock.calls
+      .map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+        && action.payload?.content?.status === 'creating')
+    expect(remints).toHaveLength(1)
+    expect(remints[0].payload.content.resumeSessionId).toBe('thread-stuck-1')
+    expect(remints[0].payload.content.sessionId).toBeUndefined()
+    expect(remints[0].payload.content.createRequestId).not.toBe('req-focus-0bc6')
+  })
+})
+
 describe('snapshot scheduler integration (zrrj)', () => {
   const SCHED_SESSION_ID = 'ses_late_change'
 
@@ -6564,7 +6888,7 @@ describe('FreshAgentView /model slash command', () => {
       content: modelCommandPaneContent({
         sessionType: 'freshcodex',
         provider: 'codex',
-        model: 'gpt-5.5',
+        model: 'gpt-6-astra',
         effort: 'max',
       }),
     }))

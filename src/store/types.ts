@@ -21,6 +21,7 @@ import type {
 } from '@shared/settings'
 import type { CodingCliProviderName, TokenSummary, SessionLocator } from '@shared/ws-protocol'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
+import type { TitleSource } from '../../shared/title-source'
 export type { CodingCliProviderName }
 
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
@@ -110,6 +111,16 @@ export interface CodingCliSession {
   gitBranch?: string
   isDirty?: boolean
   tokenUsage?: TokenSummary
+  /**
+   * b5fb provenance exposure for the reviewed reset flow: true exactly when a
+   * stored titleOverride currently applies to this row; `providerTitle` is the
+   * parsed pre-override title (absent when none was parsed);
+   * `titleOverrideSource` is the applied override's recorded titleSource
+   * (absent when the override never recorded one).
+   */
+  titleOverridden?: boolean
+  providerTitle?: string
+  titleOverrideSource?: TitleSource
 }
 
 export interface ProjectGroup {

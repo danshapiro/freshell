@@ -99,6 +99,7 @@ pub(crate) fn record_for_child(
         created_at: 1_700_000_000_000,
         updated_at: 1_700_000_000_001,
         state: SidecarRecordState::Active,
+        lane: None,
     }
 }
 

@@ -93,9 +93,9 @@ RUN scripts/verify-container-layout.sh --fixture /app --runtime-root
 
 ENV FRESHELL_E2E_RUST_SERVER_BIN=/app/target/release/freshell-server
 
-COPY docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
-# COPY preserves checkout permissions; Bash needs read access as USER node.
-RUN chmod 0755 /usr/local/bin/e2e-entrypoint.sh
+# COPY preserves checkout permissions; use an explicit mode because a private
+# checkout can otherwise bake a 0700 script that USER node cannot read.
+COPY --chmod=755 docker/cloud-run/entrypoint.sh /usr/local/bin/e2e-entrypoint.sh
 
 # The browser test harness needs an unprivileged user for permission checks.
 RUN chown -R node:node /app

@@ -24,6 +24,7 @@ const wsHarness = vi.hoisted(() => {
   const latestAttachRequestIdByTerminal = new Map<string, string>()
   const addedRestoreIds = new Set<string>()
   const addedFreshRecoveryIds = new Map<string, string>()
+  const recoveredLiveTerminalTargets = new Map<string, string>()
 
   const withCurrentAttachRequestId = (msg: any) => {
     if (
@@ -82,12 +83,24 @@ const wsHarness = vi.hoisted(() => {
       addedRestoreIds.delete(id)
       return intent
     },
+    // Mirrors src/lib/terminal-restore.ts's recovered-live-terminal target arm
+    // (focused-ep6 r5): one-shot tabId:paneId -> terminalId consult before create.
+    armRecoveredLiveTerminalTarget(tabId: string, paneId: string, terminalId: string) {
+      recoveredLiveTerminalTargets.set(`${tabId}:${paneId}`, terminalId)
+    },
+    consumeRecoveredLiveTerminalTarget(tabId: string, paneId: string) {
+      const key = `${tabId}:${paneId}`
+      const terminalId = recoveredLiveTerminalTargets.get(key)
+      if (terminalId !== undefined) recoveredLiveTerminalTargets.delete(key)
+      return terminalId
+    },
     reset() {
       messageHandlers.clear()
       reconnectHandlers.clear()
       latestAttachRequestIdByTerminal.clear()
       addedRestoreIds.clear()
       addedFreshRecoveryIds.clear()
+      recoveredLiveTerminalTargets.clear()
     },
   }
 })
@@ -107,6 +120,10 @@ vi.mock('@/lib/terminal-restore', () => ({
   clearTerminalRestoreRequestId: (id: string) => wsHarness.clearRestoreRequestId(id),
   addTerminalFreshRecoveryRequestId: (id: string, intent: string) => wsHarness.addFreshRecoveryRequestId(id, intent),
   consumeTerminalFreshRecoveryRequest: (id: string) => wsHarness.consumeFreshRecoveryRequest(id),
+  armRecoveredLiveTerminalTarget: (tabId: string, paneId: string, terminalId: string) =>
+    wsHarness.armRecoveredLiveTerminalTarget(tabId, paneId, terminalId),
+  consumeRecoveredLiveTerminalTarget: (tabId: string, paneId: string) =>
+    wsHarness.consumeRecoveredLiveTerminalTarget(tabId, paneId),
 }))
 
 vi.mock('@/lib/terminal-themes', () => ({

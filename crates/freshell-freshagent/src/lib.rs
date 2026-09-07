@@ -39,6 +39,7 @@
 pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
+pub(crate) mod codex_sidecar_tracking;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
@@ -46,7 +47,6 @@ pub mod model_capabilities;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
-pub mod rename_persistence;
 pub mod rollback_record;
 pub mod session_lease;
 pub mod snapshot;
@@ -67,11 +67,11 @@ pub use claude_snapshot::{
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
-    SinkWrite,
+    BindProvenance, ClaimCommit, CloseAnswer, FreshAgentBindingUpsert, FreshAgentSettings,
+    PaneIdentitySink, ProvenanceUpdate, SharedPaneIdentitySink, SinkAliasClearWrite,
+    SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
-pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
 pub use rollback_record::{
     now_ms, rollback_ack_frame, rollback_broadcast_frame, rollback_error_frame, RollbackDirection,
     RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest, CODEX_OLD_CLI_COPY,
@@ -312,21 +312,6 @@ pub struct FreshAgentState {
     /// snapshot) everywhere it isn't wired, matching the other Slice-1/3a
     /// fields' "unwired == degrades honestly" convention.
     pub layout: layout_store::LayoutStore,
-    /// Task 16 (`PATCH /api/panes/:id` cascade): the injected `configStore`
-    /// seam (`persistSyncableTerminalRename`'s terminal/session override
-    /// writes, `router.ts:681-683`) — `freshell-server`'s `main.rs` wires its
-    /// `SettingsRenamePersistence` here via [`Self::with_rename_persistence`].
-    /// `None` until wired (the `amplifier_locator` Option-until-wired
-    /// convention): the rename still lands in the layout store, only the
-    /// persistence cascade is skipped (Node's own `!configStore` guard,
-    /// `router.ts:668`).
-    pub(crate) rename_persistence: Option<Arc<dyn rename_persistence::RenamePersistence>>,
-    /// Task 16: the SAME handler-scoped `terminals.changed` revision counter
-    /// the WS lifecycle + REST `/api/terminals` broadcasts stamp (`main.rs`),
-    /// wired via [`Self::with_shared_terminals_revision`] so the rename
-    /// cascade's broadcast draws from the ONE monotonic sequence. `None`
-    /// until wired — the cascade then skips the broadcast honestly.
-    pub(crate) terminals_revision: Option<Arc<AtomicI64>>,
     /// Fix round 1 (Task 23 gap): the injectable post-create seam Node covers
     /// with the registry's `'terminal.created'` EVENT (`server/index.ts:647-655`
     /// -> `seedFromTerminal` for EVERY terminal, REST creates included). The
@@ -341,7 +326,7 @@ pub struct FreshAgentState {
     /// WS `terminal.create` path gets. Fired by
     /// [`terminal_tabs::spawn_terminal_pane`] after every successful
     /// REST-pipeline create (tab create, pane split, restore). `None` until
-    /// wired (the `rename_persistence` convention): creates proceed, only the
+    /// wired (the Option-until-wired convention): creates proceed, only the
     /// meta seeding is skipped.
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
     /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
@@ -450,8 +435,6 @@ impl FreshAgentState {
             on_stale_resume: None,
             sidecar_liveness: None,
             layout: layout_store::LayoutStore::default(),
-            rename_persistence: None,
-            terminals_revision: None,
             terminal_created_hook: None,
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
@@ -631,33 +614,14 @@ impl FreshAgentState {
         self
     }
 
-    /// Task 16 (`PATCH /api/panes/:id` cascade): wire in the production
-    /// [`RenamePersistence`] (`freshell-server`'s `SettingsRenamePersistence`
-    /// over the live settings store). Unwired == the rename route still
-    /// renames the store and broadcasts `ui.command{pane.rename}`, it just
-    /// skips the syncable-terminal persistence cascade.
-    pub fn with_rename_persistence(mut self, persistence: Arc<dyn RenamePersistence>) -> Self {
-        self.rename_persistence = Some(persistence);
-        self
-    }
-
     /// Fix round 1 (Task 23 gap): wire the post-create hook `freshell-server`
     /// uses to run the WS-parity meta seed -> async git enrich ->
     /// `terminal.meta.updated` broadcast for every REST-pipeline create (see
     /// the field doc for why this seam exists). Unwired == creates proceed,
-    /// meta seeding skipped. Mirrors [`Self::with_rename_persistence`].
+    /// meta seeding skipped. Mirrors the established `with_*` builder pattern
+    /// (e.g. [`Self::with_shared_sessions_revision`]).
     pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
         self.terminal_created_hook = Some(hook);
-        self
-    }
-
-    /// Task 16: share the ONE handler-scoped `terminals.changed` revision
-    /// counter (`main.rs`'s `terminals_revision`, also stamped by the WS
-    /// lifecycle and REST `/api/terminals` broadcasts) so the rename
-    /// cascade's `terminals.changed` never regresses the client's
-    /// revision watermark. Mirrors [`Self::with_shared_sessions_revision`].
-    pub fn with_shared_terminals_revision(mut self, revision: Arc<AtomicI64>) -> Self {
-        self.terminals_revision = Some(revision);
         self
     }
 
@@ -1618,6 +1582,15 @@ fn build_opencode_snapshot_json(
             // UNSUPPORTED_CAPABILITY (Task 1's pinned copy), never at stamp time.
             "undo": true,
             "redo": true,
+            // kata z7j7: model/effort are per-send (merged into the POST
+            // /session/:id/prompt_async body); sandbox/permissionMode have no
+            // opencode wire concept.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            },
         }),
     );
     snapshot.insert("tokenUsage".to_string(), opencode_token_usage(info));
@@ -2203,19 +2176,23 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
 /// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane in the
 /// SHARED server-side layout store (Task 16 — kills D10's fake acknowledgement,
 /// which answered `{paneId, tabRenamed:false}` for ANY id without touching any
-/// state). Node behavior, clause for clause:
+/// state). Behavior, clause for clause:
 ///
 /// 1. name validation (blank → 400 `name required`; >500 → 400 length message);
-/// 2. `getPaneSnapshot` BEFORE the rename (the cascade reads PRE-rename content);
-/// 3. `renamePane` outcome — a miss answers 200 `ok({message})`
+/// 2. `renamePane` outcome — a miss answers 200 `ok({message})`
 ///    (`'pane not found'` / `'no layout snapshot'`, `router.ts:1411`+`:1423`);
-/// 4. on success, the best-effort syncable-terminal cascade
-///    ([`rename_persistence::persist_syncable_terminal_rename`]);
-/// 5. `tabRenamed` = the tab has exactly one pane — computed against the
+/// 3. `tabRenamed` = the tab has exactly one pane — computed against the
 ///    client snapshot where the pane resolved (multi-client store; Node reads
 ///    its single snapshot); broadcast
 ///    `ui.command{pane.rename,{tabId,paneId,title}}`; respond
 ///    `ok({tabId, paneId, tabRenamed}, 'pane renamed')`.
+///
+/// b5fb: the rename is LAYOUT-ONLY. Pane labels never touch the terminal
+/// registry title or durable session/terminal title overrides — the
+/// syncable-terminal persistence cascade (`persistSyncableTerminalRename`,
+/// formerly `rename_persistence::persist_syncable_terminal_rename`) was
+/// removed, and `PATCH /api/sessions/:key` is now the sole durable
+/// session-rename surface.
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -2236,9 +2213,6 @@ async fn rename_pane(
         );
     }
 
-    // Snapshot BEFORE the rename (`router.ts:1407`) so the cascade sees the
-    // pane's pre-rename content (terminalId/mode/session fields).
-    let pane_snapshot = state.layout.get_pane_snapshot(&pane_id);
     let outcome = state.layout.rename_pane(&pane_id, &name);
 
     let Some(tab_id) = outcome.tab_id else {
@@ -2249,10 +2223,6 @@ async fn rename_pane(
     };
     // `result.paneId || paneId` (`router.ts:1420`).
     let pane_id = outcome.pane_id.unwrap_or(pane_id);
-
-    if let Some(snapshot) = pane_snapshot.as_ref() {
-        rename_persistence::persist_syncable_terminal_rename(&state, snapshot, &name).await;
-    }
 
     // `tabRenamed` = single-pane tab (`router.ts:1414-1415`), computed from
     // the client snapshot where the pane actually RESOLVED (multi-client
@@ -2389,6 +2359,16 @@ async fn send_keys(
                         .map(str::to_string),
                     resolves_pending: Some(pane.placeholder_id.clone()),
                     supersedes: None,
+                    // D8 (restore-open-sessions-only): REST/MCP lineage rows
+                    // intentionally stamp NO provenance — no browser client
+                    // connection exists at bind time, so there is nothing true
+                    // to attribute. Delta-r2 Finding 2: `Clear` (not merely
+                    // no-stamps) — a headless re-bind of a browser-stamped row
+                    // must ERASE the stale browser attribution instead of
+                    // inheriting it under a refreshed `updated_at`; rows
+                    // without attribution are never offered by the recovery
+                    // judgment (`recovery_inventory.rs`).
+                    provenance: identity_sink::ProvenanceUpdate::Clear,
                     settings: identity_sink::FreshAgentSettings {
                         model: pane.model.clone(),
                         sandbox: None,
@@ -2531,7 +2511,28 @@ async fn capture(
         .cloned()
     {
         Some(pane) => pane,
-        None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
+        None => {
+            // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to
+            // `fresh-agent` by a remote client's layout sync): mirror the Node
+            // capture route's pane-kind gate (router.ts:955-959) — every
+            // non-terminal layout kind answers the 422 validation wording the
+            // `content_panes` branch in terminal_tabs.rs already emits, rather
+            // than falling through to an unhandled 500 (Node, pre-fix) or a
+            // misleading 404. Runtime-backed fresh-agent panes resolved above;
+            // layout-visible terminal kinds and unknown ids keep 404
+            // `pane not found`.
+            if let Some(snap) = state.layout.get_pane_snapshot(&pane_id) {
+                if let Some(kind) = snap.kind.as_deref().filter(|k| *k != "terminal") {
+                    return fail_json(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "pane kind \"{kind}\" does not support capture-pane; use screenshot-pane"
+                        ),
+                    );
+                }
+            }
+            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
+        }
     };
     let Some(durable_id) = pane.durable_id else {
         // No turn yet → empty transcript (text/plain), matching a fresh pane.
@@ -3635,6 +3636,15 @@ mod tests {
         // SEND's requestId and the REST path stamped `None`; the placeholder
         // is the lineage source of truth on both paths now.
         assert_eq!(b.create_request_id.as_deref(), Some("r1"));
+        // Delta-r2 Finding 2 pin: the REST/MCP materialization lane is
+        // EXPLICITLY headless — its write must CLEAR any prior browser stamps
+        // on the row, never inherit them (a kept stamp under the refreshed
+        // `updated_at` would launder the row into the D8 recovery offer).
+        assert_eq!(
+            b.provenance,
+            identity_sink::ProvenanceUpdate::Clear,
+            "the REST lineage write is a provenance Clear"
+        );
         // A settings-bearing row keeps "recorded" status under the new keying.
         drop(bindings);
         assert!(fake.was_recorded("opencode", "ses_1"));
@@ -4198,6 +4208,17 @@ mod tests {
         let info = json!({ "id": "ses_x", "title": "t", "time": { "updated": 5 } });
         let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
         assert_eq!(snap["capabilities"]["undo"], json!(true));
+        // kata z7j7: opencode advertises per-send model/effort; sandbox and
+        // permissionMode have no opencode wire contract.
+        assert_eq!(
+            snap["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            })
+        );
         assert_eq!(snap["capabilities"]["redo"], json!(true));
         assert_eq!(
             snap["rollback"],
@@ -4328,8 +4349,8 @@ mod tests {
 // ── PATCH /api/panes/:id (rename pane) ───────────────────────────────────
 
 #[cfg(test)]
-#[path = "rename_cascade_tests.rs"]
-mod rename_cascade_tests;
+#[path = "rename_route_tests.rs"]
+mod rename_route_tests;
 
 #[cfg(test)]
 mod rename_pane_tests {

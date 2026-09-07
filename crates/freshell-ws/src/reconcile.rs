@@ -557,6 +557,8 @@ mod tests {
                     mode: provider,
                     cwd: None,
                     create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                     now_ms,
                 })
                 .expect("ledger bind");
@@ -747,6 +749,8 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: Some("cr-never"),
+                origin_create_request_id: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
             .expect("record binding");
@@ -772,6 +776,8 @@ mod tests {
                 mode: "claude",
                 cwd: None,
                 create_request_id: Some("cr-gone2"),
+                origin_create_request_id: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 1_000,
             })
             .expect("record binding");
@@ -858,7 +864,14 @@ mod tests {
     fn pending_marker_yields_fresh_by_race_not_silent_fresh() {
         let f = Fixture::new();
         f.ledger
-            .record_pending("T-race", "opencode", None, 1_000)
+            .record_pending(
+                "T-race",
+                "opencode",
+                None,
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("record pending");
         let mut p = pane("cr-race");
         p.mode = Some("opencode".to_string());
@@ -879,7 +892,14 @@ mod tests {
     fn marker_read_is_idempotent_across_reconciles() {
         let f = Fixture::new();
         f.ledger
-            .record_pending("T-race2", "opencode", None, 1_000)
+            .record_pending(
+                "T-race2",
+                "opencode",
+                None,
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("record pending");
         let mut p = pane("cr-race2");
         p.mode = Some("opencode".to_string());
@@ -901,7 +921,14 @@ mod tests {
     fn shell_pane_ignores_pending_markers() {
         let f = Fixture::new();
         f.ledger
-            .record_pending("T-sh", "shell", None, 1_000)
+            .record_pending(
+                "T-sh",
+                "shell",
+                None,
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                1_000,
+            )
             .expect("record pending");
         let mut p = pane("cr-sh");
         p.mode = Some("shell".to_string());

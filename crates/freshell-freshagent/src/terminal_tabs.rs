@@ -2891,7 +2891,7 @@ mod tests {
         assert_eq!(event.cwd.as_deref(), Some(tmp.to_string_lossy().as_ref()));
     }
 
-    /// The hook is optional wiring (the `rename_persistence` convention):
+    /// The hook is optional wiring (the Option-until-wired convention):
     /// an unwired state creates terminals exactly as before -- no panic, no
     /// behavior change (every pre-existing test in this module already runs
     /// unwired; this pins the contract explicitly).
@@ -6674,5 +6674,54 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("use screenshot-pane"));
+    }
+
+    #[tokio::test]
+    async fn capture_layout_synced_legacy_fresh_agent_pane_is_422() {
+        // Mirrors the e2e kata scenario
+        // (test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts:402-424):
+        // a legacy `agent-chat` pane arrives through the layout sync path, is
+        // normalized to `fresh-agent` by the layout store's migration, and
+        // exists in NO runtime pane map.
+        let state = state_with_registry();
+        state.layout.update_from_ui(
+            &serde_json::from_value::<freshell_protocol::UiLayoutSync>(json!({
+                "tabs": [{ "id": "t1" }],
+                "activeTabId": "t1",
+                "layouts": {
+                    "t1": {
+                        "type": "leaf",
+                        "id": "pane-legacy-agent",
+                        "content": {
+                            "kind": "agent-chat",
+                            "provider": "claude",
+                            "resumeSessionId": "11111111-1111-4111-8111-111111111111"
+                        }
+                    }
+                },
+                "activePane": { "t1": "pane-legacy-agent" },
+                "timestamp": 1
+            }))
+            .expect("UiLayoutSync parses"),
+            "conn-1",
+        );
+        let router = app(state);
+
+        let (status, body) = get(router, "/api/panes/pane-legacy-agent/capture", true).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["message"],
+            json!("pane kind \"fresh-agent\" does not support capture-pane; use screenshot-pane")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_unknown_pane_still_404s_pane_not_found() {
+        // Guard: no layout sync, no runtime maps — the pre-existing unknown-pane
+        // answer is unchanged by the layout consult.
+        let state = state_with_registry();
+        let (status, body) = get(app(state), "/api/panes/nope/capture", true).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["message"], json!("pane not found"));
     }
 }

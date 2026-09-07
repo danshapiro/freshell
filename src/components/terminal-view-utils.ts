@@ -88,6 +88,7 @@ export function buildTerminalResizeMessage(
 export function buildTerminalAttachMessage(input: {
   content: TerminalPaneContent | null | undefined
   terminalId: string
+  tabId?: string
   intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
   cols: number
   rows: number
@@ -108,8 +109,18 @@ export function buildTerminalAttachMessage(input: {
   maxReplayBytes?: number
   expectedSessionRef?: SessionLocator
   surfaceReset?: boolean
+  createRequestId?: string
+  tabId?: string
 } {
   const expectedSessionRef = getExpectedSessionRefForTerminalOperation(input.content)
+  // Delta-r7-r2 (Finding F3): the attach carries the attaching pane's
+  // createRequestId + tab so the server can re-stamp the terminal's Bound
+  // ledger row onto THIS pane's identity (a sidebar reattach becomes the
+  // row's pane key; the OLD pane's close record keeps covering only the old
+  // pane).
+  const createRequestId = input.content?.kind === 'terminal' && input.content.createRequestId
+    ? input.content.createRequestId
+    : undefined
   return {
     type: 'terminal.attach',
     terminalId: input.terminalId,
@@ -122,6 +133,8 @@ export function buildTerminalAttachMessage(input: {
     ...(input.maxReplayBytes ? { maxReplayBytes: input.maxReplayBytes } : {}),
     ...(input.surfaceReset ? { surfaceReset: true } : {}),
     ...(expectedSessionRef ? { expectedSessionRef } : {}),
+    ...(createRequestId ? { createRequestId } : {}),
+    ...(input.tabId ? { tabId: input.tabId } : {}),
   }
 }
 

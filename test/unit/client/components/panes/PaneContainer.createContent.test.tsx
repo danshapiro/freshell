@@ -430,7 +430,7 @@ describe('createContentForType with ext: prefix', () => {
           enabled: true,
           providers: {
             freshcodex: {
-              modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+              modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
               defaultPermissionMode: 'never',
               effort: 'high',
               style: 'serif',
@@ -465,8 +465,8 @@ describe('createContentForType with ext: prefix', () => {
       if (paneContent.kind !== 'fresh-agent') return
       expect(paneContent.sessionType).toBe('freshcodex')
       expect(paneContent.provider).toBe('codex')
-      expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'gpt-5.4-flash' })
-      expect(paneContent.model).toBe('gpt-5.4-flash')
+      expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'gpt-5.6-luna' })
+      expect(paneContent.model).toBe('gpt-5.6-luna')
       expect(paneContent.permissionMode).toBe('never')
       expect(paneContent.effort).toBe('high')
       expect(paneContent.style).toBe('serif')
@@ -562,7 +562,7 @@ describe('createContentForType with ext: prefix', () => {
       </Provider>,
     )
 
-    const hostStatsButton = document.querySelector('[aria-label="Host Stats"]') as HTMLElement
+    const hostStatsButton = document.querySelector('[aria-label="System Status"]') as HTMLElement
     expect(hostStatsButton).not.toBeNull()
     fireEvent.click(hostStatsButton)
     fireEvent.transitionEnd(getPickerContainer())
@@ -588,6 +588,6 @@ describe('createContentForType with ext: prefix', () => {
       </Provider>,
     )
 
-    expect(document.querySelector('[aria-label="Host Stats"]')).toBeNull()
+    expect(document.querySelector('[aria-label="System Status"]')).toBeNull()
   })
 })

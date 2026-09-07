@@ -474,6 +474,92 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 
+  it('folds freshAgent.status(stuck) into the store and dispatches no turn-completion action', () => {
+    // Wedged-sidecar deadman fold: the status must land (and stop the
+    // busy-driving streaming flag) WITHOUT fabricating a completion edge —
+    // the deadman never fabricates a `freshAgent.turn.complete`, so no
+    // turnCompletion/* action may be dispatched, ever. The pane layout below
+    // is seeded so a (hypothetical, forbidden) completion thunk would resolve
+    // its target and dispatch turnCompletion/recordTurnComplete — the pin
+    // would catch it.
+    const actionTypes: string[] = []
+    const store = createFreshAgentPaneStore(actionTypes)
+    const sessionId = 'thread-stuck-1'
+
+    store.dispatch(initLayout({
+      tabId: 'tab-stuck',
+      paneId: 'pane-stuck',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        createRequestId: 'req-stuck',
+        status: 'running',
+      },
+    }))
+
+    // Mid-turn shape: running + streaming, exactly what the deadman fires into.
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId,
+        latestTurnId: null,
+        status: 'running',
+        streamingActive: true,
+        revision: 1,
+      },
+    })).toBe(true)
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`].streamingActive).toBe(true)
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: { type: 'freshAgent.status', sessionId, status: 'stuck' },
+    })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
+    expect(session.status).toBe('stuck')
+    expect(session.streamingActive).toBe(false)
+    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toHaveLength(0)
+  })
+
+  it('keeps the session and surfaces an error when an event-wrapped killed reports success:false', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-kill-fails'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle' })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeDefined()
+
+    // The server's durable close FAILED (delta-r6-r2 Finding 5): the session
+    // was not killed server-side, so the client must not proceed as though
+    // it was — keep the record and surface the failure, like any other
+    // session-scoped error frame.
+    expect(sendEvent({ type: 'freshAgent.killed', success: false })).toBe(true)
+    const session = store.getState().freshAgent.sessions[key]
+    expect(session).toBeDefined()
+    expect(session.lastErrorCode).toBe('KILL_FAILED')
+    expect(session.lastError).toContain('still be running')
+
+    // A follow-up SUCCESS still folds to removal (idempotent close).
+    expect(sendEvent({ type: 'freshAgent.killed', success: true })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
+  })
+
   it('folds freshAgent.question.cancelled into removeQuestion and sits in the snapshot-invalidating set', async () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-question-cancel'

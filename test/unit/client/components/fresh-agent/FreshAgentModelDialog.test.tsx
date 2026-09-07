@@ -8,6 +8,7 @@ import { useAppSelector } from '@/store/hooks'
 import panesReducer, { initLayout, mergePaneContent } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
+import type { FreshAgentSettingScopes } from '@shared/fresh-agent-contract'
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
   type: 'settings/saveServerSettingsPatch',
@@ -151,7 +152,7 @@ function seedFreshcodexPane(
   seedPane(store, {
     sessionType: 'freshcodex',
     provider: 'codex',
-    model: 'gpt-5.5',
+    model: 'gpt-6-astra',
     effort: 'max',
     ...overrides,
   })
@@ -183,7 +184,7 @@ function seedKilroyPane(
   })
 }
 
-function StoreBackedDialog(props: { open: boolean; onClose?: () => void; onCatalogUnavailable?: () => void }) {
+function StoreBackedDialog(props: { open: boolean; onClose?: () => void; onCatalogUnavailable?: () => void; settingScopes?: FreshAgentSettingScopes }) {
   const paneContent = useAppSelector((state) => {
     const layout = state.panes.layouts['tab-1']
     if (!layout || layout.type !== 'leaf' || layout.id !== 'pane-1' || layout.content.kind !== 'fresh-agent') {
@@ -199,6 +200,7 @@ function StoreBackedDialog(props: { open: boolean; onClose?: () => void; onCatal
       open={props.open}
       onClose={props.onClose ?? (() => {})}
       {...(props.onCatalogUnavailable ? { onCatalogUnavailable: props.onCatalogUnavailable } : {})}
+      settingScopes={props.settingScopes}
     />
   )
 }
@@ -543,7 +545,7 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     const store = createStore()
     seedFreshcodexPane(store, { effort: 'low' })
     renderDialog(store, { open: true })
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.5 · low' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-6 Astra · low' }))
     expect(paneContent(store).effort).toBe('low')
   })
 
@@ -551,11 +553,11 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     const store = createStore()
     seedFreshcodexPane(store)
     const view = renderDialog(store, { open: true })
-    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.4 Flash/ }))
+    fireEvent.click(screen.getByRole('option', { name: /GPT-5\.6 Luna/ }))
     view.rerender(<Provider store={store}><StoreBackedDialog open={false} /></Provider>)
     view.rerender(<Provider store={store}><StoreBackedDialog open /></Provider>)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.5 · max' }))
-    expect(paneContent(store).model).toBe('gpt-5.5')
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-6 Astra · max' }))
+    expect(paneContent(store).model).toBe('gpt-6-astra')
   })
   it('uses the static freshcodex table without probing the catalog endpoint', async () => {
     const store = createStore()
@@ -566,14 +568,14 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(getFreshAgentModelCapabilitiesSpy).not.toHaveBeenCalled()
     // the current model is marked everywhere it appears (Recent + its group)
-    expect(screen.getAllByRole('option', { name: /GPT-5\.5.*current/ }).length).toBeGreaterThanOrEqual(1)
-    expect(screen.getByRole('option', { name: /GPT-5\.4 Flash/ })).toBeInTheDocument()
+    expect(screen.getAllByRole('option', { name: /GPT-6 Astra.*current/ }).length).toBeGreaterThanOrEqual(1)
+    expect(screen.getByRole('option', { name: /GPT-5\.6 Luna/ })).toBeInTheDocument()
 
-    // GPT-5.5 levels canonically ordered
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.5' })
+    // GPT-6 Astra levels canonically ordered
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-6 Astra' })
     const levelNames = Array.from(levelsList.querySelectorAll('[role="option"]')).map((el) => el.textContent)
-    expect(levelNames.map((name) => name?.replace(/last used|highest|current|●/g, '').trim())).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'max'])
-    expect(screen.getByRole('button', { name: 'Use GPT-5.5 · max' })).toBeInTheDocument()
+    expect(levelNames.map((name) => name?.replace(/last used|highest|current|●/g, '').trim())).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(screen.getByRole('button', { name: 'Use GPT-6 Astra · max' })).toBeInTheDocument()
   })
 
   it('commits a freshcodex model + level under the freshcodex provider defaults and MRU scope', async () => {
@@ -583,28 +585,28 @@ describe('FreshAgentModelDialog (freshcodex)', () => {
 
     renderDialog(store, { open: true, onClose })
 
-    fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.4 Flash/ }))
-    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.4 Flash' })
+    fireEvent.click(await screen.findByRole('option', { name: /GPT-5\.6 Luna/ }))
+    const levelsList = screen.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Luna' })
     fireEvent.click(Array.from(levelsList.querySelectorAll('[role="option"]')).find((el) => el.textContent?.includes('low'))!)
-    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.4 Flash · low' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use GPT-5.6 Luna · low' }))
 
     expect(onClose).toHaveBeenCalled()
     const content = paneContent(store)
-    expect(content.model).toBe('gpt-5.4-flash')
+    expect(content.model).toBe('gpt-5.6-luna')
     expect(content.effort).toBe('low')
 
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
       freshAgent: {
         providers: {
           freshcodex: {
-            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.6-luna' },
             effort: 'low',
           },
         },
       },
     })
     const levelMru = JSON.parse(window.localStorage.getItem('freshcodex.modelLevelMru.v1') ?? '[]')
-    expect(levelMru).toEqual([expect.objectContaining({ modelId: 'gpt-5.4-flash', level: 'low' })])
+    expect(levelMru).toEqual([expect.objectContaining({ modelId: 'gpt-5.6-luna', level: 'low' })])
   })
 })
 
@@ -836,5 +838,35 @@ describe('FreshAgentModelDialog (kilroy)', () => {
     await screen.findByRole('dialog', { name: 'Model and thinking level' })
     expect(screen.getByRole('option', { name: /Claude Opus 5 \(1M context\)/ })).toBeInTheDocument()
     expect(getFreshAgentModelCapabilitiesSpy).toHaveBeenCalledWith('kilroy', expect.objectContaining({ cwd: '/repo/project-a' }))
+  })
+})
+
+describe('FreshAgentModelDialog (scope-driven footer)', () => {
+  it('renders the create-only footer copy when settingScopes marks model and effort create-only', async () => {
+    const store = createStore()
+    seedFreshopencodePane(store)
+
+    renderDialog(store, {
+      open: true,
+      settingScopes: { model: 'create-only', effort: 'create-only' },
+    })
+
+    const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    expect(dialog).toHaveTextContent('applies at session start · becomes your default')
+    expect(dialog).not.toHaveTextContent('applies from your next message')
+  })
+
+  it('renders the per-send footer copy when settingScopes marks model and effort per-send', async () => {
+    const store = createStore()
+    seedFreshopencodePane(store)
+
+    renderDialog(store, {
+      open: true,
+      settingScopes: { model: 'per-send', effort: 'per-send' },
+    })
+
+    const dialog = await screen.findByRole('dialog', { name: 'Model and thinking level' })
+    expect(dialog).toHaveTextContent('applies from your next message · becomes your default')
+    expect(dialog).not.toHaveTextContent('applies at session start')
   })
 })

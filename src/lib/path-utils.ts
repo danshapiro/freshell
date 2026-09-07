@@ -70,3 +70,28 @@ export function joinPath(root: string, relativePath: string): string {
       : relativePath
   return `${trimmedRoot}${separator}${trimmedRelative}`
 }
+
+/**
+ * Extensions the client routes to an image viewer. Deliberately aligned with
+ * the `image/*` entries of the Rust byte-lane MIME table
+ * (crates/freshell-server/src/files.rs `local_file_content_type`), which the
+ * production self-hosted server uses to label exactly these correctly. The
+ * Node `/api/files/raw` route labels via send's vendored mime table, which
+ * serves `.avif` as application/octet-stream (pre-existing `/local-file` lane
+ * behavior); the named requirement (`.png`) renders on both servers.
+ */
+const IMAGE_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'bmp', 'avif', 'svg',
+])
+
+/**
+ * True when the final segment of a file path (absolute, tilde, relative, or
+ * Windows) ends in a known image extension, case-insensitively. Dotfiles
+ * like `/x/.png` have no extension and return false.
+ */
+export function isImageFilePath(filePath: string): boolean {
+  const segment = filePath.split(/[\\/]/).pop() ?? ''
+  const dot = segment.lastIndexOf('.')
+  if (dot <= 0) return false
+  return IMAGE_EXTENSIONS.has(segment.slice(dot + 1).toLowerCase())
+}

@@ -94,6 +94,16 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             mode,
             cwd,
             create_request_id,
+            origin_create_request_id: None, // the fallback keeps the write's own crid
+            // D8 (restore-open-sessions-only): REST/headless rows stamp NO
+            // provenance — there is no browser connection to attribute at bind
+            // time, and rows without attribution are never offered by the
+            // recovery ledger-only judgment (`recovery_inventory.rs`).
+            // Delta-r2 Finding 2: `Clear` (not merely no-stamps) — a headless
+            // re-bind of a browser-stamped row must ERASE the stale browser
+            // attribution instead of inheriting it under a refreshed
+            // `updated_at`.
+            provenance: crate::pane_ledger::ProvenancePolicy::Clear,
             now_ms: now_ms(),
         }) {
             Self::warn_write_failure(terminal_id, "pre-spawn claude binding (PIN 2)", &err);
@@ -149,6 +159,13 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
                 mode,
                 cwd,
                 create_request_id,
+                origin_create_request_id: None, // the fallback keeps the write's own crid
+                // D8: REST/headless lineage rows stay UNATTRIBUTED by design
+                // (no browser connection exists here) — unlike the WS create
+                // lane, which stamps from the connection identity + `tabId`.
+                // Delta-r2 Finding 2: `Clear` makes that an ERASE of any
+                // earlier browser stamps, never an inherit-forever.
+                provenance: crate::pane_ledger::ProvenancePolicy::Clear,
                 now_ms: now_ms(),
             }) {
                 Self::warn_write_failure(terminal_id, "post-spawn identity binding", &err);
@@ -158,7 +175,24 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
             // pane whose identity is still in flight (fresh codex/opencode/
             // amplifier -- trigger d): a durable pending marker from spawn
             // until resolution deletes it (binding-first order).
-            if let Err(err) = self.ledger.record_pending(terminal_id, mode, cwd, now_ms()) {
+            // Delta-r3 Finding 2: NO provenance stamps here — this lane is
+            // explicitly HEADLESS (no browser connection exists at create
+            // time, exactly its binding-write `Clear` policy), so a later
+            // locator/signal resolution of this marker still ends
+            // unattributed and the D8 judgment correctly never offers it.
+            if let Err(err) = self.ledger.record_pending(
+                terminal_id,
+                mode,
+                cwd,
+                // Lineage (delta-r7-round-3, Finding F1): the REST/headless
+                // lane stamps its own request id exactly like the WS lane —
+                // uniform marker shape; a REST-minted pane never carries a
+                // browser pane.closed (it is unattributed by design), so the
+                // key is inert there but never absent when the lane knows it.
+                create_request_id,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                now_ms(),
+            ) {
                 Self::warn_write_failure(terminal_id, "spawn-time pending marker", &err);
             }
         }
@@ -167,8 +201,10 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
     fn retire_pane_identity(&self, terminal_id: &str) {
         // The WS pane EXIT hook ONLY (terminal.rs:1334-1342) -- identity
         // retire + pending-marker delete, both called directly (sync). Do
-        // NOT port `retire_closed` from the kill path (handle_kill): that is
-        // the explicit-user-close trigger (P1.8 trigger (e)); a natural exit
+        // NOT port `retire_closed` from the kill paths (terminal.rs's
+        // `handle_kill`; the freshAgent providers' `handle_kill` since the
+        // delta-round-5 retire-on-kill repair): that is the
+        // explicit-user-close trigger (P1.8 trigger (e)); a natural exit
         // or crash must leave the ledger binding Bound, exactly like a WS
         // pane, so auto_resume::pre_respawn_guard (auto_resume.rs:445-450)
         // and the recovery inventory (RetiredReason::Closed keying,
@@ -379,6 +415,85 @@ mod tests {
     }
 
     #[test]
+    fn rest_lineage_rebind_clears_the_browser_stamps() {
+        use freshell_terminal::registry::PaneIdentityBinder as _;
+        // Delta-r2 Finding 2 (the laundering mechanism): a Bound row stamped
+        // by a browser create must NOT keep that attribution when the
+        // explicitly-HEADLESS REST/MCP lineage lane rebinds it — there is no
+        // browser connection on this lane, so a kept stamp plus the refreshed
+        // `updated_at` would keep the row inside the D8 grace window under a
+        // stale parent forever, offering a session that was not open.
+        let (b, ledger, _identity, dir) = binder("clear");
+        // Seed the browser-stamped row (the WS create lane's shape).
+        ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: SID,
+                terminal_id: "t-browser",
+                mode: "claude",
+                cwd: Some("/w"),
+                create_request_id: None,
+                origin_create_request_id: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                    crate::pane_ledger::ProvenanceStamps {
+                        client_instance_id: Some("client-1"),
+                        device_id: Some("device-1"),
+                        tab_key: Some("device-1:tab-1"),
+                        asserted_at: 1_000,
+                    },
+                ),
+                now_ms: 1_000,
+            })
+            .expect("seed browser-stamped row");
+        // The headless lineage lane rebinds the SAME (provider, session_id).
+        b.register_create_identity("t-rest-1", "claude", Some(SID), Some("/w"), Some("req-9"));
+        let row = ledger
+            .load_binding("claude", SID)
+            .expect("row survives the rebind");
+        assert_eq!(
+            row.client_instance_id, None,
+            "headless rebind clears the browser's clientInstanceId"
+        );
+        assert_eq!(row.device_id, None, "headless rebind clears the deviceId");
+        assert_eq!(row.tab_key, None, "headless rebind clears the tabKey");
+        assert_eq!(row.created_at, 1_000, "created_at is preserved on re-bind");
+        assert!(
+            row.updated_at > 1_000,
+            "updated_at still refreshes (the row is rewritten, just unattributed)"
+        );
+
+        // The pre-spawn PIN-2 arm is the same `Clear` lane: re-seed the
+        // stamps (a browser create), rebind headless, assert erased again.
+        ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: SID,
+                terminal_id: "t-browser",
+                mode: "claude",
+                cwd: Some("/w"),
+                create_request_id: None,
+                origin_create_request_id: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Replace(
+                    crate::pane_ledger::ProvenanceStamps {
+                        client_instance_id: Some("client-1"),
+                        device_id: Some("device-1"),
+                        tab_key: Some("device-1:tab-1"),
+                        asserted_at: 5_000,
+                    },
+                ),
+                now_ms: 5_000,
+            })
+            .expect("re-seed browser stamps");
+        b.record_prespawn_claude_binding(SID, "t-rest-2", "claude", Some("/w"), Some("req-10"));
+        let row = ledger.load_binding("claude", SID).expect("row");
+        assert_eq!(row.client_instance_id, None);
+        assert_eq!(row.device_id, None);
+        assert_eq!(row.tab_key, None);
+        assert_eq!(row.created_at, 1_000, "created_at survives every re-bind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn retire_pane_identity_retires_row_and_clears_pending() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         // Ledger A2: exit-side hygiene — retired rows must stop looking live.
@@ -398,7 +513,9 @@ mod tests {
         assert!(row.retired, "exit hook flips the retired flag");
         // NATURAL-EXIT contract pin: the durable ledger binding must STAY
         // Bound — retire_closed is the explicit-kill trigger
-        // (terminal.rs handle_kill), never the exit hook's. A still-Bound row
+        // (terminal.rs handle_kill, and the freshAgent providers' own
+        // handle_kill since the delta-round-5 retire-on-kill repair), never
+        // the exit hook's. A still-Bound row
         // after natural exit is load-bearing for
         // auto_resume::pre_respawn_guard and the recovery inventory's
         // RetiredReason::Closed keying.

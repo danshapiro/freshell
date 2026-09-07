@@ -13,6 +13,8 @@ export default {
         border: 'hsl(var(--border))',
         card: 'hsl(var(--card))',
         'card-foreground': 'hsl(var(--card-foreground))',
+        popover: 'hsl(var(--popover))',
+        'popover-foreground': 'hsl(var(--popover-foreground))',
         muted: 'hsl(var(--muted))',
         'muted-foreground': 'hsl(var(--muted-foreground))',
         accent: 'hsl(var(--accent))',

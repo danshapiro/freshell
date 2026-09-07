@@ -6,7 +6,7 @@
   "revision": 1753437600000,
   "latestTurnId": "44444444-4444-4444-8444-444444444444:5",
   "status": "idle",
-  "capabilities": { "send": true, "interrupt": true, "approvals": false, "questions": false, "fork": false, "undo": true, "redo": true },
+  "capabilities": { "send": true, "interrupt": true, "approvals": false, "questions": false, "fork": false, "undo": true, "redo": true, "settingScopes": { "model": "per-send", "effort": "per-send", "permissionMode": "per-send", "sandbox": "unsupported" } },
   "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
   "pendingApprovals": [],
   "pendingQuestions": [],

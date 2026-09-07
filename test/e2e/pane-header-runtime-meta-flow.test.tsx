@@ -25,6 +25,7 @@ import {
   resolveLocalSettings,
 } from '@shared/settings'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { installPaneGeometry } from '../helpers/pane-geometry'
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
@@ -351,6 +352,15 @@ function createStore(options?: {
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   HTMLElement.prototype.scrollIntoView = vi.fn()
+})
+
+const paneGeometry: { current: ReturnType<typeof installPaneGeometry> | null } = { current: null }
+beforeEach(() => {
+  paneGeometry.current = installPaneGeometry()
+})
+afterEach(() => {
+  paneGeometry.current?.restore()
+  paneGeometry.current = null
 })
 
 describe('pane header runtime metadata flow (e2e)', () => {

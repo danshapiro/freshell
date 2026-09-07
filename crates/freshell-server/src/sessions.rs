@@ -120,8 +120,10 @@ fn clean_string(v: Option<&Value>) -> Option<String> {
 /// `PATCH /api/sessions/:sessionId` — validate the `SessionPatchSchema` body,
 /// build the JS-spread patch tuple list, persist via
 /// `SettingsStore::patch_session_override`, and respond with the merged
-/// override plus the always-`null` `cascadedTerminalId` (the terminal-cascade
-/// rename is out of scope for this port).
+/// override plus `cascadedTerminalId`: `null` unless this session is running
+/// in a LIVE terminal, in which case the terminal's label is renamed and its
+/// terminal id is returned (the session→terminal live mirror below; the
+/// reverse terminal→session cascade was removed by b5fb).
 async fn patch_session(
     State(state): State<SessionsState>,
     AxumPath(raw_id): AxumPath<String>,
@@ -151,6 +153,12 @@ async fn patch_session(
         // titleSource:'user' only when a non-empty title is present (sessions-router.ts:132-133).
         if title.is_some() {
             patch.push(("titleSource", Some(json!("user"))));
+        } else {
+            // b5fb: an explicit clear removes BOTH keys — a leftover
+            // titleSource:"user" would permanently finalize the row at the top
+            // rung and block every automatic title update afterwards
+            // (migrations.rs:77-81 clears the same pair).
+            patch.push(("titleSource", None));
         }
     }
     if body.get("summaryOverride").is_some() {

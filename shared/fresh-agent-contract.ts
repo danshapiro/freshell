@@ -11,6 +11,16 @@ export const FreshAgentThreadLocatorSchema = z.object({
 
 export const FreshAgentRequestIdSchema = z.union([z.string().min(1), z.number().int()])
 
+export const FreshAgentSettingScopeSchema = z.enum(['per-send', 'create-only', 'unsupported'])
+export type FreshAgentSettingScope = z.infer<typeof FreshAgentSettingScopeSchema>
+export const FreshAgentSettingScopesSchema = z.object({
+  model: FreshAgentSettingScopeSchema.optional(),
+  effort: FreshAgentSettingScopeSchema.optional(),
+  sandbox: FreshAgentSettingScopeSchema.optional(),
+  permissionMode: FreshAgentSettingScopeSchema.optional(),
+}).strict()
+export type FreshAgentSettingScopes = z.infer<typeof FreshAgentSettingScopesSchema>
+
 export const FreshAgentCapabilitiesSchema = z.object({
   send: z.boolean(),
   interrupt: z.boolean(),
@@ -24,6 +34,10 @@ export const FreshAgentCapabilitiesSchema = z.object({
   // (TS) servers — the client treats absent as false.
   undo: z.boolean().optional(),
   redo: z.boolean().optional(),
+  // kata z7j7: per-knob application scope advertisement ('per-send' = mid-session
+  // honored; 'create-only' = applied only at session create; 'unsupported' = the
+  // provider has no concept for the knob).
+  settingScopes: FreshAgentSettingScopesSchema.optional(),
 }).strict()
 
 export const FreshAgentTokenUsageSchema = z.object({

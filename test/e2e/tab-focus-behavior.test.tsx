@@ -13,12 +13,28 @@ import TerminalView from '@/components/TerminalView'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 
-const wsMocks = vi.hoisted(() => ({
-  send: vi.fn(),
-  connect: vi.fn().mockResolvedValue(undefined),
-  onMessage: vi.fn().mockReturnValue(() => {}),
-  onReconnect: vi.fn().mockReturnValue(() => {}),
-}))
+const wsMocks = vi.hoisted(() => {
+  const messageHandlers = new Set<(msg: any) => void>()
+  return {
+    send: vi.fn(),
+    connect: vi.fn().mockResolvedValue(undefined),
+    onMessage: vi.fn((handler: (msg: any) => void) => {
+      messageHandlers.add(handler)
+      return () => messageHandlers.delete(handler)
+    }),
+    onReconnect: vi.fn().mockReturnValue(() => {}),
+    emit(msg: any) {
+      for (const handler of [...messageHandlers]) handler(msg)
+    },
+    reset() {
+      messageHandlers.clear()
+      this.send.mockClear()
+      this.connect.mockClear()
+      this.onMessage.mockClear()
+      this.onReconnect.mockClear()
+    },
+  }
+})
 
 const terminalInstances: Array<{ focus: ReturnType<typeof vi.fn> }> = []
 
@@ -173,10 +189,7 @@ function FocusHarness() {
 
 describe('tab focus behavior (e2e)', () => {
   beforeEach(() => {
-    wsMocks.send.mockClear()
-    wsMocks.connect.mockClear()
-    wsMocks.onMessage.mockClear()
-    wsMocks.onReconnect.mockClear()
+    wsMocks.reset()
     terminalInstances.length = 0
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
@@ -236,7 +249,7 @@ describe('tab focus behavior (e2e)', () => {
     })
   })
 
-  it('closing a split tab detaches all pane terminals', async () => {
+  it('closing a split tab journals one confirmed batch pane close, then detaches all pane terminals', async () => {
     const store = configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -328,13 +341,47 @@ describe('tab focus behavior (e2e)', () => {
     const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
     fireEvent.click(closeButton)
 
-    const detachMessages = wsMocks.send.mock.calls
-      .map(([msg]) => msg)
-      .filter((msg) => msg?.type === 'terminal.detach')
+    // The whole-tab close is ONE acknowledged batch envelope (focused-episode-7
+    // r3): ONE `panes.closed` carrying the tab's frozen identity set must be
+    // confirmed durable before ANY layout state moves.
+    let batchRequestId: string | undefined
+    await waitFor(() => {
+      const batch = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'panes.closed')
+      expect(batch).toMatchObject({
+        tabId: 'tab-1',
+        panes: [
+          { createRequestId: 'req-pane-1', terminalId: 'term-a' },
+          { createRequestId: 'req-pane-2', terminalId: 'term-b' },
+        ],
+      })
+      batchRequestId = batch.requestId
+    })
 
-    expect(detachMessages).toEqual([
-      { type: 'terminal.detach', terminalId: 'term-a' },
-      { type: 'terminal.detach', terminalId: 'term-b' },
-    ])
+    // Unconfirmed close: the tab and its layout still stand, and no terminal
+    // subscription has been released yet.
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(
+      wsMocks.send.mock.calls.map(([msg]) => msg).some((msg) => msg?.type === 'terminal.detach'),
+    ).toBe(false)
+
+    // The server confirms the durable batch close; the removal may now land.
+    await act(async () => {
+      wsMocks.emit({ type: 'panes.closed.result', requestId: batchRequestId, success: true })
+    })
+
+    // Once confirmed, the tab is removed and the detach reconciler releases
+    // each pane's terminal subscription (last reference to each terminal gone).
+    await waitFor(() => {
+      expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(false)
+      const detachMessages = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toEqual([
+        { type: 'terminal.detach', terminalId: 'term-a' },
+        { type: 'terminal.detach', terminalId: 'term-b' },
+      ])
+    })
   })
 })

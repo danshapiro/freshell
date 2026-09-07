@@ -3,10 +3,23 @@
 //! injects this adapter at wiring time.
 
 use freshell_freshagent::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord, SinkWrite,
+    BindProvenance, ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink,
+    RollbackRecord, SinkAliasClearWrite, SinkCloseError, SinkCloseWrite, SinkCommitWrite,
+    SinkWrite,
 };
-use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
+use freshell_ws::pane_ledger::{CloseEnvelopeError, FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
+
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the ledger's classed
+/// close-envelope error maps onto the fresh-agent crate's mirror type —
+/// the kill lanes' [`crate`]-visible contract (`Clean` ⇒ touch nothing;
+/// `Persisted` ⇒ the close is durable: end the session, fail visibly).
+fn map_close_envelope_error(err: CloseEnvelopeError) -> SinkCloseError {
+    match err {
+        CloseEnvelopeError::Clean(e) => SinkCloseError::Clean(e),
+        CloseEnvelopeError::Persisted(e) => SinkCloseError::Persisted(e),
+    }
+}
 
 pub struct LedgerIdentitySink {
     ledger: Arc<PaneLedger>,
@@ -41,9 +54,25 @@ impl PaneIdentitySink for LedgerIdentitySink {
         );
         let now = now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.record_pending(&p, &m, c.as_deref(), now))
-                .await
-                .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
+            // Delta-r3 Finding 2: fresh-agent markers carry NO spawn-time
+            // provenance. Their identity resolves through
+            // `record_fresh_agent_binding` + `delete_pending(resolves_pending)`
+            // (the upsert's own tri-state provenance, parked from the create)
+            // — never through `resolve_pending`, whose marker-stamp sourcing
+            // exists for the terminal-lineage locator/candidate lanes. Stamps
+            // here would be dead data.
+            tokio::task::spawn_blocking(move || {
+                ledger.record_pending(
+                    &p,
+                    &m,
+                    c.as_deref(),
+                    None,
+                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                    now,
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
         })
     }
 
@@ -52,6 +81,32 @@ impl PaneIdentitySink for LedgerIdentitySink {
         let now = now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                // Delta-r2 Finding 2: the upsert's tri-state provenance policy
+                // maps verbatim onto the ledger's own tri-state; the merge
+                // (Replace per-field / Inherit keep / Clear erase) lives in
+                // the ledger itself.
+                let provenance = match &upsert.provenance {
+                    freshell_freshagent::ProvenanceUpdate::Replace(stamps) => {
+                        // Focused-ep4-r2 Findings 1+2: the assertion time
+                        // rides the value across the crate boundary — the
+                        // ledger records `asserted_at` (captured at WS message
+                        // receipt), never this write's own `now_ms`.
+                        freshell_ws::pane_ledger::ProvenancePolicy::Replace(
+                            freshell_ws::pane_ledger::ProvenanceStamps {
+                                client_instance_id: stamps.client_instance_id.as_deref(),
+                                device_id: stamps.device_id.as_deref(),
+                                tab_key: stamps.tab_key.as_deref(),
+                                asserted_at: stamps.asserted_at,
+                            },
+                        )
+                    }
+                    freshell_freshagent::ProvenanceUpdate::Inherit => {
+                        freshell_ws::pane_ledger::ProvenancePolicy::Inherit
+                    }
+                    freshell_freshagent::ProvenanceUpdate::Clear => {
+                        freshell_ws::pane_ledger::ProvenancePolicy::Clear
+                    }
+                };
                 let w = FreshAgentBindingWrite {
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
@@ -63,6 +118,7 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     permission_mode: upsert.settings.permission_mode.as_deref(),
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
+                    provenance,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
@@ -141,6 +197,39 @@ impl PaneIdentitySink for LedgerIdentitySink {
         Some(s)
     }
 
+    fn load_provenance(&self, provider: &str, session_id: &str) -> Option<BindProvenance> {
+        // Focused-ep1-r4 Finding 2: the row's CURRENT stamps, memory-only via
+        // the same write-through read + fresh-agent gate as `load_settings`
+        // (terminal-lineage rows are not resume records). Unlike
+        // `load_settings` this is settings-INDEPENDENT — a stamped row answers
+        // even when its settings snapshot is blank (lineage-only): provenance
+        // lives on the row, not on the settings columns. An all-`None` answer
+        // is reported as absence (never `Some(default)`).
+        let row = self.ledger.load_binding(provider, session_id)?;
+        if row.pane_kind.as_deref() != Some("fresh-agent") {
+            return None;
+        }
+        let p = BindProvenance {
+            client_instance_id: row.client_instance_id,
+            device_id: row.device_id,
+            tab_key: row.tab_key,
+            // Focused-ep4-r2 Findings 1+2: the row read re-arms the value with
+            // its row-recorded assertion time so a re-parked/fork-resolved
+            // value keeps the ROW's attribution (`last_attributed_at`;
+            // `created_at` only when the field is absent — defensive coverage
+            // for intermediate-branch-build rows, since the D8 judgment
+            // (focused-ep4-r4 Finding 1) has no `created_at` fallback and
+            // never offers such a row as-is), never this read's wall clock.
+            asserted_at: row.last_attributed_at.unwrap_or(row.created_at),
+        };
+        // An all-`None` STAMPS answer is information-free — never returned as
+        // `Some(..)` (the check is stamp-fields only: the asserted_at fallback
+        // above is nonzero for any real row and must not synthesize
+        // provenance out of an unstamped one).
+        (p.client_instance_id.is_some() || p.device_id.is_some() || p.tab_key.is_some())
+            .then_some(p)
+    }
+
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
         // Task 3 rekeying: "recorded" now means a SETTINGS-BEARING fresh-agent
         // row (the ledger predicate `fresh_agent_settings_recorded`), NOT just
@@ -164,6 +253,194 @@ impl PaneIdentitySink for LedgerIdentitySink {
         self.ledger
             .lookup_by_create_request_id(provider, create_request_id)
             .map(|row| row.session_id)
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): the
+    /// kill handlers' awaited retire batch — the same awaited-spawn_blocking
+    /// discipline as `record_binding`. Delta-r6-r4 (focused-episode-6 round
+    /// 3, Finding 3): the ledger's close is ONE journal record and its error
+    /// is CLASSED — `Clean` (nothing durable; the caller fails the kill and
+    /// touches nothing) vs `Persisted` (the close IS durable despite the
+    /// reported error; the caller ends the session and fails visibly). The
+    /// pre-journal model's tombstone/retire split pair and its compensation
+    /// machinery are gone — there is no second write to fail past the first.
+    /// The class maps through to the lanes unchanged.
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || ledger.retire_closed(&p, &s, now))
+                .await
+                .map_err(|join| {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(
+                        std::io::Error::other(join),
+                    )
+                })?;
+            result.map_err(map_close_envelope_error)
+        })
+    }
+
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5), re-durabled by
+    /// delta-r6-r4 (round 3, Finding 3): the batched close every fresh-agent
+    /// kill lane uses — the whole identity set (plus the pending markers,
+    /// last) journals into the ledger's ONE close-envelope record (see the
+    /// trait doc; the wire id — the caller's first id — addresses it). Same
+    /// awaited-spawn_blocking + class-mapping discipline as `retire_closed`.
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkCloseWrite {
+        let ledger = self.ledger.clone();
+        let p = provider.to_string();
+        let ids = session_ids.to_vec();
+        let pendings = pending_ids.to_vec();
+        let now = now_ms();
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.close_identities(&p, &ids, &pendings, now)
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(map_close_envelope_error)
+        })
+    }
+
+    /// The PENDING companion of [`Self::retire_closed`]: delete the pending
+    /// marker. Same awaited-write discipline; a missing marker is `Ok` (the
+    /// ledger's own idempotence).
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = placeholder_id.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    /// The tombstone lifecycle transition (focused-ep5-r1 Finding 2): a
+    /// genuine claim (explicit resume/attach) clears the kill tombstone so
+    /// the claim's own binding write is never suppressed. Same
+    /// awaited-spawn_blocking discipline as `retire_closed`; a missing
+    /// tombstone is the ledger's own `Ok` idempotence. Round 4 callership:
+    /// the claude claim lane's consumed placeholder-alias fences only (the
+    /// claimed durable's own fence moved into `commit_claim`).
+    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_kill_tombstone(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    /// The claim attempt's dead-state snapshot (focused-ep5-r3 Finding 1) —
+    /// read inline against the write-through index, like `load_settings`.
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.ledger.kill_tombstone_at(provider, session_id)
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
+    /// retention probe — the row's raw Bound state, read inline against the
+    /// write-through index like [`Self::kill_tombstone_at_ms`].
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.ledger.row_is_bound(provider, session_id)
+    }
+
+    /// The claim commit (focused-ep5-r3 Findings 1+3): ONE conditional
+    /// durable transition — clear + revive atomically, refused wholesale
+    /// (no side effects) when the identity's dead-state advanced past the
+    /// claim-start snapshot. Same awaited-spawn_blocking discipline as every
+    /// write lane; the conditional semantics and the commit ordering live
+    /// entirely in the ledger.
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
+    }
+
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6): pass-through like
+    /// [`Self::commit_claim`] — the alias-existence gate and the conditional
+    /// transition both live atomically inside the ledger's guarded section.
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let aliases: Vec<String> = fence_checked_aliases.to_vec();
+        let now = now_ms();
+        Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                ledger.commit_claim_aliased(&p, &s, expect_killed_at_ms, &aliases, now)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok(match outcome {
+                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
+                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
+                    ClaimCommit::RefusedStale
+                }
+            })
+        })
+    }
+
+    /// Focused-ep5-r5 Finding 2: the durable alias record — same
+    /// awaited-spawn_blocking discipline as `retire_closed`.
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, ph, d) = (
+            provider.to_string(),
+            placeholder.to_string(),
+            durable.to_string(),
+        );
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    /// The kill consult's sync read — memory-only inline pass-through like
+    /// [`Self::kill_tombstone_at_ms`].
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
+        self.ledger.alias_tombstone_records(provider, placeholder)
+    }
+
+    /// The claim consumption's awaited pass-through (the durable half of
+    /// clear-for-durable).
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite {
+        let ledger = self.ledger.clone();
+        let (p, d) = (provider.to_string(), durable.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
+                .await
+                .map_err(std::io::Error::other)?
+        })
     }
 
     /// kata 1wxv: await the rollback-record row write BEFORE the provider
@@ -234,6 +511,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -328,6 +606,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -371,6 +650,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: Some("old-uuid".into()),
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: settings.clone(),
         })
         .await
@@ -392,6 +672,7 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: Some("old-thread".into()),
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings,
         })
         .await
@@ -514,6 +795,264 @@ mod tests {
         );
     }
 
+    /// D8 (restore-open-sessions-only): the adapter must carry the upsert's
+    /// provenance through to the ledger row — a dropped mapping at this seam
+    /// would silently orphan the parent-relative recovery judgment's inputs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_binding_maps_provenance_into_the_ledger_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Replace(
+                freshell_freshagent::BindProvenance {
+                    client_instance_id: Some("client-1".into()),
+                    device_id: Some("device-1".into()),
+                    tab_key: Some("device-1:tab-1".into()),
+                    asserted_at: 7_777,
+                },
+            ),
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        let row = ledger.load_binding("opencode", "ses_prov").expect("row");
+        assert_eq!(row.client_instance_id.as_deref(), Some("client-1"));
+        assert_eq!(row.device_id.as_deref(), Some("device-1"));
+        assert_eq!(row.tab_key.as_deref(), Some("device-1:tab-1"));
+    }
+
+    /// Focused-ep4-r2 Findings 1+2 (the seam the WS fresh-agent create lanes
+    /// write through): the provenance VALUE carries its assertion time across
+    /// the crate boundary — even when the sink's write lands 30s later than
+    /// the value's capture (a fresh-agent create whose slow spawn/SDK init
+    /// completes after the pane's tab state moved on), the row attributes at
+    /// `asserted_at`, never at the write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_binding_attributes_at_the_values_assertion_time_not_the_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let asserted = now_ms() - 30_000; // "provenance captured 30s before the write"
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_late".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Replace(
+                freshell_freshagent::BindProvenance {
+                    client_instance_id: Some("client-1".into()),
+                    device_id: Some("device-1".into()),
+                    tab_key: Some("device-1:tab-1".into()),
+                    asserted_at: asserted,
+                },
+            ),
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        let row = ledger.load_binding("opencode", "ses_late").expect("row");
+        assert_eq!(
+            row.last_attributed_at,
+            Some(asserted),
+            "the value's assertion time, not the sink's write clock"
+        );
+        assert!(
+            row.updated_at > asserted,
+            "the write itself still lands at write time ({})",
+            row.updated_at
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 2 (the seam the cold-attach seeding reads
+    /// through): `load_provenance` over the REAL pane ledger — the row's
+    /// stamps round-trip (settings-independently: even a stamped lineage-only
+    /// row), a later conn-less (all-`None`/`Inherit`) write keeps them via
+    /// the ledger's OWN preserve rule (not a fake mirror), a genuinely
+    /// unattributed row answers `None`, and a terminal-pane row (no
+    /// `pane_kind`) is gated out exactly like `load_settings`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_provenance_round_trips_stamps_through_the_real_ledger_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        assert!(
+            sink.load_provenance("opencode", "nope").is_none(),
+            "no row -> None"
+        );
+
+        // A stamped LINEAGE-ONLY row (blank settings) answers its stamps.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-x".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Replace(
+                freshell_freshagent::BindProvenance {
+                    client_instance_id: Some("client-1".into()),
+                    device_id: Some("device-1".into()),
+                    tab_key: Some("device-1:tab-1".into()),
+                    asserted_at: 7_777,
+                },
+            ),
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("awaited write succeeds");
+        let p = sink
+            .load_provenance("opencode", "ses_prov")
+            .expect("the stamped row answers (settings-independent)");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
+        assert_eq!(p.device_id.as_deref(), Some("device-1"));
+        assert_eq!(p.tab_key.as_deref(), Some("device-1:tab-1"));
+
+        // A conn-less refresh (all-`None` stamps) keeps them — the REAL
+        // ledger's `Inherit` preserve, end to end.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_prov".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("awaited conn-less refresh succeeds");
+        let p = sink
+            .load_provenance("opencode", "ses_prov")
+            .expect("the conn-less preserve kept the stamps");
+        assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
+
+        // A genuinely unattributed row answers None — never Some(default).
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_unstamped".into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        assert_eq!(sink.load_provenance("opencode", "ses_unstamped"), None);
+
+        // A terminal-pane row (no `pane_kind`) is NOT a resume record even
+        // when stamped — the same gate `load_settings` applies.
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider: "opencode",
+                session_id: "ses_terminal",
+                mode: "shell",
+                terminal_id: "term-1",
+                cwd: Some("/w"),
+                create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Replace(
+                    freshell_ws::pane_ledger::ProvenanceStamps {
+                        client_instance_id: Some("client-term"),
+                        device_id: Some("device-term"),
+                        tab_key: Some("device-term:tab-term"),
+                        asserted_at: 7_777,
+                    },
+                ),
+                now_ms: 42,
+            })
+            .expect("terminal binding write ok");
+        assert_eq!(
+            sink.load_provenance("opencode", "ses_terminal"),
+            None,
+            "terminal-lineage rows are gated out (the load_settings gate's twin)"
+        );
+    }
+
+    /// Delta-r2 Finding 2 (seam test): a freshagent-side `Clear` upsert (the
+    /// explicitly-headless REST/MCP lineage lanes) must reach the REAL ledger
+    /// as an ERASE — the browser stamps on the row are wiped, `updated_at`
+    /// still refreshes, and `created_at` is preserved. Without the mapping a
+    /// headless re-bind would keep the browser's attribution under a
+    /// refreshed timestamp and launder the row into the D8 offer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provenance_clear_reaches_the_ledger_and_erases_the_stamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let upsert = |provenance: freshell_freshagent::ProvenanceUpdate| FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: "ses_clr".into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some("cr-b".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+        sink.record_binding(upsert(freshell_freshagent::ProvenanceUpdate::Replace(
+            freshell_freshagent::BindProvenance {
+                client_instance_id: Some("client-1".into()),
+                device_id: Some("device-1".into()),
+                tab_key: Some("device-1:tab-1".into()),
+                asserted_at: 7_777,
+            },
+        )))
+        .await
+        .expect("browser-stamped write succeeds");
+        let stamped = ledger.load_binding("opencode", "ses_clr").expect("row");
+        assert_eq!(stamped.client_instance_id.as_deref(), Some("client-1"));
+
+        std::thread::sleep(std::time::Duration::from_millis(2)); // distinct updated_at
+        sink.record_binding(upsert(freshell_freshagent::ProvenanceUpdate::Clear))
+            .await
+            .expect("headless Clear rebind succeeds");
+        let cleared = ledger.load_binding("opencode", "ses_clr").expect("row");
+        assert_eq!(cleared.client_instance_id, None);
+        assert_eq!(cleared.device_id, None);
+        assert_eq!(cleared.tab_key, None);
+        assert_eq!(cleared.created_at, stamped.created_at);
+        assert!(
+            cleared.updated_at > stamped.updated_at,
+            "the row IS rewritten (updated_at refreshes), just unattributed"
+        );
+        assert_eq!(
+            sink.load_provenance("opencode", "ses_clr"),
+            None,
+            "the cleared row answers no provenance"
+        );
+    }
+
     /// resume path (sync, memory-only read).
     #[tokio::test(flavor = "multi_thread")]
     async fn lookup_by_create_request_id_resolves_the_durable_session() {
@@ -529,6 +1068,7 @@ mod tests {
             create_request_id: Some("cr-1".into()),
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             // Blank settings on purpose: lineage must resolve even for
             // lineage-only rows (settings-bearing-ness is unrelated).
             settings: FreshAgentSettings::default(),
@@ -546,6 +1086,623 @@ mod tests {
             None
         );
         assert_eq!(sink.lookup_by_create_request_id("codex", "cr-1"), None);
+    }
+
+    /// Retire-on-kill (delta-review round 5): the WS `freshAgent.kill`
+    /// handler body calls `sink.retire_closed` for every durable id the kill
+    /// covers; the sink must reach the REAL pane ledger — a Bound row ends
+    /// Retired with reason `closed` (durable on disk), an unknown or
+    /// already-retired row is an idempotent no-op, and `delete_pending`
+    /// removes a live marker (a kill observed before identity resolution must
+    /// not leave marker-driven evidence behind).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_closed_retires_the_row_and_delete_pending_clears_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "ses-to-kill".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        sink.record_pending("freshopencode-cr-kill", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
+        assert!(
+            ledger
+                .pending_for_terminal("freshopencode-cr-kill")
+                .is_some(),
+            "marker present before the kill"
+        );
+
+        sink.retire_closed("claude", "ses-to-kill")
+            .await
+            .expect("awaited retire succeeds");
+        let row = ledger.load_binding("claude", "ses-to-kill").expect("row");
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Retired);
+        assert_eq!(
+            row.retired_reason,
+            Some(freshell_ws::pane_ledger::RetiredReason::Closed)
+        );
+        // A fresh ledger over the same root sees the retirement (durable, not
+        // just memory) — the recovery inventory reads files at boot.
+        let ledger2 = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            ledger2
+                .load_binding("claude", "ses-to-kill")
+                .expect("row")
+                .state,
+            freshell_ws::pane_ledger::RowState::Retired,
+            "the retirement is durable on disk"
+        );
+
+        // Idempotent: an already-retired row re-retires to Ok, and an unknown
+        // row retires to Ok (a kill for an evicted session still lands).
+        sink.retire_closed("claude", "ses-to-kill")
+            .await
+            .expect("re-retire is an idempotent no-op");
+        sink.retire_closed("claude", "never-existed")
+            .await
+            .expect("unknown id retires to Ok");
+
+        sink.delete_pending("freshopencode-cr-kill")
+            .await
+            .expect("awaited marker delete succeeds");
+        assert!(
+            ledger
+                .pending_for_terminal("freshopencode-cr-kill")
+                .is_none(),
+            "the kill cleared the pending marker"
+        );
+        sink.delete_pending("never-recorded")
+            .await
+            .expect("missing marker deletes to Ok");
+    }
+
+    /// Delta-r6-r3 (focused-episode-6 round 2, Findings 4+5): the kill lanes'
+    /// ONE close envelope rides `retire_closed_batch` — SUCCESS: every id
+    /// ends tombstoned + Retired(Closed) and the pending markers delete, all
+    /// durable across a restart; FAILURE anywhere rolls the envelope's own
+    /// writes back (no partial closes survive to suppress a still-live
+    /// session) and the markers stand.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_closed_batch_closes_the_whole_envelope_or_nothing() {
+        use freshell_freshagent::PaneIdentitySink;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let bind = |id: &str, cr: &str| FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: id.into(),
+            mode: "freshopencode".into(),
+            create_request_id: Some(cr.into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+        sink.record_binding(bind("ses_x", "cr-x"))
+            .await
+            .expect("seed x");
+        sink.record_binding(bind("ses_y", "cr-y"))
+            .await
+            .expect("seed y");
+        sink.record_pending("ph-batch-sink", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
+
+        // SUCCESS: the whole envelope closes in one call.
+        sink.retire_closed_batch(
+            "opencode",
+            &["ses_x".to_string(), "ses_y".to_string()],
+            &["ph-batch-sink".to_string()],
+        )
+        .await
+        .expect("the batch close succeeds");
+        for id in ["ses_x", "ses_y"] {
+            let row = ledger.load_binding("opencode", id).expect("row");
+            assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Retired);
+            assert_eq!(
+                row.retired_reason,
+                Some(freshell_ws::pane_ledger::RetiredReason::Closed)
+            );
+            assert!(ledger.kill_tombstone_at("opencode", id).is_some());
+        }
+        assert!(
+            ledger.pending_for_terminal("ph-batch-sink").is_none(),
+            "the marker deleted with the close"
+        );
+        let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            disk.load_binding("opencode", "ses_x").expect("row").state,
+            freshell_ws::pane_ledger::RowState::Retired,
+            "durable across restart"
+        );
+        assert!(disk.kill_tombstone_at("opencode", "ses_y").is_some());
+
+        // FAILURE: re-seed two Bound rows, then break the ledger's
+        // close-envelope subtree (delta-r6-r4: THE durable act of the batch)
+        // — the batch must Err CLEAN (nothing durable of its own survives).
+        sink.record_binding(bind("ses_p", "cr-p"))
+            .await
+            .expect("seed p");
+        sink.record_binding(bind("ses_q", "cr-q"))
+            .await
+            .expect("seed q");
+        sink.record_pending("ph-batch-sink-2", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
+        let env_dir = tmp.path().join("close-envelopes");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = sink
+            .retire_closed_batch(
+                "opencode",
+                &["ses_p".to_string(), "ses_q".to_string()],
+                &["ph-batch-sink-2".to_string()],
+            )
+            .await
+            .expect_err("the broken close-envelope subtree fails the batch");
+        assert!(
+            !err.is_persisted(),
+            "the record provably never landed: a CLEAN failure (nothing durable)"
+        );
+        assert!(!err.to_string().is_empty());
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for id in ["ses_p", "ses_q"] {
+            let row = ledger.load_binding("opencode", id).expect("row");
+            assert_eq!(
+                row.state,
+                freshell_ws::pane_ledger::RowState::Bound,
+                "clean failure: {id}'s row is untouched by the failed close"
+            );
+            assert_eq!(
+                ledger.kill_tombstone_at("opencode", id),
+                None,
+                "clean failure: no fence residue for {id}"
+            );
+        }
+        assert!(
+            ledger.pending_for_terminal("ph-batch-sink-2").is_some(),
+            "markers delete only on a COMPLETE close"
+        );
+        // Healed retry: lands idempotently.
+        sink.retire_closed_batch(
+            "opencode",
+            &["ses_p".to_string(), "ses_q".to_string()],
+            &["ph-batch-sink-2".to_string()],
+        )
+        .await
+        .expect("the retried close lands");
+        for id in ["ses_p", "ses_q"] {
+            assert!(ledger.kill_tombstone_at("opencode", id).is_some());
+        }
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 2): `row_is_bound`
+    /// through the real ledger — the claude alias-tombstone retention probe.
+    /// Bound rows answer true; retired/unknown ids false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_is_bound_answers_the_ledgers_raw_row_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger);
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "ses-rb".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("awaited write succeeds");
+        assert!(
+            sink.row_is_bound("claude", "ses-rb"),
+            "a Bound row answers true"
+        );
+        sink.retire_closed("claude", "ses-rb")
+            .await
+            .expect("retire");
+        assert!(
+            !sink.row_is_bound("claude", "ses-rb"),
+            "a retired row answers false"
+        );
+        assert!(!sink.row_is_bound("claude", "never-written"));
+    }
+
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) through the sink
+    /// seam: only the row's bindings dir is read-only, so the ROW
+    /// PROJECTION cannot land while the journal record can. The close is the
+    /// record: the sink answers `Ok`, the fence stands durable (fed by the
+    /// record), and the Bound row reads dominated (never offered) until a
+    /// healed sweep converges it — the pre-journal model's compensated
+    /// split-pair cannot exist.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retire_whose_row_projection_fails_still_closes_through_the_sink() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "ses-comp".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("seed write");
+
+        // Only the row's bindings dir goes read-only (the projection's
+        // rename needs dir-write); the close-envelope tree stays writable.
+        let bindings_dir = tmp.path().join("bindings").join("claude");
+        std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        sink.retire_closed("claude", "ses-comp")
+            .await
+            .expect("the journal record lands; the projection is hygiene");
+        std::fs::set_permissions(&bindings_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            ledger.load_binding("claude", "ses-comp").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the projection never landed: raw Bound, masked by dominance (never offered)"
+        );
+        assert!(
+            ledger.kill_tombstone_at("claude", "ses-comp").is_some(),
+            "the close fence stands (fed by the journal record)"
+        );
+        assert!(
+            ledger
+                .dominant_kill_tombstone_keys()
+                .contains(&("claude".to_string(), "ses-comp".to_string())),
+            "the Bound row reads closed at every offer boundary"
+        );
+        let disk = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert!(
+            disk.kill_tombstone_at("claude", "ses-comp").is_some(),
+            "the fence is durable on disk (record-fed, restart-proof)"
+        );
+        // Healed sweep convergence is pinned at the ledger level
+        // (`a_close_is_one_record_and_a_failed_row_projection_is_dominance_covered_hygiene`).
+    }
+
+    /// Focused-ep5-r5 Finding 2 (retire-on-kill round 6) over the REAL
+    /// ledger, through the sink seam the claude lanes use: the alias record
+    /// writes round-trip durably (a fresh `PaneLedger` — the restart —
+    /// answers the consult), the claim consumption deletes per-durable
+    /// across placeholders, and `commit_claim_aliased`'s placeholder-fence
+    /// gate refuses under a fenced seat and commits over a clean one (with
+    /// the durable revive landing for real).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn alias_tombstones_and_the_aliased_commit_round_trip_through_the_real_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: "d-alias".into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        })
+        .await
+        .expect("row write");
+        sink.record_alias_tombstone("claude", "ph-a", "d-alias", 1_000)
+            .await
+            .expect("alias write a");
+        sink.record_alias_tombstone("claude", "ph-b", "d-alias", 2_000)
+            .await
+            .expect("alias write b");
+
+        // The restart boundary: a fresh ledger (and sink) over the same root
+        // answers the kill consult.
+        let ledger2 = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink2 = LedgerIdentitySink::new(ledger2.clone());
+        let mut records = sink2.alias_tombstone_records("claude", "ph-a");
+        records.sort();
+        assert_eq!(
+            records,
+            vec![("d-alias".to_string(), 1_000)],
+            "the persisted record answers across the scripted restart"
+        );
+
+        // The placeholder-fence gate: the pane seat's close blocks the commit.
+        sink2
+            .retire_closed("claude", "ph-seat")
+            .await
+            .expect("seat fence");
+        let outcome = sink2
+            .commit_claim_aliased("claude", "d-alias", None, &["ph-seat".to_string()])
+            .await
+            .expect("the commit answers");
+        assert_eq!(outcome, ClaimCommit::RefusedStale);
+        assert!(
+            ledger2.load_binding("claude", "d-alias").unwrap().state
+                == freshell_ws::pane_ledger::RowState::Bound,
+            "the refusal never touched the row"
+        );
+
+        // The clean-seat claim commits (durable closed first — the genuine
+        // reopen), and the consumption sweeps both placeholders.
+        sink2
+            .retire_closed("claude", "d-alias")
+            .await
+            .expect("close");
+        let fence = ledger2.kill_tombstone_at("claude", "d-alias");
+        let outcome = sink2
+            .commit_claim_aliased("claude", "d-alias", fence, &["ph-clean".to_string()])
+            .await
+            .expect("commit answers");
+        assert_eq!(outcome, ClaimCommit::Committed);
+        let cleared = sink2
+            .clear_alias_tombstones_for_durable("claude", "d-alias")
+            .await
+            .expect("consumption");
+        assert_eq!(cleared, vec!["ph-a".to_string(), "ph-b".to_string()]);
+        assert!(sink2.alias_tombstone_records("claude", "ph-a").is_empty());
+        assert!(sink2.alias_tombstone_records("claude", "ph-b").is_empty());
+        assert_eq!(
+            ledger2.load_binding("claude", "d-alias").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the committed reopen revived the row for real"
+        );
+    }
+
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2) over the REAL ledger,
+    /// through the sink seam the providers use: the kill's `retire_closed`
+    /// records the durable tombstone; a late in-flight `record_binding` (the
+    /// aborted-consumer orphan shape) is SUPPRESSED by it (no row appears —
+    /// and this holds under REAL CONCURRENCY: the kill and the write run on
+    /// parallel spawn_blocking tasks here, never a synchronous install); and
+    /// the genuine-claim `clear_kill_tombstone` reopens the identity so its
+    /// binding lands Bound again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_tombstone_fences_late_bindings_and_the_genuine_claim_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: session_id.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+
+        // Sequential sanity: kill first (no row yet — the finding's shape),
+        // the late write suppressed.
+        sink.retire_closed("claude", "durable-fence")
+            .await
+            .expect("retire ok");
+        sink.record_binding(upsert("durable-fence"))
+            .await
+            .expect("write ok");
+        assert!(
+            ledger.load_binding("claude", "durable-fence").is_none(),
+            "the tombstoned identity never gains a Bound row from a late write"
+        );
+
+        // The genuine claim reopens: clear, then the write lands Bound.
+        sink.clear_kill_tombstone("claude", "durable-fence")
+            .await
+            .expect("clear ok");
+        sink.record_binding(upsert("durable-fence"))
+            .await
+            .expect("claim write ok");
+        let row = ledger
+            .load_binding("claude", "durable-fence")
+            .expect("the claim's row exists");
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+
+        // REAL CONCURRENCY: the write and the kill launched together through
+        // the sink's own spawn_blocking hop — repeated, both start orders —
+        // must converge to not-Bound every time (the ledger's under-lock
+        // consult makes ordering the only variable, and both orders are safe).
+        for i in 0..32 {
+            let session_id = format!("durable-race-{i}");
+            // A second sink over the same ledger (the orphan's write path is
+            // the same choke point the kill consults).
+            let write_sink = LedgerIdentitySink::new(ledger.clone());
+            let kill_sink = LedgerIdentitySink::new(ledger.clone());
+            let (w, k) = if i % 2 == 0 {
+                let (w, k) = tokio::join!(
+                    write_sink.record_binding(upsert(&session_id)),
+                    kill_sink.retire_closed("claude", &session_id)
+                );
+                (w, k)
+            } else {
+                let (k, w) = tokio::join!(
+                    kill_sink.retire_closed("claude", &session_id),
+                    write_sink.record_binding(upsert(&session_id))
+                );
+                (w, k)
+            };
+            w.expect("write ok");
+            k.expect("retire ok");
+            let state = ledger.load_binding("claude", &session_id).map(|r| r.state);
+            assert!(
+                state != Some(freshell_ws::pane_ledger::RowState::Bound),
+                "iteration {i}: a killed identity converged to not-Bound, got {state:?}"
+            );
+        }
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), carried into round
+    /// 4's conditional single transition (focused-ep5-r3 Findings 1+3) over
+    /// the REAL ledger, through the sink seam the claim lanes use: the kill
+    /// closes (and fences) the row; `commit_claim` with the claim-START
+    /// snapshot (`kill_tombstone_at_ms`) returns it to Bound AND clears the
+    /// fence in one durable transition (a fresh ledger over the same root
+    /// agrees) — and the binding write the claim then lands is never
+    /// suppressed. A commit whose snapshot the dead-state has advanced past
+    /// REFUSES wholesale (no clear, no revive). The narrow cases: committing
+    /// over a never-fenced Bound row is a no-op (no timestamp churn), and an
+    /// unknown id gains no row (the V7 no-laundering discipline holds
+    /// through the new lane).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_claim_restores_a_killed_row_through_the_real_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone());
+        let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: session_id.into(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            settings: FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..FreshAgentSettings::default()
+            },
+        };
+
+        sink.record_binding(upsert("revive-1"))
+            .await
+            .expect("seed write");
+        sink.retire_closed("claude", "revive-1")
+            .await
+            .expect("kill closes");
+        assert_eq!(
+            ledger.load_binding("claude", "revive-1").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Retired,
+            "the kill closed the row"
+        );
+
+        // The claim's exact sequence: snapshot at claim start, then the ONE
+        // conditional commit — the fence clears AND the row revives together.
+        let snapshot = sink.kill_tombstone_at_ms("claude", "revive-1");
+        assert!(snapshot.is_some(), "the kill's fence is durable");
+        let outcome = sink
+            .commit_claim("claude", "revive-1", snapshot)
+            .await
+            .expect("claim commit ok");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
+        let row = ledger.load_binding("claude", "revive-1").unwrap();
+        assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+        assert_eq!(row.retired_reason, None);
+        assert_eq!(
+            sink.kill_tombstone_at_ms("claude", "revive-1"),
+            None,
+            "the fence cleared in the same transition"
+        );
+        let ledger2 = freshell_ws::pane_ledger::PaneLedger::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            ledger2.load_binding("claude", "revive-1").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the committed reopen is durable on disk"
+        );
+        // And the claim's own binding write is never fenced afterwards.
+        sink.record_binding(upsert("revive-1"))
+            .await
+            .expect("claim write");
+        assert_eq!(
+            ledger.load_binding("claude", "revive-1").unwrap().state,
+            freshell_ws::pane_ledger::RowState::Bound,
+            "the claim's write landed Bound"
+        );
+
+        // Narrow cases: a plain Bound row with NO fence is untouched
+        // (updated_at frozen), and an unknown id gains no row.
+        let before = ledger
+            .load_binding("claude", "revive-1")
+            .unwrap()
+            .updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let outcome = sink
+            .commit_claim("claude", "revive-1", None)
+            .await
+            .expect("noop commit ok");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
+        assert_eq!(
+            ledger
+                .load_binding("claude", "revive-1")
+                .unwrap()
+                .updated_at,
+            before,
+            "an unfenced re-claim is a true no-op"
+        );
+        let outcome = sink
+            .commit_claim("claude", "never-existed", None)
+            .await
+            .expect("unknown commit ok");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::Committed);
+        assert!(
+            ledger.load_binding("claude", "never-existed").is_none(),
+            "a never-recorded identity gains no row from a claim commit"
+        );
+
+        // The CONDITION (Finding 1): a newer close mid-claim refuses the
+        // commit wholesale — no clear, no revive, the row stays Retired.
+        sink.retire_closed("claude", "refuse-1")
+            .await
+            .expect("kill #1");
+        let stale_snapshot = None; // the claim believed the identity untouched
+        let outcome = sink
+            .commit_claim("claude", "refuse-1", stale_snapshot)
+            .await
+            .expect("refusal surfaces as an outcome, never an error");
+        assert_eq!(outcome, freshell_freshagent::ClaimCommit::RefusedStale);
+        assert!(
+            sink.kill_tombstone_at_ms("claude", "refuse-1").is_some(),
+            "the refusal never clears the newer fence"
+        );
     }
 
     /// Task 3 semantics change (`was_recorded` rekeying): a lineage-only
@@ -569,6 +1726,7 @@ mod tests {
             create_request_id: Some("cr-9".into()),
             resolves_pending: Some("freshopencode-cr-9".into()),
             supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings: FreshAgentSettings::default(),
         })
         .await

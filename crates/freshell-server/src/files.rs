@@ -115,6 +115,7 @@ pub fn router(state: FilesState) -> Router {
         .route("/api/files/candidate-dirs", get(candidate_dirs))
         .route("/api/files/validate-dir", post(validate_dir))
         .route("/api/files/read", get(read_file))
+        .route("/api/files/raw", get(raw_file))
         .route("/api/files/stat", get(stat_file))
         .route("/api/files/write", post(write_file))
         .route("/api/files/complete", get(complete))
@@ -244,6 +245,50 @@ async fn read_file(
                 }))
                 .into_response()
             }
+            Err(err) => internal_error(&err.to_string()),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => not_found("File not found"),
+        Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// `GET /api/files/raw?path=<p>` → raw bytes with the send-compatible
+/// Content-Type table (port of the Node `/api/files/raw` route in
+/// `server/files-router.ts`).
+///
+/// Unlike `/local-file` (deliberately unsandboxed for Browser-pane `file://`
+/// entries), this route resolves exactly like [`read_file`]: tilde
+/// expansion, flavor-aware normalization, and the live `allowedFilePaths`
+/// sandbox (403). Error shapes mirror `read_file` (`400"Cannot read
+/// directory"`, `404 "File not found"`); the byte lane reuses
+/// [`send_file_response`], so image extensions come back with their vendored
+/// `image/*` Content-Type — the pane viewer's render hook.
+async fn raw_file(
+    State(state): State<FilesState>,
+    headers: HeaderMap,
+    Query(q): Query<PathQuery>,
+) -> Response {
+    if !crate::boot::is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let Some(path) = q.path.filter(|p| !p.is_empty()) else {
+        return bad_request("path query parameter required");
+    };
+    let resolved = resolve_user_path(&path);
+    let settings = state.settings.get().await;
+    if !is_path_allowed(
+        resolved.sandbox_target(),
+        settings.allowed_file_paths.as_deref(),
+    ) {
+        return forbidden();
+    }
+    // Node's toFilesystemPath fallthrough — see read_file.
+    let resolved = resolved.fs_path.unwrap_or(resolved.display);
+    match std::fs::metadata(&resolved) {
+        Ok(meta) if meta.is_dir() => bad_request("Cannot read directory"),
+        Ok(meta) => match std::fs::read(&resolved) {
+            Ok(bytes) => send_file_response(&resolved, &meta, bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => not_found("File not found"),
             Err(err) => internal_error(&err.to_string()),
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => not_found("File not found"),
@@ -2573,5 +2618,87 @@ mod tests {
         let resp = get(&spaced).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_bytes(resp).await, b"space-name");
+    }
+
+    // ---- GET /api/files/raw (sandboxed raw-bytes lane — Node `/raw` parity port) ----
+
+    async fn raw_file_resp(state: &FilesState, headers: HeaderMap, path: Option<&str>) -> Response {
+        raw_file(
+            State(state.clone()),
+            headers,
+            Query(PathQuery {
+                path: path.map(str::to_string),
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn raw_file_serves_image_bytes_with_mime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF];
+        let png = tmp.path().join("img.png");
+        std::fs::write(&png, &bytes).unwrap();
+        let resp = raw_file_resp(&test_state(), auth_headers(), Some(&png.to_string_lossy())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        assert_eq!(body_bytes(resp).await, bytes, "binary bytes unmangled");
+    }
+
+    #[tokio::test]
+    async fn raw_file_missing_path_param_is_400_missing_file_is_404_dir_is_400() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let resp = raw_file_resp(&test_state(), auth_headers(), None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await["error"],
+            "path query parameter required"
+        );
+
+        let missing = tmp.path().join("nope.png");
+        let resp = raw_file_resp(
+            &test_state(),
+            auth_headers(),
+            Some(&missing.to_string_lossy()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(resp).await["error"], "File not found");
+
+        let resp = raw_file_resp(
+            &test_state(),
+            auth_headers(),
+            Some(&tmp.path().to_string_lossy()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "Cannot read directory");
+    }
+
+    #[tokio::test]
+    async fn raw_file_enforces_allowed_file_paths_sandbox() {
+        // R3 parity: the sandbox reads the LIVE SettingsStore (a PATCH
+        // /api/settings takes effect immediately), exactly like read_file.
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("img.png");
+        std::fs::write(&png, b"x").unwrap();
+
+        let state = test_state();
+        // SettingsStore::patch(&Value) — the same partial-settings patch API
+        // PATCH /api/settings uses; {} would fail unwrap, so unwrap to pin a
+        // valid patch body.
+        state
+            .settings
+            .patch(&json!({ "allowedFilePaths": ["/definitely-not-the-tmp-parent"] }))
+            .await
+            .unwrap();
+        let resp = raw_file_resp(&state, auth_headers(), Some(&png.to_string_lossy())).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(resp).await["error"], "Path not allowed");
     }
 }

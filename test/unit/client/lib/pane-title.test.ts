@@ -25,6 +25,8 @@ const opencodeContent: PaneContent = {
   createRequestId: 'req-1',
 }
 
+const hostStatsContent: PaneContent = { kind: 'host-stats' }
+
 describe('pane-title helpers', () => {
   it('matches extension-aware derived titles', () => {
     expect(matchesDerivedPaneTitle('OpenCode', opencodeContent, opencodeExtensions)).toBe(true)
@@ -44,5 +46,20 @@ describe('pane-title helpers', () => {
 
   it('preserves explicit runtime titles', () => {
     expect(getPaneDisplayTitle(opencodeContent, 'Release prep', opencodeExtensions)).toBe('Release prep')
+  })
+
+  it('treats every host-stats stored title as derived (legacy, canonical, or user-renamed)', () => {
+    // The host-stats pane is always named by the app: stored titles from
+    // before the rename, the canonical name, and hypothetical user overrides
+    // must all resolve to the derived title.
+    expect(matchesDerivedPaneTitle('Host Stats', hostStatsContent)).toBe(true)
+    expect(matchesDerivedPaneTitle('System Status', hostStatsContent)).toBe(true)
+    expect(matchesDerivedPaneTitle('My meter', hostStatsContent)).toBe(true)
+  })
+
+  it('displays the canonical System Status name for host-stats panes regardless of stored title', () => {
+    expect(getPaneDisplayTitle(hostStatsContent, undefined)).toBe('System Status')
+    expect(getPaneDisplayTitle(hostStatsContent, 'Host Stats')).toBe('System Status')
+    expect(getPaneDisplayTitle(hostStatsContent, 'My meter')).toBe('System Status')
   })
 })

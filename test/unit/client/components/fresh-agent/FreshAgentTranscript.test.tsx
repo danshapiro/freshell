@@ -1466,6 +1466,40 @@ describe('FreshAgentTranscript', () => {
       const chip = screen.getByRole('button', { name: /Jump to your message/ })
       expect(chip).toHaveTextContent('First user message here')
     })
+
+    it('shows only the first line of a multi-line user message, with the full text as tooltip', () => {
+      const MULTILINE = [
+        {
+          id: 'u1',
+          role: 'user' as const,
+          summary: 'First line of command\nSecond line of command\nThird line',
+          items: [{
+            id: 'i1',
+            kind: 'text' as const,
+            text: 'First line of command\nSecond line of command\nThird line',
+          }],
+        },
+        {
+          id: 'a1',
+          role: 'assistant' as const,
+          summary: 'reply',
+          items: [{ id: 'i2', kind: 'text' as const, text: 'A'.repeat(200) }],
+        },
+      ]
+      const { container } = render(<FreshAgentTranscript turns={MULTILINE} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      mockScroll(scroller, 400, 1000, 200)
+      const userTurns = container.querySelectorAll('[data-turn-role="user"]')
+      mockRect(scroller, 0)
+      mockRect(userTurns[0], -100)
+      fireEvent.scroll(scroller)
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      expect(chip).toHaveTextContent('First line of command')
+      expect(chip).not.toHaveTextContent('Second line of command')
+      expect(chip).toHaveAttribute('title', 'First line of command\nSecond line of command\nThird line')
+      expect(chip).toHaveAttribute('aria-label', 'Jump to your message: First line of command\nSecond line of command\nThird line')
+    })
   })
 
   describe('turn actions', () => {
@@ -1511,6 +1545,42 @@ describe('FreshAgentTranscript', () => {
       expect(menu).toHaveTextContent('Copy turn text')
       fireEvent.click(screen.getByRole('menuitem', { name: 'Fork conversation from here' }))
       expect(onFork).toHaveBeenCalledWith('turn-2')
+    })
+
+    it('yields to the provider menu for a fine-pointer right-click on a code block inside a turn', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          canFork={false}
+          turns={[{
+            id: 'turn-code',
+            turnId: 'turn-code',
+            role: 'assistant' as const,
+            summary: 'code answer',
+            items: [{
+              id: 'item-code',
+              kind: 'text' as const,
+              text: 'Here is the fix:\n\n```ts\nconst x: number = 1\n```',
+            }],
+          }]}
+        />,
+      )
+
+      // Assistant text renders as markdown: the fenced code block produces the
+      // specialized `.prose pre code` sub-region.
+      const codeEl = container.querySelector('article .prose pre code') as HTMLElement | null
+      expect(codeEl, 'assistant fenced code block renders .prose pre code').not.toBeNull()
+
+      // The transcript article yields WITHOUT preventDefault and without its
+      // turn menu — the provider's capture-phase handler already opened the
+      // context-sensitive fresh-agent menu for this gesture.
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+      act(() => {
+        codeEl!.dispatchEvent(event)
+      })
+
+      expect(event.defaultPrevented).toBe(false)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
     })
 
     it('offers rewind only on user turns and passes the turn through', () => {

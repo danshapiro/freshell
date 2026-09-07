@@ -8,14 +8,23 @@ import {
   useState,
   type KeyboardEvent,
 } from 'react'
-import { File, Folder, ListStart, Send, Square, X } from 'lucide-react'
+import { File, Folder, ListStart, Loader2, Paperclip, Send, Square, X } from 'lucide-react'
 import { api } from '@/lib/api'
+import { getAuthToken } from '@/lib/auth'
 import { useCoarsePointer } from '@/lib/pointer'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
-import { RUST_BASELINE_UNAVAILABLE } from '@/lib/rust-baseline-unavailable'
 import { RESERVED_ROLLBACK_SLASH_NAMES } from '@shared/fresh-agent-slash-commands'
+
+export type FreshAgentAttachment = {
+  /** Server-side saved path, present once uploaded. */
+  path?: string
+  name: string
+  bytes: number
+  status: 'uploading' | 'ready' | 'error'
+  error?: string
+}
 
 type FreshAgentComposerProps = {
   disabled?: boolean
@@ -26,10 +35,14 @@ type FreshAgentComposerProps = {
   historyKey?: string
   /** Working directory used to resolve @ file mentions. */
   cwd?: string
+  /** Runtime provider, used to filter attachment types the model can read natively. */
+  provider?: 'claude' | 'codex' | 'opencode'
   /** Messages queued while the agent is running (owned by the view). */
   queuedMessages?: readonly string[]
   onCancelQueued?: (index: number) => void
-  onSend?: (value: string) => void
+  onSend?: (value: string, attachmentPaths: string[]) => void
+  /** `!command` shell escape; absent = feature hidden. */
+  onShellCommand?: (command: string) => void
   onInterrupt?: () => void
   canInterrupt?: boolean
   commands?: FreshAgentSlashCommandMenu
@@ -76,6 +89,29 @@ type FileSuggestion = {
 
 const HISTORY_LIMIT = 50
 const EMPTY_SLASH_COMMAND_MENU: FreshAgentSlashCommandMenu = { action: [], session: [] }
+const TEXTUAL_EXTENSIONS = new Set([
+  'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'yaml', 'yml', 'toml', 'xml', 'html', 'css',
+  'js', 'jsx', 'ts', 'tsx', 'py', 'rs', 'go', 'java', 'c', 'cc', 'cpp', 'h', 'hpp', 'sh', 'bash',
+  'sql', 'diff', 'patch', 'log',
+])
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp'])
+
+/**
+ * Attachments land on disk and are referenced by path, so anything textual is
+ * readable by every provider's file tools. Native media support is what varies.
+ */
+export function attachmentRejection(provider: string | undefined, filename: string): string | null {
+  // Extensionless files (Makefile, Dockerfile, LICENSE…) are treated as text.
+  if (!filename.includes('.')) return null
+  const ext = filename.split('.').pop()?.toLowerCase() ?? ''
+  if (TEXTUAL_EXTENSIONS.has(ext)) return null
+  if (IMAGE_EXTENSIONS.has(ext)) return null
+  if (ext === 'pdf') {
+    return provider === 'claude' ? null : `this model can’t read .pdf — remove it or switch model`
+  }
+  return `.${ext} isn’t supported — attach images, PDFs (claude), or text files`
+}
+
 function getCommandPrefix(value: string): string | null {
   if (!value.startsWith('/')) return null
   const withoutSlash = value.slice(1)
@@ -131,14 +167,59 @@ function isTextEntryElement(value: Element | null): boolean {
   return Boolean(value.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
 }
 
+/**
+ * Maps a failed upload response to the attachment chip's error text. The
+ * server-oracle messages win (data.error / data.message), except two statuses
+ * get clearer client-side wording: 404 means the attachments route is absent
+ * on this server (e.g. a build without it), and 413 trips the 10 MB cap —
+ * express's error body there is an unparseable HTML page, so the size limit is
+ * spelled out here instead.
+ */
+export function attachmentUploadErrorMessage(
+  status: number,
+  data: { error?: string; message?: string } | null,
+  filename: string,
+): string {
+  if (status === 404) return 'Attachments are not supported by this server'
+  if (status === 413) return `"${filename}" exceeds the 10 MB attachment size limit`
+  return data?.error || data?.message || `upload failed (${status})`
+}
+
+/**
+ * Raw binary upload. Deliberately NOT base64-in-JSON: the server's global
+ * express.json caps JSON bodies at 1mb, so attachments ship as
+ * application/octet-stream (which the JSON parser ignores) with the filename
+ * in the query string. Auth header matches src/lib/api.ts's request().
+ */
+async function uploadAttachment(file: globalThis.File): Promise<{ path: string; bytes: number }> {
+  const headers = new Headers({ 'Content-Type': 'application/octet-stream' })
+  const token = getAuthToken()
+  if (token) headers.set('x-auth-token', token)
+  const res = await fetch(`/api/fresh-agent/attachments?name=${encodeURIComponent(file.name)}`, {
+    method: 'POST',
+    body: file,
+    headers,
+  })
+  if (!res.ok) {
+    const data = (await res.json().catch(() => null)) as {
+      error?: string
+      message?: string
+    } | null
+    throw new Error(attachmentUploadErrorMessage(res.status, data, file.name))
+  }
+  return res.json() as Promise<{ path: string; bytes: number }>
+}
+
 export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgentComposerProps>(function FreshAgentComposer({
   disabled = false,
   storageKey,
   historyKey,
   cwd,
+  provider,
   queuedMessages = [],
   onCancelQueued,
   onSend,
+  onShellCommand,
   onInterrupt,
   canInterrupt = false,
   commands = EMPTY_SLASH_COMMAND_MENU,
@@ -157,10 +238,11 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const [highlightedIndex, setHighlightedIndex] = useState(0)
   const [fileSuggestions, setFileSuggestions] = useState<FileSuggestion[]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
-  const [notice, setNotice] = useState<string | null>(null)
+  const [attachments, setAttachments] = useState<FreshAgentAttachment[]>([])
   const [queueExpanded, setQueueExpanded] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const filterRef = useRef<HTMLInputElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const historyRef = useRef<string[]>(readHistory(historyKey))
   const completionRequestIdRef = useRef(0)
   // On touch keyboards Enter inserts a newline; the Send button sends. A
@@ -195,7 +277,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
 
   const chatPrefix = getCommandPrefix(text)
   const mention = useMemo(() => getMentionToken(text), [text])
-  const isShellInput = text.startsWith('!')
+  const isShellInput = onShellCommand !== undefined && text.startsWith('!')
   const activeFilter = menuMode === 'chat' ? (chatPrefix ?? '') : filter.toLowerCase()
   // Pinned semantics: name-substring only (never description), shared by both
   // groups.
@@ -377,21 +459,57 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     requestAnimationFrame(() => textareaRef.current?.focus())
   }, [closeMenu, cwd, mention])
 
+  const addFiles = useCallback((files: Iterable<globalThis.File>) => {
+    for (const file of files) {
+      const rejection = attachmentRejection(provider, file.name)
+      if (rejection) {
+        setAttachments((current) => [...current, {
+          name: file.name,
+          bytes: file.size,
+          status: 'error',
+          error: rejection,
+        }])
+        continue
+      }
+      const placeholder: FreshAgentAttachment = { name: file.name, bytes: file.size, status: 'uploading' }
+      setAttachments((current) => [...current, placeholder])
+      void uploadAttachment(file)
+        .then((result) => {
+          setAttachments((current) => current.map((entry) => (
+            entry === placeholder ? { ...entry, status: 'ready', path: result.path } : entry
+          )))
+        })
+        .catch((error: unknown) => {
+          setAttachments((current) => current.map((entry) => (
+            entry === placeholder
+              ? { ...entry, status: 'error', error: error instanceof Error ? error.message : 'upload failed' }
+              : entry
+          )))
+        })
+    }
+  }, [provider])
+
   const sendText = useCallback(() => {
     const trimmed = text.trim()
     if (disabled) return
     if (isShellInput && trimmed.length > 1) {
-      setNotice(RUST_BASELINE_UNAVAILABLE.shellCommand)
+      onShellCommand?.(trimmed.slice(1).trim())
+      pushHistory(trimmed)
+      setText('')
+      closeMenu()
       return
     }
-    if (!trimmed) return
+    const readyAttachments = attachments.filter((entry) => entry.status === 'ready' && entry.path)
+    if (!trimmed && readyAttachments.length === 0) return
+    if (attachments.some((entry) => entry.status === 'uploading')) return
     if (trimmed.startsWith('/') && executeSlashText(trimmed)) return
     if (trimmed.startsWith('/') && tryReservedRollbackCommand(trimmed)) return
-    onSend?.(trimmed)
+    onSend?.(trimmed, readyAttachments.map((entry) => entry.path as string))
     if (trimmed) pushHistory(trimmed)
+    setAttachments((current) => current.filter((entry) => entry.status === 'error'))
     setText('')
     closeMenu()
-  }, [closeMenu, disabled, executeSlashText, isShellInput, onSend, pushHistory, text, tryReservedRollbackCommand])
+  }, [attachments, closeMenu, disabled, executeSlashText, isShellInput, onSend, onShellCommand, pushHistory, text, tryReservedRollbackCommand])
 
   const recallHistory = useCallback((direction: 1 | -1): boolean => {
     const history = historyRef.current
@@ -528,6 +646,11 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
         event.preventDefault()
         sendText()
       }}
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault()
+        if (event.dataTransfer?.files?.length) addFiles(event.dataTransfer.files)
+      }}
     >
       {menuMode && menuLength > 0 ? (
         <div
@@ -637,7 +760,35 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
         </div>
       ) : null}
 
-      {notice ? <div role="status" className="mb-2 text-sm text-muted-foreground">{notice}</div> : null}
+      {attachments.length > 0 ? (
+        <div className="fresh-agent-attachments mb-2 flex flex-wrap gap-1.5" role="list" aria-label="Attachments">
+          {attachments.map((attachment, index) => (
+            <span
+              key={`${attachment.name}-${index}`}
+              role="listitem"
+              className={cn(
+                'fresh-agent-attachment inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs',
+                attachment.status === 'error'
+                  ? 'border-destructive/60 text-destructive'
+                  : 'border-border/70 text-muted-foreground',
+              )}
+              title={attachment.error ?? attachment.path ?? attachment.name}
+            >
+              {attachment.status === 'uploading' ? <Loader2 className="h-3 w-3 animate-spin" aria-label="uploading" /> : null}
+              <span className="truncate">{attachment.name}</span>
+              {attachment.status === 'error' ? <span className="truncate">— {attachment.error}</span> : null}
+              <button
+                type="button"
+                className="-m-2 shrink-0 p-2 hover:text-destructive sm:m-0 sm:p-0"
+                aria-label={`Remove attachment ${attachment.name}`}
+                onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
 
       <div
         className="fresh-agent-thinking-bar mb-2 flex h-[0.5em] justify-center"
@@ -673,6 +824,12 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
             setText(event.target.value)
             setHistoryIndex(-1)
           }}
+          onPaste={(event) => {
+            if (event.clipboardData?.files?.length) {
+              event.preventDefault()
+              addFiles(event.clipboardData.files)
+            }
+          }}
           onKeyDown={(event) => {
             if (handleMenuKeyDown(event)) return
             if (event.key === 'ArrowUp' && (text === '' || historyIndex >= 0)) {
@@ -698,6 +855,16 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
           }}
         />
         <div className="fresh-agent-composer-actions">
+          <button
+            type="button"
+            disabled={disabled}
+            className="fresh-agent-composer-action inline-flex h-11 w-11 items-center justify-center rounded-md border border-border/70 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-9"
+            aria-label="Attach files"
+            title="Attach files — images, PDFs (claude), and text files"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Paperclip className="h-4 w-4" />
+          </button>
           <button
             type="button"
             onClick={onInterrupt}
@@ -745,6 +912,17 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
             <TooltipContent align="end">Send message</TooltipContent>
           </Tooltip>
         </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          hidden
+          aria-hidden
+          onChange={(event) => {
+            if (event.target.files?.length) addFiles(event.target.files)
+            event.target.value = ''
+          }}
+        />
       </div>
     </form>
   )

@@ -1133,7 +1133,19 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   coding-CLI terminal already exited still persists; previously the pane kept the stale name
   until a sidebar click (or the rename was silently lost).
 
-### EDEV-10 — Pane-rename cascade finalizes `titleSource:'user'` on the session override (Node writes a plain `{titleOverride}` the sweep can steal)
+> Update (b5fb): the pane→server alignment this entry introduced is REMOVED by the rename scope
+> contract (docs/development/rename-scope-contract.md): pane/tab renames no longer PATCH anything
+> server-side and the D8 exited-terminal sessionRef fallback is gone. The session→pane mirror
+> (`applySessionRenameCascade`) remains legitimate.
+
+### EDEV-10 — REMOVED (b5fb)
+
+> **Removed by the rename scope contract (b5fb):** the whole pane-rename persistence cascade was
+> deleted on both servers (pane renames are layout-local per
+> docs/development/rename-scope-contract.md), so the divergence this entry recorded no longer
+> exists. The historical entry text is retained below for traceability.
+
+> Historical title: EDEV-10 — Pane-rename cascade finalizes `titleSource:'user'` on the session override (Node writes a plain `{titleOverride}` the sweep can steal)
 - what_differs: `PATCH /api/panes/:id`'s syncable-terminal cascade persists the
   session override as `{titleOverride, titleSource:'user'}`
   (`crates/freshell-server/src/main.rs::SettingsRenamePersistence::patch_session_override_title`).
@@ -1169,7 +1181,14 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   user's title.
 
 
-### EDEV-11 — Pane-rename cascade reads `paneContent.sessionRef` as an EXPLICIT session-resolution superset (Node never reads it)
+### EDEV-11 — REMOVED (b5fb)
+
+> **Removed by the rename scope contract (b5fb):** the `sessionRef` superset read is gone because
+> the pane-rename persistence cascade itself is gone on both servers (pane renames are
+> layout-local per docs/development/rename-scope-contract.md); the divergence this entry recorded
+> no longer exists. The historical entry text is retained below for traceability.
+
+> Historical title: EDEV-11 — Pane-rename cascade reads `paneContent.sessionRef` as an EXPLICIT session-resolution superset (Node never reads it)
 <!-- Renumbered from the sweep branch's EDEV-08 at merge: main's EDEV-08 is the REST createRequestId-mint entry. -->
 - what_differs: `PATCH /api/panes/:id`'s syncable-terminal rename cascade
   (`crates/freshell-freshagent/src/rename_persistence.rs`,

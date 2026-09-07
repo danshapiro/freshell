@@ -11,8 +11,8 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76 "QA-Lever Design",
  * \u00a78.3 "One MCP smoke").
  *
- * Proves the retained standalone MCP stdio binary under `tools/freshell-mcp/`
- * through its built `dist/tools/freshell-mcp/server.js` entrypoint.
+ * Proves the legacy Node MCP stdio binary (`server/mcp/` -- FROZEN, consumed
+ * here ONLY as the already-BUILT `dist/server/mcp/server.js`, never edited)
  * drives an OWNED, ephemeral Rust `freshell-server` end-to-end over its REAL
  * stdio JSON-RPC wire protocol, with ZERO Rust-side MCP code. This is the
  * "zero-Rust-MCP" QA lever the spec's \u00a76.2 describes: the moment the Rust
@@ -21,6 +21,8 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * unmodified Node MCP binary can drive it unchanged.
  *
  * Deliberately gated to the RUST target only (see `playwright.config.ts`'s
+ * `rust-chromium` project `testMatch`), not run against legacy: the legacy
+ * MCP<->legacy-REST path is legacy's own already-tested path (its own test
  * suite covers it). The NEW thing this pins is RUST-SERVER REST compatibility
  * with the unmodified MCP client -- i.e. a regression in the Rust
  * `/api/tabs`, `/api/panes`, `/api/panes/:id/send-keys`,
@@ -34,6 +36,7 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * here as `RustServer` (`helpers/rust-server.ts`, HARNESS-01). Duplicating
  * that ~250-line process-lifecycle harness in a second, Vitest-based location
  * would be pure duplication risk for zero benefit. This test needs NO browser
+ * `page` at all -- like `agent-continuity-matrix.spec.ts`, it drives pure
  * REST (here, REST-over-MCP-over-stdio) -- so it pays none of Playwright's
  * browser-launch overhead; it only reuses the process-supervision half of
  * the harness, exactly as that spec does.
@@ -45,7 +48,7 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
   test('unmodified legacy MCP stdio binary drives an ephemeral Rust server end-to-end', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-bridge-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
+    console.error(`[mcp-bridge-rust] npm run build:server completed in ${buildMs}ms (dist/server/mcp/server.js)`)
 
     const server = new RustServer({ verbose: false })
     const info = await server.start()
@@ -117,15 +120,31 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
       expect(typeof capture).toBe('string')
       expect(capture).toContain(marker)
 
-      // -- list-panes: Rust's authoritative row contains pane/terminal metadata.
-      // Tab ownership is intentionally not part of this list response.
+      // -- list-panes: our pane is present in the bare listing, correctly
+      // cross-referenced to its terminal. The pinned row contract is the
+      // Node-exact `{id, index, kind?, terminalId?, title?}` — deliberately
+      // WITHOUT a per-row `tabId` (the df1->main sync merge adopted main's
+      // evolved Node-exact listPanes row contract; see
+      // docs/plans/df1-evidence/MAIN-SYNC-MERGE.md "Gate record"). The frozen
+      // MCP binary types the same five fields (`PaneSummary`,
+      // server/mcp/freshell-tool.ts) and never reads `tabId`. Tab membership
+      // is cross-referenced the way this surface actually offers it: the
+      // `?tabId=` filter, exercised via the MCP tool's `target` param below.
       const listPanes = await mcp.callFreshellAction('list-panes')
       expect(listPanes.status).toBe('ok')
-      const ourPane = (listPanes.data.panes as Array<{ id: string; terminalId?: string }>).find(
-        (p) => p.id === paneId,
-      )
+      const ourPane = (
+        listPanes.data.panes as Array<{ id: string; index: number; kind?: string; terminalId?: string }>
+      ).find((p) => p.id === paneId)
       expect(ourPane).toBeTruthy()
       expect(ourPane?.terminalId).toBe(terminalId)
+      expect(ourPane?.kind).toBe('terminal')
+      expect(ourPane?.index).toBe(0)
+
+      // -- list-panes with the tab as target: the pane<->tab membership edge --
+      const tabPanes = await mcp.callFreshellAction('list-panes', { target: tabId })
+      expect(tabPanes.status).toBe('ok')
+      const tabPaneIds = (tabPanes.data.panes as Array<{ id: string }>).map((p) => p.id)
+      expect(tabPaneIds).toContain(paneId)
     } finally {
       await mcp.close()
       await server.stop()

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, within, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
@@ -21,12 +21,64 @@ import {
 } from '@shared/settings'
 
 // Mock the ws-client module
-const mockSend = vi.fn()
+const { mockSend, wsMessageHandlers } = vi.hoisted(() => ({
+  mockSend: vi.fn(),
+  wsMessageHandlers: new Set<(msg: unknown) => void>(),
+}))
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
+    onMessage: (handler: (msg: unknown) => void) => {
+      wsMessageHandlers.add(handler)
+      return () => {
+        wsMessageHandlers.delete(handler)
+      }
+    },
   }),
 }))
+
+/** Deliver a server frame to every subscribed ws handler (the kill-ack waits). */
+function emitWsMessage(msg: unknown) {
+  for (const handler of [...wsMessageHandlers]) handler(msg)
+}
+
+/** Answer every in-flight correlated terminal kill with success. */
+function ackAllTerminalKills() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; terminalId?: string; requestId?: string }
+    if (m?.type === 'terminal.kill' && m.requestId && m.terminalId) {
+      emitWsMessage({
+        type: 'terminal.killed',
+        requestId: m.requestId,
+        terminalId: m.terminalId,
+        success: true,
+      })
+    }
+  }
+}
+
+/** Answer every in-flight pane.closed AND every whole-tab panes.closed batch
+ * with success (delta-r7-r3, F2 + focused-episode-7 round 3, F1: the
+ * healthy-server close acknowledgments the close gate awaits). */
+function ackAllPaneCloses() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; createRequestId?: string; requestId?: string }
+    if (m?.type === 'pane.closed' && m.createRequestId) {
+      emitWsMessage({
+        type: 'pane.closed.result',
+        createRequestId: m.createRequestId,
+        success: true,
+      })
+    }
+    if (m?.type === 'panes.closed' && m.requestId) {
+      emitWsMessage({
+        type: 'panes.closed.result',
+        requestId: m.requestId,
+        success: true,
+      })
+    }
+  }
+}
 
 // Mock the api module so the repo-icon meta probe thunk never hits the network
 vi.mock('@/lib/api', () => ({
@@ -619,7 +671,7 @@ describe('TabBar', () => {
       expect(state.tabs[0].id).toBe('tab-2')
     })
 
-    it('close button sends detach message when pane has terminalId', () => {
+    it('close button sends detach message when pane has terminalId', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -652,13 +704,29 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'terminal.detach',
-        terminalId: 'term-123',
+      // Delta-r7-r3 (Finding F2): the close gate sends the durable pane-close
+      // evidence FIRST and awaits the server's answer before the layout loses
+      // the pane; on ack the identity-driven detach follows (about the
+      // terminal, never the pane). Focused-episode-7 round 3 (Finding F1):
+      // the whole-tab close is ONE batch envelope.
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'panes.closed',
+          tabId: 'tab-1',
+          requestId: expect.any(String),
+          panes: [{ createRequestId: 'req-pane-1', terminalId: 'term-123' }],
+        }),
+      )
+      ackAllPaneCloses()
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith({
+          type: 'terminal.detach',
+          terminalId: 'term-123',
+        })
       })
     })
 
-    it('shift+click on close button sends kill message', () => {
+    it('shift+click on close button sends a correlated kill and closes the tab only once it is acknowledged', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -691,13 +759,36 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton, { shiftKey: true })
 
-      expect(mockSend).toHaveBeenCalledWith({
-        type: 'terminal.kill',
-        terminalId: 'term-456',
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'terminal.kill',
+          terminalId: 'term-456',
+          createRequestId: 'req-pane-1',
+          requestId: expect.any(String),
+        }),
+      )
+      // The tab survives until the correlated durable close lands.
+      expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
+      ackAllTerminalKills()
+      // The kill-succeeded closeTab then runs the pane-close evidence gate
+      // (delta-r7-r3, F2): the tab still stands until the batch envelope is
+      // acked (focused-episode-7 round 3, F1).
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: 'panes.closed',
+            panes: [{ createRequestId: 'req-pane-1', terminalId: 'term-456' }],
+          }),
+        )
+      })
+      expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
+      ackAllPaneCloses()
+      await waitFor(() => {
+        expect(store.getState().tabs.tabs).toEqual([])
       })
     })
 
-    it('plain close sends exactly one terminal.detach per terminal', () => {
+    it('plain close sends exactly one terminal.detach per terminal', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -730,10 +821,82 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      const detachMessages = mockSend.mock.calls
-        .map(([msg]) => msg as { type?: string; terminalId?: string })
-        .filter((msg) => msg?.type === 'terminal.detach')
-      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-123' }])
+      // Exactly ONE pane-close evidence message — the gate's acknowledged
+      // BATCH send (the whole-tab close, focused-episode-7 round 3 F1; the
+      // middleware belt skips its duplicate via the one-shot confirmation
+      // mark, delta-r7-r3 F2).
+      const paneClosed = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; tabId?: string; panes?: unknown })
+        .filter((msg) => msg?.type === 'panes.closed')
+      expect(paneClosed).toEqual([
+        expect.objectContaining({
+          type: 'panes.closed',
+          tabId: 'tab-1',
+          panes: [{ createRequestId: 'req-pane-1', terminalId: 'term-123' }],
+        }),
+      ])
+      ackAllPaneCloses()
+      await waitFor(() => {
+        const detachMessages = mockSend.mock.calls
+          .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
+          .filter((msg) => msg?.type === 'terminal.detach')
+        // Exactly ONE identity-driven detach (never a CRID rider —
+        // delta-r7-r2 F2); the pane-close evidence is the separate
+        // panes.closed batch message above.
+        expect(detachMessages).toEqual([
+          { type: 'terminal.detach', terminalId: 'term-123' },
+        ])
+      })
+    })
+
+    it('shift close leaves the tab standing when the terminal close is not durably acknowledged', async () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'shell',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-fail',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+
+      const killMsg = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; requestId?: string })
+        .find((msg) => msg?.type === 'terminal.kill')
+      emitWsMessage({
+        type: 'terminal.killed',
+        requestId: killMsg?.requestId,
+        terminalId: 'term-fail',
+        success: false,
+        error: 'the terminal close could not be recorded durably; the terminal was left running',
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(
+        ['tab-1'],
+        'an unacknowledged close is not a close: the tab stays',
+      )
     })
 
     it('shift close sends terminal.kill and no terminal.detach', () => {
@@ -773,10 +936,12 @@ describe('TabBar', () => {
         .map(([msg]) => (msg as { type?: string })?.type)
       expect(sentTypes).toContain('terminal.kill')
       expect(sentTypes).not.toContain('terminal.detach')
-      expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.kill', terminalId: 'term-456' })
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'terminal.kill', terminalId: 'term-456' }),
+      )
     })
 
-    it('close button detaches every terminal in split pane layout', () => {
+    it('close button detaches every terminal in split pane layout', async () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
@@ -803,14 +968,30 @@ describe('TabBar', () => {
       const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
       fireEvent.click(closeButton)
 
-      expect(mockSend).toHaveBeenCalledTimes(2)
-      expect(mockSend).toHaveBeenNthCalledWith(1, {
-        type: 'terminal.detach',
-        terminalId: 'term-a',
-      })
-      expect(mockSend).toHaveBeenNthCalledWith(2, {
-        type: 'terminal.detach',
-        terminalId: 'term-b',
+      // Delta-r7-r2 (Finding F2): EVERY removed pane's close evidence lands
+      // FIRST; focused-episode-7 round 3 (Finding F1) carries the tab's full
+      // pane set in ONE batch envelope — then the identity-driven detaches
+      // fire only once the close evidence is acknowledged (delta-r7-r3 F2
+      // gate).
+      expect(mockSend).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        type: 'panes.closed',
+        tabId: 'tab-1',
+        panes: [
+          { createRequestId: 'req-pane-1', terminalId: 'term-a' },
+          { createRequestId: 'req-pane-2', terminalId: 'term-b' },
+        ],
+      }))
+      ackAllPaneCloses()
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledTimes(3)
+        expect(mockSend).toHaveBeenNthCalledWith(2, {
+          type: 'terminal.detach',
+          terminalId: 'term-a',
+        })
+        expect(mockSend).toHaveBeenNthCalledWith(3, {
+          type: 'terminal.detach',
+          terminalId: 'term-b',
+        })
       })
     })
 
@@ -843,14 +1024,18 @@ describe('TabBar', () => {
       fireEvent.click(closeButton, { shiftKey: true })
 
       expect(mockSend).toHaveBeenCalledTimes(2)
-      expect(mockSend).toHaveBeenNthCalledWith(1, {
-        type: 'terminal.kill',
-        terminalId: 'term-a',
-      })
-      expect(mockSend).toHaveBeenNthCalledWith(2, {
-        type: 'terminal.kill',
-        terminalId: 'term-b',
-      })
+      expect(mockSend).toHaveBeenNthCalledWith(1,
+        expect.objectContaining({
+          type: 'terminal.kill',
+          terminalId: 'term-a',
+        }),
+      )
+      expect(mockSend).toHaveBeenNthCalledWith(2,
+        expect.objectContaining({
+          type: 'terminal.kill',
+          terminalId: 'term-b',
+        }),
+      )
     })
 
     it('close button does not send ws message when tab has no terminalId', () => {

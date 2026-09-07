@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::app_server::{BoxFuture, CodexAppServerClient};
 use crate::launch_lifecycle::{CodexLaunchRuntime, CodexRuntimeReady};
 use crate::sidecar_store::{
-    verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict,
+    verify_sidecar_identity, CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, SidecarLane,
     SidecarRecordState,
 };
 use crate::sidecar_sweep::kill_verified_sidecar_tree;
@@ -124,9 +124,11 @@ impl SidecarReconciler {
                 IdentityVerdict::Verified | IdentityVerdict::Unverifiable => {
                     // Verified with a session id is claimable via the index;
                     // Verified without one and Unverifiable are held for the
-                    // sweep only.
-                    let claimable =
-                        verdict == IdentityVerdict::Verified && record.session_id.is_some();
+                    // sweep only. freshagent-lane records are sweep-only:
+                    // they are never claimed by terminal-pane restores (wfah).
+                    let claimable = verdict == IdentityVerdict::Verified
+                        && record.session_id.is_some()
+                        && record.lane != Some(SidecarLane::FreshAgent);
                     if claimable {
                         by_session
                             .entry(record.session_id.clone().expect("claimable has a session"))

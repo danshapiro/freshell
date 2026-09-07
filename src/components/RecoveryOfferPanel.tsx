@@ -11,12 +11,12 @@ import {
   isDismissed,
   recordDismissal,
 } from '@/lib/recovery/dismissal'
-import { buildRecoveryPlan, countRecoverablePanes } from '@/lib/recovery/build-recovery-plan'
+import { buildRecoveryPlan, countRecoverablePanes, isRestorablePane, placeLedgerEntries } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { addTab } from '@/store/tabsSlice'
 import { restoreLayout } from '@/store/panesSlice'
-import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { addTerminalRestoreRequestId, armRecoveredLiveTerminalTarget } from '@/lib/terminal-restore'
 import type { PaneNode } from '@/store/paneTypes'
 import { OVERLAY_Z } from '@/components/ui/overlay'
 import { Button } from '@/components/ui/button'
@@ -52,8 +52,11 @@ function walkArmingRestores(node: PaneNode | undefined): void {
 
 /**
  * Arms terminal restore for every terminal leaf carrying a sessionRef in the
- * given tabs' post-normalization layouts. Live panes never arm: Task 4's plan
- * builder strips their sessionRef (D7), so the walk skips them naturally.
+ * given tabs' post-normalization layouts. Live panes arm too (round-5 F1: the
+ * plan keeps their effective ref) — a live leaf ALSO carries a one-shot
+ * reattach arm that TerminalView consults first, so this restore arm only
+ * ever fires when the live handle died before attach (the resumed-honestly
+ * fallback the D7 live-owner refusal then converts to a reattach).
  */
 export function armRecoveredTerminalRestores(state: Pick<RootState, 'panes'>, tabIds: string[]): void {
   for (const tabId of tabIds) {
@@ -88,7 +91,16 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     getRecoveryInventory(getCurrentTabRegistryClientInstanceId(), Date.now() - bootAt)
       .then((inv) => {
         if (cancelled) return
-        if (!inv.recoverable || isDismissed(inv.contentId)) {
+        // Focused-ep4-r2 Finding 4 (vacuous-offer suppression): the
+        // offerability check consumes the SAME placeable-row predicate as the
+        // plan — countRecoverablePanes sums device-tab panes plus
+        // `placeLedgerEntries`'s joined rows. Against an older server (or any
+        // inventory whose ledger rows are all unplaceable with no device
+        // tabs) that count is 0, and the panel used to render "Restore 0
+        // panes", record the pending offer, and accept vacuously. Zero
+        // placeable panes is not recoverable: do not render, and clear the
+        // pending record like any other dead offer.
+        if (!inv.recoverable || isDismissed(inv.contentId) || countRecoverablePanes(inv) === 0) {
           // A dead offer (nothing recoverable / already dismissed) must not
           // leave a stale pending record causing pointless fetches every boot.
           // Fetch ERRORS deliberately keep the flag set (retry next boot).
@@ -151,6 +163,14 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     for (const plan of plans) {
       dispatch(addTab({ id: plan.tabId, title: plan.title }))
       dispatch(restoreLayout({ tabId: plan.tabId, layout: plan.layout, paneTitles: plan.paneTitles }))
+      // Focused-episode-6 round 5 (Finding F1): live terminal panes reattach
+      // to their still-running terminals — arm the plan's one-shot
+      // paneId→terminalId targets (pane node ids survive restoreLayout
+      // normalization, so the store leaf's own TerminalView mount consults
+      // this exact key before any create).
+      for (const target of plan.liveTerminalReattach ?? []) {
+        armRecoveredLiveTerminalTarget(plan.tabId, target.paneId, target.terminalId)
+      }
     }
     armRecoveredTerminalRestores(store.getState(), plans.map((p) => p.tabId))
     setInventory(null)
@@ -166,7 +186,28 @@ export function RecoveryOfferPanel(): JSX.Element | null {
 
   const paneCount = countRecoverablePanes(inventory)
   const device = inventory.device
-  const anyLive = device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false
+  // Focused-episode-6 round 5 (Finding F1): the live note now explains the
+  // REATTACH — every live pane (any kind) IS counted, listed, and restored
+  // (it reattaches/adopts the still-running server session; no new process
+  // spawns). The note's condition stays predicate-independent on purpose:
+  // live panes pass the restorability predicate, so the note cannot key off
+  // it without vacuity.
+  // D8 placement: the listing must match the plan's physical destination, so
+  // both consume the same partition — a kept ledger row whose stamped tabKey
+  // names a restorable tab renders under THAT tab in the same line format as
+  // its snapshot panes. Rows without a restorable tab match are not restored
+  // (delta-r2 Finding 3) and are not listed. The heading's count flows through
+  // `countRecoverablePanes`, which consumes the SAME partition (delta-r4
+  // Finding 2) — count, list, and plan can never disagree.
+  const restorableTabs = (device?.tabs ?? []).filter((tab) => tab.panes.length > 0)
+  const placement = placeLedgerEntries(inventory)
+  // Delta-round-7 (Finding F1): the note also covers live LEDGER rows — an
+  // unsnapshotted live row offered as a reattach candidate is exactly a
+  // session "still running on the server". Only JOINED entries count (the
+  // note must describe what the offer actually restores, like the count).
+  const anyLive =
+    (device?.tabs.some((tab) => tab.panes.some((pane) => pane.live)) ?? false) ||
+    [...placement.joinedByTabKey.values()].some((entries) => entries.some((e) => e.live === true))
 
   return createPortal(
     <div
@@ -219,24 +260,29 @@ export function RecoveryOfferPanel(): JSX.Element | null {
         {device && <p className="mt-1 text-xs text-muted-foreground">{device.deviceLabel}</p>}
         {/* Sole scroll region (R1): keeps heading, notes, and buttons out of the scrollable area. */}
         <ul className="mt-3 text-sm text-muted-foreground list-disc pl-5 space-y-1 overflow-y-auto flex-1 min-h-0">
-          {(device?.tabs ?? []).flatMap((tab) =>
-            tab.panes.map((pane) => (
+          {restorableTabs.flatMap((tab) => [
+            // Delta-r6 F1/F2: the listing consumes the SAME restorability
+            // predicate as the count and the plan — a closed-verdict pane is
+            // never listed (live panes ARE listed: they restore by reattach,
+            // round-5 F1).
+            ...tab.panes.filter(isRestorablePane).map((pane) => (
               <li key={`${tab.tabKey}:${pane.paneId}`}>
                 {tab.tabName}: {pane.mode ?? pane.kind}
                 {pane.cwd ? ` — ${pane.cwd}` : ''}
               </li>
-            ))
-          )}
-          {inventory.ledgerOnly.map((entry) => (
-            <li key={`${entry.provider}:${entry.sessionId}`}>
-              {entry.mode} session — {entry.cwd ?? 'unknown directory'}
-            </li>
-          ))}
+            )),
+            ...(placement.joinedByTabKey.get(tab.tabKey) ?? []).map((entry) => (
+              <li key={`${entry.provider}:${entry.sessionId}`}>
+                {tab.tabName}: {entry.mode}
+                {entry.cwd ? ` — ${entry.cwd}` : ''}
+              </li>
+            )),
+          ])}
         </ul>
         {anyLive && (
           <p data-testid="recovery-live-note" className="mt-3 text-xs text-muted-foreground">
-            Some sessions are still running on the server — they were left untouched; their panes
-            reopen without resuming.
+            Some sessions are still running on the server — restoring reattaches to them in place
+            (no new process is started).
           </p>
         )}
         <div className="mt-4 flex justify-end gap-2">

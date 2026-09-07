@@ -328,8 +328,8 @@ describe('HostStatsPane', () => {
   })
 
   describe('(f) title + icon helpers', () => {
-    it('derivePaneTitle returns Host Stats for host-stats content', () => {
-      expect(derivePaneTitle({ kind: 'host-stats' })).toBe('Host Stats')
+    it('derivePaneTitle returns System Status for host-stats content', () => {
+      expect(derivePaneTitle({ kind: 'host-stats' })).toBe('System Status')
     })
 
     it('PaneIcon renders the Gauge icon for host-stats content', () => {

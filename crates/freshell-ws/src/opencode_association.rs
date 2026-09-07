@@ -869,7 +869,14 @@ mod tests {
         // drives the module, not the WS handler).
         state
             .pane_ledger
-            .record_pending("t1", "opencode", Some("/tmp"), crate::terminal::now_ms())
+            .record_pending(
+                "t1",
+                "opencode",
+                Some("/tmp"),
+                None,
+                crate::pane_ledger::ProvenanceStamps::default(),
+                crate::terminal::now_ms(),
+            )
             .unwrap();
 
         note_possible_submit(&state, "t1", "\r");
@@ -1168,6 +1175,7 @@ mod tests {
                 permission_mode: None,
                 effort: None,
                 supersedes: None,
+                provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: now_ms(),
             })
             .expect("seed fresh-agent ledger row");

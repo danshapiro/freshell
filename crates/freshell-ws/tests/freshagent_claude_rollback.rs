@@ -28,7 +28,8 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_freshagent::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord, SinkWrite,
+    ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
+    SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite, SinkWrite,
 };
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
@@ -219,9 +220,18 @@ impl PaneIdentitySink for TestLedgerSink {
         );
         let now = Self::now_ms();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ledger.record_pending(&p, &m, c.as_deref(), now))
-                .await
-                .map_err(std::io::Error::other)?
+            tokio::task::spawn_blocking(move || {
+                ledger.record_pending(
+                    &p,
+                    &m,
+                    c.as_deref(),
+                    None,
+                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                    now,
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)?
         })
     }
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
@@ -240,6 +250,7 @@ impl PaneIdentitySink for TestLedgerSink {
                     permission_mode: upsert.settings.permission_mode.as_deref(),
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?;
@@ -274,6 +285,16 @@ impl PaneIdentitySink for TestLedgerSink {
         })
     }
     fn load_settings(&self, _provider: &str, _session_id: &str) -> Option<FreshAgentSettings> {
+        None
+    }
+    fn load_provenance(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> Option<freshell_freshagent::BindProvenance> {
+        // Rollback-focused double (like `load_settings` above): these
+        // rollback tests never cold-attach a codex/opencode session, so the
+        // provenance read-back is out of their contract.
         None
     }
     fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
@@ -321,6 +342,179 @@ impl PaneIdentitySink for TestLedgerSink {
         self.ledger
             .lookup_by_create_request_id(provider, create_request_id)
             .map(|row| row.session_id)
+    }
+
+    // Retire-on-kill (delta-review round 5): the same real-ledger pass-through
+    // the LedgerIdentitySink this double mirrors now implements.
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(|err| match err {
+                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
+                }
+                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
+                }
+            })
+        })
+    }
+
+    /// Delta-r6-r3: the real-ledger delegation mirrors
+    /// `freshell-server/src/identity_sink.rs`'s `retire_closed_batch`
+    /// (the ledger envelope is the atomicity point; one spawn_blocking hop).
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkCloseWrite {
+        let ledger = self.ledger.clone();
+        let p = provider.to_string();
+        let ids = session_ids.to_vec();
+        let pendings = pending_ids.to_vec();
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.close_identities(&p, &ids, &pendings, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(|err| match err {
+                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
+                }
+                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
+                }
+            })
+        })
+    }
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = placeholder_id.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    // Focused-ep5-r1 Finding 2: same real-ledger pass-through as `retire_closed`.
+    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_kill_tombstone(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    // Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the snapshot read is
+    // a memory-only inline pass-through (the LedgerIdentitySink discipline).
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.ledger.kill_tombstone_at(provider, session_id)
+    }
+
+    // Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
+    // retention probe — memory-only inline pass-through like the snapshot read.
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.ledger.row_is_bound(provider, session_id)
+    }
+
+    // Focused-ep5-r3 Findings 1+3: the conditional single-transition claim
+    // commit — a faithful pass-through to the real ledger op.
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
+    }
+    // Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the aliased commit's
+    // faithful pass-through (the alias gate lives inside the ledger's
+    // guarded transition).
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let aliases: Vec<String> = fence_checked_aliases.to_vec();
+        Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                ledger.commit_claim_aliased(
+                    &p,
+                    &s,
+                    expect_killed_at_ms,
+                    &aliases,
+                    TestLedgerSink::now_ms(),
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok(match outcome {
+                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
+                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
+                    ClaimCommit::RefusedStale
+                }
+            })
+        })
+    }
+    // Finding 2's alias-record pass-throughs (same disciplines as the rest of
+    // the test double).
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, ph, d) = (
+            provider.to_string(),
+            placeholder.to_string(),
+            durable.to_string(),
+        );
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
+        self.ledger.alias_tombstone_records(provider, placeholder)
+    }
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite {
+        let ledger = self.ledger.clone();
+        let (p, d) = (provider.to_string(), durable.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
+                .await
+                .map_err(std::io::Error::other)?
+        })
     }
 }
 

@@ -126,6 +126,12 @@ pub const STRIP_ENV: &[&str] = &[
     "PORT",
     "AUTH_TOKEN",
     "ALLOWED_ORIGINS",
+    // The desktop-profile features (server config-dir / profile selector) are
+    // server-internal state: leaking them into PTYs would re-point nested
+    // shells at the active profile and bypass the picker. Matches the Node
+    // scrub at server/terminal-registry.ts.
+    "FRESHELL_CONFIG_DIR",
+    "FRESHELL_PROFILE",
     "NODE_ENV",
     "npm_lifecycle_script",
     "OPENCODE_SERVER_USERNAME",

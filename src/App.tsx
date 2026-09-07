@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEve
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
-import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
+import { setLocalSettings, setServerConfigDir, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
   patchSessionRunningStateFromTerminalMeta,
@@ -19,6 +19,7 @@ import {
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { reassertAllOpenPanes } from '@/lib/kill-ack'
 import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -45,7 +46,7 @@ import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotific
 import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
-import { startTabRegistrySync } from '@/store/tabRegistrySync'
+import { startTabRegistrySync, getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { startSessionGreyTouchWatcher } from '@/store/sessionGreyTouch'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
@@ -131,6 +132,8 @@ function isVersionInfo(value: unknown): value is VersionInfo {
 type ConfigFallbackInfo = {
   reason: 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR' | 'ENOENT'
   backupExists: boolean
+  /** Profile-aware backup path (when the server provides it). */
+  backupPath?: string
 }
 
 type BootstrapPlatformInfo = {
@@ -575,7 +578,9 @@ export default function App() {
             configFallback?: {
               reason?: unknown
               backupExists?: unknown
+              backupPath?: unknown
             }
+            configDir?: string
           }
           let bootstrapData: BootstrapData | undefined
           let lastBootstrapError: unknown
@@ -643,7 +648,14 @@ export default function App() {
               setConfigFallback({
                 reason: parseConfigFallbackReason(bootstrapData.configFallback.reason),
                 backupExists: !!bootstrapData.configFallback.backupExists,
+                backupPath:
+                  typeof bootstrapData.configFallback.backupPath === 'string'
+                    ? bootstrapData.configFallback.backupPath
+                    : undefined,
               })
+            }
+            if (typeof bootstrapData.configDir === 'string' && bootstrapData.configDir) {
+              dispatch(setServerConfigDir(bootstrapData.configDir))
             }
           }
           return true
@@ -731,6 +743,13 @@ export default function App() {
           appStore.getState().panes,
         ),
         client: { mobile: isMobileRef.current },
+        // D8 (restore-open-sessions-only): the connection's provenance identity
+        // — the same deviceId/clientInstanceId `tabs.sync.push` frames carry —
+        // so the server can stamp connection-scoped ledger bind rows. The
+        // provider is re-invoked per (re)connect, so a lease-collision rotation
+        // re-stamps on the next hello.
+        deviceId: appStore.getState().tabRegistry.deviceId,
+        clientInstanceId: getCurrentTabRegistryClientInstanceId(),
       }))
 
       const requestCodexActivityList = () => {
@@ -1124,6 +1143,21 @@ export default function App() {
             } else {
               ws.clearReconcileCreateHold()
             }
+            // Focused-episode-7 round 3 (Finding F2; round-4 widened to
+            // fresh-agent panes) — the per-ready open re-assertion sweep:
+            // assert every session pane the client is DISPLAYING, so the
+            // server consumes any standing close record that contradicts the
+            // displayed layout (the healed shape is a committed close whose
+            // ack was lost mid-socket-death — incl. across a page reload,
+            // which drops the send queue). One idempotent message per
+            // displayed pane EXCEPT a pane whose close acknowledgement is
+            // outstanding (round-5 F1: the queued close flushed immediately
+            // above, inside the ws-client's ready handling, and an
+            // open-assert behind it would consume the just-committed close
+            // evidence before its ack arrives). Each send listens for its
+            // bounded correlated `pane.opened.result` (round-5 F3): a failed
+            // consume is marked, logged, and retried by the next sweep.
+            reassertAllOpenPanes(appStore.getState().panes.layouts)
           }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
@@ -1462,6 +1496,7 @@ export default function App() {
           setConfigFallback({
             reason: parseConfigFallbackReason(msg.reason),
             backupExists: !!msg.backupExists,
+            backupPath: typeof msg.backupPath === 'string' ? msg.backupPath : undefined,
           })
         }
 
@@ -1814,7 +1849,7 @@ export default function App() {
               <p>
                 Config file was invalid ({describeConfigFallbackReason(configFallback.reason)}), so freshell loaded defaults.
                 {configFallback.backupExists
-                  ? ' Backup found at ~/.freshell/config.backup.json.'
+                  ? ` Backup found at ${configFallback.backupPath ?? '~/.freshell/config.backup.json'}.`
                   : ' No backup file was found.'}
               </p>
             </div>

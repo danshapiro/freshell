@@ -21,7 +21,9 @@ export type BootstrapPayload = {
   platform: unknown
   shell: { authenticated: boolean; ready?: boolean; tasks?: Record<string, boolean> }
   perf?: { logging: boolean }
-  configFallback?: { reason: string; backupExists: boolean }
+  configFallback?: { reason: string; backupExists: boolean; backupPath?: string }
+  /** Effective server config dir (`~/.freshell` or the named profile's dir). */
+  configDir?: string
 }
 
 export const ReadModelPrioritySchema = z.enum(['visible', 'background'])
@@ -71,6 +73,16 @@ export const SessionDirectoryItemSchema = z.object({
    * indexer / terminal metadata. Powers the fresh-agent strip context meter.
    */
   tokenUsage: TokenSummarySchema.optional(),
+  /**
+   * b5fb provenance exposure for the reviewed reset flow. `titleOverridden` is
+   * true exactly when a stored titleOverride currently applies to this row;
+   * `providerTitle` is the parsed pre-override title (absent when none was
+   * parsed); `titleOverrideSource` is the override row's titleSource
+   * (absent when the override never recorded one).
+   */
+  titleOverridden: z.boolean().optional(),
+  providerTitle: z.string().optional(),
+  titleOverrideSource: z.enum(['user', 'ai', 'first-message', 'legacy', 'dir']).optional(),
 })
 
 /**

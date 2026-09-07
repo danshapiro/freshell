@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { setStatus } from '@/store/connectionSlice'
 import PaneLayout from '@/components/panes/PaneLayout'
+import { installPaneGeometry } from '../../helpers/pane-geometry'
 
 // Mock Monaco to avoid loading issues in tests
 vi.mock('@monaco-editor/react', () => {
@@ -209,6 +210,15 @@ async function selectEditorFromPicker(user: ReturnType<typeof userEvent.setup>) 
 async function findEditorPathInput() {
   return screen.findByPlaceholderText(/enter file path/i, {}, { timeout: 3_000 })
 }
+
+const paneGeometry: { current: ReturnType<typeof installPaneGeometry> | null } = { current: null }
+beforeEach(() => {
+  paneGeometry.current = installPaneGeometry()
+})
+afterEach(() => {
+  paneGeometry.current?.restore()
+  paneGeometry.current = null
+})
 
 describe('Editor Pane Integration', () => {
   let store: ReturnType<typeof createTestStore>
