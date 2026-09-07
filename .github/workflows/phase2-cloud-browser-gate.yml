@@ -17,7 +17,7 @@ jobs:
       - name: Check out exact Phase 2 candidate
         uses: actions/checkout@v4
         with:
-          ref: ad21f9d855e1900868d76379acba01cb66c2701d
+          ref: 3344a84dce0f2633250caf2b15f1a738dbd3b604
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
@@ -59,18 +59,17 @@ jobs:
       - name: Verify cloud Docker daemon
         run: docker info
 
-      - name: Run exact P2-G01 browser continuity gate
+      - name: Run exact P2-G01 and P2-G04 browser/provider gates
         run: >-
           npx playwright test
           --config test/e2e-browser/playwright.config.ts
           --project=rust-chromium
           test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts
-          --grep "P2-G01"
 
       - name: Upload runtime evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phase2-g01-ad21f9d85
-          path: .runtime-evidence/ad21f9d855e1900868d76379acba01cb66c2701d/
+          name: phase2-browser-3344a84dc
+          path: .runtime-evidence/3344a84dce0f2633250caf2b15f1a738dbd3b604/
           if-no-files-found: warn
