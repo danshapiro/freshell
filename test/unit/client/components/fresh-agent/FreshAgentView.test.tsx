@@ -5309,6 +5309,104 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.send').at(-1)?.requestId).toBe(requestId)
   })
 
+  it('clears local echo when the server normalizes the submitted text (e.g. strips quoting)', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_echo_normalized',
+        revision: 1,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_echo_normalized',
+        revision: 2,
+        status: 'running',
+        capabilities: { send: false, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-real-user',
+            turnId: 'turn-real-user',
+            role: 'user',
+            summary: 'Do the thing',
+            items: [{ id: 'item-real-user', kind: 'text', text: 'Do the thing' }],
+          },
+          {
+            id: 'turn-real-assistant',
+            turnId: 'turn-real-assistant',
+            role: 'assistant',
+            summary: 'Working',
+            items: [{ id: 'item-real-assistant', kind: 'text', text: 'Working' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-echo-normalized',
+        sessionId: 'ses_echo_normalized',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_echo_normalized' },
+        resumeSessionId: 'ses_echo_normalized',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    // User wraps in quotes; the opencode normalizer strips them server-side
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '"Do the thing"' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    // The local echo shows the raw text (with quotes)
+    expect(screen.getByText('"Do the thing"')).toBeInTheDocument()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_echo_normalized',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId: 'ses_echo_normalized',
+          status: 'running',
+          latestTurnId: 'turn-real-assistant',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Working')).toBeInTheDocument()
+    })
+    // The echo should be cleared — only the server's normalized turn should be visible
+    expect(screen.getAllByText('Do the thing')).toHaveLength(1)
+    expect(screen.queryByText('"Do the thing"')).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+  })
+
   it('keeps local echo when an older snapshot response is ignored after send acceptance', async () => {
     const store = createStore()
     let wsHandler: ((message: any) => void) | undefined

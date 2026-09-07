@@ -1147,7 +1147,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           title={glomTarget.text}
         >
           <ChevronUp className="h-3 w-3 shrink-0" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate">{glomTarget.text}</span>
+          <span className="min-w-0 flex-1 truncate">{glomTarget.text.split('\n')[0]}</span>
         </button>
       ) : null}
       <FreshAgentTurnContextMenu

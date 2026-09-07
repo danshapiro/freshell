@@ -1466,6 +1466,40 @@ describe('FreshAgentTranscript', () => {
       const chip = screen.getByRole('button', { name: /Jump to your message/ })
       expect(chip).toHaveTextContent('First user message here')
     })
+
+    it('shows only the first line of a multi-line user message, with the full text as tooltip', () => {
+      const MULTILINE = [
+        {
+          id: 'u1',
+          role: 'user' as const,
+          summary: 'First line of command\nSecond line of command\nThird line',
+          items: [{
+            id: 'i1',
+            kind: 'text' as const,
+            text: 'First line of command\nSecond line of command\nThird line',
+          }],
+        },
+        {
+          id: 'a1',
+          role: 'assistant' as const,
+          summary: 'reply',
+          items: [{ id: 'i2', kind: 'text' as const, text: 'A'.repeat(200) }],
+        },
+      ]
+      const { container } = render(<FreshAgentTranscript turns={MULTILINE} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      mockScroll(scroller, 400, 1000, 200)
+      const userTurns = container.querySelectorAll('[data-turn-role="user"]')
+      mockRect(scroller, 0)
+      mockRect(userTurns[0], -100)
+      fireEvent.scroll(scroller)
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      expect(chip).toHaveTextContent('First line of command')
+      expect(chip).not.toHaveTextContent('Second line of command')
+      expect(chip).toHaveAttribute('title', 'First line of command\nSecond line of command\nThird line')
+      expect(chip).toHaveAttribute('aria-label', 'Jump to your message: First line of command\nSecond line of command\nThird line')
+    })
   })
 
   describe('turn actions', () => {
