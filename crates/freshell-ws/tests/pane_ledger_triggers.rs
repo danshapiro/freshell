@@ -332,3 +332,17 @@ async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Regression test for the shared `common::sleeper_cli_spec` uniqueness fix:
+/// two calls with the same name must not share a script path, or parallel
+/// tests race ETXTBSY ("Text file busy") when one writes while another execves.
+#[test]
+fn shared_sleeper_cli_spec_paths_are_unique_per_call() {
+    let first = sleeper_cli_spec("claude");
+    let second = sleeper_cli_spec("claude");
+    assert_ne!(
+        first.default_cmd, second.default_cmd,
+        "same-name specs from common::sleeper_cli_spec must not share a script path -- \
+         a shared path lets a later write race an earlier spawn's execve (ETXTBSY)"
+    );
+}
