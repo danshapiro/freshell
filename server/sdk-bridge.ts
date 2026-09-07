@@ -897,7 +897,10 @@ export class SdkBridge extends EventEmitter {
     const state = this.sessions.get(sessionId)
     if (state) {
       // Reserve the turn before the first asynchronous provider event arrives.
-      state.status = 'running'
+      // The reservation is a TRACKED status fold: it must mint so the turn's
+      // running-statused frames are strictly newer than the pre-send pair (a
+      // direct write would leave the client gate dropping them as stale).
+      this.foldStatus(state, 'running')
       const timestamp = new Date().toISOString()
       const content = [{ type: 'text', text } as ContentBlock]
       state.messages.push({

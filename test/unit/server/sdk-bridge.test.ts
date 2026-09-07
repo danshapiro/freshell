@@ -400,6 +400,44 @@ describe('SdkBridge', () => {
       }
     })
 
+    it('mints a fresh seq when sendUserMessage reserves a turn (running must be newer than the pre-send idle)', async () => {
+      let wallClock = 1000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => wallClock)
+      try {
+        mockKeepStreamOpen = true
+        const session = await bridge.createSession({ cwd: '/tmp' })
+        bridge.subscribe(session.sessionId, () => {})
+        const state = bridge.getSession(session.sessionId)!
+
+        // Drive the session to idle at the frozen clock (1001 connected, 1002
+        // running, 1003 idle per the same-transition clamp).
+        pushLiveSdkMessage(initMessage())
+        pushLiveSdkMessage(assistantMessage())
+        pushLiveSdkMessage(successResultMessage())
+        await new Promise((r) => setTimeout(r, 100))
+        expect(state.status).toBe('idle')
+        expect(state.lastStatusSeq).toBe(1003)
+
+        // The send reserves the turn: the truthful new 'running' status MUST mint
+        // strictly above the idle pair — otherwise every running-statused frame of
+        // the turn carries (running, 1003) and the client gate (statusSeq <=
+        // lastStatusSeq) drops them as stale, hiding the busy indicator.
+        expect(bridge.sendUserMessage(session.sessionId, 'hello')).toBe(true)
+        expect(state.status).toBe('running')
+        expect(state.lastStatusSeq).toBeGreaterThan(1003)
+        const reservationSeq = state.lastStatusSeq!
+
+        // The first assistant edge of the new turn is a same-status fold and reuses
+        // the reservation's minted pair (no useless re-mint).
+        pushLiveSdkMessage(assistantMessage())
+        await new Promise((r) => setTimeout(r, 100))
+        expect(state.status).toBe('running')
+        expect(state.lastStatusSeq).toBe(reservationSeq)
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
     it('mints a statusSeq for the exited fold so a later exited snapshot carries the sequence', async () => {
       const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(5000)
       try {
