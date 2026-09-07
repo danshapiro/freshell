@@ -15,6 +15,7 @@ import { useCoarsePointer } from '@/lib/pointer'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import { RUST_BASELINE_UNAVAILABLE } from '@/lib/rust-baseline-unavailable'
 import { RESERVED_ROLLBACK_SLASH_NAMES } from '@shared/fresh-agent-slash-commands'
 
 export type FreshAgentAttachment = {
@@ -40,7 +41,7 @@ type FreshAgentComposerProps = {
   /** Messages queued while the agent is running (owned by the view). */
   queuedMessages?: readonly string[]
   onCancelQueued?: (index: number) => void
-  onSend?: (value: string, attachmentPaths: string[]) => void
+  onSend?: (value: string, attachmentPaths?: string[]) => void
   /** `!command` shell escape; absent = feature hidden. */
   onShellCommand?: (command: string) => void
   onInterrupt?: () => void
@@ -239,6 +240,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const [fileSuggestions, setFileSuggestions] = useState<FileSuggestion[]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [attachments, setAttachments] = useState<FreshAgentAttachment[]>([])
+  const [notice, setNotice] = useState<string | null>(null)
   const [queueExpanded, setQueueExpanded] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const filterRef = useRef<HTMLInputElement | null>(null)
@@ -277,7 +279,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
 
   const chatPrefix = getCommandPrefix(text)
   const mention = useMemo(() => getMentionToken(text), [text])
-  const isShellInput = onShellCommand !== undefined && text.startsWith('!')
+  const isShellInput = text.startsWith('!')
   const activeFilter = menuMode === 'chat' ? (chatPrefix ?? '') : filter.toLowerCase()
   // Pinned semantics: name-substring only (never description), shared by both
   // groups.
@@ -493,10 +495,14 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     const trimmed = text.trim()
     if (disabled) return
     if (isShellInput && trimmed.length > 1) {
-      onShellCommand?.(trimmed.slice(1).trim())
-      pushHistory(trimmed)
-      setText('')
-      closeMenu()
+      if (onShellCommand) {
+        onShellCommand(trimmed.slice(1).trim())
+        pushHistory(trimmed)
+        setText('')
+        closeMenu()
+      } else {
+        setNotice(RUST_BASELINE_UNAVAILABLE.shellCommand)
+      }
       return
     }
     const readyAttachments = attachments.filter((entry) => entry.status === 'ready' && entry.path)
@@ -504,7 +510,9 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     if (attachments.some((entry) => entry.status === 'uploading')) return
     if (trimmed.startsWith('/') && executeSlashText(trimmed)) return
     if (trimmed.startsWith('/') && tryReservedRollbackCommand(trimmed)) return
-    onSend?.(trimmed, readyAttachments.map((entry) => entry.path as string))
+    const attachmentPaths = readyAttachments.map((entry) => entry.path as string)
+    if (attachmentPaths.length > 0) onSend?.(trimmed, attachmentPaths)
+    else onSend?.(trimmed)
     if (trimmed) pushHistory(trimmed)
     setAttachments((current) => current.filter((entry) => entry.status === 'error'))
     setText('')
@@ -789,6 +797,8 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
           ))}
         </div>
       ) : null}
+
+      {notice ? <div role="status" className="mb-2 text-sm text-muted-foreground">{notice}</div> : null}
 
       <div
         className="fresh-agent-thinking-bar mb-2 flex h-[0.5em] justify-center"

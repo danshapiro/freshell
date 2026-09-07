@@ -34,10 +34,10 @@ describe('FreshAgentComposer', () => {
   })
   afterEach(() => cleanup())
 
-  it('hides attachment controls and blocks shell escapes without sending', () => {
+  it('shows attachment controls and blocks shell escapes without a Rust shell route', () => {
     const onSend = vi.fn()
     render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} />)
-    expect(screen.queryByRole('button', { name: 'Attach files' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeVisible()
     fireEvent.change(getInput(), { target: { value: '!pwd' } })
     fireEvent.keyDown(getInput(), { key: 'Enter' })
     expect(screen.getByRole('status')).toHaveTextContent('Shell commands are unavailable here; open a shell pane instead')
