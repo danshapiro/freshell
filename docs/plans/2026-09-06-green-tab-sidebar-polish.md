@@ -31,7 +31,7 @@ Improve dark-mode visibility of the green tab highlight; add repo icons to the l
 - The pane header's repo-icon treatment to match is `<RepoIcon info={repoIconInfo} className="h-3.5 w-3.5 shrink-0" />` rendered before the pane-type icon (`src/components/panes/PaneHeader.tsx:180`).
 - The pane header's green treatment to match is `bg-emerald-50 border-l-2 border-l-emerald-500 dark:bg-emerald-900/30` (`src/components/panes/PaneHeader.tsx:169`).
 - The `repoIconsOnTabs` setting defaults to `true` (`shared/settings.ts:906`).
-- Focused test runs: `npx vitest run <path>` (vitest auto-discovers `config/vitest/vitest.config.ts`).
+- Focused test runs: `npm run test:vitest -- run <path>` (vitest auto-discovers `config/vitest/vitest.config.ts`).
 - Full-suite gate: `npm test` (coordinated).
 - `docs/index.html` is a nonfunctional mock; significant UI changes should be reflected there.
 
@@ -64,7 +64,7 @@ Add this test to `test/unit/client/components/TabItem.test.tsx`, after the exist
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npx vitest run test/unit/client/components/TabItem.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/TabItem.test.tsx`
 
 Expected: FAIL because `dark:bg-success/25` is not present in the className — the current code only has `bg-success/15` with no dark-mode override.
 
@@ -84,7 +84,7 @@ to:
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npx vitest run test/unit/client/components/TabItem.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/TabItem.test.tsx`
 
 Expected: PASS — all existing tests plus the new dark-mode opacity test pass.
 
@@ -96,7 +96,7 @@ No refactor needed — a single Tailwind class addition.
 
 The change is scoped to `TabItem.tsx` line 168 (active+attention+highlight path). Impacted tests: `TabItem.test.tsx` (all), `TabBar.test.tsx` (integration with TabItem). The deck tests (`tile-state.test.ts`, `deck-selectors.test.ts`) classify tab state but do not assert CSS classes on the TabItem component, so they are not impacted.
 
-Run: `npx vitest run test/unit/client/components/TabItem.test.tsx test/unit/client/components/TabBar.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/TabItem.test.tsx test/unit/client/components/TabBar.test.tsx`
 
 Expected: PASS
 
@@ -133,11 +133,13 @@ mode while keeping the light-mode fill subtle."
 
 ```typescript
 vi.mock('@/components/icons/RepoIcon', () => ({
-  default: ({ info }: any) => <span data-testid="repo-icon" data-repo-key={info?.repoKey} />,
+  default: ({ info, className }: any) => (
+    <span data-testid="repo-icon" data-repo-key={info?.repoKey} data-class={className} />
+  ),
 }))
 ```
 
-This matches the pattern used in `test/unit/client/components/panes/PaneHeader.test.tsx` and keeps the test decoupled from the real `RepoIcon` SVG/img rendering.
+This matches the pattern used in `test/unit/client/components/panes/PaneHeader.test.tsx` and keeps the test decoupled from the real `RepoIcon` SVG/img rendering. Capturing `className` lets the test verify the icon matches the pane header's `h-3.5 w-3.5 shrink-0` sizing.
 
 **1b. Add the `repoIcons` reducer and a `panesSettings` option to `createTestStore`.**
 
@@ -219,6 +221,17 @@ In the `preloadedState` object (after the `freshAgent` block ending at line 249)
       const repoIcon = button.querySelector('[data-testid="repo-icon"]')
       expect(repoIcon).toBeTruthy()
       expect(repoIcon).toHaveAttribute('data-repo-key', '/home/user/myproject')
+      // Verify the icon matches the pane header treatment: h-3.5 w-3.5 shrink-0
+      expect(repoIcon).toHaveAttribute('data-class')
+      expect(repoIcon?.getAttribute('data-class')).toContain('h-3.5')
+      expect(repoIcon?.getAttribute('data-class')).toContain('w-3.5')
+      // Verify placement: repo icon comes before the provider icon (first SVG) in DOM order
+      const providerIcon = button.querySelector('svg')
+      expect(repoIcon).toBeTruthy()
+      expect(providerIcon).toBeTruthy()
+      if (repoIcon && providerIcon) {
+        expect(repoIcon.compareDocumentPosition(providerIcon) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      }
     })
 
     it('does not render a repo icon when repoIconsOnTabs is off', async () => {
@@ -258,48 +271,12 @@ In the `preloadedState` object (after the `freshAgent` block ending at line 249)
       const button = screen.getByRole('button', { name: /no repo icon session/i })
       expect(button.querySelector('[data-testid="repo-icon"]')).toBeNull()
     })
-
-    it('does not render a repo icon for a session without a cwd or repoPath', async () => {
-      const projects: ProjectGroup[] = [
-        {
-          projectPath: '/home/user/myproject',
-          sessions: [
-            {
-              sessionId: sessionId('no-cwd-session'),
-              projectPath: '/home/user/myproject',
-              lastActivityAt: Date.now(),
-              title: 'No cwd session',
-            },
-          ],
-        },
-      ]
-
-      const store = createTestStore({
-        projects,
-        repoIcons: {
-          '/home/user/myproject': {
-            status: 'ready',
-            repoRoot: '/home/user/myproject',
-            repoName: 'myproject',
-            hasIcon: false,
-          },
-        },
-      })
-      renderSidebar(store, [])
-
-      await act(async () => {
-        vi.advanceTimersByTime(100)
-      })
-
-      const button = screen.getByRole('button', { name: /no cwd session/i })
-      expect(button.querySelector('[data-testid="repo-icon"]')).toBeNull()
-    })
   })
 ```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npx vitest run test/unit/client/components/Sidebar.test.tsx -t "Sidebar repo icons"`
+Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx -t "Sidebar repo icons"`
 
 Expected: FAIL because `SidebarItem` does not yet render a `RepoIcon`, and `createTestStore` does not yet include the `repoIcons` reducer (the `options?.repoIcons` reference will be `undefined`).
 
@@ -328,6 +305,7 @@ Add after the `timestampTick` comparison:
 
 ```typescript
   if (prev.repoIconInfo?.repoKey !== next.repoIconInfo?.repoKey) return false
+  if (prev.repoIconInfo?.repoName !== next.repoIconInfo?.repoName) return false
   if (prev.repoIconInfo?.iconUrl !== next.repoIconInfo?.iconUrl) return false
 ```
 
@@ -357,14 +335,14 @@ Add the `repoIconInfoByCwd` memo (after the `selectSortedItems` memo, around lin
   }, [repoIconsOnTabs, repoIconsByCwd])
 ```
 
-Add the probe `useEffect` (after the existing effects, around line 270):
+Add the probe `useEffect` (after `sortedItems` is declared at line 374 and `busySessionKeySet` at line 385 — placing it before `sortedItems` would hit the temporal dead zone):
 
 ```typescript
   useEffect(() => {
     if (!repoIconsOnTabs) return
     const cwds = new Set<string>()
     for (const item of sortedItems) {
-      const cwd = item.cwd ?? item.repoPath ?? item.projectPath
+      const cwd = item.cwd ?? item.repoPath
       if (cwd) cwds.add(cwd)
     }
     for (const cwd of cwds) {
@@ -373,7 +351,7 @@ Add the probe `useEffect` (after the existing effects, around line 270):
   }, [sortedItems, repoIconsOnTabs, repoIconsByCwd, dispatch])
 ```
 
-Note: `sortedItems` is derived from `useStableArray` and the `selectSortedItems` selector — it's the same array used to render the session list.
+Note: `sortedItems` is derived from `useStableArray` and the `selectSortedItems` selector — it's the same array used to render the session list. The fallback chain is `item.cwd ?? item.repoPath` only (not `item.projectPath` — that is a display path, not a filesystem path, and using it would probe the repo-icon endpoint with non-repo paths).
 
 **3e. Pass `repoIconInfo` to each `SidebarItem`** in the render loop (around line 946):
 
@@ -381,7 +359,7 @@ After the `item={item}` prop, add:
 
 ```typescript
                         repoIconInfo={
-                          repoIconInfoByCwd[item.cwd ?? item.repoPath ?? item.projectPath ?? '']
+                          repoIconInfoByCwd[item.cwd ?? item.repoPath ?? '']
                         }
 ```
 
@@ -420,7 +398,7 @@ And close the outer `div` after the existing `</div>` that closes the `relative`
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npx vitest run test/unit/client/components/Sidebar.test.tsx -t "Sidebar repo icons"`
+Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx -t "Sidebar repo icons"`
 
 Expected: PASS
 
@@ -432,7 +410,7 @@ Review the `repoIconInfoByCwd` memo and probe effect — they mirror TabBar's im
 
 Impacted tests: all `Sidebar*` tests (the `SidebarItem` component changed), `SidebarItem.running-state.test.tsx`, `SidebarItem.remote-status.test.tsx`, `Sidebar.render-stability.test.tsx` (the comparator changed). The `SidebarItem` tests that create their own store don't include `repoIcons` — but `repoIconInfo` is optional and defaults to undefined, so no repo icon renders and existing assertions are unaffected.
 
-Run: `npx vitest run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/SidebarItem.running-state.test.tsx test/unit/client/components/SidebarItem.remote-status.test.tsx test/unit/client/components/Sidebar.render-stability.test.tsx test/unit/client/components/Sidebar.dom-stability.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/SidebarItem.running-state.test.tsx test/unit/client/components/SidebarItem.remote-status.test.tsx test/unit/client/components/Sidebar.render-stability.test.tsx test/unit/client/components/Sidebar.dom-stability.test.tsx`
 
 Expected: PASS
 
@@ -551,31 +529,31 @@ Add these tests to `test/unit/client/components/Sidebar.test.tsx`, inside the `d
       expect(button).toHaveClass('border-l-blue-500')
     })
 
-    it('applies muted background for an active closed session', async () => {
+    it('applies muted background for an inactive closed session', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
           sessions: [
             {
-              sessionId: sessionId('active-closed'),
+              sessionId: sessionId('inactive-closed'),
               projectPath: '/home/user/project',
               lastActivityAt: Date.now(),
-              title: 'Active closed session',
+              title: 'Inactive closed session',
               cwd: '/home/user/project',
             },
           ],
         },
       ]
-      const tabs = [{ id: 'tab-1', mode: 'shell' }]
-      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1' })
+      const store = createTestStore({ projects })
       renderSidebar(store, [])
 
       await act(async () => { vi.advanceTimersByTime(100) })
 
-      const button = screen.getByRole('button', { name: /active closed session/i })
-      expect(button).toHaveClass('bg-muted')
+      const button = screen.getByRole('button', { name: /inactive closed session/i })
+      expect(button).not.toHaveClass('bg-muted')
       expect(button).not.toHaveClass('border-l-emerald-500')
       expect(button).not.toHaveClass('border-l-blue-500')
+      expect(button).toHaveClass('border-l-transparent')
     })
 
     it('applies light green fill for an inactive open session', async () => {
@@ -629,7 +607,7 @@ to:
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `npx vitest run test/unit/client/components/Sidebar.test.tsx -t "Sidebar row green/blue treatments"`
+Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx -t "Sidebar row green/blue treatments"`
 
 Expected: FAIL because the `SidebarItem` button still uses the flat `bg-muted` / `hover:bg-muted/50` treatment — the green/blue classes are not present.
 
@@ -674,7 +652,7 @@ And in the session row HTML (around lines 833-836), add the `open` class to sess
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `npx vitest run test/unit/client/components/Sidebar.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx`
 
 Expected: PASS — all new treatment tests pass, all updated existing tests pass.
 
@@ -686,7 +664,7 @@ Review the className expression. It's a nested ternary (3 levels deep), which is
 
 Impacted tests: all `Sidebar*` tests, `SidebarItem.running-state.test.tsx`, `SidebarItem.remote-status.test.tsx`. The `SidebarItem.running-state.test.tsx` tests use `hasTab: false` (closed), so the active row would get `bg-muted border-l-transparent` and inactive gets `hover:bg-muted/50 border-l-transparent` — the `text-success`/`text-blue-500`/`text-muted-foreground` icon assertions are unaffected. The `SidebarItem.remote-status.test.tsx` tests also use `hasTab: false` — same reasoning.
 
-Run: `npx vitest run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/SidebarItem.running-state.test.tsx test/unit/client/components/SidebarItem.remote-status.test.tsx test/unit/client/components/Sidebar.render-stability.test.tsx test/unit/client/components/Sidebar.dom-stability.test.tsx test/unit/client/components/Sidebar.highlight.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/SidebarItem.running-state.test.tsx test/unit/client/components/SidebarItem.remote-status.test.tsx test/unit/client/components/Sidebar.render-stability.test.tsx test/unit/client/components/Sidebar.dom-stability.test.tsx test/unit/client/components/Sidebar.highlight.test.ts`
 
 Expected: PASS
 
@@ -707,5 +685,11 @@ aligned. Matches the pane header's border-l-2 idiom for light and dark."
 ---
 
 ## Post-Implementation Notes
+
+**Manual visual verification (both themes):** The unit tests verify that the correct CSS class tokens (including `dark:` overrides) are present, but they run in jsdom which has no real rendering engine. Before marking the work complete, start a dev server (`NODE_ENV=development PORT=3344 npm run dev`) and visually verify in a browser that:
+1. The green tab highlight is clearly visible in dark mode (Task 1)
+2. Repo icons appear in the sidebar before the provider icon, sized the same as the pane header (Task 2)
+3. Sidebar rows show green fill + green left-border for open sessions, blue fill + blue left-border for busy sessions, in both light and dark mode (Task 3)
+Toggle between light and dark mode (UI Settings → Theme) to confirm both look correct.
 
 **E2e screenshot baselines:** The sidebar visual changes (green fill, left borders, repo icons) will change pixel content in `test/e2e-browser/specs/screenshot-baselines.spec.ts` (`default-layout.png`, `sidebar-collapsed.png`). These baselines use `maxDiffPixelRatio: 0.05` and will likely fail. Re-baselining requires a running server and browser (`npm run test:e2e:local -- --update`), which is outside the unit TDD scope. The baselines should be re-captured after the changes are verified locally. This is a follow-up step, not a task.
