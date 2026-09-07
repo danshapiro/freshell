@@ -1289,11 +1289,10 @@ const CODEX_FORK_LIFECYCLE_METHODS = new Set([
   'thread/resume',
 ])
 
-/** Send one freshcodex turn and wait until its snapshot rows render. */
+/** Send one freshcodex turn and wait for the provider's durable idle snapshot. */
 async function sendCodexTurnAndWaitRows(
   page: Page,
-  harness: TestHarness,
-  tabId: string,
+  info: E2eServerInfo,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
@@ -1303,10 +1302,25 @@ async function sendCodexTurnAndWaitRows(
     paneRoot.locator('article[data-turn-index]'),
     `${expectedRowCount} snapshot rows after "${text}"`,
   ).toHaveCount(expectedRowCount, { timeout: 30_000 })
-  // Rows can render from the snapshot before the provider's completion edge
-  // has cleared the busy state. Do not race the next send/fork against that
-  // edge under a loaded multi-worker browser run.
-  await waitForPaneStatus(harness, tabId, 'idle')
+  // The pane layout starts idle and can paint rows before the provider has
+  // completed its turn. The Rust snapshot is the authoritative provider state;
+  // require both the expected durable rows and an idle status before the next
+  // send, compact, or fork action.
+  await expect
+    .poll(
+      async () => {
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        return {
+          rows: snapshot?.turns?.length ?? 0,
+          status: snapshot?.status ?? null,
+        }
+      },
+      {
+        timeout: 30_000,
+        message: `timed out waiting for the durable Codex snapshot to settle after "${text}"`,
+      },
+    )
+    .toEqual({ rows: expectedRowCount, status: 'idle' })
 }
 
 /** The parent's durable rollout file under the fake's CODEX_HOME. */
@@ -1381,7 +1395,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
 
       // Typed slash gesture → freshAgent.compact → thread/compact/start.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
@@ -1407,7 +1421,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 4, 'codex post-compact turn')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex post-compact turn')
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1418,8 +1432,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
 
       const parentRolloutBefore = await readRollout(lane.info.homeDir, 'thread-new-1')
       expect(parentRolloutBefore, 'the parent rollout must exist').toBeTruthy()
@@ -1492,8 +1506,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
 
       // Fork from turn 1's ASSISTANT row (data-turn-index 1, the synthesized
       // split id `turn-1:row-1`) via the turn's real hover affordance.

@@ -512,11 +512,10 @@ async function sendOpencodeTurn(
   return (await paneLeaf(harness, tabId))?.content?.sessionId as string
 }
 
-/** Send one freshcodex turn and wait until its snapshot rows render. */
+/** Send one freshcodex turn and wait for the provider's durable idle snapshot. */
 async function sendCodexTurnAndWaitRows(
   page: Page,
-  harness: TestHarness,
-  tabId: string,
+  info: TestServerInfo,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
@@ -526,9 +525,24 @@ async function sendCodexTurnAndWaitRows(
     paneRoot.locator('article[data-turn-index]'),
     `${expectedRowCount} snapshot rows after "${text}"`,
   ).toHaveCount(expectedRowCount, { timeout: 30_000 })
-  // The snapshot can paint before the provider completion edge clears busy;
-  // settle the lane before the next send or rollback gesture.
-  await waitForPaneStatus(harness, tabId, 'idle')
+  // Pane content starts idle and can paint rows before the provider has
+  // completed its turn. Require the durable Rust snapshot to report both the
+  // expected rows and idle before the next send or rollback gesture.
+  await expect
+    .poll(
+      async () => {
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        return {
+          rows: snapshot?.turns?.length ?? 0,
+          status: snapshot?.status ?? null,
+        }
+      },
+      {
+        timeout: 30_000,
+        message: `timed out waiting for the durable Codex snapshot to settle after "${text}"`,
+      },
+    )
+    .toEqual({ rows: expectedRowCount, status: 'idle' })
 }
 
 // ── Rollback-spec helpers (no donor) ────────────────────────────────────────
@@ -789,8 +803,8 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
       const snap = (): Promise<any | null> => fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')
       expect(userRows(await snap())).toBe(2)
 
