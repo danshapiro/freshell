@@ -17,7 +17,7 @@ jobs:
       - name: Check out exact Phase 2 candidate
         uses: actions/checkout@v4
         with:
-          ref: cc3dcf0bd8d9b0a997a54ba94a721a02dc461265
+          ref: 137fbe79449ff30fac9987336810a0c488bb0e05
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
@@ -71,6 +71,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phase2-g01-cc3dcf0bd
-          path: .runtime-evidence/cc3dcf0bd8d9b0a997a54ba94a721a02dc461265/
+          name: phase2-g01-137fbe794
+          path: .runtime-evidence/137fbe79449ff30fac9987336810a0c488bb0e05/
           if-no-files-found: warn
