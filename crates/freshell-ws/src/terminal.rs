@@ -37,8 +37,8 @@
 //! registry — dropped on server shutdown — drops every [`PtyTerminal`], whose `Drop`
 //! SIGKILLs + joins. No orphans.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -576,15 +576,10 @@ async fn run_loop(
             // The capability gates creation; output follows the row owner.
             _ = managed_output_ticker.tick(), if state.registry.has_managed_controller() => {
                 for terminal_id in state.registry.managed_attached_to(conn_id) {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
-                        state.registry.refresh_managed_output(&terminal_id, 64 * 1024),
-                    ).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => tracing::warn!(terminal_id = %terminal_id, error = %error,
+                    match refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024).await {
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(terminal_id = %terminal_id, error = %error,
                             "managed_runtime.output_refresh_failed"),
-                        Err(_) => tracing::warn!(terminal_id = %terminal_id,
-                            "managed_runtime.output_refresh_timeout"),
                     }
                 }
             }
@@ -3282,6 +3277,22 @@ pub(crate) struct LaunchPrep {
 /// (terminal.rs:1621-1689). Infallible: the only loud reject in the old
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
+fn managed_runtime_mode(mode: &str) -> bool {
+    matches!(mode, "shell" | "claude" | "opencode")
+}
+
+fn managed_opencode_endpoint(
+    mode: &str,
+    use_managed_runtime: bool,
+) -> Option<freshell_opencode::serve::Endpoint> {
+    (use_managed_runtime && mode == "opencode").then(|| freshell_opencode::serve::Endpoint {
+        hostname: "127.0.0.1".to_string(),
+        // Each managed soul has a private network namespace, so this endpoint
+        // is stable across web retries and cannot collide with another soul.
+        port: 4096,
+    })
+}
+
 fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(b"freshell-managed-terminal-v1\0");
@@ -3299,7 +3310,7 @@ fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
 
 #[cfg(test)]
 mod managed_runtime_id_tests {
-    use super::stable_managed_uuid;
+    use super::{managed_opencode_endpoint, managed_runtime_mode, stable_managed_uuid};
 
     #[test]
     fn managed_ids_are_retry_stable_and_domain_separated() {
@@ -3311,6 +3322,25 @@ mod managed_runtime_id_tests {
         assert_ne!(a, stream);
         assert_ne!(a, other);
         assert_eq!(a.get_version_num(), 4);
+    }
+
+    #[test]
+    fn phase2_managed_modes_include_opencode_but_not_other_unmigrated_providers() {
+        assert!(managed_runtime_mode("shell"));
+        assert!(managed_runtime_mode("claude"));
+        assert!(managed_runtime_mode("opencode"));
+        assert!(!managed_runtime_mode("codex"));
+        assert!(!managed_runtime_mode("amplifier"));
+    }
+
+    #[test]
+    fn managed_opencode_uses_private_namespace_fixed_endpoint() {
+        let endpoint = managed_opencode_endpoint("opencode", true)
+            .expect("managed opencode has an in-container endpoint");
+        assert_eq!(endpoint.hostname, "127.0.0.1");
+        assert_eq!(endpoint.port, 4096);
+        assert!(managed_opencode_endpoint("opencode", false).is_none());
+        assert!(managed_opencode_endpoint("shell", true).is_none());
     }
 }
 
@@ -4472,8 +4502,8 @@ pub(crate) async fn handle_create(
     // Managed create retries must be payload-identical across web-process
     // replacement, so their terminal and stream IDs derive from the pane's
     // durable createRequestId. Other creates retain their existing IDs.
-    let use_managed_runtime = state.registry.managed_runtime_connection(conn_id)
-        && matches!(mode.as_str(), "shell" | "claude");
+    let use_managed_runtime =
+        state.registry.managed_runtime_connection(conn_id) && managed_runtime_mode(&mode);
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
@@ -5207,18 +5237,21 @@ pub(crate) async fn handle_create(
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
     // `LoopbackPortAllocator` seam (spec §3.3 rev 2.1 — transport.rs:323). The
     // port rides into argv (`--hostname/--port`), which is also its record.
-    let opencode_endpoint = if mode == "opencode" {
-        use freshell_opencode::serve::PortAllocator as _;
-        match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
-            Ok(ep) => Some(ep),
-            Err(e) => {
-                return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
-                    .await
+    let opencode_endpoint =
+        if let Some(endpoint) = managed_opencode_endpoint(&mode, use_managed_runtime) {
+            Some(endpoint)
+        } else if mode == "opencode" {
+            use freshell_opencode::serve::PortAllocator as _;
+            match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
+                Ok(ep) => Some(ep),
+                Err(e) => {
+                    return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                        .await
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Build one managed setup for each newly spawned pair. A prepared resume
     // hands us its original setup/launch; a fresh or A4-inline plan builds it
@@ -5292,7 +5325,11 @@ pub(crate) async fn handle_create(
             } else {
                 resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
             };
-            let mcp_injection = if mode == "shell" {
+            let mcp_injection = if mode == "shell"
+                || (use_managed_runtime && matches!(mode.as_str(), "claude" | "opencode"))
+            {
+                // Managed providers launch inside the session host. The web
+                // process must not create provider-local MCP files for them.
                 McpInjection::default()
             } else {
                 match generate_mcp_injection(
@@ -5328,7 +5365,7 @@ pub(crate) async fn handle_create(
     // the IO layer; the pure resolver only reads the result from
     // CliLaunchInputs (mcp_injection precedent). Failure must never block the
     // launch.
-    let opencode_rebind_tui_config = if mode == "opencode" {
+    let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
         opencode_rebind_precompute()
     } else {
         None
@@ -5519,7 +5556,7 @@ pub(crate) async fn handle_create(
 
     // Phase 2 managed-runtime door: ONLY a connection that negotiated the
     // capability, against a server boot with an installed controller, may move
-    // shell/Claude PTY ownership out of the web process. Other providers and
+    // shell/Claude/OpenCode PTY ownership out of the web process. Other providers and
     // every non-negotiating connection retain the legacy local spawn path.
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
@@ -5735,20 +5772,24 @@ pub(crate) async fn handle_create(
     // The endpoint was allocated pre-launch and rode into argv; the hub's
     // OpencodeAttach arm re-checks the tracked mode, so this only arms for
     // opencode panes. Channel-deferred — safe off the dispatch path.
-    if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
-        hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+    if !use_managed_runtime {
+        if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
+            hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+        }
     }
 
     // Restore-across-restart fix (opencode): arm the opencode locator for a
     // FRESH (non-resuming) opencode pane. No-ops for every other mode/resume
     // case.
-    crate::opencode_association::maybe_arm(
-        state,
-        &terminal_id,
-        &mode,
-        resolved_cwd.as_deref(),
-        resume_session_id.as_deref(),
-    );
+    if !use_managed_runtime {
+        crate::opencode_association::maybe_arm(
+            state,
+            &terminal_id,
+            &mode,
+            resolved_cwd.as_deref(),
+            resume_session_id.as_deref(),
+        );
+    }
 
     // Lane B2: arm the codex rollout locator for a FRESH (non-resuming)
     // codex pane. Restore-created panes WITHOUT identity arm too — arm()
@@ -7427,6 +7468,58 @@ async fn maybe_restamp_on_attach(
     crate::pane_ledger::surface_write_failure(state, &attach.terminal_id, result.map(|_| ()))
 }
 
+async fn refresh_managed_output_and_associate(
+    state: &WsState,
+    terminal_id: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    // Multiple sockets can poll the same managed terminal. Keep the entire
+    // read -> identity association -> exit transition serial for that row;
+    // otherwise a second reader can mark it Exited while the first reader is
+    // still binding the native identity.
+    let gate = managed_output_gate(terminal_id);
+    let _guard = gate.lock().await;
+    if !state.registry.is_live(terminal_id) {
+        return Ok(());
+    }
+    // Bound the remote read, but never cancel the subsequent durable identity
+    // transaction mid-write merely because it took longer than the read SLA.
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        state
+            .registry
+            .refresh_managed_output(terminal_id, max_bytes),
+    )
+    .await
+    .map_err(|_| "managed output read timed out".to_string())??;
+    if let Some(session_id) = read.native_session_id.as_deref() {
+        crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
+            .await;
+    }
+    if let Some(exit_code) = read.exit_code {
+        state.registry.finish_managed_exit(terminal_id, exit_code);
+    }
+    Ok(())
+}
+
+fn managed_output_gate(terminal_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    type Gate = tokio::sync::Mutex<()>;
+    static GATES: OnceLock<StdMutex<HashMap<String, Weak<Gate>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("managed output gates lock");
+    if let Some(gate) = gates.get(terminal_id).and_then(Weak::upgrade) {
+        return gate;
+    }
+    // Weak entries do not keep old terminal IDs alive. Prune opportunistically
+    // when a new row asks for a gate, so a long-running server stays bounded.
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let gate = Arc::new(Gate::new(()));
+    gates.insert(terminal_id.to_string(), Arc::downgrade(&gate));
+    gate
+}
+
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
 /// connection to it: the registry enqueues `terminal.attach.ready` and replays the
 /// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`) onto
@@ -7464,10 +7557,8 @@ async fn handle_attach(
     paced_exit_notify: Option<freshell_terminal::PacedExitNotify>,
 ) -> AttachReply {
     if state.registry.is_managed(&attach.terminal_id) {
-        if let Err(error) = state
-            .registry
-            .refresh_managed_output(&attach.terminal_id, 256 * 1024)
-            .await
+        if let Err(error) =
+            refresh_managed_output_and_associate(state, &attach.terminal_id, 256 * 1024).await
         {
             return AttachReply::Error(Box::new(managed_runtime_error(
                 &attach.terminal_id,
@@ -11031,7 +11122,7 @@ mod pane_reconcile_gate_tests {
         }
     }
 
-    fn state() -> WsState {
+    pub(super) fn state() -> WsState {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
@@ -11261,6 +11352,113 @@ mod pane_reconcile_gate_tests {
             assert_eq!(error["code"], "RATE_LIMITED", "attempt {attempt}");
         }
         drop(interactive_create_rx);
+    }
+}
+#[cfg(test)]
+mod managed_output_order_tests {
+    use super::*;
+    use freshell_terminal::registry::{
+        ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController,
+        ManagedTerminalDescriptor, ManagedTerminalFuture,
+    };
+
+    struct ExitedOpenCodeRead;
+
+    impl ManagedTerminalController for ExitedOpenCodeRead {
+        fn launch<'a>(
+            &'a self,
+            _: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async { Err("unused launch".into()) })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused input".into()) })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused resize".into()) })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unused stop".into()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async {
+                Ok(ManagedOutputRead {
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: 1,
+                    head_seq: 1,
+                    exit_code: Some(17),
+                    native_session_id: Some("ses-short-lived".into()),
+                    chunks: vec![ManagedOutputChunk {
+                        seq_start: 1,
+                        seq_end: 1,
+                        data: "last output\n".into(),
+                    }],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_identity_and_exit_in_one_read_bind_before_exit() {
+        let state = super::pane_reconcile_gate_tests::state();
+        let terminal_id = "T-managed-short-lived";
+        state.registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-short-lived".into(),
+            incarnation_id: "incarnation-short-lived".into(),
+            terminal_id: terminal_id.into(),
+            stream_id: "S-managed-short-lived".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: Some("req-short-lived".into()),
+        });
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(ExitedOpenCodeRead)));
+
+        refresh_managed_output_and_associate(&state, terminal_id, 1024)
+            .await
+            .expect("host output read succeeds");
+
+        assert_eq!(
+            state.identity.session_ref_for(terminal_id),
+            Some(SessionLocator {
+                provider: "opencode".into(),
+                session_id: "ses-short-lived".into(),
+            }),
+            "the native identity must bind while the row is still Running"
+        );
+        let row = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|row| row.terminal_id == terminal_id)
+            .expect("the exited facade remains available for replay");
+        assert_eq!(row.status, freshell_protocol::TerminalRunStatus::Exited);
+        assert_eq!(row.resume_session_id.as_deref(), Some("ses-short-lived"));
+        assert_eq!(row.snapshot, "last output\n");
     }
 }
 #[cfg(test)]

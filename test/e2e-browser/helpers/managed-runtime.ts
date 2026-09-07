@@ -8,6 +8,9 @@ import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testin
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
 
+export const P2_OPENCODE_VERSION = '1.18.21'
+export const P2_OPENCODE_FREE_MODEL = 'opencode/big-pickle'
+
 export type ManagedRuntimeView = {
   soulId: string
   incarnationId: string
@@ -57,8 +60,8 @@ export class ManagedRuntimeBrowserRig {
           settings: {
             defaultCwd: this.repoRoot,
             codingCli: {
-              enabledProviders: ['claude'],
-              providers: { claude: { permissionMode: 'bypassPermissions' } },
+              enabledProviders: ['opencode'],
+              providers: { opencode: { model: P2_OPENCODE_FREE_MODEL } },
             },
           },
         }, null, 2))
@@ -107,6 +110,16 @@ export class ManagedRuntimeBrowserRig {
     return this.runtime.execOwnedContainerExact(containerId, args)
   }
 
+  ownedProviderExec(containerId: string, args: string[]): string {
+    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', args)
+  }
+
+  ownedContainerHasPid(containerId: string, pid: number): boolean {
+    return this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid']).split(/\r?\n/)
+      .slice(1)
+      .some((line) => Number(line.trim()) === pid)
+  }
+
   writeBrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_BROWSER_RECEIPT
       || path.join(this.runtime.browserDir, 'p2-g01-browser-continuity.json')
@@ -115,9 +128,9 @@ export class ManagedRuntimeBrowserRig {
     return target
   }
 
-  writeClaudeReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_CLAUDE_RECEIPT
-      || path.join(this.runtime.browserDir, 'p2-g04-real-claude-continuity.json')
+  writeOpencodeReceipt(value: unknown): string {
+    const target = process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT
+      || path.join(this.runtime.browserDir, 'p2-g04-real-opencode-continuity.json')
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target

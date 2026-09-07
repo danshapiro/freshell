@@ -10,6 +10,7 @@ freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 freshell-terminal = { path = "../freshell-terminal" }
 freshell-platform = { path = "../freshell-platform" }
 freshell-protocol = { path = "../freshell-protocol" }
+freshell-sessions = { path = "../freshell-sessions" }
 sha2 = "0.10"
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -310,6 +310,11 @@ impl RuntimeBackend for DockerEngineBackend {
         } else {
             Vec::new()
         };
+        let runtime_tmpfs_config = runtime_tmpfs(
+            spec.terminal
+                .as_ref()
+                .map(|terminal| terminal.mode.as_str()),
+        );
         let body = json!({
             "Image": spec.image_ref,
             "Env": host_env,
@@ -344,7 +349,7 @@ impl RuntimeBackend for DockerEngineBackend {
                 "MemorySwap": memory_swap,
                 "PidsLimit": spec.limits.pids_max,
                 "Binds": binds,
-                "Tmpfs": {"/tmp":"rw,noexec,nosuid,nodev,size=128m"}
+                "Tmpfs": runtime_tmpfs_config
             }
         });
         // The name is diagnostic only and is deliberately unique per create attempt.
@@ -581,6 +586,20 @@ impl RuntimeBackend for DockerEngineBackend {
     }
 }
 
+fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, String> {
+    let mut mounts = std::collections::BTreeMap::from([(
+        "/tmp".to_string(),
+        "rw,noexec,nosuid,nodev,size=128m".to_string(),
+    )]);
+    if mode == Some("opencode") {
+        mounts.insert(
+            "/run/opencode-tmp".to_string(),
+            "rw,exec,nosuid,nodev,size=64m,mode=1777".to_string(),
+        );
+    }
+    mounts
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExpectedConfig {
     image_ref: String,
@@ -719,6 +738,27 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             "runtime capability set changed: {actual_cap_add:?}"
         )));
     }
+    let expected_tmpfs = runtime_tmpfs(handle.terminal().map(|terminal| terminal.mode.as_str()));
+    let actual_tmpfs = host_config
+        .get("Tmpfs")
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(path, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (path.clone(), value.to_string()))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    if actual_tmpfs != expected_tmpfs {
+        return Err(BackendError::OwnershipMismatch(format!(
+            "runtime tmpfs topology changed: {actual_tmpfs:?}"
+        )));
+    }
+
     let mounts = value
         .get("Mounts")
         .and_then(Value::as_array)
@@ -921,6 +961,24 @@ mod tests {
             parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"{}");
+    }
+
+    #[test]
+    fn opencode_gets_dedicated_bounded_exec_tmpfs_while_global_tmp_stays_noexec() {
+        let opencode = runtime_tmpfs(Some("opencode"));
+        assert_eq!(
+            opencode.get("/tmp").map(String::as_str),
+            Some("rw,noexec,nosuid,nodev,size=128m")
+        );
+        assert_eq!(
+            opencode.get("/run/opencode-tmp").map(String::as_str),
+            Some("rw,exec,nosuid,nodev,size=64m,mode=1777")
+        );
+        assert_eq!(opencode.len(), 2);
+
+        let shell = runtime_tmpfs(Some("shell"));
+        assert_eq!(shell.len(), 1);
+        assert!(!shell.contains_key("/run/opencode-tmp"));
     }
 
     #[test]

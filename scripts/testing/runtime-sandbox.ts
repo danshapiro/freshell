@@ -122,7 +122,7 @@ export class RuntimeHarness {
     fs.writeFileSync(path.join(this.evidenceDir, 'manifest.json'), JSON.stringify({ ...sourceManifest, execution: { candidateSha: this.candidateSha, runId: this.runId, startedAt: new Date().toISOString() } }, null, 2))
     fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(this.phase === 1
       ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
-      : { phase: 'phase-2', claude: { status: 'pending-live-gate' }, workloadImage: 'pinned' }, null, 2))
+      : { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true }, workloadImage: 'pinned' }, null, 2))
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
     this.ensureRuntimeImage()
@@ -508,6 +508,14 @@ export class RuntimeHarness {
     return execFileSync('docker', ['exec', containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
   }
 
+  execOwnedContainerAsExact(containerId: string, user: string, command: string[]): string {
+    if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
+      throw new Error(`refusing to exec non-owned container ${containerId}`)
+    }
+    if (!/^\d+:\d+$/.test(user)) throw new Error(`invalid numeric docker exec user ${user}`)
+    return execFileSync('docker', ['exec', '--user', user, containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+  }
+
   topOwnedContainerExact(containerId: string, psArgs: string[] = ['-eo', 'pid,ppid,sid,comm']): string {
     if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
       throw new Error(`refusing to inspect non-owned container ${containerId}`)
@@ -606,9 +614,15 @@ export class RuntimeHarness {
   private ensureRuntimeImage(): void {
     const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
     let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
-    if (inspect.status !== 0) {
-      if (this.phase === 1) docker(['pull', tag])
-      else execFileSync('docker', ['build', '--pull=false', '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: this.repoRoot, stdio: 'inherit' })
+    if (this.phase === 1) {
+      if (inspect.status !== 0) {
+        docker(['pull', tag])
+        inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+      }
+    } else {
+      // Always invoke the Phase 2 build so Docker validates the current
+      // Dockerfile/provider pins. Layer caching keeps unchanged rebuilds cheap.
+      execFileSync('docker', ['build', '--pull=false', '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: this.repoRoot, stdio: 'inherit' })
       inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
     }
     this.imageRef = inspect.stdout.trim()
@@ -616,14 +630,16 @@ export class RuntimeHarness {
   }
 
   private phase2BootstrapFiles(): string[] {
-    const configured = process.env.FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE?.trim()
-    if (!configured) return []
-    try {
-      const resolved = fs.realpathSync(configured)
-      return fs.statSync(resolved).isFile() ? [resolved] : []
-    } catch {
-      return []
+    const files = new Set<string>()
+    for (const key of ['FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE', 'FRESHELL_MANAGED_OPENCODE_AUTH_FILE']) {
+      const configured = process.env[key]?.trim()
+      if (!configured) continue
+      try {
+        const resolved = fs.realpathSync(configured)
+        if (fs.statSync(resolved).isFile()) files.add(resolved)
+      } catch {}
     }
+    return [...files]
   }
 
   private phase2WorkspaceRoots(): string[] {

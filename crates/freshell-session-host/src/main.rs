@@ -67,7 +67,8 @@ async fn run() -> Result<(), String> {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
         Some("fixture-child") => fixture_child(&args[2..]).await,
-        _ => Err("usage: freshell-session-host <serve|worker|fixture-child> ...".into()),
+        Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
+        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|opencode-identity-worker> ...".into()),
     }
 }
 

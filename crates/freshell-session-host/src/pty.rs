@@ -8,14 +8,17 @@ use freshell_runtime_protocol::{
     CommandState, IncarnationId, RequestId, RuntimeError, RuntimeErrorCode, RuntimeOutputBatch,
     TerminalLaunchSpec,
 };
+use freshell_sessions::parse::opencode::{OpencodeProvider, OpencodeSessionRow};
 use freshell_terminal::PtyTerminal;
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
     },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub struct HostedPty {
@@ -26,6 +29,7 @@ pub struct HostedPty {
     exit_code: Arc<AtomicI64>,
     terminal_id: String,
     stream_epoch: String,
+    native_session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl HostedPty {
@@ -35,6 +39,7 @@ impl HostedPty {
         launch: &TerminalLaunchSpec,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
+        let launch_floor_ms = epoch_ms().saturating_sub(500);
         let stream_epoch = format!(
             "{}-{}",
             launch.stream_id,
@@ -100,6 +105,15 @@ impl HostedPty {
         )
         .map_err(|e| e.to_string())?;
         let commands = CommandJournal::open(state_dir)?;
+        let native_session_id = Arc::new(Mutex::new(launch.resume_session_id.clone()));
+        if launch.mode == "opencode" && launch.resume_session_id.is_none() {
+            spawn_opencode_identity_watcher(
+                launch,
+                launch_floor_ms,
+                Arc::clone(&native_session_id),
+                Arc::clone(&exited),
+            );
+        }
         Ok(Self {
             pty,
             output,
@@ -108,6 +122,7 @@ impl HostedPty {
             exit_code,
             terminal_id: launch.terminal_id.clone(),
             stream_epoch,
+            native_session_id,
         })
     }
 
@@ -165,6 +180,11 @@ impl HostedPty {
         batch.incarnation_id = incarnation_id;
         batch.exited = self.exited();
         batch.exit_code = self.exited().then(|| self.exit_code());
+        batch.native_session_id = self
+            .native_session_id
+            .lock()
+            .ok()
+            .and_then(|session| session.clone());
         Ok(batch)
     }
 
@@ -191,5 +211,175 @@ impl HostedPty {
     }
     pub fn spool_bytes(&self) -> u64 {
         self.output.lock().map(|j| j.spool_bytes()).unwrap_or(0)
+    }
+}
+
+fn epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn select_opencode_session(
+    rows: &[OpencodeSessionRow],
+    cwd: &str,
+    floor_ms: i64,
+) -> Option<String> {
+    let mut matches = rows.iter().filter(|row| {
+        row.has_three_views_marker != Some(1)
+            && row.created_at.is_some_and(|created| created >= floor_ms)
+            && row
+                .cwd
+                .as_deref()
+                .is_some_and(|candidate| paths_equivalent(candidate, cwd))
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first.session_id.clone())
+}
+
+fn paths_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let left = std::fs::canonicalize(left).ok();
+    let right = std::fs::canonicalize(right).ok();
+    left.is_some() && left == right
+}
+
+fn spawn_opencode_identity_watcher(
+    launch: &TerminalLaunchSpec,
+    floor_ms: i64,
+    native_session_id: Arc<Mutex<Option<String>>>,
+    _exited: Arc<AtomicBool>,
+) {
+    let data_home = launch
+        .env
+        .get("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/freshell/provider/.local/share"))
+        .join("opencode");
+    let cwd = launch.cwd.clone();
+    let terminal_id = launch.terminal_id.clone();
+    let uid = launch.run_as_uid;
+    let gid = launch.run_as_gid;
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!(terminal_id = %terminal_id, "managed_opencode.identity_helper_exe_unavailable");
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name(format!(
+            "opencode-id-{}",
+            terminal_id.chars().take(12).collect::<String>()
+        ))
+        .spawn(move || {
+            let mut command = std::process::Command::new("/usr/bin/setpriv");
+            command
+                .arg("--reuid")
+                .arg(uid.to_string())
+                .arg("--regid")
+                .arg(gid.to_string())
+                .arg("--clear-groups")
+                .arg("--no-new-privs")
+                .arg("--")
+                .arg(exe)
+                .arg("opencode-identity-worker")
+                .arg("--data-home")
+                .arg(data_home)
+                .arg("--cwd")
+                .arg(cwd)
+                .arg("--floor-ms")
+                .arg(floor_ms.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            match command.output() {
+                Ok(output) if output.status.success() => {
+                    let session_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if session_id.starts_with("ses_") {
+                        if let Ok(mut slot) = native_session_id.lock() {
+                            *slot = Some(session_id.clone());
+                        }
+                        tracing::info!(terminal_id = %terminal_id, session_id = %session_id,
+                            "managed_opencode.native_session_discovered");
+                    }
+                }
+                Ok(output) => {
+                    tracing::debug!(terminal_id = %terminal_id, status = ?output.status.code(),
+                    "managed_opencode.identity_helper_exited_without_identity")
+                }
+                Err(error) => tracing::warn!(terminal_id = %terminal_id, error = %error,
+                    "managed_opencode.identity_helper_spawn_failed"),
+            }
+        });
+}
+
+pub(crate) fn run_opencode_identity_worker(args: &[String]) -> Result<(), String> {
+    let data_home = worker_arg(args, "--data-home")?;
+    let cwd = worker_arg(args, "--cwd")?;
+    let floor_ms: i64 = worker_arg(args, "--floor-ms")?
+        .parse()
+        .map_err(|error| format!("invalid --floor-ms: {error}"))?;
+    let provider = OpencodeProvider::new(PathBuf::from(data_home));
+    // A provider can sit idle before its first turn, so this helper is allowed
+    // to wait. It lives inside the soul cgroup and disappears with the enclosure.
+    for _ in 0..14_400 {
+        match provider.list_sessions_since(floor_ms, 32) {
+            Ok(rows) => {
+                if let Some(session_id) = select_opencode_session(&rows, &cwd, floor_ms) {
+                    println!("{session_id}");
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "managed_opencode.identity_worker_deferred")
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err("timed out waiting for OpenCode native session identity".into())
+}
+
+fn worker_arg(args: &[String], name: &str) -> Result<String, String> {
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+#[cfg(test)]
+mod managed_opencode_identity_tests {
+    use super::select_opencode_session;
+    use freshell_sessions::parse::opencode::OpencodeSessionRow;
+
+    fn row(id: &str, cwd: &str, created_at: i64) -> OpencodeSessionRow {
+        OpencodeSessionRow {
+            session_id: id.to_string(),
+            cwd: Some(cwd.to_string()),
+            title: None,
+            created_at: Some(created_at),
+            last_activity_at: Some(created_at),
+            project_path: Some(cwd.to_string()),
+            has_three_views_marker: Some(0),
+        }
+    }
+
+    #[test]
+    fn selects_exactly_one_new_matching_root_session_and_refuses_ambiguity() {
+        let rows = vec![
+            row("ses_old", "/repo", 900),
+            row("ses_other", "/other", 1_100),
+            row("ses_new", "/repo", 1_200),
+        ];
+        assert_eq!(
+            select_opencode_session(&rows, "/repo", 1_000),
+            Some("ses_new".into())
+        );
+
+        let ambiguous = vec![row("ses_a", "/repo", 1_100), row("ses_b", "/repo", 1_200)];
+        assert_eq!(select_opencode_session(&ambiguous, "/repo", 1_000), None);
     }
 }

@@ -352,6 +352,19 @@ pub fn detect_available_clis_live(specs: &[CliDetectionSpec]) -> Value {
     detect_available_clis(specs, &|k| std::env::var(k).ok(), host_os_live(), &runner)
 }
 
+/// Promote an extension-backed CLI when its executable is supplied by the
+/// managed workload image rather than the web host. Never invent a provider:
+/// only an existing detection-map key may be changed from false to true.
+pub fn promote_managed_runtime_cli(available: &mut Value, name: &str) {
+    let Some(map) = available.as_object_mut() else {
+        return;
+    };
+    let Some(slot) = map.get_mut(name) else {
+        return;
+    };
+    *slot = Value::Bool(true);
+}
+
 // ── Live directory resolution ───────────────────────────────────────────────
 
 /// Resolve the extension scan dirs, mirroring `server/index.ts:224-228`:
@@ -833,6 +846,17 @@ mod tests {
         let out = detect_available_clis(&specs, &get, HostOs::Linux, &runner);
         assert_eq!(out["claude"], json!(true));
         assert_eq!(out["codex"], json!(false));
+    }
+
+    #[test]
+    fn managed_runtime_availability_only_promotes_already_registered_provider() {
+        let mut value = serde_json::json!({"claude": false, "opencode": false});
+        promote_managed_runtime_cli(&mut value, "opencode");
+        promote_managed_runtime_cli(&mut value, "not-registered");
+        assert_eq!(
+            value,
+            serde_json::json!({"claude": false, "opencode": true})
+        );
     }
 
     #[test]

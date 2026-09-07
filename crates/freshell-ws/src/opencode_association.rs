@@ -91,9 +91,6 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
     let located = match tokio::task::spawn_blocking(move || locator.tick(now)).await {
         Ok(located) => located,
         Err(join_error) => {
-            // The blocking closure only calls `OpencodeLocator::tick`, which
-            // does not itself panic in normal operation; a panic here would
-            // be a genuine bug, not a routine condition to silently swallow.
             tracing::warn!(
                 error = %join_error,
                 "opencode_locator_tick_panicked: sweep tick task panicked, skipping this cycle"
@@ -102,182 +99,223 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         }
     };
     for located in located {
-        let Some(entry) = state
-            .registry
-            .directory()
-            .into_iter()
-            .find(|e| e.terminal_id == located.terminal_id)
-        else {
-            tracing::warn!(
-                terminal_id = %located.terminal_id,
-                session_id = %located.session_id,
-                "opencode_association_rejected: terminal_missing"
-            );
-            continue;
-        };
-        if entry.mode != "opencode" || entry.status != TerminalRunStatus::Running {
-            tracing::warn!(
-                terminal_id = %located.terminal_id,
-                mode = %entry.mode,
-                "opencode_association_rejected: terminal_not_opencode_or_not_running"
-            );
-            continue;
-        }
-        if entry.resume_session_id.is_some() {
-            tracing::warn!(
-                terminal_id = %located.terminal_id,
-                "opencode_association_rejected: terminal_already_bound"
-            );
-            continue;
-        }
-        // Claim guards on the id being adopted (parity with the codex
-        // adoption tail's `codex_identity::codex_claim_refused` and the
-        // opencode SIGNAL lane's `target_session_guards_pass` — this
-        // locator lane previously had neither, so a sole cwd-matching
-        // candidate could silently rebind another pane's (or a fresh
-        // agent's) session onto this terminal).
-        if opencode_claim_refused(state, &located.terminal_id, &located.session_id).await {
-            continue;
-        }
-        // b8ke ext r14 F1: the learned identity's coordinator authority is
-        // acquired FIRST (fail-closed: a refusal mutates NO identity home —
-        // parity with the codex adoption tail) and held across the identity
-        // homes' writes; the owner commits + broadcasts only AFTER the
-        // registry/metadata/durable-binding updates all landed (pre-r14 the
-        // commit+broadcast preceded the writes — a handoff could acquire the
-        // supposedly-complete owner and reap it while this sweep kept
-        // writing stale bindings, and a binding failure could not unwind
-        // the committed owner). Pre-r11 the locator adoption only updated
-        // the identity homes while the real terminal writer ran with a
-        // VACANT canonical key.
-        let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
-            state,
-            "opencode",
-            &located.terminal_id,
-            &located.session_id,
-            None,
-        )
-        .await
-        else {
-            continue;
-        };
+        associate_session_identity(state, &located.terminal_id, &located.session_id, false).await;
+    }
+}
 
-        // P1.8 (trigger c) + P1.10: locator resolution is an identity event —
-        // durable binding row first, then the spawn-time pending marker is
-        // deleted. Registry-truth cwd, same as the in-memory binds above.
-        // Awaited (drain_and_associate is async; the helper spawn_blockings
-        // the fsync off this sweep task — V1.md).
-        // b8ke ext r39 F2: the binding write GATES THE INSTALL/ANNOUNCE —
-        // it runs FIRST (before the identity homes, the registry meta, the
-        // association broadcast, and the activity hub), so a failure
-        // installs and announces NOTHING (the consistent prior state
-        // stands) and the caller commits the held authority (the live
-        // terminal stays the named owner — never a
-        // Vacant-with-live-writer). Pre-r39 the homes/broadcast/hub all
-        // landed BEFORE the awaited write and a failure unwound to a
-        // Vacant key while the registries and clients still identified
-        // the terminal as the session writer.
-        let binding_ok = crate::pane_ledger::ledger_resolve_identity(
-            state,
-            &located.terminal_id,
-            "opencode",
-            &located.session_id,
-            entry.cwd.as_deref(),
-        )
-        .await;
-        if !binding_ok {
-            tracing::warn!(target: "freshell_ws::opencode_association",
-                terminal_id = %located.terminal_id, session_id = %located.session_id,
-                event = "opencode_association.binding_failed",
-                outcome = "committed_owner_kept",
-                failure_reason = "DURABLE_BINDING_WRITE_FAILED",
-                "opencode_association_binding_failed: the durable binding write \
-                 failed — nothing installed/announced; the held authority commits \
-                 so the live terminal stays the named owner (never a \
-                 Vacant-with-live-writer); the next route poll re-adopts and \
-                 retries the binding"
-            );
-            crate::identity_ownership::coordinator_commit_identity(
-                state,
-                authority,
-                "opencode",
-                &located.terminal_id,
-                &located.session_id,
-                None,
-            )
-            .await;
-            continue;
-        }
-        state.identity.upsert(
-            &located.terminal_id,
-            Some("opencode"),
-            Some(&located.session_id),
-            entry.cwd.as_deref(),
-            now_ms(),
+/// Managed OpenCode learns its native id inside the soul's session host, where
+/// the provider SQLite store actually lives. Fold that trusted id through the
+/// same claim guards, identity registry, pane ledger and broadcasts as the
+/// legacy host-side locator. Repeated observations of the same id are a no-op.
+pub(crate) async fn associate_managed_session(
+    state: &WsState,
+    terminal_id: &str,
+    session_id: &str,
+) {
+    associate_session_identity(state, terminal_id, session_id, true).await;
+}
+
+async fn associate_session_identity(
+    state: &WsState,
+    terminal_id: &str,
+    session_id: &str,
+    managed: bool,
+) -> bool {
+    let Some(entry) = state
+        .registry
+        .directory()
+        .into_iter()
+        .find(|entry| entry.terminal_id == terminal_id)
+    else {
+        tracing::warn!(
+            terminal_id,
+            session_id,
+            "opencode_association_rejected: terminal_missing"
         );
-        // Unified agent names (Task 2): the locator resolved the session from
-        // opencode's SQLite database — the row IS the verified persistence
-        // evidence (zero-message sessions persist at creation). The upsert
-        // established the durable identity and deliberately left a
-        // still-pending name ref for THIS transfer (the switch rule
-        // retargets only already-durable refs); the stashed pending handle
-        // transfers onto the session with the database as the native
-        // location, then the identity/registry bindings advance.
-        {
-            let acquisition = freshell_protocol::native_location::NativeAcquisition {
-                location: freshell_protocol::native_location::NativeLocation::Opencode {
-                    database_path: freshell_sessions::parse::default_opencode_data_home()
-                        .join("opencode.db")
-                        .display()
-                        .to_string(),
-                    native_session_id: Some(located.session_id.clone()),
-                    original_directory: entry.cwd.clone(),
-                    owned_local_endpoint: None,
-                },
-                evidence: freshell_protocol::native_location::NativeEvidenceKind::IndexedFile,
-                persistence: freshell_protocol::native_location::NativePersistence::Verified,
-            };
-            crate::identity::bind_pending_naming(
-                &state.identity,
-                &state.registry,
-                &located.terminal_id,
-                freshell_protocol::session_names::NamedProvider::Opencode,
-                &located.session_id,
-                acquisition,
-            )
-            .await;
-        }
-        state.registry.set_meta(
-            &located.terminal_id,
-            None,
-            None,
-            Some("opencode".to_string()),
-            Some(located.session_id.clone()),
+        return false;
+    };
+    if entry.mode != "opencode" || entry.status != TerminalRunStatus::Running {
+        tracing::warn!(terminal_id, mode = %entry.mode,
+            "opencode_association_rejected: terminal_not_opencode_or_not_running");
+        return false;
+    }
+    let managed_descriptor = state.registry.managed_descriptor(terminal_id);
+    if managed != managed_descriptor.is_some() {
+        tracing::warn!(
+            terminal_id,
+            session_id,
+            managed,
+            "opencode_association_rejected: identity_source_does_not_match_terminal_owner"
         );
-        broadcast_terminal_session_associated(
-            state,
-            &located.terminal_id,
-            &located.session_id,
-            entry.cwd.clone(),
+        return false;
+    }
+    let locator = SessionLocator {
+        provider: "opencode".to_string(),
+        session_id: session_id.to_string(),
+    };
+    if state
+        .identity
+        .session_ref_for(terminal_id)
+        .is_some_and(|bound| bound != locator)
+    {
+        tracing::warn!(
+            terminal_id,
+            session_id,
+            "opencode_association_rejected: terminal_identity_already_bound_to_different_session"
+        );
+        return false;
+    }
+    // The managed host reports the same native id on every output read.
+    // Skip a completed association only while the coordinator still names
+    // this terminal and its pending name (if any) has transferred. A
+    // registry-only resume id is insufficient: the identity and durable
+    // binding may not have been installed yet.
+    if managed
+        && entry.resume_session_id.as_deref() == Some(session_id)
+        && state.identity.session_ref_for(terminal_id).as_ref() == Some(&locator)
+        && !matches!(
+            state.identity.name_ref_for(terminal_id),
+            Some(freshell_protocol::session_names::SessionNameRef::Pending { .. })
         )
-        .await;
-        // Task 10: feed the identity proof into the activity hub — the
-        // opencode tracker's deferred (awaitingAssociation) completions
-        // release on this bind (channel-deferred, safe off the sweep task;
-        // codex_identity.rs:221 precedent).
-        if let Some(hub) = &state.activity {
-            hub.bind_opencode_session(&located.terminal_id, &located.session_id);
-        }
+        && (!state.pane_ledger.is_enabled()
+            || state
+                .pane_ledger
+                .lookup_by_session("opencode", session_id)
+                .is_some_and(|resolution| {
+                    resolution.row.state == crate::pane_ledger::RowState::Bound
+                        && resolution.row.live_terminal_id.as_deref() == Some(terminal_id)
+                        && resolution.row.pane_kind.as_deref() != Some("fresh-agent")
+                }))
+        && state.ownership.as_ref().is_none_or(|ownership| {
+            matches!(
+                ownership.observe("opencode", session_id).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                        && owner.terminal_id.as_deref() == Some(terminal_id)
+            )
+        })
+    {
+        return true;
+    }
+    if entry.resume_session_id.is_some()
+        && (!managed || entry.resume_session_id.as_deref() != Some(session_id))
+    {
+        tracing::warn!(
+            terminal_id,
+            session_id,
+            "opencode_association_rejected: terminal_already_bound_to_different_session"
+        );
+        return false;
+    }
+    if opencode_claim_refused(state, terminal_id, session_id).await {
+        return false;
+    }
+
+    // Main's learned-identity transaction: acquire coordinator authority
+    // before touching either identity home. A foreign owner or in-progress
+    // handoff refuses this adoption without restamping the pane.
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
+        state,
+        "opencode",
+        terminal_id,
+        session_id,
+        None,
+    )
+    .await
+    else {
+        return false;
+    };
+
+    // The durable binding gates every in-memory identity and client-visible
+    // announcement. On write failure keep the live terminal's coordinator
+    // owner; leaving the key Vacant would permit a second writer.
+    let binding_ok = crate::pane_ledger::ledger_resolve_identity(
+        state,
+        terminal_id,
+        "opencode",
+        session_id,
+        entry.cwd.as_deref(),
+    )
+    .await;
+    if !binding_ok {
+        tracing::warn!(target: "freshell_ws::opencode_association",
+            terminal_id, session_id,
+            event = "opencode_association.binding_failed",
+            outcome = "committed_owner_kept",
+            failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "opencode association binding failed; identity was not announced"
+        );
         crate::identity_ownership::coordinator_commit_identity(
             state,
             authority,
             "opencode",
-            &located.terminal_id,
-            &located.session_id,
+            terminal_id,
+            session_id,
             None,
         )
         .await;
+        return false;
     }
+
+    state.identity.upsert(
+        terminal_id,
+        Some("opencode"),
+        Some(session_id),
+        entry.cwd.as_deref(),
+        now_ms(),
+    );
+    // The host-side locator read its SQLite row directly. The managed
+    // session host read the row inside its own provider volume. Both are
+    // verified persistence evidence for the pending saved-name transfer.
+    // The managed path records the database's container path; the web
+    // process must not mistake its own unrelated OpenCode store for it.
+    let database_path = if managed {
+        "/home/freshell/provider/.local/share/opencode/opencode.db".to_string()
+    } else {
+        freshell_sessions::parse::default_opencode_data_home()
+            .join("opencode.db")
+            .display()
+            .to_string()
+    };
+    let acquisition = freshell_protocol::native_location::NativeAcquisition {
+        location: freshell_protocol::native_location::NativeLocation::Opencode {
+            database_path,
+            native_session_id: Some(session_id.to_string()),
+            original_directory: entry.cwd.clone(),
+            owned_local_endpoint: None,
+        },
+        evidence: freshell_protocol::native_location::NativeEvidenceKind::IndexedFile,
+        persistence: freshell_protocol::native_location::NativePersistence::Verified,
+    };
+    crate::identity::bind_pending_naming(
+        &state.identity,
+        &state.registry,
+        terminal_id,
+        freshell_protocol::session_names::NamedProvider::Opencode,
+        session_id,
+        acquisition,
+    )
+    .await;
+    state.registry.set_meta(
+        terminal_id,
+        None,
+        None,
+        Some("opencode".to_string()),
+        Some(session_id.to_string()),
+    );
+    broadcast_terminal_session_associated(state, terminal_id, session_id, entry.cwd.clone()).await;
+    if let Some(hub) = &state.activity {
+        hub.bind_opencode_session(terminal_id, session_id);
+    }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "opencode",
+        terminal_id,
+        session_id,
+        None,
+    )
+    .await
 }
 
 /// Bug-1 (sidebar rail): classify a resume target at the moment a `ses_` id

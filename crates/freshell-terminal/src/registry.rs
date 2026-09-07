@@ -857,6 +857,7 @@ pub struct ManagedOutputRead {
     pub retained_from_seq: i64,
     pub head_seq: i64,
     pub exit_code: Option<i64>,
+    pub native_session_id: Option<String>,
     pub chunks: Vec<ManagedOutputChunk>,
 }
 
@@ -4625,7 +4626,10 @@ impl TerminalRegistry {
 
     /// Pull bounded host-spooled output and merge it into the ordinary
     /// terminal replay/fan-out path. The host is still the sole PTY reader;
-    /// this is a control-plane read of already-drained output.
+    /// this is a control-plane read of already-drained output. The caller
+    /// must associate any reported native session identity, then apply the
+    /// reported exit with [`Self::finish_managed_exit`]. An output read can
+    /// report both facts at once, and association requires a Running row.
     pub async fn refresh_managed_output(
         &self,
         terminal_id: &str,
@@ -4680,9 +4684,6 @@ impl TerminalRegistry {
                 chunk.data.clone(),
             );
         }
-        if let Some(exit_code) = read.exit_code {
-            self.finish_managed_exit(terminal_id, exit_code);
-        }
         Ok(read)
     }
 
@@ -4706,16 +4707,40 @@ impl TerminalRegistry {
         }
         state.status = TerminalRunStatus::Exited;
         state.exit_code = Some(exit_code);
-        state.last_activity_at = now_ms();
+        let now = now_ms();
+        state.last_activity_at = now;
+        state.last_output_activity_at = now;
+        state.last_meaningful_activity_at = now;
+        state.last_meaningful_output_at = now;
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
             terminal_id: terminal_id.to_string(),
         });
-        for subscriber in state.subscribers.values() {
-            (subscriber.sink)(exit.clone());
+        // The host spool's final chunks were ingested before this transition.
+        // A paced subscriber still has undelivered pages in the ring: stage
+        // its exit until the replay drain completes, exactly as the local
+        // PTY natural-exit path does.
+        let mut staged_notify: Vec<PacedExitNotify> = Vec::new();
+        let mut retire_now: Vec<u64> = Vec::new();
+        for (conn_id, subscriber) in state.subscribers.iter_mut() {
+            if subscriber.paced_deferred {
+                subscriber.paced_exit_pending = Some(exit_code);
+                if let Some(notify) = subscriber.paced_exit_notify.clone() {
+                    staged_notify.push(notify);
+                }
+            } else {
+                (subscriber.sink)(exit.clone());
+                retire_now.push(*conn_id);
+            }
         }
-        state.subscribers.clear();
+        for conn_id in retire_now {
+            state.subscribers.remove(&conn_id);
+        }
         drop(state);
+        for notify in staged_notify {
+            notify(terminal_id, exit_code);
+        }
+        self.release_session_ref_ownership(terminal_id, "registry/managed-exit");
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
             at: now_ms(),
@@ -15017,6 +15042,96 @@ mod tests {
             .expect("managed exit row retained");
         assert_eq!(row.status, TerminalRunStatus::Exited);
         assert_eq!(row.snapshot, "tail\n");
+    }
+
+    #[test]
+    fn managed_exit_waits_for_paced_replay_before_notifying_the_client() {
+        let registry = TerminalRegistry::new();
+        registry.set_paced_page_max_bytes(0);
+        registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-paced-exit".into(),
+            incarnation_id: "incarnation-paced-exit".into(),
+            terminal_id: "T-paced-exit".into(),
+            stream_id: "S-paced-exit".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: None,
+        });
+        for seq in 1..=3 {
+            assert!(registry.ingest_managed_output(
+                "T-paced-exit",
+                seq,
+                seq,
+                format!("output-{seq}\n"),
+            ));
+        }
+        let (sink, seen) = collector();
+        let notified: Arc<StdMutex<Vec<(String, i64)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let notify_sink = Arc::clone(&notified);
+        let start = registry
+            .attach(
+                "T-paced-exit",
+                1,
+                sink,
+                Some("managed-paced-exit".into()),
+                0,
+                false,
+                true,
+                None,
+                None,
+                None,
+                PacedAttachOptions {
+                    paced_exit_notify: Some(Arc::new(move |terminal_id, exit_code| {
+                        notify_sink
+                            .lock()
+                            .unwrap()
+                            .push((terminal_id.to_string(), exit_code));
+                    })),
+                    ..PacedAttachOptions::default()
+                },
+            )
+            .paced
+            .expect("managed facade starts paced replay");
+        for seq in 4..=6 {
+            assert!(registry.ingest_managed_output(
+                "T-paced-exit",
+                seq,
+                seq,
+                format!("final-{seq}\n"),
+            ));
+        }
+        assert!(registry.finish_managed_exit("T-paced-exit", 17));
+        assert_eq!(registry.paced_exit_pending_of("T-paced-exit", 1), Some(17));
+        assert_eq!(
+            notified.lock().unwrap().as_slice(),
+            &[("T-paced-exit".to_string(), 17)]
+        );
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| matches!(message, ServerMessage::TerminalExit(_))));
+
+        let mut cursor = start.session.page_end;
+        loop {
+            match registry.complete_paced_tail(
+                "T-paced-exit",
+                1,
+                "managed-paced-exit",
+                cursor,
+                6,
+                0,
+            ) {
+                PacedTailCompletion::Handoff { end_seq, .. } => cursor = end_seq,
+                PacedTailCompletion::Completed { .. } => break,
+                other => panic!("unexpected paced completion: {other:?}"),
+            }
+        }
+        let delivered = seen.lock().unwrap();
+        assert!(
+            matches!(delivered.last(), Some(ServerMessage::TerminalExit(exit)) if exit.exit_code == 17)
+        );
     }
 
     #[test]

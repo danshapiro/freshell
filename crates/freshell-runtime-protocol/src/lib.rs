@@ -347,6 +347,10 @@ pub struct RuntimeOutputBatch {
     pub exited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
+    /// Provider-native durable conversation id discovered by the session host.
+    /// For OpenCode this is the soul-local `ses_*` row, never a web-side guess.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
     #[serde(default)]
     pub frames: Vec<RuntimeOutputFrame>,
 }
