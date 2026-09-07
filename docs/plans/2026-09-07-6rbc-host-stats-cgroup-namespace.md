@@ -272,7 +272,7 @@ function safeIsDir(dirPath: string): boolean {
  * live AT <cgroupRoot> itself. Those limit files exist only at the root of a
  * namespace-rooted mount: the REAL cgroup2 root of a non-namespaced host has
  * none of them (only statistics/pressure files), so reads resolved to the fs
- * root degrade to the same null/threads-max fallbacks as before there. Two
+ * root degrade to the same null/threads-max fallbacks as before there. Three
  * v2 shapes therefore resolve to the fs root (path ''): membership '0::/',
  * a membership path that does not exist under <cgroupRoot> (a mount rooted
  * at the container's cgroup while /proc still reports the host path), and a
@@ -579,9 +579,11 @@ In `crates/freshell-platform/src/host_stats_readers.rs`:
 /// pids.max live AT `<cgroup_root>` itself. Those limit files only exist at
 /// the root of a namespace-rooted mount: the REAL cgroup2 root of a
 /// non-namespaced host has none of them, so reading at the fs root degrades
-/// to the same `None` fallback as before there. Two v2 shapes therefore
-/// resolve to the fs root (empty path): membership `0::/`, and a membership
-/// path that does not exist under `<cgroup_root>`. cgroup v1 is unchanged:
+/// to the same `None` fallback as before there. Three v2 shapes therefore
+/// resolve to the fs root (empty path): membership `0::/`, a membership path
+/// that does not exist under `<cgroup_root>`, and a `../`-relative membership
+/// (out-of-namespace per `cgroup_namespaces(7)` — reads at the closest
+/// visible ancestor, never above `<cgroup_root>`). cgroup v1 is unchanged:
 /// v1 has no namespace membership rewrite and the v1 fs root DOES carry
 /// (garbage-sentinel) limit files, so v1 never reads the fs root.
 enum CgroupLeaf {
@@ -601,9 +603,17 @@ fn resolve_cgroup_leaf(
     for line in &lines {
         if let Some(rest) = line.strip_prefix("0::") {
             let leaf = rest.trim_start_matches('/');
-            // '' -> namespace root; unmounted membership path -> the
-            // namespace-visible fs root.
-            if leaf.is_empty() || !cgroup_root.join(leaf).is_dir() {
+            // '' is a cgroup-namespace root; a membership path absent from
+            // the mounted cgroupfs is the same namespace shape seen through
+            // /proc; a '../'-relative membership (out-of-namespace) must
+            // never resolve ABOVE the injected root. All three read at the
+            // fs root — the closest visible ancestor; on a real
+            // non-namespaced host the root has no limit files, so the
+            // readers' None fallbacks fire exactly as before.
+            if leaf.is_empty()
+                || leaf.split('/').any(|segment| segment == "..")
+                || !cgroup_root.join(leaf).is_dir()
+            {
                 return Some(CgroupLeaf::V2(String::new()));
             }
             return Some(CgroupLeaf::V2(leaf.to_string()));
@@ -642,10 +652,10 @@ fn resolve_cgroup_leaf(
    `resolve_cgroup_leaf(proc_root, "pids", cgroup_root)`. The `dir`
    computation is unchanged (`cgroup_root.join("")` is the fs root).
 
-4. `read_pids_constraint`: change line 725 to pass `cgroup_root`, replace the
-   stale doc at lines 718–719 and the line-726 comment per the text below,
-   and replace the walk header through the loop end (current lines 727–762)
-   in full with:
+4. `read_pids_constraint`: replace the stale doc at lines 718–719 and the
+   line-726 comment (per the walk comment in the block below), and replace the
+   function body from the resolver call (line 725) through the end of the
+   function (the closing brace at line 763) in full with:
 
 ```rust
     let leaf = resolve_cgroup_leaf(proc_root, "pids", cgroup_root)?;
