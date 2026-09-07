@@ -1027,6 +1027,10 @@ pub struct ReadyCapabilities {
     /// `terminal.interest.claimedTerminalIds`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_lifetime_claim_v1: Option<bool>,
+    /// Phase 2 durable runtime acknowledgement. Present only when the client
+    /// opted in and this server boot has an installed managed controller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_runtime_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

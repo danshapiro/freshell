@@ -2922,6 +2922,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "managedRuntimeV1": {
+              "type": "boolean"
+            },
             "pacedTerminalReplayV1": {
               "type": "boolean"
             },

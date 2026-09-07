@@ -97,6 +97,7 @@ describe('WsClient.connect', () => {
       paneReconcileFreshAgentV1: true,
       pacedTerminalReplayV1: true,
       terminalLifetimeClaimV1: true,
+      managedRuntimeV1: true,
     })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })

@@ -1413,6 +1413,8 @@ dependencies = [
  "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-runtime-client",
+ "freshell-runtime-protocol",
  "freshell-sessions",
  "freshell-terminal",
  "freshell-ws",

@@ -607,7 +607,7 @@ pub fn stuck_window_ms_from_env() -> i64 {
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false, false, false, false).await
+    build_handshake_with_capabilities(state, false, false, false, false, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -632,6 +632,7 @@ pub async fn build_handshake_with_capabilities(
     terminal_interest_v1: bool,
     paced_terminal_replay_v1: bool,
     terminal_lifetime_claim_v1: bool,
+    managed_runtime_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     // kata b8ke Task 4 (reconnect-owner discovery, T1 rec A3): replay current
@@ -687,13 +688,15 @@ pub async fn build_handshake_with_capabilities(
                 || pane_reconcile_fresh_agent_v1
                 || terminal_interest_v1
                 || paced_terminal_replay_v1
-                || terminal_lifetime_claim_v1)
+                || terminal_lifetime_claim_v1
+                || managed_runtime_v1)
                 .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
                     terminal_interest_v1: terminal_interest_v1.then_some(true),
                     paced_terminal_replay_v1: paced_terminal_replay_v1.then_some(true),
                     terminal_lifetime_claim_v1: terminal_lifetime_claim_v1.then_some(true),
+                    managed_runtime_v1: managed_runtime_v1.then_some(true),
                 }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
@@ -933,6 +936,16 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Phase 2 durable runtime: client opt-in is necessary but not sufficient.
+    // A server only advertises/uses the capability when this boot installed
+    // a managed controller; feature-off/default builds therefore stay legacy.
+    let managed_runtime_v1 = value
+        .get("capabilities")
+        .and_then(|caps| caps.get("managedRuntimeV1"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && state.registry.has_managed_controller();
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
@@ -943,6 +956,7 @@ async fn handle_socket(
         terminal_interest_v1,
         paced_terminal_replay_v1,
         terminal_lifetime_claim_v1,
+        managed_runtime_v1,
     )
     .await
     {
@@ -1006,6 +1020,7 @@ async fn handle_socket(
         conn_identity,
         terminal_interest_v1,
         terminal_lifetime_claim_v1,
+        managed_runtime_v1,
     )
     .await;
 }
@@ -1190,7 +1205,7 @@ mod tests {
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
         let negotiated =
-            build_handshake_with_capabilities(&s, true, false, false, false, false).await;
+            build_handshake_with_capabilities(&s, true, false, false, false, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1205,7 +1220,7 @@ mod tests {
         );
         // Same shape as an explicit `false` negotiation.
         let unnegotiated =
-            build_handshake_with_capabilities(&s, false, false, false, false, false).await;
+            build_handshake_with_capabilities(&s, false, false, false, false, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }
@@ -1218,7 +1233,7 @@ mod tests {
     async fn handshake_advertises_paced_terminal_replay_only_when_negotiated() {
         let s = state();
         let negotiated =
-            build_handshake_with_capabilities(&s, false, false, false, true, false).await;
+            build_handshake_with_capabilities(&s, false, false, false, true, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1228,7 +1243,7 @@ mod tests {
         // Non-paced negotiations keep the capabilities object byte-identical
         // to today's output — no paced key is invented.
         let pane_only =
-            build_handshake_with_capabilities(&s, true, false, false, false, false).await;
+            build_handshake_with_capabilities(&s, true, false, false, false, false, false).await;
         let ready = serde_json::to_value(&pane_only[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1253,7 +1268,7 @@ mod tests {
     async fn handshake_advertises_terminal_lifetime_claim_only_when_negotiated() {
         let s = state();
         let negotiated =
-            build_handshake_with_capabilities(&s, false, false, true, false, true).await;
+            build_handshake_with_capabilities(&s, false, false, true, false, true, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1262,7 +1277,7 @@ mod tests {
 
         // A claim-less negotiation must not invent the key.
         let interest_only =
-            build_handshake_with_capabilities(&s, false, false, true, false, false).await;
+            build_handshake_with_capabilities(&s, false, false, true, false, false, false).await;
         let ready = serde_json::to_value(&interest_only[0]).unwrap();
         assert_eq!(
             ready["capabilities"],

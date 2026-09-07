@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 84,
+  "schemaCount": 85,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -522,6 +522,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "managedRuntimeV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "pacedTerminalReplayV1": {
                   "const": true,
                   "type": "boolean"
@@ -4894,6 +4898,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "managedRuntimeV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "pacedTerminalReplayV1": {
               "const": true,
               "type": "boolean"
@@ -7883,6 +7891,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "managedRuntimeV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "pacedTerminalReplayV1": {
           "const": true,
           "type": "boolean"

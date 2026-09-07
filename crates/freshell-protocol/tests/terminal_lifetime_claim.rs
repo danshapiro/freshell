@@ -59,6 +59,7 @@ fn ready_capabilities_advertise_terminal_lifetime_claim_v1_when_negotiated() {
             terminal_interest_v1: Some(true),
             paced_terminal_replay_v1: None,
             terminal_lifetime_claim_v1: Some(true),
+            managed_runtime_v1: None,
         }),
         runtime_owners: None,
     };
@@ -82,6 +83,7 @@ fn ready_capabilities_omit_terminal_lifetime_claim_v1_when_none() {
             terminal_interest_v1: None,
             paced_terminal_replay_v1: None,
             terminal_lifetime_claim_v1: None,
+            managed_runtime_v1: None,
         }),
         runtime_owners: None,
     };

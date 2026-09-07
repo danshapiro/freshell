@@ -447,6 +447,7 @@ export const HelloSchema = z.object({
     // declared, not just sent (same strip hazard as above); absent for the
     // frozen client shape.
     terminalLifetimeClaimV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -1146,6 +1147,7 @@ export const ReadyCapabilitiesSchema = z
     // that opted in via capabilities.terminalLifetimeClaimV1. Present iff the
     // client may send `terminal.interest.claimedTerminalIds`.
     terminalLifetimeClaimV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   })
   .optional()
 

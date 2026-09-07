@@ -15,12 +15,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
-# Phase 1 handoff marker only. This flag is disabled by default and intentionally
-# has no dependency or routing wiring yet; enabling it MUST NOT cause a legacy
-# process launch to be described as managed. Phase 2/3 will attach the runtime
-# client only after their live continuity/provider gates pass.
+# Opt-in managed terminal controller. The default build keeps local terminal
+# ownership; the runtime client is only included when this feature is enabled.
 default = []
-managed-runtime-v1 = []
+managed-runtime-v1 = ["dep:freshell-runtime-client", "dep:freshell-runtime-protocol"]
 
 [[bin]]
 name = "freshell-server"
@@ -52,6 +50,8 @@ freshell-terminal = { path = "../freshell-terminal" }
 # kata b8ke Task 3: the ONE runtime-ownership coordinator minted in main and
 # injected into every fresh-agent lane (plus the Starting-state watchdog).
 freshell-ownership = { path = "../freshell-ownership" }
+freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
+freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip;
 # `process` = `fresh_agent_extras.rs` spawns `tokio::process::Command` directly
