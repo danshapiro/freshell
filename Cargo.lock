@@ -1375,6 +1375,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-runtime-client"
+version = "0.1.0"
+dependencies = [
+ "freshell-runtime-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "freshell-runtime-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1431,10 +1441,15 @@ dependencies = [
 name = "freshell-session-host"
 version = "0.1.0"
 dependencies = [
+ "freshell-platform",
+ "freshell-protocol",
  "freshell-runtime-protocol",
+ "freshell-terminal",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tracing",
 ]

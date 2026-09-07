@@ -1,8 +1,14 @@
+mod command_journal;
+mod control;
+mod output_journal;
+mod pty;
+
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, GrantId, HostBootId,
     HostCommand, HostReply, HostResult, IncarnationId, RuntimeError, RuntimeErrorCode,
-    RuntimeLimits, SoulId, CONTROL_PROTOCOL_VERSION,
+    RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
+use pty::HostedPty;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -37,6 +43,7 @@ struct HostState {
     requested_limits: RuntimeLimits,
     persisted: Mutex<PersistedHostState>,
     child: Mutex<Option<Child>>,
+    pty: Mutex<Option<HostedPty>>,
 }
 
 #[tokio::main]
@@ -106,6 +113,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         requested_limits,
         persisted: Mutex::new(persisted),
         child: Mutex::new(None),
+        pty: Mutex::new(None),
     });
 
     loop {
@@ -169,23 +177,20 @@ async fn dispatch(
                     "grant-v1".into(),
                     "stop-v1".into(),
                     "security-probe-v1".into(),
+                    "terminal-v1".into(),
+                    "output-replay-v1".into(),
+                    "runtime-metrics-v1".into(),
                 ],
                 effective_limits: limits,
             })
         }
         command => {
-            let expected_auth = host_proof(
+            control::authenticate_command(
                 &state.secret,
-                "command-auth",
                 &state.host_boot_id,
                 &state.incarnation_id,
-            );
-            if envelope.auth.as_deref() != Some(expected_auth.as_str()) {
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::HostAuthenticationFailed,
-                    "invalid incarnation command proof",
-                ));
-            }
+                envelope.auth.as_deref(),
+            )?;
             match command {
                 HostCommand::GrantExecution {
                     incarnation_id,
@@ -195,6 +200,7 @@ async fn dispatch(
                     execution_generation,
                     grant_id,
                     fixture,
+                    terminal,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     if host_boot_id != state.host_boot_id {
@@ -210,6 +216,7 @@ async fn dispatch(
                         execution_generation,
                         grant_id,
                         fixture,
+                        terminal,
                     )
                     .await
                 }
@@ -231,6 +238,9 @@ async fn dispatch(
                     if let Some(child) = state.child.lock().await.as_mut() {
                         let _ = child.start_kill();
                     }
+                    if let Some(pty) = state.pty.lock().await.as_mut() {
+                        pty.stop();
+                    }
                     append_event(&state.state_dir, "host.stop_requested", serde_json::json!({"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
                     Ok(HostResult::Stopped)
                 }
@@ -241,14 +251,81 @@ async fn dispatch(
                 HostCommand::Status { incarnation_id } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let persisted = state.persisted.lock().await.clone();
+                    let mut evidence = persisted.fixture_evidence;
+                    if let Some(pty) = state.pty.lock().await.as_ref() {
+                        evidence = serde_json::json!({
+                            "workload":"terminal",
+                            "terminalId":pty.terminal_id(),
+                            "streamEpoch":pty.stream_epoch(),
+                            "headSeq":pty.head_seq(),
+                            "spoolBytes":pty.spool_bytes(),
+                            "exited":pty.exited(),
+                            "exitCode":pty.exit_code(),
+                        });
+                    }
                     Ok(HostResult::Status {
                         host_boot_id: state.host_boot_id.clone(),
                         worker_pid: persisted.worker_pid,
                         worker_launch_count: persisted.worker_launch_count,
                         max_control_epoch: persisted.max_control_epoch,
                         max_execution_generation: persisted.max_execution_generation,
-                        fixture_evidence: persisted.fixture_evidence,
+                        fixture_evidence: evidence,
                     })
+                }
+                HostCommand::TerminalInput {
+                    incarnation_id,
+                    request_id,
+                    data,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let mut pty = state.pty.lock().await;
+                    let pty = pty.as_mut().ok_or_else(|| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::UnsupportedWorkload,
+                            "incarnation is not a managed terminal",
+                        )
+                    })?;
+                    let state = pty.write_input(&request_id, &data)?;
+                    Ok(HostResult::TerminalInput { state })
+                }
+                HostCommand::TerminalResize {
+                    incarnation_id,
+                    cols,
+                    rows,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let mut pty = state.pty.lock().await;
+                    pty.as_mut()
+                        .ok_or_else(|| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::UnsupportedWorkload,
+                                "incarnation is not a managed terminal",
+                            )
+                        })?
+                        .resize(cols, rows)?;
+                    Ok(HostResult::TerminalResize)
+                }
+                HostCommand::TerminalReadOutput {
+                    incarnation_id,
+                    after_seq,
+                    max_bytes,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let pty = state.pty.lock().await;
+                    let batch = pty
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::new(
+                                RuntimeErrorCode::UnsupportedWorkload,
+                                "incarnation is not a managed terminal",
+                            )
+                        })?
+                        .read_output(incarnation_id, after_seq, max_bytes)?;
+                    Ok(HostResult::TerminalOutput(batch))
+                }
+                HostCommand::RuntimeMetrics { incarnation_id } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    Ok(HostResult::RuntimeMetrics(read_runtime_metrics()))
                 }
                 HostCommand::Hello { .. } => unreachable!(),
             }
@@ -275,7 +352,8 @@ async fn grant_execution(
     control_epoch: u64,
     execution_generation: u64,
     grant_id: GrantId,
-    fixture: FixtureKind,
+    fixture: Option<FixtureKind>,
+    terminal: Option<TerminalLaunchSpec>,
 ) -> Result<HostResult, RuntimeError> {
     let mut persisted = state.persisted.lock().await;
     if control_epoch < persisted.max_control_epoch
@@ -313,49 +391,81 @@ async fn grant_execution(
     persisted.worker_pid = None;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
 
-    let exe = std::env::current_exe()
-        .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
-    let fixture_name = match fixture {
-        FixtureKind::Heartbeat => "heartbeat",
-        FixtureKind::DescendantSpawner => "descendants",
-        FixtureKind::CpuBurner => "cpu_burner",
-        FixtureKind::MemoryAllocator => "memory_allocator",
-        FixtureKind::NativeSession => "native_session",
-        FixtureKind::SecurityProbe => "security",
+    let (pid, evidence) = match (fixture, terminal) {
+        (Some(fixture), None) => {
+            let exe = std::env::current_exe()
+                .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
+            let fixture_name = match fixture {
+                FixtureKind::Heartbeat => "heartbeat",
+                FixtureKind::DescendantSpawner => "descendants",
+                FixtureKind::CpuBurner => "cpu_burner",
+                FixtureKind::MemoryAllocator => "memory_allocator",
+                FixtureKind::NativeSession => "native_session",
+                FixtureKind::SecurityProbe => "security",
+            };
+            let mut command = Command::new(exe);
+            command
+                .arg("worker")
+                .arg("--fixture")
+                .arg(fixture_name)
+                .arg("--state-dir")
+                .arg(&state.state_dir)
+                .arg("--soul-id")
+                .arg(soul_id.as_str())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let child = command.spawn().map_err(|e| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("spawn fixture: {e}"),
+                )
+            })?;
+            let pid = child.id().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "fixture child has no pid",
+                )
+            })?;
+            *state.child.lock().await = Some(child);
+            let evidence = if fixture == FixtureKind::SecurityProbe {
+                security_probe(&state.state_dir)
+            } else {
+                serde_json::json!({"fixture":fixture_name})
+            };
+            (pid, evidence)
+        }
+        (None, Some(terminal)) => {
+            let hosted =
+                HostedPty::spawn(&state.state_dir, state.incarnation_id.clone(), &terminal)
+                    .map_err(|e| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            format!("spawn managed terminal: {e}"),
+                        )
+                    })?;
+            let pid = hosted.pid();
+            let evidence = serde_json::json!({
+                "workload":"terminal",
+                "terminalId": hosted.terminal_id(),
+                "streamEpoch": hosted.stream_epoch(),
+                "cwd":terminal.cwd,
+                "mode":terminal.mode,
+            });
+            *state.pty.lock().await = Some(hosted);
+            (pid, evidence)
+        }
+        _ => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "execution grant must carry exactly one fixture or terminal workload",
+            ));
+        }
     };
-    let mut command = Command::new(exe);
-    command
-        .arg("worker")
-        .arg("--fixture")
-        .arg(fixture_name)
-        .arg("--state-dir")
-        .arg(&state.state_dir)
-        .arg("--soul-id")
-        .arg(soul_id.as_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = command.spawn().map_err(|e| {
-        RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
-            format!("spawn fixture: {e}"),
-        )
-    })?;
-    let pid = child.id().ok_or_else(|| {
-        RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
-            "fixture child has no pid",
-        )
-    })?;
-    *state.child.lock().await = Some(child);
 
     persisted.worker_launch_count += 1;
     persisted.worker_pid = Some(pid);
-    persisted.fixture_evidence = if fixture == FixtureKind::SecurityProbe {
-        security_probe(&state.state_dir)
-    } else {
-        serde_json::json!({"fixture":fixture_name})
-    };
+    persisted.fixture_evidence = evidence;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
     append_event(&state.state_dir, "host.grant_consumed", serde_json::json!({"grantId":grant_id,"workerPid":pid,"workerLaunchCount":persisted.worker_launch_count,"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
 
@@ -668,6 +778,34 @@ fn security_probe(state_dir: &Path) -> serde_json::Value {
     })
 }
 
+fn read_runtime_metrics() -> RuntimeMetrics {
+    let cpu = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat").unwrap_or_default();
+    let memory_events = std::fs::read_to_string("/sys/fs/cgroup/memory.events").unwrap_or_default();
+    RuntimeMetrics {
+        cpu_usage_usec: keyed_u64(&cpu, "usage_usec"),
+        cpu_throttled_usec: keyed_u64(&cpu, "throttled_usec"),
+        cpu_nr_throttled: keyed_u64(&cpu, "nr_throttled"),
+        memory_current_bytes: read_limit("/sys/fs/cgroup/memory.current").unwrap_or(0),
+        memory_peak_bytes: read_limit("/sys/fs/cgroup/memory.peak").unwrap_or(0),
+        memory_oom: keyed_u64(&memory_events, "oom"),
+        memory_oom_kill: keyed_u64(&memory_events, "oom_kill"),
+        pids_current: read_limit("/sys/fs/cgroup/pids.current").unwrap_or(0),
+        pids_max: read_limit("/sys/fs/cgroup/pids.max").unwrap_or(0),
+    }
+}
+
+fn keyed_u64(input: &str, key: &str) -> u64 {
+    input
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            (parts.next()? == key)
+                .then(|| parts.next()?.parse().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
 fn read_effective_limits(fallback: RuntimeLimits) -> RuntimeLimits {
     RuntimeLimits {
         cpu_milli: read_cpu_milli().unwrap_or(fallback.cpu_milli),
@@ -876,7 +1014,8 @@ mod tests {
                 control_epoch: 1,
                 execution_generation: 1,
                 grant_id: GrantId::new(),
-                fixture: FixtureKind::Heartbeat,
+                fixture: Some(FixtureKind::Heartbeat),
+                terminal: None,
             },
         );
         let error = dispatch(envelope, &state).await.unwrap_err();
@@ -924,6 +1063,7 @@ mod tests {
             },
             persisted: Mutex::new(PersistedHostState::default()),
             child: Mutex::new(None),
+            pty: Mutex::new(None),
         })
     }
 

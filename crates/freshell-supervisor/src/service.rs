@@ -1,15 +1,17 @@
 use crate::{
+    admission::AdmissionPolicy,
     backend::{BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend},
     registry::{
-        BackendCreatedRecord, ExecutionGrantRecord, LaunchPreparation, PreparedLaunch, Registry,
-        RegistryError,
+        stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord, LaunchPreparation,
+        PreparedLaunch, Registry, RegistryError,
     },
 };
 use freshell_runtime_protocol::{
-    host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole,
-    Envelope, FixtureKind, HostBootId, HostCommand, HostReply, HostResult, IncarnationId,
-    LaunchResult, LaunchState, RequestId, RuntimeError, RuntimeErrorCode, RuntimeLimits,
-    RuntimeView, SoulId, StopOutcome, CONTROL_PROTOCOL_VERSION,
+    host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
+    ControlRole, Envelope, FixtureKind, HostBootId, HostCommand, HostReply, HostResult,
+    IncarnationId, LaunchResult, LaunchState, RequestId, RuntimeError, RuntimeErrorCode,
+    RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome,
+    TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -30,6 +32,7 @@ pub struct SupervisorConfig {
     pub test_run_id: String,
     pub control_secret: String,
     pub lifecycle_log: PathBuf,
+    pub admission: AdmissionPolicy,
 }
 
 #[derive(Clone)]
@@ -136,6 +139,39 @@ impl Supervisor {
                 let (outcome, view) = self.stop(request.soul_id).await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
+            AdminCommand::TerminalInput(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .terminal_input(envelope.request_id, request.soul_id, request.data)
+                    .await?;
+                Ok(AdminResult::TerminalInput { state })
+            }
+            AdminCommand::TerminalResize(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.terminal_resize(request.soul_id, request.cols, request.rows)
+                    .await?;
+                Ok(AdminResult::TerminalResize)
+            }
+            AdminCommand::TerminalReadOutput(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let output = self
+                    .terminal_read_output(request.soul_id, request.after_seq, request.max_bytes)
+                    .await?;
+                Ok(AdminResult::TerminalOutput(output))
+            }
+            AdminCommand::RuntimeMetrics(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let metrics = self.runtime_metrics(request.soul_id).await?;
+                Ok(AdminResult::RuntimeMetrics(metrics))
+            }
         }
     }
 
@@ -145,6 +181,10 @@ impl Supervisor {
         request: freshell_runtime_protocol::LaunchRequest,
     ) -> Result<LaunchResult, RuntimeError> {
         let limits = request.limits.validate()?;
+        request.validate_workload()?;
+        crate::limits::verify_profile(request.profile, limits).map_err(|message| {
+            RuntimeError::new(RuntimeErrorCode::InvalidRuntimeLimits, message)
+        })?;
         let payload_digest = semantic_launch_digest(&request)?;
         let prepared = self
             .registry
@@ -152,10 +192,15 @@ impl Supervisor {
                 soul_id: request.soul_id.clone(),
                 provider: request.provider.clone(),
                 provider_store_id: request.provider_store_id.clone(),
+                native_session_id: request.native_session_id.clone(),
                 creation_seed_ref: request.creation_seed_ref.clone(),
                 request_id: request_id.clone(),
                 payload_digest,
                 requested_limits: limits,
+                profile: request.profile,
+                project_key: request.project_key.clone(),
+                terminal: request.terminal.clone(),
+                admission: self.config.admission,
             })
             .await
             .map_err(map_registry)?;
@@ -180,6 +225,11 @@ impl Supervisor {
                     runtime_dir: runtime_dir.clone(),
                     limits,
                     test_run_id: self.config.test_run_id.clone(),
+                    terminal: request.terminal.clone(),
+                    provider_volume_name: stable_provider_volume_name(
+                        self.registry.installation_id(),
+                        &prepared.soul_id,
+                    ),
                 })
                 .await
                 .map_err(map_backend)?;
@@ -279,6 +329,7 @@ impl Supervisor {
                 handle.incarnation_id().clone(),
                 request.soul_id.clone(),
                 request.fixture,
+                request.terminal.clone(),
                 handle.runtime_dir(),
                 &authenticated,
                 &grant,
@@ -303,6 +354,145 @@ impl Supervisor {
             effective_limits: authenticated.effective_limits,
             fixture_evidence: accepted.fixture_evidence,
         })
+    }
+
+    async fn terminal_input(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        data: String,
+    ) -> Result<CommandState, RuntimeError> {
+        if data.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "terminal input exceeds control-frame budget",
+            ));
+        }
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::TerminalInput {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
+                    data,
+                },
+            )
+            .await?
+        {
+            HostResult::TerminalInput { state } => Ok(state),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected terminal input reply",
+            )),
+        }
+    }
+
+    async fn terminal_resize(
+        &self,
+        soul_id: SoulId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError> {
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::TerminalResize {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    cols,
+                    rows,
+                },
+            )
+            .await?
+        {
+            HostResult::TerminalResize => Ok(()),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected terminal resize reply",
+            )),
+        }
+    }
+
+    async fn terminal_read_output(
+        &self,
+        soul_id: SoulId,
+        after_seq: u64,
+        max_bytes: u64,
+    ) -> Result<RuntimeOutputBatch, RuntimeError> {
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::TerminalReadOutput {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    after_seq,
+                    max_bytes,
+                },
+            )
+            .await?
+        {
+            HostResult::TerminalOutput(output) => Ok(output),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected terminal output reply",
+            )),
+        }
+    }
+
+    async fn runtime_metrics(&self, soul_id: SoulId) -> Result<RuntimeMetrics, RuntimeError> {
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::RuntimeMetrics {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?
+        {
+            HostResult::RuntimeMetrics(metrics) => Ok(metrics),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected runtime metrics reply",
+            )),
+        }
     }
 
     async fn stop(&self, soul_id: SoulId) -> Result<(StopOutcome, RuntimeView), RuntimeError> {
@@ -504,7 +694,8 @@ impl Supervisor {
         &self,
         incarnation_id: IncarnationId,
         soul_id: SoulId,
-        fixture: FixtureKind,
+        fixture: Option<FixtureKind>,
+        terminal: Option<TerminalLaunchSpec>,
         runtime_dir: &Path,
         host: &AuthenticatedHost,
         grant: &ExecutionGrantRecord,
@@ -517,6 +708,7 @@ impl Supervisor {
             execution_generation: grant.execution_generation,
             grant_id: grant.grant_id.clone(),
             fixture,
+            terminal,
         };
         match self
             .send_authenticated_host_command(incarnation_id, runtime_dir, host, command)
@@ -729,7 +921,11 @@ fn semantic_launch_digest(
         "providerStoreId": request.provider_store_id,
         "creationSeedRef": request.creation_seed_ref,
         "limits": request.limits,
+        "profile": request.profile,
+        "projectKey": request.project_key,
+        "nativeSessionId": request.native_session_id,
         "fixture": request.fixture,
+        "terminal": request.terminal,
     });
     let bytes = serde_json::to_vec(&value)
         .map_err(|e| RuntimeError::new(RuntimeErrorCode::InvalidRequest, e.to_string()))?;
@@ -761,6 +957,7 @@ fn map_registry(error: RegistryError) -> RuntimeError {
         RegistryError::StaleControlEpoch { .. } => RuntimeErrorCode::StaleControlEpoch,
         RegistryError::UnknownSoul(_) => RuntimeErrorCode::UnknownSoul,
         RegistryError::UnknownIncarnation(_) => RuntimeErrorCode::UnknownIncarnation,
+        RegistryError::BlockedResource { .. } => RuntimeErrorCode::BlockedResource,
         RegistryError::FaultInjected(_) => RuntimeErrorCode::FaultInjected,
         _ => RuntimeErrorCode::RegistryFailure,
     };
