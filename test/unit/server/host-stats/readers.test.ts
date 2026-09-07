@@ -15,6 +15,9 @@
  *  - small cgroup variant trees (v2 finite limit, v2 pids 'max' fallback,
  *    v1 controllers, pid_max-only) are written into os.tmpdir() at setup,
  *    keeping the committed tree exactly as the plan enumerates.
+ *  - cgroup-v2 namespace variants (membership '0::/' with limit files AT the
+ *    fs root, a membership path absent from the mounted cgroupfs, and a
+ *    '../'-relative membership) are written into os.tmpdir() at setup.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import fs from 'node:fs'
@@ -83,6 +86,11 @@ let pidsNoCurrentCgroup: string
 let pidsRootCgroupProc: string
 let v1ChainProc: string
 let v1ChainCgroup: string
+let nsV2Proc: string
+let nsV2Cgroup: string
+let nsMissingProc: string
+let nsRootCgroup: string
+let nsEscapeProc: string
 
 function writeFile(root: string, rel: string, content: string): void {
   const full = path.join(root, rel)
@@ -207,10 +215,13 @@ beforeAll(() => {
   writeFile(pidsNoCurrentCgroup, 'slices/c.service/pids.max', 'max\n')
   writeFile(pidsNoCurrentCgroup, 'slices/pids.max', '500\n')
 
-  // Process sits AT the cgroup2 root ('0::/'): no limit files exist there
-  // and resolveCgroupLeaf yields null -> no binding constraint.
+  // Process membership reported as the namespace root ('0::/'); the committed
+  // cgroup tree has no top-level limit files, so even after the
+  // namespace-aware fs-root read there is no binding constraint — the
+  // fallbacks behave exactly as on a real non-namespaced host root.
   pidsRootCgroupProc = path.join(tmp, 'pids-root-cgroup', 'proc')
   writeFile(pidsRootCgroupProc, 'self/cgroup', '0::/\n')
+  writeFile(pidsRootCgroupProc, 'sys/kernel/threads-max', '4242\n')
 
   // v1 pids controller chain: leaf pair finite but low utilization,
   // ancestor pair higher -> the ancestor must win.
@@ -221,6 +232,41 @@ beforeAll(() => {
   writeFile(v1ChainCgroup, 'pids/limited.slice/svc.service/pids.current', '50\n')
   writeFile(v1ChainCgroup, 'pids/limited.slice/pids.max', '1000\n')
   writeFile(v1ChainCgroup, 'pids/limited.slice/pids.current', '900\n')
+
+  // cgroup-v2 NAMESPACE (Docker's default private cgroupns on v2 hosts):
+  // the kernel reports this process's membership as '0::/' and the
+  // namespace-private cgroupfs mount exposes the container's own cgroup —
+  // WITH limit files — at the filesystem root.
+  nsV2Proc = path.join(tmp, 'ns-v2', 'proc')
+  nsV2Cgroup = path.join(tmp, 'ns-v2', 'cgroup')
+  writeFile(nsV2Proc, 'self/cgroup', '0::/\n')
+  writeFile(nsV2Proc, 'sys/kernel/threads-max', '999999\n')
+  writeFile(nsV2Cgroup, 'memory.current', '1073741824\n')
+  writeFile(nsV2Cgroup, 'memory.max', '4294967296\n')
+  writeFile(nsV2Cgroup, 'pids.max', '512\n')
+  writeFile(nsV2Cgroup, 'pids.current', '400\n')
+
+  // Membership names a host path that does NOT exist under the mounted
+  // cgroupfs (mount rooted at the container's cgroup while /proc still
+  // reports the host path): the namespace-visible fs root carries the files.
+  nsMissingProc = path.join(tmp, 'ns-missing', 'proc')
+  nsRootCgroup = path.join(tmp, 'ns-missing', 'cgroup')
+  writeFile(nsMissingProc, 'self/cgroup', '0::/docker/deadbeefcafe\n')
+  writeFile(nsRootCgroup, 'memory.current', '268435456\n')
+  writeFile(nsRootCgroup, 'memory.max', '536870912\n')
+  writeFile(nsRootCgroup, 'pids.max', '256\n')
+  writeFile(nsRootCgroup, 'pids.current', '10\n')
+
+  // '../'-relative membership (cgroup_namespaces(7): a process seen from
+  // outside its cgroup namespace). The sibling 'escape' dir carries
+  // DIFFERENT limit values and sits ABOVE the injected cgroup root; the
+  // resolver must bind the namespace root (nsV2Cgroup), never the escape.
+  nsEscapeProc = path.join(tmp, 'ns-escape', 'proc')
+  writeFile(nsEscapeProc, 'self/cgroup', '0::/../escape\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/memory.current', '1\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/memory.max', '2\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/pids.max', '999\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/pids.current', '1\n')
 })
 
 afterAll(() => {
@@ -301,10 +347,35 @@ describe('readCgroupMemory', () => {
     expect(readCgroupMemory(CGROUP, emptyCgroupRoot)).toBeNull()
   })
 
-  it('returns null when the leaf files are absent (fs root has no limit files by design)', () => {
-    // cgroupRoot exists but the leaf tree does not -> must NOT fall back to
-    // reading the cgroup fs root.
+  it('returns null when neither the leaf nor the fs root has limit files', () => {
+    // cgroupRoot exists but holds no limit files at any depth the namespace
+    // contract can see (leaf tree absent, fs root empty).
     expect(readCgroupMemory(emptyCgroupRoot, PROMINI)).toBeNull()
+  })
+
+  it('reads limit files at the fs root when v2 membership is the namespace root (0::/)', () => {
+    expect(readCgroupMemory(nsV2Cgroup, nsV2Proc)).toEqual({
+      limitBytes: 4294967296,
+      currentBytes: 1073741824,
+    })
+  })
+
+  it('falls back to the fs root when the v2 membership path is not mounted', () => {
+    expect(readCgroupMemory(nsRootCgroup, nsMissingProc)).toEqual({
+      limitBytes: 536870912,
+      currentBytes: 268435456,
+    })
+  })
+
+  it('returns null for 0::/ when the (non-namespaced) fs root has no limit files', () => {
+    expect(readCgroupMemory(emptyCgroupRoot, pidsRootCgroupProc)).toBeNull()
+  })
+
+  it('treats ../-relative v2 membership as the fs root, never above the injected root', () => {
+    expect(readCgroupMemory(nsV2Cgroup, nsEscapeProc)).toEqual({
+      limitBytes: 4294967296,
+      currentBytes: 1073741824,
+    })
   })
 })
 
@@ -470,6 +541,18 @@ describe('readPidsLimit', () => {
   it('never uses /proc/sys/kernel/pid_max (wrap boundary, not a process cap)', () => {
     expect(readPidsLimit(pidMaxOnlyProc, CGROUP)).toBeNull()
   })
+
+  it('reads pids.max at the fs root when v2 membership is the namespace root (0::/)', () => {
+    expect(readPidsLimit(nsV2Proc, nsV2Cgroup)).toBe(512)
+  })
+
+  it('falls back to the fs root when the v2 membership path is not mounted', () => {
+    expect(readPidsLimit(nsMissingProc, nsRootCgroup)).toBe(256)
+  })
+
+  it('keeps the threads-max fallback for 0::/ at a real (non-namespaced) fs root', () => {
+    expect(readPidsLimit(pidsRootCgroupProc, emptyCgroupRoot)).toBe(4242)
+  })
 })
 
 describe('readPidsConstraint', () => {
@@ -514,12 +597,27 @@ describe('readPidsConstraint', () => {
     expect(readPidsConstraint(v1ChainProc, v1ChainCgroup)).toEqual({ current: 900, max: 1000 })
   })
 
-  it('returns null at the cgroup2 root (no limit files exist there)', () => {
+  it('returns null for 0::/ when the fs root has no pids limit files', () => {
+    // Namespace-root membership resolves to the fs root; the committed cgroup
+    // tree has no top-level pids.max, exactly like a real non-namespaced
+    // host root -> no binding constraint.
     expect(readPidsConstraint(pidsRootCgroupProc, CGROUP)).toBeNull()
   })
 
   it('returns null when there is no cgroup data', () => {
     expect(readPidsConstraint(missing, CGROUP)).toBeNull()
+  })
+
+  it('binds the fs-root node when v2 membership is the namespace root (0::/)', () => {
+    expect(readPidsConstraint(nsV2Proc, nsV2Cgroup)).toEqual({ current: 400, max: 512 })
+  })
+
+  it('binds the fs-root node when the v2 membership path is not mounted', () => {
+    expect(readPidsConstraint(nsMissingProc, nsRootCgroup)).toEqual({ current: 10, max: 256 })
+  })
+
+  it('treats ../-relative v2 membership as the fs root, never above the injected root', () => {
+    expect(readPidsConstraint(nsEscapeProc, nsV2Cgroup)).toEqual({ current: 400, max: 512 })
   })
 })
 
