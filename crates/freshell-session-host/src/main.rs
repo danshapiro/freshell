@@ -495,10 +495,13 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
     if !home.is_dir() {
         return Err("managed provider HOME volume is not mounted".into());
     }
-    // chmod while uid 0 still owns the rootless volume inode; after chown
-    // the trusted host intentionally lacks FOWNER.
+
+    // Keep directories root-owned until every bootstrap file is durable. The
+    // trusted host deliberately lacks DAC_OVERRIDE/FOWNER, so chowning a 0700
+    // parent early would lock the host out before later files are copied.
     set_mode(&home, 0o700)?;
-    set_owner(&home, terminal.run_as_uid, terminal.run_as_gid)?;
+    let mut provider_dirs = std::collections::BTreeSet::new();
+    provider_dirs.insert(home.clone());
 
     for (index, file) in terminal.provider_bootstrap_files.iter().enumerate() {
         let source = PathBuf::from(format!("/run/freshell-bootstrap/provider-{index}"));
@@ -514,7 +517,7 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
                     current.push(component);
                     std::fs::create_dir_all(&current).map_err(|error| error.to_string())?;
                     set_mode(&current, 0o700)?;
-                    set_owner(&current, terminal.run_as_uid, terminal.run_as_gid)?;
+                    provider_dirs.insert(current.clone());
                 }
             }
         }
@@ -535,11 +538,20 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
         out.write_all(&bytes).map_err(|error| error.to_string())?;
         out.sync_all().map_err(|error| error.to_string())?;
         set_mode(&tmp, 0o600)?;
-        set_owner(&tmp, terminal.run_as_uid, terminal.run_as_gid)?;
         std::fs::rename(&tmp, &destination).map_err(|error| error.to_string())?;
+        set_owner(&destination, terminal.run_as_uid, terminal.run_as_gid)?;
         if let Some(parent) = destination.parent() {
             let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
         }
+    }
+
+    // Once all file writes are complete, transfer directory ownership from
+    // deepest to shallowest; HOME is last. No trusted-host filesystem access
+    // under provider HOME is required after this point.
+    let mut provider_dirs = provider_dirs.into_iter().collect::<Vec<_>>();
+    provider_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in provider_dirs {
+        set_owner(&dir, terminal.run_as_uid, terminal.run_as_gid)?;
     }
     Ok(())
 }
