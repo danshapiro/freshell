@@ -634,6 +634,7 @@ export type TerminalRecord = {
     | 'resumeCandidateCapture'
     | 'readThreadTurn'
     | 'listThreadTurns'
+    | 'noteSessionId'
   >
   codexSidecarLifecycleUnsubscribe?: () => void
   codexSidecarLifecyclePublished?: boolean
@@ -1106,6 +1107,10 @@ export function buildSpawnSpec(
   // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs
   // - PORT/AUTH_TOKEN/ALLOWED_ORIGINS: server-specific vars that cause port conflicts
   //   and leak credentials into child processes
+  // - FRESHELL_CONFIG_DIR: the server's profile config dir, server-internal;
+  //   leaking it into PTYs would re-point nested CLI/test runs at it
+  // - FRESHELL_PROFILE: the desktop profile selector; leaking it would pin
+  //   nested Freshell launches to this profile and bypass the picker
   // - NODE_ENV/npm_lifecycle_script: server's production env leaks into child shells,
   //   breaking tools like React test-utils that check NODE_ENV
   const {
@@ -1117,6 +1122,8 @@ export function buildSpawnSpec(
     PORT: _port,
     AUTH_TOKEN: _authToken,
     ALLOWED_ORIGINS: _allowedOrigins,
+    FRESHELL_CONFIG_DIR: _freshellConfigDir,
+    FRESHELL_PROFILE: _freshellProfile,
     NODE_ENV: _nodeEnv,
     npm_lifecycle_script: _npmLifecycleScript,
     OPENCODE_SERVER_USERNAME: _opencodeServerUsername,
@@ -2044,6 +2051,15 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
+  private async noteCodexSidecarSession(record: TerminalRecord, sessionId: string): Promise<void> {
+    if (!record.codexSidecar?.noteSessionId) return
+    try {
+      await record.codexSidecar.noteSessionId(sessionId)
+    } catch (error) {
+      logger.warn({ err: error, terminalId: record.terminalId, sessionId }, 'Failed to stamp Codex sidecar ownership record with session id; restore-claim for this sidecar is degraded')
+    }
+  }
+
   private armCodexRolloutWatch(record: TerminalRecord, candidate = this.getCodexRolloutWatchCandidate(record)): void {
     const sidecar = record.codexSidecar
     if (!candidate || !sidecar?.watchPath) return
@@ -2488,6 +2504,7 @@ export class TerminalRegistry extends EventEmitter {
     this.clearCodexForkHandoffPending(record)
     this.armCodexRolloutWatch(record, forkCandidate)
     record.codexSidecar?.markCandidatePersisted?.()
+    await this.noteCodexSidecarSession(record, forkCandidate.candidateThreadId)
     logger.info({
       terminalId: record.terminalId,
       oldSessionId: oldResumeSessionId,
@@ -2579,6 +2596,9 @@ export class TerminalRegistry extends EventEmitter {
     const storedDurability = this.codexDurabilityRecordToRef(stored)
     record.codexDurability = storedDurability
     record.codexSidecar?.markCandidatePersisted?.()
+    if (storedDurability.candidate) {
+      await this.noteCodexSidecarSession(record, storedDurability.candidate.candidateThreadId)
+    }
     this.clearCodexInputGate(record)
     this.armCodexRolloutWatch(record)
     logger.info({
@@ -4289,6 +4309,10 @@ export class TerminalRegistry extends EventEmitter {
       ...await collectShutdownFailures([...sidecarShutdowns]),
     ]
     throwShutdownFailures(failures, 'Codex registry shutdown work failed.')
+  }
+
+  getMaxTerminals(): number {
+    return this.maxTerminals
   }
 
   getDiagnosticCounts(): TerminalRegistryDiagnosticCounts {

@@ -94,3 +94,47 @@ describe('buildFreshAgentSlashCommandMenu', () => {
     ])
   })
 })
+
+describe('fresh-agent slash commands: /undo + /redo (kata 1wxv decision 8)', () => {
+  it('registers /undo for every session type, with no aliases', () => {
+    for (const sessionType of ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] as const) {
+      const undo = getFreshAgentSlashCommands(sessionType).find((c) => c.name === 'undo')
+      expect(undo?.action).toBe('undo')
+      expect(undo?.aliases).toBeUndefined()
+    }
+  })
+  it('delta-r1 F7: /undo and /redo carry per-op capability requirements (menu hides them before discovery / on capability-false panes)', () => {
+    for (const sessionType of ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] as const) {
+      const undo = getFreshAgentSlashCommands(sessionType).find((c) => c.name === 'undo')
+      expect(undo?.requiresCapability).toBe('undo')
+    }
+    for (const sessionType of ['freshclaude', 'kilroy', 'freshopencode'] as const) {
+      const redo = getFreshAgentSlashCommands(sessionType).find((c) => c.name === 'redo')
+      expect(redo?.requiresCapability).toBe('redo')
+    }
+    // The freshcodex exclusion stays structural: /redo leaves the menu TWICE over here
+    // (no catalog entry at all, AND codex stamps capabilities.redo=false server-side).
+    expect(getFreshAgentSlashCommands('freshcodex').find((c) => c.name === 'redo')).toBeUndefined()
+    // Existing capability requirement stays intact.
+    expect(getFreshAgentSlashCommands('freshclaude').find((c) => c.name === 'fork')?.requiresCapability).toBe('fork')
+  })
+  it('registers /redo for claude/opencode session types only — freshcodex is undo-only (decision 5: no redo affordance appears, never "show then reject")', () => {
+    for (const sessionType of ['freshclaude', 'kilroy', 'freshopencode'] as const) {
+      const redo = getFreshAgentSlashCommands(sessionType).find((c) => c.name === 'redo')
+      expect(redo?.action).toBe('redo')
+      expect(redo?.aliases).toBeUndefined()
+    }
+    expect(getFreshAgentSlashCommands('freshcodex').find((c) => c.name === 'redo')).toBeUndefined()
+    expect(resolveFreshAgentSlashCommand('freshcodex', '/redo')?.action).not.toBe('redo')
+  })
+  it('resolves both commands where registered', () => {
+    expect(resolveFreshAgentSlashCommand('freshclaude', '/undo')?.action).toBe('undo')
+    expect(resolveFreshAgentSlashCommand('freshopencode', 'redo')?.action).toBe('redo')
+  })
+  // Reserved names (r2; seam corrected r3 correction 8): the CATALOG filtering above only
+  // governs the menu. /undo and /redo are additionally reserved at the COMPOSER's submit
+  // path (pre-catalog-resolution — a seam runSlashCommand could never provide, since the
+  // filtered catalog omits capability-false commands and unresolved names fall through to
+  // model text), so a TYPED '/redo' on freshcodex is intercepted with the pinned notice
+  // instead of falling through to the model — the composer/view-level tests live in Task 6.
+})

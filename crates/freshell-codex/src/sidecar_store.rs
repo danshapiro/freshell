@@ -63,6 +63,10 @@ pub struct CodexSidecarRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub state: SidecarRecordState,
+    /// Spawning lane. Absent (`None`) on all pre-existing rows; `None` means
+    /// terminal-pane for claim purposes and must keep meaning that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<SidecarLane>,
 }
 
 /// Lifecycle state of a recorded sidecar: `Active` (owned by a live server
@@ -73,6 +77,18 @@ pub struct CodexSidecarRecord {
 pub enum SidecarRecordState {
     Active,
     Retained { reason: String },
+}
+
+/// Which spawning lane owns a recorded sidecar. `None` decodes every row
+/// written before this field existed — all of them terminal-pane writes —
+/// and the claim path must treat `None`/`TerminalPane` identically forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SidecarLane {
+    /// `SpawnedCodexAppServerRuntime` (terminal-pane codex sessions).
+    TerminalPane,
+    /// `FreshCodexState::spawn_sidecar` (freshcodex fresh-agent panes).
+    FreshAgent,
 }
 
 /// The durable record store. `root: None` ⇒ DISABLED: every write/remove is
@@ -366,8 +382,10 @@ pub fn set_codex_sidecar_store(store: Arc<CodexSidecarStore>) {
 
 /// The installed process-wide store, if any. `None` (nothing installed) means
 /// callers fall back to [`CodexSidecarStore::disabled`] — behavior identical
-/// to the pre-store world.
-pub(crate) fn codex_sidecar_store() -> Option<Arc<CodexSidecarStore>> {
+/// to the pre-store world. Also read by the freshagent lane
+/// (freshell-freshagent), which writes `Some(SidecarLane::FreshAgent)`
+/// records at spawn.
+pub fn codex_sidecar_store() -> Option<Arc<CodexSidecarStore>> {
     GLOBAL_SIDECAR_STORE.read().unwrap().clone()
 }
 

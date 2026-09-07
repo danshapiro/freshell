@@ -1,15 +1,21 @@
 import type { FreshAgentSessionCommand } from './fresh-agent-contract.js'
 import type { FreshAgentSessionType } from './fresh-agent.js'
 
-export type FreshAgentSlashCommandAction = 'new' | 'compact' | 'fork' | 'model'
+export type FreshAgentSlashCommandAction = 'new' | 'compact' | 'fork' | 'model' | 'undo' | 'redo'
 
 export type FreshAgentSlashCommand = {
   name: string
   description: string
   action: FreshAgentSlashCommandAction
   aliases?: readonly string[]
-  /** Requires the matching capability flag in the thread snapshot to be true. */
-  requiresCapability?: 'fork'
+  /**
+   * Requires the matching capability flag in the thread snapshot to be true.
+   * Absent/unknown-to-the-menu capability ⇒ the menu entry is HIDDEN (the client
+   * rule that absent ⇔ false) — never "show then reject". Delta-r1 F7 added
+   * `undo`/`redo`: before capability discovery (no snapshot) and on
+   * capability-false panes, /undo and /redo leave the menu.
+   */
+  requiresCapability?: 'fork' | 'undo' | 'redo'
 }
 
 const BASE_COMMANDS = [
@@ -32,6 +38,18 @@ const BASE_COMMANDS = [
     aliases: ['branch'],
     requiresCapability: 'fork',
   },
+  {
+    name: 'undo',
+    description: 'Roll back the last turn (conversation only — files stay as they are)',
+    action: 'undo',
+    requiresCapability: 'undo',
+  },
+  {
+    name: 'redo',
+    description: 'Restore the last rolled-back turn',
+    action: 'redo',
+    requiresCapability: 'redo',
+  },
 ] as const satisfies readonly FreshAgentSlashCommand[]
 
 /**
@@ -51,9 +69,23 @@ const COMMANDS_WITH_MODEL: readonly FreshAgentSlashCommand[] = [...BASE_COMMANDS
 export const FRESH_AGENT_SLASH_COMMANDS_BY_SESSION_TYPE = {
   freshclaude: COMMANDS_WITH_MODEL,
   kilroy: COMMANDS_WITH_MODEL,
-  freshcodex: COMMANDS_WITH_MODEL,
-  freshopencode: COMMANDS_WITH_MODEL,
+  // /redo is CAPABILITY-FILTERED out of the freshcodex catalog (kata 1wxv
+  // decision 5 — codex is undo-only; no "show then reject"). The server-side
+  // codex×redo refusal stays as the permanent wire backstop. merge: main
+  // extended the model command to every session type, and BASE_COMMANDS now
+  // carries undo/redo, so COMMANDS_WITH_MODEL inherits both.
+  freshcodex: [...BASE_COMMANDS.filter((command) => command.name !== 'redo'), MODEL_COMMAND],
+  freshopencode: [...BASE_COMMANDS, MODEL_COMMAND],
 } as const satisfies Record<FreshAgentSessionType, readonly FreshAgentSlashCommand[]>
+
+/**
+ * kata 1wxv (r3 correction 8): the reserved names the COMPOSER intercepts
+ * before catalog resolution — a typed `/undo` or `/redo` is NEVER sent to the
+ * model as text, even where the catalog filtered it out (freshcodex `/redo`
+ * gets the pinned unsupported notice instead). Exported so composer + view +
+ * tests share one source.
+ */
+export const RESERVED_ROLLBACK_SLASH_NAMES = ['undo', 'redo'] as const
 
 export function getFreshAgentSlashCommands(sessionType: FreshAgentSessionType): readonly FreshAgentSlashCommand[] {
   return FRESH_AGENT_SLASH_COMMANDS_BY_SESSION_TYPE[sessionType]

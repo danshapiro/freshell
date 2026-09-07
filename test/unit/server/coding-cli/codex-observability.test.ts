@@ -16,6 +16,9 @@ import {
   runCodexReaperMaintenanceTick,
   startCodexObservability,
 } from '../../../../server/coding-cli/codex-observability.js'
+import {
+  CodexSidecarReconciler,
+} from '../../../../server/coding-cli/codex-app-server/sidecar-reattach.js'
 
 const tempDirs = new Set<string>()
 
@@ -396,6 +399,231 @@ describeWithLinuxProc('codex-observability reaper maintenance tick', () => {
       log: createLogSpy(),
     })).resolves.toBeUndefined()
   })
+})
+
+// Task 3 sweep gating: the reconciler's held survivors drive whether the tick re-runs the reaper
+// (and which ids it must skip). Raw detached fixture children play the surviving sidecar groups.
+describeWithLinuxProc('codex-observability reaper maintenance tick reconciler sweep gating', () => {
+  const sweptChildren = new Set<number>()
+
+  afterEach(async () => {
+    await Promise.all([...sweptChildren].map(async (pid) => {
+      sweptChildren.delete(pid)
+      try {
+        process.kill(-pid, 'SIGKILL')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+      }
+      await waitForProcessExit(pid).catch(() => undefined)
+    }))
+  })
+
+  async function waitForProcessExit(pid: number, timeoutMs = 15_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return
+        throw error
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    throw new Error(`Timed out waiting for process ${pid} to exit`)
+  }
+
+  async function isProcessGroupAlive(processGroupId: number): Promise<boolean> {
+    try {
+      process.kill(-processGroupId, 0)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
+      throw error
+    }
+  }
+
+  function buildExpired(): CodexSidecarReconciler {
+    return new CodexSidecarReconciler({ reapGraceMs: 0 })
+  }
+
+  // A raw detached fixture child stands in for a surviving sidecar group: its pgid is its own pid
+  // and its authentic /proc identity slots straight into a dead-owner ownership record.
+  async function spawnSweepFixtureChild(): Promise<{ pid: number; identity: Record<string, unknown> }> {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      detached: true,
+      stdio: 'ignore',
+    })
+    child.unref()
+    const pid = child.pid
+    if (!pid) throw new Error('sweep fixture child did not expose a pid')
+    sweptChildren.add(pid)
+    const [cmdline, cwd, stat] = await Promise.all([
+      fsp.readFile(`/proc/${pid}/cmdline`).catch(() => Buffer.from('')),
+      fsp.readlink(`/proc/${pid}/cwd`).catch(() => null),
+      fsp.readFile(`/proc/${pid}/stat`, 'utf8'),
+    ])
+    const closeParen = stat.lastIndexOf(')')
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/)
+    const startTimeTicks = Number(fields[19])
+    return {
+      pid,
+      identity: {
+        commandLine: cmdline.toString('utf8').split('\0').filter(Boolean),
+        cwd,
+        startTimeTicks: Number.isFinite(startTimeTicks) ? startTimeTicks : null,
+      },
+    }
+  }
+
+  it('sweeps unclaimed survivors once the grace window expires and forgets the reaped ids', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnSweepFixtureChild()
+    const recordPath = path.join(metadataDir, 'obs-swept.json')
+    await fsp.writeFile(recordPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-swept',
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+      sessionId: 'thr-swept',
+    })), { mode: 0o600 })
+    const reconciler = buildExpired()
+    const metadata = JSON.parse(await fsp.readFile(recordPath, 'utf8'))
+    await reconciler.hold({ metadataDir, metadataPath: recordPath, metadata })
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 1, inFlightClaims: 0 })
+    expect(reconciler.hasExpired()).toBe(true)
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1, reconciler })
+
+    // Expired and unclaimed: the reaper runs with the id OUTSIDE skipOwnershipIds — full teardown.
+    expect(await isProcessGroupAlive(pid)).toBe(false)
+    await expect(fsp.stat(recordPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    // forget(result.reapedOwnershipIds) pruned every map, claimable-session index included.
+    expect(reconciler.snapshot()).toMatchObject({ held: 0, claimableSessions: 0, inFlightClaims: 0 })
+    expect(reconciler.claimForSession('thr-swept')).toBeNull()
+  })
+
+  it('passes held ids into skipOwnershipIds while the grace window has not expired', async () => {
+    const metadataDir = await makeTempDir()
+    const protectedChild = await spawnSweepFixtureChild()
+    const protectedPath = path.join(metadataDir, 'obs-protected.json')
+    await fsp.writeFile(protectedPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-protected',
+      wrapperPid: protectedChild.pid,
+      processGroupId: protectedChild.pid,
+      wrapperIdentity: protectedChild.identity,
+      sessionId: 'thr-protected',
+    })), { mode: 0o600 })
+    // Control: an unprotected dead-owner record in the same dir proves the tick DID run the
+    // reaper — the protected survivor's survival is the skip set, not a skipped tick.
+    const controlChild = await spawnSweepFixtureChild()
+    const controlPath = path.join(metadataDir, 'obs-control.json')
+    await fsp.writeFile(controlPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-control',
+      wrapperPid: controlChild.pid,
+      processGroupId: controlChild.pid,
+      wrapperIdentity: controlChild.identity,
+    })), { mode: 0o600 })
+    const reconciler = new CodexSidecarReconciler() // default grace: far from expiring
+    const protectedMetadata = JSON.parse(await fsp.readFile(protectedPath, 'utf8'))
+    await reconciler.hold({ metadataDir, metadataPath: protectedPath, metadata: protectedMetadata })
+    expect(reconciler.hasExpired()).toBe(false)
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1, reconciler })
+
+    // The reaper ran (the control record is reaped) but the held id was skipped.
+    expect(await isProcessGroupAlive(controlChild.pid)).toBe(false)
+    await expect(fsp.stat(controlPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await isProcessGroupAlive(protectedChild.pid)).toBe(true)
+    await expect(fsp.stat(protectedPath)).resolves.toBeDefined()
+    // …and no retry bookkeeping was written for the skipped id (it was never attempted).
+    await expect(fsp.stat(`${protectedPath}.reaper.json`)).rejects.toMatchObject({ code: 'ENOENT' })
+    // The reconciler still holds the survivor claimable afterwards.
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 1, inFlightClaims: 0 })
+    expect(reconciler.claimForSession('thr-protected')?.metadata.ownershipId).toBe('obs-protected')
+  }, 20_000)
+
+  it('skips the reaper entirely when no retries are due and the reconciler grace has not expired', async () => {
+    const metadataDir = await makeTempDir()
+    const { pid, identity } = await spawnSweepFixtureChild()
+    const recordPath = path.join(metadataDir, 'obs-live-owner.json')
+    await fsp.writeFile(recordPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-live-owner-not-due',
+      ownerServerPid: process.pid, // owner alive: not due, so only sweepDue could fire this tick
+      wrapperPid: pid,
+      processGroupId: pid,
+      wrapperIdentity: identity,
+    })), { mode: 0o600 })
+    const reconciler = new CodexSidecarReconciler()
+    const metadata = JSON.parse(await fsp.readFile(recordPath, 'utf8'))
+    await reconciler.hold({ metadataDir, metadataPath: recordPath, metadata })
+    expect(reconciler.hasExpired()).toBe(false)
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1, reconciler })
+
+    // The tick early-returned: the reaper never ran, so it never wrote retry bookkeeping for the
+    // alive-but-unproven owner record (a running reaper would have retried it in place).
+    await expect(fsp.stat(`${recordPath}.reaper.json`)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(recordPath)).resolves.toBeDefined()
+    expect(await isProcessGroupAlive(pid)).toBe(true)
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 0 })
+  })
+
+  it('hands the reaper a per-record skip-set function, so a claim landing mid-pass is honored (review Minor 1)', async () => {
+    const metadataDir = await makeTempDir()
+    // An EXPIRED reconciler holding two survivors; both records are scanned in one reaper pass.
+    const claimedChild = await spawnSweepFixtureChild()
+    const claimedPath = path.join(metadataDir, 'obs-late-claim.json')
+    await fsp.writeFile(claimedPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-late-claim',
+      wrapperPid: claimedChild.pid,
+      processGroupId: claimedChild.pid,
+      wrapperIdentity: claimedChild.identity,
+      sessionId: 'thr-late-claim',
+    })), { mode: 0o600 })
+    const sweptChild = await spawnSweepFixtureChild()
+    const sweptPath = path.join(metadataDir, 'obs-mid-pass-swept.json')
+    await fsp.writeFile(sweptPath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-mid-pass-swept',
+      wrapperPid: sweptChild.pid,
+      processGroupId: sweptChild.pid,
+      wrapperIdentity: sweptChild.identity,
+    })), { mode: 0o600 })
+    const reconciler = buildExpired()
+    for (const recordPath of [claimedPath, sweptPath]) {
+      const metadata = JSON.parse(await fsp.readFile(recordPath, 'utf8'))
+      expect(await reconciler.hold({ metadataDir, metadataPath: recordPath, metadata })).toBe('held')
+    }
+    expect(reconciler.snapshot()).toMatchObject({ held: 2, claimableSessions: 1, inFlightClaims: 0 })
+
+    // The claim lands while the pass is already scanning: the first per-record consultation
+    // performs it, and every record checked afterwards sees the id in-flight. A pass-start
+    // snapshot would consult the set exactly once for the whole pass.
+    const original = reconciler.sweepProtectionSet.bind(reconciler)
+    let claimLanded = false
+    const spy = vi.spyOn(reconciler, 'sweepProtectionSet').mockImplementation(() => {
+      if (!claimLanded) {
+        claimLanded = true
+        expect(reconciler.claimForSession('thr-late-claim')?.metadata.ownershipId).toBe('obs-late-claim')
+      }
+      return original()
+    })
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1, reconciler })
+
+    // Per-record re-query: more than one consultation for a two-record pass.
+    expect(claimLanded).toBe(true)
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(2)
+    // The claimed survivor was protected from every check after its claim landed: no signal, no
+    // retry bookkeeping, record kept.
+    expect(await isProcessGroupAlive(claimedChild.pid)).toBe(true)
+    await expect(fsp.stat(claimedPath)).resolves.toBeDefined()
+    await expect(fsp.stat(`${claimedPath}.reaper.json`)).rejects.toMatchObject({ code: 'ENOENT' })
+    // …while the unclaimed expired record was swept and then forgotten by the reconciler.
+    expect(await isProcessGroupAlive(sweptChild.pid)).toBe(false)
+    await expect(fsp.stat(sweptPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(reconciler.snapshot()).toMatchObject({ held: 1, claimableSessions: 0, inFlightClaims: 1 })
+    expect(reconciler.sweepProtectionSet()).toEqual(new Set(['obs-late-claim']))
+  }, 20_000)
 })
 
 describeWithLinuxProc('codex-observability lifecycle', () => {

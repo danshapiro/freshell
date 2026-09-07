@@ -1,11 +1,15 @@
-//! Task 16 (`PATCH /api/panes/:id`, kills D10): store-backed rename +
-//! syncable-terminal cascade tests. Split out of `lib.rs` per this branch's
+//! Task 16 (`PATCH /api/panes/:id`, kills D10): store-backed rename ROUTE
+//! tests. Split out of `lib.rs` per this branch's
 //! `pane_ops_tests.rs`/`layout_store_tests.rs` precedent (`lib.rs` is already
-//! over the 1,000-line ceiling). The legacy behavior under test:
-//! `router.ts:1396-1427` + `persistSyncableTerminalRename` (`:649-693`).
+//! over the 1,000-line ceiling). Formerly `rename_cascade_tests.rs`: the
+//! syncable-terminal persistence cascade (`persistSyncableTerminalRename`,
+//! `router.ts:649-693`) was removed in b5fb — the route is layout-only, and
+//! the b5fb pins at the bottom hold GREEN by structural absence: no
+//! persistence seam exists for the route to call, so each rename emits
+//! exactly one `ui.command{pane.rename}` frame and zero `terminals.changed`
+//! frames.
 
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -14,7 +18,6 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
 
-use super::rename_persistence::{BoxFuture, RenamePersistence};
 use super::FreshAgentState;
 
 // ── helpers (oneshot pattern from `lib.rs`'s `rename_pane_tests`) ───────────
@@ -98,32 +101,7 @@ fn drain_frames(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value>
     frames
 }
 
-/// A recording fake `RenamePersistence` — captures both patch calls verbatim.
-#[derive(Default)]
-struct RecordingPersistence {
-    terminal_calls: Mutex<Vec<(String, String)>>,
-    session_calls: Mutex<Vec<(String, String)>>,
-}
-
-impl RenamePersistence for RecordingPersistence {
-    fn patch_terminal_override_title(&self, terminal_id: &str, title: &str) -> BoxFuture<()> {
-        self.terminal_calls
-            .lock()
-            .unwrap()
-            .push((terminal_id.to_string(), title.to_string()));
-        Box::pin(async {})
-    }
-
-    fn patch_session_override_title(&self, key: &str, title: &str) -> BoxFuture<()> {
-        self.session_calls
-            .lock()
-            .unwrap()
-            .push((key.to_string(), title.to_string()));
-        Box::pin(async {})
-    }
-}
-
-// ── the 5 Task-16 behavior tests ─────────────────────────────────────────────
+// ── the route tests ──────────────────────────────────────────────────────────
 
 /// Store rename + `ui.command{pane.rename}` broadcast + `tabRenamed:true` for
 /// a single-pane tab (`router.ts:1408-1420`).
@@ -174,154 +152,6 @@ async fn rename_pane_unknown_pane_is_200_with_message() {
     assert_eq!(body["data"], json!({ "message": "pane not found" }));
     assert_eq!(body["message"], json!("pane not found"));
     assert!(drain_frames(&mut rx).is_empty(), "no broadcast on a miss");
-}
-
-/// A syncable (`mode:"claude"`) terminal pane cascades: both persistence
-/// patches land with the right args (session key resolved via the explicit
-/// `sessionRef` superset read — EDEV-11), the registry title is updated, and
-/// `terminals.changed` is broadcast (`router.ts:668-690`).
-#[tokio::test]
-async fn rename_pane_cascades_to_syncable_terminal_via_injected_persistence() {
-    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-    let registry = freshell_terminal::TerminalRegistry::new();
-    let fake = Arc::new(RecordingPersistence::default());
-    let revision = Arc::new(AtomicI64::new(0));
-    let state = state_with(tx.clone())
-        .with_terminal_registry(registry.clone())
-        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>)
-        .with_shared_terminals_revision(Arc::clone(&revision));
-
-    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
-    seed_layout(
-        &state,
-        lone_pane_layout(json!({
-            "kind": "terminal",
-            "mode": "claude",
-            "terminalId": terminal_id,
-            "sessionRef": { "provider": "claude", "sessionId": "sess-ref-1" },
-        })),
-    );
-
-    // Subscribe AFTER the create so only the rename's frames are captured.
-    let mut rx = tx.subscribe();
-    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Cascade Title").await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["data"]["tabRenamed"], json!(true), "{body}");
-    assert_eq!(
-        *fake.terminal_calls.lock().unwrap(),
-        vec![(terminal_id.clone(), "Cascade Title".to_string())]
-    );
-    assert_eq!(
-        *fake.session_calls.lock().unwrap(),
-        vec![("claude:sess-ref-1".to_string(), "Cascade Title".to_string())]
-    );
-    // `registry.updateTitle` write-through (`router.ts:682`).
-    assert_eq!(
-        registry.title_of(&terminal_id).as_deref(),
-        Some("Cascade Title")
-    );
-
-    // `terminals.changed` (shared revision bumped) + `ui.command{pane.rename}`.
-    let frames = drain_frames(&mut rx);
-    let changed = frames
-        .iter()
-        .find(|f| f["type"] == json!("terminals.changed"))
-        .unwrap_or_else(|| panic!("no terminals.changed in {frames:?}"));
-    assert_eq!(changed["revision"], json!(1));
-    assert_eq!(revision.load(Ordering::SeqCst), 1);
-    assert!(
-        frames
-            .iter()
-            .any(|f| f["type"] == json!("ui.command") && f["command"] == json!("pane.rename")),
-        "{frames:?}"
-    );
-}
-
-/// A plain shell pane NEVER cascades (`mode` ∉ SYNCABLE_TERMINAL_MODES,
-/// `router.ts:668`): no persistence calls, no `terminals.changed` — only the
-/// `pane.rename` ui.command.
-#[tokio::test]
-async fn rename_pane_shell_pane_never_cascades() {
-    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-    let registry = freshell_terminal::TerminalRegistry::new();
-    let fake = Arc::new(RecordingPersistence::default());
-    let revision = Arc::new(AtomicI64::new(0));
-    let state = state_with(tx.clone())
-        .with_terminal_registry(registry.clone())
-        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>)
-        .with_shared_terminals_revision(Arc::clone(&revision));
-
-    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
-    seed_layout(
-        &state,
-        lone_pane_layout(json!({
-            "kind": "terminal",
-            "mode": "shell",
-            "terminalId": terminal_id,
-        })),
-    );
-
-    let mut rx = tx.subscribe();
-    let (status, body) = patch_pane(crate::router(state), "p1", "Shell Title").await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(fake.terminal_calls.lock().unwrap().is_empty());
-    assert!(fake.session_calls.lock().unwrap().is_empty());
-    assert_eq!(revision.load(Ordering::SeqCst), 0);
-
-    let frames = drain_frames(&mut rx);
-    assert_eq!(frames.len(), 1, "{frames:?}");
-    assert_eq!(frames[0]["command"], json!("pane.rename"));
-}
-
-/// validator-A10: an agent-api-created claude pane whose paneContent carries
-/// NO `sessionRef`/`resumeSessionId` (`router.ts:762-773`) still cascades to
-/// the session override, because the session binding lives in the terminal
-/// REGISTRY (post-association metadata, resolved REGISTRY-FIRST per
-/// `router.ts:658-676`).
-#[tokio::test]
-async fn rename_pane_cascades_via_registry_session_binding_without_pane_content_session_fields() {
-    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
-    let registry = freshell_terminal::TerminalRegistry::new();
-    let fake = Arc::new(RecordingPersistence::default());
-    let revision = Arc::new(AtomicI64::new(0));
-    let state = state_with(tx.clone())
-        .with_terminal_registry(registry.clone())
-        .with_rename_persistence(Arc::clone(&fake) as Arc<dyn RenamePersistence>)
-        .with_shared_terminals_revision(Arc::clone(&revision));
-
-    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
-    // The session binding is seeded ONLY in the registry (what a locator
-    // association writes back via `set_meta` with zero client involvement).
-    registry.set_meta(
-        &terminal_id,
-        None,
-        None,
-        Some("claude".to_string()),
-        Some("sess-a10".to_string()),
-    );
-    seed_layout(
-        &state,
-        lone_pane_layout(json!({
-            "kind": "terminal",
-            "mode": "claude",
-            "terminalId": terminal_id,
-        })),
-    );
-
-    let (status, body) = patch_pane(crate::router(state), "p1", "A10 Title").await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        *fake.terminal_calls.lock().unwrap(),
-        vec![(terminal_id.clone(), "A10 Title".to_string())]
-    );
-    assert_eq!(
-        *fake.session_calls.lock().unwrap(),
-        vec![("claude:sess-a10".to_string(), "A10 Title".to_string())],
-        "registry-first resolution must find the association-learned binding"
-    );
 }
 
 // ── multi-client layout store (cross-client pane-id resolution fix) ─────────
@@ -389,5 +219,116 @@ async fn rename_from_non_primary_client_succeeds_and_tab_renamed_uses_that_snaps
     assert_eq!(
         frames[0]["payload"],
         json!({ "tabId": "t1", "paneId": "p1", "title": "Cross Client" })
+    );
+}
+
+// ── b5fb pins: the pane-rename persistence cascade is deleted ────────────────
+
+/// b5fb pin: renaming a SYNCABLE coding-CLI pane writes nothing beyond the
+/// layout store — the registry title is untouched, no `terminals.changed`
+/// fires, and exactly one `ui.command{pane.rename}` frame goes out. The RED
+/// form wired a recording `RenamePersistence` fake into the old cascade and
+/// watched it get called; GREEN holds by structural absence (the seam no
+/// longer exists) observed through the wire frames.
+#[tokio::test]
+async fn rename_pane_never_cascades_for_a_syncable_claude_terminal() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+
+    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "terminalId": terminal_id,
+            "sessionRef": { "provider": "claude", "sessionId": "sess-ref-1" },
+        })),
+    );
+
+    // Subscribe AFTER the create so only the rename's frames are captured.
+    let mut rx = tx.subscribe();
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Local Only").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(
+        registry.title_of(&terminal_id).as_deref(),
+        Some("Local Only"),
+        "registry title untouched by a pane rename"
+    );
+    let frames = drain_frames(&mut rx);
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["type"] != json!("terminals.changed")),
+        "no terminals.changed from a pane rename: {frames:?}"
+    );
+    let rename_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["type"] == json!("ui.command") && f["command"] == json!("pane.rename"))
+        .collect();
+    assert_eq!(
+        rename_frames.len(),
+        1,
+        "exactly one ui.command{{pane.rename}} frame: {frames:?}"
+    );
+}
+
+/// b5fb pin: A→B→C pane reuse carries NO pane label into durable history.
+/// Two renames of the same pane while bound to successive sessions: neither
+/// emits `terminals.changed`, the registry title never takes a pane label,
+/// and each rename yields exactly one `ui.command{pane.rename}` frame. The
+/// RED form recorded the old cascade's `session_calls` (both sessions were
+/// written); GREEN holds by structural absence observed through the frames.
+#[tokio::test]
+async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+
+    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
+    let mut rx = tx.subscribe();
+    // Session A displayed
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal", "mode": "claude", "terminalId": terminal_id,
+            "sessionRef": { "provider": "claude", "sessionId": "sess-A" },
+        })),
+    );
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Reusable Name").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Pane reused for session B
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal", "mode": "claude", "terminalId": terminal_id,
+            "sessionRef": { "provider": "claude", "sessionId": "sess-B" },
+        })),
+    );
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Reusable Name 2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let title = registry.title_of(&terminal_id);
+    assert!(
+        title.as_deref() != Some("Reusable Name") && title.as_deref() != Some("Reusable Name 2"),
+        "registry title never takes a pane label: {title:?}"
+    );
+    let frames = drain_frames(&mut rx);
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["type"] != json!("terminals.changed")),
+        "no terminals.changed across pane reuse: {frames:?}"
+    );
+    let rename_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["type"] == json!("ui.command") && f["command"] == json!("pane.rename"))
+        .collect();
+    assert_eq!(
+        rename_frames.len(),
+        2,
+        "each rename yields exactly one ui.command{{pane.rename}} frame: {frames:?}"
     );
 }

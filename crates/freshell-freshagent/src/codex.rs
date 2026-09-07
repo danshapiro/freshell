@@ -62,9 +62,10 @@ use freshell_codex::launch_plan::codex_sidecar_spawn_spec;
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
-    CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
-    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    normalize_freshcodex_model, read_rollout_history_mode, to_codex_reasoning_effort,
+    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
+    CodexSubscription, HistoryMode, StartThreadParams, StartTurnParams, ThreadForkParams,
+    CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
@@ -78,6 +79,9 @@ use crate::summary::{
     truncate_summary, SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO, TOOL_ERROR_LABEL, TOOL_RESULT_LABEL,
 };
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
+
+mod controls;
+mod metadata;
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
@@ -198,6 +202,15 @@ pub struct FreshCodexState {
     /// same reason `set_opencode_busy_deadman_for_tests` mutates through shared state.
     /// Seeded from `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS`.
     codex_quiet_window_ms: Arc<AtomicU64>,
+    /// Per-thread rollback single-flight (kata 1wxv Task 2, r2 lock discipline):
+    /// [`Self::handle_rollback`] acquires BEFORE the session's `turn_lock` (lock
+    /// order: rollback_in_flight FIRST, then the turn lock — never the reverse).
+    /// [`Self::handle_send`] NEVER acquires or consults this registry: while a
+    /// rollback holds the turn lock, a send simply waits on the turn lock, then
+    /// proceeds and destroys redo ("send waits, rollback wins, then destroys") —
+    /// no circular wait, no deadlock.
+    rollback_in_flight: crate::InFlightRegistry,
+    controls: controls::ControlRegistry,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -228,6 +241,49 @@ struct CodexSession {
     /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
     /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
+    /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
+    /// `turn/started` — a posting window exists where `active_turn` is still
+    /// notification-driven NONE while the compact turn is already running
+    /// provider-side. `handle_compact` SETS this under the session `turn_lock`
+    /// (the handle_send busy-truth discipline) and the notification consumer
+    /// CLEARS it at the compact turn's `turn/completed` (any status — a failed
+    /// compact ends the turn too). `handle_rollback`'s busy gate reads
+    /// `active_turn.is_some() || compact_in_flight` so a post-RPC/pre-turn-started
+    /// rollback can never force-interrupt the compact.
+    compact_in_flight: Arc<AtomicBool>,
+    /// Focused-review ep1-r3 F4 (compact completion-id OWNERSHIP): the compact
+    /// turn's id, captured from its `turn/started` — i.e. the FIRST `turn/started`
+    /// observed while [`Self::compact_in_flight`] is armed with no id captured yet
+    /// (provider FIFO: the compact was submitted before any later send, so its
+    /// start surfaces first). [`reduce_notification`] clears `compact_in_flight`
+    /// ONLY at the `turn/completed` whose params turn id MATCHES this id; a
+    /// completion carrying a DIFFERENT id (the documented probed sequence lands a
+    /// DELAYED PRIOR-turn completion inside the armed-clear-pending window, before
+    /// the compact's own `turn/started`) never clears it. `None` while armed ==
+    /// armed-clear-pending (the compact's start hasn't surfaced). Reset to `None`
+    /// by `handle_compact` at every arm and by the (submit-call-owned) RPC-failure
+    /// clear path, so ownership belongs to exactly one compact operation.
+    compact_turn_id: Arc<StdMutex<Option<String>>>,
+    /// Kata 1wxv Task 2 (LBC-1, r3): the thread's DURABLE history mode.
+    /// `Some(Paginated)` for threads freshell STARTED (we SET
+    /// `historyMode:"paginated"` on `thread/start`); resumed/adopted/forked
+    /// threads take the mode parsed from the rollout's persisted
+    /// `session_meta.history_mode` (`read_rollout_history_mode` — `thread/resume`
+    /// carries no mode param, so the durable meta is the only source of truth;
+    /// the app-server has no live read-back). `None` only when that durable
+    /// meta is missing/unparseable ⇒ legacy ⇒ capability stamps `undo:false`.
+    /// Kata 1wxv Task 5 consumes it (`build_codex_snapshot_json`'s
+    /// `capabilities.undo` stamp, read by [`FreshCodexState::get_snapshot`]).
+    history_mode: Option<HistoryMode>,
+    /// The per-session async turn lock (kata 1wxv Task 2, r2 serialization
+    /// discipline): [`FreshCodexState::handle_rollback`] holds it across the
+    /// WHOLE handler (busy-check → reads → revert → record write → reply);
+    /// [`FreshCodexState::handle_send`] holds it across the `turn/start` write
+    /// and the busy-truth set (closing the check-then-set window against the
+    /// rollback busy gate). Rollback-vs-rollback additionally single-flights on
+    /// `rollback_in_flight`, acquired FIRST (never the reverse order).
+    turn_lock: Arc<TokioMutex<()>>,
     /// The notification-consumer task (aborted on shutdown/kill).
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
@@ -252,6 +308,26 @@ struct CodexSession {
     /// into the consumer ([`reduce_notification`]), the exit watcher
     /// ([`spawn_exit_watcher`]), and the snapshot path ([`FreshCodexState::get_snapshot`]).
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    /// D8 (restore-open-sessions-only, focused-ep1-r3/-r4): the LATEST
+    /// connection-scoped provenance this session was attached under — parked by
+    /// [`FreshCodexState::finish_create`] from the create's threaded stamps,
+    /// REFRESHED by [`FreshCodexState::adopt_live_create`] when a resume-create
+    /// adopts this live session over a new connection (focused-ep1-r4 Finding
+    /// 1, re-park + ledger re-stamp), CARRIED across crash-recovery rebuilds
+    /// (the in-place [`FreshCodexState::ensure_session_alive`] re-register and
+    /// the mint-new [`FreshCodexState::respawn_as_new_thread_after_crash`]
+    /// re-key — the same logical session continuing; its row-level twins are
+    /// the conn-less refresh's `Inherit` preserve and the mint-new row's
+    //    / `supersedes` inheritance), and read by
+    /// [`FreshCodexState::handle_fork`] as precedence source (2) for the child
+    /// record + child ledger row (the FORKING connection's stamps win,
+    /// focused-ep1-r5 Finding 1). The conn-less attach-resume lane
+    /// ([`FreshCodexState::ensure_session_resumable`]) seeds it from the
+    /// DURABLE row's stamps (focused-ep1-r4 Finding 2); a genuinely
+    /// unattributed row leaves `None` parked — never invented. Every park
+    /// site filters hollow `Some`s away (focused-ep1-r5 Finding 2): a
+    /// partially initialized client's hello never lands here.
+    provenance: Option<crate::BindProvenance>,
 }
 
 /// Per-session state of the wedged-sidecar quiet deadman: while a turn is in flight
@@ -265,7 +341,11 @@ struct CodexSession {
 /// never across an `.await`, never while broadcasting. When it is nested with the
 /// session's `active_turn` mutex (the feed and fire checks), `quiet_deadman` is ALWAYS
 /// the outer lock and `active_turn` the inner one (the file-wide order).
-struct QuietDeadman {
+///
+/// `pub(crate)` only because the `pub(crate)` [`spawn_exit_watcher`] names it in its
+/// signature (its cross-module callers construct a deadman with
+/// [`QuietDeadman::new_shared`]); no field is ever exposed.
+pub(crate) struct QuietDeadman {
     /// Bumped on EVERY state mutation (arm, feed/reset, disarm, resolve). A waiter
     /// fires only when the generation it was armed under is still current.
     generation: u64,
@@ -279,7 +359,7 @@ struct QuietDeadman {
 
 impl QuietDeadman {
     /// A fresh, disarmed deadman behind its shared lock (the `active_turn` field pattern).
-    fn new_shared() -> Arc<StdMutex<Self>> {
+    pub(crate) fn new_shared() -> Arc<StdMutex<Self>> {
         Arc::new(StdMutex::new(Self {
             generation: 0,
             deadline: None,
@@ -376,6 +456,8 @@ impl FreshCodexState {
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
+            rollback_in_flight: crate::InFlightRegistry::new(),
+            controls: Default::default(),
         }
     }
 
@@ -418,6 +500,115 @@ impl FreshCodexState {
         self.identity_sink.get().cloned()
     }
 
+    /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
+    /// the claim lifecycle's COMMIT: an explicit resume/attach of a durable
+    /// thread is a NEW pane GENUINELY CLAIMING that identity — invoked ONLY
+    /// once the replacement session is established (the sidecar's
+    /// `thread/resume` answered, id-verified) — clearing its durable kill
+    /// fence so the claim's own binding write is never mistaken for the
+    /// killed session's orphaned write and suppressed, AND returning a
+    /// kill-closed ledger row to Bound (Finding 4: unconditional — the
+    /// V7-gated refresh write skips a lineage-only record, and the row once
+    /// stayed Closed while the live thread ran). Deliberately NOT called by
+    /// the crash-recovery / fork / adopt-live lanes: none of them claims an
+    /// identity a user just closed (and the crash lanes' writes must stay
+    /// fenced when a kill raced the respawn).
+    /// Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on the
+    /// claim-START dead-state snapshot — a kill landing mid-claim (the user
+    /// closed the pane while the resume awaited the provider) advances the
+    /// durable tombstone past it, and the commit is then REFUSED with no
+    /// durable side effects: the caller tears the just-built session down
+    /// and the row the kill retired stays Retired. A reviving claim must
+    /// never undo a newer close. On commit the fence-clear AND the row
+    /// revive are ONE ledger transition (Finding 3: no split-write
+    /// intermediate). Returns true iff the claim committed. An `Err` (io
+    /// failure deciding or writing) provably left the durable close
+    /// untouched (round 5, focused-ep5-r4 Finding 5): warn-loud and report
+    /// false — the caller tears the session down, kill wins.
+    async fn commit_session_claim(
+        &self,
+        durable_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> bool {
+        let Some(sink) = self.identity_sink() else {
+            return true;
+        };
+        match sink
+            .commit_claim(PROVIDER, durable_id, expect_killed_at_ms)
+            .await
+        {
+            Ok(crate::identity_sink::ClaimCommit::Committed) => true,
+            Ok(crate::identity_sink::ClaimCommit::RefusedStale) => {
+                tracing::info!(target: "freshell_freshagent::codex",
+                    durable = %durable_id,
+                    "freshagent.codex.claim_refused_stale_dead_state: a close landed while \
+                     this resume was in flight; the claim commits nothing and the lane tears down"
+                );
+                false
+            }
+            Err(e) => {
+                // Round 5 (focused-ep5-r4 Finding 5): the ledger's commit is
+                // crash-atomic, so an `Err` here means the durable close was
+                // left UNTOUCHED (the fence stands, the row stays Closed —
+                // only a cleanup-phase failure can land past the transition,
+                // and that one reports `Committed`). Registering anyway would
+                // build a live session over a durably-closed row. Treat the
+                // error like a refusal: the caller tears the session down and
+                // the close stands (kill wins).
+                tracing::warn!(error = %e, session = %durable_id,
+                    "freshagent.codex.claim_commit_failed: the durable close left the claim \
+                     undecidable; the lane tears down and leaves the close standing");
+                false
+            }
+        }
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1): the claim's
+    /// POST-REGISTRATION dead-state re-check. The commit's durable decision
+    /// and the kill's retire write serialize on the ledger guard, but a kill
+    /// QUEUED behind a successful commit (its decision pre-dated the kill)
+    /// lands while this lane is between commit and registration — nothing
+    /// else observes that ordering. Re-validate against the claim-start
+    /// snapshot once the session is registered (kill-visible): an advanced
+    /// dead state at this point means the row was retired after our commit,
+    /// so the registered session is a late orphan of the pane the user
+    /// closed — the caller tears it down and leaves the row Retired. Same
+    /// predicate as the ledger's `commit_claim` refusal.
+    fn claim_dead_state_advanced(&self, durable_id: &str, claim_dead_state: Option<i64>) -> bool {
+        let current = self
+            .identity_sink()
+            .and_then(|sink| sink.kill_tombstone_at_ms(PROVIDER, durable_id));
+        match (current, claim_dead_state) {
+            (Some(cur), Some(exp)) => cur > exp,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// Focused-ep5-r3 Finding 1: the claim attempt's dead-state snapshot,
+    /// read at claim START (before the spawn/resume awaits) and handed to
+    /// [`Self::commit_session_claim`] at commit time.
+    fn claim_dead_state_snapshot(&self, durable_id: &str) -> Option<i64> {
+        self.identity_sink()
+            .and_then(|sink| sink.kill_tombstone_at_ms(PROVIDER, durable_id))
+    }
+
+    /// The commit's inverse (retire-on-kill round 3, Finding 5's "re-raise"
+    /// arm): a claim whose lease was REVOKED at completion tears its
+    /// freshly-spawned session back down — the identity is dead again, so
+    /// `retire_closed` restores the close's durable record exactly (the kill
+    /// fence re-raised, the revived row re-retired — both idempotent). An
+    /// older in-flight binding write of the prior epoch is fenced again,
+    /// never a Bound resurrection.
+    async fn rollback_session_claim(&self, durable_id: &str) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        if let Err(e) = sink.retire_closed(PROVIDER, durable_id).await {
+            tracing::warn!(error = %e, session = %durable_id, "freshagent.codex.claim_rollback_failed");
+        }
+    }
+
     /// P1.13: write one fresh-agent binding row (FULL settings snapshot) through the
     /// identity sink. AWAITED at every identity site (the wave-A durable-before-answer
     /// policy) BEFORE that site's reply/broadcast goes out; a failed write is surfaced
@@ -434,6 +625,12 @@ impl FreshCodexState {
         effort: Option<&str>,
         cwd: Option<&str>,
         supersedes: Option<&str>,
+        // D8 provenance stamps — `Some` from connection-scoped creates and
+        // from the fork lane (the RESOLVED fork provenance: forking
+        // connection > parent's parked > parent's row, focused-ep1-r5);
+        // `None` on conn-less refresh/respawn lanes (the ledger merge keeps or
+        // supersedes-inherits prior stamps).
+        provenance: Option<&crate::BindProvenance>,
     ) {
         let Some(sink) = self.identity_sink() else {
             return;
@@ -451,8 +648,17 @@ impl FreshCodexState {
         };
         // No-laundering guard (V7/A10): never persist an all-blank snapshot --
         // it would mask a genuine record miss forever. Real creates always carry
-        // at least cwd; a supersession write always goes through (G3 linkage).
-        if settings == crate::identity_sink::FreshAgentSettings::default() && supersedes.is_none() {
+        // at least cwd; a supersession write always goes through (G3 linkage);
+        // and a connection-scoped PROVENANCE assertion (the adopt-lane refresh,
+        // focused-ep1-r4 Finding 1) goes through even with a blank settings
+        // snapshot — the row stays lineage-only (settings keying is unchanged)
+        // while the stamps assert the CURRENT attribution (the focused-ep1
+        // branch-2 regime; a blank-snapshot row with stamps is never a
+        // laundered defaults row).
+        if settings == crate::identity_sink::FreshAgentSettings::default()
+            && supersedes.is_none()
+            && provenance.is_none()
+        {
             return;
         }
         if let Err(e) = sink
@@ -463,6 +669,11 @@ impl FreshCodexState {
                 create_request_id: create_request_id.map(Into::into),
                 resolves_pending: None,
                 supersedes: supersedes.map(Into::into),
+                // Delta-r2 Finding 2 tri-state: a connection-supplied value
+                // asserts (`Replace`); a conn-less refresh/respawn lane
+                // asserts nothing (`Inherit` — the ledger merge keeps prior
+                // stamps).
+                provenance: provenance.cloned().into(),
                 settings,
             })
             .await
@@ -551,7 +762,13 @@ impl FreshCodexState {
     /// register the session + its notification consumer, and broadcast `freshAgent.created`
     /// (or `freshAgent.create.failed`). Long-running (cold sidecar spawn), so the WS loop
     /// dispatches this as a detached task and keeps fanning out the bus meanwhile.
-    pub async fn handle_create(&self, msg: FreshAgentCreate) {
+    /// `provenance` (D8): the WS connection's stamped identity for this create
+    /// (`None` on conn-less lanes); threaded to the `thread/start` binding write.
+    pub async fn handle_create(
+        &self,
+        msg: FreshAgentCreate,
+        provenance: Option<crate::BindProvenance>,
+    ) {
         let request_id = msg.request_id.clone();
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
@@ -609,8 +826,12 @@ impl FreshCodexState {
         let model = normalize_freshcodex_model(raw_model.as_deref());
         let raw_effort = msg.effort.clone().or(rec.effort);
         let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
-        let sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
-        let permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
+        let mut sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
+        let mut permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
+        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
+            self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", error);
+            return;
+        }
 
         // Validate the effort maps to the codex wire vocabulary (adapter create calls
         // toCodexReasoningEffort purely to reject unsupported efforts before spawning).
@@ -647,7 +868,11 @@ impl FreshCodexState {
             // naming it, spawn nothing (base checked only the dead-thread negative
             // cache here, never the live sessions map).
             if self.has_live_session(&resume_session_id).await {
-                self.adopt_live_create(&request_id, &resume_session_id)
+                // D8 (focused-ep1-r4 Finding 1): the adopt re-parks/re-stamps
+                // the CURRENT connection's provenance — recovery plans mint
+                // NEW tabIds, so the incumbent must not keep the old tab's
+                // attribution.
+                self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                     .await;
                 return;
             }
@@ -669,8 +894,10 @@ impl FreshCodexState {
                         break;
                     }
                     crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
-                        // Under-lock ADOPT (the V5 TOCTOU window).
-                        self.adopt_live_create(&request_id, &resume_session_id)
+                        // Under-lock ADOPT (the V5 TOCTOU window). D8
+                        // (focused-ep1-r4 Finding 1): re-parks/re-stamps the
+                        // CURRENT connection's provenance on the incumbent.
+                        self.adopt_live_create(&request_id, &resume_session_id, provenance.clone())
                             .await;
                         return;
                     }
@@ -710,6 +937,7 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 lease_guard,
+                provenance,
             )
             .await;
             return;
@@ -731,6 +959,9 @@ impl FreshCodexState {
                 model: Some(model.clone()),
                 sandbox: sandbox.clone(),
                 approval_policy: permission_mode.clone(),
+                // LBC-1 (kata 1wxv Task 2): every thread freshell STARTS adopts
+                // `historyMode:"paginated"` (thread/revert refuses legacy threads).
+                history_mode: Some(HistoryMode::Paginated),
             })
             .await;
         let thread_id = match started {
@@ -740,6 +971,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 self.fail_create(&request_id, "CODEX_THREAD_START_FAILED", &err.to_string());
                 return;
             }
@@ -757,6 +989,11 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            None,
+            // Threads freshell starts are paginated (we SET the mode at start).
+            Some(HistoryMode::Paginated),
+            provenance,
+            // The plain create lane never commits a claim — nothing to roll back.
             None,
         )
         .await;
@@ -795,6 +1032,9 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // D8: the creating connection's provenance (a resume-create is still a
+        // connection-scoped create: this pane IS open in that client's tab).
+        provenance: Option<crate::BindProvenance>,
     ) {
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
@@ -807,6 +1047,13 @@ impl FreshCodexState {
             );
             return;
         }
+
+        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
+        // SNAPSHOT — taken at claim start, before the sidecar spawn and the
+        // `thread/resume` await — so a kill landing while this resume is in
+        // flight advances the durable tombstone past it and the commit below
+        // REFUSES instead of undoing the newer close.
+        let claim_dead_state = self.claim_dead_state_snapshot(&resume_session_id);
 
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
@@ -833,6 +1080,9 @@ impl FreshCodexState {
                     model: Some(model.clone()),
                     sandbox: sandbox.clone(),
                     approval_policy: permission_mode.clone(),
+                    // thread/resume takes NO mode param (the durable rollout meta
+                    // carries the history mode).
+                    history_mode: None,
                 },
             )
             .await;
@@ -843,6 +1093,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -863,6 +1114,7 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
@@ -885,9 +1137,60 @@ impl FreshCodexState {
         let thread_id = resume_session_id;
         self.clear_dead_thread(&thread_id).await;
 
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding
+        // 4+5): this explicit create-with-resume GENUINELY CLAIMS the thread
+        // — the claim COMMITS here, after the sidecar's `thread/resume`
+        // answered and its id was verified (the replacement session is
+        // established): clear the durable kill fence BEFORE finish_create's
+        // binding write, AND return a kill-closed row to Bound.
+        // warn-only on failure — never a resume blocker. finish_create's
+        // lease-revoke arm rolls the commit back (`claim`), and
+        // `finish_create`'s post-registration re-check (round 5, Finding 1)
+        // tears down a late orphan a kill queued behind the commit produced.
+        //
+        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
+        // the claim-start dead-state snapshot. A kill that landed while this
+        // resume awaited `thread/resume` advanced the tombstone; the commit
+        // refuses with NO side effects, so the just-built sidecar is an
+        // orphan of a pane the user closed mid-create — tear it down (nothing
+        // registered yet; every sessions-map insert lives in finish_create,
+        // below) and answer failed, leaving the row the kill retired Retired.
+        if !self
+            .commit_session_claim(&thread_id, claim_dead_state)
+            .await
+        {
+            client.close().await;
+            let mut child = child;
+            let _ = child.start_kill();
+            reap_owned_codex_sidecars(&ownership_id);
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                &format!(
+                    "codex thread {thread_id} closed while the resume was in flight; torn down"
+                ),
+            );
+            return;
+        }
+
+        // Kata 1wxv Task 2 (r3): the durable rollout meta is the ONE source of
+        // truth for the resumed thread's history mode (thread/resume takes no
+        // mode param) — only a missing/unparseable meta stamps legacy.
+        let history_mode = match read_rollout_history_mode(&thread_id) {
+            Some(mode) => Some(mode),
+            None => {
+                tracing::debug!(session = %thread_id,
+                    "freshagent.codex.history_mode_unreadable_on_resume: stamping legacy");
+                None
+            }
+        };
+
         self.finish_create(
             request_id,
-            thread_id,
+            thread_id.clone(),
             client,
             notifs,
             ownership_id,
@@ -898,6 +1201,13 @@ impl FreshCodexState {
             sandbox,
             permission_mode,
             lease_guard,
+            history_mode,
+            provenance,
+            // This lane committed the claim above: its lease-revoke arm in
+            // `finish_create` must roll the commit back, and the
+            // post-registration re-check (round 5, Finding 1) compares
+            // against the claim-start snapshot.
+            Some((thread_id.as_str(), claim_dead_state)),
         )
         .await;
     }
@@ -923,7 +1233,29 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // Kata 1wxv Task 2: the thread's durable history mode — `Some(Paginated)`
+        // for threads freshell started, the rollout-meta parse for resumes.
+        history_mode: Option<HistoryMode>,
+        // D8: the creating connection's provenance for the binding write below
+        // (`None` on conn-less lanes; the ledger merge keeps prior stamps).
+        provenance: Option<crate::BindProvenance>,
+        // Retire-on-kill round 3 (Finding 5): `Some((<the resumed durable
+        // id>, <the claim-start dead-state snapshot>))` when the caller
+        // committed (round 5: COMMITS, before this tail) a claim
+        // (create-with-resume); the lease-revoke arm below then rolls the
+        // commit back before answering failed, so a torn-down claim never
+        // leaves the identity unfenced / Bound, and the post-registration
+        // dead-state re-check (round 5, Finding 1) compares the fence
+        // against the snapshot. `None` on the plain create lane (nothing was
+        // committed — nothing to roll back or re-check).
+        claim: Option<(&str, Option<i64>)>,
     ) {
+        // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
+        // initialized client's hello — all fields absent) behaves like `None`
+        // on every decision below: the park, the eviction-guard adopt, and
+        // the binding write's stamps.
+        let provenance = provenance.filter(|p| p.is_meaningful());
+
         // Task 12 EVICTION GUARD: on base this tail REPLACED a live incumbent under the
         // same threadId -- orphaning the winner's sidecar and stealing its binding
         // (strictly worse than a duplicate). If a LIVE entry already occupies the
@@ -942,11 +1274,17 @@ impl FreshCodexState {
             let _ = child.start_kill();
             let _ = child.wait().await;
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             // Own tree confirmed torn down -- releasing the lease is safe.
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
             }
-            self.adopt_live_create(&request_id, &thread_id).await;
+            // D8 (focused-ep1-r4 Finding 1): the eviction-guard adopt also
+            // re-parks/re-stamps the CURRENT connection's provenance on the
+            // incumbent (this arm returns immediately, so moving `provenance`
+            // in is safe).
+            self.adopt_live_create(&request_id, &thread_id, provenance)
+                .await;
             return;
         }
 
@@ -967,12 +1305,16 @@ impl FreshCodexState {
         // cannot possibly observe an event that fired before it existed). The unbounded
         // `notifs` channel buffers whatever arrives in the meantime -- nothing is lost,
         // only its delivery to the consumer is deferred.
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let (created_tx, created_rx) = oneshot::channel();
         let consumer = self.spawn_consumer_after(
             notifs,
             thread_id.clone(),
             active_turn.clone(),
             quiet_deadman.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
             Some(created_rx),
         );
 
@@ -1002,13 +1344,58 @@ impl FreshCodexState {
                 sandbox: sandbox.clone(),
                 permission_mode: permission_mode.clone(),
                 active_turn,
+                compact_in_flight,
+                compact_turn_id,
+                history_mode,
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
                 quiet_deadman,
+                // D8 (focused-ep1-r3 — the parking invariant): park the creating
+                // connection's provenance ON the session so downstream readers
+                // (the fork child row + child record) assert the CURRENT
+                // attribution; `None` stays on conn-less lanes (never invented).
+                provenance: provenance.clone(),
             },
         );
+
+        // Round 5 (focused-ep5-r4 Finding 1), the create-resume lane's
+        // post-registration dead-state re-check (the attach lane's twin is in
+        // `ensure_session_resumable`): a kill QUEUED behind this claim's
+        // commit lands between the commit and the insert above — the
+        // registered session is a late orphan of the pane the user closed
+        // (the kill's retire already left the row Retired). Tear it down and
+        // answer failed; kill always wins.
+        if let Some((claim_id, claim_dead_state)) = claim {
+            if self.claim_dead_state_advanced(claim_id, claim_dead_state) {
+                tracing::info!(target: "freshell_freshagent::codex",
+                    durable = %claim_id,
+                    "freshagent.codex.claim_late_orphan_torn_down: a close landed between the \
+                     claim's commit and its registration; the registered orphan is torn down"
+                );
+                if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                    session.consumer.abort();
+                    session.client.close().await;
+                    if let Some(kill_tx) = session.kill_tx {
+                        let _ = kill_tx.send(());
+                    }
+                    let _ = session.watcher.await;
+                }
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    &format!(
+                        "codex thread {thread_id} closed while the resume was in flight; torn down"
+                    ),
+                );
+                return;
+            }
+        }
 
         // Task 12: bind the durable thread id to this live session + release the lease
         // in ONE lock scope. A revoked lease means we must NOT keep the session -- tear
@@ -1022,6 +1409,13 @@ impl FreshCodexState {
                         let _ = kill_tx.send(());
                     }
                     let _ = session.watcher.await;
+                }
+                // Finding 5's re-raise: a committed claim (the resume lane)
+                // that gets torn down here dies again — restore the close's
+                // durable record (fence re-raised, the revived row
+                // re-retired) before answering failed.
+                if let Some((claim_id, _)) = claim {
+                    self.rollback_session_claim(claim_id).await;
                 }
                 g.fail(); // own tree torn down -- reopen the key
                 self.fail_create(
@@ -1046,6 +1440,7 @@ impl FreshCodexState {
             effort.as_deref(),
             cwd.as_deref(),
             None,
+            provenance.as_ref(),
         )
         .await;
 
@@ -1128,7 +1523,61 @@ impl FreshCodexState {
     /// The HAS-LIVE→ADOPT arm (Task 12, V1): answer a loser's create-with-resume with a
     /// `freshAgent.created` naming the live durable threadId under the loser's own
     /// `requestId` — no spawn, no rollout clobber.
-    async fn adopt_live_create(&self, request_id: &str, thread_id: &str) {
+    ///
+    /// D8 (focused-ep1-r4 Finding 1 — mirror of the opencode in-memory-hit
+    /// refresh, `ec435cbf3`): the adopted resume-create is STILL a
+    /// connection-scoped create — this pane IS open in that client's
+    /// (possibly NEW, recovery-minted) tab. Re-park the CURRENT connection's
+    /// provenance on the incumbent and assert it to the ledger with this
+    /// lane's awaited binding refresh (durable-before-answer, BEFORE the
+    /// created broadcast below) — otherwise the parked value and every later
+    /// refresh/fork would keep the PRE-reload connection's attribution. A
+    /// conn-less adopt (`provenance == None`) re-parks nothing (the parked
+    /// Some is never regressed to None) and writes nothing (never invented).
+    /// A HOLLOW `Some` (a partially initialized client's hello without
+    /// device/client fields, focused-ep1-r5 Finding 2) behaves like `None`:
+    /// it must never overwrite the parked truth nor fire the refresh write.
+    async fn adopt_live_create(
+        &self,
+        request_id: &str,
+        thread_id: &str,
+        provenance: Option<crate::BindProvenance>,
+    ) {
+        if let Some(p) = provenance.filter(|p| p.is_meaningful()) {
+            // Re-park + snapshot the incumbent's settings in one lock scope
+            // (the refresh write below asserts the parked identity together
+            // with the session's current values — the same composition this
+            // lane's per-send/fork writes use). A vanished incumbent (a kill
+            // racing the has-live check) skips the write: there is nothing
+            // live to re-attribute.
+            let parked = {
+                let mut guard = self.sessions.lock().await;
+                guard.get_mut(thread_id).map(|s| {
+                    s.provenance = Some(p.clone());
+                    (
+                        s.model.clone(),
+                        s.effort.clone(),
+                        s.cwd.clone(),
+                        s.sandbox.clone(),
+                        s.permission_mode.clone(),
+                    )
+                })
+            };
+            if let Some((model, effort, cwd, sandbox, permission_mode)) = parked {
+                self.record_codex_binding(
+                    thread_id,
+                    None,
+                    &model,
+                    sandbox.as_deref(),
+                    permission_mode.as_deref(),
+                    effort.as_deref(),
+                    cwd.as_deref(),
+                    None,
+                    Some(&p),
+                )
+                .await;
+            }
+        }
         self.create_dedup
             .record_success(
                 request_id,
@@ -1199,30 +1648,79 @@ impl FreshCodexState {
             guard.get(&session_id).map(|s| {
                 (
                     s.client.clone(),
-                    s.model.clone(),
-                    s.effort.clone(),
-                    s.cwd.clone().or_else(|| cwd.clone()),
-                    s.sandbox.clone(),
-                    s.permission_mode.clone(),
                     s.active_turn.clone(),
+                    s.turn_lock.clone(),
                     s.quiet_deadman.clone(),
                 )
             })
         };
-        let Some((
-            client,
-            model,
-            effort,
-            turn_cwd,
-            sandbox,
-            permission_mode,
-            active_turn,
-            quiet_deadman,
-        )) = looked_up
+        let Some((client, active_turn, turn_lock, quiet_deadman)) = looked_up else {
+            self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
+            return;
+        };
+
+        // Kata 1wxv Task 2 (r2 serialization discipline): take the session's
+        // async turn lock and hold it from here across the `turn/start` write
+        // AND the active-turn set — the check-then-set window against
+        // `handle_rollback`'s busy gate (a rollback holding this lock observes
+        // either no-turn or a fully-registered in-flight turn, never the "turn
+        // starting but not yet tracked" intermediate). `handle_send` NEVER
+        // acquires or consults `rollback_in_flight`: while a rollback holds
+        // this lock, the send simply waits, then proceeds and destroys redo
+        // ("send waits, rollback wins, then destroys").
+        let _turn = turn_lock.lock().await;
+
+        // Read defaults after acquiring the turn lock: a queued send inherits the
+        // last accepted settings, while this message's explicit choices win.
+        let stored = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id).map(|s| {
+                (
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.cwd.clone(),
+                    s.sandbox.clone(),
+                    s.permission_mode.clone(),
+                )
+            })
+        };
+        let Some((stored_model, stored_effort, stored_cwd, stored_sandbox, stored_permission)) =
+            stored
         else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
+        let settings = msg.settings.as_ref();
+        let model = settings
+            .and_then(|s| s.model.clone())
+            .unwrap_or(stored_model);
+        let effort = settings.and_then(|s| s.effort.clone()).or(stored_effort);
+        let turn_cwd = settings.and_then(|s| s.cwd.clone()).or(stored_cwd).or(cwd);
+        let mut sandbox = settings
+            .and_then(|s| s.sandbox)
+            .map(sandbox_wire_value)
+            .or(stored_sandbox);
+        let mut permission_mode = settings
+            .and_then(|s| s.permission_mode.clone())
+            .or(stored_permission);
+        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
+            self.send_error(&request_id, "INVALID_PERMISSION_MODE", error);
+            return;
+        }
+
+        // Decision 5 (codex/opencode/claude share this helper): any new
+        // submission permanently destroys redo. AWAITED before the turn goes
+        // out; a ledger write failure is logged but never blocks the send.
+        if let Some(err) = crate::rollback_record::destroy_redo_on_submit(
+            &self.identity_sink(),
+            PROVIDER,
+            &session_id,
+            now_ms(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, session = %session_id, "freshagent.codex.destroy_redo_on_submit_failed");
+        }
 
         // Re-normalize model/effort on send (adapter.ts:961-963) — idempotent for stored values.
         let model = normalize_freshcodex_model(Some(&model));
@@ -1237,10 +1735,9 @@ impl FreshCodexState {
 
         let params = StartTurnParams {
             thread_id: session_id.clone(),
-            // toCodexUserInput(text): [{ type:'text', text, text_elements:[] }] (adapter.ts:164).
-            input: vec![json!({ "type": "text", "text": msg.text, "text_elements": [] })],
+            input: codex_user_input(&msg.text, msg.images.as_deref()),
             cwd: turn_cwd.clone(),
-            model: Some(model),
+            model: Some(model.clone()),
             // DEV-0003: none/minimal/low/medium/high forwarded VERBATIM; max/xhigh → xhigh.
             effort: wire_effort,
             sandbox_policy: sandbox.as_deref().map(sandbox_policy_value),
@@ -1261,6 +1758,30 @@ impl FreshCodexState {
                 return;
             }
         };
+
+        // Only persist choices once the provider has accepted them. Failed sends
+        // keep the previous working settings for resume and retry.
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            session.model = model.clone();
+            session.effort = effort.clone();
+            session.cwd = turn_cwd.clone();
+            session.sandbox = sandbox.clone();
+            session.permission_mode = permission_mode.clone();
+        }
+        self.record_codex_binding(
+            &session_id,
+            None,
+            &model,
+            sandbox.as_deref(),
+            permission_mode.as_deref(),
+            effort.as_deref(),
+            turn_cwd.as_deref(),
+            None,
+            // Send/settings mutation is not a new browser assertion — conn-less
+            // (merge keeps prior stamps, ep4 writer rules).
+            None,
+        )
+        .await;
 
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
@@ -1359,10 +1880,25 @@ impl FreshCodexState {
     /// (`thread/status/changed{active}` → `turn/started` → items/token-usage →
     /// `thread/status/changed{idle}` → `turn/completed{turn.status:'completed'}`; NO
     /// `thread/compacted` notification exists in the success flow, so no new
-    /// `CodexStatus` is needed). Concurrency gate: a BEST-EFFORT refusal while a turn
-    /// is tracked active (`active_turn` set) — a concurrent send or a rapid second
-    /// Compact click can slip past it, in which case the app-server's rejection is
-    /// the backstop (surfaced as `CODEX_COMPACT_FAILED`). Every failure path is LOUD
+    /// `CodexStatus` is needed). Concurrency gate (kata 1wxv Task 2 review M1):
+    /// the refusal-while-active gate AND the `compact_thread` RPC run UNDER the
+    /// session `turn_lock` (the `handle_send`/`handle_rollback` discipline) — a
+    /// rollback holding this lock makes a racing compact WAIT, so
+    /// `thread/revert` can never land inside the compact RPC's check-then-set
+    /// window (the provider revert would force-interrupt a compact turn the
+    /// busy gate never saw). `thread/compact/start`'s `Record<string, never>`
+    /// answer carries no turn id, and the probed 0.147.0 order returns the RPC
+    /// BEFORE `turn/started` — so compact's busy TRUTH pairs the notification-
+    /// written `active_turn` with the explicit `compact_in_flight` bit SET under
+    /// the turn lock below and cleared at the compact turn's `turn/completed`
+    /// ([`reduce_notification`]) — delta-r1 F2; the rollback busy gate reads
+    /// both. The
+    /// active-turn refusal remains, and a rapid second Compact click is refused
+    /// server-side with the rollback `BUSY_TURN` copy while the first compact's
+    /// window marker is armed (focused ep1-r2 F3 — the failure-clear of that
+    /// marker then belongs to the call that armed it alone); the app-server's
+    /// rejection stays the backstop for a genuinely failed RPC (surfaced as
+    /// `CODEX_COMPACT_FAILED`). Every failure path is LOUD
     /// via the nested `freshAgent.error` banner envelope (a request-less top-level
     /// `error` frame never reaches the frozen client's pane surface).
     ///
@@ -1417,16 +1953,33 @@ impl FreshCodexState {
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .map(|s| (s.client.clone(), s.active_turn.clone()))
+            guard.get(&session_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.turn_lock.clone(),
+                    s.compact_in_flight.clone(),
+                    s.compact_turn_id.clone(),
+                )
+            })
         };
-        let Some((client, active_turn)) = looked_up else {
+        let Some((client, active_turn, turn_lock, compact_in_flight, compact_turn_id)) = looked_up
+        else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
             // lost-session leg, never silence.
             self.broadcast(&lost_session_frame(&session_id));
             return;
         };
+
+        // Kata 1wxv Task 2 review M1: take the session's async turn lock and
+        // hold it across the busy gate AND the `thread/compact/start` RPC (the
+        // [`Self::handle_send`] discipline) — a rollback holding this lock makes
+        // a racing compact WAIT, so `thread/revert` can never land inside the
+        // compact RPC's check-then-set window (the provider revert would
+        // force-interrupt a compact turn the busy gate never saw). Compact
+        // never acquires or consults `rollback_in_flight`: it simply waits on
+        // the lock, mirroring send.
+        let _turn = turn_lock.lock().await;
 
         if active_turn.lock().expect("active_turn mutex").is_some() {
             self.emit_fresh_agent_error(
@@ -1439,9 +1992,405 @@ impl FreshCodexState {
             return;
         }
 
+        // Focused-review ep1-r2 F3 (compact ownership): a SECOND compact
+        // landing while compact-1's window marker is armed (its RPC answered,
+        // its `turn/started` not yet surfaced) is REFUSED with the rollback
+        // `BUSY_TURN` copy. The precheck MUST read the window bit: the pre-F3
+        // gate examined only `active_turn`, so the rapid second compact entered
+        // the RPC — and a REJECTED second RPC's failure-clear below then wiped
+        // the FIRST compact's busy truth, letting a queued rollback land
+        // `thread/revert` mid-compact. Refusal BEFORE arming restores
+        // ownership: the failure-clear can now only ever run for the call that
+        // armed the bit.
+        if compact_in_flight.load(Ordering::SeqCst) {
+            self.emit_fresh_agent_error(
+                &session_id,
+                "BUSY_TURN",
+                crate::rollback_record::ROLLBACK_BUSY_MESSAGE,
+            );
+            return;
+        }
+
+        // Delta-r1 F2: mark the compact-window busy truth UNDER the turn lock,
+        // BEFORE the RPC — the `thread/compact/start` answer arrives BEFORE any
+        // `turn/started` notification (the probed 0.147.0 order), and
+        // `active_turn` alone leaves that post-RPC window uncovered. The bit
+        // clears when the compact turn's OWN `turn/completed` (any status) flows
+        // through `reduce_notification` — ep1-r3 F4: ID-MATCHED against
+        // `compact_turn_id` (captured at the compact's `turn/started`), so a
+        // delayed PRIOR-turn completion can never clear another compact's window.
+        // The ownership id resets HERE (armed-clear-pending) at every arm, and a
+        // FAILED RPC means no compact turn ever starts — clear what we set (the
+        // submit call owns the failure path; fail-closed, never wedges the gate).
+        *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+        compact_in_flight.store(true, Ordering::SeqCst);
         if let Err(err) = client.compact_thread(&session_id).await {
+            // Focused ep4-r6 (codex.rs:1530, F4 at round 5): ONLY an
+            // explicit JSON-RPC rejection proves the compact never started
+            // → the marker clears. Transport means a WS write/flush
+            // failure — which tells nothing about whether the server
+            // received the frame — and every other class is the
+            // ambiguous-post-send shape; all stay fail-closed: the compact
+            // turn's own notifications own the retirement (a never-
+            // starting compact wedges conservatively, never silently).
+            if matches!(&err, CodexAppServerError::Rpc { .. }) {
+                compact_in_flight.store(false, Ordering::SeqCst);
+                *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+            }
             self.emit_fresh_agent_error(&session_id, "CODEX_COMPACT_FAILED", &err.to_string());
         }
+    }
+
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 2; codex undo-only) ─
+
+    /// Handle a `freshAgent.undo` (or a misplaced `freshAgent.redo`) for codex:
+    /// `thread/revert` is the in-place, same-thread-id DESTRUCTIVE history
+    /// rollback (keep the prefix strictly BEFORE the boundary turn; an empty
+    /// prefix — reverting before the first turn — LEGALLY empties the thread).
+    /// Codex has NO redo primitive (decision 5): a redo is refused
+    /// permanently, the wire-level refusal cell stays forever, and the stored
+    /// record's `can_redo` bit is always false.
+    ///
+    /// Ordering (durable-BEFORE-mutation + the r2 serialization discipline):
+    ///   1. the permanent redo refusal and the request-shape validation;
+    ///   2. `ensure_session_alive` (the same arms as [`Self::handle_fork`]) —
+    ///      a crash-stale session transparently respawns first;
+    ///   3. `rollback_in_flight` single-flight, acquired FIRST, then the
+    ///      session's `turn_lock`, held across the WHOLE rest of this handler
+    ///      (busy-check → pre-revert read → ledger pre-write → revert →
+    ///      broadcast/reply). `handle_send` never touches `rollback_in_flight`;
+    ///      it waits behind this lock, then proceeds and destroys redo — no
+    ///      circular wait exists;
+    ///   4. the busy gate (`active_turn` set ⇒ `BUSY_TURN`) is the SOLE
+    ///      mid-turn protection — the provider revert FORCE-INTERRUPTS
+    ///      (validator extra-1), so a gate hole is silent corruption, and no
+    ///      RPC at all leaves this handler for a refused attempt;
+    ///   5. the PRE-REVERT capture (`thread/read{includeTurns:true}`, with the
+    ///      zero-turn include-turns fallback `get_snapshot` already uses) pins
+    ///      the removed tail before the destructive RPC destroys it;
+    ///   6. the ledger record pre-write is AWAITED BEFORE the mutation — a
+    ///      pre-write failure refuses with `INTERNAL_ERROR` +
+    ///      `LEDGER_WRITE_REFUSAL_COPY` and the provider history is NEVER
+    ///      mutated; a provider failure AFTER a successful pre-write is
+    ///      compensated ONLY on explicit RPC-rejection legs (the provider
+    ///      ANSWERED with a JSON-RPC error ⇒ provably unmoved — the pre-op
+    ///      record is restored before the refusal is answered); transport legs
+    ///      (Timeout/Closed/Transport ⇒ the provider may have applied) KEEP
+    ///      the post-op ledger and answer `INTERNAL_ERROR` +
+    ///      `CODEX_UNCERTAIN_ROLLBACK_COPY` (review M3 — a compensating
+    ///      rewrite would erase markers for a possibly-applied revert).
+    ///
+    /// Record semantics (r3 UNION rule): `entries` accumulates the union of
+    /// EVERY epoch's rolled-back turns (codex's revert DESTROYS the tail
+    /// natively, so the ledger is the markers' only durable home — decision
+    /// 6); a new undo landing while `redo_destroyed` was set starts a NEW
+    /// epoch that clears ONLY that bit (the record's redo fields then describe
+    /// the new chain; codex has no chain root). Marker rows are never dropped.
+    /// A rollback NEVER chimes: the broadcast is `freshAgent.session.rolledBack`
+    /// with `revokeAttention:true`, never a `turn.complete`.
+    pub async fn handle_rollback(
+        &self,
+        op: crate::rollback_record::RollbackRequest,
+        reply_sink: FrameSink,
+    ) {
+        use crate::rollback_record::*;
+
+        // Decision 5: undo-only. (The WS refusal cell also answers codex redo
+        // permanently; this belt covers a directly-dispatched frame.)
+        if op.direction == RollbackDirection::Redo {
+            reply_sink(rollback_error_frame(
+                &op,
+                "UNSUPPORTED_CAPABILITY",
+                "Redo is not supported for freshcodex (codex history revert is destructive; there is no redo primitive).",
+            ));
+            return;
+        }
+        // `turnId` absent on a toTurn frame is a server-side validation error
+        // (never a zod refinement — the frozen contract keeps bare objects).
+        if op.mode == RollbackModeReq::ToTurn && op.turn_id.is_none() {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INVALID_ROLLBACK_TARGET",
+                "undo toTurn requires a turnId",
+            ));
+            return;
+        }
+
+        // ensure-alive parity with handle_fork (the same arms): a crash-stale
+        // sidecar transparently respawns; genuinely lost sessions answer the
+        // client's recovery-engaging INVALID_SESSION_ID shape.
+        let thread_id = match self.ensure_session_alive(&op.session_id).await {
+            Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
+                op.session_id.clone()
+            }
+            Ok(EnsureAliveOutcome::Respawned { new_session_id }) => new_session_id,
+            Err(EnsureAliveError::NotFound) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INVALID_SESSION_ID",
+                    &format!("codex session {} not found", op.session_id),
+                ));
+                return;
+            }
+            Err(EnsureAliveError::RespawnFailed(err)) => {
+                reply_sink(rollback_error_frame(&op, "INTERNAL_ERROR", &err));
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            }
+        };
+
+        // Rollback-vs-rollback single-flight (lock order: FIRST, before the
+        // turn lock — never the reverse).
+        let Some(_guard) = self.rollback_in_flight.try_acquire(&thread_id) else {
+            reply_sink(rollback_error_frame(
+                &op,
+                "INTERNAL_ERROR",
+                &format!("rollback already in progress for {thread_id}"),
+            ));
+            return;
+        };
+
+        let (client, active_turn, turn_lock, compact_in_flight) = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&thread_id) {
+                Some(s) => (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.turn_lock.clone(),
+                    s.compact_in_flight.clone(),
+                ),
+                None => {
+                    // TOCTOU: a kill can land between ensure-alive and this lookup.
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INVALID_SESSION_ID",
+                        &format!("codex session {thread_id} not found"),
+                    ));
+                    return;
+                }
+            }
+        };
+        // Held for the REST of this handler. Busy truth is written by
+        // handle_send UNDER this same lock across the turn/start write (the
+        // check-then-set window is closed): observed idle here means no send is
+        // in flight, and no send can start until this handler releases.
+        let _turn = turn_lock.lock().await;
+        // Delta-r1 F2: the busy gate ALSO reads the compact-window truth — a
+        // `thread/compact/start` whose RPC answered but whose turn/started
+        // notification has not surfaced is mid-turn provider-side; a rollback
+        // here would force-interrupt the compact.
+        if active_turn.lock().expect("active_turn mutex").is_some()
+            || compact_in_flight.load(Ordering::SeqCst)
+        {
+            // Zero RPCs leave this handler on the refused path — the busy gate
+            // is the SOLE mid-turn protection (the provider revert would
+            // force-interrupt).
+            reply_sink(rollback_error_frame(
+                &op,
+                "BUSY_TURN",
+                ROLLBACK_BUSY_MESSAGE,
+            ));
+            return;
+        }
+
+        // PRE-REVERT capture — thread/revert destroys the removed tail, so the
+        // ack's removedPromptText and the ledger markers come from this read.
+        let read = match client.read_thread(&thread_id, true).await {
+            Ok(v) => v,
+            Err(err) if is_codex_include_turns_unavailable(&err) => {
+                // LBC-1: a ZERO-TURN paginated thread answers -32601
+                // "list_turns is not supported yet" until its first turn
+                // commits — the same include-turns fallback get_snapshot uses.
+                match client.read_thread(&thread_id, false).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        reply_sink(rollback_error_frame(
+                            &op,
+                            "INTERNAL_ERROR",
+                            &err.to_string(),
+                        ));
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    &err.to_string(),
+                ));
+                return;
+            }
+        };
+        let raw_turns = read
+            .get("thread")
+            .and_then(|t| t.get("turns"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (before_turn_id, removed) =
+            match resolve_codex_boundary(&raw_turns, op.mode, op.turn_id.as_deref()) {
+                Ok(v) => v,
+                Err(CodexRollbackError::NothingToUndo) => {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "NOTHING_TO_UNDO",
+                        UNDO_EMPTY_MESSAGE,
+                    ));
+                    return;
+                }
+                Err(CodexRollbackError::TargetNotFound) => {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INVALID_ROLLBACK_TARGET",
+                        &format!("turn {:?} is not in this thread's history", op.turn_id),
+                    ));
+                    return;
+                }
+            };
+        let removed_ids: Vec<String> = removed
+            .iter()
+            .filter_map(|t| {
+                t.get("turnId")
+                    .or_else(|| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        // The composer-refill payload: the FIRST removed USER display turn's text.
+        let prompt = removed
+            .iter()
+            .find(|t| t.get("role").and_then(Value::as_str) == Some("user"))
+            .map(codex_turn_plain_text)
+            .unwrap_or_default();
+
+        // Durable record FIRST (durable-BEFORE-mutation): the post-op record is
+        // computed from the PRE-revert read, then AWAITED. A failed write
+        // refuses the rollback — provider history is never mutated.
+        let now = now_ms();
+        let previous = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, &thread_id));
+        // The epoch state AT LOAD (before the bit clears) selects the marker
+        // splice semantics below.
+        let starts_new_epoch = previous.as_ref().map(|p| p.redo_destroyed).unwrap_or(false);
+        let mut record = match previous.clone() {
+            Some(p) => p,
+            None => RollbackRecord::empty(now),
+        };
+        // Review Minor-3 + delta-r1 F8: the marker bucket is CONVERSATION order
+        // on every lane (the plan :165 union rule wins over the :166 codex
+        // append bullet), ordered by LITERAL epoch bookkeeping — positions never
+        // read timestamps:
+        // - a NEW epoch (redo_destroyed was set at load) bumps `current_epoch`
+        //   FIRST — every existing entry freezes with its own epoch value —
+        //   then the new entry lands behind them;
+        // - otherwise (same epoch) the new entry splices BEFORE the existing
+        //   same-epoch entries (each undo removes an EARLIER-in-conversation
+        //   step, so the current-epoch block reads t1..tn ascending).
+        // Only the redo-capable chain state resets across the boundary —
+        // `entries` is NEVER cleared (the r3 union accumulates); the revision
+        // floor is restamped by the set_can_redo below.
+        if starts_new_epoch {
+            record.redo_destroyed = false;
+            record.begin_new_epoch();
+        }
+        record.splice_undo_entry(
+            RollbackEntry {
+                removed_turns: removed,
+                prompt_text: prompt.clone(),
+                at_ms: now,
+                epoch: record.current_epoch,
+            },
+            now,
+        );
+        record.set_can_redo(false, now); // codex is undo-only (decision 5)
+        if let Some(sink) = self.identity_sink() {
+            if let Err(e) = sink.record_rollback(PROVIDER, &thread_id, record).await {
+                tracing::warn!(error = %e, session = %thread_id, "freshagent.codex.rollback_pre_write_failed");
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    LEDGER_WRITE_REFUSAL_COPY,
+                ));
+                return;
+            }
+        }
+
+        if let Err(err) = client.revert_thread(&thread_id, &before_turn_id).await {
+            if matches!(&err, CodexAppServerError::Rpc { .. }) {
+                // An explicit JSON-RPC error ANSWER means the provider PROVABLY
+                // rejected the revert (unmoved): restore the pre-op record
+                // FIRST (the ledger must not describe a rollback the provider
+                // rejected), then answer.
+                if let Some(sink) = self.identity_sink() {
+                    let restore = previous.unwrap_or_else(|| RollbackRecord::empty(now));
+                    if let Err(e) = sink.record_rollback(PROVIDER, &thread_id, restore).await {
+                        tracing::warn!(error = %e, session = %thread_id, "freshagent.codex.rollback_compensate_failed");
+                    }
+                }
+                if is_codex_revert_legacy_refusal(&err) {
+                    // LBC-1 belt: a pre-feature LEGACY thread (the durable
+                    // history_mode stamp already advertises undo:false; if we get
+                    // here anyway, the refusal carries the known-legacy copy).
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "UNSUPPORTED_CAPABILITY",
+                        CODEX_LEGACY_THREAD_COPY,
+                    ));
+                } else if is_codex_revert_unknown_method(&err) {
+                    // The CLI predates thread/revert (unknown-method / -32601).
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "UNSUPPORTED_CAPABILITY",
+                        CODEX_OLD_CLI_COPY,
+                    ));
+                } else {
+                    reply_sink(rollback_error_frame(
+                        &op,
+                        "INTERNAL_ERROR",
+                        &err.to_string(),
+                    ));
+                }
+            } else {
+                // Review M3 — transport legs (Timeout/Closed/Transport): the
+                // provider may ALREADY have applied the revert, so NEVER
+                // compensate (erasing markers for a possibly-applied mutation
+                // would falsify the ledger). KEEP the post-op record and answer
+                // INTERNAL_ERROR with the uncertain-state copy.
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "INTERNAL_ERROR",
+                    CODEX_UNCERTAIN_ROLLBACK_COPY,
+                ));
+            }
+            return;
+        }
+
+        // Converge siblings + revoke attention (decisions 6/10). The broadcast
+        // carries NO prompt text (other devices' composers are untouched), and
+        // a rollback NEVER chimes (no freshAgent.turn.complete).
+        self.broadcast(&rollback_broadcast_frame(
+            &op,
+            &thread_id,
+            &removed_ids,
+            false,
+        ));
+        reply_sink(rollback_ack_frame(
+            &op,
+            &thread_id,
+            Some(&prompt),
+            &removed_ids,
+            false,
+            None,
+        ));
     }
 
     // ── freshAgent.fork (WS, AGENT-07) ───────────────────────────────────────
@@ -1508,7 +2457,23 @@ impl FreshCodexState {
     /// archived on the parent, ANY later failure additionally BEST-EFFORT
     /// `thread/unarchive`s the child on the PARENT client (its own error is ignored —
     /// the parent may be mid-kill), restoring the child's original visibility.
-    pub async fn handle_fork(&self, msg: FreshAgentFork, reply_sink: FrameSink) {
+    /// `provenance` (D8, focused-ep1-r5 Finding 1) is the FORKING connection's
+    /// stamped identity (the WS dispatch composes it from the hello identity
+    /// + the fork's `tabId`, exactly like the create lanes).
+    ///
+    /// Fork is always connection-initiated (a user clicks Fork in a specific
+    /// browser tab), so the child row's attribution resolves by precedence:
+    /// first the forking connection's provenance — a HOLLOW `Some` (a
+    /// partially initialized client's hello, Finding 2) behaves like `None`
+    /// and never overrides real stamps — then the parent's PARKED provenance,
+    /// then the parent's DURABLE ROW stamps via
+    /// [`crate::identity_sink::PaneIdentitySink::load_provenance`].
+    pub async fn handle_fork(
+        &self,
+        msg: FreshAgentFork,
+        provenance: Option<crate::BindProvenance>,
+        reply_sink: FrameSink,
+    ) {
         let parent_id = match self.ensure_session_alive(&msg.session_id).await {
             Ok(EnsureAliveOutcome::AlreadyRunning) | Ok(EnsureAliveOutcome::Recovered) => {
                 // A resume-recovered parent keeps its ORIGINAL id.
@@ -1587,6 +2552,10 @@ impl FreshCodexState {
                     s.cwd.clone(),
                     s.sandbox.clone(),
                     s.permission_mode.clone(),
+                    // Fork precedence source (2) (focused-ep1-r3/r5): the
+                    // parent's PARKED provenance (the child pane continues
+                    // the parent's lineage in the same client context).
+                    s.provenance.clone(),
                 )
             })
         };
@@ -1597,6 +2566,7 @@ impl FreshCodexState {
             parent_cwd,
             parent_sandbox,
             parent_permission_mode,
+            parent_provenance,
         )) = looked_up
         else {
             // TOCTOU: a kill can land between ensure-alive and this lookup — the loud
@@ -1606,6 +2576,25 @@ impl FreshCodexState {
             reply_sink(lost_session_frame(&parent_id));
             return;
         };
+
+        // D8 (focused-ep1-r5 Findings 1+2): fork provenance by precedence —
+        // (1) the FORKING connection's provenance (fork is always
+        // connection-initiated; parked provenance is SHARED across the
+        // globally-shared session, so a fork from tab B must not stamp the
+        // child with tab A's most-recent park). A HOLLOW connection `Some`
+        // (a partially initialized client's hello) behaves like `None` —
+        // it never overrides real stamps. (2) the parent's parked value.
+        // (3) the parent's DURABLE row stamps — the last source that can
+        // know, and the child's NEW ledger key is where a `None` resolution
+        // (merged keep-when-None against an empty row) could never be
+        // rescued.
+        let fork_provenance = provenance
+            .filter(|p| p.is_meaningful())
+            .or(parent_provenance)
+            .or_else(|| {
+                self.identity_sink()
+                    .and_then(|s| s.load_provenance(PROVIDER, &parent_id))
+            });
 
         // Effective fork params: the parent's stored settings (model/effort/cwd/
         // sandbox/permission_mode), with `input` overriding ONLY cwd/model (the legacy
@@ -1713,6 +2702,7 @@ impl FreshCodexState {
                     model: Some(eff_model.clone()),
                     sandbox: parent_sandbox.clone(),
                     approval_policy: parent_permission_mode.clone(),
+                    history_mode: None, // resume carries no mode param
                 },
             )
             .await;
@@ -1751,7 +2741,11 @@ impl FreshCodexState {
         }
 
         // Register the child on its OWN sidecar (the shared registration tail, the
-        // ensure_session_resumable shape), inheriting the parent's settings.
+        // ensure_session_resumable shape), inheriting the parent's settings. The
+        // child rollout's durable session_meta is the history-mode SoT (kata 1wxv
+        // Task 2): a paginated parent's child stays rollback-capable. The child
+        // record also parks the resolved fork provenance (D8 fork-chain
+        // inheritance, focused-ep1-r3/r5) so a fork-of-fork stays attributed.
         self.register_live_session(
             &child_id,
             child_client,
@@ -1763,11 +2757,18 @@ impl FreshCodexState {
             eff_cwd.clone(),
             parent_sandbox.clone(),
             parent_permission_mode.clone(),
+            read_rollout_history_mode(&child_id),
+            fork_provenance.clone(),
         )
         .await;
 
         // P1.13: the child's binding row, AWAITED before the forked reply
         // (durable-before-answer). Fork is not a create: no create_request_id.
+        // D8 (focused-ep1-r5 Finding 1): the child row asserts the RESOLVED fork
+        // provenance (forking connection > parent's parked > parent's row —
+        // never the parent's stale park when the fork came from another tab).
+        // `None` only when no source knows the attribution (a conn-less,
+        // never-stamped parent) — unattributed rather than invented.
         self.record_codex_binding(
             &child_id,
             None,
@@ -1777,6 +2778,7 @@ impl FreshCodexState {
             parent_effort.as_deref(),
             eff_cwd.as_deref(),
             None,
+            fork_provenance.as_ref(),
         )
         .await;
 
@@ -1835,6 +2837,27 @@ impl FreshCodexState {
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
         let session_id = msg.session_id.clone();
 
+        // Durable close first (see the comment block above): retire the
+        // pane-ledger row before any teardown; a Failed close fails the kill
+        // and runs nothing below.
+        let close_answer = self.retire_closed_row(&session_id).await;
+        if close_answer == crate::identity_sink::CloseAnswer::Failed {
+            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: SESSION_TYPE.to_string(),
+                success: false,
+            }));
+            return;
+        }
+        let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
+
+        self.clear_controls(&session_id).await;
+
+        // Task 12: an explicitly-killed session must reopen its durable id (the watcher
+        // also clears it; idempotent -- this covers watcher-less test sessions too).
+        self.leases.clear_binding(PROVIDER, &session_id);
+
         let removed = self.sessions.lock().await.remove(&session_id);
         if let Some(session) = removed {
             session.consumer.abort();
@@ -1846,9 +2869,6 @@ impl FreshCodexState {
             // for it so the sidecar is actually gone before we broadcast success.
             let _ = session.watcher.await;
         }
-        // Task 12: an explicitly-killed session must reopen its durable id (the watcher
-        // also clears it; idempotent -- this covers watcher-less test sessions too).
-        self.leases.clear_binding(PROVIDER, &session_id);
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
@@ -1864,8 +2884,39 @@ impl FreshCodexState {
             provider: PROVIDER.to_string(),
             session_id,
             session_type: SESSION_TYPE.to_string(),
-            success: true,
+            // A persisted-despite-error close ends the session (consistent
+            // with the durable close) but the kill visibly fails
+            // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
+            success: !close_reported_failure,
         }));
+    }
+
+    /// The kill-side lane of `retire_closed` (delta-review round 5):
+    /// AWAITED retire of this provider's ledger row before the
+    /// `freshAgent.killed` broadcast (durable-before-answer, like the
+    /// create-path binding write). Delta-r6-r4: the answer is
+    /// [`CloseAnswer`] — `Failed` (nothing durable; the caller FAILS the
+    /// kill, no live state touched) vs `Persisted` (the close IS durable;
+    /// the caller ends the session and fails visibly). With no sink wired
+    /// there is nothing to record: `Recorded`.
+    async fn retire_closed_row(&self, session_id: &str) -> crate::identity_sink::CloseAnswer {
+        let Some(sink) = self.identity_sink() else {
+            return crate::identity_sink::CloseAnswer::Recorded;
+        };
+        match sink.retire_closed(PROVIDER, session_id).await {
+            Ok(()) => crate::identity_sink::CloseAnswer::Recorded,
+            Err(e) => {
+                let persisted = e.is_persisted();
+                if persisted {
+                    tracing::error!(error = %e, session = %session_id,
+                        "freshagent.codex.retire_on_kill_persisted_despite_error: the close is durable; \
+                         the kill ends the session and answers failure");
+                } else {
+                    tracing::warn!(error = %e, session = %session_id, "freshagent.codex.retire_on_kill_failed");
+                }
+                crate::identity_sink::CloseAnswer::of(Err(e))
+            }
+        }
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
@@ -2052,7 +3103,14 @@ impl FreshCodexState {
         &self,
         session_id: &str,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (cwd, session_model, session_effort, session_sandbox, session_permission_mode) = {
+        let (
+            cwd,
+            session_model,
+            session_effort,
+            session_sandbox,
+            session_permission_mode,
+            session_provenance,
+        ) = {
             let guard = self.sessions.lock().await;
             let session = guard.get(session_id).ok_or(EnsureAliveError::NotFound)?;
             if !session.exited.load(Ordering::SeqCst) {
@@ -2064,6 +3122,12 @@ impl FreshCodexState {
                 session.effort.clone(),
                 session.sandbox.clone(),
                 session.permission_mode.clone(),
+                // D8 (focused-ep1-r3): the parked provenance rides ACROSS the
+                // recovery rebuild below (and into the mint-new fallback) — the
+                // same logical session continues; nothing new is invented (the
+                // conn-less refresh's keep-when-None merge is the row-level
+                // twin, preserving exactly these stamps).
+                session.provenance.clone(),
             )
         };
 
@@ -2194,6 +3258,7 @@ impl FreshCodexState {
                     sandbox,
                     permission_mode,
                     lease_guard,
+                    session_provenance,
                 )
                 .await;
         }
@@ -2228,6 +3293,7 @@ impl FreshCodexState {
                     model: resume_model,
                     sandbox: sandbox.clone(),
                     approval_policy: permission_mode.clone(),
+                    history_mode: None, // resume carries no mode param
                 },
             )
             .await;
@@ -2247,6 +3313,7 @@ impl FreshCodexState {
                             model: None,
                             sandbox: None,
                             approval_policy: None,
+                            history_mode: None, // resume carries no mode param
                         },
                     )
                     .await
@@ -2263,6 +3330,7 @@ impl FreshCodexState {
                 let mut dead_child = child;
                 let _ = dead_child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone so
                 // a later attach/create against it fails fast instead of repeating this same
                 // spawn-resume-fail cycle.
@@ -2276,6 +3344,7 @@ impl FreshCodexState {
                         sandbox,
                         permission_mode,
                         lease_guard,
+                        session_provenance,
                     )
                     .await;
             }
@@ -2284,6 +3353,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -2300,6 +3370,7 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             tracing::error!(
                 requested = %session_id,
                 returned = %started.thread_id,
@@ -2317,12 +3388,16 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let quiet_deadman = QuietDeadman::new_shared();
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             session_id.to_string(),
             active_turn.clone(),
             quiet_deadman.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -2354,11 +3429,24 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    compact_in_flight,
+                    compact_turn_id,
+                    // Kata 1wxv Task 2 (r3): the durable rollout meta is the SoT
+                    // for the mode across crash-recovery resume (undo capability
+                    // survives rehydration for a paginated thread; only a
+                    // missing/unparseable meta stamps legacy).
+                    history_mode: read_rollout_history_mode(session_id),
+                    turn_lock: Arc::new(TokioMutex::new(())),
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
                     quiet_deadman,
+                    // D8 (focused-ep1-r3): CARRY the crashed session's parked
+                    // provenance onto the rebuilt record (the same logical
+                    // session continues) so a post-recovery fork stays
+                    // attributed. `None` stays `None` — never invented.
+                    provenance: session_provenance.clone(),
                 },
             );
         }
@@ -2367,6 +3455,7 @@ impl FreshCodexState {
         // snapshots the LIVE in-session values (which originate from a real
         // create/user change); the helper's no-laundering guard skips it if they
         // are all blank. AWAITED before this fn returns (durable-before-answer).
+        // D8: conn-less refresh — provenance `None` keeps the create's stamps.
         self.record_codex_binding(
             session_id,
             None,
@@ -2375,6 +3464,7 @@ impl FreshCodexState {
             permission_mode.as_deref(),
             effort.as_deref(),
             cwd.as_deref(),
+            None,
             None,
         )
         .await;
@@ -2420,6 +3510,12 @@ impl FreshCodexState {
         sandbox: Option<String>,
         permission_mode: Option<String>,
         mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
+        // D8 (focused-ep1-r3): the crashed session's parked provenance, CARRIED
+        // onto the mint-new record below (the identity moved; the same logical
+        // session continues). The ledger row below is its row-level twin:
+        // `supersedes: Some(old)` makes the merge inherit the superseded row's
+        // stamps.
+        provenance: Option<crate::BindProvenance>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
@@ -2443,6 +3539,9 @@ impl FreshCodexState {
                 model: Some(model.clone()),
                 sandbox: sandbox.clone(),
                 approval_policy: permission_mode.clone(),
+                // LBC-1 (kata 1wxv Task 2): every thread freshell STARTS adopts
+                // `historyMode:"paginated"`.
+                history_mode: Some(HistoryMode::Paginated),
             })
             .await;
         let new_thread_id = match started {
@@ -2452,6 +3551,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -2462,12 +3562,16 @@ impl FreshCodexState {
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let quiet_deadman = QuietDeadman::new_shared();
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             new_thread_id.clone(),
             active_turn.clone(),
             quiet_deadman.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -2494,11 +3598,18 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    compact_in_flight,
+                    compact_turn_id,
+                    history_mode: Some(HistoryMode::Paginated),
+                    turn_lock: Arc::new(TokioMutex::new(())),
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
                     exited,
                     quiet_deadman,
+                    // D8 (focused-ep1-r3): the parked provenance rides the
+                    // OLD→NEW re-key (carried from the crashed session).
+                    provenance,
                 },
             );
         }
@@ -2527,6 +3638,9 @@ impl FreshCodexState {
             effort.as_deref(),
             cwd.as_deref(),
             Some(old_session_id),
+            // D8: conn-less crash-respawn — provenance `None`; the ledger
+            // inherits the superseded parent's stamps (fork-chain rule).
+            None,
         )
         .await;
 
@@ -2636,6 +3750,14 @@ impl FreshCodexState {
         // Drain child stdio so verbose app-server/MCP logs can never fill the pipe and stall it.
         drain_child_io(&mut child);
 
+        // wfah: durable tracking BEFORE the handshake — the record must exist
+        // even while this sidecar's 45s startup budget is still running, or an
+        // unclean server death would leave the child untracked.
+        if let Some(pid) = child.id() {
+            crate::codex_sidecar_tracking::record_spawned_sidecar(&ownership_id, pid, &ws_url)
+                .await;
+        }
+
         let deadline = Instant::now() + SIDECAR_START_BUDGET;
 
         // Connect the WS as soon as the listener is up (the app-server binds it after startup).
@@ -2644,6 +3766,7 @@ impl FreshCodexState {
                 Ok(transport) => break Arc::new(transport),
                 Err(err) => {
                     if let Ok(Some(status)) = child.try_wait() {
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!(
                             "codex app-server exited before listening: {status}"
                         ));
@@ -2651,6 +3774,7 @@ impl FreshCodexState {
                     if Instant::now() >= deadline {
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server WS never came up: {err}"));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2671,6 +3795,7 @@ impl FreshCodexState {
                         client.close().await;
                         let _ = child.start_kill();
                         reap_owned_codex_sidecars(&ownership_id);
+                        crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                         return Err(format!("codex app-server initialize failed: {err}"));
                     }
                     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2698,8 +3823,18 @@ impl FreshCodexState {
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
         quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+        compact_in_flight: Arc<AtomicBool>,
+        compact_turn_id: Arc<StdMutex<Option<String>>>,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, quiet_deadman, None)
+        self.spawn_consumer_after(
+            notifs,
+            thread_id,
+            active_turn,
+            quiet_deadman,
+            compact_in_flight,
+            compact_turn_id,
+            None,
+        )
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -2711,12 +3846,15 @@ impl FreshCodexState {
     /// sender resolves its receiver immediately with `Err`, which this ignores) --
     /// callers must still fire it on every path, but a bug that forgets to can never
     /// wedge the consumer forever.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_consumer_after(
         &self,
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
         quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+        compact_in_flight: Arc<AtomicBool>,
+        compact_turn_id: Arc<StdMutex<Option<String>>>,
         gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
@@ -2728,14 +3866,29 @@ impl FreshCodexState {
             if let Some(gate) = gate {
                 let _ = gate.await;
             }
+            state.clear_controls(&thread_id).await;
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
+                if state
+                    .consume_control_notification(&thread_id, &notification)
+                    .await
+                {
+                    // A control-consumed notification (an approval/question
+                    // request) never reaches `reduce_notification`, but it IS
+                    // lane-visible proof the sidecar is alive: feed the
+                    // wedged-sidecar quiet deadman here too, or a turn parked on
+                    // a pending approval past the window would read as wedged.
+                    note_codex_activity(&state, &thread_id, &active_turn, &quiet_deadman);
+                    continue;
+                }
                 let events = reduce_notification(
                     &mut subscription,
                     notification,
                     &active_turn,
                     &quiet_deadman,
                     &state,
+                    &compact_in_flight,
+                    &compact_turn_id,
                 );
                 for event in events {
                     // DIAG-01: the positive turn-complete chime only -- session_id
@@ -2749,6 +3902,7 @@ impl FreshCodexState {
                     }
                 }
             }
+            state.clear_controls(&thread_id).await;
         })
     }
 
@@ -2914,8 +4068,44 @@ impl FreshCodexState {
                 .stuck_since
                 .is_some()
         });
-        build_codex_snapshot_json(thread_id, &raw, active_turn_present, stuck)
-            .map_err(CodexSnapshotError::Protocol)
+        // Kata 1wxv Task 5: the capability stamp is SESSION-SCOPED by the
+        // recorded DURABLE history mode (correction item 1, r3 — never live-probed
+        // per snapshot; the app-server exposes no mode read-back). A session the
+        // sessions map can't name (TOCTOU kill between resume and this read)
+        // reads as legacy: `undo:false`, never over-advertised.
+        let history_mode = self
+            .sessions
+            .lock()
+            .await
+            .get(thread_id)
+            .and_then(|s| s.history_mode);
+        let rollback = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, thread_id));
+        let mut snapshot = build_codex_snapshot_json(
+            thread_id,
+            &raw,
+            active_turn_present,
+            history_mode,
+            rollback.as_ref(),
+            stuck,
+        )
+        .map_err(CodexSnapshotError::Protocol)?;
+        self.overlay_controls(thread_id, &mut snapshot).await;
+        if let Some(session) = self.sessions.lock().await.get(thread_id) {
+            let mut settings = Map::new();
+            if !session.model.is_empty() {
+                settings.insert("model".into(), json!(session.model));
+            }
+            if let Some(effort) = &session.effort {
+                settings.insert("effort".into(), json!(effort));
+            }
+            if let Some(permission) = &session.permission_mode {
+                settings.insert("permissionMode".into(), json!(permission));
+            }
+            snapshot["settings"] = Value::Object(settings);
+        }
+        Ok(snapshot)
     }
 
     /// Resolve the live client + active-turn bit for `thread_id`, via
@@ -3120,6 +4310,12 @@ impl FreshCodexState {
             }
         }
 
+        // Round 4 (focused-ep5-r3 Finding 1): the claim's dead-state
+        // SNAPSHOT — taken at claim start, after the lease and before the
+        // sidecar spawn + `thread/resume` await — so a kill landing while
+        // this resume is in flight advances the durable tombstone past it
+        // and the commit below REFUSES instead of undoing the newer close.
+        let claim_dead_state = self.claim_dead_state_snapshot(thread_id);
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd).await {
             Ok(parts) => parts,
             Err(err) => {
@@ -3163,6 +4359,19 @@ impl FreshCodexState {
         }
         let rec = recovered.clone().unwrap_or_default();
 
+        // D8 (focused-ep1-r4 Finding 2 — the parking invariant's durable
+        // half): this construction lane is CONN-LESS (attach / snapshot reads
+        // carry no tab identity), so seed the parked provenance from the
+        // DURABLE row's stamps — the authoritative record of where this
+        // session last lived (a fork parked from this session asserts them on
+        // the child row's NEW ledger key, where keep-when-None could never
+        // rescue a `None` park). A row that genuinely carries no stamps seeds
+        // nothing: `None` stays parked (never invented) and the conn-less
+        // refresh below keeps whatever the row had.
+        let row_provenance = sink
+            .as_ref()
+            .and_then(|s| s.load_provenance("codex", thread_id));
+
         let resume_result = client
             .resume_thread(
                 thread_id,
@@ -3171,6 +4380,7 @@ impl FreshCodexState {
                     model: rec.model.clone(),
                     sandbox: rec.sandbox.clone(),
                     approval_policy: rec.permission_mode.clone(),
+                    history_mode: None, // resume carries no mode param
                 },
             )
             .await;
@@ -3181,6 +4391,7 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Own tree torn down above -- releasing the lease is safe.
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -3206,6 +4417,7 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
             tracing::error!(
                 requested = %thread_id,
                 returned = %started.thread_id,
@@ -3225,6 +4437,36 @@ impl FreshCodexState {
         // clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(thread_id).await;
 
+        // Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Findings
+        // 4+5): this attach-resume GENUINELY CLAIMS the thread — the claim
+        // COMMITS here, after `thread/resume` answered id-verified (the
+        // replacement session is established): clear the durable kill fence
+        // BEFORE the refresh write below (and before any later write for
+        // this rebuilt session), AND return a kill-closed row to Bound
+        // (Finding 4 — unconditional: the V7-gated refresh below skips a
+        // lineage-only record; the revive is not its job). The lease-revoke
+        // arm below rolls the commit back (Finding 5's re-raise).
+        //
+        // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL on
+        // the claim-start dead-state snapshot. A kill that landed while this
+        // resume awaited `thread/resume` advanced the tombstone; the commit
+        // refuses with NO side effects, so the just-spawned sidecar is an
+        // orphan of a pane the user closed mid-attach — tear it down (nothing
+        // registered yet; registration lives below) and fail the resume,
+        // leaving the row the kill retired Retired.
+        if !self.commit_session_claim(thread_id, claim_dead_state).await {
+            client.close().await;
+            let mut child = child;
+            let _ = child.start_kill();
+            reap_owned_codex_sidecars(&ownership_id);
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            return Err(ResumeSessionError::Transient(
+                "codex thread closed while the resume was in flight; torn down".to_string(),
+            ));
+        }
+
         // Registration tail (shared with `handle_fork`). P1.13 (Task 5, R3): the ledger
         // record's settings snapshot -- blank only when no record was recoverable
         // (never-recorded historical sessions resume on defaults, exactly as before
@@ -3241,8 +4483,51 @@ impl FreshCodexState {
                 cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
                 rec.sandbox.clone(),
                 rec.permission_mode.clone(),
+                // Kata 1wxv Task 2 (r3): the durable rollout meta carries the
+                // mode across resume (only a missing/unparseable meta ⇒ legacy).
+                read_rollout_history_mode(thread_id),
+                // D8 (focused-ep1-r4 Finding 2): the conn-less attach-resume
+                // parks the DURABLE row's stamps (never invented — a genuinely
+                // unattributed row seeds `None`); the conn-less refresh below
+                // writes `None` stamps so the ledger's keep-when-None merge
+                // preserves whatever the row had.
+                row_provenance,
             )
             .await;
+
+        // Round 5 (focused-ep5-r4 Finding 1): the claim start's commit and
+        // the kill's retire serialize on the ledger guard, but a kill QUEUED
+        // behind a successful commit (the commit's decision pre-dated it)
+        // lands while this lane is between the commit and this registration.
+        // Now that the session is registered (kill-visible), re-validate the
+        // dead state against the claim-start snapshot: an advanced fence
+        // means the row was retired after our commit — the registered
+        // session is a late orphan of the pane the user closed, so tear it
+        // down (the kill's own retire already left the row Retired; the
+        // kill's post-retire map removal also finds this session when the
+        // ordering runs the other way — the two halves close every
+        // interleaving; kill always wins).
+        if self.claim_dead_state_advanced(thread_id, claim_dead_state) {
+            tracing::info!(target: "freshell_freshagent::codex",
+                durable = %thread_id,
+                "freshagent.codex.claim_late_orphan_torn_down: a close landed between the \
+                 claim's commit and its registration; the registered orphan is torn down"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(thread_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            return Err(ResumeSessionError::Transient(
+                "codex thread closed while the resume was in flight; torn down".to_string(),
+            ));
+        }
 
         // Task 13: bind the durable thread id to this live session + release the lease.
         if let Some(mut g) = lease_guard.take() {
@@ -3257,6 +4542,10 @@ impl FreshCodexState {
                     }
                     let _ = session.watcher.await;
                 }
+                // Finding 5's re-raise: the ONE post-commit failure arm — the
+                // close the commit undid is durable again (fence re-raised,
+                // the revived row re-retired).
+                self.rollback_session_claim(thread_id).await;
                 g.fail();
                 return Err(ResumeSessionError::Transient(
                     "session lease revoked during attach-resume; torn down".to_string(),
@@ -3279,6 +4568,9 @@ impl FreshCodexState {
                 rec.effort.as_deref(),
                 cwd.or(rec.cwd.as_deref()),
                 None,
+                // D8: conn-less attach-resume refresh — provenance `None`
+                // keeps the row's existing stamps.
+                None,
             )
             .await;
         }
@@ -3295,6 +4587,12 @@ impl FreshCodexState {
     /// snapshot. Returns the new session's `active_turn` handle. Callers own everything
     /// AROUND this insert (watcher ownership of the child, lease completion in
     /// [`Self::ensure_session_resumable`], the binding row in [`Self::handle_fork`]).
+    /// `provenance` (D8, focused-ep1-r3 + focused-ep1-r4 Finding 2): the
+    /// provenance to PARK on the new session record — [`Self::handle_fork`]
+    /// passes the resolved fork provenance (forking connection > parent's
+    /// parked > parent's row, focused-ep1-r5); the conn-less attach-resume
+    /// ([`Self::ensure_session_resumable`]) passes the DURABLE row's stamps
+    /// (a genuinely unattributed row seeds `None` — never invented).
     #[allow(clippy::too_many_arguments)]
     async fn register_live_session(
         &self,
@@ -3308,15 +4606,23 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        // Kata 1wxv Task 2: the thread's durable history mode (the rollout-meta
+        // parse the resume/fork callers perform post-RPC).
+        history_mode: Option<HistoryMode>,
+        provenance: Option<crate::BindProvenance>,
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let quiet_deadman = QuietDeadman::new_shared();
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
         let consumer = self.spawn_consumer(
             notifs,
             thread_id.to_string(),
             active_turn.clone(),
             quiet_deadman.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
@@ -3339,11 +4645,16 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 active_turn: active_turn.clone(),
+                compact_in_flight: compact_in_flight.clone(),
+                compact_turn_id: compact_turn_id.clone(),
+                history_mode,
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
                 quiet_deadman,
+                provenance,
             },
         );
         active_turn
@@ -3401,11 +4712,17 @@ impl FreshCodexState {
                 sandbox: None,
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(active_turn)),
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
+                // This fixture models a thread freshell started (paginated).
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
                 quiet_deadman,
+                provenance: None,
             },
         );
     }
@@ -3450,6 +4767,11 @@ fn is_codex_include_turns_unavailable(err: &CodexAppServerError) -> bool {
     let message = err.to_string();
     message.contains("includeTurns is unavailable before first user message")
         || message.contains("not materialized yet")
+        // LBC-1 (kata 1wxv Task 2): a ZERO-TURN PAGINATED thread answers
+        // -32601 "list_turns is not supported yet" on read/includeTurns +
+        // turns/list until its first turn commits — the same "no committed
+        // turns yet" fallback case this helper exists for.
+        || message.contains("list_turns is not supported yet")
 }
 
 /// The reference has no dedicated "is this genuinely a missing thread" check for
@@ -3879,6 +5201,14 @@ fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
     _active_turn_present: bool,
+    // Kata 1wxv Task 5: the session's DURABLE history mode (the capability stamp
+    // source) and the durable rollback record (the marker bucket + redo bit +
+    // revision floor; `None` when the session never rolled back).
+    history_mode: Option<HistoryMode>,
+    rollback: Option<&crate::rollback_record::RollbackRecord>,
+    // Wedged-sidecar deadman flag (r47n): overlay `stuck` over a still-running/
+    // starting wire status BEFORE capability derivation (Node `withStuckOverlay`
+    // parity, `adapter.ts:793-795`).
     stuck: bool,
 ) -> Result<Value, String> {
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
@@ -3946,7 +5276,9 @@ fn build_codex_snapshot_json(
         })
         .collect();
 
-    Ok(json!({
+    let (diffs, child_threads) = metadata::transcript_metadata(&turns);
+    let undo_capable = history_mode == Some(HistoryMode::Paginated);
+    let mut snapshot = json!({
         "sessionType": SESSION_TYPE,
         "provider": PROVIDER,
         "threadId": thread_id,
@@ -3960,8 +5292,25 @@ fn build_codex_snapshot_json(
             "questions": false,
             "fork": !is_running,
             "worktrees": false,
-            "diffs": false,
-            "childThreads": false,
+            "diffs": !diffs.is_empty(),
+            "childThreads": !child_threads.is_empty(),
+            // Kata 1wxv Task 5: SESSION-SCOPED stamps (correction item 1, r3) —
+            // undo iff the thread's durable history mode is paginated; codex
+            // redo is permanently unavailable (revert is destructive; there is
+            // no redo primitive). Absent updatable older servers emit neither
+            // key; a legacy/unknown mode stamps undo:false here — never a
+            // hard-coded true.
+            "undo": undo_capable,
+            "redo": false,
+            // kata z7j7: all four knobs are per-send — the client ships them on
+            // every `freshAgent.send` and `handle_send` merges them over the
+            // session baseline before `turn/start`.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "per-send",
+                "permissionMode": "per-send",
+            },
         },
         "tokenUsage": {
             "inputTokens": 0,
@@ -3972,11 +5321,29 @@ fn build_codex_snapshot_json(
         "pendingApprovals": [],
         "pendingQuestions": [],
         "worktrees": [],
-        "diffs": [],
-        "childThreads": [],
+        "diffs": diffs,
+        "childThreads": child_threads,
         "turns": turns,
         "extensions": { "codex": {} },
-    }))
+    });
+    if let Some(record) = rollback {
+        // The marker bucket is LEDGER-SOURCED: `thread/revert` destroys the
+        // provider tail, so only the r3 entries union can satisfy decision 6's
+        // "persist marked". The stored `can_redo` bit is the only source (codex
+        // stamps it false at every write). The record also doubles as the
+        // revision floor: a stale `updatedAt` (or the include-turns-fallback
+        // read) never lets the client's monotonic watermark drop the
+        // post-rollback snapshot.
+        let basis = snapshot["revision"].as_i64().unwrap_or(0);
+        let floored = crate::rollback_record::stamp_rollback_snapshot(
+            &mut snapshot,
+            basis,
+            record,
+            record.can_redo(),
+        );
+        snapshot["revision"] = json!(floored);
+    }
+    Ok(snapshot)
 }
 
 /// One raw codex turn's items, grouped into contiguous same-role rows -- the intermediate
@@ -4136,7 +5503,7 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 /// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
 ///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
 #[allow(clippy::too_many_arguments)]
-fn spawn_exit_watcher(
+pub(crate) fn spawn_exit_watcher(
     mut child: tokio::process::Child,
     ownership_id: String,
     thread_id: String,
@@ -4146,6 +5513,9 @@ fn spawn_exit_watcher(
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
 ) -> tokio::task::JoinHandle<()> {
+    // wfah: the thread id is fixed by the time the watcher is constructed at
+    // every successful spawn site; enrich the durable record once, here.
+    crate::codex_sidecar_tracking::enrich_record_session_id(&ownership_id, &thread_id);
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -4163,6 +5533,7 @@ fn spawn_exit_watcher(
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Task 12: the bound session is gone -- reopen its durable id.
                 leases.clear_binding(PROVIDER, &thread_id);
                 tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
@@ -4173,6 +5544,7 @@ fn spawn_exit_watcher(
                 // the wedged-ALIVE `stuck` flag.
                 disarm_codex_quiet(&quiet_deadman, &thread_id, "exit");
                 reap_owned_codex_sidecars(&ownership_id);
+                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
                 // Task 12: a crashed sidecar is no longer a live writer -- reopen the
                 // durable id (the entry stays mapped for PR-4 lazy respawn, which
                 // re-claims through the attach/send seams).
@@ -4291,8 +5663,9 @@ fn disarm_codex_quiet(
 /// — leaving running/starting, a turn completing, or the thread closing all clear it;
 /// `turn/started` SETS it too, as a fallback alongside `handle_send`'s direct set).
 ///
-/// Every notification reaching this consumer is lane-visible proof the sidecar is alive,
-/// so it feeds the wedged-sidecar quiet deadman ([`note_codex_activity`]) on entry; the
+/// Every notification reaching this reducer is lane-visible proof the sidecar is alive,
+/// so it feeds the wedged-sidecar quiet deadman ([`note_codex_activity`]) on entry (the
+/// consumer loop feeds control-consumed notifications itself, before it `continue`s); the
 /// `TurnStarted` arm feeds again right after it sets `active_turn`, because a turn that
 /// started OUTSIDE `handle_send` (e.g. observed mid-restore) is only arm-able from here.
 /// Conversely, each terminal-status clear point above also DISARMS the window
@@ -4300,12 +5673,28 @@ fn disarm_codex_quiet(
 /// feed re-arms while the turn is still tracked, and a stale armed deadline surviving
 /// the clearance would make `arm_codex_quiet_if_absent` refuse to arm for a later
 /// snapshot-observed externally-started turn.
+///
+/// Delta-r1 F2: a turn/completed arm ALSO clears the session's compact-window
+/// busy truth (`compact_in_flight`) — the compact turn ends there (any status).
+/// Focused-review ep1-r3 F4 (completion-id OWNERSHIP): the clear is KEYED —
+/// `compact_in_flight` clears ONLY at the `turn/completed` whose params turn id
+/// matches `compact_turn_id` (captured at the compact's own `turn/started`:
+/// the FIRST start observed while armed-clear-pending — provider FIFO puts the
+/// compact's start before any later send's). A `turn/completed` carrying a
+/// DIFFERENT id (a DELAYED PRIOR-turn completion can land inside the
+/// armed-clear-pending window — the probed sequence emits `thread/status:idle`
+/// BEFORE that stale completion) NEVER clears the window, and neither does a
+/// completion arriving with no id captured yet. The quiet-deadman disarm in that
+/// arm is keyed the same way: it rides the ACTIVE turn's retirement, so a stale
+/// completion that retires nothing leaves the still-in-flight turn's window armed.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
     active_turn: &Arc<StdMutex<Option<String>>>,
     quiet_deadman: &Arc<StdMutex<QuietDeadman>>,
     state: &FreshCodexState,
+    compact_in_flight: &Arc<AtomicBool>,
+    compact_turn_id: &Arc<StdMutex<Option<String>>>,
 ) -> Vec<CodexAdapterEvent> {
     // Lane-visible activity: resolves a flagged stuck state first, then resets the
     // armed window (or disarms once no turn is in flight).
@@ -4324,11 +5713,21 @@ fn reduce_notification(
                 .collect()
         }
         CodexNotification::ThreadStatusChanged { thread_id, status } => {
-            // adapter.ts:898-903 — unconditional clear (harmless if unset) once the thread
-            // leaves running/starting, regardless of whether TurnStarted ever fired.
+            // adapter.ts:898-903 — clear (harmless if unset) once the thread
+            // leaves running/starting, regardless of whether TurnStarted ever
+            // fired. ep3-r4 F2: while a compact window is armed, the
+            // thread-level idle is the COMPACT LIFECYCLE's documented
+            // punctuation (it lands between the compact's turn/started and its
+            // turn/completed) — it must never clear `active_turn`, which a
+            // submission accepted inside the window has already installed for
+            // its own newer turn; the id-matched completion arm owns every
+            // retirement inside the window.
             if thread_id == subscription.session_id() {
                 let normalized = normalize_codex_thread_status(&status);
-                if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
+                if normalized != CodexStatus::Running
+                    && normalized != CodexStatus::Starting
+                    && !compact_in_flight.load(Ordering::SeqCst)
+                {
                     clear_active_turn(active_turn);
                     // The terminal status also disarms (adapter.ts:1015): the entry
                     // feed re-armed the window while the turn was still tracked, and
@@ -4342,14 +5741,58 @@ fn reduce_notification(
                 .collect()
         }
         CodexNotification::TurnCompleted(event) => {
-            // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
+            // The compact-window ownership block below owns `compact_in_flight`;
+            // `active_turn` retires ONLY when the completing turn IS the active
+            // one (the ids match). Unconditional was WRONG (ep2-r4): the compact's
+            // own delayed `turn/completed` lands AFTER the thread went idle —
+            // and a send submitted in that idle window installed ITS own active
+            // turn; clearing unconditionally erased the newer turn's busy truth
+            // while it was still running (the rollback gate then observed
+            // false||false and admitted a mid-turn thread/revert that
+            // force-interrupts the newer turn). A completion carrying NO id can
+            // never retire anything (fail-closed).
             if event.thread_id == subscription.session_id() {
-                clear_active_turn(active_turn);
-                // Terminal status: disarm too (adapter.ts:1030). Without this the entry
-                // feed's re-arm leaves a stale `Some(deadline)` that
-                // `arm_codex_quiet_if_absent` would honor for a later externally-started
-                // turn whose `turn/started` this process never saw.
-                disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
+                // Scoped: the `active_turn` guard must be dropped BEFORE the
+                // quiet-deadman disarm below (the file-wide lock order is
+                // `quiet_deadman` outer / `active_turn` inner — never lock
+                // `quiet_deadman` while holding `active_turn`).
+                let retired = {
+                    let mut active = active_turn.lock().expect("active_turn mutex");
+                    let retired = event.turn_id.as_deref().is_some()
+                        && active.as_deref() == event.turn_id.as_deref();
+                    if retired {
+                        *active = None;
+                    }
+                    retired
+                };
+                // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
+                // window ends HERE — but ONLY on the `turn/completed` whose params
+                // turn id MATCHES the captured `compact_turn_id` (any status — a
+                // failed compact completes the same way). A completion carrying a
+                // DIFFERENT id inside the armed window (a delayed PRIOR-turn
+                // completion — the probed sequence lands one between
+                // `thread/status:idle` and the compact's own `turn/started`) and a
+                // completion while no id is captured yet BOTH leave the window
+                // armed: the compact's own completion never landed, so the
+                // pre-start/post-RPC rollback window stays closed.
+                let mut owned_turn_id = compact_turn_id.lock().expect("compact_turn_id mutex");
+                if compact_in_flight.load(Ordering::SeqCst)
+                    && owned_turn_id.is_some()
+                    && event.turn_id.as_deref() == owned_turn_id.as_deref()
+                {
+                    compact_in_flight.store(false, Ordering::SeqCst);
+                    *owned_turn_id = None;
+                }
+                drop(owned_turn_id);
+                // The completion that retired the TRACKED active turn also disarms
+                // (adapter.ts:1030). A stale/differently-keyed completion retired
+                // nothing — disarming there would strand the still-in-flight turn
+                // with no armed window (the entry feed's re-arm keeps it armed, and
+                // `arm_codex_quiet_if_absent` must not honor a stale deadline for a
+                // later externally-started turn whose `turn/started` we never saw).
+                if retired {
+                    disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
+                }
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -4358,6 +5801,16 @@ fn reduce_notification(
                 subscription.set_active_turn(turn_id.clone());
                 if event.thread_id == subscription.session_id() {
                     *active_turn.lock().expect("active_turn mutex") = Some(turn_id.clone());
+                    // ep1-r3 F4: capture the compact turn's OWNERSHIP id — the FIRST
+                    // turn/started observed while the compact window is armed with
+                    // no id captured (provider FIFO: the compact was submitted
+                    // before any later send, so its start surfaces first).
+                    if compact_in_flight.load(Ordering::SeqCst) {
+                        let mut owned = compact_turn_id.lock().expect("compact_turn_id mutex");
+                        if owned.is_none() {
+                            *owned = Some(turn_id.clone());
+                        }
+                    }
                     // Arm the quiet window for a turn that began outside `handle_send`
                     // (the entry feed above ran while no turn was tracked yet).
                     note_codex_activity(
@@ -4382,7 +5835,9 @@ fn reduce_notification(
                 .into_iter()
                 .collect()
         }
-        CodexNotification::FsChanged { .. } | CodexNotification::Other { .. } => Vec::new(),
+        CodexNotification::FsChanged { .. }
+        | CodexNotification::Other { .. }
+        | CodexNotification::ServerRequest { .. } => Vec::new(),
     }
 }
 
@@ -4482,6 +5937,7 @@ async fn shut_down_fork_child(
     let _ = child.start_kill();
     let _ = child.wait().await;
     reap_owned_codex_sidecars(ownership_id);
+    crate::codex_sidecar_tracking::scrub_sidecar_record(ownership_id);
 }
 
 /// Codex fork's `lastTurnId` normalization (fresh-eyes round-3 F6): the REST snapshot
@@ -4501,6 +5957,110 @@ fn strip_codex_row_suffix(turn_id: &str) -> &str {
     } else {
         turn_id
     }
+}
+
+/// Why a codex rollback boundary could not be resolved (kata 1wxv Task 2).
+enum CodexRollbackError {
+    /// Step on an empty history (`NOTHING_TO_UNDO`). Codex's empty-prefix
+    /// toTurn is LEGAL (reverting before the first turn empties the thread),
+    /// so there is NO first-turn refusal case here.
+    NothingToUndo,
+    /// A toTurn target id missing from (or unresolvable against) the raw
+    /// turns (`INVALID_ROLLBACK_TARGET`).
+    TargetNotFound,
+}
+
+/// The codex rollback target math (kata decisions 2/3): `raw_turns` from
+/// `thread/read{includeTurns:true}`. Step = the LAST raw turn; toTurn = the raw
+/// turn whose id equals the display id's stripped form
+/// ([`strip_codex_row_suffix`]). Returns the `beforeTurnId` wire value plus
+/// the removed DISPLAY turns: the [`build_codex_turn_json`] projections of raw
+/// turns `[boundary..]` (the exact `FreshAgentTurn` JSON the snapshot would
+/// have shown), which the ledger records as the marker payload.
+fn resolve_codex_boundary(
+    raw_turns: &[Value],
+    mode: crate::rollback_record::RollbackModeReq,
+    turn_id: Option<&str>,
+) -> Result<(String, Vec<Value>), CodexRollbackError> {
+    let idx = match mode {
+        crate::rollback_record::RollbackModeReq::Step => raw_turns
+            .len()
+            .checked_sub(1)
+            .ok_or(CodexRollbackError::NothingToUndo)?,
+        crate::rollback_record::RollbackModeReq::ToTurn => {
+            let target = strip_codex_row_suffix(turn_id.ok_or(CodexRollbackError::TargetNotFound)?);
+            raw_turns
+                .iter()
+                .position(|t| t.get("id").and_then(Value::as_str) == Some(target))
+                .ok_or(CodexRollbackError::TargetNotFound)?
+        }
+    };
+    let before_turn_id = raw_turns[idx]
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or(CodexRollbackError::TargetNotFound)?
+        .to_string();
+    let mut removed = Vec::new();
+    for raw in &raw_turns[idx..] {
+        removed
+            .extend(build_codex_turn_json(raw, 0).map_err(|_| CodexRollbackError::TargetNotFound)?);
+    }
+    Ok((before_turn_id, removed))
+}
+
+/// Plain text of one display turn — the composer-refill payload: the
+/// `text`-kind items' texts joined; the turn `summary` as fallback.
+fn codex_turn_plain_text(turn: &Value) -> String {
+    let joined = turn["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|i| i["kind"] == "text")
+                .filter_map(|i| i["text"].as_str())
+                .collect::<Vec<&str>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default();
+    if joined.is_empty() {
+        turn["summary"].as_str().unwrap_or("").to_string()
+    } else {
+        joined
+    }
+}
+
+/// Server `INTERNAL_ERROR` copy for a codex `thread/revert` whose outcome is
+/// UNCERTAIN (transport legs — Timeout/Closed/Transport: the provider may
+/// ALREADY have applied the mutation). The post-op ledger is KEPT (never
+/// compensated — erasing markers for a possibly-applied revert would falsify
+/// the ledger) and the pane is told the two histories may disagree until the
+/// next refresh. Explicit RPC-rejection legs instead compensate (the provider
+/// ANSWERED, so the revert provably did not apply).
+const CODEX_UNCERTAIN_ROLLBACK_COPY: &str =
+    "Undo state could not be confirmed — conversation and undo history may disagree until the next refresh.";
+
+/// LBC-1: a pre-feature LEGACY thread — `thread/revert` answered
+/// `-32600 "…only supports paginated threads"`. Structured on the RPC code
+/// when available (the `RpcError` display also embeds the `[-32600]` tag, so
+/// the string fallback keeps non-Rpc carriers covered).
+fn is_codex_revert_legacy_refusal(err: &CodexAppServerError) -> bool {
+    match err {
+        CodexAppServerError::Rpc { error, .. } => {
+            error.code == -32600 && error.message.contains("only supports paginated threads")
+        }
+        _ => {
+            err.to_string().contains("-32600")
+                && err.to_string().contains("only supports paginated threads")
+        }
+    }
+}
+
+/// The sidecar predates `thread/revert`: unknown-method/`-32601` (or the
+/// method-missing shape an app-server <0.149 emits for the method name).
+fn is_codex_revert_unknown_method(err: &CodexAppServerError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("-32601") || msg.contains("method not found")
 }
 
 // ── PATCH /api/settings (fresh-clients enable toggle) ────────────────────────
@@ -4597,6 +6157,33 @@ fn sandbox_wire_value(sandbox: freshell_protocol::Sandbox) -> String {
     .to_string()
 }
 
+fn normalize_codex_permission(
+    permission: &mut Option<String>,
+    sandbox: &mut Option<String>,
+) -> Result<(), &'static str> {
+    // Older settings offered Read-only in the approval menu. Preserve that
+    // intent using the actual sandbox field instead of sending an invalid policy.
+    if permission.as_deref() == Some("read-only") {
+        *permission = Some("on-request".into());
+        *sandbox = Some("read-only".into());
+    }
+    match permission.as_deref() {
+        None | Some("untrusted" | "on-failure" | "on-request" | "never") => Ok(()),
+        _ => Err("Choose a supported Codex approval policy: untrusted, on-failure, on-request, or never."),
+    }
+}
+
+fn codex_user_input(
+    text: &str,
+    images: Option<&[freshell_protocol::FreshAgentImage]>,
+) -> Vec<Value> {
+    let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
+    for image in images.unwrap_or_default() {
+        input.push(json!({ "type": "image", "url": format!("data:{};base64,{}", image.media_type, image.data) }));
+    }
+    input
+}
+
 /// `toCodexSandboxPolicy(sandbox)` (adapter.ts:136-149): the turn/start `sandboxPolicy` object.
 fn sandbox_policy_value(sandbox: &str) -> Value {
     match sandbox {
@@ -4643,6 +6230,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::identity_sink::PaneIdentitySink;
     use crate::summary::{SUMMARY_KIND_AUTHORED, SUMMARY_KIND_ECHO};
     use freshell_codex::{CodexStatus, CodexTurnEvent};
 
@@ -5115,7 +6703,7 @@ pub(crate) mod tests {
 
     // ── freshAgent.interrupt / freshAgent.kill / onExit self-heal (PR-1) ───────
 
-    fn state_with_bus() -> (FreshCodexState, tokio::sync::broadcast::Receiver<String>) {
+    pub(super) fn state_with_bus() -> (FreshCodexState, tokio::sync::broadcast::Receiver<String>) {
         let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshCodexState::new(
             Arc::new("tok".to_string()),
@@ -5123,6 +6711,21 @@ pub(crate) mod tests {
             json!({ "freshAgent": { "enabled": false } }),
         );
         (st, rx)
+    }
+
+    /// `state_with_bus` + a wired in-memory identity sink (kata 1wxv Tasks 2-4):
+    /// the rollback handlers AWAIT durable rollback-record writes BEFORE any
+    /// provider mutation, so their tests need the fake ledger surface
+    /// (`record_rollback`/`load_rollback`, `set_fail_writes`).
+    fn state_with_sink() -> (
+        FreshCodexState,
+        tokio::sync::broadcast::Receiver<String>,
+        std::sync::Arc<crate::identity_sink::FakeIdentitySink>,
+    ) {
+        let (st, rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        (st, rx, fake)
     }
 
     /// Insert a `CodexSession` directly (bypassing the real sidecar spawn `handle_create`
@@ -5161,11 +6764,17 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
+                // These fixtures model threads freshell started (paginated).
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
                 quiet_deadman,
+                provenance: None,
             },
         );
         state.broadcast_tx.subscribe()
@@ -5173,7 +6782,7 @@ pub(crate) mod tests {
 
     /// A harmless real child that stays alive until reaped (the interrupt/kill tests' fake
     /// "owned sidecar" -- no real `codex` binary needed).
-    fn spawn_sleeper() -> tokio::process::Child {
+    pub(super) fn spawn_sleeper() -> tokio::process::Child {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("30");
         cmd.kill_on_drop(true);
@@ -5186,7 +6795,7 @@ pub(crate) mod tests {
     /// [`freshell_codex::ChannelPeer`] actually flows through [`reduce_notification`]
     /// and clears `active_turn` -- exercising the exact production path `get_snapshot`
     /// (REST) relies on for `capabilities.send`.
-    async fn insert_fake_session_with_real_consumer(
+    pub(super) async fn insert_fake_session_with_real_consumer(
         state: &FreshCodexState,
         thread_id: &str,
         client: Arc<CodexAppServerClient>,
@@ -5196,11 +6805,15 @@ pub(crate) mod tests {
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
         let quiet_deadman = QuietDeadman::new_shared();
+        let compact_in_flight = Arc::new(AtomicBool::new(false));
+        let compact_turn_id = Arc::new(StdMutex::new(None));
         let consumer = state.spawn_consumer(
             notifs,
             thread_id.to_string(),
             active_turn.clone(),
             quiet_deadman.clone(),
+            compact_in_flight.clone(),
+            compact_turn_id.clone(),
         );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
@@ -5224,11 +6837,17 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                compact_in_flight,
+                compact_turn_id,
+                // These fixtures model threads freshell started (paginated).
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
                 exited,
                 quiet_deadman,
+                provenance: None,
             },
         );
         state.broadcast_tx.subscribe()
@@ -5868,6 +7487,93 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn send_applies_updated_model_effort_permissions_and_images() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (st, _) = state_with_bus();
+        st.set_identity_sink(Arc::new(crate::identity_sink::FakeIdentitySink::default()));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-parity-send",
+        )
+        .await;
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(serde_json::from_value(json!({
+                "provider":"codex", "sessionType":"freshcodex", "sessionId":"thread-1", "text":"Look at this",
+                "images":[{"data":"aGVsbG8=", "mediaType":"image/png"}],
+                "settings":{"model":"gpt-5.5", "effort":"low", "permissionMode":"never", "sandbox":"read-only", "cwd":"/tmp"}
+            })).unwrap()).await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        let (id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({"turn":{"id":"turn-new"}}));
+        task.await.unwrap();
+        let saved = st
+            .identity_sink()
+            .unwrap()
+            .load_settings("codex", "thread-1")
+            .expect("accepted settings survive resume");
+        peer.disconnect();
+        st.shutdown().await;
+        assert_eq!(saved.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(saved.effort.as_deref(), Some("low"));
+        assert_eq!(saved.permission_mode.as_deref(), Some("never"));
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["effort"], "low");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(params["cwd"], "/tmp");
+        assert_eq!(
+            params["input"][1],
+            json!({"type":"image","url":"data:image/png;base64,aGVsbG8="})
+        );
+    }
+
+    #[test]
+    fn codex_snapshot_exposes_actual_changed_files_and_child_threads() {
+        let raw = json!({"thread":{"id":"parent", "turns":[{"id":"turn-1", "items":[
+            {"id":"edit-1","type":"fileChange","status":"completed","changes":[{"path":"src/app.ts","kind":{"type":"update"},"diff":"-old\n+new"}]},
+            {"id":"child-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"parent","receiverThreadIds":["child"],"agentsStates":{}},
+            {"id":"edit-2","type":"fileChange","status":"completed","changes":[{"path":"src/app.ts","kind":{"type":"update"},"diff":"-new\n+final"}]},
+            {"id":"child-2","type":"collabAgentToolCall","tool":"wait","status":"completed","senderThreadId":"parent","receiverThreadIds":["child"],"agentsStates":{}}
+        ]}]}});
+        let snapshot = build_codex_snapshot_json("parent", &raw, false, None, None, false).unwrap();
+        assert_eq!(snapshot["capabilities"]["diffs"], true);
+        assert_eq!(
+            snapshot["diffs"],
+            json!([{"id":"src/app.ts","path":"src/app.ts","status":"completed"}])
+        );
+        assert_eq!(snapshot["capabilities"]["childThreads"], true);
+        assert_eq!(
+            snapshot["childThreads"],
+            json!([{"id":"child","threadId":"child","origin":"spawnAgent"}])
+        );
+    }
+
+    #[test]
+    fn legacy_read_only_permission_preserves_read_only_intent() {
+        let mut permission = Some("read-only".into());
+        let mut sandbox = Some("danger-full-access".into());
+        normalize_codex_permission(&mut permission, &mut sandbox).unwrap();
+        assert_eq!(permission.as_deref(), Some("on-request"));
+        assert_eq!(sandbox.as_deref(), Some("read-only"));
+        let mut permission = Some("not-a-policy".into());
+        assert!(normalize_codex_permission(&mut permission, &mut sandbox).is_err());
+    }
+
+    #[tokio::test]
     async fn handle_interrupt_issues_rpc_for_tracked_turn_and_clears_it() {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
@@ -6038,6 +7744,659 @@ pub(crate) mod tests {
         assert_eq!(frame["success"], true);
     }
 
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END — it must retire the
+    /// thread's pane-ledger row `Closed` through the identity sink, so the
+    /// recovery inventory (Bound-only at its `row_is_bound` pre-filter) can
+    /// never re-offer a session the user had just closed inside the 7s
+    /// creation-race grace window.
+    #[tokio::test]
+    async fn handle_kill_retires_the_ledger_row_for_the_killed_thread() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx, fake) = state_with_sink();
+        let child = spawn_sleeper();
+        insert_fake_session(
+            &st,
+            "thread-kill",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill-retire",
+        )
+        .await;
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-kill".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("codex".to_string(), "thread-kill".to_string())),
+            "the kill must retire (codex, thread-kill): {retires:?}"
+        );
+    }
+
+    /// The unknown-id arm of the same contract: a kill for an already-evicted
+    /// session (the session map is process memory; the durable row outlives it)
+    /// still retires the row the id names — idempotently when no row exists.
+    #[tokio::test]
+    async fn handle_kill_of_an_evicted_session_still_retires_the_row_it_names() {
+        let (st, _rx, fake) = state_with_sink();
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "evicted-thread".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        let retires = fake.retires.lock().unwrap().clone();
+        assert!(
+            retires.contains(&("codex".to_string(), "evicted-thread".to_string())),
+            "the kill must retire (codex, evicted-thread): {retires:?}"
+        );
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 3), the codex lane:
+    /// the durable close (kill tombstone + row retire, one ledger write) must
+    /// be recorded BEFORE any teardown/settlement await — a server crash mid-
+    /// teardown must never lose the close (the row would stay Bound and the
+    /// next recovery could offer a pane the user closed). THE HOOKED
+    /// TEARDOWN STALL: a session whose exit-watcher never completes parks the
+    /// kill's teardown phase forever; the retire must already be durable
+    /// while the settle never lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_kill_records_the_durable_close_before_the_teardown_settles() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        let (st, _rx, fake) = state_with_sink();
+
+        // A session whose watcher never resolves (the stalled teardown) and
+        // whose kill_tx is absent — the teardown block parks on the watcher
+        // join forever.
+        let consumer = tokio::spawn(async {});
+        let watcher = tokio::spawn(std::future::pending::<()>());
+        let exited = Arc::new(AtomicBool::new(false));
+        st.sessions.lock().await.insert(
+            "thread-stall".to_string(),
+            CodexSession {
+                client,
+                model: "gpt-5.3-codex-spark".to_string(),
+                effort: None,
+                cwd: None,
+                sandbox: None,
+                permission_mode: None,
+                active_turn: Arc::new(StdMutex::new(None)),
+                compact_in_flight: Arc::new(AtomicBool::new(false)),
+                compact_turn_id: Arc::new(StdMutex::new(None)),
+                history_mode: Some(HistoryMode::Paginated),
+                turn_lock: Arc::new(TokioMutex::new(())),
+                consumer,
+                kill_tx: None,
+                watcher,
+                exited,
+                quiet_deadman: QuietDeadman::new_shared(),
+                provenance: None,
+            },
+        );
+
+        let st2 = st.clone();
+        let kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                provider: freshell_protocol::AgentProvider::Codex,
+                session_id: "thread-stall".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                cwd: None,
+            })
+            .await;
+        });
+
+        // The teardown never settles, so the ONLY way the durable close can
+        // be observable is if it was recorded FIRST. Bounded poll (the
+        // kill-window tests' 25ms discipline).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let retired = fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), "thread-stall".to_string()));
+            if retired {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the durable close (kill tombstone + row retire) must be recorded BEFORE \
+                 the teardown/settlement awaits — a crash inside them lost the close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !kill.is_finished(),
+            "fixture: the teardown is still stalled (the close preceded it, not followed it)"
+        );
+        kill.abort();
+    }
+
+    /// Delta-r6 close-durability (failures propagate), the codex lane: a kill
+    /// whose durable close could NOT be recorded must FAIL — the
+    /// `freshAgent.killed` answer reports `success:false` and NO live state
+    /// was touched (the session stays mapped, its lease binding stands, the
+    /// consumer/sidecar teardown never ran). Warn-and-continue would leave
+    /// the row Bound and recoverable while the client believes the pane is
+    /// closed.
+    #[tokio::test]
+    async fn a_kill_whose_durable_close_fails_reports_failure_and_touches_no_live_state() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx, fake) = state_with_sink();
+        let child = spawn_sleeper();
+        insert_fake_session(
+            &st,
+            "thread-kill-fail",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill-fail",
+        )
+        .await;
+        // The ledger fails every write (disk-full/permission shape).
+        fake.set_fail_writes(true);
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-kill-fail".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            st.sessions.lock().await.contains_key("thread-kill-fail"),
+            "a failed durable close must leave the session mapped (nothing torn down)"
+        );
+        assert!(
+            !fake
+                .retires
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), "thread-kill-fail".to_string())),
+            "sanity: the failed retire recorded nothing"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "a kill whose durable close failed must report success:false: {killed_frame}"
+        );
+    }
+
+    /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the codex lane's
+    /// PERSISTED class: the durable close IS recorded although its write
+    /// reports failure (the journal record landed — the rename-committed
+    /// class, staged by the fake sink's persisted arm). Keeping the session
+    /// live beside durable close evidence would misclassify it `closed` at
+    /// recovery — so the kill ENDS the session (teardown runs, the map is
+    /// cleaned) while the answer still reports `success:false`: the kill
+    /// visibly fails, never masquerading as clean success nor clean failure.
+    #[tokio::test]
+    async fn a_kill_whose_close_persists_despite_the_reported_error_ends_the_session_and_fails_visibly(
+    ) {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx, fake) = state_with_sink();
+        let child = spawn_sleeper();
+        insert_fake_session(
+            &st,
+            "thread-kill-pers",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-kill-pers",
+        )
+        .await;
+        // The close's record is durable but the write "reports failure".
+        fake.fail_retires_as_persisted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-kill-pers".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+
+        assert!(
+            !st.sessions.lock().await.contains_key("thread-kill-pers"),
+            "the close IS durable: the session ends (never a live session beside close evidence)"
+        );
+        assert!(
+            fake.retires
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), "thread-kill-pers".to_string())),
+            "the close's facts are on record (the journal record stands)"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the kill fails VISIBLY even though the close is durable: {killed_frame}"
+        );
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 1), the codex
+    /// ATTACH-resume lane: a kill QUEUED behind the claim's commit (the
+    /// commit's dead-state decision pre-dates the kill — the report's
+    /// exact interleaving) lands while the lane is between its completed
+    /// commit and its session registration. Kill must still win: the lane's
+    /// post-registration dead-state re-check observes the advanced fence,
+    /// the late session is torn down before it is ever answerable, and the
+    /// row the kill retired stays Retired. (The fake sink's post-commit
+    /// stall is the deterministic model: the commit APPLIES — fence cleared,
+    /// row revived — then the lane parks pre-registration while the kill
+    /// lands.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_attached_thread(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx, fake) = state_with_sink();
+        let thread = "historical-thread-killed-post-commit";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/tmp".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+
+        // The close the user MEANT (before this attach): row Closed + fence.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let claim_start_snapshot = fake.kill_tombstone_at_ms("codex", thread);
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // Stall the claim AFTER its commit lands, BEFORE the registration.
+        let stall = fake.arm_post_commit_stall("codex", thread);
+        let st2 = st.clone();
+        let attach = tokio::spawn(async move {
+            st2.handle_attach(attach_msg(thread)).await;
+        });
+        stall
+            .applied
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim's commit landed (the lane is parked pre-registration)");
+        assert_eq!(
+            fake.kill_tombstone_at_ms("codex", thread),
+            None,
+            "fixture: the commit cleared the fence — its decision pre-dates the kill below"
+        );
+
+        // THE INTERLEAVING (Finding 1): the user's close lands between the
+        // completed commit and the registration.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let post_kill = fake.kill_tombstone_at_ms("codex", thread);
+        assert!(
+            post_kill.is_some() && post_kill > claim_start_snapshot,
+            "fixture: the post-commit close re-raised the fence past the claim's snapshot"
+        );
+        stall.release.send(()).expect("release the stalled claim");
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), attach)
+            .await
+            .expect("attach resolves")
+            .expect("attach task completed");
+
+        // The lane must answer the attach with the resume failure (never a
+        // silently-adopted orphan), must register NOTHING, and must leave the
+        // row the kill retired Retired with its fence standing.
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("CODEX_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "the kill-queued-behind-the-commit attach answers the resume failure"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "the late orphan session was torn down, never kept"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the row the kill retired stays Retired — the commit must not outlive the kill"
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "the post-commit kill's fence stands"
+        );
+        st.shutdown().await;
+    }
+
+    /// The CREATE-resume lane twin of the Finding-1 pin above: the
+    /// post-commit kill lands while `finish_create` is between the claim's
+    /// commit ( handle_create_resume ) and its sessions-map insert — the
+    /// re-check tears the registered session down and the create answers
+    /// failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_commit_and_the_registration_still_closes_the_resumed_create(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx, fake) = state_with_sink();
+        let thread = "thread-killed-post-commit-create";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/tmp".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "fixture: the fence is durable"
+        );
+
+        let stall = fake.arm_post_commit_stall("codex", thread);
+        let st2 = st.clone();
+        let create = tokio::spawn(async move {
+            st2.handle_create(
+                FreshAgentCreate {
+                    request_id: "req-post-commit-kill".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: Some(thread.to_string()),
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex".to_string()),
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
+            .await;
+        });
+        stall
+            .applied
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim's commit landed (the lane is parked pre-registration)");
+
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        stall.release.send(()).expect("release the stalled claim");
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), create)
+            .await
+            .expect("the create resolves")
+            .expect("create task completed");
+
+        let mut saw_create_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("freshAgent.create.failed") {
+                saw_create_failed = true;
+            }
+        }
+        assert!(
+            saw_create_failed,
+            "the kill-queued-behind-the-commit create answers failed (never a live orphan)"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "the late orphan session was torn down, never kept"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the row the kill retired stays Retired"
+        );
+        st.shutdown().await;
+    }
+
+    /// Retire-on-kill round 5 (focused-ep5-r4 Finding 5), the codex
+    /// ATTACH-resume lane: the claim commit's `Err` (an io failure deciding
+    /// or writing the durable transition) leaves the close UNTOUCHED (the
+    /// fence stands, the row stays Closed — the ledger's commit is crash-
+    /// atomic that way). Continuing would register a live session against a
+    /// durably-closed row (omitted from the next recovery), so the lane must
+    /// fail instead: no registration, no revive, the session torn down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_commit_error_stops_the_attach_resume_and_leaves_the_close_standing() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx, fake) = state_with_sink();
+        let thread = "historical-thread-commit-error";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/tmp".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // The commit's io failure knob: every durable write from here errs —
+        // commit_claim's Err is the Finding-5 shape.
+        fake.set_fail_writes(true);
+        st.handle_attach(attach_msg(thread)).await;
+
+        let mut saw_resume_failed = false;
+        while let Ok(raw) = rx.try_recv() {
+            if raw.contains("CODEX_ATTACH_RESUME_FAILED") {
+                saw_resume_failed = true;
+            }
+        }
+        assert!(
+            saw_resume_failed,
+            "a commit error must FAIL the resume, never register a live session over a Closed row"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "nothing registers when the commit could not run"
+        );
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the close stands: the row stays Retired"
+        );
+        assert!(
+            fake.kill_tombstone_at_ms("codex", thread).is_some(),
+            "the close stands: the fence was never cleared"
+        );
+        st.shutdown().await;
+    }
+
+    /// Focused-ep5-r1 Finding 2 (retire-on-kill round 2), the tombstone
+    /// lifecycle's exit on the codex lane: a kill folds the durable kill
+    /// tombstone (the evicted-id arm — the session map is process memory),
+    /// and an EXPLICIT late resume-create of the same thread GENUINELY CLAIMS
+    /// it — clearing the tombstone BEFORE finish_create's binding write, so
+    /// the claim's write lands and is never suppressed as a stale orphan.
+    #[tokio::test]
+    async fn resume_create_after_a_kill_clears_the_tombstone_and_rebinds() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx, fake) = state_with_sink();
+        let thread_id = "thread-claim-resume";
+
+        // The close, naming the durable thread id (the codex wire shape —
+        // the map never held a session here, the evicted arm covers it).
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("codex".to_string(), thread_id.to_string())),
+            "the kill folded the thread's kill tombstone"
+        );
+
+        // The explicit late resume (real create-with-resume through the fake
+        // app server — the fixture answers thread/resume with the requested id).
+        configure_fake_codex_cmd("{}");
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-claim-resume".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: Some(thread_id.to_string()),
+                session_ref: None,
+                model: Some("gpt-5.3-codex".to_string()),
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the resume itself answers created (never a failure): {created}"
+        );
+        assert_eq!(created["sessionId"], json!(thread_id));
+
+        assert!(
+            fake.claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread_id.to_string())),
+            "the genuine claim COMMITS (round 4: fence-clear + revive in one conditional \
+             transition) BEFORE its own write"
+        );
+        assert!(
+            !fake
+                .kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("codex".to_string(), thread_id.to_string())),
+            "the durable fence is gone post-commit"
+        );
+        assert!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.provider == "codex" && b.session_id == thread_id),
+            "the claim's binding write landed (never tombstone-suppressed)"
+        );
+        assert!(
+            !fake
+                .suppressed
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread_id.to_string())),
+            "the claim's own write is never suppressed"
+        );
+        st.shutdown().await;
+    }
+
     // ── freshAgent.compact (AGENT-04, approval-respond Task 4) ─────────────
 
     fn compact_msg(session_id: &str) -> FreshAgentCompact {
@@ -6047,6 +8406,43 @@ pub(crate) mod tests {
             session_type: freshell_protocol::SessionType::Freshcodex,
             cwd: None,
             instructions: None,
+        }
+    }
+
+    /// Drain every buffered bus frame (ep1-r3 F4 test-sync discipline: sync
+    /// points must wait on the NEXT frame the consumer produces for the event
+    /// just emitted, never a RESIDUAL one — earlier notifications keep their
+    /// snapshots/chimes in the receiver until read).
+    fn drain_wire(wire: &mut tokio::sync::broadcast::Receiver<String>) {
+        loop {
+            match wire.try_recv() {
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                _ => break,
+            }
+        }
+    }
+
+    /// Await the session's NEXT idle `freshAgent.session.snapshot` on the bus —
+    /// the deterministic "the consumer ran the notification just emitted" edge.
+    async fn await_next_idle_snapshot(
+        wire: &mut tokio::sync::broadcast::Receiver<String>,
+        thread_id: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "the expected completion never flowed");
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == thread_id
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break;
+            }
         }
     }
 
@@ -6062,6 +8458,36 @@ pub(crate) mod tests {
     ) {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
+        let rx = insert_fake_session_with_real_consumer(
+            st,
+            thread_id,
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            &format!("codex-sidecar-test-compact-{thread_id}"),
+        )
+        .await;
+        (peer, rx)
+    }
+
+    /// [`insert_idle_compact_session`] with a short client request timeout, so
+    /// an unanswered RPC resolves as `CodexAppServerError::Timeout` inside the
+    /// test's budget (the ep4-r5 fail-closed window: the request frame provably
+    /// left, but the answer never came).
+    async fn insert_idle_compact_session_with_timeout(
+        st: &FreshCodexState,
+        thread_id: &str,
+        request_timeout_ms: u64,
+    ) -> (
+        freshell_codex::ChannelPeer,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect_with_timeout(
+            transport,
+            Duration::from_millis(request_timeout_ms),
+        );
         let rx = insert_fake_session_with_real_consumer(
             st,
             thread_id,
@@ -6123,6 +8549,688 @@ pub(crate) mod tests {
         peer.emit_notification(
             "turn/completed",
             json!({ "threadId": thread_id, "turn": { "id": "turn-compact-1", "status": turn_status } }),
+        );
+    }
+
+    /// Focused-review ep1-r2 F3: `compact_in_flight` has OPERATION OWNERSHIP.
+    /// Compact-1's `thread/compact/start` answers BEFORE any `turn/started`
+    /// surfaces (the probed 0.147.0 order), leaving the busy truth carried by
+    /// the explicit window bit. A rapid SECOND compact in that window must be
+    /// REFUSED with the rollback `BUSY_TURN` copy (the refusal copy the viewer
+    /// mirrors) — BEFORE any RPC: it never arms, so no failure path of the
+    /// second call can clear compact-1's marker (the pre-F3 precheck ignored
+    /// the bit; a rejected second RPC's failure-clear wiped the FIRST compact's
+    /// busy truth, and a queued rollback could then `thread/revert` mid-compact).
+    #[tokio::test]
+    async fn a_second_compact_in_the_answered_but_unstarted_window_is_refused_busy_turn() {
+        let (st, mut rx) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cdbl").await;
+
+        let compact_1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // The provider answers IMMEDIATELY; the notification stream stays
+        // SILENT (no turn/started yet) — the exact post-RPC/pre-turn-started
+        // window, with the busy truth carried by compact-1's window bit alone.
+        peer.respond(&compact_id, json!({}));
+        compact_1.await.expect("compact-1 task");
+
+        // Compact-2 in the window: REFUSED BUSY_TURN with ZERO RPCs reaching
+        // the app-server (the red shape instead issues a second
+        // thread/compact/start — surface it for a loud failure).
+        let compact_2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        tokio::select! {
+            raw = rx.recv() => {
+                let frame: Value = serde_json::from_str(&raw.expect("a refusal frame")).unwrap();
+                assert_eq!(frame["event"]["type"], json!("freshAgent.error"), "{frame}");
+                assert_eq!(
+                    frame["event"]["code"],
+                    json!("BUSY_TURN"),
+                    "the second compact mirrors the rollback refusal code: {frame}"
+                );
+                assert_eq!(
+                    frame["event"]["message"],
+                    json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE),
+                    "the viewer sees the rollback refusal copy: {frame}"
+                );
+            }
+            req = peer.expect_request() => {
+                panic!("the refused compact must issue NO RPC — it never reaches a failure path that could clear compact-1's marker (got {req:?})")
+            }
+        }
+        compact_2.await.expect("compact-2 task settles");
+
+        // Exactly ONE revert-capable busy tracker remains (compact-1's window
+        // bit, unreverted): a rollback through the window still refuses
+        // BUSY_TURN with zero provider traffic.
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cdbl", "rb-cdbl", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(
+                method, "thread/read",
+                "the ONLY RPC a not-refused rollback may issue in this drive"
+            );
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cdbl", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "compact-1's marker survived compact-2 — the window still refuses: {frames:?}"
+        );
+
+        // The marker ends ONLY at compact-1's own turn/completed: after the
+        // probed notification sequence a third compact is accepted (the tracker
+        // cleared legitimately and re-arms).
+        emit_compact_notification_sequence(&peer, "thread-cdbl", "completed");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cleared = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the compact turn's completion frames never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break false;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == "thread-cdbl"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break true;
+            }
+        };
+        assert!(
+            cleared,
+            "an idle session.snapshot proves the clear edge ran"
+        );
+
+        let compact_3 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cdbl")).await;
+            })
+        };
+        let (compact3_id, method, _p) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/compact/start",
+            "the tracker lifecycle is intact — a post-completion compact runs"
+        );
+        peer.respond(&compact3_id, json!({}));
+        compact_3.await.expect("compact-3 task");
+    }
+
+    /// Focused-review ep1-r3 F4 (codex completion-id OWNERSHIP): the compact
+    /// window (`compact_in_flight`) may be cleared ONLY by the `turn/completed`
+    /// whose params turn id MATCHES the compact's own ownership id (captured
+    /// at the compact's `turn/started`). The probed real sequence interleaves
+    /// a DELAYED PRIOR turn completion inside the armed-clear-pending window:
+    ///
+    ///   thread/status:idle → compact armed (RPC answered, no turn/started yet)
+    ///   → turn/completed{prior id} (stale) → turn/started{compact id}
+    ///   → turn/completed{compact id}.
+    ///
+    /// The stale completion must never clear the window (a rollback admitted
+    /// there would force-interrupt the still-unstarted compaction — the exact
+    /// pre-start window delta-r1 F2 armed the bit for); a rollback attempt
+    /// between the stale and the matching completion stays BUSY_TURN; the gate
+    /// releases EXACTLY at the id-matched completion.
+    #[tokio::test]
+    async fn a_stale_prior_completion_never_clears_the_compact_window_and_only_the_matching_completion_does(
+    ) {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cstale").await;
+
+        // The prior turn's lifecycle ended provider-side: thread/status:idle is
+        // observed BEFORE its delayed completion (the documented probe).
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cstale", "status": { "type": "idle" } }),
+        );
+
+        // Arm the compact: its RPC answers immediately; the notification stream
+        // stays SILENT (no turn/started yet) — the armed-clear-pending window.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cstale")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+
+        // The STALE prior-turn completion lands mid-window (drain first: the
+        // test-start `thread/status:idle` snapshot and every earlier frame are
+        // RESIDUAL — then emit, then await THIS emission's consumer edge).
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-prior-9", "status": "completed" } }),
+        );
+        // ... and provably flows through the consumer BEFORE the probe (the
+        // NEXT idle session.snapshot is the deterministic consumer sync idiom).
+        await_next_idle_snapshot(&mut wire, "thread-cstale").await;
+
+        // A rollback attempt inside the armed-clear-pending window stays
+        // BUSY_TURN (answer any RPC the drive issues so the shape is
+        // deterministic either way: the red shape reaches thread/read and
+        // lands NOTHING_TO_UNDO — the defect).
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-1", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 1");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "F4: a completion with a DIFFERENT id inside the armed-clear-pending window never clears it"
+        );
+
+        // The compact's OWN lifecycle begins (captures the ownership turn id);
+        // a mid-window rollback STILL refuses (the window holds through the
+        // started edge — its own completion hasn't landed).
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-compact-1" } }),
+        );
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-2", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "the armed-but-incomplete compact window still refuses after turn/started"
+        );
+
+        // The id-MATCHED completion releases the gate (same drain discipline:
+        // the earlier completions' chime/snapshot leftovers are residual).
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cstale", "turn": { "id": "turn-compact-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cstale").await;
+        let (sink2, captured2) = capturing_sink();
+        let rollback_driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cstale", "rb-cstale-3", None), sink2)
+                    .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cstale", "turns": [] } }),
+            );
+        }
+        rollback_driver2.await.expect("rollback task 3");
+        assert!(
+            saw_read,
+            "the busy gate reopened at the id-matched completion"
+        );
+        assert_eq!(
+            captured_frames(&captured2)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the matching completion released the gate"
+        );
+    }
+
+    /// Focused-review ep2-r4 (codex completion reaches past the compact into a
+    /// NEWER turn): the documented provider order reports `thread/status:idle`
+    /// (clearing `active_turn`, composer sendable) BEFORE the compact's delayed
+    /// `turn/completed`; a submission inside that window installs its own active
+    /// turn. The compact's own completion then ran the session-wide UNCONDITIONAL
+    /// active-turn clear — erasing the newer send's busy truth: the rollback
+    /// gate read false||false exactly while the new turn was in flight, and a
+    /// `thread/revert` admitted there FORCE-INTERRUPTS that turn. The completion
+    /// now clears `active_turn` ONLY when the completed id MATCHES the active
+    /// turn's id; the compact-window clear keeps its own ownership rule.
+    ///
+    ///   thread/status:idle → compact armed (RPC answered) → turn/started{id-c}
+    ///   → NEW SEND (turn/start → id-new) → turn/completed{id-c} (the compact's
+    ///   OWN completion — clears ONLY the compact window) — the gate must stay
+    ///   BUSY on the newer turn → turn/completed{id-new} releases it EXACTLY.
+    #[tokio::test]
+    async fn a_compact_completion_inside_a_newer_turns_window_clears_only_the_compact_window() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cnewer").await;
+
+        // The prior turn ended: idle is observed BEFORE its delayed completion.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cnewer", "status": { "type": "idle" } }),
+        );
+
+        // Arm the compact: the RPC answers immediately; ownership id lands with
+        // its turn/started.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cnewer")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1" } }),
+        );
+
+        // INSIDE the compact window: a new submission installs its own active
+        // turn (the initialized connection means turn/start is the next RPC).
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cnewer".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cnewer".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-9" } }));
+        send_driver.await.expect("send task");
+
+        // The compact's OWN delayed completion lands NOW: clears the compact
+        // window (ownership match) — and MUST leave the newer send's
+        // `active_turn` untouched. The rollback gate stays BUSY on it.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-c-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cnewer", "rb-cnewer-1", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cnewer", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "ep2-r4: the compact's completion never reaches past its own window — the newer turn still owns the gate"
+        );
+
+        // The newer turn's OWN completion releases the gate exactly here.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cnewer", "turn": { "id": "turn-new-9", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cnewer").await;
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cnewer", "rb-cnewer-2", None), sink)
+                    .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cnewer", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert!(
+            saw_read,
+            "the newer turn's own completion reopened the gate"
+        );
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the newer turn's own completion released the gate"
+        );
+    }
+
+    /// Focused-review ep3-r4 F2 (the compact window's thread-level idle must
+    /// never erase a NEWER turn's busy truth): the documented compact event
+    /// sequence carries `thread/status:changed{type:idle}` BETWEEN the
+    /// compact's `turn/started` and its `turn/completed`; a submission accepted
+    /// inside the window installs its own active turn (whose turn/started can
+    /// land before that idle) — and the status arm UNCONDITIONALLY cleared
+    /// `active_turn`, so the compact's id-matched completion then retired only
+    /// the compact bits: both rollback-gate inputs read false mid-new-turn and
+    /// a `thread/revert` admitted there force-interrupts the newer turn. The
+    /// thread-level idle is the compact lifecycle's own punctuation while the
+    /// window is armed — it must not touch `active_turn` (the id-matched
+    /// completion owns retirements inside the window).
+    #[tokio::test]
+    async fn the_compact_windows_thread_level_idle_keeps_the_newer_turns_busy_truth() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cidle").await;
+
+        // Arm the compact: RPC answers; the compact's own turn starts.
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cidle")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-compact-7" } }),
+        );
+
+        // A submission inside the window installs its own active turn BEFORE
+        // the compact window's thread-level idle lands.
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-cidle".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cidle".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "newer turn".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-1" } }));
+        send_driver.await.expect("send task");
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-new-1" } }),
+        );
+
+        // The compact window's documented thread-level idle lands NOW — it is
+        // the compact lifecycle's punctuation, NOT the newer turn's end: the
+        // newer turn's busy truth must survive it.
+        drain_wire(&mut wire);
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cidle", "status": { "type": "idle" } }),
+        );
+        // ...and the compact's own completion retires exactly the compact bits.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-compact-7", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cidle").await;
+
+        // The rollback gate MUST refuse: the newer turn is still running and
+        // owns the busy truth.
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thread-cidle", "rb-cidle-1", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "ep3-r4 F2: the compact window's idle never erases the newer turn's busy truth: {frames:?}"
+        );
+
+        // The newer turn's own completion then retires it EXACTLY — the gate
+        // opens (NOTHING_TO_UNDO — prowl through the empty durable ledger).
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cidle", "turn": { "id": "turn-new-1", "status": "completed" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cidle").await;
+        // The status snapshot broadcast precedes the reduce-notification's
+        // applied clearing by a consumer poll — poll the gate inputs until the
+        // newer turn's completion has landed (id-matched retirement).
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let active_turn = {
+                    let guard = st.sessions.lock().await;
+                    guard
+                        .get("thread-cidle")
+                        .expect("session")
+                        .active_turn
+                        .clone()
+                };
+                if active_turn.lock().expect("active_turn mutex").is_none() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "the newer turn's own completion retires the gate input"
+        );
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cidle", "rb-cidle-2", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cidle", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task 2");
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the newer turn's own completion releases the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_in_the_compact_answered_but_turn_unstarted_window_is_refused_busy_turn() {
+        // Delta-r1 F2: `thread/compact/start` answers BEFORE the compact turn's
+        // notification lifecycle (`turn/started`) surfaces — the REAL 0.147.0
+        // sequence has the RPC return first. In that post-RPC/pre-turn-started
+        // window `active_turn` is still notification-driven EMPTY, so the busy
+        // gate needs the session's `compact_in_flight` bit (SET under the turn
+        // lock at compact start, cleared by the compact's turn/completed).
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cwin").await;
+
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cwin")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // The provider answers the RPC IMMEDIATELY; the notification stream stays
+        // SILENT (no turn/started yet) — the exact probed window.
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+
+        // A rollback in the window must refuse BUSY_TURN — answer any RPC it DOES
+        // issue so the drive is deterministic in both shapes (a red run shows the
+        // rollback reaching thread/read and landing NOTHING_TO_UNDO; a green run
+        // shows no RPC at all — the refusal leg issues ZERO provider traffic).
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cwin", "rb-cwin", None), sink)
+                    .await;
+            })
+        };
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(
+                method, "thread/read",
+                "the ONLY RPC a not-refused rollback may issue in this drive"
+            );
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-cwin", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0]["event"]["code"],
+            json!("BUSY_TURN"),
+            "the post-RPC/pre-turn-started window must still refuse: {frames:?}"
+        );
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE)
+        );
+
+        // The window CLOSES at the compact's own turn/completed: after the probed
+        // notification sequence, a follow-up rollback is NOT busy-refused (it
+        // reaches thread/read and lands its true verdict on the empty thread).
+        // The `wire` receiver is the session's bus: waiting for the completion
+        // frames here proves the consumer already ran the clear edge (the FIX-1
+        // test's deterministic sync idiom).
+        emit_compact_notification_sequence(&peer, "thread-cwin", "completed");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cleared = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the compact turn's completion frames never flowed"
+            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break false;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] == "thread-cwin"
+                && frame["event"]["type"] == "freshAgent.session.snapshot"
+                && frame["event"]["status"] == "idle"
+            {
+                break true;
+            }
+        };
+        assert!(
+            cleared,
+            "an idle session.snapshot frame proves the clear edge ran"
+        );
+
+        let (sink2, captured2) = capturing_sink();
+        let rollback_driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thread-cwin", "rb-cwin-2", None), sink2)
+                    .await;
+            })
+        };
+        let (read_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/read", "the busy gate reopened");
+        peer.respond(
+            &read_id,
+            json!({ "thread": { "id": "thread-cwin", "turns": [] } }),
+        );
+        rollback_driver2.await.expect("rollback task 2");
+        let frames2 = captured_frames(&captured2);
+        assert_eq!(
+            frames2[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "after turn/completed the gate reopened: {frames2:?}"
         );
     }
 
@@ -6350,6 +9458,81 @@ pub(crate) mod tests {
             rx.try_recv().is_err(),
             "an RPC failure must not fabricate a completion"
         );
+
+        // ep4-r5: an EXPLICIT rejection is proof the compact never started —
+        // the busy marker cleared, so a retried compact reaches a fresh RPC
+        // (as opposed to the timeout class, which refuses locally).
+        let driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-ce")).await;
+            })
+        };
+        let (id2, method2, _p2) = peer.expect_request().await;
+        assert_eq!(
+            method2, "thread/compact/start",
+            "an explicit rejection re-opens the gate for a retry"
+        );
+        peer.respond_error(&id2, -32600, "compact rejected again");
+        driver2.await.expect("compact task 2");
+    }
+
+    /// Focused-review ep4-r4 (Minor-1, codex.rs:1530): a compact RPC that
+    /// TIMES OUT crossed the wire with an ambiguous lifecycle — the app server
+    /// may still start the compact — so the busy marker must STAY armed: a
+    /// second compact is refused LOCALLY (no second RPC may reach the peer),
+    /// and the rollback gate would stay closed with it. Clearing the marker on
+    /// timeout (the pre-fix shape) re-arms a second compact -> a live provider
+    /// compaction folded by... exactly the torn-owner hazard ep1-r2 F3 closed.
+    #[tokio::test]
+    async fn handle_compact_rpc_timeout_keeps_the_busy_marker_fail_closed() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session_with_timeout(&st, "thread-cto", 50).await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cto")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        // Never answer: the client's request timeout fires (50ms).
+        driver
+            .await
+            .expect("the compact handler resolves on the timeout");
+
+        // The loud error envelope arrived; the busy marker must OUTLIVE it.
+        loop {
+            let raw = rx.recv().await.expect("the bus stays open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                assert_eq!(frame["event"]["code"], "CODEX_COMPACT_FAILED");
+                break;
+            }
+        }
+
+        // A second compact must be refused WITHOUT another RPC — proof the
+        // timed-out window still owns the gate.
+        st.handle_compact(compact_msg("thread-cto")).await;
+        loop {
+            let raw = rx.recv().await.expect("the bus stays open");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                assert_eq!(
+                    frame["event"]["code"], "BUSY_TURN",
+                    "the second compact refused through the (surviving) busy marker: {frame}"
+                );
+                break;
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), peer.expect_request())
+                .await
+                .is_err(),
+            "ep4-r4: the refused second compact NEVER reaches the app server"
+        );
     }
 
     #[tokio::test]
@@ -6391,6 +9574,7 @@ pub(crate) mod tests {
             input,
             request_id: Some(request_id.to_string()),
             cwd: None,
+            tab_id: None,
         }
     }
 
@@ -6445,7 +9629,7 @@ pub(crate) mod tests {
         let (st, _rx_boot) = state_with_bus();
         let (sink, captured) = capturing_sink();
 
-        st.handle_fork(fork_msg("does-not-exist", "fork-req-x", None), sink)
+        st.handle_fork(fork_msg("does-not-exist", "fork-req-x", None), None, sink)
             .await;
 
         // Legacy throws FreshAgentLostSessionError on an unknown parent; the port
@@ -6482,7 +9666,7 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-fork-err", "fork-req-e", None), sink)
+                st.handle_fork(fork_msg("parent-fork-err", "fork-req-e", None), None, sink)
                     .await;
             })
         };
@@ -6544,8 +9728,12 @@ pub(crate) mod tests {
         let driver1 = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d1", None), sink1)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-fork-dup", "fork-req-d1", None),
+                    None,
+                    sink1,
+                )
+                .await;
             })
         };
         answer_initialize(&peer).await;
@@ -6557,7 +9745,11 @@ pub(crate) mod tests {
         let (sink2, captured2) = capturing_sink();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d2", None), sink2),
+            st.handle_fork(
+                fork_msg("parent-fork-dup", "fork-req-d2", None),
+                None,
+                sink2,
+            ),
         )
         .await
         .expect("the duplicate fork is refused inline, never upstream-blocking");
@@ -6585,8 +9777,12 @@ pub(crate) mod tests {
         let driver3 = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-fork-dup", "fork-req-d3", None), sink3)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-fork-dup", "fork-req-d3", None),
+                    None,
+                    sink3,
+                )
+                .await;
             })
         };
         let (id3, method, _params) = peer.expect_request().await;
@@ -6636,7 +9832,7 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-arch-err", "fork-req-a", None), sink)
+                st.handle_fork(fork_msg("parent-arch-err", "fork-req-a", None), None, sink)
                     .await;
             })
         };
@@ -6689,7 +9885,7 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-malformed", "fork-req-m", None), sink)
+                st.handle_fork(fork_msg("parent-malformed", "fork-req-m", None), None, sink)
                     .await;
             })
         };
@@ -6761,8 +9957,12 @@ pub(crate) mod tests {
             let driver = {
                 let st = st.clone();
                 tokio::spawn(async move {
-                    st.handle_fork(fork_msg("parent-params", "fork-req-p", overrides), sink)
-                        .await;
+                    st.handle_fork(
+                        fork_msg("parent-params", "fork-req-p", overrides),
+                        None,
+                        sink,
+                    )
+                    .await;
                 })
             };
 
@@ -6829,7 +10029,7 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-bare", "fork-req-c", None), sink)
+                st.handle_fork(fork_msg("parent-bare", "fork-req-c", None), None, sink)
                     .await;
             })
         };
@@ -6893,8 +10093,12 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-spawn-fail", "fork-req-s", None), sink)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-spawn-fail", "fork-req-s", None),
+                    None,
+                    sink,
+                )
+                .await;
             })
         };
 
@@ -6956,7 +10160,7 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-ua-fail", "fork-req-u", None), sink)
+                st.handle_fork(fork_msg("parent-ua-fail", "fork-req-u", None), None, sink)
                     .await;
             })
         };
@@ -7020,8 +10224,12 @@ pub(crate) mod tests {
         let driver = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-resume-fail", "fork-req-r", None), sink)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-resume-fail", "fork-req-r", None),
+                    None,
+                    sink,
+                )
+                .await;
             })
         };
 
@@ -7079,7 +10287,7 @@ pub(crate) mod tests {
         let parent_id = create_real_fake_session(&st, &mut rx).await;
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(&parent_id, "fork-req-1", None), sink)
+        st.handle_fork(fork_msg(&parent_id, "fork-req-1", None), None, sink)
             .await;
 
         // The exact `freshAgent.forked` reply — every field, request_id echoed (the
@@ -7207,6 +10415,1135 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(&log_path);
     }
 
+    /// Focused-ep1-r3 (codex sibling of the opencode parking finding — the
+    /// cross-provider audit's named gap): the freshcodex fork child row was
+    /// written with provenance `None`, so it started UNATTRIBUTED — and the D8
+    /// recovery judgment (`d8_parent_relative_keep`) drops unattributed rows
+    /// even when the forked child pane is genuinely open in a surviving client.
+    /// Fix shape mirrors opencode: the connection's provenance is PARKED on the
+    /// session at create (`finish_create`), and the fork inherits the parent's
+    /// parked value into both the child session record and the child ledger row.
+    #[tokio::test]
+    async fn fork_child_binding_carries_the_parent_connections_parked_provenance() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-parked-prov" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let parent_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-p"),
+                Some("device-p"),
+                Some("tab-p"),
+                7_777,
+            )),
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&parent_id, "fork-req-prov", None), None, sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-parked-prov"));
+
+        // The parent parked the create's provenance at finish_create…
+        // …and the child session record parks the inherited value (a
+        // fork-of-fork stays attributed: connection > session > child rows).
+        {
+            let guard = st.sessions.lock().await;
+            let parent = guard.get(&parent_id).expect("the parent session stays");
+            let child = guard
+                .get("child-parked-prov")
+                .expect("the child session is registered");
+            for (who, s) in [("parent", parent), ("child", child)] {
+                let p = s
+                    .provenance
+                    .clone()
+                    .unwrap_or_else(|| panic!("the {who} session parks the provenance"));
+                assert_eq!(p.client_instance_id.as_deref(), Some("client-p"), "{who}");
+                assert_eq!(p.device_id.as_deref(), Some("device-p"), "{who}");
+                assert_eq!(p.tab_key.as_deref(), Some("device-p:tab-p"), "{who}");
+            }
+        }
+
+        // …and the child's ledger ROW asserts the same attribution (an
+        // unattributed row here is what the D8 judgment was dropping).
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let row = bindings
+                .iter()
+                .find(|b| b.session_id == "child-parked-prov")
+                .expect("a binding row for the child");
+            assert_eq!(
+                row.asserted_stamps().client_instance_id.as_deref(),
+                Some("client-p"),
+                "the child row inherits the parent's parked provenance, not None"
+            );
+            assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-p"));
+            assert_eq!(
+                row.asserted_stamps().tab_key.as_deref(),
+                Some("device-p:tab-p")
+            );
+        }
+    }
+
+    /// The resumed-same-thread crash-recovery door (mirror of
+    /// [`handle_fork...respawns_the_parent_sidecar_then_forks`]'s machinery):
+    /// `ensure_session_alive`'s in-place rebuild must CARRY the crashed
+    /// session's parked provenance onto the rebuilt record (the conn-less
+    /// refresh's keep-when-None ledger merge is its row-level twin — the
+    /// parked copy is the same identity, never invented), so a fork AFTER the
+    /// transparent respawn still writes an attributed child row.
+    #[tokio::test]
+    async fn fork_after_crash_recovery_keeps_the_create_provenance_chain() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let parent_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-crash"),
+                Some("device-crash"),
+                Some("tab-crash"),
+                7_777,
+            )),
+        )
+        .await;
+        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+
+        // The respawned parent (spawn 2: resume echoes the requested id) and the
+        // child's own sidecar (spawn 3) share this config.
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-crash-prov" } } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg(&parent_id, "fork-req-crash-prov", None),
+            None,
+            sink,
+        )
+        .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-after-crash-prov"));
+
+        {
+            let guard = st.sessions.lock().await;
+            let parent = guard
+                .get(&parent_id)
+                .expect("the respawned parent stays registered under the SAME id");
+            let p = parent
+                .provenance
+                .clone()
+                .expect("the in-place recovery rebuild CARRIES the parked provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-crash"));
+            assert_eq!(p.device_id.as_deref(), Some("device-crash"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-crash:tab-crash"));
+
+            let child = guard
+                .get("child-after-crash-prov")
+                .expect("the fork child is registered");
+            let cp = child
+                .provenance
+                .clone()
+                .expect("the fork child parks the respawned parent's provenance");
+            assert_eq!(cp.client_instance_id.as_deref(), Some("client-crash"));
+        }
+
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-crash-prov")
+            .expect("a binding row for the post-crash fork child");
+        assert_eq!(
+            row.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-crash")
+        );
+        assert_eq!(
+            row.asserted_stamps().device_id.as_deref(),
+            Some("device-crash")
+        );
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-crash:tab-crash")
+        );
+    }
+
+    /// The mint-new crash-recovery door (the `Respawned { new_session_id }`
+    /// route): `respawn_as_new_thread_after_crash` re-keys the session record
+    /// under the FRESH thread id; the parked provenance must ride across that
+    /// re-key (the mint-new row's `supersedes` inheritance is its row-level
+    /// twin), so the fork of the respawned parent is still attributed.
+    #[tokio::test]
+    async fn fork_after_a_mint_new_respawn_keeps_the_create_provenance_chain() {
+        let _guard = ENV_LOCK.lock().await;
+        // Spawn 1: the parent, crashing right after `thread/start`.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-old-prov",
+                "exitProcessAfterMethodsOnce": ["thread/start"],
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let old_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-mint"),
+                Some("device-mint"),
+                Some("tab-mint"),
+                7_777,
+            )),
+        )
+        .await;
+        assert_eq!(old_id, "parent-old-prov", "fixture sanity: the clicked id");
+        wait_for_self_heal(&st, &mut rx, &old_id).await;
+
+        // The durable rollout is confirmed gone — ensure-alive mints a fresh
+        // thread (spawn 2: `thread/start` -> "parent-new-prov"); the fork child's
+        // sidecar is spawn 3.
+        st.mark_thread_dead(&old_id).await;
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "parent-new-prov",
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-mint-prov" } } }
+                }
+            })
+            .to_string(),
+        );
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint-prov", None), None, sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(
+            frames[0]["parentSessionId"],
+            json!("parent-new-prov"),
+            "resolved-parent keying is unchanged: {frames:?}"
+        );
+        assert_eq!(frames[0]["sessionId"], json!("child-after-mint-prov"));
+
+        {
+            let guard = st.sessions.lock().await;
+            let parent = guard
+                .get("parent-new-prov")
+                .expect("the minted parent is registered under the NEW id");
+            let p = parent
+                .provenance
+                .clone()
+                .expect("the mint-new rebuild CARRIES the parked provenance across the id move");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-mint"));
+            assert_eq!(p.device_id.as_deref(), Some("device-mint"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-mint:tab-mint"));
+
+            let child = guard
+                .get("child-after-mint-prov")
+                .expect("the fork child is registered");
+            let cp = child
+                .provenance
+                .clone()
+                .expect("the mint-new fork child parks the parent's provenance");
+            assert_eq!(cp.client_instance_id.as_deref(), Some("client-mint"));
+        }
+
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-mint-prov")
+            .expect("a binding row for the mint-new fork child");
+        assert_eq!(
+            row.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-mint")
+        );
+        assert_eq!(
+            row.asserted_stamps().device_id.as_deref(),
+            Some("device-mint")
+        );
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-mint:tab-mint")
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 1 (the MAIN already-live resume arm, the
+    /// `has_live_session` fast path): a connection-scoped `freshAgent.create`
+    /// carrying a `resumeSessionId` that resolves to an ALREADY-LIVE thread is
+    /// answered by ADOPTING the live session — the recovery-plan shape (plans
+    /// mint NEW tabIds), so the adopt must re-park the CURRENT connection's
+    /// provenance on the incumbent AND assert it to the ledger with this
+    /// lane's awaited binding refresh BEFORE the created reply (the mirror of
+    /// the opencode in-memory-hit refresh, ec435cbf3). Otherwise the parked
+    /// value (and every later refresh/fork) keeps the OLD tab's attribution.
+    #[tokio::test]
+    async fn adopt_live_create_restamps_the_parked_provenance_and_the_ledger_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-adopt" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // The original connection's create parks (and rows) the OLD stamps.
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+                7_777,
+            )),
+        )
+        .await;
+
+        // A NEW connection's recovery-create resumes the ALREADY-LIVE thread:
+        // the has-live fast path adopts it (no spawn).
+        let mut resume = create_msg("req-adopt-restamp");
+        resume.resume_session_id = Some(thread_id.clone());
+        st.handle_create(
+            resume,
+            Some(crate::BindProvenance::for_create(
+                Some("client-new"),
+                Some("device-new"),
+                Some("tab-new"),
+                7_777,
+            )),
+        )
+        .await;
+        let created = await_created(&mut rx, "req-adopt-restamp").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the adopt answers created: {created}"
+        );
+        assert_eq!(created["sessionId"], json!(thread_id));
+
+        // The incumbent re-parks the CURRENT connection's provenance…
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("the adopt RE-PARKS the current connection's provenance");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-new"));
+            assert_eq!(p.device_id.as_deref(), Some("device-new"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+
+        // …and asserts it to the ledger with the lane's awaited refresh write
+        // (durable-before-answer: the created frame above already resolved).
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == thread_id)
+                .expect("the adopt's refresh write");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id.as_deref(),
+                Some("client-new"),
+                "the adopt refresh re-stamps the row, never keeps the old tab"
+            );
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
+        }
+
+        // …and every later fork of the adopted session asserts the CURRENT
+        // attribution on the child row.
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(fork_msg(&thread_id, "fork-req-adopt", None), None, sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-after-adopt"));
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let child = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-adopt")
+            .expect("a binding row for the post-adopt fork child");
+        assert_eq!(
+            child.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().device_id.as_deref(),
+            Some("device-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 1 (a LISTED EARLY EXIT — `finish_create`'s
+    /// eviction guard): a resume-create that SPAWNS (has-live was false at the
+    /// guard) but finds a LIVE incumbent at registration time adopts that
+    /// incumbent — this arm must restamp exactly like the fast path.
+    #[tokio::test]
+    async fn adopt_live_create_through_the_finish_create_eviction_guard_restamps_the_current_connection(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-after-evict-adopt" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+                7_777,
+            )),
+        )
+        .await;
+
+        // Drive `handle_create_resume` DIRECTLY (skipping handle_create's
+        // has-live fast path and the lease claim): the fresh sidecar resumes
+        // the thread, and finish_create's eviction guard then finds the
+        // incumbent LIVE (the TOCTOU shape: a live entry landed between the
+        // has-live check and registration) -> the :990 adopt arm.
+        st.handle_create_resume(
+            "req-evict-adopt".to_string(),
+            thread_id.clone(),
+            None,
+            "gpt-5.3-codex-spark".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(crate::BindProvenance::for_create(
+                Some("client-new"),
+                Some("device-new"),
+                Some("tab-new"),
+                7_777,
+            )),
+        )
+        .await;
+        let created = await_created(&mut rx, "req-evict-adopt").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the eviction-guard adopt answers created: {created}"
+        );
+        assert_eq!(created["sessionId"], json!(thread_id));
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("the eviction-guard adopt RE-PARKS the current connection");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-new"));
+            assert_eq!(p.device_id.as_deref(), Some("device-new"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-new:tab-new"));
+        }
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == thread_id)
+                .expect("the eviction-guard adopt's refresh write");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id.as_deref(),
+                Some("client-new"),
+                "the eviction-guard adopt refresh re-stamps the row"
+            );
+            assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+            assert_eq!(
+                b.asserted_stamps().tab_key.as_deref(),
+                Some("device-new:tab-new")
+            );
+        }
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg(&thread_id, "fork-req-evict-adopt", None),
+            None,
+            sink,
+        )
+        .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-after-evict-adopt"));
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let child = bindings
+            .iter()
+            .find(|b| b.session_id == "child-after-evict-adopt")
+            .expect("a binding row for the post-adopt fork child");
+        assert_eq!(
+            child.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().device_id.as_deref(),
+            Some("device-new")
+        );
+        assert_eq!(
+            child.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
+    }
+
+    /// The no-regression pin (the invariant's second half): an adopt answer
+    /// with NO connection identity (conn-less lane) must NOT regress the
+    /// incumbent's already-parked Some to None, and writes nothing (the
+    /// ledger's keep-when-None merge preserves the row's stamps).
+    #[tokio::test]
+    async fn adopt_live_create_with_no_connection_provenance_keeps_the_parked_stamps_and_writes_nothing(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+                7_777,
+            )),
+        )
+        .await;
+        let rows_before = fake
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .iter()
+            .filter(|b| b.session_id == thread_id)
+            .count();
+
+        let mut resume = create_msg("req-adopt-none");
+        resume.resume_session_id = Some(thread_id.clone());
+        st.handle_create(resume, None).await;
+        let created = await_created(&mut rx, "req-adopt-none").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the conn-less adopt still answers created: {created}"
+        );
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("a conn-less adopt must NOT regress the parked Some to None");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-old"));
+            assert_eq!(p.device_id.as_deref(), Some("device-old"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-old:tab-old"));
+        }
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|b| b.session_id == thread_id)
+                .count(),
+            rows_before,
+            "a conn-less adopt writes nothing (keep-when-None preserves the row)"
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 1 (Major — fork stamps from the FORKING
+    /// connection): parked provenance is shared across the globally-shared
+    /// session, so under forceNew multi-tab a fork from tab B must stamp the
+    /// child with TAB B's identity — never the parent's parked (tab A's
+    /// most-recent) attribution. A fork is always connection-initiated, so
+    /// the forking connection's provenance wins over every parked/row source.
+    #[tokio::test]
+    async fn fork_stamps_the_child_from_the_forking_connection_over_the_stale_park() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-from-tab-b" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // Tab A's connection created the parent (parks + rows A's stamps).
+        let parent_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-a"),
+                Some("device-a"),
+                Some("tab-a"),
+                7_777,
+            )),
+        )
+        .await;
+
+        // The fork is issued over TAB B's connection (the multi-tab shape:
+        // the shared session's parked value is A's, the fork is B's).
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg(&parent_id, "fork-req-b", None),
+            Some(crate::BindProvenance::for_create(
+                Some("client-b"),
+                Some("device-b"),
+                Some("tab-b"),
+                7_777,
+            )),
+            sink,
+        )
+        .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-from-tab-b"));
+
+        // The child SESSION parks the forking connection's stamps…
+        {
+            let guard = st.sessions.lock().await;
+            let child = guard
+                .get("child-from-tab-b")
+                .expect("the child session is registered");
+            let p = child
+                .provenance
+                .clone()
+                .expect("the child parks the FORKING connection's provenance, not the stale park");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-b"));
+            assert_eq!(p.device_id.as_deref(), Some("device-b"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-b:tab-b"));
+        }
+
+        // …and the child ROW asserts the same (the recovery judgment's keep
+        // + tab rejoin read the row).
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-from-tab-b")
+            .expect("a binding row for the child");
+        assert_eq!(
+            row.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-b"),
+            "the fork child row stamps the FORKING connection, not the parent's stale park"
+        );
+        assert_eq!(row.asserted_stamps().device_id.as_deref(), Some("device-b"));
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-b:tab-b")
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 1, precedence tail + Finding 2's fork arm in
+    /// one: a fork whose connection provenance is HOLLOW (a partially
+    /// initialized client's hello — all fields absent) behaves like None, and
+    /// with a parent that parks nothing the child stamps fall back to the
+    /// parent's DURABLE ROW (the last source that knows the attribution).
+    #[tokio::test]
+    async fn fork_falls_back_to_the_durable_row_when_the_fork_connection_is_hollow_and_the_park_is_empty(
+    ) {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-of-row-fallback" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // A conn-less create parks NOTHING on the parent…
+        let parent_id = create_real_fake_session_with_provenance(&st, &mut rx, None).await;
+        // …but the parent's durable row knows the attribution (stamped by a
+        // later merge — lineage-only payload so no settings change rides).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: parent_id.clone(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("row stamp write ok");
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg(&parent_id, "fork-req-hollow", None),
+            // HOLLOW: the forking connection's hello carried no device/client
+            // fields — must NOT override (i.e. blank out) the row's stamps.
+            Some(crate::BindProvenance::default()),
+            sink,
+        )
+        .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-of-row-fallback"));
+
+        {
+            let guard = st.sessions.lock().await;
+            let child = guard
+                .get("child-of-row-fallback")
+                .expect("the child session is registered");
+            let p = child
+                .provenance
+                .clone()
+                .expect("the child parks the durable row's stamps (hollow connection, empty park)");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let row = bindings
+            .iter()
+            .find(|b| b.session_id == "child-of-row-fallback")
+            .expect("a binding row for the child");
+        assert_eq!(
+            row.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-row"),
+            "the child row falls back to the parent's durable row stamps, not a hollow None"
+        );
+        assert_eq!(
+            row.asserted_stamps().device_id.as_deref(),
+            Some("device-row")
+        );
+        assert_eq!(
+            row.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the codex adopt gate, the :1222 named
+    /// line): a resume-create carrying a HOLLOW connection provenance (hello
+    /// without device/client fields) behaves EXACTLY like the conn-less
+    /// adopt — the incumbent's parked Some must not regress into a hollow
+    /// value and no refresh write fires (parked/row truth is never replaced
+    /// with nothing).
+    #[tokio::test]
+    async fn hollow_adopt_provenance_never_overrides_the_parked_stamps_or_the_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::for_create(
+                Some("client-old"),
+                Some("device-old"),
+                Some("tab-old"),
+                7_777,
+            )),
+        )
+        .await;
+        let rows_before = fake
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .iter()
+            .filter(|b| b.session_id == thread_id)
+            .count();
+
+        // The partially-initialized client's recovery-create: hollow Some.
+        let mut resume = create_msg("req-hollow-adopt");
+        resume.resume_session_id = Some(thread_id.clone());
+        st.handle_create(resume, Some(crate::BindProvenance::default()))
+            .await;
+        let created = await_created(&mut rx, "req-hollow-adopt").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the hollow adopt still answers created: {created}"
+        );
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the incumbent stays");
+            let p = s
+                .provenance
+                .clone()
+                .expect("a hollow adopt must NOT regress the parked Some to a hollow value");
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-old"));
+            assert_eq!(p.device_id.as_deref(), Some("device-old"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-old:tab-old"));
+        }
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|b| b.session_id == thread_id)
+                .count(),
+            rows_before,
+            "a hollow-provenance adopt writes nothing (like the conn-less adopt)"
+        );
+    }
+
+    /// Focused-ep1-r5 Finding 2 (the create-lane park): a create carrying a
+    /// HOLLOW connection provenance parks NOTHING (a hollow Some would ride
+    /// into the fork chain and the per-lane reads as a truth-shaped hole),
+    /// and the row is stamped with None fields — exactly the conn-less
+    /// create's shape.
+    #[tokio::test]
+    async fn hollow_create_provenance_parks_nothing_and_stamps_nothing() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let thread_id = create_real_fake_session_with_provenance(
+            &st,
+            &mut rx,
+            Some(crate::BindProvenance::default()),
+        )
+        .await;
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard.get(&thread_id).expect("the created session");
+            assert_eq!(
+                s.provenance, None,
+                "a hollow hello parks None — never a hollow Some"
+            );
+        }
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == thread_id)
+            .expect("the create's binding write");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id,
+            None,
+            "hollow stamps nothing"
+        );
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
+    }
+
+    /// Focused-ep1-r4 Finding 1, the settings-independence arm (the codex
+    /// twin of opencode's `create_resume_with_a_lineage_only_row_still_-
+    /// restamps_the_current_connections_provenance`): an adopt over an
+    /// incumbent whose reconstructed settings are ALL BLANK (a LINEAGE-ONLY
+    /// durable row — no model/cwd recoverable) must STILL assert the current
+    /// connection's provenance to the ledger: the provenance refresh, not a
+    /// settings write, is the point. The V7 no-laundering guard must not eat
+    /// it — the row stays lineage-only (settings keying untouched).
+    #[tokio::test]
+    async fn adopt_live_create_over_a_lineage_only_incumbent_still_restamps_the_provenance() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A stamped LINEAGE-ONLY row (blank settings).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "thread-lineage-adopt".into(),
+            mode: "freshcodex".into(),
+            create_request_id: Some("cr-old".into()),
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-old".into()),
+                device_id: Some("device-old".into()),
+                tab_key: Some("device-old:tab-old".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("seed binding write ok");
+        st.set_identity_sink(fake.clone());
+
+        // Conn-less attach reconstructs the session (all-blank settings),
+        // seeding the OLD row's stamps (focused-ep1-r4 Finding 2).
+        st.handle_attach(attach_msg("thread-lineage-adopt")).await;
+
+        // A NEW connection's recovery-create adopts the live incumbent.
+        let mut resume = create_msg("req-adopt-lineage");
+        resume.resume_session_id = Some("thread-lineage-adopt".to_string());
+        st.handle_create(
+            resume,
+            Some(crate::BindProvenance::for_create(
+                Some("client-new"),
+                Some("device-new"),
+                Some("tab-new"),
+                7_777,
+            )),
+        )
+        .await;
+        let created = await_created(&mut rx, "req-adopt-lineage").await;
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "the adopt answers created: {created}"
+        );
+
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == "thread-lineage-adopt")
+            .expect("the adopt's refresh write must NOT be eaten by the no-laundering guard");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-new"),
+            "the provenance refresh must not be gated on settings presence"
+        );
+        assert_eq!(b.asserted_stamps().device_id.as_deref(), Some("device-new"));
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-new:tab-new")
+        );
+        assert_eq!(
+            b.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "the settings payload is untouched by the provenance refresh (stays lineage-only)"
+        );
+    }
+
+    /// Focused-ep1-r4 Finding 2 (codex): the CONN-LESS cold attach
+    /// (`freshAgent.attach` of a thread the local map has never heard of —
+    /// the post-restart rehydrate) must seed the parked provenance from the
+    /// DURABLE row's stamps (the authoritative record of where this session
+    /// last lived): the fork child's NEW ledger key is where keep-when-None
+    /// cannot rescue a `None` park.
+    #[tokio::test]
+    async fn attach_resume_seeds_the_parked_provenance_from_the_durable_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            &json!({
+                "overrides": {
+                    "thread/fork": { "result": { "thread": { "id": "child-of-row-seeded" } } }
+                }
+            })
+            .to_string(),
+        );
+        let (st, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // The durable row from the pre-restart connection: settings + stamps.
+        // (cwd must be a REAL directory — the fork below spawns the child's
+        // sidecar with the parent's inherited cwd.)
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "thread-row-seeded".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
+                client_instance_id: Some("client-row".into()),
+                device_id: Some("device-row".into()),
+                tab_key: Some("device-row:tab-row".into()),
+                asserted_at: 7_777,
+            }),
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        st.set_identity_sink(fake.clone());
+
+        st.handle_attach(attach_msg("thread-row-seeded")).await;
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard
+                .get("thread-row-seeded")
+                .expect("the attach-resume registered the session");
+            let p = s.provenance.clone().expect(
+                "the conn-less cold attach seeds the parked provenance from the durable row",
+            );
+            assert_eq!(p.client_instance_id.as_deref(), Some("client-row"));
+            assert_eq!(p.device_id.as_deref(), Some("device-row"));
+            assert_eq!(p.tab_key.as_deref(), Some("device-row:tab-row"));
+        }
+
+        // The conn-less refresh (settings recovered) writes None stamps — the
+        // ledger's keep-when-None merge keeps the row's, never None over Some.
+        {
+            let bindings = fake.bindings.lock().expect("bindings mutex");
+            let b = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == "thread-row-seeded")
+                .expect("the attach-resume refresh write (settings recovered)");
+            assert_eq!(
+                b.asserted_stamps().client_instance_id,
+                None,
+                "conn-less refresh stamps"
+            );
+            assert_eq!(b.asserted_stamps().device_id, None);
+            assert_eq!(b.asserted_stamps().tab_key, None);
+        }
+
+        // …and a fork after the attach (before any snapshot) produces an
+        // ATTRIBUTED child row on its NEW ledger key.
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg("thread-row-seeded", "fork-req-row-seed", None),
+            None,
+            sink,
+        )
+        .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one sink frame: {frames:?}");
+        assert_eq!(frames[0]["type"], "freshAgent.forked", "{frames:?}");
+        assert_eq!(frames[0]["sessionId"], json!("child-of-row-seeded"));
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let child = bindings
+            .iter()
+            .find(|b| b.session_id == "child-of-row-seeded")
+            .expect("a binding row for the post-attach fork child");
+        assert_eq!(
+            child.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-row"),
+            "the fork child inherits the row-seeded provenance, not a fork-time None"
+        );
+        assert_eq!(
+            child.asserted_stamps().device_id.as_deref(),
+            Some("device-row")
+        );
+        assert_eq!(
+            child.asserted_stamps().tab_key.as_deref(),
+            Some("device-row:tab-row")
+        );
+    }
+
+    /// The paired never-invent pin (Finding 2's second arm): a conn-less cold
+    /// attach of a session whose durable row is GENUINELY UNATTRIBUTED (all
+    /// stamps None) parks NOTHING — never invented — and the conn-less refresh
+    /// merge preserves exactly what the row had (nothing).
+    #[tokio::test]
+    async fn attach_resume_with_a_genuinely_unattributed_row_keeps_the_parked_none() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // A settings-bearing row with NO stamps (recorded via an explicit
+        // upsert, not the seed helper, so the row unambiguously has them unset).
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: "thread-unattributed".into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                cwd: Some("/w".into()),
+            },
+        })
+        .await
+        .expect("seed binding write ok");
+        st.set_identity_sink(fake.clone());
+
+        st.handle_attach(attach_msg("thread-unattributed")).await;
+
+        {
+            let guard = st.sessions.lock().await;
+            let s = guard
+                .get("thread-unattributed")
+                .expect("the attach-resume registered the session");
+            assert_eq!(
+                s.provenance, None,
+                "a genuinely unattributed row seeds nothing — never invented"
+            );
+        }
+        // The conn-less refresh writes None stamps and the merge preserves the
+        // row's (empty) stamps — no attribution is ever fabricated.
+        let bindings = fake.bindings.lock().expect("bindings mutex");
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == "thread-unattributed")
+            .expect("the attach-resume refresh write (settings recovered)");
+        assert_eq!(b.asserted_stamps().client_instance_id, None);
+        assert_eq!(b.asserted_stamps().device_id, None);
+        assert_eq!(b.asserted_stamps().tab_key, None);
+        assert!(
+            b.settings.model.is_some(),
+            "the refresh still re-persists the recovered settings"
+        );
+    }
+
     #[tokio::test]
     async fn onexit_self_heal_emits_exited_status_with_no_chime_and_keeps_session_mapped() {
         let (transport, _peer) = freshell_codex::new_channel_transport();
@@ -7257,6 +11594,1407 @@ pub(crate) mod tests {
             st.sessions.lock().await.contains_key("thread-1"),
             "the session stays mapped after an unrequested exit"
         );
+    }
+
+    // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 2) ────────────────
+
+    fn undo_msg(
+        session_id: &str,
+        request_id: &str,
+        turn_id: Option<&str>,
+    ) -> crate::rollback_record::RollbackRequest {
+        crate::rollback_record::RollbackRequest {
+            direction: crate::rollback_record::RollbackDirection::Undo,
+            mode: if turn_id.is_some() {
+                crate::rollback_record::RollbackModeReq::ToTurn
+            } else {
+                crate::rollback_record::RollbackModeReq::Step
+            },
+            turn_id: turn_id.map(str::to_string),
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: freshell_protocol::AgentProvider::Codex,
+            request_id: request_id.to_string(),
+            cwd: None,
+        }
+    }
+
+    /// Two raw completed turns; the item JSON mirrors the exact raw-turn shape
+    /// the `build_codex_turn_json` projection tests pin in this file (a
+    /// userMessage content-part item + an agentMessage text item per turn).
+    fn two_turn_thread_read(thread_id: &str) -> Value {
+        json!({ "thread": { "id": thread_id, "turns": [
+            { "id": "turn-1", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t1-u", "content": [{ "type": "text", "text": "first prompt" }] },
+                { "type": "agentMessage", "id": "t1-a", "text": "first answer" },
+            ]},
+            { "id": "turn-2", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t2-u", "content": [{ "type": "text", "text": "second prompt" }] },
+                { "type": "agentMessage", "id": "t2-a", "text": "second answer" },
+            ]},
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_step_reverts_the_last_turn_and_answers_with_the_removed_prompt() {
+        let (st, mut rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-1",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-1",
+        )
+        .await;
+
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-1", "rb-1", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+
+        // Pre-revert capture happens BEFORE the destructive RPC (thread/revert
+        // destroys the removed tail — the ack/broadcast/ledger data comes from
+        // this read).
+        let (read_id, method, read_params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert_eq!(read_params["threadId"], json!("thr-undo-1"));
+        assert_eq!(read_params["includeTurns"], json!(true));
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-1"));
+        let (revert_id, method2, revert_params) = peer.expect_request().await;
+        assert_eq!(method2, "thread/revert");
+        assert_eq!(
+            revert_params,
+            json!({ "threadId": "thr-undo-1", "beforeTurnId": "turn-2" })
+        );
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+
+        let frames = captured_frames(&captured);
+        assert_eq!(
+            frames.len(),
+            1,
+            "one ack on the requesting sink: {frames:?}"
+        );
+        let frame = &frames[0];
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["event"]["type"], "freshAgent.rolledBack");
+        assert_eq!(frame["event"]["requestId"], json!("rb-1"));
+        assert_eq!(frame["event"]["direction"], json!("undo"));
+        assert_eq!(frame["event"]["mode"], json!("step"));
+        assert_eq!(frame["event"]["removedPromptText"], json!("second prompt"));
+        let removed = frame["event"]["removedTurnIds"]
+            .as_array()
+            .expect("ids array");
+        assert_eq!(
+            removed.len(),
+            2,
+            "the raw turn splits into user+assistant display rows"
+        );
+        assert!(
+            removed
+                .iter()
+                .all(|id| id.as_str().unwrap_or_default().starts_with("turn-2")),
+            "split-row ids carry the raw prefix: {removed:?}"
+        );
+        assert_eq!(
+            frame["event"]["canRedo"],
+            json!(false),
+            "codex is undo-only (decision 5)"
+        );
+
+        // The broadcast converges siblings + revokes attention; NEVER a
+        // turn.complete (a rollback never chimes).
+        let mut saw_rolledback = false;
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).expect("broadcast frame json");
+            assert_ne!(
+                v["event"]["type"],
+                json!("freshAgent.turn.complete"),
+                "rollback never chimes"
+            );
+            if v["event"]["type"] == json!("freshAgent.session.rolledBack") {
+                saw_rolledback = true;
+                assert_eq!(v["event"]["sessionId"], json!("thr-undo-1"));
+                assert_eq!(v["event"]["revokeAttention"], json!(true));
+                assert_eq!(v["event"]["canRedo"], json!(false));
+                assert!(
+                    v["event"]["removedPromptText"].is_null(),
+                    "the broadcast never carries the prompt (other devices' composers are untouched)"
+                );
+            }
+        }
+        assert!(
+            saw_rolledback,
+            "the broadcast bus carried session.rolledBack"
+        );
+
+        // The durable record: codex is append-only entries; the stored can_redo
+        // bit is always false.
+        let record = fake
+            .load_rollback("codex", "thr-undo-1")
+            .expect("rollback record written");
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].prompt_text, "second prompt");
+        assert!(!record.can_redo());
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_record_write_failure_refuses_and_never_reverts() {
+        // Durable-BEFORE-mutation: a failed record pre-write REFUSES the
+        // rollback (INTERNAL_ERROR + LEDGER_WRITE_REFUSAL_COPY) and the
+        // provider history is NEVER mutated.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-nowrite",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-nowrite",
+        )
+        .await;
+        fake.set_fail_writes(true);
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-nowrite", "rb-6", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, method, _params) = peer.expect_request().await;
+        assert_eq!(
+            method, "thread/read",
+            "pre-mutation reads are still allowed"
+        );
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-nowrite"));
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::LEDGER_WRITE_REFUSAL_COPY)
+        );
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no thread/revert is issued once the record cannot be saved"
+        );
+        assert!(
+            fake.load_rollback("codex", "thr-undo-nowrite").is_none(),
+            "a refused rollback leaves no record"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_to_turn_strips_the_row_suffix_and_removes_the_tail() {
+        // `turn-1:row-0` (a display-row id) names the RAW turn `turn-1`;
+        // reverting before it removes BOTH raw turns.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-2",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-2",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-2", "rb-2", Some("turn-1:row-0")), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-2"));
+        let (revert_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        assert_eq!(
+            params["beforeTurnId"],
+            json!("turn-1"),
+            "the :row-N suffix is stripped to the raw provider turn id"
+        );
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        let removed = frames[0]["event"]["removedTurnIds"]
+            .as_array()
+            .expect("ids")
+            .len();
+        assert_eq!(removed, 4, "both raw turns -> four display rows");
+        assert_eq!(
+            frames[0]["event"]["removedPromptText"],
+            json!("first prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_mid_turn_is_busy_without_touching_the_sidecar() {
+        // The busy gate (active_turn + rollback_in_flight) is the SOLE mid-turn
+        // protection: the provider revert FORCE-INTERRUPTS (validator extra-1),
+        // so a gate hole is silent corruption — this test must prove ZERO RPCs
+        // (not even turn/interrupt) reach the sidecar for the refused attempt.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-busy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(Some("turn-live".to_string()))),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-busy",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thr-undo-busy", "rb-3", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("BUSY_TURN"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::ROLLBACK_BUSY_MESSAGE)
+        );
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        assert_eq!(frames[0]["event"]["requestId"], json!("rb-3"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "a mid-turn rollback issues ZERO RPCs (no thread/revert, no turn/interrupt)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_redo_is_refused_codex_is_undo_only() {
+        // Decision 5: codex history revert is destructive — there is NO redo
+        // primitive, permanently (the wire-level refusal cell stays forever;
+        // this handler-level check is the belt).
+        let (st, _rx, fake) = state_with_sink();
+        let (sink, captured) = capturing_sink();
+        let mut op = undo_msg("thr-anything", "rb-4", None);
+        op.direction = crate::rollback_record::RollbackDirection::Redo;
+        st.handle_rollback(op, sink).await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!("Redo is not supported for freshcodex (codex history revert is destructive; there is no redo primitive).")
+        );
+        assert!(
+            fake.rollbacks.lock().unwrap().is_empty(),
+            "a refused redo writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_empty_history_says_nothing_to_undo_and_never_reverts() {
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-empty",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-empty",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-empty", "rb-5", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &read_id,
+            json!({ "thread": { "id": "thr-undo-empty", "turns": [] } }),
+        );
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("NOTHING_TO_UNDO"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::UNDO_EMPTY_MESSAGE)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no thread/revert on empty history"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_zero_turn_paginated_read_falls_back_and_says_nothing_to_undo() {
+        // LBC-1 regression pin: a paginated thread with ZERO committed turns
+        // answers -32601 "list_turns is not supported yet" to
+        // read/includeTurns:true + turns/list until the first turn commits. The
+        // same fallback get_snapshot uses covers the rollback pre-read: retry
+        // includeTurns:false, then NOTHING_TO_UNDO — never a spurious
+        // INTERNAL_ERROR, never a revert RPC.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-zero",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-zero",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-zero", "rb-zero", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, method, params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        assert_eq!(params["includeTurns"], json!(true));
+        peer.respond_error(&read_id, -32601, "list_turns is not supported yet");
+        let (retry_id, method2, params2) = peer.expect_request().await;
+        assert_eq!(method2, "thread/read", "the include-turns fallback retries");
+        assert_eq!(params2["includeTurns"], json!(false));
+        peer.respond(&retry_id, json!({ "thread": { "id": "thr-undo-zero" } }));
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("NOTHING_TO_UNDO"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), peer.next_frame())
+                .await
+                .is_err(),
+            "no thread/revert fires for a zero-turn thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_legacy_thread_refusal_maps_the_copy_and_compensates_the_record() {
+        // -32600 "only supports paginated threads" (a pre-feature LEGACY thread,
+        // LBC-1) ⇒ UNSUPPORTED_CAPABILITY + CODEX_LEGACY_THREAD_COPY. The ledger
+        // was pre-written before the mutation attempt, so the provably-rejected
+        // revert triggers the COMPENSATING rewrite of the pre-op record.
+        let (st, _rx, fake) = state_with_sink();
+        let prior = {
+            let mut r = crate::rollback_record::RollbackRecord::empty(10);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t0" })],
+                    prompt_text: "prior".into(),
+                    at_ms: 11,
+                    epoch: 0,
+                },
+                12,
+            );
+            r
+        };
+        fake.record_rollback("codex", "thr-undo-legacy", prior.clone())
+            .await
+            .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-legacy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-legacy",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-legacy", "rb-legacy", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-legacy"));
+        let (revert_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        peer.respond_error(
+            &revert_id,
+            -32600,
+            "thread/revert only supports paginated threads",
+        );
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::CODEX_LEGACY_THREAD_COPY)
+        );
+        assert_eq!(
+            fake.load_rollback("codex", "thr-undo-legacy"),
+            Some(prior),
+            "the compensating rewrite restored the pre-op record — the ledger \
+             must not describe a rollback the provider PROVABLY rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_old_cli_revert_maps_32601_to_unsupported_capability() {
+        // A codex CLI that predates `thread/revert` (unknown-method/-32601)
+        // maps to UNSUPPORTED_CAPABILITY + CODEX_OLD_CLI_COPY (never an
+        // uncontextualized INTERNAL_ERROR).
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-oldcli",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-oldcli",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-oldcli", "rb-oldcli", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-oldcli"));
+        let (revert_id, _m, _p) = peer.expect_request().await;
+        peer.respond_error(&revert_id, -32601, "Method not found: thread/revert");
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames[0]["event"]["code"], json!("UNSUPPORTED_CAPABILITY"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(crate::rollback_record::CODEX_OLD_CLI_COPY)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_unknown_session_answers_invalid_session_id() {
+        // Task 2 review N2: the unknown-session prologue — a rollback against a
+        // never-registered thread id answers the recovery-engaging
+        // INVALID_SESSION_ID shape on the REQUESTING sink (op-keyed,
+        // `rollback:true`), with zero sidecar contact.
+        let (st, _rx, _fake) = state_with_sink();
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(undo_msg("thr-never-seen", "rb-unknown", None), sink)
+            .await;
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1, "exactly one refusal frame: {frames:?}");
+        let frame = &frames[0];
+        assert_eq!(frame["type"], json!("freshAgent.event"));
+        assert_eq!(frame["provider"], json!("codex"));
+        assert_eq!(frame["sessionType"], json!("freshcodex"));
+        assert_eq!(frame["sessionId"], json!("thr-never-seen"));
+        assert_eq!(frame["event"]["type"], json!("freshAgent.error"));
+        assert_eq!(frame["event"]["code"], json!("INVALID_SESSION_ID"));
+        assert_eq!(
+            frame["event"]["message"],
+            json!("codex session thr-never-seen not found")
+        );
+        assert_eq!(frame["event"]["rollback"], json!(true));
+        assert_eq!(frame["event"]["requestId"], json!("rb-unknown"));
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_rpc_error_rejection_compensates_the_pre_op_record() {
+        // Task 2 review M3 (rpc leg): an explicit JSON-RPC error ANSWER is a
+        // provable rejection — the provider provably did NOT apply the revert —
+        // so the pre-written record IS compensated back to the pre-op record
+        // before the refusal is answered.
+        let (st, _rx, fake) = state_with_sink();
+        let prior = {
+            let mut r = crate::rollback_record::RollbackRecord::empty(10);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t0" })],
+                    prompt_text: "prior".into(),
+                    at_ms: 11,
+                    epoch: 0,
+                },
+                12,
+            );
+            r
+        };
+        fake.record_rollback("codex", "thr-undo-rpcerr", prior.clone())
+            .await
+            .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-rpcerr",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-rpcerr",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-rpcerr", "rb-rpcerr", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-rpcerr"));
+        let (revert_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        // A plain JSON-RPC error (neither the legacy-thread nor the
+        // unknown-method shape): the provider ANSWERED — provably unmoved.
+        peer.respond_error(&revert_id, -32000, "revert exploded");
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert!(
+            frames[0]["event"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("revert exploded"),
+            "a generic rpc rejection surfaces the raw error: {frames:?}"
+        );
+        assert_eq!(
+            fake.load_rollback("codex", "thr-undo-rpcerr"),
+            Some(prior),
+            "the compensating rewrite restored the pre-op record — an explicit \
+             rpc error is a PROVABLE rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_transport_error_keeps_the_ledger_and_reports_uncertain_state() {
+        // Task 2 review M3 (transport leg): on a transport-class failure
+        // (Timeout/Closed/Transport — the peer vanishes mid-RPC) the provider
+        // may ALREADY have applied the revert, so the post-op ledger is KEPT
+        // (a compensating rewrite would erase markers for a history the
+        // provider actually truncated) and the refusal answers INTERNAL_ERROR
+        // with the uncertain-state copy.
+        let (st, _rx, fake) = state_with_sink();
+        let prior_entry_count = 1usize;
+        fake.record_rollback("codex", "thr-undo-transport", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(10);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t0" })],
+                    prompt_text: "prior".into(),
+                    at_ms: 11,
+                    epoch: 0,
+                },
+                12,
+            );
+            r
+        })
+        .await
+        .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-transport",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-transport",
+        )
+        .await;
+        let (sink, captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-transport", "rb-transport", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-transport"));
+        let (_revert_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/revert");
+        // The connection dies with the revert UNSERVED — a `Closed` transport
+        // leg; the provider may have applied the mutation before dying.
+        peer.disconnect();
+        driver.await.expect("rollback task");
+        let frames = captured_frames(&captured);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["event"]["code"], json!("INTERNAL_ERROR"));
+        assert_eq!(
+            frames[0]["event"]["message"],
+            json!(CODEX_UNCERTAIN_ROLLBACK_COPY)
+        );
+        assert_eq!(frames[0]["event"]["rollback"], json!(true));
+        let record = fake
+            .load_rollback("codex", "thr-undo-transport")
+            .expect("the post-op ledger record is KEPT");
+        assert_eq!(
+            record.entries.len(),
+            prior_entry_count + 1,
+            "no compensating rewrite after a possibly-applied mutation — the \
+             new marker stays"
+        );
+        let prompts: Vec<&str> = record
+            .entries
+            .iter()
+            .map(|e| e.prompt_text.as_str())
+            .collect();
+        assert!(
+            prompts.contains(&"second prompt"),
+            "the ledger still describes the rollback the provider may have applied: {prompts:?}"
+        );
+        assert!(
+            prompts.contains(&"prior"),
+            "the prior marker survives in the kept union: {prompts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_send_permanently_destroys_redo() {
+        // Decision 5: any new submission permanently destroys redo; decision 6:
+        // the markers survive.
+        let (st, _rx, fake) = state_with_sink();
+        fake.record_rollback("codex", "thr-send-destroy", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(1);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "t9" })],
+                    prompt_text: "p".into(),
+                    at_ms: 2,
+                    epoch: 0,
+                },
+                3,
+            );
+            r
+        })
+        .await
+        .expect("seed");
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-send-destroy",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-send-destroy",
+        )
+        .await;
+        // Drive a real send (the scripted initialize + turn/start rig the
+        // existing handle_send drives use).
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-destroy".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-send-destroy".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "fresh submission".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (turn_req, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_req, json!({ "turn": { "id": "turn-new-1" } }));
+        driver.await.expect("send task");
+        let record = fake
+            .load_rollback("codex", "thr-send-destroy")
+            .expect("record survives");
+        assert!(
+            record.redo_destroyed,
+            "any new submission permanently destroys redo (decision 5)"
+        );
+        assert!(!record.can_redo(), "destroy clears the stored can_redo bit");
+        assert_eq!(
+            record.entries.len(),
+            1,
+            "markers survive the destroy (decision 6)"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_after_a_destroyed_redo_starts_a_new_epoch_but_keeps_all_markers() {
+        // r3 epoch rule: a new UNDO landing while `redo_destroyed` is set starts
+        // a NEW epoch that clears ONLY the redo-capable chain state
+        // (`redo_destroyed` clears — the record's redo fields now describe the
+        // NEW chain; the prior chain's redo stays permanently dead). `entries`
+        // is the UNION of every epoch's markers and is NEVER dropped.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-epoch",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-epoch",
+        )
+        .await;
+        fake.record_rollback("codex", "thr-epoch", {
+            let mut r = crate::rollback_record::RollbackRecord::empty(1);
+            r.push_entry(
+                crate::rollback_record::RollbackEntry {
+                    removed_turns: vec![json!({ "id": "old-epoch" })],
+                    prompt_text: "old".into(),
+                    at_ms: 2,
+                    epoch: 0,
+                },
+                3,
+            );
+            r.destroy_redo(4);
+            r
+        })
+        .await
+        .expect("seed");
+        let (sink, _captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-epoch", "rb-epoch", None), sink)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, _m, _p) = peer.expect_request().await;
+        peer.respond(&read_id, two_turn_thread_read("thr-epoch"));
+        let (revert_id, _m2, _p2) = peer.expect_request().await;
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+        let record = fake.load_rollback("codex", "thr-epoch").expect("record");
+        assert!(
+            !record.redo_destroyed,
+            "the redo state now describes the NEW chain (the prior chain's redo stays dead)"
+        );
+        assert!(
+            !record.can_redo(),
+            "codex canRedo is always false (undo-only)"
+        );
+        assert_eq!(
+            record.entries.len(),
+            2,
+            "r3: the UNION of every epoch's markers — entries are never dropped"
+        );
+        assert_eq!(record.entries[0].prompt_text, "old");
+        assert_eq!(record.entries[1].prompt_text, "second prompt");
+        // Delta-r1 F8 case (a): the load-time destroy bit opened a NEW epoch —
+        // the frozen prior entry KEEPS its own epoch (0), the new op pushed with
+        // the bumped counter (1).
+        assert_eq!(record.current_epoch, 1);
+        assert_eq!(
+            record.entries[0].epoch, 0,
+            "frozen entries keep their epochs"
+        );
+        assert_eq!(
+            record.entries[1].epoch, 1,
+            "the new op records the bumped (current) epoch"
+        );
+    }
+
+    /// One remaining completed turn — the post-revert read shape after the
+    /// two-turn fixture's tail is gone.
+    fn one_turn_thread_read(thread_id: &str) -> Value {
+        json!({ "thread": { "id": thread_id, "turns": [
+            { "id": "turn-1", "status": "completed", "items": [
+                { "type": "userMessage", "id": "t1-u", "content": [{ "type": "text", "text": "first prompt" }] },
+                { "type": "agentMessage", "id": "t1-a", "text": "first answer" },
+            ]},
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_double_undo_within_one_epoch_keeps_the_marker_bucket_in_conversation_order(
+    ) {
+        // Whole-branch review Minor-3: the codex marker bucket is CONVERSATION
+        // order (the plan :165 union rule wins over the codex bullet at :166).
+        // Two sequential undos inside ONE epoch (no submission between) remove
+        // turn-2 then turn-1; the second op's entry is spliced BEFORE the
+        // first's, so the bucket reads [turn-1 markers…, turn-2 markers…]
+        // ascending — the opencode rebuild / claude splice parity.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-undo-order",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-undo-order",
+        )
+        .await;
+
+        // First undo: the two-turn thread loses turn-2 ("second prompt").
+        let (sink1, cap1) = capturing_sink();
+        let driver1 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-order", "rb-o1", None), sink1)
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (read_id, m1, _p1) = peer.expect_request().await;
+        assert_eq!(m1, "thread/read");
+        peer.respond(&read_id, two_turn_thread_read("thr-undo-order"));
+        let (revert_id, m2, p2) = peer.expect_request().await;
+        assert_eq!(m2, "thread/revert");
+        assert_eq!(p2["beforeTurnId"], json!("turn-2"));
+        peer.respond(&revert_id, json!({}));
+        driver1.await.expect("first rollback task");
+        assert_eq!(
+            captured_frames(&cap1).len(),
+            1,
+            "the ack plane is untouched by the ordering change"
+        );
+
+        // Second undo, SAME epoch (redo_destroyed never set): the thread now
+        // reads as one turn, so the step removes turn-1 ("first prompt").
+        let (sink2, _cap2) = capturing_sink();
+        let driver2 = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-undo-order", "rb-o2", None), sink2)
+                    .await;
+            })
+        };
+        let (read_id2, m3, _p3) = peer.expect_request().await;
+        assert_eq!(m3, "thread/read");
+        peer.respond(&read_id2, one_turn_thread_read("thr-undo-order"));
+        let (revert_id2, m4, p4) = peer.expect_request().await;
+        assert_eq!(m4, "thread/revert");
+        assert_eq!(p4["beforeTurnId"], json!("turn-1"));
+        peer.respond(&revert_id2, json!({}));
+        driver2.await.expect("second rollback task");
+
+        let record = fake
+            .load_rollback("codex", "thr-undo-order")
+            .expect("record");
+        assert_eq!(
+            record
+                .entries
+                .iter()
+                .map(|e| e.prompt_text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first prompt", "second prompt"],
+            "the second undo's entry splices BEFORE the first's — sequential undos within one \
+             epoch read t1..tn ascending"
+        );
+        let bucket_ids: Vec<String> = record
+            .entries
+            .iter()
+            .flat_map(|e| e.removed_turns.iter())
+            .filter_map(|t| {
+                t.get("turnId")
+                    .or_else(|| t.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            bucket_ids.len(),
+            4,
+            "each removed step is a user+assistant row pair: {bucket_ids:?}"
+        );
+        assert!(
+            bucket_ids[..2].iter().all(|id| id.starts_with("turn-1"))
+                && bucket_ids[2..].iter().all(|id| id.starts_with("turn-2")),
+            "the flattened marker bucket reads [t1_markers…, t2_markers…]: {bucket_ids:?}"
+        );
+    }
+
+    /// An N-raw-turn `thread/read` body: turn ids `turn-{i}` for i in
+    /// [first, first+count), each a user+agent pair with text `prompt {i}` /
+    /// `answer {i}`.
+    fn codex_thread_read_span(thread_id: &str, first: usize, count: usize) -> Value {
+        let turns: Vec<Value> = (first..first + count)
+            .map(|i| {
+                json!({ "id": format!("turn-{i}"), "status": "completed", "items": [
+                    { "type": "userMessage", "id": format!("t{i}-u"), "content": [{ "type": "text", "text": format!("prompt {i}") }] },
+                    { "type": "agentMessage", "id": format!("t{i}-a"), "text": format!("answer {i}") },
+                ]})
+            })
+            .collect();
+        json!({ "thread": { "id": thread_id, "turns": turns } })
+    }
+
+    /// The next REAL request on the scripted peer, answering the client's
+    /// lazy initialize/initialized handshake transparently (the first RPC any
+    /// drive issues triggers it; `client.ts:777-778`).
+    async fn expect_codex_request_handshake_aware(
+        peer: &freshell_codex::ChannelPeer,
+    ) -> (freshell_codex::RequestId, String, serde_json::Value) {
+        loop {
+            let (id, method, params) = peer.expect_request().await;
+            if method == "initialize" {
+                peer.respond(
+                    &id,
+                    json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+                );
+                let _ = peer.expect_notification().await; // initialized
+                continue;
+            }
+            return (id, method, params);
+        }
+    }
+
+    /// Drive one step-undo op: handle_rollback → thread/read (answered with
+    /// `read_body`) → thread/revert (answered ok).
+    async fn drive_codex_undo(
+        st: &FreshCodexState,
+        peer: &freshell_codex::ChannelPeer,
+        thread_id: &str,
+        request_id: &str,
+        read_body: Value,
+    ) {
+        let (sink, _captured) = capturing_sink();
+        let driver = {
+            let st = st.clone();
+            let thread_id = thread_id.to_string();
+            let request_id = request_id.to_string();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg(&thread_id, &request_id, None), sink)
+                    .await;
+            })
+        };
+        let (read_id, method, _p) = expect_codex_request_handshake_aware(peer).await;
+        assert_eq!(method, "thread/read");
+        peer.respond(&read_id, read_body);
+        let (revert_id, method2, _p2) = expect_codex_request_handshake_aware(peer).await;
+        assert_eq!(method2, "thread/revert");
+        peer.respond(&revert_id, json!({}));
+        driver.await.expect("rollback task");
+    }
+
+    /// Wait until the session's active-turn tracker CLEARS (the real
+    /// consumer's turn/completed clear edge), bounded.
+    async fn await_codex_active_turn_clear(st: &FreshCodexState, thread_id: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let active_turn = {
+                let guard = st.sessions.lock().await;
+                guard.get(thread_id).expect("session").active_turn.clone()
+            };
+            let clear = active_turn.lock().expect("active_turn mutex").is_none();
+            if clear {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "active_turn never cleared (the turn/completed consumer edge did not land)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_rollback_undo_send_undo_undo_freezes_epoch_zero_and_orders_the_new_epoch_ascending(
+    ) {
+        // Delta-r1 F8's codified multi-epoch case: undo → send (decision 5
+        // destroy) → undo → undo ⇒ the marker bucket is the FIRST epoch's
+        // frozen prefix, then the NEW epoch's entries in conversation order
+        // ascending — literal bookkeeping only, positions never read at_ms.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thr-f8",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-f8",
+        )
+        .await;
+
+        // Undo #1 (epoch 0): the four-turn thread loses turn-4.
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-1",
+            codex_thread_read_span("thr-f8", 1, 4),
+        )
+        .await;
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        assert_eq!(record.current_epoch, 0);
+        assert_eq!(record.entries.len(), 1);
+        assert_eq!(record.entries[0].epoch, 0);
+        assert_eq!(record.entries[0].prompt_text, "prompt 4");
+
+        // A submission in between destroys redo (decision 5) — the epoch
+        // boundary marker. The send is driven start→completed through the REAL
+        // consumer so the active-turn tracker clears before the next undo.
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-f8-send".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-f8".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "prompt 5".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let (turn_start_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&turn_start_id, json!({ "turn": { "id": "turn-5" } }));
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thr-f8", "turn": { "id": "turn-5", "status": "completed" } }),
+        );
+        send_driver.await.expect("send task");
+        await_codex_active_turn_clear(&st, "thr-f8").await;
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        assert!(
+            record.redo_destroyed,
+            "submitting after the undo retired redo (decision 5)"
+        );
+
+        // Undo #2: the destroy bit at load opens EPOCH 1 (turn-3 rolls back).
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-2",
+            codex_thread_read_span("thr-f8", 1, 3),
+        )
+        .await;
+        // Undo #3, SAME epoch: turn-2 rolls back and splices BEFORE the
+        // epoch-1 prior entry (conversation order ascending).
+        drive_codex_undo(
+            &st,
+            &peer,
+            "thr-f8",
+            "rb-f8-3",
+            codex_thread_read_span("thr-f8", 1, 2),
+        )
+        .await;
+
+        let record = fake.load_rollback("codex", "thr-f8").expect("record");
+        let shape: Vec<(u32, &str)> = record
+            .entries
+            .iter()
+            .map(|e| (e.epoch, e.prompt_text.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(0, "prompt 4"), (1, "prompt 2"), (1, "prompt 3")],
+            "first epoch's frozen prefix, then the new epoch ascending — literal epoch bookkeeping, never timestamps"
+        );
+        assert_eq!(record.current_epoch, 1);
+        assert!(
+            !record.redo_destroyed,
+            "the new epoch cleared only the redo chain state"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_send_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
+        // r2 serialization discipline: ONE per-session async turn lock, held
+        // across the WHOLE rollback handler. handle_send takes the same lock
+        // (never touching rollback_in_flight) — "send waits, rollback wins,
+        // then destroys". While thread/revert is parked UNSERVED, the racing
+        // send must not reach the sidecar at all; after the revert resolves,
+        // the send's turn/start follows and the final record carries
+        // redo_destroyed.
+        let (st, _rx, fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-race",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-race",
+        )
+        .await;
+        let (sink, _captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-race", "rb-race", None), sink)
+                    .await;
+            })
+        };
+        let send_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(FreshAgentSend {
+                    request_id: Some("req-race".to_string()),
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thr-race".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    text: "the submission that must wait".to_string(),
+                    images: None,
+                    cwd: None,
+                    settings: None,
+                })
+                .await;
+            })
+        };
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            answer_initialize(&peer).await;
+            let (read_id, method, _p) = peer.expect_request().await;
+            assert_eq!(method, "thread/read");
+            peer.respond(&read_id, two_turn_thread_read("thr-race"));
+            let (revert_id, method2, _p) = peer.expect_request().await;
+            assert_eq!(method2, "thread/revert");
+            // The revert is mid-flight holding the turn lock: the racing send
+            // (spawned above, immediately runnable) must NOT have reached the
+            // sidecar — no turn/start frame exists yet.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), peer.next_frame())
+                    .await
+                    .is_err(),
+                "the send waits on the turn lock while the rollback holds it"
+            );
+            peer.respond(&revert_id, json!({}));
+            let (turn_id, method3, params3) = peer.expect_request().await;
+            assert_eq!(
+                method3, "turn/start",
+                "thread/revert lands strictly BEFORE the waiting send's turn/start"
+            );
+            assert_eq!(params3["threadId"], json!("thr-race"));
+            peer.respond(&turn_id, json!({ "turn": { "id": "turn-race-1" } }));
+            rollback_driver.await.expect("rollback task");
+            send_driver.await.expect("send task");
+        })
+        .await;
+        joined.expect("no deadlock: send + rollback both complete within the budget");
+        let record = fake
+            .load_rollback("codex", "thr-race")
+            .expect("a record exists");
+        assert_eq!(record.entries.len(), 1, "the rollback wrote its marker");
+        assert!(
+            record.redo_destroyed,
+            "send waits, rollback wins, then destroys"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_compact_plus_undo_serializes_on_the_turn_lock_without_deadlock() {
+        // Task 2 review M1: `handle_compact` holds the session turn lock across
+        // its busy gate AND the `thread/compact/start` RPC (the `handle_send`
+        // discipline), so a rollback holding the lock makes a racing compact
+        // WAIT — `thread/revert` lands strictly BEFORE `thread/compact/start`,
+        // and the revert can never force-interrupt a compact turn the busy
+        // gate never saw.
+        let (st, _rx, _fake) = state_with_sink();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session(
+            &st,
+            "thr-crace",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-crace",
+        )
+        .await;
+        let (sink, _captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(undo_msg("thr-crace", "rb-crace", None), sink)
+                    .await;
+            })
+        };
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thr-crace")).await;
+            })
+        };
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            answer_initialize(&peer).await;
+            let (read_id, method, _p) = peer.expect_request().await;
+            assert_eq!(method, "thread/read");
+            peer.respond(&read_id, two_turn_thread_read("thr-crace"));
+            let (revert_id, method2, _p) = peer.expect_request().await;
+            assert_eq!(method2, "thread/revert");
+            // The revert is mid-flight holding the turn lock: the racing
+            // compact must NOT have reached the sidecar — no
+            // thread/compact/start frame exists yet.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), peer.next_frame())
+                    .await
+                    .is_err(),
+                "the compact waits on the turn lock while the rollback holds it"
+            );
+            peer.respond(&revert_id, json!({}));
+            let (compact_id, method3, params3) = peer.expect_request().await;
+            assert_eq!(
+                method3, "thread/compact/start",
+                "thread/revert lands strictly BEFORE the waiting compact's RPC"
+            );
+            assert_eq!(params3["threadId"], json!("thr-crace"));
+            peer.respond(&compact_id, json!({}));
+            rollback_driver.await.expect("rollback task");
+            compact_driver.await.expect("compact task");
+        })
+        .await;
+        joined.expect("no deadlock: compact + rollback both complete within the budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_parses_the_rollouts_durable_history_mode() {
+        // r3 durability: thread/resume takes no mode param; the rollout's
+        // persisted `session_meta.history_mode` is the durable source of truth
+        // (validator-C proved the mode persists there). A paginated thread
+        // keeps undo capability across normal session rehydration; ONLY a
+        // missing/unparseable durable mode stamps legacy (undo:false).
+        let _guard = ENV_LOCK.lock().await;
+        let codex_home = std::env::var("CODEX_HOME").expect("isolated CODEX_HOME");
+        for (case, thread_id, meta_line, expected) in [
+            (
+                "paginated",
+                "thr-hist-paged",
+                Some(
+                    r#"{"timestamp":"2026-08-23T00:00:00.000Z","type":"session_meta","payload":{"id":"thr-hist-paged","cwd":"/w","history_mode":"paginated"}}"#,
+                ),
+                Some(freshell_codex::HistoryMode::Paginated),
+            ),
+            (
+                "missing",
+                "thr-hist-missing",
+                Some(
+                    r#"{"timestamp":"2026-08-23T00:00:00.000Z","type":"session_meta","payload":{"id":"thr-hist-missing","cwd":"/w"}}"#,
+                ),
+                None,
+            ),
+            (
+                "unparseable",
+                "thr-hist-bad",
+                Some(
+                    r#"{"timestamp":"2026-08-23T00:00:00.000Z","type":"session_meta","payload":{"id":"thr-hist-bad","cwd":"/w","history_mode":42}}"#,
+                ),
+                None,
+            ),
+            ("absent", "thr-hist-absent", None, None),
+        ] {
+            // A durable rollout whose session_meta carries the named mode (or
+            // none at all — the "no rollout file" sub-case), written into the
+            // isolated CODEX_HOME the ENV_LOCK guard installed.
+            if let Some(line) = meta_line {
+                let dir = std::path::Path::new(&codex_home)
+                    .join("sessions")
+                    .join("2026")
+                    .join("08")
+                    .join("23");
+                std::fs::create_dir_all(&dir).expect("sessions dir");
+                std::fs::write(
+                    dir.join(format!("rollout-2026-08-23T00-00-00-{thread_id}.jsonl")),
+                    format!("{line}\n"),
+                )
+                .expect("write fake rollout");
+            }
+            configure_fake_codex_cmd("{}");
+            let (st, mut rx) = state_with_bus();
+            st.handle_create(
+                FreshAgentCreate {
+                    request_id: format!("req-{case}"),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: Some(thread_id.to_string()),
+                    session_ref: None,
+                    model: None,
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
+            .await;
+            let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                    if frame["type"] == "freshAgent.created"
+                        || frame["type"] == "freshAgent.create.failed"
+                    {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .expect("the fake app-server responds within the budget");
+            assert_eq!(
+                created["type"], "freshAgent.created",
+                "fixture resume-create failed ({case}): {created}"
+            );
+            assert_eq!(created["sessionId"], json!(thread_id));
+            let mode = {
+                let guard = st.sessions.lock().await;
+                guard
+                    .get(thread_id)
+                    .expect("the resumed session registered")
+                    .history_mode
+            };
+            assert_eq!(
+                mode, expected,
+                "{case}: the durable rollout meta is the history-mode source of truth"
+            );
+            st.shutdown().await;
+        }
     }
 
     // -- freshAgent.attach (PR-4) --
@@ -7313,6 +13051,218 @@ pub(crate) mod tests {
                 .contains_key("historical-thread-attach"),
             "the resumed thread must be registered for reuse by a later send/attach"
         );
+    }
+
+    /// Focused-ep5-r2 Finding 4 (retire-on-kill round 3), the codex lane: an
+    /// attach-resume of a kill-closed thread whose record is LINEAGE-ONLY
+    /// (load_settings answers None, so the V7-gated refresh write is skipped)
+    /// must still return the row to Bound — a successful attach records the
+    /// row live-again unconditionally.
+    #[tokio::test]
+    async fn attach_resume_of_a_killed_lineage_only_thread_revives_the_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, rx, fake) = state_with_sink();
+        let thread = "historical-thread-lineage";
+        // The lineage-only seed: a row exists with a blank settings snapshot.
+        fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: thread.into(),
+            mode: "freshcodex".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            settings: crate::identity_sink::FreshAgentSettings::default(),
+        })
+        .await
+        .expect("lineage seed write");
+        assert!(
+            fake.load_settings("codex", thread).is_none(),
+            "fixture: lineage-only — no settings snapshot (the refresh gate's skip case)"
+        );
+
+        // The close: row Closed + fence (by name — the map never held it).
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "fixture: the kill closed the row"
+        );
+
+        // The attach-resume (the fake app server answers thread/resume with
+        // the requested id — the donor test's fixture).
+        st.handle_attach(attach_msg(thread)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if st.sessions.lock().await.contains_key(thread) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attach-resume never registered the session"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Drain any pending frame so the bus receiver's lifetime is not the
+        // resume's completion signal.
+        drop(rx);
+
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Bound),
+            "a successful attach-resume must return the kill-closed row to Bound"
+        );
+        assert!(
+            fake.claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread.to_string())),
+            "the claim's revive fired even though the V7 refresh gate skipped the settings write"
+        );
+        // The V7 gate held: NO refresh binding write landed for the thread
+        // (the lone bindings entry is the seed) — revive is not a settings concern.
+        assert_eq!(
+            fake.bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| b.provider == "codex" && b.session_id == thread)
+                .count(),
+            1,
+            "no laundered settings write for the lineage-only resume"
+        );
+    }
+
+    /// Focused-ep5-r3 Finding 1 (retire-on-kill round 4), the codex
+    /// attach-resume lane: the user closes the pane while the resume is
+    /// still in flight (`thread/resume` outstanding) — the kill records the
+    /// close BEFORE the claim's commit. The commit must REFUSE: the row the
+    /// close retired stays Retired, the newer fence stands, nothing
+    /// registers, and the just-spawned sidecar is torn down. (The fake
+    /// sink's claim gate holds the commit's decide point — the deterministic
+    /// twin of the ledger guard contended mid-claim; the decision itself is
+    /// the real conditional.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_mid_attach_resume_is_never_undone_by_the_claim_commit() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, rx, fake) = state_with_sink();
+        let thread = "historical-thread-killed-mid-resume";
+        fake.seed(
+            "codex",
+            thread,
+            crate::identity_sink::FreshAgentSettings {
+                cwd: Some("/w".into()),
+                ..crate::identity_sink::FreshAgentSettings::default()
+            },
+        );
+
+        // The close the user will MEAN: row Closed + fence, before the attach.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        let claim_start_snapshot = fake.kill_tombstone_at_ms("codex", thread);
+        assert!(
+            claim_start_snapshot.is_some(),
+            "fixture: the fence is durable"
+        );
+
+        // Gate the claim's commit, then start the attach.
+        let gate = fake.arm_claim_commit_gate("codex", thread);
+        let st2 = st.clone();
+        let attach = tokio::spawn(async move {
+            st2.handle_attach(attach_msg(thread)).await;
+        });
+
+        // The resume reached its commit point (the provider resume SUCCEEDED).
+        gate.entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the claim reached its commit");
+
+        // THE INTERLEAVING: the user closes the pane now — the kill lands
+        // before the commit decides.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+        })
+        .await;
+        assert_ne!(
+            fake.kill_tombstone_at_ms("codex", thread),
+            claim_start_snapshot,
+            "fixture: the mid-claim close advanced the durable dead-state"
+        );
+        gate.release.send(()).expect("release the claim decision");
+        gate.decided
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the commit decided");
+
+        // The attach unwinds WITHOUT registering; the rest of the lane's tail
+        // (status frame) drains harmlessly.
+        tokio::time::timeout(std::time::Duration::from_secs(15), attach)
+            .await
+            .expect("attach resolves")
+            .expect("attach task completed");
+        drop(rx);
+
+        // No commit side effect ran: the row stays Retired, the newer fence
+        // stands (never cleared by the stale claim), and no session registers.
+        assert_eq!(
+            fake.states
+                .lock()
+                .unwrap()
+                .get(&("codex".to_string(), thread.to_string()))
+                .copied(),
+            Some(crate::identity_sink::FakeRowState::Closed),
+            "the claim must never revive the row the newer close retired"
+        );
+        assert!(
+            fake.kill_tombstones
+                .lock()
+                .unwrap()
+                .contains_key(&("codex".to_string(), thread.to_string())),
+            "the newer kill's fence stands — never cleared by the stale claim"
+        );
+        assert!(
+            fake.claim_refusals
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread.to_string())),
+            "the refusal is positively logged"
+        );
+        assert!(
+            !fake
+                .claim_commits
+                .lock()
+                .unwrap()
+                .contains(&("codex".to_string(), thread.to_string())),
+            "no commit side effect ran"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key(thread),
+            "the orphan session was torn down, never registered"
+        );
+        st.shutdown().await;
     }
 
     /// Decision-table row: NOT tracked + the app-server says the thread genuinely doesn't
@@ -7665,21 +13615,25 @@ pub(crate) mod tests {
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-retryable-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: None,
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-retryable-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
         std::env::remove_var("CODEX_CMD");
 
@@ -7726,6 +13680,7 @@ pub(crate) mod tests {
             sandbox: None,
             effort: None,
             plugins: None,
+            tab_id: None,
         }
     }
 
@@ -7776,7 +13731,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-sequential-marker-unused");
 
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
         let first = await_created(&mut rx, "req-dedup-seq").await;
         assert_eq!(
             first["type"], "freshAgent.created",
@@ -7784,7 +13739,7 @@ pub(crate) mod tests {
         );
         let first_session_id = first["sessionId"].as_str().unwrap().to_string();
 
-        st.handle_create(create_msg("req-dedup-seq")).await;
+        st.handle_create(create_msg("req-dedup-seq"), None).await;
         let second = await_created(&mut rx, "req-dedup-seq").await;
 
         assert_eq!(
@@ -7817,8 +13772,8 @@ pub(crate) mod tests {
         let st1 = st.clone();
         let st2 = st.clone();
         tokio::join!(
-            st1.handle_create(create_msg("req-dedup-race")),
-            st2.handle_create(create_msg("req-dedup-race")),
+            st1.handle_create(create_msg("req-dedup-race"), None),
+            st2.handle_create(create_msg("req-dedup-race"), None),
         );
 
         let first = await_created(&mut rx, "req-dedup-race").await;
@@ -7854,11 +13809,11 @@ pub(crate) mod tests {
         // requestIds -> distinct sessions" on its own merits, not on an accident of the
         // fixture's default.
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-a"}"#);
-        st.handle_create(create_msg("req-dedup-a")).await;
+        st.handle_create(create_msg("req-dedup-a"), None).await;
         let a = await_created(&mut rx, "req-dedup-a").await;
 
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-b"}"#);
-        st.handle_create(create_msg("req-dedup-b")).await;
+        st.handle_create(create_msg("req-dedup-b"), None).await;
         let b = await_created(&mut rx, "req-dedup-b").await;
 
         assert_ne!(
@@ -7887,7 +13842,7 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-post-exit-marker-unused");
 
-        st.handle_create(create_msg("req-dedup-exit")).await;
+        st.handle_create(create_msg("req-dedup-exit"), None).await;
         let created = await_created(&mut rx, "req-dedup-exit").await;
         let session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -7903,7 +13858,7 @@ pub(crate) mod tests {
         // app-server fail?".
         configure_fake_codex_cmd("{}");
 
-        st.handle_create(create_msg("req-dedup-exit")).await;
+        st.handle_create(create_msg("req-dedup-exit"), None).await;
         let replay = await_created(&mut rx, "req-dedup-exit").await;
 
         assert_eq!(
@@ -7932,7 +13887,7 @@ pub(crate) mod tests {
         let capture = tracing_capture::capture_by_session("dedup-post-kill-marker-unused");
 
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-kill-1"}"#);
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
         let created = await_created(&mut rx, "req-dedup-kill").await;
         let killed_session_id = created["sessionId"].as_str().unwrap().to_string();
 
@@ -7948,7 +13903,7 @@ pub(crate) mod tests {
         // absent an override) so a genuine re-create is provably distinguishable from
         // an accidental fixture coincidence, not just from a cache replay.
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-dedup-kill-2"}"#);
-        st.handle_create(create_msg("req-dedup-kill")).await;
+        st.handle_create(create_msg("req-dedup-kill"), None).await;
         let recreated = await_created(&mut rx, "req-dedup-kill").await;
 
         assert_ne!(
@@ -7990,7 +13945,7 @@ pub(crate) mod tests {
         for i in 0..30 {
             let request_id = format!("req-order-{i}");
             configure_fake_codex_cmd(&format!(r#"{{"threadStartThreadId":"thread-order-{i}"}}"#));
-            st.handle_create(create_msg(&request_id)).await;
+            st.handle_create(create_msg(&request_id), None).await;
 
             // Settle window: give the (possibly-racing) consumer task a chance to run
             // and broadcast its first status-snapshot event, if it's going to.
@@ -8048,24 +14003,28 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-resume-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-existing-durable".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-resume-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-existing-durable".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -8111,24 +14070,28 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-sref-resume-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-existing-durable".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-sref-resume-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-existing-durable".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -8185,24 +14148,28 @@ pub(crate) mod tests {
         );
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-resume-2".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-truly-gone".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-resume-2".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-truly-gone".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -8247,24 +14214,28 @@ pub(crate) mod tests {
         configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
         let (st, mut rx) = state_with_bus();
 
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-term25-create".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: Some(freshell_protocol::SessionLocator {
-                provider: "codex".to_string(),
-                session_id: "thread-A-requested".to_string(),
-            }),
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-term25-create".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: Some(freshell_protocol::SessionLocator {
+                    provider: "codex".to_string(),
+                    session_id: "thread-A-requested".to_string(),
+                }),
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
         .await;
 
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -8705,9 +14676,10 @@ pub(crate) mod tests {
         )
     }
 
-    const ISOLATED_CODEX_ENV_KEYS: [&str; 5] = [
+    const ISOLATED_CODEX_ENV_KEYS: [&str; 6] = [
         "CODEX_HOME",
         "CODEX_CMD",
+        "FRESHELL_HOME",
         "FAKE_CODEX_APP_SERVER_BEHAVIOR",
         "FAKE_CODEX_APP_SERVER_ARG_LOG",
         "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
@@ -8854,21 +14826,35 @@ pub(crate) mod tests {
         st: &FreshCodexState,
         rx: &mut tokio::sync::broadcast::Receiver<String>,
     ) -> String {
-        st.handle_create(FreshAgentCreate {
-            request_id: "req-1".to_string(),
-            session_type: freshell_protocol::SessionType::Freshcodex,
-            provider: Some(freshell_protocol::AgentProvider::Codex),
-            cwd: None,
-            legacy_restore_context: None,
-            resume_session_id: None,
-            session_ref: None,
-            model: None,
-            model_selection: None,
-            permission_mode: None,
-            sandbox: None,
-            effort: None,
-            plugins: None,
-        })
+        create_real_fake_session_with_provenance(st, rx, None).await
+    }
+
+    /// [`create_real_fake_session`] with the D8 connection provenance the WS
+    /// dispatch would stamp on a connection-scoped create (the parking tests).
+    async fn create_real_fake_session_with_provenance(
+        st: &FreshCodexState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        provenance: Option<crate::BindProvenance>,
+    ) -> String {
+        st.handle_create(
+            FreshAgentCreate {
+                request_id: "req-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            provenance,
+        )
         .await;
 
         let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -8947,21 +14933,25 @@ pub(crate) mod tests {
         // inlines the same `freshAgent.create` the existing create tests send.
         let tmp_cwd = std::env::temp_dir().to_string_lossy().to_string();
         state
-            .handle_create(FreshAgentCreate {
-                request_id: "req-bind-1".to_string(),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: Some(tmp_cwd),
-                legacy_restore_context: None,
-                resume_session_id: None,
-                session_ref: None,
-                model: Some("gpt-5.3-codex-spark".to_string()),
-                model_selection: None,
-                permission_mode: Some("on-request".to_string()),
-                sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
-                effort: Some("high".to_string()),
-                plugins: None,
-            })
+            .handle_create(
+                FreshAgentCreate {
+                    request_id: "req-bind-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: Some(tmp_cwd),
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    model_selection: None,
+                    permission_mode: Some("on-request".to_string()),
+                    sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                    effort: Some("high".to_string()),
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
             .await;
         let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -8994,6 +14984,83 @@ pub(crate) mod tests {
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
     }
 
+    /// D8 lane-reach (restore-open-sessions-only, review round 3): the
+    /// WS-dispatched connection provenance threaded into `handle_create` must
+    /// reach the binding row at thread/start. Optional ledger fields would
+    /// otherwise let this lane keep writing `None` silently (and the recovery
+    /// judgment would then drop genuinely-open freshcodex sessions).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_binding_carries_the_creates_connection_provenance() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let tmp_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        state
+            .handle_create(
+                FreshAgentCreate {
+                    request_id: "req-bind-prov".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: Some(tmp_cwd),
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: None,
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                Some(crate::BindProvenance::for_create(
+                    Some("client-codex"),
+                    Some("device-codex"),
+                    Some("tab-codex"),
+                    7_777,
+                )),
+            )
+            .await;
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "fixture create failed: {created}"
+        );
+        let thread_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == thread_id)
+            .expect("binding row written at thread/start");
+        assert_eq!(
+            b.asserted_stamps().client_instance_id.as_deref(),
+            Some("client-codex")
+        );
+        assert_eq!(
+            b.asserted_stamps().device_id.as_deref(),
+            Some("device-codex")
+        );
+        assert_eq!(
+            b.asserted_stamps().tab_key.as_deref(),
+            Some("device-codex:tab-codex")
+        );
+    }
+
     /// Task 4 (P1.13, awaited-writes policy): a failed ledger write is surfaced as a
     /// live `freshAgent.error{code:'LEDGER_WRITE_FAILED'}` frame (never a silent
     /// warn-and-drop) AND the create still succeeds -- a write failure never blocks
@@ -9009,21 +15076,25 @@ pub(crate) mod tests {
         state.set_identity_sink(fake.clone());
 
         state
-            .handle_create(FreshAgentCreate {
-                request_id: "req-ledger-fail".to_string(),
-                session_type: freshell_protocol::SessionType::Freshcodex,
-                provider: Some(freshell_protocol::AgentProvider::Codex),
-                cwd: None,
-                legacy_restore_context: None,
-                resume_session_id: None,
-                session_ref: None,
-                model: Some("gpt-5.3-codex-spark".to_string()),
-                model_selection: None,
-                permission_mode: None,
-                sandbox: None,
-                effort: None,
-                plugins: None,
-            })
+            .handle_create(
+                FreshAgentCreate {
+                    request_id: "req-ledger-fail".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
             .await;
 
         // Drain the bus (bounded, as in the alarm tests): both the alarm frame and
@@ -9704,7 +15775,7 @@ pub(crate) mod tests {
         );
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(&parent_id, "fork-req-crash", None), sink)
+        st.handle_fork(fork_msg(&parent_id, "fork-req-crash", None), None, sink)
             .await;
 
         // The fork SUCCEEDED on the requesting connection — never a loud failure
@@ -9864,7 +15935,7 @@ pub(crate) mod tests {
         );
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(&old_id, "fork-req-mint", None), sink)
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint", None), None, sink)
             .await;
 
         // THE F-1 pin: the forked reply's EXACT envelope is keyed to the RESOLVED parent id
@@ -10035,7 +16106,7 @@ pub(crate) mod tests {
         );
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg(&old_id, "fork-req-mint-fail", None), sink)
+        st.handle_fork(fork_msg(&old_id, "fork-req-mint-fail", None), None, sink)
             .await;
 
         // THE F-1 failure-leg pin: the FULL nested envelope, keyed to the RESOLVED parent.
@@ -10161,7 +16232,7 @@ pub(crate) mod tests {
             let st = st.clone();
             let old_id = old_id.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg(&old_id, "fork-req-g1", None), sink1)
+                st.handle_fork(fork_msg(&old_id, "fork-req-g1", None), None, sink1)
                     .await;
             })
         };
@@ -10215,7 +16286,11 @@ pub(crate) mod tests {
         let (sink2, captured2) = capturing_sink();
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_fork(fork_msg("parent-new-mint", "fork-req-g2", None), sink2),
+            st.handle_fork(
+                fork_msg("parent-new-mint", "fork-req-g2", None),
+                None,
+                sink2,
+            ),
         )
         .await
         .expect("the re-keyed duplicate fork is refused inline, never upstream-blocking");
@@ -10268,8 +16343,12 @@ pub(crate) mod tests {
         let driver3 = {
             let st = st.clone();
             tokio::spawn(async move {
-                st.handle_fork(fork_msg("parent-new-mint", "fork-req-g3", None), sink3)
-                    .await;
+                st.handle_fork(
+                    fork_msg("parent-new-mint", "fork-req-g3", None),
+                    None,
+                    sink3,
+                )
+                .await;
             })
         };
         driver3.await.expect("fork #3 task");
@@ -10463,6 +16542,18 @@ pub(crate) mod tests {
         assert_eq!(snapshot["tokenUsage"]["inputTokens"], json!(0));
         assert_eq!(snapshot["pendingApprovals"], json!([]));
         assert_eq!(snapshot["extensions"]["codex"], json!({}));
+
+        // kata z7j7: codex honors all four settings knobs per send (merged over
+        // the session baseline before turn/start).
+        assert_eq!(
+            snapshot["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "per-send",
+                "permissionMode": "per-send",
+            })
+        );
 
         // The turn's transcript text survived the mapping.
         let turns = snapshot["turns"].as_array().expect("turns array");
@@ -11133,6 +17224,190 @@ pub(crate) mod tests {
         assert_eq!(
             turns[1]["items"][0]["text"],
             json!("Codex completed this turn without recording an assistant response.")
+        );
+    }
+
+    // ── kata 1wxv Task 5: snapshot rollback surfacing (codex) ─────────────────
+    //
+    // The capability stamp is SESSION-SCOPED by the DURABLE history mode
+    // (correction item 1, r3): `undo` ⟺ `Some(Paginated)`; legacy AND unknown
+    // (`None` — a missing/unparseable durable mode) stamp `undo:false`. `redo`
+    // is permanently false (codex revert is destructive; there is no redo
+    // primitive). The marker bucket comes from the LEDGER record (the r3
+    // entries union) — `thread/revert` destroys the tail, so there is no
+    // provider-side projection to recompute marker content from.
+
+    fn codex_raw_thread_updated_at_7() -> Value {
+        json!({
+            "thread": {
+                "id": "thread-9",
+                "preview": "",
+                "updatedAt": 7,
+                "status": { "type": "idle" },
+                "turns": [{
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "type": "userMessage",
+                        "id": "u-1",
+                        "content": [{ "type": "text", "text": "earlier" }],
+                    }],
+                }],
+            }
+        })
+    }
+
+    /// One ledger record whose entries union is a single op over the USER-role
+    /// display turn `turn-9` (last op at ms 100 — the revision floor).
+    fn codex_rollback_record_with_turn_9() -> crate::rollback_record::RollbackRecord {
+        use crate::rollback_record::*;
+        let mut record = RollbackRecord::empty(50);
+        record.push_entry(
+            RollbackEntry {
+                removed_turns: vec![json!({
+                    "id": "turn-9",
+                    "turnId": "turn-9",
+                    "ordinal": 1,
+                    "source": "durable",
+                    "role": "user",
+                    "summary": "later",
+                    "items": [{ "id": "turn-9:item-0", "kind": "text", "text": "later" }],
+                })],
+                prompt_text: "later".into(),
+                at_ms: 90,
+                epoch: 0,
+            },
+            100,
+        );
+        record
+    }
+
+    #[test]
+    fn codex_snapshot_stamps_paginated_capabilities_the_marker_bucket_and_the_revision_floor() {
+        let record = codex_rollback_record_with_turn_9();
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            Some(&record),
+            false,
+        )
+        .expect("snapshot builds");
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "undoneDepth is the USER-role step count of the bucket (never entries.len()); F6: codex is undo-only ⇒ NO marker is ever redoable"
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(bucket[0]["rolledBack"], json!(true));
+        assert_eq!(bucket[0]["turnId"], json!("turn-9"));
+        assert_eq!(
+            snap["revision"],
+            json!(100),
+            "the record's lastOpAtMs is the revision floor (basis 7 loses)"
+        );
+    }
+
+    #[test]
+    fn codex_snapshot_stamps_legacy_and_unknown_history_undo_false() {
+        // `None` == a legacy thread OR an unparseable durable mode — the stamp is
+        // session-scoped and NEVER hard-coded true.
+        let record = codex_rollback_record_with_turn_9();
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            None,
+            Some(&record),
+            false,
+        )
+        .expect("snapshot builds");
+        assert_eq!(snap["capabilities"]["undo"], json!(false));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+        // A record's markers still surface (the capability gate is client-side).
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
+    }
+
+    #[test]
+    fn codex_snapshot_without_a_record_hides_the_rollback_keys() {
+        let snap = build_codex_snapshot_json(
+            "thread-9",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .expect("snapshot builds");
+        assert!(
+            snap.get("rolledBackTurns").is_none(),
+            "the marker bucket is omitted entirely when nothing was rolled back"
+        );
+        assert!(snap.get("rollback").is_none());
+        assert_eq!(snap["revision"], json!(7), "no floor without a record");
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        assert_eq!(snap["capabilities"]["redo"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_surfaces_the_durable_rollback_record_and_floors_the_revision() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx, fake) = state_with_sink();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-snapshot-rollback",
+        )
+        .await;
+        fake.record_rollback("codex", "thread-1", codex_rollback_record_with_turn_9())
+            .await
+            .expect("record write");
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+        };
+        let (init_id, _m, _p) = peer.expect_request().await;
+        peer.respond(
+            &init_id,
+            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+        );
+        let _ = peer.expect_notification().await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        // A STALE provider basis (3) — the rollback op (ms 100) is newer.
+        peer.respond(
+            &id,
+            json!({ "thread": { "id": "thread-1", "status": { "type": "idle" }, "updatedAt": 3, "turns": [] } }),
+        );
+
+        let snapshot = driver.await.unwrap().expect("snapshot builds");
+        assert_eq!(
+            snapshot["capabilities"]["undo"],
+            json!(true),
+            "the paginated fixture session stamps undo (session-scoped, from the durable history mode record)"
+        );
+        assert_eq!(snapshot["capabilities"]["redo"], json!(false));
+        assert_eq!(
+            snapshot["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] })
+        );
+        assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("turn-9"));
+        assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["revision"],
+            json!(100),
+            "a stale provider basis never beats the record floor (the client monotonic watermark holds)"
         );
     }
 }

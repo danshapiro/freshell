@@ -770,6 +770,14 @@ export function normalizeCodexThreadSnapshot(input: {
       worktrees: (input.rawSnapshot.worktrees?.length ?? 0) > 0,
       diffs: (input.rawSnapshot.diffs?.length ?? 0) > 0,
       childThreads: (input.rawSnapshot.childThreads?.length ?? 0) > 0,
+      // kata z7j7: the adapter merges per-send settings into turn/start
+      // (adapter.ts:957-1002) — all four knobs are per-send.
+      settingScopes: {
+        model: 'per-send' as const,
+        effort: 'per-send' as const,
+        sandbox: 'per-send' as const,
+        permissionMode: 'per-send' as const,
+      },
     },
     tokenUsage: input.rawSnapshot.tokenUsage ?? {
       inputTokens: 0,

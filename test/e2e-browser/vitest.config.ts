@@ -2,6 +2,8 @@
 // These tests verify the E2E test infrastructure itself and run in a Node
 // environment. They are NOT run by `npm test` (which uses the root vitest
 // configs); instead, they are run explicitly during E2E helper development.
+// Strip ambient shell env (proxies, FRESHELL_BIND_HOST) before anything else — see sanitize-test-env.ts.
+import '../../config/vitest/sanitize-test-env.js'
 import { defineConfig } from 'vitest/config'
 import path from 'path'
 import { fileURLToPath } from 'url'

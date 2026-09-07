@@ -2,9 +2,7 @@ import type { TerminalMode } from './terminal-registry.js'
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
-import { logger } from './logger.js'
 import { setResponsePerfContext } from './request-logger.js'
-import { cascadeTerminalRenameToSession } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import {
   TerminalDirectoryQuerySchema,
@@ -20,7 +18,6 @@ import {
   type ReadModelWorkScheduler,
 } from './read-models/work-scheduler.js'
 
-const log = logger.child({ component: 'terminals-router' })
 export const MAX_TERMINAL_TITLE_OVERRIDE_LENGTH = 500
 
 export const TerminalPatchSchema = z.object({
@@ -72,7 +69,6 @@ export interface TerminalsRouterDeps {
     broadcastTerminalsChanged?: () => void
   }
   terminalMetadata?: { list: () => TerminalMeta[]; get?: (terminalId: string) => TerminalMeta | undefined }
-  codingCliIndexer?: { refresh: () => Promise<void> }
   terminalViewService?: TerminalViewService
   readModelScheduler?: ReadModelWorkScheduler
 }
@@ -303,21 +299,9 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
     if (typeof titleOverride === 'string' && titleOverride.trim()) registry.updateTitle(terminalId, titleOverride.trim())
     if (typeof descriptionOverride === 'string') registry.updateDescription(terminalId, descriptionOverride)
 
-    // Cascade: if this terminal has a coding CLI session, also rename the session.
-    // Uses get() instead of list().find() so the cascade works even after the
-    // terminal process has exited (retired entries preserve provider/sessionId).
-    if (typeof titleOverride === 'string' && titleOverride.trim() && deps.terminalMetadata) {
-      try {
-        const meta = deps.terminalMetadata.get?.(terminalId)
-          ?? deps.terminalMetadata.list().find((m) => m.terminalId === terminalId)
-        await cascadeTerminalRenameToSession(meta, titleOverride.trim())
-        if (meta?.provider && meta?.sessionId) {
-          await deps.codingCliIndexer?.refresh()
-        }
-      } catch (err) {
-        log.warn({ err, terminalId }, 'Cascade rename to session failed (non-fatal)')
-      }
-    }
+    // b5fb scope contract: a terminal (pane) rename is terminal scope only.
+    // It never writes a durable provider session override — the sole durable
+    // session-rename surface is PATCH /api/sessions/:key.
 
     wsHandler.broadcastTerminalsChanged?.()
     res.json(next)

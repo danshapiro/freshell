@@ -12,7 +12,6 @@ vi.mock('../../../server/config-store', () => ({
 
 import { configStore } from '../../../server/config-store'
 import {
-  cascadeTerminalRenameToSession,
   cascadeSessionRenameToTerminal,
   findTerminalForSession,
 } from '../../../server/rename-cascade'
@@ -30,54 +29,6 @@ function makeMeta(overrides: Partial<TerminalMeta> = {}): TerminalMeta {
 describe('rename-cascade', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-  })
-
-  describe('cascadeTerminalRenameToSession', () => {
-    it('calls patchSessionOverride with correct composite key when terminal has provider+sessionId', async () => {
-      const meta = makeMeta({
-        terminalId: 'term-1',
-        provider: 'claude',
-        sessionId: 'abc-123',
-      })
-
-      await cascadeTerminalRenameToSession(meta, 'My Custom Title')
-
-      expect(configStore.patchSessionOverride).toHaveBeenCalledOnce()
-      expect(configStore.patchSessionOverride).toHaveBeenCalledWith(
-        'claude:abc-123',
-        { titleOverride: 'My Custom Title', titleSource: 'user' },
-      )
-    })
-
-    it('does nothing when meta is undefined', async () => {
-      await cascadeTerminalRenameToSession(undefined, 'My Custom Title')
-
-      expect(configStore.patchSessionOverride).not.toHaveBeenCalled()
-    })
-
-    it('does nothing when terminal has no provider (shell pane)', async () => {
-      const meta = makeMeta({
-        terminalId: 'term-shell',
-        provider: undefined,
-        sessionId: undefined,
-      })
-
-      await cascadeTerminalRenameToSession(meta, 'Shell Title')
-
-      expect(configStore.patchSessionOverride).not.toHaveBeenCalled()
-    })
-
-    it('does nothing when terminal has provider but no sessionId', async () => {
-      const meta = makeMeta({
-        terminalId: 'term-1',
-        provider: 'claude',
-        sessionId: undefined,
-      })
-
-      await cascadeTerminalRenameToSession(meta, 'Title')
-
-      expect(configStore.patchSessionOverride).not.toHaveBeenCalled()
-    })
   })
 
   describe('cascadeSessionRenameToTerminal', () => {

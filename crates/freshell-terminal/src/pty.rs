@@ -562,6 +562,8 @@ mod tests {
         parent.insert("PATH".into(), "/usr/bin".into());
         parent.insert("CI".into(), "1".into()); // in STRIP_ENV
         parent.insert("NODE_ENV".into(), "production".into()); // in STRIP_ENV
+        parent.insert("FRESHELL_CONFIG_DIR".into(), "/tmp/x".into()); // in STRIP_ENV
+        parent.insert("FRESHELL_PROFILE".into(), "work".into()); // in STRIP_ENV
         parent.insert("TERM".into(), "dumb".into()); // overridden below
         parent.insert("HOME".into(), "/home/u".into());
 
@@ -574,9 +576,11 @@ mod tests {
         ]);
 
         let env = build_child_env(&parent, &spec);
-        // Stripped.
+        // Stripped (Node-PTY sink party with server/terminal-registry.ts).
         assert!(!env.contains_key("CI"));
         assert!(!env.contains_key("NODE_ENV"));
+        assert!(!env.contains_key("FRESHELL_CONFIG_DIR"));
+        assert!(!env.contains_key("FRESHELL_PROFILE"));
         // Preserved.
         assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home/u"));

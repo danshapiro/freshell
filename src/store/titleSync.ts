@@ -1,9 +1,15 @@
+/**
+ * Rename scope contract (docs/development/rename-scope-contract.md):
+ * pane and tab renames are LOCAL organization. They never write terminal or
+ * session overrides — the only durable session rename flows through an
+ * explicit session-scope action (`PATCH /api/sessions/:key` via the sidebar /
+ * history rename, or Task 7's reset). `applySessionRenameCascade` is the one
+ * sanctioned cross-scope mirror: session -> open panes.
+ */
 import type { AppDispatch, RootState } from './store'
 import { updatePaneTitle, updatePaneTitleByTerminalId, updatePaneTitleBySessionRef } from './panesSlice'
 import { updateTab } from './tabsSlice'
 import { api } from '@/lib/api'
-import { isCodingAgentContent } from '@/lib/coding-agent-detection'
-import type { PaneContent, PaneNode } from './paneTypes'
 
 type TitleSyncThunk = (dispatch: AppDispatch, getState: () => RootState) => void
 
@@ -11,49 +17,6 @@ function getSinglePaneId(state: RootState, tabId: string): string | null {
   const layout = state.panes.layouts[tabId]
   if (!layout || layout.type !== 'leaf') return null
   return layout.id
-}
-
-function findPaneContent(node: PaneNode | undefined, paneId: string): PaneContent | null {
-  if (!node) return null
-  if (node.type === 'leaf') return node.id === paneId ? node.content : null
-  return findPaneContent(node.children[0], paneId) || findPaneContent(node.children[1], paneId)
-}
-
-/**
- * A user rename must reach the server-authoritative session override so the
- * left sidebar (which renders the server session title) stays aligned with the
- * tab/pane. Coding-CLI terminal panes cascade via the terminals API; SDK panes
- * (fresh-agent) write the session override directly. Shell panes
- * and browser panes stay Redux-only. Fire-and-forget: the Redux rename already
- * applied, so server failures must not block the UI.
- */
-function syncRenameToServer(content: PaneContent | null, title: string): void {
-  if (!content || !isCodingAgentContent(content)) return
-  if (content.kind === 'terminal') {
-    // Any non-shell (coding-agent) terminal, including user-installed extension
-    // CLIs, cascades via the terminals API to its session override.
-    if (content.terminalId) {
-      void api.patch(`/api/terminals/${encodeURIComponent(content.terminalId)}`, { titleOverride: title }).catch(() => {})
-      return
-    }
-    // Exited coding-CLI terminals have no live terminalId (TerminalView clears
-    // it on exit), so the terminals-API cascade is unavailable and the server
-    // sweep only sees live terminals. Fall back to the pane's durable
-    // sessionRef so the user's rename intent still persists on the session
-    // override (D8).
-    const ref = content.sessionRef
-    if (ref?.provider && ref.sessionId) {
-      const compositeKey = `${ref.provider}:${ref.sessionId}`
-      void api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: title }).catch(() => {})
-    }
-    return
-  }
-  if (content.kind === 'fresh-agent') {
-    if (content.sessionId) {
-      const compositeKey = `${content.provider}:${content.sessionId}`
-      void api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: title }).catch(() => {})
-    }
-  }
 }
 
 /**
@@ -87,10 +50,7 @@ export function applyPaneRename(input: {
   return (dispatch, getState) => {
     dispatch(updatePaneTitle(input))
 
-    const state = getState()
-    syncRenameToServer(findPaneContent(state.panes.layouts[input.tabId], input.paneId), input.title)
-
-    const singlePaneId = getSinglePaneId(state, input.tabId)
+    const singlePaneId = getSinglePaneId(getState(), input.tabId)
     if (singlePaneId !== input.paneId) return
 
     dispatch(updateTab({
@@ -116,8 +76,7 @@ export function applyTabRename(input: {
       },
     }))
 
-    const state = getState()
-    const singlePaneId = getSinglePaneId(state, input.tabId)
+    const singlePaneId = getSinglePaneId(getState(), input.tabId)
     if (!singlePaneId) return
 
     dispatch(updatePaneTitle({
@@ -125,6 +84,17 @@ export function applyTabRename(input: {
       paneId: singlePaneId,
       title: input.title,
     }))
-    syncRenameToServer(findPaneContent(state.panes.layouts[input.tabId], singlePaneId), input.title)
   }
+}
+
+/**
+ * Reviewed reset: clear the durable session title override AND its source so
+ * the provider-native title is revealed and the title-source ladder unblocks.
+ * Session-scoped by definition — called only from an explicit per-session
+ * "Reset to provider title" action. (`PATCH /api/sessions/:key` with
+ * `{titleOverride: null}`; servers now clear titleSource too.)
+ */
+export async function clearSessionTitleOverride(provider: string, sessionId: string): Promise<void> {
+  const compositeKey = `${provider}:${sessionId}`
+  await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: null })
 }
