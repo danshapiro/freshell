@@ -818,21 +818,6 @@ test.describe('Fresh Agent', () => {
       return settings?.freshAgent?.providers?.freshcodex?.style ?? null
     }).toBe('serif')
 
-    await page.route('**/api/fresh-agent/diff*', async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          diff: [
-            'diff --git a/src/index.css b/src/index.css',
-            '@@ -1,3 +1,3 @@',
-            '-.old { color: blue; }',
-            '+.fresh-agent-style-serif { color: #1d1a16; }',
-            ' context line',
-          ].join('\n'),
-        }),
-      })
-    })
     await page.route('**/api/fresh-agent/threads/freshcodex/codex/style-thread*', async (route) => {
       await route.fulfill({
         status: 200,
@@ -952,7 +937,11 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     await expect(freshcodexRoot.locator('.fresh-agent-turn-header', { hasText: 'Freshcodex' })).toHaveCount(1)
     await expect(freshcodexRoot.locator('[data-turn-continuation="true"]')).toHaveCount(1)
-    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
+    // The transcript's jump chip can temporarily overlay the toggle after the
+    // status strip changes the viewport height. Keyboard activation targets
+    // the focused button instead of a screen point, so it remains reliable in
+    // both the local browser and the constrained cloud viewport.
+    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     // The status strip shrank the transcript viewport by one row, so the
     // "Jump to your message" glom chip overlays the top band where the
@@ -964,7 +953,14 @@ test.describe('Fresh Agent', () => {
     // intercept the activation.
     await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
-    await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
+    // Rust exposes diff summaries only. The summary panel is intentionally
+    // static; there is no legacy Node `/api/fresh-agent/diff` endpoint or
+    // per-file button to open a full diff.
+    const diffPanel = freshcodexRoot.locator('.fresh-agent-diff-panel').first()
+    await expect(diffPanel).toBeVisible()
+    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('src/index.css')
+    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('modified')
+    await expect(diffPanel.locator('.fresh-agent-file-diff').first()).toContainText('Full diff loading is unavailable.')
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
     expect(transcriptFont.toLowerCase()).toContain('georgia')
     const rootFont = await freshcodexRoot.evaluate((node) => getComputedStyle(node).fontFamily)
@@ -981,7 +977,7 @@ test.describe('Fresh Agent', () => {
     const questionBackground = await freshcodexRoot.locator('.fresh-agent-question-card').first()
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(questionBackground).toBe('rgb(251, 250, 247)')
-    const diffBackground = await freshcodexRoot.locator('.fresh-agent-diff-panel').first()
+    const diffBackground = await diffPanel
       .evaluate((node) => getComputedStyle(node).backgroundColor)
     expect(diffBackground).toBe('rgb(251, 250, 247)')
     const composerButtonFont = await freshcodexRoot.locator('.fresh-agent-composer-action').first()
