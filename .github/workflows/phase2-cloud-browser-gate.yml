@@ -1,0 +1,76 @@
+name: Phase 2 Cloud Browser Gate
+
+on:
+  push:
+    branches: [test/phase2-cloud-fe688]
+
+permissions:
+  contents: read
+
+jobs:
+  p2-g01:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+    steps:
+      - name: Check out exact Phase 2 candidate
+        uses: actions/checkout@v4
+        with:
+          ref: fe6881336b079472a037047037cce5079d4e29ad
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Provide repository mise exec seam
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cat > "$HOME/.local/bin/mise" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [ "${1:-}" != "exec" ]; then
+            echo "test mise shim only supports: mise exec <tool> -- <command>" >&2
+            exit 2
+          fi
+          shift
+          while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+          [ "$#" -gt 0 ] || exit 2
+          shift
+          exec "$@"
+          SH
+          chmod +x "$HOME/.local/bin/mise"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify cloud Docker daemon
+        run: docker info
+
+      - name: Run exact P2-G01 browser continuity gate
+        run: >-
+          npx playwright test
+          --config test/e2e-browser/playwright.config.ts
+          --project=rust-chromium
+          test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts
+          --grep "P2-G01"
+
+      - name: Upload runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-g01-fe6881336
+          path: .runtime-evidence/fe6881336b079472a037047037cce5079d4e29ad/
+          if-no-files-found: warn
