@@ -208,21 +208,16 @@ impl RuntimeLimits {
 /// Named resource profile saved with a managed soul. The numeric limits remain
 /// authoritative; the profile records user intent and supports future edits without
 /// silently changing a running incarnation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeProfile {
     DefaultAgent,
     TestFixture,
+    // Backward-compatible wire default for Phase 1 callers, which supplied
+    // explicit numeric limits before named profiles existed. New managed
+    // terminal callers always send an explicit profile.
+    #[default]
     Custom,
-}
-
-impl Default for RuntimeProfile {
-    fn default() -> Self {
-        // Backward-compatible wire default for Phase 1 callers, which supplied
-        // explicit numeric limits before named profiles existed. New managed
-        // terminal callers always send an explicit profile.
-        Self::Custom
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,7 +511,7 @@ pub struct StopRequest {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AdminCommand {
     Health,
-    Launch(LaunchRequest),
+    Launch(Box<LaunchRequest>),
     Stop(StopRequest),
     Inventory,
     TerminalInput(TerminalInputRequest),
@@ -605,7 +600,7 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fixture: Option<FixtureKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminal: Option<TerminalLaunchSpec>,
+        terminal: Option<Box<TerminalLaunchSpec>>,
     },
     Stop {
         incarnation_id: IncarnationId,

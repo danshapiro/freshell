@@ -13,11 +13,11 @@ pub struct TerminalMounts {
 
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
     let workspace = canonical_dir(Path::new(&spec.workspace_path), "workspace")?;
-    if workspace != PathBuf::from(&spec.workspace_path) {
+    if workspace != Path::new(&spec.workspace_path) {
         return Err("workspace path must already be canonical".into());
     }
     let cwd = canonical_dir(Path::new(&spec.cwd), "cwd")?;
-    if cwd != PathBuf::from(&spec.cwd) {
+    if cwd != Path::new(&spec.cwd) {
         return Err("cwd path must already be canonical".into());
     }
     if !cwd.starts_with(&workspace) {
@@ -29,7 +29,7 @@ pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, Stri
         .as_deref()
         .map(|raw| -> Result<PathBuf, String> {
             let canonical = canonical_dir(Path::new(raw), "git common dir")?;
-            if canonical != PathBuf::from(raw) {
+            if canonical != Path::new(raw) {
                 return Err("git common dir must already be canonical".into());
             }
             Ok(canonical)
@@ -42,7 +42,7 @@ pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, Stri
     for file in &spec.provider_bootstrap_files {
         let source = std::fs::canonicalize(&file.source_path)
             .map_err(|error| format!("provider bootstrap file: {error}"))?;
-        if !source.is_file() || source != PathBuf::from(&file.source_path) {
+        if !source.is_file() || source != Path::new(&file.source_path) {
             return Err("provider bootstrap file must be a canonical regular file".into());
         }
         reject_management_path(&source)?;

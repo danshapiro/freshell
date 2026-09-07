@@ -1799,7 +1799,8 @@ impl TerminalRegistry {
             inner
                 .terminals
                 .iter()
-                .filter_map(|(id, handle)| handle.managed.is_none().then(|| id.clone()))
+                .filter(|(_, handle)| handle.managed.is_none())
+                .map(|(id, _)| id.clone())
                 .collect()
         };
         ids.iter()

@@ -269,7 +269,7 @@ export class RuntimeHarness {
       // cannot traverse this harness's 0700 testRoot or read its 0600 secret.
       // Add only DAC_OVERRIDE to keep the same private-file contract portable;
       // managed workload containers still use the stricter broker-enforced set.
-      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_OVERRIDE', '--security-opt', 'no-new-privileges',
+      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_OVERRIDE', '--cap-add', 'CHOWN', '--security-opt', 'no-new-privileges',
       '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
       '-v', `${this.testRoot}:${this.testRoot}:rw`,
       '-v', `${this.buildDir}:${this.buildDir}:ro`,
@@ -330,6 +330,16 @@ export class RuntimeHarness {
         throw new Error(`supervisor ${instance.containerId} exited before health: ${logs}`)
       }
       if (fs.existsSync(instance.controlSocket)) {
+        // Rootful Docker creates the bind-mounted UDS as container root, so
+        // the non-root GitHub/CI harness cannot connect to its mode-0600
+        // socket. Rootless Docker already maps container root to this user.
+        // Bridge ownership only for this exact test-supervisor socket; the
+        // managed runtime host sockets remain private to the supervisor.
+        if (!dockerIsRootless()) {
+          const uid = process.getuid?.() ?? 1000
+          const gid = process.getgid?.() ?? 1000
+          try { docker(['exec', instance.containerId, 'chown', `${uid}:${gid}`, instance.controlSocket]) } catch {}
+        }
         try { return await this.adminOk(instance, { method: 'health' }) } catch (error) { lastError = error }
       }
       await sleep(50)
@@ -701,6 +711,19 @@ export function newSoul(): string {
 
 export function newRequest(): string {
   return `request-${randomUUID()}`
+}
+
+let dockerRootlessCache: boolean | undefined
+
+function dockerIsRootless(): boolean {
+  if (dockerRootlessCache !== undefined) return dockerRootlessCache
+  try {
+    const options = JSON.parse(docker(['info', '--format', '{{json .SecurityOptions}}'])) as string[]
+    dockerRootlessCache = options.some((value) => /rootless/i.test(value))
+  } catch {
+    dockerRootlessCache = false
+  }
+  return dockerRootlessCache
 }
 
 export function dockerSocketPath(): string {
