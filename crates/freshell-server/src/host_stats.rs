@@ -1721,6 +1721,46 @@ mod tests {
         );
     }
 
+    /// f0ef threaded case at the tile-facing layer: procmini carries 7
+    /// numeric top-level dirs (non-leader threads invisible to a /proc walk)
+    /// while the cgroup counts 42 tasks — the service must surface the
+    /// cgroup-scoped pair, never the process-count heuristic. (Node mirror:
+    /// test/unit/server/host-stats/service-fixture.test.ts.)
+    #[test]
+    fn host_stats_limits_section_binds_committed_threaded_fixture() {
+        let interest = HostStatsInterestRegistry::default();
+        let collector = test_collector(procmini_fixture(), sys_fixture(), &interest);
+        let limits = collector.ctx.read_limits_section();
+        assert!(limits.available);
+        assert_eq!(limits.pids_used, Some(42));
+        assert_eq!(limits.pids_max, Some(10854));
+        assert_eq!(readers::read_pid_count(&procmini_fixture()), Some(7));
+    }
+
+    /// f0ef namespace-divergence case: outside a PID namespace a top-level
+    /// /proc walk also sees UNRELATED cgroups' processes; the correctly
+    /// scoped pids.current is unaffected by the noise.
+    #[test]
+    fn host_stats_limits_section_ignores_unrelated_proc_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        write_rel(
+            &proc_root,
+            "self/cgroup",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/freshell-rust.service\n",
+        );
+        for pid in 9000..9030u32 {
+            std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+        }
+        assert_eq!(readers::read_pid_count(&proc_root), Some(30));
+        let interest = HostStatsInterestRegistry::default();
+        let collector = test_collector(proc_root, sys_fixture(), &interest);
+        let limits = collector.ctx.read_limits_section();
+        assert!(limits.available);
+        assert_eq!(limits.pids_used, Some(42));
+        assert_eq!(limits.pids_max, Some(10854));
+    }
+
     #[test]
     fn host_stats_pids_constraint_binds_highest_utilization_node() {
         // Leaf 90/100 (0.9) beats ancestor 500/1000 (0.5).
