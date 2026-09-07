@@ -5,6 +5,7 @@ export type SuiteKey =
   | 'default:test/unit/client'
   | 'server:test/server'
   | 'server:all:run'
+  | 'runtime:gate'
 
 export type CommandKey =
   | 'test'
@@ -19,6 +20,7 @@ export type CommandKey =
   | 'test:integration'
   | 'test:client'
   | 'test:vitest'
+  | 'test:runtime'
 
 export const COMMAND_KEYS = [
   'test',
@@ -33,6 +35,7 @@ export const COMMAND_KEYS = [
   'test:integration',
   'test:client',
   'test:vitest',
+  'test:runtime',
 ] as const satisfies readonly CommandKey[]
 
 export type CoordinatorInput = {
@@ -48,7 +51,7 @@ export type UpstreamPhase =
   }
   | {
     runner: 'npm'
-    script: 'typecheck' | 'build' | 'test:balanced'
+    script: 'typecheck' | 'build' | 'test:balanced' | 'test:runtime:raw'
     args: string[]
   }
 
@@ -67,9 +70,10 @@ type SinglePhaseSpec = {
 }
 
 const COMPOSITE_COMMANDS = new Set<CommandKey>(['test', 'test:all', 'check', 'verify'])
+type SingleVitestCommandKey = Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify' | 'test:runtime'>
 const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
 const SERVER_VITEST_CONFIG = 'config/vitest/vitest.server.config.ts'
-const SINGLE_PHASE_SPECS: Record<Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>, SinglePhaseSpec> = {
+const SINGLE_PHASE_SPECS: Record<SingleVitestCommandKey, SinglePhaseSpec> = {
   'test:watch': {
     owner: 'default',
     broadArgs: ['--config', DEFAULT_VITEST_CONFIG],
@@ -123,6 +127,10 @@ const TARGET_VALUE_FLAGS = new Set(['-t', '--testNamePattern', '--reporter', '--
 
 export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
+
+  if (input.commandKey === 'test:runtime') {
+    return coordinated('runtime:gate', [npmPhase('test:runtime:raw', normalizedArgs)])
+  }
 
   if (input.commandKey === 'test:vitest') {
     return passthrough([buildVitestPassthroughPhase(normalizedArgs)])
@@ -216,7 +224,7 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
   ])
 }
 
-function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>, args: string[]): CommandDisposition {
+function classifySinglePhaseCommand(commandKey: SingleVitestCommandKey, args: string[]): CommandDisposition {
   const spec = SINGLE_PHASE_SPECS[commandKey]
 
   if (spec.passthroughKind === 'passthrough') {
@@ -247,7 +255,7 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
 }
 
 function buildSinglePhasePassthroughPhase(
-  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
+  commandKey: SingleVitestCommandKey,
   args: string[],
 ): UpstreamPhase {
   const spec = SINGLE_PHASE_SPECS[commandKey]
@@ -265,7 +273,7 @@ function buildSinglePhasePassthroughPhase(
 }
 
 function buildSinglePhaseDelegatedPhase(
-  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
+  commandKey: SingleVitestCommandKey,
   args: string[],
 ): UpstreamPhase {
   const spec = SINGLE_PHASE_SPECS[commandKey]
@@ -332,7 +340,7 @@ function isBroadCompositeWorkload(args: string[]): boolean {
 }
 
 function isBroadSinglePhaseWorkload(
-  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
+  commandKey: SingleVitestCommandKey,
   args: string[],
 ): boolean {
   if (commandKey === 'test:server') {
@@ -564,7 +572,7 @@ function vitestPhase(config: 'default' | 'server', args: string[]): UpstreamPhas
   }
 }
 
-function npmPhase(script: 'typecheck' | 'build' | 'test:balanced', args: string[]): UpstreamPhase {
+function npmPhase(script: 'typecheck' | 'build' | 'test:balanced' | 'test:runtime:raw', args: string[]): UpstreamPhase {
   return {
     runner: 'npm',
     script,

@@ -88,7 +88,9 @@
     "test:port": "vitest run --config config/vitest/vitest.port.config.ts",
     "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
     "test:oracle:t2": "vitest run --config config/vitest/vitest.oracle-t2.config.ts",
-    "test:sandbox": "bash scripts/sandbox-test.sh"
+    "test:sandbox": "bash scripts/sandbox-test.sh",
+    "test:runtime": "tsx scripts/testing/test-coordinator.ts run test:runtime",
+    "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",
