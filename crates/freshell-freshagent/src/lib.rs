@@ -1503,7 +1503,10 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
 /// here -- this REST read has no live busy/idle bit to consult (that lives in the WS
 /// session's in-memory turn task, not the serve's own session record) -- an honest
 /// approximation the task report calls out; the client's WS-driven busy chrome already
-/// covers the live case, this endpoint's job is the committed transcript.
+/// covers the live case, this endpoint's job is the committed transcript. eaw7: the
+/// snapshot carries NO `statusSeq` by design — the `idle` above is an untracked
+/// default, and only tracked status folds mint a seq (the never-mint-from-defaults
+/// rule); the client folds seq-less snapshots via the legacy unconditional path.
 fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value) -> Value {
     let messages = messages.as_array().cloned().unwrap_or_default();
     let turns: Vec<Value> = messages

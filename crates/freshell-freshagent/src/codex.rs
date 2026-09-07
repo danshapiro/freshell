@@ -61,10 +61,11 @@ use freshell_codex::launch_lifecycle::{
 use freshell_codex::launch_plan::codex_sidecar_spawn_spec;
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient,
-    CodexAppServerError, CodexNotification, CodexStatus, CodexSubscription, StartThreadParams,
-    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, next_monotonic_status_seq, normalize_codex_thread_status,
+    normalize_freshcodex_effort, normalize_freshcodex_model, to_codex_reasoning_effort,
+    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
+    CodexSubscription, StartThreadParams, StartTurnParams, ThreadForkParams,
+    CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
@@ -205,6 +206,19 @@ struct CodexSession {
     /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
     /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// eaw7: the status half of the session's tracked (status, statusSeq) pair — the
+    /// LAST status any tracked fold recorded (`lastStatusByThread` mirror,
+    /// adapter.ts:301-305). Read by the differs→mint/same→reuse fold
+    /// ([`fold_codex_tracked_status`]); `None` until the first tracked status edge.
+    last_status: Arc<StdMutex<Option<CodexStatus>>>,
+    /// eaw7: the strictly-monotonic per-session status sequence's last MINTED value
+    /// (wall-clock ms; `lastStatusSeqByThread` mirror, adapter.ts:301-305). Hosted on
+    /// the session (NOT the task-private [`CodexSubscription`]) because two production
+    /// status edges live outside the subscription's consumer: the exit-watcher's
+    /// crash self-heal and the attach/resume ack — so BOTH the consumer and the
+    /// watcher are handed a clone at registration, `active_turn` precedent. `None`
+    /// until the session's first tracked status fold.
+    last_status_seq: Arc<StdMutex<Option<i64>>>,
     /// The notification-consumer task (aborted on shutdown/kill).
     consumer: tokio::task::JoinHandle<()>,
     /// Signals the exit-watcher to gracefully tear the sidecar down (a REQUESTED
@@ -876,6 +890,11 @@ impl FreshCodexState {
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // eaw7: the session's tracked (status, statusSeq) cells (adapter.ts
+        // `lastStatusByThread`/`lastStatusSeqByThread` mirrors) -- cloned into the
+        // consumer AND the exit-watcher so every minted status edge shares one sequence.
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
 
         // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
         // pushed a `ThreadStarted` notification onto `notifs` (the fake app-server
@@ -894,6 +913,8 @@ impl FreshCodexState {
             notifs,
             thread_id.clone(),
             active_turn.clone(),
+            last_status.clone(),
+            last_status_seq.clone(),
             Some(created_rx),
         );
 
@@ -910,6 +931,8 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
 
         self.sessions.lock().await.insert(
@@ -922,6 +945,8 @@ impl FreshCodexState {
                 sandbox: sandbox.clone(),
                 permission_mode: permission_mode.clone(),
                 active_turn,
+                last_status,
+                last_status_seq,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -1916,7 +1941,23 @@ impl FreshCodexState {
             status,
             revision: None,
         };
-        if let Some(frame) = adapter_event_to_frame(&event, &session_id) {
+        // eaw7: the attach/resume fold is a TRACKED status edge — mint/stamp from the
+        // session's shared cells. A raced-away entry (a kill landing between the branch
+        // read and here) has no tracker to mint from; drop the ack rather than answer
+        // for a dead session.
+        let tracker = {
+            let guard = self.sessions.lock().await;
+            guard
+                .get(&session_id)
+                .map(|s| (s.last_status.clone(), s.last_status_seq.clone()))
+        };
+        let Some((last_status, last_status_seq)) = tracker else {
+            tracing::warn!(provider = PROVIDER, session_id = %session_id, "freshagent.codex.attach_ack_raced_kill");
+            return;
+        };
+        if let Some(frame) =
+            adapter_event_to_frame(&event, &session_id, &last_status, &last_status_seq)
+        {
             let _ = self.broadcast_tx.send(frame);
         }
     }
@@ -2224,8 +2265,18 @@ impl FreshCodexState {
         }
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // eaw7: a recovered sidecar re-announces its statuses -- fresh (status,
+        // statusSeq) cells (the dead entry's baselines died with its sidecar).
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, session_id.to_string(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            session_id.to_string(),
+            active_turn.clone(),
+            last_status.clone(),
+            last_status_seq.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2235,6 +2286,8 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -2255,6 +2308,8 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    last_status,
+                    last_status_seq,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -2361,8 +2416,17 @@ impl FreshCodexState {
         };
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // eaw7: a NEW thread id means a NEW (status, statusSeq) baseline.
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, new_thread_id.clone(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            new_thread_id.clone(),
+            active_turn.clone(),
+            last_status.clone(),
+            last_status_seq.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -2372,6 +2436,8 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
 
         {
@@ -2387,6 +2453,8 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    last_status,
+                    last_status_seq,
                     consumer,
                     kill_tx: Some(kill_tx),
                     watcher,
@@ -2589,8 +2657,17 @@ impl FreshCodexState {
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        last_status: Arc<StdMutex<Option<CodexStatus>>>,
+        last_status_seq: Arc<StdMutex<Option<i64>>>,
     ) -> tokio::task::JoinHandle<()> {
-        self.spawn_consumer_after(notifs, thread_id, active_turn, None)
+        self.spawn_consumer_after(
+            notifs,
+            thread_id,
+            active_turn,
+            last_status,
+            last_status_seq,
+            None,
+        )
     }
 
     /// Like [`Self::spawn_consumer`], but if `gate` is given, the consumer's first
@@ -2607,6 +2684,8 @@ impl FreshCodexState {
         mut notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
         thread_id: String,
         active_turn: Arc<StdMutex<Option<String>>>,
+        last_status: Arc<StdMutex<Option<CodexStatus>>>,
+        last_status_seq: Arc<StdMutex<Option<i64>>>,
         gate: Option<oneshot::Receiver<()>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
@@ -2623,7 +2702,11 @@ impl FreshCodexState {
                     if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
                         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.turn.complete");
                     }
-                    let frame = adapter_event_to_frame(&event, &thread_id);
+                    // eaw7: the (status, statusSeq) cells are resolved AT FRAME TIME from
+                    // the threaded Arcs — the [`CodexAdapterEvent`] enum variants and
+                    // their constructor sites in freshell-codex stay seq-free by design.
+                    let frame =
+                        adapter_event_to_frame(&event, &thread_id, &last_status, &last_status_seq);
                     if let Some(frame) = frame {
                         let _ = broadcast_tx.send(frame);
                     }
@@ -2662,8 +2745,26 @@ impl FreshCodexState {
                 .map_err(CodexSnapshotError::AppServer)?,
             Err(err) => return Err(CodexSnapshotError::AppServer(err)),
         };
-        build_codex_snapshot_json(thread_id, &raw, active_turn_present)
-            .map_err(CodexSnapshotError::Protocol)
+        // eaw7: the fresh `thread/read` status folds through the session's tracked
+        // (status, statusSeq) pair — differs → mint, same → reuse — so the REST
+        // snapshot stamps the same per-session sequence the WS lane broadcasts. A
+        // raced-away entry has no tracker: the snapshot stays seq-less rather than
+        // minting from nothing.
+        let tracker = {
+            let guard = self.sessions.lock().await;
+            guard
+                .get(thread_id)
+                .map(|s| (s.last_status.clone(), s.last_status_seq.clone()))
+        };
+        build_codex_snapshot_json(
+            thread_id,
+            &raw,
+            active_turn_present,
+            tracker.as_ref().map(|(last_status, last_status_seq)| {
+                (last_status.as_ref(), last_status_seq.as_ref())
+            }),
+        )
+        .map_err(CodexSnapshotError::Protocol)
     }
 
     /// Resolve the live client + active-turn bit for `thread_id`, via
@@ -3058,8 +3159,17 @@ impl FreshCodexState {
         permission_mode: Option<String>,
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // eaw7: the freshly-registered session's tracked (status, statusSeq) cells.
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let exited = Arc::new(AtomicBool::new(false));
-        let consumer = self.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let consumer = self.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            last_status.clone(),
+            last_status_seq.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let watcher = spawn_exit_watcher(
             child,
@@ -3069,6 +3179,8 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -3080,6 +3192,8 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 active_turn: active_turn.clone(),
+                last_status,
+                last_status_seq,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -3120,6 +3234,11 @@ impl FreshCodexState {
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        // The watcher shares the session's tracked (status, statusSeq) cells, exactly
+        // like production registration — the self-heal edge must mint from the SAME
+        // sequence every other status edge of the session used.
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let watcher = spawn_exit_watcher(
             child,
             format!("codex-sidecar-test-snapshot-router-{thread_id}"),
@@ -3128,6 +3247,8 @@ impl FreshCodexState {
             kill_rx,
             exited.clone(),
             Arc::clone(&self.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -3139,6 +3260,8 @@ impl FreshCodexState {
                 sandbox: None,
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(active_turn)),
+                last_status,
+                last_status_seq,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -3612,13 +3735,24 @@ fn summarize_codex_items(items: &[Value]) -> (String, &'static str) {
 /// schema, not by omission. The reference's `rawSnapshot.tokenUsage` is therefore ALWAYS
 /// `undefined` on this path too; this is not a Rust-side gap, it is the reference's own honest
 /// zero, faithfully reproduced.
+/// `status_tracker`: `Some((last_status, last_status_seq))` when the thread maps to a
+/// LIVE session record — the fresh `status` read then folds through the tracked
+/// (status, statusSeq) pair (differs → mint, same → reuse) and the snapshot carries
+/// `"statusSeq"`. `None` (a session removed between the runtime resolve and the fold)
+/// leaves the snapshot seq-less rather than minting from an untracked default.
 fn build_codex_snapshot_json(
     thread_id: &str,
     raw: &Value,
     _active_turn_present: bool,
+    status_tracker: Option<StatusTrackerCells<'_>>,
 ) -> Result<Value, String> {
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
     let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
+    // eaw7: fold the fresh status read through the session's tracked pair (`adapter.ts`
+    // `getSnapshot`'s `mintStatusSeq(threadId, threadStatus)`, :1134-1154).
+    let status_seq = status_tracker.map(|(last_status, last_status_seq)| {
+        fold_codex_tracked_status(last_status, last_status_seq, status)
+    });
     // `isRunning` (`normalize.ts:756`): PURELY the freshly-read thread status --
     // `status === 'running' || status === 'compacting'` -- and NOTHING else. The reference
     // has no independently-tracked in-flight-turn fallback here.
@@ -3667,7 +3801,7 @@ fn build_codex_snapshot_json(
         })
         .collect();
 
-    Ok(json!({
+    let mut snapshot = json!({
         "sessionType": SESSION_TYPE,
         "provider": PROVIDER,
         "threadId": thread_id,
@@ -3697,7 +3831,14 @@ fn build_codex_snapshot_json(
         "childThreads": [],
         "turns": turns,
         "extensions": { "codex": {} },
-    }))
+    });
+    if let Some(seq) = status_seq {
+        // The wire key is EXACTLY camelCase "statusSeq" (the shared fresh-agent
+        // contract), never "status_seq"; the key is present only when the status
+        // came from the tracked fold.
+        snapshot["statusSeq"] = json!(seq);
+    }
+    Ok(snapshot)
 }
 
 /// One raw codex turn's items, grouped into contiguous same-role rows -- the intermediate
@@ -3856,6 +3997,7 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 ///   the reference's "leave the runtime mapped for lazy restart" invariant.
 /// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
 ///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
+#[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached watcher; the tracked (status, statusSeq) cells ride beside `exited`.
 fn spawn_exit_watcher(
     mut child: tokio::process::Child,
     ownership_id: String,
@@ -3864,6 +4006,8 @@ fn spawn_exit_watcher(
     kill_rx: oneshot::Receiver<()>,
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    last_status: Arc<StdMutex<Option<CodexStatus>>>,
+    last_status_seq: Arc<StdMutex<Option<i64>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
@@ -3902,7 +4046,12 @@ fn spawn_exit_watcher(
                     session_id: thread_id.clone(),
                     status: CodexStatus::Exited,
                 };
-                if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
+                // eaw7: the crash self-heal mints from the session's SHARED (status,
+                // statusSeq) cells (threaded in beside `exited`), so the terminal edge
+                // orders against every status frame the consumer minted before it.
+                if let Some(frame) =
+                    adapter_event_to_frame(&event, &thread_id, &last_status, &last_status_seq)
+                {
                     let _ = broadcast_tx.send(frame);
                 }
             }
@@ -3980,15 +4129,54 @@ fn reduce_notification(
     }
 }
 
+/// The borrowed halves of a session's tracked (status, statusSeq) cells, handed to
+/// the fold helper and the REST snapshot builder (`build_codex_snapshot_json`).
+type StatusTrackerCells<'a> = (&'a StdMutex<Option<CodexStatus>>, &'a StdMutex<Option<i64>>);
+
+/// Fold a tracked codex status into the session's (status, statusSeq) cells and
+/// return the seq to stamp (`mintStatusSeq`, adapter.ts:306-318): a re-fold of the
+/// SAME status reuses the recorded seq — a re-announce is not a status change and
+/// must not bump the client's accept baseline; a differing status — or the session's
+/// first tracked fold — mints strictly above via [`next_monotonic_status_seq`]
+/// (wall-clock milliseconds).
+fn fold_codex_tracked_status(
+    last_status: &StdMutex<Option<CodexStatus>>,
+    last_status_seq: &StdMutex<Option<i64>>,
+    status: CodexStatus,
+) -> i64 {
+    let mut status_guard = last_status.lock().expect("last status mutex");
+    let mut seq_guard = last_status_seq.lock().expect("last status seq mutex");
+    if *status_guard == Some(status) {
+        if let Some(seq) = *seq_guard {
+            return seq;
+        }
+    }
+    let seq = next_monotonic_status_seq(*seq_guard, now_ms());
+    *status_guard = Some(status);
+    *seq_guard = Some(seq);
+    seq
+}
+
 /// Map an adapter event to a `freshAgent.event` wire frame (sdk-events.ts normalization:
 /// `sdk.*` → `freshAgent.*`). Returns the pre-serialized JSON, or `None` on a serialize error.
-fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<String> {
+/// Status-bearing frames (the `StatusSnapshot` + `Status` arms) resolve the session's
+/// tracked (status, statusSeq) pair AT CALL TIME from the threaded cells — folding
+/// (mint/reuse) and stamping in the same step — so [`CodexAdapterEvent`] enum variants
+/// and their constructor sites never carry a seq. The wire key is EXACTLY camelCase
+/// `"statusSeq"`, never `status_seq`; non-status frames stay seq-less.
+fn adapter_event_to_frame(
+    event: &CodexAdapterEvent,
+    thread_id: &str,
+    last_status: &StdMutex<Option<CodexStatus>>,
+    last_status_seq: &StdMutex<Option<i64>>,
+) -> Option<String> {
     let inner = match event {
         CodexAdapterEvent::StatusSnapshot {
             session_id,
             status,
             revision,
         } => {
+            let status_seq = fold_codex_tracked_status(last_status, last_status_seq, *status);
             let mut map = Map::new();
             map.insert("type".into(), json!("freshAgent.session.snapshot"));
             map.insert("sessionId".into(), json!(session_id));
@@ -3998,6 +4186,7 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
             if let Some(revision) = revision {
                 map.insert("revision".into(), json!(revision));
             }
+            map.insert("statusSeq".into(), json!(status_seq));
             Value::Object(map)
         }
         CodexAdapterEvent::TurnComplete { session_id, at } => json!({
@@ -4009,6 +4198,7 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
             "type": "freshAgent.status",
             "sessionId": session_id,
             "status": status.as_str(),
+            "statusSeq": fold_codex_tracked_status(last_status, last_status_seq, *status),
         }),
     };
     let msg = ServerMessage::FreshAgentEvent(FreshAgentEvent {
@@ -4589,12 +4779,17 @@ pub(crate) mod tests {
     #[test]
     fn turn_complete_event_frames_carry_the_inner_type() {
         // The status-guarded chime → freshAgent.event { event.type: freshAgent.turn.complete }.
+        // A chime is NOT a status-bearing frame: even WITH tracked cells it stays seq-less.
+        let last_status = StdMutex::new(None);
+        let last_status_seq = StdMutex::new(None);
         let frame = adapter_event_to_frame(
             &CodexAdapterEvent::TurnComplete {
                 session_id: "t-1".into(),
                 at: 42,
             },
             "t-1",
+            &last_status,
+            &last_status_seq,
         )
         .unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
@@ -4604,10 +4799,16 @@ pub(crate) mod tests {
         assert_eq!(wire["sessionId"], "t-1");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+        assert!(
+            wire["event"].get("statusSeq").is_none(),
+            "turn-complete frames are never status-stamped: {wire}"
+        );
     }
 
     #[test]
     fn idle_snapshot_frames_carry_the_snapshot_inner_type() {
+        let last_status = StdMutex::new(None);
+        let last_status_seq = StdMutex::new(None);
         let frame = adapter_event_to_frame(
             &CodexAdapterEvent::StatusSnapshot {
                 session_id: "t-1".into(),
@@ -4615,6 +4816,8 @@ pub(crate) mod tests {
                 revision: None,
             },
             "t-1",
+            &last_status,
+            &last_status_seq,
         )
         .unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
@@ -4623,9 +4826,78 @@ pub(crate) mod tests {
         assert_eq!(wire["event"]["status"], "idle");
     }
 
+    /// eaw7 statusSeq: every status-bearing codex frame (the `StatusSnapshot` and
+    /// `Status` arms) resolves the session's tracked pair at call time from the
+    /// threaded cells — minted into the frame under the exact camelCase wire key; a
+    /// same-status re-fold reuses the recorded seq; a differing status mints
+    /// strictly above it.
+    #[test]
+    fn status_frames_mint_and_stamp_a_monotonic_status_seq() {
+        let last_status = StdMutex::new(None);
+        let last_status_seq = StdMutex::new(None);
+        let frame_for = |event: &CodexAdapterEvent| {
+            serde_json::from_str::<Value>(
+                &adapter_event_to_frame(event, "t-1", &last_status, &last_status_seq).unwrap(),
+            )
+            .unwrap()
+        };
+
+        let running = frame_for(&CodexAdapterEvent::StatusSnapshot {
+            session_id: "t-1".into(),
+            status: CodexStatus::Running,
+            revision: None,
+        });
+        let running_seq = running["event"]["statusSeq"]
+            .as_i64()
+            .expect("the StatusSnapshot arm stamps a numeric statusSeq");
+        assert!(
+            running["event"].get("status_seq").is_none(),
+            "the wire key is exactly \"statusSeq\", never status_seq: {running}"
+        );
+
+        // A re-announce of the SAME status reuses the recorded seq (the exited
+        // Status arm re-fold here differs — first the same-status reuse probe).
+        let running_again = frame_for(&CodexAdapterEvent::StatusSnapshot {
+            session_id: "t-1".into(),
+            status: CodexStatus::Running,
+            revision: None,
+        });
+        assert_eq!(
+            running_again["event"]["statusSeq"].as_i64(),
+            Some(running_seq),
+            "a same-status re-fold reuses the recorded seq"
+        );
+
+        // The Status arm mints strictly above for a differing status.
+        let exited = frame_for(&CodexAdapterEvent::Status {
+            session_id: "t-1".into(),
+            status: CodexStatus::Exited,
+        });
+        assert_eq!(exited["event"]["type"], "freshAgent.status");
+        let exited_seq = exited["event"]["statusSeq"]
+            .as_i64()
+            .expect("the Status arm stamps a numeric statusSeq");
+        assert!(
+            exited_seq > running_seq,
+            "a differing status mints strictly above: {exited_seq} <= {running_seq}"
+        );
+
+        // The cells thread the pair so every arm reads the same tracker.
+        assert_eq!(
+            *last_status.lock().expect("last status mutex"),
+            Some(CodexStatus::Exited)
+        );
+        assert_eq!(
+            *last_status_seq.lock().expect("last status seq mutex"),
+            Some(exited_seq)
+        );
+    }
+
     #[test]
     fn completed_turn_yields_snapshot_then_chime_frames() {
         // End-to-end reducer → wire: an idle snapshot precedes the positive chime.
+        let last_status = StdMutex::new(None);
+        let last_status_seq = StdMutex::new(None);
         let mut sub = CodexSubscription::new("t-1");
         let events = sub.on_turn_completed(
             &CodexTurnEvent {
@@ -4640,7 +4912,7 @@ pub(crate) mod tests {
         );
         let inner_types: Vec<String> = events
             .iter()
-            .filter_map(|e| adapter_event_to_frame(e, "t-1"))
+            .filter_map(|e| adapter_event_to_frame(e, "t-1", &last_status, &last_status_seq))
             .map(|f| {
                 serde_json::from_str::<Value>(&f).unwrap()["event"]["type"]
                     .as_str()
@@ -4734,6 +5006,11 @@ pub(crate) mod tests {
         let consumer = tokio::spawn(async {});
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
+        // The exit-watcher shares the session's tracked (status, statusSeq) cells —
+        // the self-heal edge mints from the SAME sequence every other status edge
+        // of the session used (production registration parity).
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let watcher = spawn_exit_watcher(
             child,
             ownership_id.to_string(),
@@ -4742,6 +5019,8 @@ pub(crate) mod tests {
             kill_rx,
             exited.clone(),
             Arc::clone(&state.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -4753,6 +5032,8 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                last_status,
+                last_status_seq,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -4786,7 +5067,15 @@ pub(crate) mod tests {
         child: tokio::process::Child,
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
-        let consumer = state.spawn_consumer(notifs, thread_id.to_string(), active_turn.clone());
+        let last_status: Arc<StdMutex<Option<CodexStatus>>> = Arc::new(StdMutex::new(None));
+        let last_status_seq: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
+        let consumer = state.spawn_consumer(
+            notifs,
+            thread_id.to_string(),
+            active_turn.clone(),
+            last_status.clone(),
+            last_status_seq.clone(),
+        );
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let watcher = spawn_exit_watcher(
@@ -4797,6 +5086,8 @@ pub(crate) mod tests {
             kill_rx,
             exited.clone(),
             Arc::clone(&state.leases),
+            last_status.clone(),
+            last_status_seq.clone(),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -4808,6 +5099,8 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                last_status,
+                last_status_seq,
                 consumer,
                 kill_tx: Some(kill_tx),
                 watcher,
@@ -6281,6 +6574,18 @@ pub(crate) mod tests {
         assert_eq!(frame["sessionId"], "thread-1");
         assert_eq!(frame["event"]["type"], "freshAgent.status");
         assert_eq!(frame["event"]["status"], "exited");
+        // eaw7 statusSeq: the crash self-heal is a TRACKED status edge — the exit
+        // watcher mints from the session's shared cell (threaded in beside
+        // `active_turn`), so even this terminal edge orders against every status the
+        // pane folded before it.
+        assert!(
+            frame["event"]["statusSeq"].is_i64(),
+            "the exited self-heal carries a numeric statusSeq: {frame}"
+        );
+        assert!(
+            frame["event"].get("status_seq").is_none(),
+            "the wire key is exactly \"statusSeq\", never status_seq: {frame}"
+        );
 
         // No accompanying chime, and the session STAYS mapped (adapter.ts:937-944 invariant
         // -- PR-1 leaves the actual lazy-restart-on-next-send unimplemented; see report).
@@ -6339,6 +6644,13 @@ pub(crate) mod tests {
         assert_ne!(
             frame["event"]["code"], "INVALID_SESSION_ID",
             "a resumable historical thread must never be declared lost"
+        );
+        // eaw7 statusSeq: the attach/resume fold is a MINTED tracked edge — the
+        // pane's reconnect gate needs the numeric pair to order this ack against
+        // every live status event of the session.
+        assert!(
+            frame["event"]["statusSeq"].is_i64(),
+            "the attach ack snapshot carries a numeric statusSeq: {frame}"
         );
 
         assert!(
@@ -9426,6 +9738,98 @@ pub(crate) mod tests {
             .await
             .expect("second read reuses the now-live session");
         assert_eq!(snapshot2["threadId"], json!("historical-thread-1"));
+    }
+
+    /// eaw7 (fresh-agent-rust statusSeq): the REST snapshot folds the fresh
+    /// `thread/read` status through the session's tracked (status, statusSeq) pair —
+    /// stamped under the exact camelCase `"statusSeq"` key — a same-status re-read
+    /// REUSES the recorded seq (a poll is not a status change and must not bump the
+    /// client's accept baseline), a differing status mints strictly above it.
+    #[tokio::test]
+    async fn get_snapshot_folds_fresh_status_reads_through_the_status_seq_tracker() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(None)),
+            spawn_sleeper(),
+            "codex-sidecar-test-status-seq-rest",
+        )
+        .await;
+
+        // Drive one REST read end-to-end: answer the (first-call-only) initialize
+        // handshake, then this read's `thread/read` with the given wire status type.
+        async fn drive_read(
+            st: &FreshCodexState,
+            peer: &freshell_codex::ChannelPeer,
+            status_type: &str,
+        ) -> Value {
+            let driver = {
+                let st = st.clone();
+                tokio::spawn(async move { st.get_snapshot("thread-1", None).await })
+            };
+            loop {
+                let (id, method, _params) = peer.expect_request().await;
+                match method.as_str() {
+                    "initialize" => {
+                        peer.respond(
+                            &id,
+                            json!({ "userAgent": "x", "codexHome": "/h", "platformFamily": "u", "platformOs": "l" }),
+                        );
+                        let _ = peer.expect_notification().await;
+                    }
+                    "thread/read" => {
+                        peer.respond(
+                            &id,
+                            json!({
+                                "thread": {
+                                    "id": "thread-1",
+                                    "preview": "",
+                                    "updatedAt": 1770000007,
+                                    "status": { "type": status_type },
+                                    "turns": [],
+                                }
+                            }),
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected request {other}"),
+                }
+            }
+            driver.await.unwrap().expect("snapshot builds")
+        }
+
+        // The first tracked read mints; a same-status re-read REUSES the recorded seq.
+        let first = drive_read(&st, &peer, "idle").await;
+        let first_seq = first["statusSeq"]
+            .as_i64()
+            .expect("the REST snapshot carries the tracked statusSeq");
+        assert!(
+            first.get("status_seq").is_none(),
+            "the wire key is exactly \"statusSeq\", never status_seq: {first}"
+        );
+        let second = drive_read(&st, &peer, "idle").await;
+        assert_eq!(
+            second["statusSeq"].as_i64(),
+            Some(first_seq),
+            "a same-status REST re-read reuses the recorded seq (no baseline churn): {second}"
+        );
+
+        // A differing fresh status mints strictly above.
+        let third = drive_read(&st, &peer, "active").await;
+        assert_eq!(third["status"], json!("running"));
+        let third_seq = third["statusSeq"]
+            .as_i64()
+            .expect("statusSeq on the differing read");
+        assert!(
+            third_seq > first_seq,
+            "a differing status mints strictly above: {third_seq} <= {first_seq}"
+        );
     }
 
     #[tokio::test]

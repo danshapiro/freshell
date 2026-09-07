@@ -375,6 +375,17 @@ async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over
     assert_eq!(frame["sessionType"], "freshclaude");
     assert_eq!(frame["event"]["status"], "idle");
     assert_eq!(frame["event"]["timelineSessionId"], durable);
+    // eaw7 statusSeq: the resume ack announces the session's TRACKED status, so it
+    // carries the session's numeric statusSeq (the reconnect staleness gate's server
+    // half) under the exact camelCase wire key.
+    assert!(
+        frame["event"]["statusSeq"].is_i64(),
+        "the resume ack snapshot carries a numeric statusSeq: {frame}"
+    );
+    assert!(
+        frame["event"].get("status_seq").is_none(),
+        "the wire key is exactly \"statusSeq\", never status_seq: {frame}"
+    );
 }
 
 /// Kilroy panes ride the same claude provider arm with `sessionType: "kilroy"`; the
@@ -520,12 +531,18 @@ async fn send_by_durable_id_routes_to_the_live_session() {
 
     // The sidecar answers every `send` with `sdk.status busy` -- awaiting it proves the
     // sidecar PROCESSED the routed send (the accepted broadcast races the log append).
-    await_frame(&mut ws, Duration::from_secs(10), |v| {
+    let busy = await_frame(&mut ws, Duration::from_secs(10), |v| {
         v["type"] == "freshAgent.event"
             && v["event"]["type"] == "freshAgent.status"
             && v["event"]["status"] == "busy"
     })
     .await;
+    // eaw7 statusSeq: the tracked status fold stamps every status-bearing broadcast
+    // with the session's numeric statusSeq.
+    assert!(
+        busy["event"]["statusSeq"].is_i64(),
+        "the busy status broadcast carries a numeric statusSeq: {busy}"
+    );
 
     // The fake sidecar actually received the send line (routing, not just the ack).
     let sends = env
@@ -560,7 +577,7 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     )
     .await;
     // The rebind ack gates the ordering (attach handled before the send below).
-    await_frame(&mut ws2, Duration::from_secs(10), |v| {
+    let ack = await_frame(&mut ws2, Duration::from_secs(10), |v| {
         v["sessionId"] == DURABLE_FALLBACK
     })
     .await;
@@ -588,6 +605,21 @@ async fn events_after_durable_rebind_are_stamped_with_the_durable_id() {
     assert_eq!(
         status["sessionId"], DURABLE_FALLBACK,
         "post-rebind envelopes must be stamped with the durable id"
+    );
+
+    // eaw7 statusSeq: the ack and the later status broadcast speak ONE per-session
+    // sequence — the busy fold minted strictly above the ack's stamped seq, so a
+    // client-side `statusSeq > lastStatusSeq` gate can never let the stale ack
+    // clobber the live busy status.
+    let ack_seq = ack["event"]["statusSeq"]
+        .as_i64()
+        .expect("the rebind ack snapshot carries a numeric statusSeq");
+    let busy_seq = status["event"]["statusSeq"]
+        .as_i64()
+        .expect("the busy status broadcast carries a numeric statusSeq");
+    assert!(
+        busy_seq > ack_seq,
+        "statusSeq is strictly monotonic per session: busy {busy_seq} <= ack {ack_seq}"
     );
 }
 
