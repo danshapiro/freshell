@@ -460,6 +460,7 @@ async function main() {
         agent,
         model,
         effort,
+        ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
       const data = unwrap(res)
@@ -577,6 +578,7 @@ async function main() {
         mode,
         shell,
         cwd,
+        ...(isTruthy(getFlag(flags, 'hostStats')) ? { hostStats: true } : {}),
         ...(promoted.sessionRef ? { sessionRef: promoted.sessionRef } : {}),
       })
       writeJson(res)
