@@ -27,6 +27,7 @@ mod existence;
 mod existence_by_id;
 mod extensions;
 mod files;
+mod fresh_agent_extras;
 mod identity_sink;
 mod instance_id;
 mod legacy_local_seed;
@@ -1552,6 +1553,16 @@ async fn main() -> ExitCode {
         home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
     };
 
+    // `GET /api/fresh-agent/diff` (`fresh-agent-extras-router.ts:304-321`):
+    // the FreshAgentDiffPanel expandable-row fetch (AGENT-13, plan
+    // `docs/plans/2026-09-06-ekc6.md` Task 1). Same boot-resolved home shape
+    // as `checkpoints_state` — /diff ignores it; the plan's Task 2 (/exec)
+    // uses it as the default cwd.
+    let fresh_agent_extras_state = fresh_agent_extras::FreshAgentExtrasApiState {
+        auth_token: Arc::clone(&auth_token),
+        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+    };
+
     // SAFE-02: the global authenticated API rate limiter (checklist:
     // `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:539`).
     // ONE process-wide token bucket, wired below as the outermost-but-one
@@ -1582,6 +1593,7 @@ async fn main() -> ExitCode {
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
         .merge(session_metadata::router(session_metadata_state))
         .merge(checkpoints::router(checkpoints_state))
+        .merge(fresh_agent_extras::router(fresh_agent_extras_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.
