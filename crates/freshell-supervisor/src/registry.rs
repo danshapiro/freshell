@@ -1097,6 +1097,68 @@ mod tests {
         assert!(matches!(conflict, RegistryError::RequestConflict));
     }
 
+    #[tokio::test]
+    async fn provider_bootstrap_persists_reference_never_credential_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let credential = workspace.path().join("claude-credential.json");
+        let secret = "phase2-secret-byte-sentinel-never-persist";
+        std::fs::write(&credential, format!(r#"{{"token":"{secret}"}}"#)).unwrap();
+        let credential = std::fs::canonicalize(credential).unwrap();
+        let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
+
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let mut launch = prep(SoulId::new(), RequestId::new(), "bootstrap-ref-only");
+        launch.provider = "claude".into();
+        launch.terminal = Some(TerminalLaunchSpec {
+            terminal_id: "terminal-bootstrap".into(),
+            stream_id: "stream-bootstrap".into(),
+            mode: "claude".into(),
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: workspace_path.to_string_lossy().into_owned(),
+            cols: 80,
+            rows: 24,
+            project_key: "bootstrap-test".into(),
+            workspace_path: workspace_path.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: Some("create-bootstrap".into()),
+            resume_session_id: Some("session-bootstrap".into()),
+            provider_bootstrap_files: vec![freshell_runtime_protocol::ProviderBootstrapFile {
+                source_path: credential.to_string_lossy().into_owned(),
+                provider_relative_path: ".claude/.credentials.json".into(),
+            }],
+        });
+        registry.prepare_launch(launch).await.unwrap();
+
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let terminal_json: String = conn
+            .query_row(
+                "SELECT terminal_spec FROM incarnations LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(terminal_json.contains(&credential.to_string_lossy().to_string()));
+        assert!(!terminal_json.contains(secret));
+        drop(conn);
+
+        let mut durable_bytes = Vec::new();
+        for candidate in [
+            registry.inner.db_path.clone(),
+            registry.inner.db_path.with_extension("sqlite3-wal"),
+        ] {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                durable_bytes.extend(bytes);
+            }
+        }
+        assert!(
+            !String::from_utf8_lossy(&durable_bytes).contains(secret),
+            "credential bytes must never enter supervisor durable state"
+        );
+    }
+
     #[test]
     fn second_supervisor_cannot_own_same_registry() {
         let dir = tempfile::tempdir().unwrap();
