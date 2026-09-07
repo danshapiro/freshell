@@ -330,6 +330,44 @@ async function gate06MemoryOomChildOnly(h: RuntimeHarness): Promise<void> {
   h.assert(caseId, replay.view.launchState === 'running' && replay.view.containerId === shell.containerId, 'child OOM is not misclassified as a lost/replaced soul', replay)
   const stop = dataOf(await h.adminOk(supervisor, h.stopBody(shell.soulId, epoch)), 'stop')
   h.assert(caseId, stop.outcome === 'verified_empty', 'OOM-tested runtime still cleans up by exact enclosure')
+
+  // Provider-root OOM: the PTY child itself dies while the trusted session
+  // host remains alive. This is the green-zombie shape Phase 2 must surface.
+  const rootSoul = newSoul()
+  const rootTerminal = terminalSpec(h, {
+    caseId,
+    projectKey: 'p2-root-oom',
+    program: '/usr/local/bin/node',
+    args: [
+      '--max-old-space-size=1024',
+      '-e',
+      'const a=[]; setInterval(()=>a.push(Buffer.alloc(16*1024*1024,1)),5)',
+    ],
+  })
+  const rootLaunch = dataOf(await h.adminOk(supervisor, h.launchBody({
+    soulId: rootSoul,
+    limits: PHASE2_TEST_LIMITS,
+    profile: 'test_fixture',
+    projectKey: 'p2-root-oom',
+    provider: 'shell',
+    terminal: rootTerminal,
+    expectedControlEpoch: epoch,
+  }), { requestId: newRequest() }), 'launch')
+  const rootBefore = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(rootSoul, epoch)), 'runtime_metrics')
+  let rootMetrics: any = rootBefore
+  let rootOutput: any = null
+  const rootDeadline = Date.now() + 30_000
+  while (Date.now() < rootDeadline) {
+    await sleep(250)
+    rootMetrics = dataOf(await h.adminOk(supervisor, h.runtimeMetricsBody(rootSoul, epoch)), 'runtime_metrics')
+    rootOutput = dataOf(await h.adminOk(supervisor, h.terminalReadOutputBody(rootSoul, 0, 64 * 1024, epoch)), 'terminal_output')
+    if (rootMetrics.memoryOomKill > rootBefore.memoryOomKill && rootOutput.exited) break
+  }
+  h.assert(caseId, rootMetrics.memoryOomKill > rootBefore.memoryOomKill, 'provider-root allocation is OOM-killed by the same 256 MiB cgroup', { rootBefore, rootMetrics })
+  h.assert(caseId, rootOutput?.exited === true && typeof rootOutput?.exitCode === 'number' && rootOutput.exitCode !== 0, 'host reports PTY-root exit and nonzero exit code through terminal output status', rootOutput)
+  h.assert(caseId, h.isContainerRunning(rootLaunch.view.containerId), 'session host/container survives provider-root OOM long enough to report it')
+  const rootStop = dataOf(await h.adminOk(supervisor, h.stopBody(rootSoul, epoch)), 'stop')
+  h.assert(caseId, rootStop.outcome === 'verified_empty', 'dead provider enclosure is still authoritatively stopped and released')
 }
 
 export async function gate07PidCeilingAndSetsid(h: RuntimeHarness): Promise<void> {

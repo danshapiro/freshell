@@ -406,6 +406,7 @@ pub struct ManagedOutputRead {
     pub truncated: bool,
     pub retained_from_seq: i64,
     pub head_seq: i64,
+    pub exit_code: Option<i64>,
     pub chunks: Vec<ManagedOutputChunk>,
 }
 
@@ -2326,7 +2327,47 @@ impl TerminalRegistry {
                 chunk.data.clone(),
             );
         }
+        if let Some(exit_code) = read.exit_code {
+            self.finish_managed_exit(terminal_id, exit_code);
+        }
         Ok(read)
+    }
+
+    /// Managed equivalent of `finish_pty_exit`: the OS process is already
+    /// gone and the supervisor-owned enclosure has been stopped; retain the
+    /// facade/replay tail but mark it exited and tell attached viewers once.
+    pub fn finish_managed_exit(&self, terminal_id: &str, exit_code: i64) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            let Some(handle) = inner.terminals.get(terminal_id) else {
+                return false;
+            };
+            if handle.managed.is_none() {
+                return false;
+            }
+            Arc::clone(&handle.shared)
+        };
+        let mut state = shared.lock().expect("terminal lock");
+        if state.status == TerminalRunStatus::Exited {
+            return true;
+        }
+        state.status = TerminalRunStatus::Exited;
+        state.exit_code = Some(exit_code);
+        state.last_activity_at = now_ms();
+        let exit = ServerMessage::TerminalExit(TerminalExit {
+            exit_code,
+            terminal_id: terminal_id.to_string(),
+        });
+        for subscriber in state.subscribers.values() {
+            (subscriber.sink)(exit.clone());
+        }
+        state.subscribers.clear();
+        self.notify_activity(ActivityEvent::Exit {
+            terminal_id: terminal_id.to_string(),
+            at: now_ms(),
+            spontaneous: true,
+        });
+        true
     }
 
     /// Managed terminal facades currently attached to one socket. Used by the
@@ -6207,6 +6248,31 @@ mod tests {
         assert_eq!(registry.kill_all(), 0);
         assert!(registry.is_live("T-managed"));
         assert!(registry.is_managed("T-managed"));
+    }
+
+    #[test]
+    fn managed_exit_marks_facade_exited_but_retains_replay_row() {
+        let registry = TerminalRegistry::new();
+        registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-exit".into(),
+            incarnation_id: "incarnation-exit".into(),
+            terminal_id: "T-exit".into(),
+            stream_id: "S-exit".into(),
+            mode: "shell".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: None,
+        });
+        assert!(registry.ingest_managed_output("T-exit", 1, 1, "tail\n".into()));
+        assert!(registry.finish_managed_exit("T-exit", 17));
+        assert!(!registry.is_live("T-exit"));
+        let row = registry
+            .directory()
+            .into_iter()
+            .find(|row| row.terminal_id == "T-exit")
+            .expect("managed exit row retained");
+        assert_eq!(row.status, TerminalRunStatus::Exited);
+        assert_eq!(row.snapshot, "tail\n");
     }
 
     #[test]
