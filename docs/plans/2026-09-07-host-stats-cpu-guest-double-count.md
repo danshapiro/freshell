@@ -140,16 +140,20 @@ Extend the comment in `crates/freshell-server/src/host_stats.rs` test
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts`
+Run: `npm run test:vitest -- test/unit/server/host-stats/readers.test.ts`
 
 Expected: FAIL because the current parser sums all 10 fields — the aggregate row with
 nonzero guest parses to `total=175181, busy=8830` while the (correct) assertions still
 expect `174236`/`7885`. The failure must be an assertion mismatch on `times.total` (and
-`times.busy`), not a setup/import error.
+`times.busy`), not a setup/import error. (Command shape load-bearing-validated: the
+coordinator prepends its own `run --config <server>` for server-owned targets, so passing
+`run` yourself turns it into an OR-filter that matches extra files; the form without `run`
+runs exactly this one file. Verified green on 79 tests at plan baseline.)
 
 Run: `cargo test -p freshell-server host_stats_fixture_cpu_times_parse_exact`
 
 Expected: FAIL for the same reason (`times.total` is `175181.0`, asserted `174236.0`).
+(Command load-bearing-validated at plan baseline: 1 passed / 926 filtered.)
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -185,7 +189,7 @@ fn parse_proc_stat_cpu_fields(fields: &[f64]) -> Option<(f64, f64, f64)> {
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `npm run test:vitest -- run test/unit/server/host-stats/readers.test.ts`
+Run: `npm run test:vitest -- test/unit/server/host-stats/readers.test.ts`
 
 Expected: PASS
 
@@ -211,9 +215,18 @@ consumers read via the service with delta-guarded rates (`server/host-stats/serv
 `freshell-server` test mentioning host_stats (the parse-exact test above, the service-level
 fixture tests asserting first-tick zero deltas, and the platform crate's unit tests).
 
-Run: `npm run test:vitest -- run test/unit/server/host-stats/ test/unit/client/lib/host-stats-status.test.ts`
+The vitest impacted set MUST be split into config-pure invocations — the repo test
+coordinator falls back to the default config (which excludes `test/unit/server/**`) when a
+single `test:vitest` passthrough mixes server and client targets, and would then run zero
+host-stats server tests with a vacuous green (load-bearing finding LB1, verified).
 
-Expected: PASS
+Run: `npm run test:vitest -- test/unit/server/host-stats/`
+
+Expected: PASS (server config; the whole host-stats server suite)
+
+Run: `npm run test:vitest -- test/unit/client/lib/host-stats-status.test.ts`
+
+Expected: PASS (default config; 45 tests)
 
 Run: `cargo test -p freshell-server host_stats && cargo test -p freshell-platform`
 
