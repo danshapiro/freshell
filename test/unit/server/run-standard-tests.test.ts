@@ -74,6 +74,7 @@ describe('run-standard-tests', () => {
           [
             { name: 'client', configPath: 'config/vitest/vitest.config.ts', maxWorkers: '5', priority: 'background' },
             { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+            { name: 'port', configPath: 'config/vitest/vitest.port.config.ts', priority: 'background' },
           ],
           [
             { name: 'electron', configPath: 'config/vitest/vitest.electron.config.ts', priority: 'background' },
@@ -94,6 +95,7 @@ describe('run-standard-tests', () => {
             { name: 'client', configPath: 'config/vitest/vitest.config.ts', maxWorkers: '50%', priority: 'normal' },
             { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '50%', priority: 'normal' },
             { name: 'electron', configPath: 'config/vitest/vitest.electron.config.ts', priority: 'normal' },
+            { name: 'port', configPath: 'config/vitest/vitest.port.config.ts', priority: 'normal' },
           ],
         ],
       })
@@ -163,6 +165,21 @@ describe('run-standard-tests', () => {
         stages: [
           [
             { name: 'server', configPath: 'config/vitest/vitest.server.config.ts', maxWorkers: '3', priority: 'background' },
+          ],
+        ],
+      })
+    })
+
+    it('routes port contract paths to the port suite only', () => {
+      expect(createStandardTestPlan({
+        availableParallelism: 32,
+        ci: false,
+        forwardedArgs: ['test/unit/port/ws-contract-freeze.test.ts'],
+      })).toEqual({
+        mode: 'desktop',
+        stages: [
+          [
+            { name: 'port', configPath: 'config/vitest/vitest.port.config.ts', priority: 'background' },
           ],
         ],
       })
