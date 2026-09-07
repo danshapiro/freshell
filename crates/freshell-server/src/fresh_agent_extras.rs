@@ -137,6 +137,31 @@
 //!   UTF-16 code units. Identical for ASCII; boundary differences only for
 //!   multi-byte output at exactly the 200KB line (same accepted divergence
 //!   class as the AGENT-14 checkpoints port documented).
+//! - **#10 exec stdin** is a held-open, never-written pipe (`Stdio::piped`
+//!   retained across `wait()`) — mirroring Node execFile's default piped
+//!   stdin, so stdin-reading commands hang to the 30s timeout instead of
+//!   seeing an immediate EOF.
+//! - **#11 exec content-type gate**: only `application/json` (params
+//!   stripped, case-folded) is parsed — matching express `json()`'s default
+//!   type test. Vendor `application/*+json` types fall into the
+//!   missing-command 400 exactly like Node. Non-object top-level JSON
+//!   values map to the missing-command 400 for arrays and primitives alike;
+//!   note the express body-parser at its default strict mode actually
+//!   400s (HTML SyntaxError page) on bare PRIMITIVES before the route —
+//!   arrays/objects reach the handler there — so this port is narrower than
+//!   Node only for bare primitives, a good-faith-unreachable edge whose
+//!   status (400) matches either way. (This corrects the plan divergence-11
+//!   sentence, which wrongly claimed `JSON.parse('5').command` is what
+//!   produces Node's 400.)
+//! - **#12 body size limit** (delta-review R1): Node mounts json({ limit:
+//!   '1mb' }) on the extras router, so exec bodies above 1MB 413-reject
+//!   there; this port parses via axum's `Bytes` extractor under the
+//!   server-wide default body limit, accepting a 1-2MB command where Node
+//!   refused — same accepted deviation class recorded for other Rust ports
+//!   in this repo ("axum default body limit vs Express json 1mb"). Over the
+//!   server-wide limit, both stacks 413 with non-byte-stable error pages.
+//!   Only reachable with a ≥1MB command body, which no good-faith client
+//!   produces.
 
 use std::path::PathBuf;
 use std::process::Stdio;

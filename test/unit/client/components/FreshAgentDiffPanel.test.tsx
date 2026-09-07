@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 
+// Provenance: pins the panel's already-present inline-error/loading behavior
+// that AGENT-13's Rust port relies on — plan docs/plans/2026-09-06-ekc6.md
+// Task 3 (work item ekc6); the route it fetches is now ported in
+// crates/freshell-server/src/fresh_agent_extras.rs.
 const mockApiGet = vi.fn()
 
 vi.mock('@/lib/api', () => ({
