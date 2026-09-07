@@ -942,6 +942,88 @@ fn disarm_clears_the_fork_watch() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn repointed_fork_watch_silences_the_old_lineage() {
+    // D-RESUME support pin (kata 3gvd, LB2): the proxy resume arm re-points
+    // the disk fork lane at the RESUMED thread via `watch_fork(t, NEW)`,
+    // which REPLACES the terminal's one watch (HashMap keyed on terminal_id,
+    // doc-pinned overwrite semantics at `watch_fork`). Nothing unit-pinned
+    // that the re-pointed watch goes SILENT for the OLD lineage -- an
+    // overwrite that append-merged two lineage sets would keep rebinding
+    // the pane whenever the retired thread next forked. All ids uuid-shaped
+    // (the fork lane's is_uuid_shaped candidate filter).
+    const OLD: &str = "aaaaaaaa-1111-2222-3333-444444444444";
+    const NEW: &str = "bbbbbbbb-1111-2222-3333-444444444444";
+    const OLD_CHILD: &str = "cccccccc-2222-3333-4444-555555555555";
+    const OLD_CHILD_2: &str = "dddddddd-2222-3333-4444-555555555555";
+    const NEW_CHILD: &str = "eeeeeeee-2222-3333-4444-555555555555";
+    let root = unique_temp_dir("fork-repoint");
+    let locator = CodexLocator::new(root.clone());
+
+    // Baseline: the OLD lineage fires while watched.
+    assert!(locator.watch_fork("t1", OLD));
+    assert!(locator.note_fork_submit("t1", 1_000));
+    let old_child = write_rollout_full(
+        &root,
+        "2026/07/27",
+        OLD_CHILD,
+        Some("/tmp/x"),
+        Some(OLD),
+        Some("user"),
+    );
+    let located = locator.tick_forks(1_100);
+    assert_eq!(
+        located,
+        vec![ForkLocated {
+            terminal_id: "t1".into(),
+            old_session_id: OLD.into(),
+            new_session_id: OLD_CHILD.into(),
+            rollout_path: old_child,
+            cwd: Some("/tmp/x".into()),
+        }],
+        "the watched OLD lineage fires a fork hit"
+    );
+
+    // Re-point at the RESUMED thread; then a fork of the OLD lineage goes
+    // silent (its child file is scanned into known_files and never
+    // re-fires), while a fork of the NEW lineage hits.
+    assert!(locator.watch_fork("t1", NEW));
+    assert!(locator.note_fork_submit("t1", 2_000));
+    write_rollout_full(
+        &root,
+        "2026/07/27",
+        OLD_CHILD_2,
+        Some("/tmp/x"),
+        Some(OLD),
+        Some("user"),
+    );
+    assert!(
+        locator.tick_forks(2_100).is_empty(),
+        "the OLD-lineage watch is gone: no hit for t1"
+    );
+    let new_child = write_rollout_full(
+        &root,
+        "2026/07/27",
+        NEW_CHILD,
+        Some("/tmp/x"),
+        Some(NEW),
+        Some("user"),
+    );
+    let located = locator.tick_forks(2_200);
+    assert_eq!(
+        located,
+        vec![ForkLocated {
+            terminal_id: "t1".into(),
+            old_session_id: NEW.into(),
+            new_session_id: NEW_CHILD.into(),
+            rollout_path: new_child,
+            cwd: Some("/tmp/x".into()),
+        }],
+        "the re-pointed watch tracks the NEW lineage"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // Warn-once latch tests live in a `#[path]` child (this file sits against
 // the 1,000-line cap; same convention as `tabs_persist_validation_tests.rs`).
 #[path = "codex_locator_tests_warn.rs"]

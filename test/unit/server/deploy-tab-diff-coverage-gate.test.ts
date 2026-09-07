@@ -45,13 +45,19 @@ const term = (
   extra: Record<string, unknown> = {},
 ) => ({ terminalId, status, ...extra })
 
-const pane = (paneId: string, liveTerminalId: string | null, mode = 'shell') => ({
+const pane = (
+  paneId: string,
+  liveTerminalId: string | null,
+  mode = 'shell',
+  extra: Record<string, unknown> = {},
+) => ({
   paneId,
   kind: 'terminal',
   payload: {
     mode,
     sessionRef: null,
     liveTerminal: liveTerminalId ? { terminalId: liveTerminalId } : null,
+    ...extra,
   },
 })
 
@@ -313,5 +319,117 @@ describe('deploy-tab-diff --help', () => {
     expect(r.code).toBe(0)
     expect(r.out).toContain('--allow-uncovered')
     expect(r.out).toContain('4 capture coverage gap')
+  })
+})
+
+// Kata 3gvd pins: the continuity gates the in-TUI resume work (Tasks 1-5)
+// relies on must keep failing CLOSED for codex panes — an unresolved coding
+// pane is an explicit hard failure, never a recoverable pass.
+describe('codex pane identity verdicts (kata 3gvd pins)', () => {
+  it('verify FAILs (exit 1) a captured open codex pane with NO sessionRef as NO CAPTURED IDENTITY', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
+    try {
+      const binDir = await makeAbortCurl(tmp)
+      const before = path.join(tmp, 'before.json')
+      // A live coding-CLI pane captured WITHOUT a sessionRef is unverifiable
+      // by construction: restore can only ever build a blank session for it.
+      const doc = captureDoc(
+        [term('term-codex', 'running', { mode: 'codex', title: 'Codex work', cwd: '/home/dan/proj' })],
+        [openRecord('t1', [pane('p-codex', 'term-codex', 'codex')])],
+      )
+      await fs.writeFile(before, JSON.stringify(doc))
+      const r = await runScript(
+        ['verify', '--url', 'http://unused.invalid', '--token', 't', '--before', before, '--after', before],
+        { PATH: `${binDir}:${process.env.PATH}` },
+      )
+      expect(r.code).toBe(1)
+      expect(r.code).not.toBe(99) // offline mode made zero network calls
+      expect(r.out).not.toContain('NETWORK CALL')
+      expect(r.out).toContain('================ TAB-DIFF DIVERGENCE (1) ================')
+      // The verdict row carries the pane's full identity coordinates.
+      expect(r.out).toMatch(
+        /NO CAPTURED IDENTITY\tdevice=dev-1\ttab=Tab t1 \(t1\)\tpane=p-codex\tkind=terminal\twas=-:-/,
+      )
+      // NO-IDENTITY panes are excluded from snapshot remediation: no snapshot
+      // can carry an identity that was never captured, so the manual-recovery
+      // note is emitted instead of the UI recovery flow.
+      expect(r.out).toContain('UNRECOVERABLE FROM SNAPSHOTS')
+      expect(r.out).toMatch(/ {2}NO-IDENTITY device=dev-1\ttab=Tab t1 \(t1\)\tpane=p-codex\tmode=codex/)
+      // Fail-closed: the unresolved coding pane NEVER passes as recoverable.
+      expect(r.out).not.toContain('OK: every previously-live pane came back')
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('verify passes (exit 0) when the captured codex pane carried a sessionRef that the after doc reproduces', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
+    try {
+      const binDir = await makeAbortCurl(tmp)
+      const before = path.join(tmp, 'before.json')
+      // Treatment/control pair with the previous case — proves the harness
+      // distinguishes true fail-closed behavior from a vacuous pass: same
+      // shape, but payload.sessionRef {provider: 'codex'} is present in both
+      // before and after docs, so the identity diff finds no divergence.
+      const doc = captureDoc(
+        [term('term-codex', 'running', { mode: 'codex', title: 'Codex work', cwd: '/home/dan/proj' })],
+        [openRecord('t1', [
+          pane('p-codex', 'term-codex', 'codex', {
+            sessionRef: { provider: 'codex', sessionId: 's-codex-1' },
+          }),
+        ])],
+      )
+      await fs.writeFile(before, JSON.stringify(doc))
+      const r = await runScript(
+        ['verify', '--url', 'http://unused.invalid', '--token', 't', '--before', before, '--after', before],
+        { PATH: `${binDir}:${process.env.PATH}` },
+      )
+      expect(r.code).toBe(0)
+      expect(r.code).not.toBe(99) // offline mode made zero network calls
+      expect(r.out).toContain('OK: every previously-live pane came back with the same session identity.')
+      expect(r.out).not.toContain('FAIL')
+      expect(r.out).not.toContain('NO CAPTURED IDENTITY')
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('capture halts (exit 4) and lists an uncovered running codex terminal enriched with session=none', { timeout: 120_000 }, async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
+    try {
+      const terminals = [
+        term('term-covered', 'running', { mode: 'shell', title: 'Covered', cwd: '/tmp' }),
+        // Deliberately NO sessionRef: a codex terminal covered by NO persisted
+        // pane is unrecoverable outright — session=none is the operator-
+        // visible "never recoverable" signal for exactly that class.
+        term('term-codex', 'running', { mode: 'codex', title: 'Codex work', cwd: '/home/dan/proj' }),
+      ]
+      const { binDir, env } = await makeRoutedCurl(tmp, {
+        index: INDEX,
+        device: DEVICE([openRecord('t1', [pane('p1', 'term-covered')])]),
+        terminals,
+      })
+      const out = path.join(tmp, 'before.json')
+      const r = await runScript(
+        ['capture', '--url', 'http://unused.invalid', '--token', 't', '--out', out],
+        { ...env, PATH: `${binDir}:${process.env.PATH}` },
+      )
+      // 4 = coverage gap (distinct from 1 = capture unusable).
+      expect(r.code).toBe(4)
+      expect(r.out).toContain(
+        'FAIL: 1 running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):',
+      )
+      // Enriched row: mode/cwd/title pulled from the artifact's own
+      // .terminals[]; session=none because no sessionRef was captured.
+      expect(r.out).toContain('  - term-codex (mode=codex, cwd=/home/dan/proj, title=Codex work, session=none)')
+      expect(r.out).not.toMatch(/- term-covered/)
+      // The artifact WAS written (needed for diagnosis) and messaging says so.
+      expect(r.out).toMatch(/WAS written to/)
+      const artifact = JSON.parse(await fs.readFile(out, 'utf8'))
+      expect(artifact.terminals).toHaveLength(2)
+      expect(r.out).toContain('--allow-uncovered')
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true })
+    }
   })
 })

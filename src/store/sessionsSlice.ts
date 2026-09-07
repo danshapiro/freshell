@@ -295,18 +295,32 @@ function patchProjectRunningState(
     runningBySessionKey.set(`${record.provider}:${record.sessionId}`, record.terminalId)
   }
 
+  // Identity moves (server-side rebind): an upsert saying terminal T now
+  // belongs to session key X implies every OTHER row's stale claim on T is
+  // over. terminalId → its current session key per this payload.
+  const currentKeyByTerminalId = new Map<string, string>()
+  for (const record of payload.upsert) {
+    if (record.provider && record.sessionId) {
+      currentKeyByTerminalId.set(record.terminalId, `${record.provider}:${record.sessionId}`)
+    }
+  }
+
   for (const project of projects) {
     for (const session of project.sessions) {
       const sessionRecord = session as typeof session & {
         isRunning?: boolean
         runningTerminalId?: string
       }
-      if (
-        sessionRecord.runningTerminalId
-        && clearedTerminalIds.has(sessionRecord.runningTerminalId)
-      ) {
-        sessionRecord.isRunning = false
-        sessionRecord.runningTerminalId = undefined
+      if (sessionRecord.runningTerminalId) {
+        const rowKey = `${session.provider || 'claude'}:${session.sessionId}`
+        const movedToKey = currentKeyByTerminalId.get(sessionRecord.runningTerminalId)
+        if (
+          clearedTerminalIds.has(sessionRecord.runningTerminalId)
+          || (movedToKey !== undefined && movedToKey !== rowKey)
+        ) {
+          sessionRecord.isRunning = false
+          sessionRecord.runningTerminalId = undefined
+        }
       }
 
       const runningTerminalId = runningBySessionKey.get(`${session.provider || 'claude'}:${session.sessionId}`)

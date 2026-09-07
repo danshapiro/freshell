@@ -17,6 +17,7 @@ import sessionsReducer, {
   setSessionWindowError,
   setSessionWindowLoading,
   appendSessionsPage,
+  patchSessionRunningStateFromTerminalMeta,
 } from '@/store/sessionsSlice'
 import type { ProjectGroup } from '@/store/types'
 
@@ -1187,6 +1188,121 @@ describe('sessionsSlice', () => {
 
       state = sessionsReducer(state, stamp({ paneKeys: [] }))
       expect(Object.keys(state.contextUsageByKey)).toEqual([])
+    })
+  })
+
+  describe('patchSessionRunningStateFromTerminalMeta identity moves', () => {
+    const rebindProjects = (): ProjectGroup[] => ([
+      {
+        projectPath: '/repo',
+        sessions: [
+          {
+            provider: 'codex',
+            sessionId: 'old-thread',
+            projectPath: '/repo',
+            lastActivityAt: 1,
+            title: 'Old thread',
+            isRunning: true,
+            runningTerminalId: 't-1',
+          },
+          {
+            provider: 'codex',
+            sessionId: 'new-thread',
+            projectPath: '/repo',
+            lastActivityAt: 2,
+            title: 'New thread',
+          },
+        ],
+      },
+    ] as any)
+
+    const findRow = (projects: ProjectGroup[], sessionId: string) =>
+      projects
+        .flatMap((project) => project.sessions)
+        .find((session) => session.sessionId === sessionId) as any
+
+    it('moves running state off the superseded session row on a rebind (old → cleared, new → running)', () => {
+      const stateWithRebind: SessionsState = {
+        ...initialState,
+        projects: rebindProjects(),
+        windows: {
+          sidebar: {
+            projects: rebindProjects(),
+          },
+        },
+      }
+
+      const state = sessionsReducer(stateWithRebind, patchSessionRunningStateFromTerminalMeta({
+        upsert: [{ terminalId: 't-1', provider: 'codex', sessionId: 'new-thread', updatedAt: Date.now() }],
+        remove: [],
+      }))
+
+      const oldRow = findRow(state.projects, 'old-thread')
+      const newRow = findRow(state.projects, 'new-thread')
+      expect(oldRow.isRunning).toBe(false)
+      expect(oldRow.runningTerminalId).toBeUndefined()
+      expect(newRow.isRunning).toBe(true)
+      expect(newRow.runningTerminalId).toBe('t-1')
+
+      // Window surfaces: the reducer loops all windows, so the sidebar
+      // window's copy of the rows gets the same treatment.
+      const windowOldRow = findRow(state.windows.sidebar.projects, 'old-thread')
+      const windowNewRow = findRow(state.windows.sidebar.projects, 'new-thread')
+      expect(windowOldRow.isRunning).toBe(false)
+      expect(windowOldRow.runningTerminalId).toBeUndefined()
+      expect(windowNewRow.isRunning).toBe(true)
+      expect(windowNewRow.runningTerminalId).toBe('t-1')
+    })
+
+    it('a same-key refresh keeps the row running (no false clear)', () => {
+      const stateWithRunning: SessionsState = {
+        ...initialState,
+        projects: rebindProjects(),
+      }
+
+      const state = sessionsReducer(stateWithRunning, patchSessionRunningStateFromTerminalMeta({
+        upsert: [{ terminalId: 't-1', provider: 'codex', sessionId: 'old-thread', updatedAt: Date.now() }],
+        remove: [],
+      }))
+
+      const oldRow = findRow(state.projects, 'old-thread')
+      const newRow = findRow(state.projects, 'new-thread')
+      expect(oldRow.isRunning).toBe(true)
+      expect(oldRow.runningTerminalId).toBe('t-1')
+      expect(newRow.isRunning).toBeUndefined()
+      expect(newRow.runningTerminalId).toBeUndefined()
+    })
+
+    it('remove entries still clear rows (pre-existing contract, pinned)', () => {
+      const stateWithRunning: SessionsState = {
+        ...initialState,
+        projects: rebindProjects(),
+      }
+
+      const state = sessionsReducer(stateWithRunning, patchSessionRunningStateFromTerminalMeta({
+        upsert: [],
+        remove: ['t-1'],
+      }))
+
+      const oldRow = findRow(state.projects, 'old-thread')
+      expect(oldRow.isRunning).toBe(false)
+      expect(oldRow.runningTerminalId).toBeUndefined()
+    })
+
+    it('upserts without provider/sessionId still mark the terminal cleared (pre-existing contract)', () => {
+      const stateWithRunning: SessionsState = {
+        ...initialState,
+        projects: rebindProjects(),
+      }
+
+      const state = sessionsReducer(stateWithRunning, patchSessionRunningStateFromTerminalMeta({
+        upsert: [{ terminalId: 't-1', updatedAt: Date.now() }],
+        remove: [],
+      }))
+
+      const oldRow = findRow(state.projects, 'old-thread')
+      expect(oldRow.isRunning).toBe(false)
+      expect(oldRow.runningTerminalId).toBeUndefined()
     })
   })
 })

@@ -12,6 +12,8 @@
 
 use freshell_protocol::TerminalRunStatus;
 
+use freshell_codex::launch_lifecycle::CodexTerminalLaunchManager;
+
 use crate::terminal::now_ms;
 use crate::WsState;
 
@@ -229,27 +231,36 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             },
         )
         .await;
-        if !ok {
-            tracing::warn!(terminal_id = %f.terminal_id, "codex_fork_rebind_refused");
-            // `tick_forks` eagerly advanced the watch to the (now refused)
-            // child id BEFORE these guards ran. Re-register with the OLD id
-            // so a later GENUINE fork of the pane's real session is still
-            // detected; `watch_fork` also re-snapshots known_files, so the
-            // refused child's rollout can never re-fire. Blocking pool, same
-            // as the adoption-lane watch_fork above (bounded fs walk).
-            let watch_locator = std::sync::Arc::clone(locator);
-            let terminal_id = f.terminal_id.clone();
-            let old_session_id = f.old_session_id.clone();
-            if let Err(join_error) = tokio::task::spawn_blocking(move || {
-                watch_locator.watch_fork(&terminal_id, &old_session_id);
-            })
-            .await
-            {
-                tracing::warn!(
-                    error = %join_error,
-                    "codex_watch_fork_panicked: blocking watch_fork task panicked"
-                );
-            }
+        if ok {
+            // Fan-out parity with the proxy resume arm (D-RESUME): the new
+            // thread id is the durable sidecar record's restore-time reattach
+            // key. Silent no-op for unmanaged terminals (no record exists).
+            CodexTerminalLaunchManager::global()
+                .note_session_id(&f.terminal_id, &f.new_session_id)
+                .await;
+            // No watch re-registration on success: `tick_forks` already
+            // advanced the watch to the child id (see the refused arm below).
+            continue;
+        }
+        tracing::warn!(terminal_id = %f.terminal_id, "codex_fork_rebind_refused");
+        // `tick_forks` eagerly advanced the watch to the (now refused)
+        // child id BEFORE these guards ran. Re-register with the OLD id
+        // so a later GENUINE fork of the pane's real session is still
+        // detected; `watch_fork` also re-snapshots known_files, so the
+        // refused child's rollout can never re-fire. Blocking pool, same
+        // as the adoption-lane watch_fork above (bounded fs walk).
+        let watch_locator = std::sync::Arc::clone(locator);
+        let terminal_id = f.terminal_id.clone();
+        let old_session_id = f.old_session_id.clone();
+        if let Err(join_error) = tokio::task::spawn_blocking(move || {
+            watch_locator.watch_fork(&terminal_id, &old_session_id);
+        })
+        .await
+        {
+            tracing::warn!(
+                error = %join_error,
+                "codex_watch_fork_panicked: blocking watch_fork task panicked"
+            );
         }
     }
 }

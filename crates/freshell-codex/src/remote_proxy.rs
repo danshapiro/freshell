@@ -5,8 +5,11 @@
 //! a loopback WS server the codex TUI connects to (`--remote <this ws_url>`); it dials a
 //! real upstream app-server and relays frames bidirectionally, scanning them via the
 //! Slice-1 pure extractors ([`crate::remote_proxy_envelope`],
-//! [`crate::remote_proxy_side_effects`]) to surface durability candidates, turn/lifecycle
-//! events, and `fs/changed` repair triggers, and rewriting the two `thread/fork` frames
+//! [`crate::remote_proxy_side_effects`]) to surface durability candidates
+//! (`thread/start` responses, `thread/started` notifications, and `thread/fork` /
+//! `thread/resume` responses — the latter with request/response thread-id agreement
+//! attribution so an in-TUI `/resume` rebinds identity), turn/lifecycle events, and
+//! `fs/changed` repair triggers, and rewriting the two `thread/fork` frames
 //! (request: strip `turns`; response: normalize for the TUI). NOT wired into
 //! `freshell-ws`/`freshell-server` in this slice — deliberately additive library code with
 //! a typed `mpsc` event stream for a later slice (Slice 3/5) to consume.
@@ -62,10 +65,11 @@ use crate::remote_proxy_envelope::{
 };
 use crate::remote_proxy_side_effects::{
     extract_fork_response_candidate, extract_fs_changed_repair_trigger,
-    extract_thread_lifecycle_event, extract_thread_start_response_candidate,
-    extract_thread_started_notification_side_effects, extract_turn_notification_event,
-    normalize_thread_fork_response_for_tui, rewrite_thread_fork_request_exclude_turns,
-    ForkResponseOptions, RemoteProxyCandidate, ThreadLifecycleEvent, ThreadStartResponseOptions,
+    extract_thread_lifecycle_event, extract_thread_resume_response_candidate,
+    extract_thread_start_response_candidate, extract_thread_started_notification_side_effects,
+    extract_turn_notification_event, normalize_thread_fork_response_for_tui,
+    rewrite_thread_fork_request_exclude_turns, ForkResponseOptions, RemoteProxyCandidate,
+    ThreadLifecycleEvent, ThreadResumeResponseOptions, ThreadStartResponseOptions,
     ThreadStartedLifecycle, TurnEvent as SideEffectTurnEvent,
 };
 
@@ -615,6 +619,21 @@ fn to_ws_message(frame: OutFrame) -> Message {
 
 // ── the hub: single-task owner of all shared relay/dedup state ─────────────────────
 
+/// What the proxy recorded about a `thread/resume` client request so the response
+/// extractor can enforce request/response thread-id agreement ONLY when the request
+/// was threadId-mode (see [`Hub::handle_thread_resume_request`] /
+/// [`extract_thread_resume_request_attribution`]).
+#[derive(Clone, Debug, Default)]
+struct ResumeRequestAttribution {
+    /// `params.threadId` from the request (None when absent/empty).
+    thread_id: Option<String>,
+    /// False when experimental `params.history` (non-empty) or a non-empty
+    /// `params.path` were supplied — the server then IGNORES `params.threadId`
+    /// (protocol: "history > non-empty path > thread_id"), so a differing response
+    /// id is legal and must not hard-fail.
+    enforce_agreement: bool,
+}
+
 struct ConnState {
     client_tx: Option<mpsc::UnboundedSender<WriterMsg>>,
     upstream_tx: Option<mpsc::UnboundedSender<WriterMsg>>,
@@ -626,6 +645,7 @@ struct ConnState {
     pending_to_upstream: VecDeque<OutFrame>,
     pending_methods: HashMap<RequestId, String>,
     pending_fork_requests: HashMap<RequestId, Option<String>>,
+    pending_resume_requests: HashMap<RequestId, ResumeRequestAttribution>,
     /// Sniffed server→client approval requests still awaiting a resolution (decision 5).
     /// Keyed on the SERVER's id space (never consulted for our own client requests);
     /// drained with `ApprovalResolved` emissions on connection teardown (decision 5b).
@@ -640,6 +660,7 @@ impl ConnState {
             pending_to_upstream: VecDeque::new(),
             pending_methods: HashMap::new(),
             pending_fork_requests: HashMap::new(),
+            pending_resume_requests: HashMap::new(),
             pending_server_approvals: HashSet::new(),
         }
     }
@@ -1074,6 +1095,14 @@ impl Hub {
             return;
         }
 
+        // S5.c NON-CHANGE: `thread/resume` deliberately stays OUT of the identity
+        // gate's hold set (turn/start + thread/fork only) — a resume candidate can be
+        // the pane's very first identity; holding it would deadlock that boot shape.
+        if method.as_deref() == Some("thread/resume") {
+            self.handle_thread_resume_request(conn_id, data, binary, id);
+            return;
+        }
+
         if method.as_deref() == Some("turn/interrupt") && data.len() <= MAX_FULL_PARSE_BYTES {
             if let (Ok(parsed), Some(id)) = (serde_json::from_slice::<Value>(&data), id.as_ref()) {
                 if self.completed_turn_interrupt(&parsed).is_some() {
@@ -1172,6 +1201,28 @@ impl Hub {
         );
     }
 
+    /// `thread/resume` requests relay UNREWRITTEN (unlike `thread/fork` there is
+    /// nothing to strip). The proxy records a bounded-attribution tuple so the
+    /// response extractor can enforce request/response agreement ONLY when the
+    /// request was threadId-mode: experimental `params.history` or a non-empty
+    /// `params.path` make the server IGNORE params.threadId (protocol: "history >
+    /// non-empty path > thread_id"), so those modes must never hard-fail.
+    fn handle_thread_resume_request(
+        &mut self,
+        conn_id: u64,
+        data: Vec<u8>,
+        binary: bool,
+        id: Option<JsonRpcEnvelopeId>,
+    ) {
+        if let Some(req_id) = id.as_ref().and_then(envelope_id_to_request_id) {
+            if let Some(conn) = self.connections.get_mut(&conn_id) {
+                conn.pending_resume_requests
+                    .insert(req_id, extract_thread_resume_request_attribution(&data));
+            }
+        }
+        self.forward_client_frame(conn_id, data, binary, id, Some("thread/resume".to_string()));
+    }
+
     // ── upstream -> client (`handleUpstreamMessage`, `remote-proxy.ts:457-511`) ─────
 
     fn handle_upstream_frame(&mut self, conn_id: u64, data: Vec<u8>, binary: bool) {
@@ -1233,7 +1284,7 @@ impl Hub {
             }
 
             let req_id = envelope_id_to_request_id(&id);
-            let (method, fork_request) = match self.connections.get_mut(&conn_id) {
+            let (method, fork_request, resume_request) = match self.connections.get_mut(&conn_id) {
                 Some(conn) => {
                     let method = req_id
                         .as_ref()
@@ -1241,9 +1292,12 @@ impl Hub {
                     let fork_request = req_id
                         .as_ref()
                         .and_then(|rid| conn.pending_fork_requests.get(rid).cloned());
-                    (method, fork_request)
+                    let resume_request = req_id
+                        .as_ref()
+                        .and_then(|rid| conn.pending_resume_requests.get(rid).cloned());
+                    (method, fork_request, resume_request)
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
 
             if method.as_deref() == Some("thread/start") {
@@ -1257,6 +1311,16 @@ impl Hub {
                     binary,
                     req_id,
                     fork_request.flatten(),
+                );
+                return;
+            }
+            if method.as_deref() == Some("thread/resume") || resume_request.is_some() {
+                self.handle_thread_resume_response(
+                    conn_id,
+                    data,
+                    binary,
+                    req_id,
+                    resume_request.unwrap_or_default(),
                 );
                 return;
             }
@@ -1380,6 +1444,81 @@ impl Hub {
                 self.fail_unsafe_upstream_frame(
                     conn_id,
                     Some("thread/start"),
+                    &format!("{reason:?}"),
+                );
+            }
+        }
+    }
+
+    /// `thread/resume` response handler — mirrors [`Hub::handle_thread_start_response`]'s
+    /// discipline: small frames forward REGARDLESS and only attempt a candidate; only an
+    /// oversized frame takes the strict extract-or-fail-closed path. Removes the pending
+    /// attribution record at entry, mirroring the fork handler. One deliberate difference
+    /// from the start handler: a missing/unresolvable request id fails closed for ANY
+    /// frame size (the start handler forwards small frames id-less), because resume
+    /// attribution requires a recorded request. Unlike thread/start there is no legacy
+    /// counterpart — this detects the in-TUI `/resume` identity switch the kata tracks;
+    /// the response's `result.thread` IS the switched-to thread (resume preserves the
+    /// caller-requested id for threadId-mode requests).
+    fn handle_thread_resume_response(
+        &mut self,
+        conn_id: u64,
+        data: Vec<u8>,
+        binary: bool,
+        req_id: Option<RequestId>,
+        attribution: ResumeRequestAttribution,
+    ) {
+        let ResumeRequestAttribution {
+            thread_id: requested_thread_id,
+            enforce_agreement,
+        } = attribution;
+        let Some(req_id) = req_id else {
+            self.fail_unsafe_upstream_frame(
+                conn_id,
+                Some("thread/resume"),
+                "id_not_pending_resume",
+            );
+            return;
+        };
+        if let Some(conn) = self.connections.get_mut(&conn_id) {
+            conn.pending_resume_requests.remove(&req_id);
+        }
+
+        if data.len() <= MAX_FULL_PARSE_BYTES {
+            let mut pending = HashSet::new();
+            pending.insert(req_id);
+            if let Ok(candidate) = extract_thread_resume_response_candidate(
+                &data,
+                &ThreadResumeResponseOptions {
+                    requested_thread_id: requested_thread_id.as_deref(),
+                    enforce_id_agreement: enforce_agreement,
+                    pending_thread_resume_request_ids: &pending,
+                },
+            ) {
+                self.emit(RemoteProxyEvent::Candidate(candidate));
+            }
+            self.send_to_client(conn_id, data, binary);
+            return;
+        }
+
+        let mut pending = HashSet::new();
+        pending.insert(req_id);
+        match extract_thread_resume_response_candidate(
+            &data,
+            &ThreadResumeResponseOptions {
+                requested_thread_id: requested_thread_id.as_deref(),
+                enforce_id_agreement: enforce_agreement,
+                pending_thread_resume_request_ids: &pending,
+            },
+        ) {
+            Ok(candidate) => {
+                self.emit(RemoteProxyEvent::Candidate(candidate));
+                self.send_to_client(conn_id, data, binary);
+            }
+            Err(reason) => {
+                self.fail_unsafe_upstream_frame(
+                    conn_id,
+                    Some("thread/resume"),
                     &format!("{reason:?}"),
                 );
             }
@@ -1817,6 +1956,72 @@ fn extract_thread_fork_parent_thread_id(raw: &[u8]) -> Option<String> {
     }
 }
 
+/// Reads a client `thread/resume` request's attribution tuple via a bounded byte scan
+/// (not a full parse — same `json_scan` idioms as
+/// [`extract_thread_fork_parent_thread_id`]), so this is safe to call regardless of
+/// frame size. `thread_id` comes from `params.threadId` (None when absent/empty);
+/// `enforce_agreement` is false when experimental `params.history` is a non-empty array
+/// or `params.path` is a non-empty string — the server IGNORES `params.threadId` in
+/// those modes (protocol: "history > non-empty path > thread_id"), so a response thread
+/// id differing from the recorded one is then legal and must not hard-fail. Malformed
+/// frames fall back to the defaulted tuple: with no recorded `thread_id` the extractor
+/// has nothing to disagree with either way.
+fn extract_thread_resume_request_attribution(raw: &[u8]) -> ResumeRequestAttribution {
+    use crate::json_scan::{
+        decode_string_entry, find_entry, scan_object, skip_whitespace, ValueKind,
+        BYTE_CLOSE_BRACKET, BYTE_OPEN_BRACE,
+    };
+    use crate::remote_proxy_envelope::MAX_SCANNED_TOKEN_BYTES;
+
+    let fallback = ResumeRequestAttribution::default;
+    let start = skip_whitespace(raw, 0);
+    if start >= raw.len() || raw[start] != BYTE_OPEN_BRACE {
+        return fallback();
+    }
+    let Ok(root) = scan_object(raw, start, MAX_SCANNED_TOKEN_BYTES) else {
+        return fallback();
+    };
+    let Some(params) = find_entry(&root.entries, "params") else {
+        return fallback();
+    };
+    if params.value_kind != ValueKind::Object {
+        return fallback();
+    }
+    let Ok(params_object) = scan_object(raw, params.value_start, MAX_SCANNED_TOKEN_BYTES) else {
+        return fallback();
+    };
+
+    let thread_id = find_entry(&params_object.entries, "threadId").and_then(|entry| {
+        if entry.value_kind != ValueKind::String {
+            return None;
+        }
+        decode_string_entry(raw, entry)
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
+
+    // `params.history` is `Option<Vec<ResponseItem>>` on the wire — a non-empty ARRAY
+    // is the only shape that activates history-mode (and thereby makes the server
+    // ignore `params.threadId`).
+    let history_non_empty = find_entry(&params_object.entries, "history").is_some_and(|entry| {
+        entry.value_kind == ValueKind::Array && {
+            let inner = skip_whitespace(raw, entry.value_start + 1);
+            inner < raw.len() && raw[inner] != BYTE_CLOSE_BRACKET
+        }
+    });
+    let path_non_empty = find_entry(&params_object.entries, "path").is_some_and(|entry| {
+        entry.value_kind == ValueKind::String
+            && decode_string_entry(raw, entry)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false)
+    });
+
+    ResumeRequestAttribution {
+        thread_id,
+        enforce_agreement: !(history_non_empty || path_non_empty),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1874,5 +2079,83 @@ mod tests {
             extract_thread_fork_parent_thread_id(br#"{"id":1,"method":"thread/fork","params":{}}"#),
             None
         );
+    }
+
+    #[test]
+    fn extract_thread_resume_request_attribution_pins_the_thread_id_and_enforce_agreement_table() {
+        // `enforce_agreement` must be true ONLY when neither relax mode is active: a
+        // non-empty `params.history` array OR a non-empty `params.path` string makes
+        // the server IGNORE `params.threadId` (protocol: "history > non-empty path >
+        // thread_id"), so a response thread id differing from the recorded one is then
+        // legal and agreement must not be enforced.
+        let frame = |params: serde_json::Value| {
+            serde_json::json!({
+                "id": 1,
+                "method": "thread/resume",
+                "params": params,
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let cases = [
+            // ── params.threadId shapes (history/path absent ⇒ agreement enforced) ──
+            (
+                frame(serde_json::json!({ "threadId": "thread-A" })),
+                (Some("thread-A"), true),
+            ),
+            (frame(serde_json::json!({})), (None, true)),
+            (frame(serde_json::json!({ "threadId": "" })), (None, true)),
+            (frame(serde_json::json!({ "threadId": 42 })), (None, true)),
+            // ── params.history shapes ──
+            (
+                frame(serde_json::json!({ "threadId": "thread-A", "history": [] })),
+                (Some("thread-A"), true),
+            ),
+            (
+                frame(
+                    serde_json::json!({ "threadId": "thread-A", "history": [{ "type": "message" }] }),
+                ),
+                (Some("thread-A"), false),
+            ),
+            // A non-array `history` (protocol-malformed) does NOT relax enforcement.
+            (
+                frame(serde_json::json!({ "history": { "items": [] } })),
+                (None, true),
+            ),
+            // ── params.path shapes ──
+            (
+                frame(serde_json::json!({ "threadId": "thread-A", "path": "" })),
+                (Some("thread-A"), true),
+            ),
+            (
+                frame(serde_json::json!({ "threadId": "thread-A", "path": "/tmp/rollout.jsonl" })),
+                (Some("thread-A"), false),
+            ),
+            (frame(serde_json::json!({ "path": 7 })), (None, true)),
+            // ── either relax mode (both shown) disables enforcement ──
+            (
+                frame(serde_json::json!({
+                    "threadId": "thread-A",
+                    "history": [{ "type": "message" }],
+                    "path": "/tmp/rollout.jsonl",
+                })),
+                (Some("thread-A"), false),
+            ),
+            // ── a malformed frame falls back to the defaulted tuple (doc'd behavior):
+            //    nothing recorded to agree with, enforcement off ──
+            (b"not json".to_vec(), (None, false)),
+        ];
+        for (raw, expected) in cases {
+            let attribution = extract_thread_resume_request_attribution(&raw);
+            assert_eq!(
+                (
+                    attribution.thread_id.as_deref(),
+                    attribution.enforce_agreement
+                ),
+                expected,
+                "unexpected attribution for frame: {}",
+                String::from_utf8_lossy(&raw),
+            );
+        }
     }
 }

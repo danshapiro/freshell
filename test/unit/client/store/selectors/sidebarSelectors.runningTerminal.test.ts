@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest'
+import { enableMapSet } from 'immer'
+import sessionsReducer, {
+  patchSessionRunningStateFromTerminalMeta,
+} from '@/store/sessionsSlice'
 import {
   buildSessionItems,
   filterSessionItemsByVisibility,
@@ -6,6 +10,9 @@ import {
 } from '@/store/selectors/sidebarSelectors'
 import type { BackgroundTerminal } from '@/store/types'
 import type { RootState } from '@/store/store'
+
+// Enable Immer's MapSet plugin for Set/Map support in Redux state
+enableMapSet()
 
 function createState(): RootState {
   return {
@@ -232,6 +239,80 @@ describe('sidebarSelectors running session mapping', () => {
         liveTerminalOnly: true,
       }),
     ])
+  })
+
+  it('rebind presentation: the new session row is running, the superseded row is not, and no duplicate rows exist', () => {
+    // Between the `terminal.meta.updated` frame (terminal t-1 now belongs to
+    // codex:new) and the 50ms-debounced session-window refresh, the shipped
+    // store holds the LAGGING directory view: codex:old still claims t-1
+    // (isRunning: true, runningTerminalId: 't-1'). Run the exact reducer
+    // action the invalidation handler dispatches, then project through the
+    // selector — the combined path must render the move, not a duplicate.
+    const laggingSessionsState = {
+      projects: [
+        {
+          projectPath: '/repo',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'old',
+              projectPath: '/repo',
+              lastActivityAt: 1,
+              title: 'Old thread',
+              isRunning: true,
+              runningTerminalId: 't-1',
+            },
+            {
+              provider: 'codex',
+              sessionId: 'new',
+              projectPath: '/repo',
+              lastActivityAt: 2,
+              title: 'New thread',
+            },
+          ],
+        },
+      ],
+      expandedProjects: new Set<string>(),
+      wsSnapshotReceived: true,
+    }
+    const sessionsState = sessionsReducer(laggingSessionsState as any, patchSessionRunningStateFromTerminalMeta({
+      upsert: [{ terminalId: 't-1', provider: 'codex', sessionId: 'new', updatedAt: 2_000 }],
+      remove: [],
+    }))
+
+    const terminals: BackgroundTerminal[] = [
+      {
+        terminalId: 't-1',
+        title: 'Codex',
+        createdAt: 100,
+        lastActivityAt: 2_100,
+        status: 'running',
+        hasClients: true,
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'new',
+        },
+      },
+    ]
+
+    const items = buildSessionItems(sessionsState.projects, [], emptyPanes, terminals, {}, 'repo')
+
+    const newItem = items.find((item) => item.provider === 'codex' && item.sessionId === 'new')
+    expect(newItem).toMatchObject({
+      isRunning: true,
+      runningTerminalId: 't-1',
+      hasTab: false,
+    })
+
+    const oldItems = items.filter((item) => item.provider === 'codex' && item.sessionId === 'old')
+    expect(oldItems.length).toBeLessThanOrEqual(1)
+    expect(oldItems.every((item) => !item.isRunning && item.runningTerminalId === undefined)).toBe(true)
+
+    const claimants = items.filter((item) =>
+      item.runningTerminalId === 't-1' || (item.runningTerminalIds ?? []).includes('t-1'))
+    expect(claimants).toHaveLength(1)
+    expect(claimants[0]?.sessionId).toBe('new')
   })
 })
 
