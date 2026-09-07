@@ -216,7 +216,7 @@ async fn dispatch(
                         execution_generation,
                         grant_id,
                         fixture,
-                        terminal,
+                        terminal.map(|terminal| *terminal),
                     )
                     .await
                 }
@@ -489,7 +489,7 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
         .get("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "managed provider requires terminal HOME".to_string())?;
-    if home != PathBuf::from("/home/freshell/provider") {
+    if home != Path::new("/home/freshell/provider") {
         return Err("managed provider HOME must be /home/freshell/provider".into());
     }
     if !home.is_dir() {

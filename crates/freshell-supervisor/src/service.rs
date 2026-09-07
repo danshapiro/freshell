@@ -128,7 +128,7 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                self.launch(envelope.request_id, request)
+                self.launch(envelope.request_id, *request)
                     .await
                     .map(AdminResult::Launch)
             }
@@ -326,11 +326,10 @@ impl Supervisor {
             .map_err(map_backend)?;
         let accepted = self
             .send_grant(
-                handle.incarnation_id().clone(),
+                &handle,
                 request.soul_id.clone(),
                 request.fixture,
                 request.terminal.clone(),
-                handle.runtime_dir(),
                 &authenticated,
                 &grant,
             )
@@ -692,14 +691,14 @@ impl Supervisor {
 
     async fn send_grant(
         &self,
-        incarnation_id: IncarnationId,
+        handle: &crate::registry::OwnedRuntimeHandle,
         soul_id: SoulId,
         fixture: Option<FixtureKind>,
         terminal: Option<TerminalLaunchSpec>,
-        runtime_dir: &Path,
         host: &AuthenticatedHost,
         grant: &ExecutionGrantRecord,
     ) -> Result<AcceptedGrant, RuntimeError> {
+        let incarnation_id = handle.incarnation_id().clone();
         let command = HostCommand::GrantExecution {
             incarnation_id: incarnation_id.clone(),
             soul_id,
@@ -708,10 +707,10 @@ impl Supervisor {
             execution_generation: grant.execution_generation,
             grant_id: grant.grant_id.clone(),
             fixture,
-            terminal,
+            terminal: terminal.map(Box::new),
         };
         match self
-            .send_authenticated_host_command(incarnation_id, runtime_dir, host, command)
+            .send_authenticated_host_command(incarnation_id, handle.runtime_dir(), host, command)
             .await?
         {
             HostResult::GrantAccepted {

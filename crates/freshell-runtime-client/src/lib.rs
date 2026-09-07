@@ -105,7 +105,7 @@ impl RuntimeClient {
         request.expected_control_epoch = Some(epoch);
         let original = request.clone();
         match self
-            .request(request_id.clone(), AdminCommand::Launch(request))
+            .request(request_id.clone(), AdminCommand::Launch(Box::new(request)))
             .await
         {
             Ok(AdminResult::Launch(result)) => Ok(result),
@@ -114,7 +114,7 @@ impl RuntimeClient {
                 let mut retry = original;
                 retry.expected_control_epoch = Some(epoch);
                 match self
-                    .request(request_id, AdminCommand::Launch(retry))
+                    .request(request_id, AdminCommand::Launch(Box::new(retry)))
                     .await?
                 {
                     AdminResult::Launch(result) => Ok(result),
