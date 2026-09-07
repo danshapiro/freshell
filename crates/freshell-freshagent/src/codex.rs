@@ -3884,10 +3884,12 @@ fn build_codex_snapshot_json(
     let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
     let status = normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null));
     // Wedged-sidecar deadman overlay: a deadman-flagged session whose fresh read still
-    // shows the thread running reports `stuck` (never a fabricated completion). The
-    // overlay touches ONLY the serialized status — `is_running` and the derived
-    // capabilities still follow the freshly-read provider status.
-    let wire_status = if stuck && status == CodexStatus::Running {
+    // shows the thread running OR starting reports `stuck` (never a fabricated
+    // completion) — the Node lane's `withStuckOverlay` also overlays over `'starting'`
+    // (`adapter.ts:793-795`). The overlay touches ONLY the serialized status —
+    // `is_running` and the derived capabilities still follow the freshly-read provider
+    // status.
+    let wire_status = if stuck && matches!(status, CodexStatus::Running | CodexStatus::Starting) {
         CodexStatus::Stuck
     } else {
         status
@@ -4257,10 +4259,13 @@ fn note_codex_activity(
     }
 }
 
-/// Disarm the deadman on session teardown (`resolution`: `"exit"` for the crash
-/// self-heal, `"kill"` for a requested kill/shutdown). Resolves a flagged stuck state
-/// and invalidates outstanding waiters; never broadcasts (the caller's own frame —
-/// `exited` / `killed` — is the session's terminal status).
+/// Disarm the deadman on terminal statuses and session teardown (`resolution`:
+/// `"turn_complete"` / `"thread_closed"` / `"activity"` at the `reduce_notification`
+/// clear points — mirroring the Node lane's disarm reasons, `adapter.ts:1015,1030,
+/// 1002` — `"exit"` for the crash self-heal, `"kill"` for a requested kill/shutdown).
+/// Resolves a flagged stuck state and invalidates outstanding waiters; never
+/// broadcasts (the caller's own frame — the terminal status / `exited` / `killed` —
+/// is the session's terminal signal).
 fn disarm_codex_quiet(
     quiet: &Arc<StdMutex<QuietDeadman>>,
     thread_id: &str,
@@ -4286,6 +4291,11 @@ fn disarm_codex_quiet(
 /// so it feeds the wedged-sidecar quiet deadman ([`note_codex_activity`]) on entry; the
 /// `TurnStarted` arm feeds again right after it sets `active_turn`, because a turn that
 /// started OUTSIDE `handle_send` (e.g. observed mid-restore) is only arm-able from here.
+/// Conversely, each terminal-status clear point above also DISARMS the window
+/// ([`disarm_codex_quiet`], reasons mirroring `adapter.ts:1015,1030,1002`): the entry
+/// feed re-arms while the turn is still tracked, and a stale armed deadline surviving
+/// the clearance would make `arm_codex_quiet_if_absent` refuse to arm for a later
+/// snapshot-observed externally-started turn.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
@@ -4316,6 +4326,10 @@ fn reduce_notification(
                 let normalized = normalize_codex_thread_status(&status);
                 if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
                     clear_active_turn(active_turn);
+                    // The terminal status also disarms (adapter.ts:1015): the entry
+                    // feed re-armed the window while the turn was still tracked, and
+                    // a stale deadline would block a later snapshot-observed arm.
+                    disarm_codex_quiet(quiet_deadman, subscription.session_id(), "activity");
                 }
             }
             subscription
@@ -4327,6 +4341,11 @@ fn reduce_notification(
             // adapter.ts:912-913 — the turn is over regardless of status; clear unconditionally.
             if event.thread_id == subscription.session_id() {
                 clear_active_turn(active_turn);
+                // Terminal status: disarm too (adapter.ts:1030). Without this the entry
+                // feed's re-arm leaves a stale `Some(deadline)` that
+                // `arm_codex_quiet_if_absent` would honor for a later externally-started
+                // turn whose `turn/started` this process never saw.
+                disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
             }
             subscription.on_turn_completed(&event, now_ms())
         }
@@ -4350,6 +4369,9 @@ fn reduce_notification(
         CodexNotification::ThreadClosed { thread_id } => {
             if thread_id == subscription.session_id() {
                 clear_active_turn(active_turn);
+                // The thread is gone (adapter.ts:1002): disarm so no stale deadline
+                // outlives it (same stale-arm hole as the completion path).
+                disarm_codex_quiet(quiet_deadman, subscription.session_id(), "thread_closed");
             }
             subscription
                 .on_thread_closed(&thread_id)
@@ -5654,6 +5676,28 @@ pub(crate) mod tests {
             .expect("snapshot task")
             .expect("snapshot builds");
         assert_eq!(snap["status"], "stuck");
+
+        // Overlay parity pin (Node `adapter.ts:793-795` overlays `stuck` over
+        // `running` OR `starting`): a flagged session whose fresh read is
+        // `starting` serializes "stuck" too.
+        let snap_driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-quiet-midrestore", None).await })
+        };
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        let mut starting_payload = snapshot_payload();
+        starting_payload["thread"]["status"] = json!({ "type": "notLoaded" });
+        peer.respond(&id, starting_payload);
+        let snap = snap_driver
+            .await
+            .expect("snapshot task")
+            .expect("snapshot builds");
+        assert_eq!(
+            snap["status"], "stuck",
+            "stuck overlays a starting read too"
+        );
+
         let flap =
             collect_frames_until(&mut frame_rx, std::time::Duration::from_millis(400), |_| {
                 false
@@ -5696,6 +5740,116 @@ pub(crate) mod tests {
             drain.frames.iter().all(|w| w["event"]["status"] != "stuck"),
             "a quiet session with no turn in flight must never go stuck: {:?}",
             drain.frames
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_deadman_rearms_after_terminal_status_clearance() {
+        // M1 regression: a terminal status (`turn/completed` here) must DISARM the
+        // quiet deadman, not merely suppress its fire by clearing `active_turn`
+        // (the waiter's `has_turn` re-check). A stale `Some(deadline)` left behind
+        // makes `arm_codex_quiet_if_absent` refuse to arm for a later
+        // EXTERNALLY-started turn observed via snapshot (its `turn/started` never
+        // seen by this process), so that turn's wedge would never be detected.
+        let (st, mut frame_rx) = state_with_bus();
+        st.set_codex_quiet_window_ms_for_tests(150);
+
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-quiet-rearm",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-quiet-rearm",
+        )
+        .await;
+
+        // Turn 1: in flight via the production send path, then completed by push.
+        // The entry feed on `turn/completed` re-arms (the turn is still tracked at
+        // feed time); the completion path must then DISARM the window.
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move { st.handle_send(send_msg("thread-quiet-rearm", "run")).await })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({ "turn": { "id": "turn-1" } }));
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-quiet-rearm", "turnId": "turn-1", "turn": { "id": "turn-1", "status": "inProgress" } }),
+        );
+        send.await.expect("send task");
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-quiet-rearm", "turn": { "id": "turn-1", "status": "completed" } }),
+        );
+        // The idle snapshot frame proves the consumer has processed the completion
+        // (clear + disarm) before the test proceeds.
+        let idle = collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(idle.matched, "completion processed: {:?}", idle.frames);
+
+        // Total lane silence for several windows: with the turn cleared nothing may
+        // fire, and — post-fix — no stale deadline may survive the clearance.
+        let silence =
+            collect_frames_until(&mut frame_rx, std::time::Duration::from_millis(450), |_| {
+                false
+            })
+            .await;
+        assert!(
+            silence
+                .frames
+                .iter()
+                .all(|w| w["event"]["status"] != "stuck"),
+            "no fire with no turn in flight: {:?}",
+            silence.frames
+        );
+
+        // Turn 2: started EXTERNALLY on the same sidecar (no `turn/started` ever
+        // seen here); a snapshot poll observes it in flight and must arm a FRESH
+        // window. Pre-fix, the stale deadline from turn 1's entry feed makes
+        // `arm_codex_quiet_if_absent` refuse, so the wedge below never fires.
+        let snap_driver = {
+            let st = st.clone();
+            tokio::spawn(async move { st.get_snapshot("thread-quiet-rearm", None).await })
+        };
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        peer.respond(
+            &id,
+            json!({
+                "thread": {
+                    "id": "thread-quiet-rearm",
+                    "status": { "type": "active" },
+                    "turns": [{ "id": "turn-2", "status": "inProgress", "items": [] }],
+                }
+            }),
+        );
+        let snap = snap_driver
+            .await
+            .expect("snapshot task")
+            .expect("snapshot builds");
+        assert_eq!(
+            snap["status"], "running",
+            "freshly observed, not yet flagged"
+        );
+
+        // The freshly armed window fires on its own within the budget — impossible
+        // while a stale deadline from turn 1 still occupies the deadman.
+        let collect = collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck"
+        })
+        .await;
+        assert!(
+            collect.matched,
+            "a snapshot-observed turn must arm a fresh window after terminal-status clearance: {:?}",
+            collect.frames
         );
     }
 
