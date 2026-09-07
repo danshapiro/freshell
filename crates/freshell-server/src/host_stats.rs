@@ -2336,12 +2336,12 @@ docker0: 2000000   20000    2    1    0     0          0         0  3000000   30
         rewrite_counter(&proc_root.join("vmstat"), "oom_kill", 14);
         assert!(
             wait_until(Duration::from_millis(500), || {
-                collector.snapshot().live.paging.oom_kills_delta == 1
+                let paging = &collector.snapshot().live.paging;
+                paging.oom_kills_delta == 1 && paging.oom_kills_total == 14
             })
             .await,
-            "paging deltas re-base on the restart sample"
+            "paging deltas re-base on the restart sample (delta 1, total 14)"
         );
-        assert_eq!(collector.snapshot().live.paging.oom_kills_total, 14);
 
         // Slow tier (Finding 1 disposition): the FIRST post-restart slow tick
         // is the null-safe first slow sample — zero rates/deltas, totals
@@ -2353,21 +2353,26 @@ docker0: 2000000   20000    2    1    0     0          0         0  3000000   30
             .await,
             "first post-restart slow tick populates the slow sections"
         );
-        let first_slow = collector.snapshot();
-        assert!(first_slow.live.disk_io.available);
-        assert_eq!(first_slow.live.disk_io.read_bps, 0.0);
-        assert_eq!(first_slow.live.disk_io.write_bps, 0.0);
-        assert_eq!(first_slow.live.disk_io.util_pct, None);
-        assert_eq!(first_slow.live.disk_io.weighted_await_ms, None);
-        let net = &first_slow.live.network;
-        assert!(net.available);
-        assert_eq!(net.rx_bps, 0.0);
-        assert_eq!(net.tx_bps, 0.0);
-        assert_eq!(net.rx_errors_total, 19);
-        assert_eq!(net.tx_errors_total, 16);
-        assert_eq!(net.rx_dropped_total, 4);
-        assert_eq!(net.tx_dropped_total, 6);
-        assert_eq!(net.rx_errors_delta, 0);
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                let live = &collector.snapshot().live;
+                live.disk_io.available
+                    && live.disk_io.read_bps == 0.0
+                    && live.disk_io.write_bps == 0.0
+                    && live.disk_io.util_pct.is_none()
+                    && live.disk_io.weighted_await_ms.is_none()
+                    && live.network.available
+                    && live.network.rx_bps == 0.0
+                    && live.network.tx_bps == 0.0
+                    && live.network.rx_errors_total == 19
+                    && live.network.tx_errors_total == 16
+                    && live.network.rx_dropped_total == 4
+                    && live.network.tx_dropped_total == 6
+                    && live.network.rx_errors_delta == 0
+            })
+            .await,
+            "first post-restart slow tick is the null-safe first slow sample with G1 totals"
+        );
 
         // Positive re-base proof #2 (dt-free witnesses only): grow eth0 rx
         // errs by exactly 1 (17->18) and grow ONLY sda's diskstats counters
@@ -2387,13 +2392,12 @@ docker0: 2000000   20000    2    1    0     0          0         0  3000000   30
             wait_until(Duration::from_millis(2000), || {
                 let live = &collector.snapshot().live;
                 live.network.rx_errors_delta == 1
+                    && live.network.rx_errors_total == 20
+                    && live.disk_io.weighted_await_ms == Some(8.0)
             })
             .await,
-            "network deltas re-base on the restart sample"
+            "network/disk re-base on the restart sample (dt-free witnesses)"
         );
-        let rebased = collector.snapshot();
-        assert_eq!(rebased.live.network.rx_errors_total, 20);
-        assert_eq!(rebased.live.disk_io.weighted_await_ms, Some(8.0));
         collector.set_active(false);
     }
 
