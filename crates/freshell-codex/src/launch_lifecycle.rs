@@ -57,7 +57,7 @@ use crate::sidecar_store::{
     codex_sidecar_store, proc_cmdline, proc_starttime, CodexSidecarRecord, CodexSidecarStore,
     SidecarRecordState, SIDECAR_RECORD_VERSION,
 };
-use crate::transport::reap_owned_codex_sidecars;
+use crate::transport::{reap_owned_codex_sidecars, OwnedProcessTreeBarrier};
 
 /// `assertAcceptingPlans` (`launch-planner.ts:199`), byte-identical.
 pub const CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE: &str =
@@ -70,6 +70,11 @@ pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
 /// How long a spawned app-server gets to bring its WS listener up — the shared
 /// sidecar-spawn budget (S5.d.1 unification; also `freshell-freshagent`'s spawn).
 pub const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+
+/// Restart transactions stamp the replacement sidecar's spawn env with the
+/// restart transaction's ownership id under this var, so the durable restart
+/// journal/recovery can fence a replacement against the retired tree.
+const RESTART_REPLACEMENT_OWNERSHIP_ENV: &str = "FRESHELL_RESTART_REPLACEMENT_ID";
 
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
@@ -84,6 +89,11 @@ pub struct CodexRuntimeReady {
 /// the adopt-time ownership update, and teardown. The S5 RPC surface
 /// (`readThreadTurn`/`watchPath`/…) joins this trait when its consumers land.
 pub trait CodexLaunchRuntime: Send + Sync {
+    /// Stamp a durable restart ownership token onto the next sidecar spawn.
+    /// Fresh runtimes are created per plan, so this is set once before
+    /// `ensure_ready`.
+    fn set_replacement_ownership_id(&self, _ownership_id: Option<&str>) {}
+
     /// Bring the app-server up (spawn on first call) and return its WS URL
     /// (`runtime.ensureReady(cwd)`, called with the create cwd in BOTH plan branches,
     /// `launch-planner.ts:137,153`).
@@ -122,6 +132,16 @@ pub trait CodexLaunchRuntime: Send + Sync {
 
     /// Tear the app-server down (`runtime.shutdown()`, `launch-planner.ts:302`).
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Snapshot the exact app-server process tree before a restart journal
+    /// crosses its destructive boundary. Injected runtimes that own no OS
+    /// process may leave this absent; the real spawn runtime always returns
+    /// its capture-before-kill barrier while live.
+    fn capture_restart_barrier(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<OwnedProcessTreeBarrier>, String>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The planner's runtime factory (`CodexLaunchPlanner` ctor `runtimeOrFactory`,
@@ -236,6 +256,16 @@ impl CodexLaunchSidecar {
         if let Some(proxy) = self.inner.lock().await.proxy.as_ref() {
             proxy.fail_candidate_capture(message);
         }
+    }
+
+    async fn capture_restart_barrier(&self) -> Result<Option<OwnedProcessTreeBarrier>, String> {
+        let inner = self.inner.lock().await;
+        if inner.shutdown_succeeded {
+            return Ok(Some(OwnedProcessTreeBarrier::already_quiescent()));
+        }
+        // Hold this exact sidecar's lifecycle lock across capture so shutdown
+        // cannot remove the child between the live-state check and snapshot.
+        self.runtime.capture_restart_barrier().await
     }
 
     async fn assert_adoptable(&self) -> Result<(), String> {
@@ -375,10 +405,22 @@ impl CodexLaunchPlanner {
         &self,
         input: &CodexLaunchPlanInput<'_>,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        self.plan_create_fenced(input, None).await
+    }
+
+    pub async fn plan_create_fenced(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        replacement_ownership_id: Option<&str>,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         self.assert_accepting_plans()?;
         let plan = plan_codex_launch(input).map_err(CodexLaunchError::Config)?;
 
+        // Reattach-aware selection needs the plan (Task 7); restart transactions
+        // stamp the replacement's ownership id on the fresh runtime before any
+        // spawn (restart fencing).
         let runtime = (self.runtime_factory)(&plan).await;
+        runtime.set_replacement_ownership_id(replacement_ownership_id);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let sidecar = Arc::new(CodexLaunchSidecar {
             id,
@@ -452,10 +494,24 @@ impl CodexLaunchPlanner {
         attempts: u32,
         retry_delay_ms: u64,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        self.plan_create_with_retry_fenced(input, attempts, retry_delay_ms, None)
+            .await
+    }
+
+    pub async fn plan_create_with_retry_fenced(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        attempts: u32,
+        retry_delay_ms: u64,
+        replacement_ownership_id: Option<&str>,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.plan_create(input).await {
+            match self
+                .plan_create_fenced(input, replacement_ownership_id)
+                .await
+            {
                 Ok(launch) => return Ok(launch),
                 Err(error) => {
                     let is_config_error = matches!(error, CodexLaunchError::Config(_));
@@ -617,6 +673,14 @@ pub fn set_global_codex_launch_manager_for_tests(manager: CodexTerminalLaunchMan
 pub struct CodexTerminalLaunchManager {
     planner: CodexLaunchPlanner,
     adopted: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
+    /// Restart owns a stronger lifecycle than the ordinary PTY exit hook.
+    /// Entries move here before any await so a racing exit notification cannot
+    /// queue-and-forget teardown, and a failed barrier stays retryable by the
+    /// same terminal/runtime key.
+    restart_retirements: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
+    /// Classification fence kept independently while shutdown owns the
+    /// retirement value across awaits.
+    restart_retiring_terminal_ids: Mutex<std::collections::HashSet<String>>,
     /// Teardown/retention worker feed: the bool is the RETAIN decision,
     /// made by the sender at hand-off time (Task 10).
     teardown_tx: OnceLock<mpsc::UnboundedSender<(AdoptedTerminalLaunch, bool)>>,
@@ -640,6 +704,8 @@ impl CodexTerminalLaunchManager {
         Self {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
+            restart_retirements: Mutex::new(HashMap::new()),
+            restart_retiring_terminal_ids: Mutex::new(std::collections::HashSet::new()),
             teardown_tx: OnceLock::new(),
             shutdown_retention: AtomicBool::new(false),
             plan_budget: Arc::new(tokio::sync::Semaphore::new(CODEX_SIDECAR_PLAN_CONCURRENCY)),
@@ -793,6 +859,26 @@ impl CodexTerminalLaunchManager {
             .await
     }
 
+    /// Restart-transaction door (restart-resumable pane): the same retry
+    /// schedule, but the replacement spawn is stamped with the restart
+    /// transaction's ownership id so recovery can fence the hand-off.
+    pub async fn plan_create_with_retry_fenced(
+        &self,
+        input: &CodexLaunchPlanInput<'_>,
+        attempts: u32,
+        replacement_ownership_id: Option<&str>,
+    ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
+        self.ensure_teardown_worker();
+        self.planner
+            .plan_create_with_retry_fenced(
+                input,
+                attempts,
+                CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
+                replacement_ownership_id,
+            )
+            .await
+    }
+
     /// Adopt the launch for a created terminal (`codexPlan.sidecar.adopt({terminalId,
     /// generation: 0})`, `ws-handler.ts:2511`) and key its teardown by terminal id.
     pub async fn adopt(
@@ -941,6 +1027,158 @@ impl CodexTerminalLaunchManager {
         }
     }
 
+    /// Restart-only teardown for a managed Codex terminal. Unlike the normal
+    /// sync exit hook, this path is awaitable: the caller does not create the
+    /// replacement until the old proxy has closed and the sidecar runtime has
+    /// confirmed its captured process tree dead.
+    pub async fn shutdown_terminal_for_restart(&self, terminal_id: &str) -> Result<bool, String> {
+        self.shutdown_terminal_for_restart_with_expected_exit(terminal_id, || Ok(()))
+            .await
+    }
+
+    /// Restart-only teardown with an atomic expected-exit classification.
+    ///
+    /// The adopted launch is removed from the ordinary PTY-exit path while
+    /// that path's mutex is held, then `mark_expected_exit` runs before the
+    /// launch becomes available to asynchronous shutdown. Consequently a
+    /// proxy close cannot make the TUI report a natural crash before the
+    /// terminal registry knows the exit belongs to restart.
+    pub async fn shutdown_terminal_for_restart_with_expected_exit<F>(
+        &self,
+        terminal_id: &str,
+        mark_expected_exit: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if !self.quarantine_terminal_for_restart(terminal_id, mark_expected_exit)? {
+            return Ok(false);
+        }
+        self.continue_terminal_restart_shutdown(terminal_id).await
+    }
+
+    fn quarantine_terminal_for_restart<F>(
+        &self,
+        terminal_id: &str,
+        mark_expected_exit: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        if self
+            .restart_retirements
+            .lock()
+            .unwrap()
+            .contains_key(terminal_id)
+        {
+            mark_expected_exit()?;
+            self.restart_retiring_terminal_ids
+                .lock()
+                .unwrap()
+                .insert(terminal_id.to_string());
+            return Ok(true);
+        }
+
+        // Keep this lock across classification. The ordinary exit callback
+        // blocks in `notify_terminal_exit` until the entry has moved and the
+        // registry marker is visible.
+        let mut adopted = self.adopted.lock().unwrap();
+        let Some(entry) = adopted.remove(terminal_id) else {
+            // A concurrent retry may have completed the move after our first
+            // check but before we obtained the adopted lock.
+            drop(adopted);
+            if self
+                .restart_retirements
+                .lock()
+                .unwrap()
+                .contains_key(terminal_id)
+            {
+                mark_expected_exit()?;
+                self.restart_retiring_terminal_ids
+                    .lock()
+                    .unwrap()
+                    .insert(terminal_id.to_string());
+                return Ok(true);
+            }
+            return Ok(false);
+        };
+        if let Err(error) = mark_expected_exit() {
+            adopted.insert(terminal_id.to_string(), entry);
+            return Err(error);
+        }
+        self.restart_retirements
+            .lock()
+            .unwrap()
+            .insert(terminal_id.to_string(), entry);
+        self.restart_retiring_terminal_ids
+            .lock()
+            .unwrap()
+            .insert(terminal_id.to_string());
+        Ok(true)
+    }
+
+    async fn continue_terminal_restart_shutdown(&self, terminal_id: &str) -> Result<bool, String> {
+        let entry = self.restart_retirements.lock().unwrap().remove(terminal_id);
+        let Some(entry) = entry else {
+            return Ok(false);
+        };
+        match entry.sidecar.shutdown().await {
+            Ok(()) => {
+                self.restart_retiring_terminal_ids
+                    .lock()
+                    .unwrap()
+                    .remove(terminal_id);
+                Ok(true)
+            }
+            Err(error) => {
+                self.restart_retirements
+                    .lock()
+                    .unwrap()
+                    .insert(terminal_id.to_string(), entry);
+                Err(error)
+            }
+        }
+    }
+
+    /// Read-only classification used while shutdown owns the retirement value
+    /// across an await.
+    pub fn is_terminal_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminal_ids
+            .lock()
+            .unwrap()
+            .contains(terminal_id)
+    }
+
+    /// Capture the adopted app-server's exact tree without moving ownership.
+    /// The terminal PTY has a separate process-group barrier; managed Codex
+    /// restart persists both before either owner is torn down.
+    pub async fn capture_terminal_restart_barrier(
+        &self,
+        terminal_id: &str,
+    ) -> Result<Option<OwnedProcessTreeBarrier>, String> {
+        // Read the two ownership maps in separate lock scopes. Restart
+        // quarantine moves an entry while holding `adopted` and then
+        // `restart_retirements`; nesting these in the reverse order here would
+        // make concurrent preflight and quarantine deadlock.
+        let adopted_sidecar = self
+            .adopted
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .map(|entry| Arc::clone(&entry.sidecar));
+        let sidecar = adopted_sidecar.or_else(|| {
+            self.restart_retirements
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| Arc::clone(&entry.sidecar))
+        });
+        match sidecar {
+            Some(sidecar) => sidecar.capture_restart_barrier().await,
+            None => Ok(None),
+        }
+    }
+
     /// Server-exit teardown (main.rs graceful shutdown): mirrors legacy's close-time
     /// `codexLaunchPlanner.shutdown()` (`server/index.ts:981-1049` shutdown owners) —
     /// the planner stops accepting plans and tears down its unadopted sidecars
@@ -959,7 +1197,12 @@ impl CodexTerminalLaunchManager {
             let mut map = self.adopted.lock().unwrap();
             map.drain().map(|(_, entry)| entry).collect()
         };
-        for entry in adopted {
+        let retiring: Vec<AdoptedTerminalLaunch> = {
+            let mut map = self.restart_retirements.lock().unwrap();
+            map.drain().map(|(_, entry)| entry).collect()
+        };
+        self.restart_retiring_terminal_ids.lock().unwrap().clear();
+        for entry in adopted.into_iter().chain(retiring) {
             if retain {
                 let _ = entry.sidecar.retain(SERVER_SHUTDOWN_RETENTION_REASON).await;
             } else {
@@ -996,6 +1239,7 @@ struct SpawnedSidecar {
     /// The durable record written at spawn (tracked spawns only) — kept so
     /// `update_ownership_metadata` can enrich + rewrite it without a re-read.
     record: Option<CodexSidecarRecord>,
+    tree: OwnedProcessTreeBarrier,
 }
 
 /// The real [`CodexLaunchRuntime`]: spawns `codex -c features.apps=false app-server
@@ -1016,6 +1260,7 @@ pub struct SpawnedCodexAppServerRuntime {
     store: Arc<CodexSidecarStore>,
     state: tokio::sync::Mutex<Option<SpawnedSidecar>>,
     adopted_metadata: Mutex<Option<(String, u64)>>,
+    replacement_ownership_id: Mutex<Option<String>>,
 }
 
 impl Default for SpawnedCodexAppServerRuntime {
@@ -1035,6 +1280,7 @@ impl SpawnedCodexAppServerRuntime {
             store: codex_sidecar_store().unwrap_or_else(|| Arc::new(CodexSidecarStore::disabled())),
             state: tokio::sync::Mutex::new(None),
             adopted_metadata: Mutex::new(None),
+            replacement_ownership_id: Mutex::new(None),
         }
     }
 
@@ -1134,6 +1380,10 @@ pub fn drain_child_io(child: &mut tokio::process::Child) {
 }
 
 impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
+    fn set_replacement_ownership_id(&self, ownership_id: Option<&str>) {
+        *self.replacement_ownership_id.lock().unwrap() = ownership_id.map(str::to_string);
+    }
+
     fn ensure_ready(
         &self,
         cwd: Option<String>,
@@ -1165,6 +1415,11 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             for (key, value) in &spec.env {
                 cmd.env(key, value);
             }
+            if let Some(replacement_ownership_id) =
+                self.replacement_ownership_id.lock().unwrap().as_deref()
+            {
+                cmd.env(RESTART_REPLACEMENT_OWNERSHIP_ENV, replacement_ownership_id);
+            }
             cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -1194,6 +1449,11 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             let mut child = cmd
                 .spawn()
                 .map_err(|error| format!("codex app-server spawn failed ({command}): {error}"))?;
+            let tree = OwnedProcessTreeBarrier::capture(
+                child.id().unwrap_or(0),
+                crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV,
+                &ownership_id,
+            );
             drain_child_io(&mut child);
 
             // Wait for the listener: probe-dial until accepted or the budget expires.
@@ -1302,6 +1562,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                 ownership_id,
                 child,
                 record,
+                tree,
             });
             Ok(CodexRuntimeReady { ws_url })
         })
@@ -1406,15 +1667,65 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let mut state = self.state.lock().await;
-            if let Some(mut spawned) = state.take() {
-                let _ = spawned.child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await;
-                reap_owned_codex_sidecars(&spawned.ownership_id);
+            // Keep the state across teardown: a failed ownership barrier stays
+            // retryable (restart fencing) rather than dropping the handle.
+            if let Some(spawned) = state.as_mut() {
+                #[cfg(target_os = "linux")]
+                {
+                    let tree_dead = spawned.tree.terminate_and_confirm().await;
+                    let child_reaped = matches!(
+                        tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await,
+                        Ok(Ok(_))
+                    );
+                    if !(tree_dead && child_reaped) {
+                        return Err(format!(
+                            "codex app-server ownership barrier incomplete \
+                             (ownership_id={}, tree_dead={tree_dead}, child_reaped={child_reaped})",
+                            spawned.ownership_id
+                        ));
+                    }
+                    // Barrier-confirmed dead; the /proc ownership sweep is now a
+                    // no-op backstop for anything pid-tagged before the barrier ledger.
+                    reap_owned_codex_sidecars(&spawned.ownership_id);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Non-Linux misses the ownership barrier: restore the base
+                    // start_kill+wait flow (the pre-barrier canonical leg; a
+                    // failure here retains `state` exactly like the Linux leg,
+                    // so kill_on_drop stays armed and a later teardown can
+                    // retry a wedged child).
+                    let _ = spawned.child.start_kill();
+                    let child_reaped = matches!(
+                        tokio::time::timeout(Duration::from_secs(5), spawned.child.wait()).await,
+                        Ok(Ok(_))
+                    );
+                    if !child_reaped {
+                        return Err(
+                            "codex app-server failed to exit within the shutdown window (non-Linux kill leg)"
+                                .to_string(),
+                        );
+                    }
+                }
                 // Explicit teardown scrubs the record (Task 3): a cleanly
                 // shut-down sidecar must leave nothing for boot reconcile.
                 self.scrub_record(&spawned.ownership_id);
+                state.take();
             }
             Ok(())
+        })
+    }
+
+    fn capture_restart_barrier(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<OwnedProcessTreeBarrier>, String>> {
+        Box::pin(async move {
+            Ok(self
+                .state
+                .lock()
+                .await
+                .as_ref()
+                .map(|spawned| spawned.tree.clone()))
         })
     }
 }

@@ -7,9 +7,22 @@ import {
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
-import type { ReadyCapabilities, ServerMessage, SessionLocator } from '@shared/ws-protocol'
+import type {
+  ClientMessage,
+  ReadyCapabilities,
+  RuntimeDescriptor,
+  ServerMessage,
+  SessionLocator,
+} from '@shared/ws-protocol'
 import type { TerminalInterestSnapshot } from '@/lib/terminal-interest'
 import { createLogger } from '@/lib/client-logger'
+import type { applyAgentRestartReplaced as applyPaneAgentRestartReplacedT } from '@/store/panesSlice'
+import type { applyAgentRestartReplaced as applyFreshAgentRestartReplacedT } from '@/store/freshAgentSlice'
+import type { FreshAgentState } from '@/store/freshAgentTypes'
+import type { PanesState, PaneNode } from '@/store/paneTypes'
+import { paneMatchesAgentRuntimeReplacement } from '@/lib/pane-utils'
+import type { updateTab as updateTabT } from '@/store/tabsSlice'
+import type { clearTerminalLifecycle as clearTerminalLifecycleT } from '@/store/terminalLifecycleSlice'
 
 const log = createLogger('WsClient')
 
@@ -75,7 +88,72 @@ type InFlightCreate = {
   lastResendEpoch: number
 }
 
+type AgentRestartClientMessage = Extract<ClientMessage, { type: 'agent.restart' }>
+
+type InFlightAgentRestart = {
+  message: AgentRestartClientMessage
+  fingerprint: string
+  lastResendEpoch: number
+  started: boolean
+  retryAttempts: number
+  retryTimer: number | null
+  retryExhausted: boolean
+}
+
+type AgentRestartStore = {
+  dispatch: (action: unknown) => unknown
+  getState: () => {
+    panes: PanesState
+    freshAgent: FreshAgentState
+  }
+}
+
+/**
+ * The agent-restart fold's action creators, injected with the store by the
+ * owning pane views ([`bindAgentRestartStore`]). This module must never
+ * value-import them directly: `tabsSlice` depends on `kill-ack`, which
+ * imports THIS module, so a static `ws-client -> tabsSlice` edge closes a
+ * module cycle that drags the entire store graph (including `kill-ack` itself)
+ * into eager evaluation whenever anything grabs the ws client (the test-setup
+ * `resetWsClientForTests` preload showed this up as vi.mock bypasses).
+ */
+type AgentRestartActions = {
+  applyPaneAgentRestartReplaced: typeof applyPaneAgentRestartReplacedT
+  applyFreshAgentRestartReplaced: typeof applyFreshAgentRestartReplacedT
+  updateTab: typeof updateTabT
+  clearTerminalLifecycle: typeof clearTerminalLifecycleT
+}
+
+function collectTerminalRestartViewers(
+  panes: PanesState,
+  replacement: Extract<ServerMessage, { type: 'agent.restart.replaced' }>,
+): { tabIds: Set<string>; paneIds: Set<string> } {
+  const tabIds = new Set<string>()
+  const paneIds = new Set<string>()
+  const visit = (tabId: string, node: PaneNode) => {
+    if (node.type === 'split') {
+      visit(tabId, node.children[0])
+      visit(tabId, node.children[1])
+      return
+    }
+    if (
+      node.content.kind === 'terminal'
+      && paneMatchesAgentRuntimeReplacement(node.content, replacement)
+    ) {
+      tabIds.add(tabId)
+      paneIds.add(node.id)
+    }
+  }
+  for (const [tabId, root] of Object.entries(panes.layouts)) {
+    visit(tabId, root)
+  }
+  return { tabIds, paneIds }
+}
+
 const CONNECTION_TIMEOUT_MS = 10_000
+const AGENT_RESTART_RETRY_BASE_MS = 500
+const AGENT_RESTART_RETRY_MAX_MS = 4_000
+const AGENT_RESTART_MAX_AUTOMATIC_RETRIES = 3
 
 // App-level transport liveness. Server-side WS pings are invisible to JS, so
 // liveness is proven by an app-level {type:'ping'}→{type:'pong'} round trip
@@ -122,6 +200,24 @@ function isTerminalAttachMessage(msg: unknown): msg is TerminalAttachClientMessa
     && candidate.terminalId.length > 0
 }
 
+function isAgentRestartMessage(msg: unknown): msg is AgentRestartClientMessage {
+  if (!msg || typeof msg !== 'object') return false
+  const candidate = msg as Partial<AgentRestartClientMessage>
+  return candidate.type === 'agent.restart'
+    && typeof candidate.requestId === 'string'
+    && candidate.requestId.length > 0
+}
+
+function runtimeDescriptorFromMessage(msg: ServerMessage): RuntimeDescriptor | undefined {
+  if (!('runtime' in msg)) return undefined
+  const runtime = msg.runtime
+  if (!runtime || typeof runtime !== 'object') return undefined
+  return typeof runtime.runtimeId === 'string'
+    && typeof runtime.generation === 'number'
+    ? runtime
+    : undefined
+}
+
 export class WsClient {
   private ws: WebSocket | null = null
   private _state: ConnectionState = 'disconnected'
@@ -152,6 +248,11 @@ export class WsClient {
   private readyTimeout: number | null = null
   private reconnectEpoch = 0
   private inFlightCreates = new Map<string, InFlightCreate>()
+  private inFlightAgentRestarts = new Map<string, InFlightAgentRestart>()
+  private completedAgentRestartResults = new Map<string, string>()
+  private retiredRuntimeGenerations = new Map<string, number>()
+  private agentRestartStore?: AgentRestartStore
+  private agentRestartActions?: AgentRestartActions
   private preReadyCreateQueue = new Map<string, unknown>()
   // Sender-level pre-verdict create hold (only when paneReconcileV1 is acked):
   // pane creates wait here until their pane's verdict folds (cancelCreate
@@ -186,8 +287,58 @@ export class WsClient {
   private clearQueuedMessagesAfterProtocolMismatch(): void {
     this.pendingMessages = []
     this.inFlightCreates.clear()
+    this.clearAllAgentRestartRetryTimers()
+    this.inFlightAgentRestarts.clear()
     this.preReadyCreateQueue.clear()
     this.resetReconcileHold({ requeueHeld: false })
+  }
+
+  private clearAgentRestartRetryTimer(entry: InFlightAgentRestart): void {
+    if (entry.retryTimer !== null) {
+      window.clearTimeout(entry.retryTimer)
+      entry.retryTimer = null
+    }
+  }
+
+  private clearAllAgentRestartRetryTimers(): void {
+    for (const entry of this.inFlightAgentRestarts.values()) {
+      this.clearAgentRestartRetryTimer(entry)
+    }
+  }
+
+  private sendAgentRestartEntry(entry: InFlightAgentRestart): void {
+    this.ws?.send(entry.fingerprint)
+    this.outboundMessageObserver?.(entry.message)
+  }
+
+  private scheduleAgentRestartRetry(requestId: string, entry: InFlightAgentRestart): void {
+    if (
+      entry.retryTimer !== null
+    ) {
+      return
+    }
+    if (entry.retryAttempts >= AGENT_RESTART_MAX_AUTOMATIC_RETRIES) {
+      entry.retryExhausted = true
+      return
+    }
+    const delay = Math.min(
+      AGENT_RESTART_RETRY_BASE_MS * (2 ** entry.retryAttempts),
+      AGENT_RESTART_RETRY_MAX_MS,
+    )
+    entry.retryAttempts += 1
+    entry.retryTimer = window.setTimeout(() => {
+      entry.retryTimer = null
+      if (
+        this.inFlightAgentRestarts.get(requestId) !== entry
+        || this._state !== 'ready'
+        || this.ws?.readyState !== WebSocket.OPEN
+        || this.serverCapabilities.agentRestartV1 !== true
+      ) {
+        return
+      }
+      this.sendAgentRestartEntry(entry)
+      entry.lastResendEpoch = this.reconnectEpoch
+    }, delay)
   }
 
   cancelCreate(requestId: string): void {
@@ -260,6 +411,87 @@ export class WsClient {
     // is not half-open): resets the silence clock and clears an outstanding probe.
     this.lastInboundAt = Date.now()
     this.probeSentAt = null
+    if (msg.type === 'agent.restart.started') {
+      const inFlight = this.inFlightAgentRestarts.get(msg.requestId)
+      if (inFlight) {
+        inFlight.started = true
+      }
+    }
+    if (msg.type === 'agent.restart.replaced' || msg.type === 'agent.restart.failed') {
+      const inFlight = this.inFlightAgentRestarts.get(msg.requestId)
+      if (
+        msg.type === 'agent.restart.failed'
+        && msg.retryable
+        && (
+          msg.recoveryPending === true
+          || (msg.recoveryPending === undefined && inFlight?.started === true)
+        )
+        && inFlight
+      ) {
+        // The failure frame is the durable phase authority. A reconnect can
+        // receive this before the replayed started edge, so never infer
+        // recoverability from per-socket delivery history.
+        inFlight.started = true
+        inFlight.retryExhausted = false
+        if (inFlight) {
+          this.scheduleAgentRestartRetry(msg.requestId, inFlight)
+        }
+      } else {
+        const fingerprint = JSON.stringify(msg)
+        if (this.completedAgentRestartResults.get(msg.requestId) === fingerprint) {
+          return
+        }
+        this.completedAgentRestartResults.set(msg.requestId, fingerprint)
+        if (this.completedAgentRestartResults.size > 1_000) {
+          const oldest = this.completedAgentRestartResults.keys().next().value
+          if (typeof oldest === 'string') this.completedAgentRestartResults.delete(oldest)
+        }
+        if (inFlight) {
+          this.clearAgentRestartRetryTimer(inFlight)
+          this.inFlightAgentRestarts.delete(msg.requestId)
+        }
+      }
+
+      if (msg.type === 'agent.restart.replaced') {
+        const store = this.agentRestartStore
+        const actions = this.agentRestartActions
+        const terminalViewers = store
+          ? collectTerminalRestartViewers(store.getState().panes, msg)
+          : undefined
+        this.retiredRuntimeGenerations.set(
+          msg.oldRuntimeId,
+          Math.max(this.retiredRuntimeGenerations.get(msg.oldRuntimeId) ?? -1, msg.oldGeneration),
+        )
+        // This is the single replacement fold. It runs before public message
+        // handlers, so React effects can only observe the committed descriptor.
+        if (store && actions) {
+          store.dispatch(actions.applyPaneAgentRestartReplaced(msg))
+          store.dispatch(actions.applyFreshAgentRestartReplaced(msg))
+          if (terminalViewers) {
+            for (const tabId of terminalViewers.tabIds) {
+              store.dispatch(actions.updateTab({
+                id: tabId,
+                updates: { status: 'running' },
+              }))
+            }
+            for (const paneId of terminalViewers.paneIds) {
+              store.dispatch(actions.clearTerminalLifecycle({ paneId }))
+            }
+          }
+        }
+      }
+    }
+
+    const runtime = runtimeDescriptorFromMessage(msg)
+    if (
+      runtime
+      && (this.retiredRuntimeGenerations.get(runtime.runtimeId) ?? -1) >= runtime.generation
+    ) {
+      // A quiescing old runtime can still have buffered output/status frames
+      // in transit after the committed replacement. Never deliver them.
+      return
+    }
+
     if (msg.type === 'ready') {
       this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
         ? msg.serverInstanceId
@@ -274,6 +506,15 @@ export class WsClient {
       this._state = 'ready'
       if (isReconnect) {
         this.reconnectEpoch += 1
+      }
+
+      if (this.serverCapabilities.agentRestartV1 === true) {
+        for (const entry of this.inFlightAgentRestarts.values()) {
+          if (entry.lastResendEpoch === this.reconnectEpoch) continue
+          this.clearAgentRestartRetryTimer(entry)
+          this.sendAgentRestartEntry(entry)
+          entry.lastResendEpoch = this.reconnectEpoch
+        }
       }
 
       if (perfConfig.enabled && this.connectStartedAt !== null) {
@@ -511,7 +752,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true, agentRestartV1: true },
           ...helloExtensions,
         })
       }
@@ -698,6 +939,10 @@ export class WsClient {
     this._state = 'disconnected'
     this.pendingMessages = []
     this.inFlightCreates.clear()
+    this.clearAllAgentRestartRetryTimers()
+    this.inFlightAgentRestarts.clear()
+    this.completedAgentRestartResults.clear()
+    this.retiredRuntimeGenerations.clear()
     this.preReadyCreateQueue.clear()
     this.resetReconcileHold({ requeueHeld: false })
     this.serverCapabilities = {}
@@ -826,6 +1071,30 @@ export class WsClient {
   send(msg: unknown) {
     if (this.intentionalClose) return
 
+    if (isAgentRestartMessage(msg)) {
+      const fingerprint = JSON.stringify(msg)
+      const current = this.inFlightAgentRestarts.get(msg.requestId)
+      if (current && current.fingerprint !== fingerprint) {
+        throw new Error(`agent.restart requestId ${msg.requestId} was reused with a different request`)
+      }
+      const entry = current ?? {
+        message: JSON.parse(fingerprint) as AgentRestartClientMessage,
+        fingerprint,
+        lastResendEpoch: -1,
+        started: false,
+        retryAttempts: 0,
+        retryTimer: null,
+        retryExhausted: false,
+      }
+      this.inFlightAgentRestarts.set(msg.requestId, entry)
+      if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
+        this.clearAgentRestartRetryTimer(entry)
+        this.sendAgentRestartEntry(entry)
+        entry.lastResendEpoch = this.reconnectEpoch
+      }
+      return
+    }
+
     if (isTerminalInputMessage(msg)) {
       markTerminalInputSent(msg.terminalId)
     }
@@ -922,6 +1191,59 @@ export class WsClient {
       type: 'tabs.sync.client.retire',
       ...payload,
     })
+  }
+
+  /**
+   * Start a restart transaction that survives a dropped requester socket.
+   * The byte-identical request is replayed after the next ready frame.
+   */
+  requestAgentRestart(message: AgentRestartClientMessage): void {
+    if (
+      this._state === 'ready'
+      && this.serverCapabilities.agentRestartV1 !== true
+    ) {
+      throw new Error('This server does not support agent runtime restart.')
+    }
+    this.send(message)
+  }
+
+  isAgentRestartRetryExhausted(requestId: string): boolean {
+    return this.inFlightAgentRestarts.get(requestId)?.retryExhausted === true
+  }
+
+  isAgentRestartRecoveryPending(requestId: string): boolean {
+    return this.inFlightAgentRestarts.get(requestId)?.started === true
+  }
+
+  retryAgentRestart(requestId: string): boolean {
+    const entry = this.inFlightAgentRestarts.get(requestId)
+    if (!entry || !entry.started) return false
+
+    this.clearAgentRestartRetryTimer(entry)
+    entry.retryAttempts = 0
+    entry.retryExhausted = false
+    entry.lastResendEpoch = -1
+    if (
+      this._state === 'ready'
+      && this.ws?.readyState === WebSocket.OPEN
+      && this.serverCapabilities.agentRestartV1 === true
+    ) {
+      this.sendAgentRestartEntry(entry)
+      entry.lastResendEpoch = this.reconnectEpoch
+    }
+    return true
+  }
+
+  /**
+   * Install the one Redux fold target for restart broadcasts. Calling this
+   * from multiple mounted pane views is intentionally idempotent.
+   */
+  bindAgentRestartStore(store: AgentRestartStore, actions: AgentRestartActions): void {
+    if (this.agentRestartStore && this.agentRestartStore !== store) {
+      throw new Error('WsClient agent restart store is already bound')
+    }
+    this.agentRestartStore = store
+    this.agentRestartActions = actions
   }
 
   onMessage(handler: MessageHandler): () => void {

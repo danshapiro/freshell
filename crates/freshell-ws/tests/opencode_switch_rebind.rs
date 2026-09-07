@@ -254,6 +254,7 @@ async fn spawn_server_returning_state(
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: opencode_data_home.map(|home| {
             Arc::new(freshell_sessions::opencode_locator::OpencodeLocator::new(

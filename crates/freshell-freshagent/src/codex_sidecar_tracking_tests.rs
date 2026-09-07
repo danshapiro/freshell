@@ -269,8 +269,8 @@ async fn failed_spawn_leaves_no_record() {
 async fn build_recorded_watch(
     ownership_id: &str,
 ) -> (
-    tokio::task::JoinHandle<()>,
-    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<bool>,
+    tokio::sync::oneshot::Sender<crate::codex::CodexKillRequest>,
     u32,
 ) {
     let child = spawn_sleep_child();
@@ -287,6 +287,11 @@ async fn build_recorded_watch(
         Arc::new(AtomicBool::new(false)),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{ownership_id}"),
+            generation: 1,
+        },
     );
     (watcher, kill_tx, pid)
 }
@@ -298,7 +303,12 @@ async fn requested_kill_arm_removes_the_record() {
     let (watcher, kill_tx, pid) = build_recorded_watch("codex-sidecar-wfah-t3-kill").await;
     assert_eq!(guard.records().len(), 1, "recorded before the kill");
 
-    kill_tx.send(()).expect("kill channel open");
+    let (captured_tx, _captured_rx) = tokio::sync::oneshot::channel();
+    kill_tx
+        .send(crate::codex::CodexKillRequest {
+            captured: captured_tx,
+        })
+        .expect("kill channel open");
     watcher.await.expect("watcher completes");
 
     assert!(
@@ -337,6 +347,11 @@ async fn unrequested_exit_arm_removes_the_record() {
         exited.clone(),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        freshell_protocol::RuntimeDescriptor {
+            runtime_id: format!("fresh-runtime-test-{pid}"),
+            generation: 1,
+        },
     );
     watcher.await.expect("watcher completes");
 
@@ -360,6 +375,8 @@ async fn handle_kill_leaves_no_record() {
     assert_eq!(guard.records().len(), 1);
 
     st.handle_kill(freshell_protocol::FreshAgentKill {
+        expected_runtime_id: None,
+        expected_generation: None,
         provider: freshell_protocol::AgentProvider::Codex,
         session_id,
         session_type: freshell_protocol::SessionType::Freshcodex,

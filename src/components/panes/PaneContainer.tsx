@@ -22,6 +22,7 @@ import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 import { getWsClient } from '@/lib/ws-client'
+import { getAgentRestartBannerSink } from '@/lib/agent-restart-banner-sink'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { api } from '@/lib/api'
 import { isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
@@ -266,6 +267,21 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     dispatch(clearPaneRenameRequest())
   }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, paneTitleSetByUser, extensionEntries, dispatch])
 
+  // Late fan-in for the context-menu provider's agent-restart banner: pane
+  // shells mount (and subscribe to ws) in a later commit than app-level
+  // providers (StablePaneLayout's measurement pass), so a mount-once
+  // subscription there lands BEFORE this pane's own subscriptions. This
+  // forwarder deliberately has no dep array — re-registering on every pane
+  // commit keeps it registered after them. The sink is installed by
+  // ContextMenuProvider at mount (before any pane commits); outside the
+  // provider this is a no-op. Double delivery is idempotent — see
+  // src/lib/agent-restart-banner-sink.ts.
+  useEffect(() => {
+    const sink = getAgentRestartBannerSink()
+    if (!sink) return
+    return getWsClient().onMessage((message) => sink(message))
+  })
+
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
     setRenameValue(currentTitle)
@@ -338,6 +354,10 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           sessionId,
           sessionType: content.sessionType,
           provider: content.provider,
+          ...(content.runtimeId && content.runtimeGeneration !== undefined ? {
+            expectedRuntimeId: content.runtimeId,
+            expectedGeneration: content.runtimeGeneration,
+          } : {}),
           ...(cwd ? { cwd } : {}),
         }).then((ack) => {
           if (!ack.ok) {

@@ -557,6 +557,7 @@ async fn spawn_server_with_rollback_rig(
     }));
 
     let state = WsState {
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         pane_ledger: Arc::clone(&pane_ledger),
         layout: Default::default(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),

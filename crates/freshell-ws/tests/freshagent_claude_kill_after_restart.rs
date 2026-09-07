@@ -439,6 +439,8 @@ fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
 
 fn kill_msg(session_id: &str) -> FreshAgentKill {
     FreshAgentKill {
+        expected_runtime_id: None,
+        expected_generation: None,
         provider: AgentProvider::Claude,
         session_id: session_id.to_string(),
         session_type: SessionType::Freshclaude,

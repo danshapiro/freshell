@@ -54,6 +54,22 @@ export const SessionLocatorSchema = SessionRefSchema.extend({
 
 export type SessionLocator = z.infer<typeof SessionLocatorSchema>
 
+export const AgentRuntimeKindSchema = z.enum(['terminal', 'fresh-agent'])
+export type AgentRuntimeKind = z.infer<typeof AgentRuntimeKindSchema>
+
+export const RuntimeDescriptorSchema = z.object({
+  runtimeId: z.string().min(1),
+  generation: z.number().int().nonnegative(),
+})
+export type RuntimeDescriptor = z.infer<typeof RuntimeDescriptorSchema>
+/**
+ * Runtime fields remain optional on legacy v7 message shapes solely so an
+ * upgraded client can parse older v7 servers. After a ready frame advertises
+ * `capabilities.agentRestartV1`, the upgraded server guarantees descriptors on
+ * terminal create/attach/inventory/reconcile/output/exit and fresh-agent
+ * create/materialize/event/reconcile runtime surfaces.
+ */
+
 // ──────────────────────────────────────────────────────────────
 // Terminal metadata schemas (used in both directions)
 // ──────────────────────────────────────────────────────────────
@@ -418,6 +434,10 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // A v7 client must wait for the matching ready advertisement. Older v7
+    // servers strip this unknown hello key and therefore safely look
+    // unsupported to the upgraded client.
+    agentRestartV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -790,6 +810,8 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  expectedRuntimeId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
   text: z.string().min(1),
   settings: z.object({
@@ -810,6 +832,8 @@ export const FreshAgentInterruptSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  expectedRuntimeId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
 })
 
@@ -847,6 +871,8 @@ export const FreshAgentKillSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  expectedRuntimeId: z.string().min(1).optional(),
+  expectedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
 })
 
@@ -884,6 +910,16 @@ export const FreshAgentRedoSchema = z.object({
   type: z.literal('freshAgent.redo'),
   ...freshAgentRollbackShape,
 })
+
+export const AgentRestartSchema = z.object({
+  type: z.literal('agent.restart'),
+  requestId: z.string().min(1),
+  provider: CodingCliProviderSchema,
+  sessionId: z.string().min(1),
+  kind: AgentRuntimeKindSchema,
+  liveId: z.string().min(1),
+  expectedGeneration: z.number().int().nonnegative(),
+}).strict()
 
 export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
@@ -955,6 +991,8 @@ export const PaneVerdictSchema = z.object({
   reason: z.string().optional(),
   /** A newer duplicate generation exists for the same createRequestId; flags the duplicate terminalId. */
   duplicate: z.string().optional(),
+  /** Server-owned live runtime fence for attach/reconcile verdicts. */
+  runtime: RuntimeDescriptorSchema.optional(),
 })
 
 export const PaneReconcileResultSchema = z.object({
@@ -977,6 +1015,7 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    agentRestartV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -994,6 +1033,7 @@ export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
 // ── Client message discriminated union ──
 
 export const ClientMessageSchema = z.discriminatedUnion('type', [
+  AgentRestartSchema,
   PaneReconcileRequestSchema,
   HelloSchema,
   PingSchema,
@@ -1079,6 +1119,55 @@ export type ErrorMessage = {
   timestamp: string
 }
 
+export type AgentRestartFailureCode =
+  | 'CAPABILITY_NOT_NEGOTIATED'
+  | 'UNRESUMABLE'
+  | 'RUNTIME_NOT_FOUND'
+  | 'STALE_GENERATION'
+  | 'REQUEST_ID_CONFLICT'
+  | 'PREFLIGHT_FAILED'
+  | 'SHUTDOWN_FAILED'
+  | 'REPLACEMENT_FAILED'
+  | 'UNSUPPORTED_PLATFORM'
+  | 'OVERLOADED'
+
+export type AgentRestartStartedMessage = {
+  type: 'agent.restart.started'
+  requestId: string
+  provider: string
+  sessionId: string
+  kind: AgentRuntimeKind
+  runtimeId: string
+  generation: number
+}
+
+export type AgentRestartReplacedMessage = {
+  type: 'agent.restart.replaced'
+  requestId: string
+  provider: string
+  sessionId: string
+  kind: AgentRuntimeKind
+  oldRuntimeId: string
+  oldGeneration: number
+  runtimeId: string
+  generation: number
+}
+
+export type AgentRestartFailedMessage = {
+  type: 'agent.restart.failed'
+  requestId: string
+  provider: string
+  sessionId: string
+  kind: AgentRuntimeKind
+  runtimeId: string
+  generation: number
+  code: AgentRestartFailureCode
+  message: string
+  retryable: boolean
+  /** Present on servers that make the durable post-retirement phase explicit. */
+  recoveryPending?: boolean
+}
+
 // -- Terminal lifecycle --
 
 export type TerminalCreatedMessage = {
@@ -1092,6 +1181,7 @@ export type TerminalCreatedMessage = {
   restoreError?: RestoreError
   /** Resume-validation: operator-visible notice set when the server dropped a stale resume id and spawned fresh. The client writes it into the pane's xterm. Additive; Node never sets it. */
   notice?: string
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalAttachReadyMessage = {
@@ -1108,6 +1198,7 @@ export type TerminalAttachReadyMessage = {
   replayToSeq: number
   attachRequestId?: string
   sessionRef?: SessionLocator
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalGeometryAuthority = 'single_client' | 'server_stream' | 'multi_client_unknown'
@@ -1118,6 +1209,7 @@ export type TerminalStreamChangedMessage = {
   streamId: string
   reason: 'new_pty_session' | 'codex_pty_recovery' | 'retention_lost' | 'server_restart_incompatible_retention'
   attachRequestId?: string
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalDetachedMessage = {
@@ -1221,6 +1313,7 @@ export type TerminalExitMessage = {
   type: 'terminal.exit'
   terminalId: string
   exitCode: number
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalStatusMessage = {
@@ -1250,6 +1343,8 @@ export type TerminalReplacedMessage = {
   exitCode: number
   attempt: number
   maxAttempts: number
+  /** Server-owned identity fence for the replacement generation. */
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalOutputMessage = {
@@ -1261,6 +1356,7 @@ export type TerminalOutputMessage = {
   data: string
   attachRequestId?: string
   source?: 'live' | 'replay'
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalOutputBatchSegment = {
@@ -1283,6 +1379,7 @@ export type TerminalOutputBatchMessage = {
   data: string
   serializedBytes: number
   segments: TerminalOutputBatchSegment[]
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalOutputGapMessage = {
@@ -1293,6 +1390,7 @@ export type TerminalOutputGapMessage = {
   toSeq: number
   reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
   attachRequestId?: string
+  runtime?: RuntimeDescriptor
 }
 
 export type TerminalTitleUpdatedMessage = {
@@ -1321,6 +1419,7 @@ export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
   sessionRef: SessionLocator
+  runtime?: RuntimeDescriptor
   /**
    * Present ONLY on a server-authoritative mid-session rebind (the CLI under
    * this pane switched/forked to a new session). Names the session id this
@@ -1518,13 +1617,13 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_STALE_REVISION'
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; runtime?: RuntimeDescriptor }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
-  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
-  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown; runtime?: RuntimeDescriptor }
+  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; runtime?: RuntimeDescriptor }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
-  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean; runtime?: RuntimeDescriptor }
 
 // -- Extensions --
 
@@ -1572,6 +1671,7 @@ export type TerminalInventoryMessage = {
     codexDurability?: CodexDurabilityRef
     /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */
     resumeTargetIsSubagent?: boolean
+    runtime?: RuntimeDescriptor
   }>
   terminalMeta: TerminalMetaRecord[]
 }
@@ -1582,6 +1682,9 @@ export type ServerMessage =
   | ReadyMessage
   | PongMessage
   | ErrorMessage
+  | AgentRestartStartedMessage
+  | AgentRestartReplacedMessage
+  | AgentRestartFailedMessage
   | TerminalCreatedMessage
   | TerminalAttachReadyMessage
   | TerminalModesSyncMessage

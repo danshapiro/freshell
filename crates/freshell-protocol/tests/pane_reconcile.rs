@@ -49,6 +49,25 @@ fn hello_capabilities_omit_pane_reconcile_v1_when_absent() {
     assert_eq!(back, wire);
 }
 
+#[test]
+fn hello_capabilities_parse_agent_restart_v1_without_changing_wire_version() {
+    let wire = json!({
+        "type": "hello",
+        "protocolVersion": 7,
+        "token": "t",
+        "capabilities": { "agentRestartV1": true }
+    });
+    let msg: ClientMessage = serde_json::from_value(wire.clone()).expect("hello parses");
+    let ClientMessage::Hello(ref hello) = msg else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        hello.capabilities.as_ref().and_then(|c| c.agent_restart_v1),
+        Some(true)
+    );
+    assert_eq!(serde_json::to_value(msg).expect("serializes"), wire);
+}
+
 // --- advertisement (ready) ---------------------------------------------------
 
 #[test]
@@ -80,10 +99,29 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
             pane_reconcile_v1: Some(true),
             pane_reconcile_fresh_agent_v1: None,
             terminal_interest_v1: None,
+            agent_restart_v1: None,
         }),
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert_eq!(wire["capabilities"], json!({ "paneReconcileV1": true }));
+}
+
+#[test]
+fn ready_advertises_agent_restart_only_after_the_client_opts_in() {
+    let ready = freshell_protocol::Ready {
+        timestamp: "2026-07-29T00:00:00.000Z".to_string(),
+        boot_id: Some("boot-1".to_string()),
+        server_instance_id: Some("srv-1".to_string()),
+        build_id: None,
+        capabilities: Some(ReadyCapabilities {
+            pane_reconcile_v1: None,
+            pane_reconcile_fresh_agent_v1: None,
+            terminal_interest_v1: None,
+            agent_restart_v1: Some(true),
+        }),
+    };
+    let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
+    assert_eq!(wire["capabilities"], json!({ "agentRestartV1": true }));
 }
 
 // --- pane.reconcile.request --------------------------------------------------
@@ -171,6 +209,7 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 corrected: Some(true),
                 reason: None,
                 duplicate: None,
+                runtime: None,
             },
             PaneVerdict {
                 pane_key: "tab3:paneB".to_string(),
@@ -180,6 +219,7 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 corrected: None,
                 reason: Some("no_recoverable_identity".to_string()),
                 duplicate: None,
+                runtime: None,
             },
         ],
     });
@@ -225,6 +265,7 @@ fn error_verdict_carries_reason_and_no_retry_after_ms() {
         corrected: None,
         reason: Some("index_warming".to_string()),
         duplicate: None,
+        runtime: None,
     };
     let wire = serde_json::to_value(&verdict).expect("serializes");
     assert_eq!(wire["verdict"], "error");

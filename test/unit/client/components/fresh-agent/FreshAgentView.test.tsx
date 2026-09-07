@@ -5,7 +5,12 @@ import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, {
+  markSessionLost,
+  sessionInit,
+  sessionSnapshotReceived,
+  setSessionStatus,
+} from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
@@ -992,6 +997,8 @@ describe('FreshAgentView', () => {
             provider: 'opencode',
             createRequestId: 'req-stop-route',
             sessionId: 'ses_stop_route',
+            runtimeId: 'runtime-stop-route',
+            runtimeGeneration: 4,
             initialCwd: '/repo/route-aware',
             status: 'running',
           }}
@@ -1006,6 +1013,8 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_stop_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      expectedRuntimeId: 'runtime-stop-route',
+      expectedGeneration: 4,
       cwd: '/repo/route-aware',
     })
   })
@@ -1659,6 +1668,11 @@ describe('FreshAgentView', () => {
 
   it('clears a restored Freshopencode placeholder when history reports FRESH_AGENT_LOST_SESSION', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce({
       status: 404,
       message: 'OpenCode fresh-agent placeholder freshopencode-restored is not restorable.',
@@ -1678,6 +1692,8 @@ describe('FreshAgentView', () => {
         sessionRef: { provider: 'opencode', sessionId: 'freshopencode-restored' },
         resumeSessionId: 'freshopencode-restored',
         status: 'connected',
+        runtimeId: 'freshopencode-runtime-old',
+        runtimeGeneration: 4,
       },
     }))
 
@@ -1693,6 +1709,8 @@ describe('FreshAgentView', () => {
       expect(content.sessionRef).toBeUndefined()
       expect(content.resumeSessionId).toBeUndefined()
       expect(content.status).toBe('idle')
+      expect(content.runtimeId).toBeUndefined()
+      expect(content.runtimeGeneration).toBeUndefined()
       expect(content.restoreError).toEqual({
         code: 'RESTORE_UNAVAILABLE',
         reason: 'durable_artifact_missing',
@@ -1700,6 +1718,24 @@ describe('FreshAgentView', () => {
     })
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+    const replacementRequestId = getFreshAgentPaneContent(store).createRequestId
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.created',
+        requestId: replacementRequestId,
+        sessionId: 'ses_opencode_recreated',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        runtime: { runtimeId: 'freshopencode-runtime-new', generation: 5 },
+      })
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        sessionId: 'ses_opencode_recreated',
+        runtimeId: 'freshopencode-runtime-new',
+        runtimeGeneration: 5,
+      })
+    })
   })
 
   it('attaches materialized FreshOpenCode panes with durable route metadata on mount and reconnect', async () => {
@@ -1772,6 +1808,8 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-2',
         sessionId: 'thread-1',
         status: 'idle',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
         initialCwd: '/repo',
         model: 'gpt-5.3-codex-spark',
       },
@@ -1803,6 +1841,8 @@ describe('FreshAgentView', () => {
       sessionId: 'thread-1',
       sessionType: 'freshcodex',
       provider: 'codex',
+      expectedRuntimeId: 'runtime-current',
+      expectedGeneration: 8,
       text: 'Ship it',
       settings: {
         cwd: '/repo',
@@ -3965,6 +4005,8 @@ describe('FreshAgentView', () => {
         provider: 'codex',
         createRequestId: 'req-reset-alias',
         sessionId: 'thread-reset-alias',
+        runtimeId: 'runtime-reset-alias',
+        runtimeGeneration: 3,
         status: 'idle',
       },
     }))
@@ -3988,6 +4030,8 @@ describe('FreshAgentView', () => {
       sessionId: 'thread-reset-alias',
       sessionType: 'freshcodex',
       provider: 'codex',
+      expectedRuntimeId: 'runtime-reset-alias',
+      expectedGeneration: 3,
     })
     // The replacement conversation starts only once the durable close is
     // acknowledged (correlated close waits, focused-episode-6 round 2).
@@ -4063,6 +4107,19 @@ describe('FreshAgentView', () => {
 
   it('routes FreshOpenCode new-conversation kill through the pane cwd', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'ses_new_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      latestTurnId: 'old-turn',
+      status: 'idle',
+      runtime: { runtimeId: 'runtime-before-new', generation: 10 },
+    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -4074,6 +4131,8 @@ describe('FreshAgentView', () => {
         sessionId: 'ses_new_route',
         initialCwd: '/repo/route-aware',
         status: 'idle',
+        runtimeId: 'runtime-before-new',
+        runtimeGeneration: 10,
       },
     }))
 
@@ -4096,7 +4155,52 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_new_route',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      expectedRuntimeId: 'runtime-before-new',
+      expectedGeneration: 10,
       cwd: '/repo/route-aware',
+    })
+    // Durable-close-first: the re-mint (and its runtime-identity clear) only
+    // runs after the server acknowledges the OLD session's close — the
+    // sibling test below ("starts the new conversation only once the old
+    // session close is durably acknowledged") pins that gate. Answer the kill.
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.killed',
+        sessionId: 'ses_new_route',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        success: true,
+      })
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).runtimeId).toBeUndefined()
+      expect(getFreshAgentPaneContent(store).runtimeGeneration).toBeUndefined()
+    })
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_new_route'].runtimeId).toBeUndefined()
+    expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_new_route'].runtimeGeneration).toBeUndefined()
+    const replacementRequestId = getFreshAgentPaneContent(store).createRequestId
+    act(() => {
+      const created = {
+        type: 'freshAgent.created',
+        requestId: replacementRequestId,
+        sessionId: 'ses_after_new',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        runtime: { runtimeId: 'runtime-after-new', generation: 11 },
+      }
+      expect(handleFreshAgentMessage(store.dispatch, created, undefined, store.getState)).toBe(true)
+      onMessage?.(created)
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        sessionId: 'ses_after_new',
+        runtimeId: 'runtime-after-new',
+        runtimeGeneration: 11,
+      })
+      expect(store.getState().freshAgent.sessions['freshopencode:opencode:ses_after_new']).toMatchObject({
+        runtimeId: 'runtime-after-new',
+        runtimeGeneration: 11,
+      })
     })
   })
 
@@ -5764,6 +5868,59 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('clears runtime fences when lost-session recovery has no durable identity', async () => {
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'non-durable-lost-session',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      runtime: { runtimeId: 'runtime-nondurable-old', generation: 5 },
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-nondurable-lost',
+        sessionId: 'non-durable-lost-session',
+        status: 'connected',
+        runtimeId: 'runtime-nondurable-old',
+        runtimeGeneration: 5,
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(markSessionLost({
+        sessionId: 'non-durable-lost-session',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        runtime: { runtimeId: 'runtime-nondurable-old', generation: 5 },
+      }))
+    })
+
+    await waitFor(() => {
+      const content = getFreshAgentPaneContent(store)
+      expect(content.status).toBe('idle')
+      expect(content.createRequestId).not.toBe('req-nondurable-lost')
+      expect(content.runtimeId).toBeUndefined()
+      expect(content.runtimeGeneration).toBeUndefined()
+      expect(content.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'dead_live_handle',
+      })
+    })
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:non-durable-lost-session'].runtimeId).toBeUndefined()
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:non-durable-lost-session'].runtimeGeneration).toBeUndefined()
+  })
+
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
@@ -5929,6 +6086,8 @@ describe('FreshAgentView', () => {
         sessionId: 'dead-session-id',
         status: 'idle',
         resumeSessionId: 'named-resume',
+        runtimeId: 'runtime-claude-lost-old',
+        runtimeGeneration: 12,
       },
     }))
 
@@ -5946,6 +6105,7 @@ describe('FreshAgentView', () => {
       sessionId: 'dead-session-id',
       sessionType: 'freshclaude',
       provider: 'claude',
+      runtime: { runtimeId: 'runtime-claude-lost-old', generation: 12 },
       event: {
         type: 'freshAgent.session.snapshot',
         sessionId: 'dead-session-id',
@@ -5973,6 +6133,7 @@ describe('FreshAgentView', () => {
       sessionId: 'dead-session-id',
       sessionType: 'freshclaude',
       provider: 'claude',
+      runtime: { runtimeId: 'runtime-claude-lost-old', generation: 12 },
       event: {
         type: 'freshAgent.error',
         sessionId: 'dead-session-id',
@@ -5994,6 +6155,12 @@ describe('FreshAgentView', () => {
         effort: 'high',
       }))
     })
+    const recoveredPane = getFreshAgentPaneContent(store)
+    expect(recoveredPane.runtimeId).toBeUndefined()
+    expect(recoveredPane.runtimeGeneration).toBeUndefined()
+    const recoveredSession = store.getState().freshAgent.sessions['freshclaude:claude:dead-session-id']
+    expect(recoveredSession.runtimeId).toBeUndefined()
+    expect(recoveredSession.runtimeGeneration).toBeUndefined()
   })
 
   it('shows the underlying snapshot-load error when a freshclaude restore has no session-state failure message', async () => {
@@ -6096,6 +6263,14 @@ describe('FreshAgentView', () => {
 
   it('allows retrying a disabled fresh-client create after settings change', async () => {
     const store = createStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'codex-thread-disabled',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      latestTurnId: null,
+      status: 'idle',
+      runtime: { runtimeId: 'runtime-disabled-old', generation: 2 },
+    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -6106,6 +6281,8 @@ describe('FreshAgentView', () => {
         createRequestId: 'req-disabled-create',
         status: 'creating',
         sessionRef: { provider: 'codex', sessionId: 'codex-thread-disabled' },
+        runtimeId: 'runtime-disabled-old',
+        runtimeGeneration: 2,
       },
     }))
 
@@ -6135,6 +6312,8 @@ describe('FreshAgentView', () => {
         expect(leaf.content.status).toBe('creating')
         expect(leaf.content.createError).toBeUndefined()
         expect(leaf.content.createRequestId).not.toBe('req-disabled-create')
+        expect(leaf.content.runtimeId).toBeUndefined()
+        expect(leaf.content.runtimeGeneration).toBeUndefined()
         expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
           type: 'freshAgent.create',
           requestId: leaf.content.createRequestId,
@@ -6142,11 +6321,28 @@ describe('FreshAgentView', () => {
         }))
       }
     })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:codex-thread-disabled'].runtimeId).toBeUndefined()
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:codex-thread-disabled'].runtimeGeneration).toBeUndefined()
   })
 
   it('surfaces a missing Freshcodex rollout as a restore error instead of replacing the thread', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce(new Error('no rollout found for thread id codex-thread-missing'))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'codex-thread-missing',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      latestTurnId: 'old-turn',
+      status: 'running',
+      streamingActive: true,
+      streamingText: 'stale output',
+      runtime: { runtimeId: 'freshcodex-runtime-old', generation: 6 },
+    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -6159,6 +6355,8 @@ describe('FreshAgentView', () => {
         sessionId: 'codex-thread-missing',
         resumeSessionId: 'codex-thread-missing',
         sessionRef: { provider: 'codex', sessionId: 'codex-thread-missing' },
+        runtimeId: 'freshcodex-runtime-old',
+        runtimeGeneration: 6,
       },
     }))
 
@@ -6176,7 +6374,40 @@ describe('FreshAgentView', () => {
         expect(leaf.content.resumeSessionId).toBe('codex-thread-missing')
         expect(leaf.content.sessionRef).toBeUndefined()
         expect(leaf.content.status).toBe('idle')
+        expect(leaf.content.runtimeId).toBeUndefined()
+        expect(leaf.content.runtimeGeneration).toBeUndefined()
       }
+    })
+    const replacementRequestId = getFreshAgentPaneContent(store).createRequestId
+    const clearedSession = store.getState().freshAgent.sessions['freshcodex:codex:codex-thread-missing']
+    expect(clearedSession.runtimeId).toBeUndefined()
+    expect(clearedSession.runtimeGeneration).toBeUndefined()
+    act(() => {
+      const created = {
+        type: 'freshAgent.created',
+        requestId: replacementRequestId,
+        sessionId: 'codex-thread-missing',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        runtime: { runtimeId: 'freshcodex-runtime-new', generation: 7 },
+      }
+      expect(handleFreshAgentMessage(store.dispatch, created, undefined, store.getState)).toBe(true)
+      onMessage?.(created)
+    })
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({
+        sessionId: 'codex-thread-missing',
+        runtimeId: 'freshcodex-runtime-new',
+        runtimeGeneration: 7,
+      })
+      expect(store.getState().freshAgent.sessions['freshcodex:codex:codex-thread-missing']).toMatchObject({
+        runtimeId: 'freshcodex-runtime-new',
+        runtimeGeneration: 7,
+        status: 'connected',
+        latestTurnId: undefined,
+        streamingText: '',
+        streamingActive: false,
+      })
     })
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.create',
@@ -6652,9 +6883,14 @@ describe('freshcodex wedged-sidecar notice', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
     }))
+    // The re-mint may hand the flow either to the plain update fold
+    // (pre-fence path) or to the restart re-key (`restartFreshAgentCreate`,
+    // the fence-correct reducer for intentional remints): watch the SHAPE, not
+    // the action label.
     const remints = dispatchSpy.mock.calls
       .map(([action]) => action)
-      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+      .filter((action: any) => (action?.type === 'panes/updatePaneContent'
+        || action?.type === 'panes/restartFreshAgentCreate')
         && action.payload?.content?.status === 'creating')
     expect(remints).toHaveLength(1)
     expect(remints[0].payload.content.resumeSessionId).toBe('thread-stuck-1')
@@ -6829,6 +7065,109 @@ describe('snapshot scheduler integration (zrrj)', () => {
     // 4th positional arg is the query/options bag ({ revision?, cwd?, signal? }).
     const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
     expect(options?.signal).toBeUndefined()
+  })
+
+  it('does not apply a pre-replacement snapshot after the pane runtime fence changes', async () => {
+    const store = createStore()
+    const oldSnapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+    const newSnapshot = createDeferred<ReturnType<typeof freshopencodeSnapshot>>()
+    apiMock.getFreshAgentThreadSnapshot
+      .mockReturnValueOnce(oldSnapshot.promise)
+      .mockReturnValueOnce(newSnapshot.promise)
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        ...schedulerPaneContent('req-runtime-snapshot'),
+        runtimeId: 'runtime-before-restart',
+        runtimeGeneration: 4,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          ...getFreshAgentPaneContent(store),
+          runtimeId: 'runtime-after-restart',
+          runtimeGeneration: 5,
+        },
+      }))
+    })
+    oldSnapshot.resolve(freshopencodeSnapshot('pre-restart transcript', 1))
+
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText('pre-restart transcript')).not.toBeInTheDocument()
+
+    newSnapshot.resolve(freshopencodeSnapshot('post-restart transcript', 2))
+    await screen.findByText('post-restart transcript')
+  })
+
+  it('rejects untagged and mismatched fresh-agent frames after the pane has a runtime fence', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-runtime-frame',
+        sessionId: 'ses_fenced',
+        status: 'connected',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_fenced',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: { type: 'freshAgent.session.snapshot' },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_fenced',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: { type: 'freshAgent.session.snapshot' },
+        runtime: { runtimeId: 'runtime-old', generation: 7 },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_fenced',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: { type: 'freshAgent.session.snapshot' },
+        runtime: { runtimeId: 'runtime-current', generation: 9 },
+      })
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
   })
 })
 

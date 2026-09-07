@@ -48,6 +48,7 @@ pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
 pub mod rollback_record;
+pub mod runtime_identity;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
@@ -78,8 +79,54 @@ pub use rollback_record::{
     LEDGER_WRITE_REFUSAL_COPY, OPENCODE_OLD_CLI_COPY, REDO_DESTROYED_MESSAGE, REDO_EMPTY_MESSAGE,
     REDO_REMOVED_HISTORY_COPY, ROLLBACK_BUSY_MESSAGE, ROLLBACK_RECORD_VERSION, UNDO_EMPTY_MESSAGE,
 };
+pub use runtime_identity::{
+    FreshRuntimeIdentity, FreshRuntimeRegistry, SharedFreshRuntimeRegistry,
+};
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
+
+/// Provider-runtime result for an exact restart retirement attempt.
+///
+/// `RetirementIncomplete` is deliberately distinct from `Stale`: the selected
+/// runtime was found and fenced, but one of its ownership barriers has not yet
+/// completed. Coordinators must persist that phase and retry the same
+/// retirement before creating a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartShutdownOutcome {
+    Stopped,
+    Stale,
+    RetirementIncomplete { message: String },
+}
+
+/// Exact provider-owned inputs for restarting one currently-live fresh-agent
+/// runtime. This is deliberately captured from the live manager, not inferred
+/// from server defaults or reconstructed from a best-effort pane-ledger write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshAgentRestartResumePlan {
+    pub session_type: freshell_protocol::SessionType,
+    pub settings: FreshAgentSettings,
+}
+
+/// Whether a mutating client control selects this exact live runtime.
+///
+/// Runtime metadata was added after the original fresh-agent protocol. An
+/// untagged control is compatible only with a first-generation runtime: no
+/// predecessor can exist yet, so it cannot accidentally mutate a replacement.
+/// Once a durable session has crossed a replacement boundary, both fields are
+/// mandatory and must match exactly.
+pub(crate) fn control_targets_runtime(
+    expected_runtime_id: Option<&str>,
+    expected_generation: Option<u64>,
+    runtime: &freshell_protocol::RuntimeDescriptor,
+) -> bool {
+    match (expected_runtime_id, expected_generation) {
+        (Some(runtime_id), Some(generation)) => {
+            runtime.runtime_id == runtime_id && runtime.generation == generation
+        }
+        (None, None) => runtime.generation <= 1,
+        _ => false,
+    }
+}
 
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by
@@ -148,6 +195,11 @@ use freshell_protocol::{
 
 use crate::summary::{truncate_summary, SUMMARY_KIND_ECHO};
 
+/// Ownership tag persisted by the restart coordinator before replacement
+/// creation. Provider sidecars and terminal PTYs inherit it so a later server
+/// boot can find and quiesce an ambiguously spawned replacement.
+pub const RESTART_REPLACEMENT_OWNERSHIP_ENV: &str = "FRESHELL_RESTART_REPLACEMENT_ID";
+
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
 const SESSION_TYPE: &str = "freshopencode";
 /// The runtime provider (`AGENT_SESSION_TYPES.opencode.provider`).
@@ -180,6 +232,19 @@ pub(crate) fn resolve_probe_timeout_ms(state_override: Option<u64>, env_raw: Opt
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(10_000u64)
 }
+
+/// Read-only admission probe for a restart transaction whose old runtime has
+/// not yet been retired. The provider/session pair is already normalized by
+/// the terminal create pipeline before this seam is called.
+pub type RestartRetirementProbe = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Opaque permit returned by the server-owned restart coordinator. REST
+/// terminal creation retains it through spawn and ownership registration,
+/// without introducing a dependency from this crate back to `freshell-ws`.
+pub type RestartAdmissionPermit = Box<dyn std::any::Any + Send>;
+pub type RestartAdmissionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<RestartAdmissionPermit, ()>> + Send>>;
+pub type RestartAdmissionGate = Arc<dyn Fn(String, String) -> RestartAdmissionFuture + Send + Sync>;
 
 /// Shared, cheaply-cloneable fresh-agent REST state (mergeable into the server app).
 #[derive(Clone)]
@@ -215,6 +280,15 @@ pub struct FreshAgentState {
     /// `session_identity`. `None` (tests without identity concerns) = the
     /// legacy no-write behavior.
     pub(crate) pane_identity: Option<Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
+    /// Restart transaction admission probe, wired by `freshell-server` to the
+    /// same coordinator used by WS create/reconcile. A matching terminal
+    /// resume must not spawn while the retired generation may still write.
+    /// `None` keeps isolated crate tests that do not construct a coordinator
+    /// usable.
+    pub(crate) restart_retirement_probe: Option<RestartRetirementProbe>,
+    /// Atomic cross-kind restart admission. Unlike the read-only probe, this
+    /// returns a permit held through the final spawn/adoption commit.
+    pub(crate) restart_admission_gate: Option<RestartAdmissionGate>,
     /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
     /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
     /// and `content_panes` (browser/editor) -- a pane id appears in exactly
@@ -421,6 +495,8 @@ impl FreshAgentState {
             terminal_registry: None,
             session_identity: None,
             pane_identity: None,
+            restart_retirement_probe: None,
+            restart_admission_gate: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
@@ -691,6 +767,19 @@ impl FreshAgentState {
     /// to the sidecars would create a real Arc cycle.
     pub fn with_sidecar_liveness(mut self, probe: SidecarLivenessProbe) -> Self {
         self.sidecar_liveness = Some(probe);
+        self
+    }
+
+    /// Wire the restart coordinator's session-scoped retirement admission
+    /// probe into REST terminal create/split/respawn.
+    pub fn with_restart_retirement_probe(mut self, probe: RestartRetirementProbe) -> Self {
+        self.restart_retirement_probe = Some(probe);
+        self
+    }
+
+    /// Wire the restart coordinator's atomic durable-session admission gate.
+    pub fn with_restart_admission_gate(mut self, gate: RestartAdmissionGate) -> Self {
+        self.restart_admission_gate = Some(gate);
         self
     }
 
@@ -1869,6 +1958,7 @@ async fn create_tab(
                 provider: PROVIDER.to_string(),
                 session_id: placeholder.clone(),
                 session_type: SESSION_TYPE.to_string(),
+                runtime: None,
             }));
         }
     }
@@ -2087,6 +2177,7 @@ async fn resume_session_ref_tab(
             provider: PROVIDER.to_string(),
             session_id: durable_id.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
         }));
     }
 
@@ -2392,6 +2483,7 @@ async fn send_keys(
                     provider: PROVIDER.to_string(),
                     session_id: durable_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: None,
                 }));
             }
         }
@@ -2409,6 +2501,7 @@ async fn send_keys(
                 provider: PROVIDER.to_string(),
                 session_id: durable_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
+                runtime: None,
                 session_ref: Some(session_ref.clone()),
             },
         ));
@@ -3246,6 +3339,7 @@ mod tests {
             provider: PROVIDER.to_string(),
             session_id: "ses_123".to_string(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: "ses_123".to_string(),

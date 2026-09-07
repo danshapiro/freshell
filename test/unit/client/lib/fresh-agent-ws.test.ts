@@ -154,6 +154,64 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('centrally fences created and materialized frames before they can mutate a fenced pane', () => {
+    const store = createFreshAgentPaneStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-runtime-fenced',
+        sessionId: 'placeholder-runtime-fenced',
+        status: 'running',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+
+    const created = (runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.created',
+        requestId: 'req-runtime-fenced',
+        sessionId: 'created-runtime-fenced',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    expect(created()).toBe(true)
+    expect(created({ runtimeId: 'runtime-old', generation: 7 })).toBe(true)
+    expect(created({ runtimeId: 'runtime-current', generation: 9 })).toBe(true)
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:created-runtime-fenced']).toBeUndefined()
+
+    expect(created({ runtimeId: 'runtime-current', generation: 8 })).toBe(true)
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:created-runtime-fenced']).toBeDefined()
+
+    const materialized = (runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'placeholder-runtime-fenced',
+        sessionId: 'durable-runtime-fenced',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    expect(materialized()).toBe(true)
+    expect(materialized({ runtimeId: 'runtime-old', generation: 7 })).toBe(true)
+    expect(materialized({ runtimeId: 'runtime-current', generation: 9 })).toBe(true)
+    expect(store.getState().panes.layouts['tab-1']?.content).toMatchObject({
+      sessionId: 'placeholder-runtime-fenced',
+    })
+
+    expect(materialized({ runtimeId: 'runtime-current', generation: 8 })).toBe(true)
+    expect(store.getState().panes.layouts['tab-1']?.content).toMatchObject({
+      sessionId: 'durable-runtime-fenced',
+    })
+  })
+
   it('create.failed SESSION_RESERVED (retryable) is not projected into pendingCreateFailures and keeps the create route alive', () => {
     // Task 14: a transient reservation must never mint an error-card entry
     // (no Retry button racing the same-requestId re-drive) AND must not
@@ -349,6 +407,103 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${placeholderId}`]).toBeUndefined()
     expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${durableId}`]).toBeDefined()
     expect(actionTypes).toContain(flushPersistedLayoutNow.type)
+  })
+
+  it('drops untagged and stale transport events at the central handler when their pane is runtime-fenced', () => {
+    const actionTypes: string[] = []
+    const store = createFreshAgentPaneStore(actionTypes)
+    const sessionId = 'ses-runtime-fenced'
+    const send = (event: Record<string, unknown>, runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: { sessionId, ...event },
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        createRequestId: 'req-runtime-fenced',
+        status: 'running',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+
+    // The current runtime is allowed to create the session. Every later
+    // mutation must carry exactly that runtime fence.
+    expect(send({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle' }, {
+      runtimeId: 'runtime-current', generation: 8,
+    })).toBe(true)
+    actionTypes.length = 0
+
+    expect(send({ type: 'freshAgent.status', status: 'running' })).toBe(true)
+    expect(send({ type: 'freshAgent.permission.request', requestId: 'approval-stale', tool: { name: 'Bash' } })).toBe(true)
+    expect(send({ type: 'freshAgent.question.request', requestId: 'question-stale', questions: [] }, {
+      runtimeId: 'runtime-old', generation: 7,
+    })).toBe(true)
+    expect(send({ type: 'freshAgent.turn.complete', at: 1234 })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
+    expect(session).toMatchObject({ status: 'idle', pendingPermissions: {}, pendingQuestions: {} })
+    expect(actionTypes).not.toContain('turnCompletion/recordTurnComplete')
+  })
+
+  it('ignores untagged and stale killed acknowledgements once a pane is runtime-fenced', () => {
+    const store = createFreshAgentPaneStore()
+    const sessionId = 'ses-kill-fenced'
+    store.dispatch(initLayout({
+      tabId: 'tab-kill',
+      paneId: 'pane-kill',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        createRequestId: 'req-kill',
+        status: 'running',
+        runtimeId: 'runtime-current',
+        runtimeGeneration: 8,
+      },
+    }))
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      runtime: { runtimeId: 'runtime-current', generation: 8 },
+      event: {
+        type: 'freshAgent.session.snapshot',
+        sessionId,
+        latestTurnId: null,
+        status: 'idle',
+      },
+    }, undefined, store.getState)
+
+    const killed = (runtime?: { runtimeId: string, generation: number }) =>
+      handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.killed',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+        ...(runtime ? { runtime } : {}),
+      }, undefined, store.getState)
+
+    expect(killed()).toBe(true)
+    expect(killed({ runtimeId: 'runtime-old', generation: 7 })).toBe(true)
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]).toBeDefined()
+
+    expect(killed({ runtimeId: 'runtime-current', generation: 8 })).toBe(true)
+    expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]).toBeUndefined()
   })
 
   it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {

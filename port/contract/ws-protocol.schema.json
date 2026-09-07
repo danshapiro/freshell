@@ -2,8 +2,64 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 82,
+  "schemaCount": 85,
   "schemas": {
+    "AgentRestartSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "liveId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "agent.restart",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "provider",
+        "sessionId",
+        "kind",
+        "liveId",
+        "expectedGeneration"
+      ],
+      "type": "object"
+    },
+    "AgentRuntimeKindSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "terminal",
+        "fresh-agent"
+      ],
+      "type": "string"
+    },
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -433,6 +489,53 @@
         {
           "additionalProperties": false,
           "properties": {
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "terminal",
+                "fresh-agent"
+              ],
+              "type": "string"
+            },
+            "liveId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "provider": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "agent.restart",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId",
+            "provider",
+            "sessionId",
+            "kind",
+            "liveId",
+            "expectedGeneration"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "panes": {
               "items": {
                 "additionalProperties": false,
@@ -522,6 +625,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "agentRestartV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileFreshAgentV1": {
                   "const": true,
                   "type": "boolean"
@@ -1898,6 +2005,15 @@
             "cwd": {
               "type": "string"
             },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "images": {
               "items": {
                 "additionalProperties": false,
@@ -1994,6 +2110,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -2204,6 +2329,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -3174,6 +3308,15 @@
             "cwd": {
               "type": "string"
             },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "images": {
               "items": {
                 "additionalProperties": false,
@@ -3270,6 +3413,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -3480,6 +3632,15 @@
           "additionalProperties": false,
           "properties": {
             "cwd": {
+              "type": "string"
+            },
+            "expectedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expectedRuntimeId": {
+              "minLength": 1,
               "type": "string"
             },
             "provider": {
@@ -3923,6 +4084,15 @@
         "cwd": {
           "type": "string"
         },
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRuntimeId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "provider": {
           "enum": [
             "claude",
@@ -3962,6 +4132,15 @@
       "additionalProperties": false,
       "properties": {
         "cwd": {
+          "type": "string"
+        },
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRuntimeId": {
+          "minLength": 1,
           "type": "string"
         },
         "provider": {
@@ -4127,6 +4306,15 @@
         "cwd": {
           "type": "string"
         },
+        "expectedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedRuntimeId": {
+          "minLength": 1,
+          "type": "string"
+        },
         "images": {
           "items": {
             "additionalProperties": false,
@@ -4283,6 +4471,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "agentRestartV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "const": true,
               "type": "boolean"
@@ -7090,6 +7282,25 @@
               "reason": {
                 "type": "string"
               },
+              "runtime": {
+                "additionalProperties": false,
+                "properties": {
+                  "generation": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "runtimeId": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "runtimeId",
+                  "generation"
+                ],
+                "type": "object"
+              },
               "sessionRef": {
                 "additionalProperties": false,
                 "properties": {
@@ -7159,6 +7370,25 @@
         },
         "reason": {
           "type": "string"
+        },
+        "runtime": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runtimeId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "runtimeId",
+            "generation"
+          ],
+          "type": "object"
         },
         "sessionRef": {
           "additionalProperties": false,
@@ -7264,6 +7494,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "agentRestartV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileFreshAgentV1": {
           "const": true,
           "type": "boolean"
@@ -7359,6 +7593,26 @@
       "required": [
         "provider",
         "sessionId"
+      ],
+      "type": "object"
+    },
+    "RuntimeDescriptorSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runtimeId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtimeId",
+        "generation"
       ],
       "type": "object"
     },

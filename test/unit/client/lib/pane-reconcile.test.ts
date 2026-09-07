@@ -346,6 +346,14 @@ describe('foldVerdicts', () => {
     expect(dispatched.countOf(setPaneRestoreError.type)).toBe(1)
   })
 
+  it('error{restart_retirement_pending} stays retryable through the warming flow', () => {
+    const { req, dispatch, dispatched } = foldHarness([['error', { reason: 'restart_retirement_pending' }]])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome.warming).toBe(1)
+    expect(dispatched.countOf(setReconcileWarming.type)).toBe(1)
+    expect(dispatched.countOf(setPaneRestoreError.type)).toBe(0)
+  })
+
   it('invalid becomes a per-pane restoreError and counts as invalid', () => {
     const { req, dispatch, dispatched } = foldHarness([['invalid', { reason: 'unsupported_kind' }]])
     const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))

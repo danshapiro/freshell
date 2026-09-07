@@ -91,7 +91,7 @@ const ioEvents: Array<{ kind: 'send' | 'write', type?: string, data: string }> =
 function withCurrentAttachRequestId(msg: any) {
   if (
     typeof msg?.terminalId !== 'string'
-    || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+    || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap' && msg?.type !== 'terminal.stream.changed')
   ) {
     return msg
   }
@@ -106,7 +106,7 @@ function withCurrentAttachRequestId(msg: any) {
       : `test-stream:${msg.terminalId}`
     latestStreamIdByTerminal.set(msg.terminalId, streamId)
     next = { ...next, streamId }
-  } else {
+  } else if (msg.type !== 'terminal.stream.changed') {
     const streamId = typeof next.streamId === 'string' && next.streamId.length > 0
       ? next.streamId
       : latestStreamIdByTerminal.get(msg.terminalId)
@@ -177,6 +177,7 @@ function createSettingsState(policy: 'ask' | 'always' | 'never') {
 function createStore(
   policy: 'ask' | 'always' | 'never',
   mode: TerminalPaneContent['mode'] = 'opencode',
+  runtime?: { runtimeId: string, generation: number },
 ) {
   const tabId = 'tab-osc52'
   const paneId = 'pane-osc52'
@@ -189,6 +190,7 @@ function createStore(
     mode,
     shell: 'system',
     terminalId,
+    ...(runtime ? { runtimeId: runtime.runtimeId, runtimeGeneration: runtime.generation } : {}),
   }
 
   const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -268,8 +270,9 @@ describe('TerminalView OSC52 policy handling', () => {
   async function renderView(
     policy: 'ask' | 'always' | 'never',
     mode: TerminalPaneContent['mode'] = 'opencode',
+    runtime?: { runtimeId: string, generation: number },
   ) {
-    const { store, tabId, paneId, paneContent, terminalId } = createStore(policy, mode)
+    const { store, tabId, paneId, paneContent, terminalId } = createStore(policy, mode, runtime)
     render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
@@ -302,6 +305,48 @@ describe('TerminalView OSC52 policy handling', () => {
     })
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
+  })
+
+  it('fails closed for output, output gaps, and stream changes without the pane runtime fence', async () => {
+    const runtime = { runtimeId: 'terminal-runtime-current', generation: 8 }
+    const { store, terminalId } = await renderView('always', 'shell', runtime)
+
+    messageHandler!({
+      type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'untagged-output',
+    })
+    messageHandler!({
+      type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 2, reason: 'queue_overflow',
+    })
+    messageHandler!({
+      type: 'terminal.stream.changed', terminalId, streamId: 'untagged-stream', reason: 'retention_lost',
+    })
+    messageHandler!({
+      type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 3, data: 'wrong-output',
+      runtime: { runtimeId: 'terminal-runtime-old', generation: 7 },
+    })
+    messageHandler!({
+      type: 'terminal.output.gap', terminalId, fromSeq: 4, toSeq: 4, reason: 'queue_overflow',
+      runtime: { runtimeId: 'terminal-runtime-current', generation: 9 },
+    })
+    messageHandler!({
+      type: 'terminal.stream.changed', terminalId, streamId: 'wrong-stream', reason: 'retention_lost',
+      runtime: { runtimeId: 'terminal-runtime-old', generation: 7 },
+    })
+
+    expect(writeEvents()).toEqual([])
+    expect(terminalInstances[0].write).not.toHaveBeenCalled()
+    expect((store.getState().panes.layouts['tab-osc52'] as any).content.streamId).toBeUndefined()
+
+    messageHandler!({
+      type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 5, data: 'current-output', runtime,
+    })
+    await waitFor(() => {
+      expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'current-output')).toBe(true)
+    })
+    messageHandler!({
+      type: 'terminal.stream.changed', terminalId, streamId: 'current-stream', reason: 'retention_lost', runtime,
+    })
+    expect((store.getState().panes.layouts['tab-osc52'] as any).content.streamId).toBe('current-stream')
   })
 
   it('strips startup probes, sends replies before writing visible output, and preserves OSC52 handling', async () => {

@@ -1018,6 +1018,58 @@ pub(crate) async fn spawn_terminal_pane(
     // freshell-ws/src/terminal.rs does this exact OR-fold).
     let claude_fresh_prealloc = claude_prealloc_mint || rest_outcome.claude_fresh_prealloc;
 
+    // Production uses the async gate: it serializes this complete spawn
+    // pipeline with explicit restart and every other resume for the same
+    // durable provider session. The read-only probe remains only as the
+    // compatibility fallback for isolated crate tests.
+    let _restart_admission = if let Some(session_id) = resume_session_id.as_deref() {
+        let denied = if let Some(gate) = &state.restart_admission_gate {
+            match gate(mode.clone(), session_id.to_string()).await {
+                Ok(permit) => Some(permit),
+                Err(()) => {
+                    tracing::warn!(
+                        event = "terminal.create.blocked_by_pending_restart_recovery",
+                        transport = "rest",
+                        provider = %mode,
+                        session_id,
+                        "terminal resume blocked by restart session admission"
+                    );
+                    return Err(fail_json_code(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SESSION_RESERVED",
+                        format!(
+                            "Session {mode}/{session_id} is reserved by restart recovery; retry shortly"
+                        ),
+                    ));
+                }
+            }
+        } else if state
+            .restart_retirement_probe
+            .as_ref()
+            .is_some_and(|probe| probe(&mode, session_id))
+        {
+            tracing::warn!(
+                event = "terminal.create.blocked_by_pending_restart_retirement",
+                transport = "rest",
+                provider = %mode,
+                session_id,
+                "terminal resume blocked while restart retirement remains pending"
+            );
+            return Err(fail_json_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SESSION_RESERVED",
+                format!(
+                    "Session {mode}/{session_id} is still retiring its previous runtime; retry shortly"
+                ),
+            ));
+        } else {
+            None
+        };
+        denied
+    } else {
+        None
+    };
+
     // Hoisted spawn-environment inputs, computed ONCE (Task 8's WS pattern,
     // REST twin): the amplifier windows-arm guard below and the spawn-spec
     // construction in `settle_gated_create` (its `windows_like` branch pick,
@@ -4825,6 +4877,7 @@ mod tests {
     }
 
     const LIVE_SESSION: &str = "22222222-3333-4444-8555-666666666666";
+    const UNRELATED_SESSION: &str = "33333333-4444-4555-8666-777777777777";
 
     /// Forge what a REST-spawned live resume leaves behind: a Running registry
     /// row carrying (mode, resume_session_id). Headless: no real PTY.
@@ -4940,6 +4993,65 @@ mod tests {
         );
 
         registry.kill(&new_tid);
+    }
+
+    #[tokio::test]
+    async fn atomic_restart_admission_blocks_only_matching_rest_resume() {
+        let argv_file = unique_argv_file("restart-retirement-rest-gate");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]))
+            .with_restart_admission_gate(Arc::new(|provider, session_id| {
+                Box::pin(async move {
+                    if provider == "claude" && session_id == LIVE_SESSION {
+                        Err(())
+                    } else {
+                        Ok(Box::new(()) as crate::RestartAdmissionPermit)
+                    }
+                })
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], json!("SESSION_RESERVED"), "{body}");
+        assert!(
+            registry.identity_probe_rows().is_empty(),
+            "blocked resume must not spawn a replacement"
+        );
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": {
+                    "provider": "claude",
+                    "sessionId": UNRELATED_SESSION,
+                },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let unrelated_terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(registry.is_running(&unrelated_terminal_id));
+
+        registry.kill(&unrelated_terminal_id);
     }
 
     #[tokio::test]

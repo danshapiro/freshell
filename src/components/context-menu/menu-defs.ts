@@ -13,8 +13,8 @@ import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
-import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
-import { collectSessionRefsFromNode } from '@/lib/session-utils'
+import { buildPaneRefreshTarget, findPaneContent, resolveAgentRestartTarget } from '@/lib/pane-utils'
+import { findPaneForSession, findUnopenedProjectSessions } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
 import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
@@ -42,6 +42,7 @@ export type MenuActions = {
   moveTab: (tabId: string, dir: -1 | 1) => void
   renamePane: (tabId: string, paneId: string) => void
   refreshPane: (tabId: string, paneId: string) => void
+  restartPane: (tabId: string, paneId: string) => void
   replacePane: (tabId: string, paneId: string) => void
   splitPane: (tabId: string, paneId: string, direction: 'horizontal' | 'vertical') => void
   resetSplit: (tabId: string, splitId: string) => void
@@ -103,6 +104,11 @@ export type MenuBuildContext = {
   actions: MenuActions
   aiEnabled: boolean
   platform: string | null
+  /** Whether the server advertised `agentRestartV1` on the ready frame.
+   * Withheld on platforms whose persisted replacement-fence recovery cannot
+   * succeed — the menu then degrades Restart to Refresh (fail closed). */
+  agentRestartSupported: boolean
+  localServerInstanceId?: string
   extensions?: ClientExtensionEntry[]
   reopenActivityByPaneId?: Record<string, ReopenPaneActivity>
   tabRegistryGroups?: TabsRegistryGroups
@@ -241,19 +247,43 @@ function collectPaneLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[
   ]
 }
 
+function buildPaneLifecycleItem(
+  tabId: string,
+  paneId: string,
+  content: PaneContent | null,
+  agentRestartSupported: boolean,
+  actions: MenuActions,
+): MenuItem {
+  if (content && agentRestartSupported && resolveAgentRestartTarget(content)) {
+    return {
+      type: 'item',
+      id: 'restart-pane',
+      label: 'Restart pane',
+      onSelect: () => actions.restartPane(tabId, paneId),
+    }
+  }
+
+  return {
+    type: 'item',
+    id: 'refresh-pane',
+    label: 'Refresh pane',
+    onSelect: () => actions.refreshPane(tabId, paneId),
+    disabled: !content || !buildPaneRefreshTarget(content),
+  }
+}
+
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
   const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform, extensions } = ctx
+  const workspaceState = {
+    tabs: { tabs },
+    panes: { layouts: paneLayouts },
+  }
   const isSessionOpen = (sessionId: string, provider?: string) => {
-    const keyProvider = provider || 'claude'
-    for (const tab of tabs) {
-      const layout = paneLayouts[tab.id]
-      if (!layout) continue
-      const refs = collectSessionRefsFromNode(layout)
-      if (refs.some((ref) => ref.provider === keyProvider && ref.sessionId === sessionId)) {
-        return true
-      }
-    }
-    return false
+    return Boolean(findPaneForSession(
+      workspaceState,
+      { provider: provider || 'claude', sessionId },
+      ctx.localServerInstanceId,
+    ))
   }
 
   if (target.kind === 'global') {
@@ -422,17 +452,10 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
     const reopenPaneAsItem = buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx)
-    const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
       ...paneResumeMenuItem,
       ...reopenPaneAsItem,
-      {
-        type: 'item',
-        id: 'refresh-pane',
-        label: 'Refresh pane',
-        onSelect: () => actions.refreshPane(target.tabId, target.paneId),
-        disabled: !canRefreshPane,
-      },
+      buildPaneLifecycleItem(target.tabId, target.paneId, paneContent, ctx.agentRestartSupported, actions),
       { type: 'item', id: 'split-right', label: 'Split right', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'pane-split-sep' },
@@ -467,8 +490,6 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
     const reopenPaneAsItem = buildReopenPaneAsItem(target.tabId, target.paneId, paneContent, tab, ctx)
-    const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
-
     const urlItems: MenuItem[] = target.hoveredUrl ? [
       {
         type: 'item',
@@ -501,13 +522,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       ...urlItems,
       ...buildTerminalClipboardItems(terminalActions, hasSelection),
       { type: 'separator', id: 'terminal-clipboard-sep' },
-      {
-        type: 'item',
-        id: 'refresh-pane',
-        label: 'Refresh pane',
-        onSelect: () => actions.refreshPane(target.tabId, target.paneId),
-        disabled: !canRefreshPane,
-      },
+      buildPaneLifecycleItem(target.tabId, target.paneId, paneContent, ctx.agentRestartSupported, actions),
       { type: 'item', id: 'terminal-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'terminal-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'terminal-split-sep' },
@@ -630,10 +645,15 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const sidebarResumeMenuItem = resumeCandidate
       ? [buildCopyResumeMenuItem('session-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
+    const openItems: MenuItem[] = isSessionOpen(target.sessionId, target.provider)
+      ? []
+      : [
+          { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
+          { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
+        ]
 
     return [
-      { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
-      { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
+      ...openItems,
       { type: 'item', id: 'session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider) },
       // Reviewed reset (b5fb): offered only when an override is applied AND its
       // recorded source is not a sweep rung ('first-message'/'dir') the
@@ -676,6 +696,11 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
 
   if (target.kind === 'history-project') {
     const expanded = expandedProjects.has(target.projectPath)
+    const project = sessions.find((candidate) => candidate.projectPath === target.projectPath)
+    const unopenedCount = project
+      ? findUnopenedProjectSessions(workspaceState, project, ctx.localServerInstanceId).length
+      : undefined
+    const allSessionsOpen = unopenedCount === 0
     return [
       {
         type: 'item',
@@ -686,7 +711,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'history-project-color', label: 'Set project color', onSelect: () => actions.setProjectColor(target.projectPath) },
       { type: 'item', id: 'history-project-copy', label: 'Copy project path', onSelect: () => actions.copyProjectPath(target.projectPath) },
       { type: 'separator', id: 'history-project-sep' },
-      { type: 'item', id: 'history-project-open-all', label: 'Open all sessions in tabs', onSelect: () => actions.openAllSessionsInProject(target.projectPath) },
+      {
+        type: 'item',
+        id: 'history-project-open-all',
+        label: allSessionsOpen ? 'All sessions already open' : 'Open all sessions in tabs',
+        onSelect: () => actions.openAllSessionsInProject(target.projectPath),
+        disabled: allSessionsOpen,
+      },
     ]
   }
 

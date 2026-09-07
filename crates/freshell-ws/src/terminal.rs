@@ -59,11 +59,11 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    AgentProvider, ClientMessage, ErrorCode, ErrorMsg, FreshAgentCreateFailed, FreshAgentEvent,
-    PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator,
-    SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated,
-    TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
-    TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
+    AgentProvider, AgentRestartFailureCode, ClientMessage, ErrorCode, ErrorMsg, FreshAgentAttach,
+    FreshAgentCreateFailed, FreshAgentEvent, PaneClosed, PaneClosedResult, PanesClosedResult, Pong,
+    ServerMessage, SessionLocator, SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel,
+    TerminalCreate, TerminalCreated, TerminalDetach, TerminalIdOnly, TerminalInputBlocked,
+    TerminalInputBlockedReason, TerminalKill, TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -101,6 +101,62 @@ pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
         Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
     }
+}
+
+fn fresh_agent_attach_restart_locator(
+    attach: &FreshAgentAttach,
+) -> Option<crate::restart::RuntimeLocator> {
+    let provider = match attach.provider {
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        freshell_protocol::AgentProvider::Amplifier => return None,
+    };
+    let session_id = match attach.provider {
+        freshell_protocol::AgentProvider::Claude => attach
+            .session_ref
+            .as_ref()
+            .filter(|session_ref| session_ref.provider == provider)
+            .map(|session_ref| session_ref.session_id.as_str())
+            .or(attach.resume_session_id.as_deref())
+            .filter(|session_id| !session_id.is_empty()),
+        freshell_protocol::AgentProvider::Codex | freshell_protocol::AgentProvider::Opencode => {
+            (!attach.session_id.is_empty()).then_some(attach.session_id.as_str())
+        }
+        freshell_protocol::AgentProvider::Amplifier => None,
+    }?;
+    Some(crate::restart::RuntimeLocator::new(
+        freshell_protocol::AgentRuntimeKind::FreshAgent,
+        provider,
+        session_id,
+    ))
+}
+
+fn fresh_agent_attach_reserved_frame(attach: &FreshAgentAttach) -> ServerMessage {
+    let provider = match attach.provider {
+        freshell_protocol::AgentProvider::Claude => "claude",
+        freshell_protocol::AgentProvider::Codex => "codex",
+        freshell_protocol::AgentProvider::Opencode => "opencode",
+        freshell_protocol::AgentProvider::Amplifier => "amplifier",
+    };
+    let session_type = match attach.session_type {
+        freshell_protocol::SessionType::Freshclaude => "freshclaude",
+        freshell_protocol::SessionType::Freshcodex => "freshcodex",
+        freshell_protocol::SessionType::Kilroy => "kilroy",
+        freshell_protocol::SessionType::Freshopencode => "freshopencode",
+    };
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: serde_json::json!({
+            "type": "freshAgent.error",
+            "sessionId": attach.session_id,
+            "code": "SESSION_RESERVED",
+            "message": "Restart is still retiring the previous session runtime",
+        }),
+        provider: provider.to_string(),
+        session_id: attach.session_id.clone(),
+        session_type: session_type.to_string(),
+        runtime: None,
+    })
 }
 
 /// `Date.now()` — epoch milliseconds (`terminal.created.createdAt`). Also
@@ -259,6 +315,7 @@ pub async fn run(
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    agent_restart_v1: bool,
     origin_kind: &'static str,
     conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
@@ -299,6 +356,7 @@ pub async fn run(
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
+        agent_restart_v1,
         conn_id,
         origin_kind,
         conn_identity,
@@ -321,6 +379,7 @@ async fn run_loop(
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    agent_restart_v1: bool,
     conn_id: u64,
     origin_kind: &'static str,
     mut conn_identity: ConnectionIdentity,
@@ -349,7 +408,16 @@ async fn run_loop(
     let mut writer_finished = false;
     let conn_sink: FrameSink = {
         let sender = ws_tx.clone();
-        Arc::new(move |msg| {
+        let restart = state.restart.clone();
+        Arc::new(move |mut msg| {
+            restart.observe_server_message(&mut msg);
+            if !crate::restart::RestartCoordinator::restart_runtime_contract_satisfied(&msg) {
+                tracing::error!(
+                    message = ?msg,
+                    "agent.restart.runtime_descriptor_contract.failed"
+                );
+                return;
+            }
             sender.push_server(msg);
         })
     };
@@ -485,6 +553,7 @@ async fn run_loop(
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
                             pane_reconcile_fresh_agent_v1,
+                            agent_restart_v1,
                             &interactive_create_tx,
                             &create_cancel_rx,
                             &mut host_stats_last_refresh_at,
@@ -547,6 +616,9 @@ async fn run_loop(
                 match frame {
                     // A pre-serialized server→client frame — forward it verbatim.
                     Ok(json) => {
+                        let Some(json) = state.restart.observe_serialized(&json) else {
+                            continue;
+                        };
                         if ws_tx.send(Message::Text(json.into())).await.is_err() {
                             close_reason = "send_error";
                             break;
@@ -717,6 +789,87 @@ async fn run_loop(
     }
 }
 
+/// `(provider, sessionId)` carried by a wire `sessionRef` object, when both
+/// fields are well-formed strings and the sessionId is non-empty.
+fn raw_session_ref_identity(value: &serde_json::Value) -> Option<(&str, &str)> {
+    let session_ref = value.get("sessionRef")?;
+    let provider = session_ref.get("provider")?.as_str()?;
+    let session_id = session_ref.get("sessionId")?.as_str()?;
+    (!session_id.is_empty()).then_some((provider, session_id))
+}
+
+/// The terminal-side legacy-resume carve-out: `resumeSessionId` present but
+/// REDUNDANT — an exact echo of a well-formed `sessionRef` naming the same
+/// provider (== mode) and session id. The typed create path prefers the
+/// sessionRef, so the echo carries no restore identity of its own. Any
+/// other presence (no sessionRef, provider mismatch, contradicting ids,
+/// non-string value) keeps the ejh6 refusal.
+fn terminal_resume_ref_echo(value: &serde_json::Value) -> bool {
+    let Some(mode) = value.get("mode").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(resume_id) = value
+        .get("resumeSessionId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    match raw_session_ref_identity(value) {
+        Some((provider, session_id)) => provider == mode && session_id == resume_id,
+        None => false,
+    }
+}
+
+/// The freshAgent-side legacy-resume carve-out: peek whether a pending
+/// restart recovery reserves the SAME durable identity the typed admission
+/// fence (`acquire_session_admission` / `fresh_agent_attach_restart_locator`)
+/// would consult. Peek-only — no permit is acquired here; the typed fence
+/// re-checks under the session mutex and emits the SESSION_RESERVED reply.
+/// Identity rules mirror the typed fences exactly: create and claude-attach
+/// prefer a provider-matching sessionRef, then the string resumeSessionId;
+/// codex/opencode attach fences on the client `sessionId`.
+fn fresh_agent_resume_fence_pending(state: &WsState, value: &serde_json::Value) -> bool {
+    let Some(provider) = value.get("provider").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !matches!(provider, "claude" | "codex" | "opencode") {
+        return false;
+    }
+    let resume_id = value
+        .get("resumeSessionId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let session_id = match value.get("type").and_then(|t| t.as_str()) {
+        Some("freshAgent.create") => match raw_session_ref_identity(value) {
+            Some((p, session_id)) if p == provider => Some(session_id),
+            _ => resume_id,
+        },
+        Some("freshAgent.attach") => {
+            if provider == "claude" {
+                match raw_session_ref_identity(value) {
+                    Some((p, session_id)) if p == provider => Some(session_id),
+                    _ => resume_id,
+                }
+            } else {
+                value
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            }
+        }
+        _ => None,
+    };
+    let Some(session_id) = session_id else {
+        return false;
+    };
+    state
+        .restart
+        .session_recovery_pending_for(&crate::restart::RestartSessionKey::new(
+            provider, session_id,
+        ))
+}
+
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
 /// connection (only on an unrecoverable send failure).
 #[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, one call site.
@@ -729,6 +882,7 @@ async fn handle_client_text(
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
+    agent_restart_v1: bool,
     interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
     create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
     // Task 9: per-connection hoststats.refresh floor stamp (see run_loop).
@@ -790,10 +944,26 @@ async fn handle_client_text(
     // reject). The two INVALID_MESSAGE families (terminal.create,
     // codingcli.create) were armed in Task 6; Task 7 armed the freshAgent
     // families (create.failed envelope / attach event channel).
-    if let Some(resume_value) = value.get("resumeSessionId") {
-        let _ = resume_value; // presence is what matters; the value is never read
+    //
+    // Two restart-resumable-pane carve-outs (1d591b723) let the typed path
+    // answer instead of this guard:
+    //  1. terminal/codingcli ECHO: a `sessionRef` whose provider matches the
+    //     mode and whose sessionId equals a non-empty string
+    //     `resumeSessionId` makes the legacy field a redundant echo of the
+    //     authoritative sessionRef — the typed create prefers sessionRef
+    //     (`derive_launch_prep`), so the echo is inert and the create
+    //     proceeds (a CONTRADICTING pair is still refused: the legacy field
+    //     would be consulted as fallback identity).
+    //  2. freshAgent retirement-fence escape: when a pending restart
+    //     recovery reserves the durable identity the typed admission fence
+    //     consults, the reply must come from that fence as SESSION_RESERVED
+    //     (retryable), never as this non-retryable legacy refusal.
+    if value.get("resumeSessionId").is_some() {
+        // presence is what matters; the value is never read by the refusal
         match value.get("type").and_then(|t| t.as_str()) {
-            Some("terminal.create") | Some("codingcli.create") => {
+            Some("terminal.create") | Some("codingcli.create")
+                if !terminal_resume_ref_echo(&value) =>
+            {
                 let reply = ServerMessage::Error(ErrorMsg {
                     code: ErrorCode::InvalidMessage,
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
@@ -818,7 +988,7 @@ async fn handle_client_text(
             // `freshAgent.error` event channel keyed by sessionId — the same
             // shape claude.rs:265-282 broadcasts today. Built from the raw
             // frame: presence already proven by the guard condition.
-            Some("freshAgent.create") => {
+            Some("freshAgent.create") if !fresh_agent_resume_fence_pending(state, &value) => {
                 let reply = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
                     code: "FRESH_AGENT_CREATE_FAILED".to_string(),
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
@@ -831,7 +1001,7 @@ async fn handle_client_text(
                 });
                 return send(ws_tx, &reply).await;
             }
-            Some("freshAgent.attach") => {
+            Some("freshAgent.attach") if !fresh_agent_resume_fence_pending(state, &value) => {
                 let session_id = value
                     .get("sessionId")
                     .and_then(|s| s.as_str())
@@ -854,6 +1024,8 @@ async fn handle_client_text(
                         .and_then(|s| s.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    // Legacy-resume refusal: rejected before any runtime exists.
+                    runtime: None,
                 });
                 return send(ws_tx, &reply).await;
             }
@@ -1144,12 +1316,131 @@ async fn handle_client_text(
             handle_auto_resume_cancel(cancel, state);
             true
         }
+        ClientMessage::AgentRestart(request) => {
+            if !agent_restart_v1 {
+                tracing::warn!(
+                    request_id = %request.request_id,
+                    provider = %request.provider,
+                    session_id = %request.session_id,
+                    "agent.restart.rejected_unnegotiated"
+                );
+                return send(
+                    ws_tx,
+                    &state.restart.failure_frame_for(
+                        &request,
+                        &crate::restart::RestartFailure::new(
+                            AgentRestartFailureCode::CapabilityNotNegotiated,
+                            "agent restart was not negotiated for this connection",
+                            false,
+                        ),
+                    ),
+                )
+                .await;
+            }
+            // Bounded ingress (fix 6) BEFORE any spawn/lock: LB-03 says an
+            // arrival whose request id is already known (an in-flight
+            // registered transaction, a durable pending row, or a stored
+            // terminal result) is a correlated resend and bypasses admission
+            // entirely — `execute_with_events`'s replay/follower machinery
+            // answers it. Only DISTINCT new request ids consume the
+            // per-session/global/pending-row budget; overload is a typed
+            // failure echoing the request's runtime descriptor.
+            let admission = if state.restart.is_known_request(&request) {
+                None
+            } else {
+                match state.restart.try_admit_restart(&request) {
+                    Ok(guard) => Some(guard),
+                    Err(failure) => {
+                        tracing::warn!(
+                            request_id = %request.request_id,
+                            provider = %request.provider,
+                            session_id = %request.session_id,
+                            retryable = failure.retryable,
+                            reason = %failure.message,
+                            "agent.restart.rejected_overloaded"
+                        );
+                        return send(ws_tx, &state.restart.failure_frame_for(&request, &failure))
+                            .await;
+                    }
+                }
+            };
+            // Registered spawn (fix 1): the transaction is owned by the
+            // coordinator's JoinSet so graceful shutdown latches new work,
+            // joins the in-flight set before provider/terminal cleanup, and
+            // (during shutdown) emits the typed rejection through the SAME
+            // broadcast wiring below. The admission guard (when present) is
+            // held across the whole spawned task.
+            let broadcast_tx = Arc::clone(&state.broadcast_tx);
+            state
+                .restart
+                .spawn_registered(request, admission, move |message| {
+                    if let Ok(frame) = serde_json::to_string(message) {
+                        let _ = broadcast_tx.send(frame);
+                    }
+                })
+                .await;
+            true
+        }
         // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
         // shared provider state as a DETACHED task so the cold sidecar spawn + the live
         // turn never block this connection's select loop (which must keep fanning out
         // the broadcast bus so the provider `freshAgent.*` frames reach the client).
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
+            let provider_name = create.provider.map(|provider| match provider {
+                freshell_protocol::AgentProvider::Claude => "claude",
+                freshell_protocol::AgentProvider::Codex => "codex",
+                freshell_protocol::AgentProvider::Opencode => "opencode",
+                freshell_protocol::AgentProvider::Amplifier => "amplifier",
+            });
+            let durable_session_id = provider_name.and_then(|provider| {
+                create
+                    .session_ref
+                    .as_ref()
+                    .filter(|session_ref| session_ref.provider == provider)
+                    .map(|session_ref| session_ref.session_id.as_str())
+                    .filter(|session_id| !session_id.is_empty())
+                    .or_else(|| {
+                        create
+                            .resume_session_id
+                            .as_deref()
+                            .filter(|session_id| !session_id.is_empty())
+                    })
+                    .map(str::to_owned)
+            });
+            let restart_admission = if let (Some(provider), Some(session_id)) =
+                (provider_name, durable_session_id)
+            {
+                match state
+                    .restart
+                    .acquire_session_admission(provider, &session_id)
+                    .await
+                {
+                    Ok(admission) => Some(admission),
+                    Err(()) => {
+                        tracing::warn!(
+                            target: "freshell_ws::restart",
+                            request_id = %create.request_id,
+                            provider,
+                            session_id,
+                            "freshAgent.create.blocked_by_pending_restart_recovery"
+                        );
+                        return send(
+                            ws_tx,
+                            &ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                                code: "SESSION_RESERVED".to_string(),
+                                message: "Restart is still retiring the previous session runtime"
+                                    .to_string(),
+                                request_id: create.request_id,
+                                retryable: Some(true),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                None
+            };
             if state.fresh_codex.is_enabled() {
                 // D8 (restore-open-sessions-only): thread this connection's
                 // provenance (hello identity + the create's `tabId`) down the
@@ -1167,23 +1458,32 @@ async fn handle_client_text(
                     Some(freshell_protocol::AgentProvider::Codex) => {
                         let fresh_codex = state.fresh_codex.clone();
                         tokio::spawn(
-                            async move { fresh_codex.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _restart_admission = restart_admission;
+                                fresh_codex.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     Some(freshell_protocol::AgentProvider::Claude) => {
                         let fresh_claude = state.fresh_claude.clone();
                         tokio::spawn(
-                            async move { fresh_claude.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _restart_admission = restart_admission;
+                                fresh_claude.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     // Batch D PR-2: freshopencode joins the codex/claude WS create path.
                     Some(freshell_protocol::AgentProvider::Opencode) => {
                         let fresh_opencode = state.fresh_opencode.clone();
                         tokio::spawn(
-                            async move { fresh_opencode.handle_create(create, Some(provenance)).await }
-                                .instrument(tracing::Span::current()),
+                            async move {
+                                let _restart_admission = restart_admission;
+                                fresh_opencode.handle_create(create, Some(provenance)).await
+                            }
+                            .instrument(tracing::Span::current()),
                         );
                     }
                     _ => {}
@@ -1201,26 +1501,57 @@ async fn handle_client_text(
         // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
         // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
+            let restart_admission =
+                if let Some(locator) = fresh_agent_attach_restart_locator(&attach) {
+                    match state
+                        .restart
+                        .acquire_session_admission(&locator.provider, &locator.session_id)
+                        .await
+                    {
+                        Ok(admission) => Some(admission),
+                        Err(()) => {
+                            tracing::warn!(
+                                target: "freshell_ws::restart",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                client_session_id = %attach.session_id,
+                                "freshAgent.attach.blocked_by_pending_restart_recovery"
+                            );
+                            return send(ws_tx, &fresh_agent_attach_reserved_frame(&attach)).await;
+                        }
+                    }
+                } else {
+                    None
+                };
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(
-                        async move { fresh_codex.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _restart_admission = restart_admission;
+                            fresh_codex.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Claude => {
                     let fresh_claude = state.fresh_claude.clone();
                     tokio::spawn(
-                        async move { fresh_claude.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _restart_admission = restart_admission;
+                            fresh_claude.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
                     tokio::spawn(
-                        async move { fresh_opencode.handle_attach(attach).await }
-                            .instrument(tracing::Span::current()),
+                        async move {
+                            let _restart_admission = restart_admission;
+                            fresh_opencode.handle_attach(attach).await
+                        }
+                        .instrument(tracing::Span::current()),
                     );
                 }
                 _ => {}
@@ -1931,6 +2262,30 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
 
+/// Restart-resumable-pane merge reconciliation (1d591b723 × S5.e): a
+/// restore-class codex create carrying the LEGACY echo pair — a
+/// provider-matching `sessionRef` whose sessionId equals a non-empty
+/// `resumeSessionId` — is the restart/reconcile replay wire shape for a
+/// runtime the client previously launched PLAIN (the pre-managed-launch
+/// contract). Reproducing it must therefore follow the recorded plain CLI
+/// route (`codex --resume <id>`): no managed app-server plan is built for
+/// this shape regardless of the ambient `FRESHELL_CODEX_MANAGED_LAUNCH`
+/// default. Modern sessionRef-only restores keep the S5.e managed default
+/// (the reattach/queue-cap doors pin it); interactive creates are unaffected
+/// (restore is falsy there).
+fn codex_restore_replays_legacy_echo_route(create: &TerminalCreate, mode: &str) -> bool {
+    if mode != "codex" || create.restore != Some(true) {
+        return false;
+    }
+    let Some(session_ref) = create.session_ref.as_ref() else {
+        return false;
+    };
+    if session_ref.provider != mode || session_ref.session_id.is_empty() {
+        return false;
+    }
+    create.resume_session_id.as_deref() == Some(session_ref.session_id.as_str())
+}
+
 /// Freshell opencode TUI rebind plugin — the IO-layer half of the injection
 /// (`cli_launch.rs` consumes the result via
 /// `CliLaunchInputs::opencode_rebind_tui_config`, the `mcp_injection`
@@ -1974,6 +2329,13 @@ fn cli_provider_settings(
     if mode == "shell" || mode == "codex" {
         return (None, None, None);
     }
+    configured_provider_settings(state, mode)
+}
+
+fn configured_provider_settings(
+    state: &WsState,
+    mode: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
     let Some(p) = state.settings.coding_cli.providers.get(mode) else {
         return (None, None, None);
     };
@@ -2004,8 +2366,64 @@ impl PlanLaunchError {
     }
 }
 
+fn restart_cli_provider_settings(
+    mode: &str,
+    launch: &freshell_terminal::TerminalRestartLaunch,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if mode == "codex" {
+        return (None, None, None);
+    }
+    (
+        launch.permission_mode.clone(),
+        launch.model.clone(),
+        launch.sandbox.clone(),
+    )
+}
+
+fn restart_uses_managed_codex_launch(
+    mode: &str,
+    flag_value: Option<&str>,
+    restart_launch: Option<&freshell_terminal::TerminalRestartLaunch>,
+) -> bool {
+    if mode != "codex" {
+        return false;
+    }
+    restart_launch
+        .and_then(|launch| launch.codex_managed)
+        .unwrap_or_else(|| codex_create_uses_managed_launch(mode, flag_value))
+}
+
+fn capture_terminal_restart_launch(
+    mode: &str,
+    shell: Shell,
+    cli_settings: (Option<String>, Option<String>, Option<String>),
+    codex_plan: Option<&freshell_codex::launch_plan::CodexLaunchPlan>,
+) -> freshell_terminal::TerminalRestartLaunch {
+    if mode == "codex" {
+        return freshell_terminal::TerminalRestartLaunch {
+            shell,
+            permission_mode: codex_plan.and_then(|plan| plan.approval_policy.clone()),
+            model: codex_plan.and_then(|plan| plan.model.clone()),
+            sandbox: codex_plan
+                .and_then(|plan| plan.sandbox)
+                .map(|sandbox| sandbox.as_str().to_string()),
+            codex_managed: Some(codex_plan.is_some()),
+        };
+    }
+    let (permission_mode, model, sandbox) = cli_settings;
+    freshell_terminal::TerminalRestartLaunch {
+        shell,
+        permission_mode,
+        model,
+        sandbox,
+        codex_managed: None,
+    }
+}
+
 /// codex `--remote <wsUrl>` planning (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH`
-/// default ON since S5.e): plan the managed app-server launch
+/// default ON since S5.e): a normal create follows
+/// `FRESHELL_CODEX_MANAGED_LAUNCH`; a restart follows the route captured from
+/// the original runtime. When managed, plan the app-server launch
 /// (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
 /// initial budget); the codex provider settings route through the PLAN, not
 /// argv (the `ws:2464-2465` strip). Flag `"0"` opts out to the plain-CLI shape
@@ -2018,6 +2436,9 @@ impl PlanLaunchError {
 /// seam as `RespawnError::LaunchUnresolvable`. Restore-class callers thread
 /// their per-connection cancel watch; the WS interactive and auto-resume
 /// doors pass `None` (never-fired watch minted in the manager).
+/// Restart adds `+restart_launch`/`+replacement_ownership_id` — same idiom as
+/// the three other attributed functions in this file.
+#[allow(clippy::too_many_arguments)]
 async fn plan_codex_managed_launch(
     state: &WsState,
     mode: &str,
@@ -2025,14 +2446,24 @@ async fn plan_codex_managed_launch(
     resume_session_id: Option<&str>,
     class: freshell_codex::launch_lifecycle::LaunchClass,
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+    restart_launch: Option<&freshell_terminal::TerminalRestartLaunch>,
+    replacement_ownership_id: Option<&str>,
 ) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, PlanLaunchError> {
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    if !codex_create_uses_managed_launch(mode, managed_flag.as_deref()) {
+    if !restart_uses_managed_codex_launch(mode, managed_flag.as_deref(), restart_launch) {
         return Ok(None);
     }
     let codex_provider = state.settings.coding_cli.providers.get("codex");
     let provider_str = |key: &str| {
+        if let Some(launch) = restart_launch {
+            return match key {
+                "model" => launch.model.clone(),
+                "sandbox" => launch.sandbox.clone(),
+                "permissionMode" => launch.permission_mode.clone(),
+                _ => None,
+            };
+        }
         codex_provider
             .and_then(|p| p.get(key))
             .and_then(|v| v.as_str())
@@ -2050,25 +2481,39 @@ async fn plan_codex_managed_launch(
         approval_policy: plan_approval.as_deref(),
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
-    let result = match cancel {
-        Some(cancel_rx) => {
-            manager
-                .plan_create_with_retry(
-                    &input,
-                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
-                    class,
-                    cancel_rx,
-                )
-                .await
-        }
-        None => {
-            manager
-                .plan_create_with_retry_uncancellable(
-                    &input,
-                    freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
-                    class,
-                )
-                .await
+    let result = if let Some(ownership_id) = replacement_ownership_id {
+        // Restart-transaction door: the replacement spawn is stamped with the
+        // restart transaction's ownership id so recovery can fence the
+        // hand-off. The fenced lane owns its budget discipline internally;
+        // restart recovery (not a per-connection cancel watch) bounds it.
+        manager
+            .plan_create_with_retry_fenced(
+                &input,
+                freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                Some(ownership_id),
+            )
+            .await
+    } else {
+        match cancel {
+            Some(cancel_rx) => {
+                manager
+                    .plan_create_with_retry(
+                        &input,
+                        freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                        class,
+                        cancel_rx,
+                    )
+                    .await
+            }
+            None => {
+                manager
+                    .plan_create_with_retry_uncancellable(
+                        &input,
+                        freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                        class,
+                    )
+                    .await
+            }
         }
     };
     result.map(Some).map_err(|error| match error {
@@ -2093,31 +2538,71 @@ impl Drop for KeyedCreateGuard {
     }
 }
 
-/// The sessionRef a create claims at spawn time (council rule 7, D8), when
-/// resolvable from the create BODY alone: a non-shell mode whose session id
-/// comes from `sessionRef` (provider must match the mode — the same filter
-/// as the resume derivation in `handle_create`) or the legacy
-/// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
-/// the P0.4 restore ladder) are freshly minted or single-source and carry no
-/// concurrent-duplicate shape, so they claim nothing.
-fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
+/// Resolve the ONE effective terminal resume identity before any dedupe,
+/// lease, restart-admission, launch planning, or spawn work begins.
+///
+/// This includes Claude's durable restore ladder. Keeping the resolution at
+/// the admission boundary prevents a request with no client-supplied
+/// `sessionRef` from bypassing a pending restart fence and prevents later
+/// stages from leasing a different identity than the one actually spawned.
+fn resolve_create_resume_identity(
+    state: &WsState,
+    create: &TerminalCreate,
+) -> Result<(LaunchIntent, Option<String>), String> {
     if create.mode == "shell" {
-        return None;
+        return Ok((LaunchIntent::Resume, None));
     }
-    let session_id = create
+
+    let requested_ref = create
         .session_ref
         .as_ref()
-        .filter(|r| r.provider == create.mode)
-        .map(|r| r.session_id.clone())
-        // ejh6: DEAD FROM THE WIRE — the raw pre-parse guard rejects any
-        // `resumeSessionId` carry before dispatch. Retained so the rung table
-        // stays total if this fn is ever fed an internally-built create.
+        .filter(|session_ref| session_ref.provider == create.mode);
+    let should_preallocate_fresh_claude = create.mode == "claude"
+        && create.restore != Some(true)
+        && create.session_ref.is_none()
+        && create
+            .resume_session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+            .is_none();
+    let should_preallocate_fresh_amplifier = create.mode == "amplifier"
+        && create.restore != Some(true)
+        && create.session_ref.is_none()
+        && create
+            .resume_session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+            .is_none();
+
+    if should_preallocate_fresh_claude {
+        return Ok((LaunchIntent::Start, Some(Uuid::new_v4().to_string())));
+    }
+    if should_preallocate_fresh_amplifier {
+        return Ok((LaunchIntent::Resume, Some(Uuid::new_v4().to_string())));
+    }
+
+    let mut resume_session_id = requested_ref
+        .map(|session_ref| session_ref.session_id.clone())
         .or_else(|| create.resume_session_id.clone())
-        .filter(|s| !s.is_empty())?;
-    Some(SessionLocator {
-        provider: create.mode.clone(),
-        session_id,
-    })
+        .filter(|session_id| !session_id.is_empty());
+
+    if create.mode == "claude" && create.restore == Some(true) {
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|session_id| !is_canonical_claude_session_id(session_id))
+        {
+            resume_session_id = None;
+        }
+        if resume_session_id.is_none() {
+            resume_session_id = resolve_claude_restore_session_id(state, &create.request_id);
+        }
+        if resume_session_id.is_none() {
+            crate::invariants::error_claude_restore_unresolved(&create.request_id);
+            return Err("Restore requires a canonical session reference.".to_string());
+        }
+    }
+
+    Ok((LaunchIntent::Resume, resume_session_id))
 }
 
 /// RAII release of a D8 sessionRef lease claim
@@ -2230,6 +2715,12 @@ pub(crate) struct ExitHookDeps {
     /// -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
     /// rename cascade still resolves after this terminal's process has exited.
     pub identity: crate::identity::TerminalIdentityRegistry,
+    /// Fix 8 descriptor unpin: on EVERY exit path (natural or kill — the hook
+    /// fires once either way) the terminal identity retires, and its runtime
+    /// descriptor moves out of the pinned live store into the coordinator's
+    /// bounded retired history, so the live store pins only live runtimes
+    /// while late output/exit frames stay fenced.
+    pub restart: crate::restart::RestartCoordinator,
     /// P1.8 exit hygiene: the pending-marker delete rides the same hook.
     pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
     /// Restore-across-restart fix (opencode): disarm the locator, so an exited
@@ -2284,7 +2775,19 @@ pub(crate) fn build_pty_exit_hook(
         // handle to the manager's async teardown worker.
         freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .notify_terminal_exit(&terminal_id);
+        // A managed proxy close can make the TUI exit non-zero while the
+        // explicit restart transaction is still awaiting sidecar teardown.
+        // The manager's quarantine holds its ordinary-exit mutex until this
+        // registry marker is visible, so reading it after notification closes
+        // the race without classifying an unrelated natural crash.
+        let restart_retiring = deps.registry.is_restart_retiring(&terminal_id);
         deps.identity.retire(&terminal_id);
+        // Fix 8: the runtime identity behind this terminal id is finally gone
+        // (natural exit AND kill both funnel through this hook) — unpin its
+        // descriptor into the bounded retired history. Idempotent; a terminal
+        // the coordinator never observed is a no-op.
+        deps.restart
+            .unpin_descriptor(freshell_protocol::AgentRuntimeKind::Terminal, &terminal_id);
         // DEV-0008 closure (Task 18): retire the META record + broadcast the
         // removal on NATURAL exit (see ExitHookDeps::terminal_meta).
         if deps.terminal_meta.retire(&terminal_id, now_ms()) {
@@ -2350,7 +2853,7 @@ pub(crate) fn build_pty_exit_hook(
             }
         }
         // Lane D1: genuine natural exits only (kill removed the row → false).
-        if finished {
+        if finished && !restart_retiring {
             // Missing probe: i64::MAX is a deliberate "treat as healthy /
             // fresh attempt budget" sentinel (the healthy-lifetime check
             // reads it as a long-lived process), NOT "unknown".
@@ -2365,6 +2868,20 @@ pub(crate) fn build_pty_exit_hook(
                 create_request_id,
                 lifetime_ms,
             });
+        } else if finished {
+            // The expected-exit suppression just fenced this terminal's one
+            // queued CrashEvent — consume the tombstone so it cannot linger
+            // for the process lifetime. Idempotent against the auto-resume
+            // consume sites (`resumable_session_ref` /
+            // `pre_respawn_guard`): whichever suppression point fires first
+            // owns the removal, and post-commit stale events are separately
+            // fenced by `session_owned_live`.
+            deps.registry.consume_restart_retiring(&terminal_id);
+            tracing::info!(
+                terminal_id = %terminal_id,
+                exit_code,
+                "terminal.restart_expected_exit"
+            );
         }
     })
 }
@@ -2682,8 +3199,13 @@ pub(crate) async fn prepare_launch(
     // functionally broken pane. So a `restore:true` codex create with no
     // sessionRef/resumeSessionId keeps today's EXACT on-permit inline
     // planning path (LaunchClass::Interactive inside handle_create),
-    // byte-identical to today.
-    let codex_launch = if prep.resume_session_id.is_some() {
+    // byte-identical to today. The legacy-echo replay shape
+    // (`codex_restore_replays_legacy_echo_route`) skips planning HERE so the
+    // inline arm below can tell "no plan by route" apart from "no plan
+    // because no resume id was derived".
+    let codex_launch = if prep.resume_session_id.is_some()
+        && !codex_restore_replays_legacy_echo_route(create, &mode)
+    {
         match plan_codex_managed_launch(
             state,
             &mode,
@@ -2691,6 +3213,8 @@ pub(crate) async fn prepare_launch(
             prep.resume_session_id.as_deref(),
             freshell_codex::launch_lifecycle::LaunchClass::Restore,
             Some(cancel),
+            None,
+            None,
         )
         .await
         {
@@ -2734,7 +3258,7 @@ pub(crate) async fn handle_create(
     // the TOP so `prepared_codex`'s Drop guard is alive across EVERY
     // pre-plan early return below (keyed-create adopt, D8 lease, rate
     // limit, unknown mode, claude ladder, D7 guard, opencode port).
-    let (prep, mut prepared_codex, prepared_resume_gate) = match prepared {
+    let (prep, prepared_codex, prepared_resume_gate) = match prepared {
         // p.codex_launch is None for non-codex modes AND for the A4
         // fresh-plan exclusion (no derived resume session id) — the None
         // arm of the plan site below then plans on-permit, byte-identical
@@ -2742,6 +3266,135 @@ pub(crate) async fn handle_create(
         Some(p) => (Some(p.prep), p.codex_launch, p.resume_gate),
         None => (None, None, None),
     };
+    handle_create_with_restart_launch(
+        create,
+        prep,
+        prepared_codex,
+        prepared_resume_gate,
+        out,
+        state,
+        conn_id,
+        pane_reconcile_v1,
+        create_limiter,
+        None,
+        None,
+        conn_identity,
+        asserted_at,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_create_with_restart_launch(
+    create: TerminalCreate,
+    prep: Option<LaunchPrep>,
+    mut prepared_codex: Option<PreparedCodexLaunch>,
+    prepared_resume_gate: Option<ResumeGateCarry>,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    state: &WsState,
+    conn_id: u64,
+    pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    restart_launch: Option<freshell_terminal::TerminalRestartLaunch>,
+    replacement_ownership_id: Option<String>,
+    // D8 provenance + receipt time of the create being (re)driven — conn-less
+    // doors (the restart coordinator's replacement) pass a default identity,
+    // and the hollow-stamps filter below treats it as "no attribution".
+    conn_identity: &ConnectionIdentity,
+    asserted_at: i64,
+) -> bool {
+    let mode = create.mode.clone();
+    // Admission-boundary identity for the restart fence (restart-resumable
+    // pane): the identity the restart admission gate consults BEFORE any
+    // dedupe/lease/plan work. The prepared restore door supplies the prep's
+    // FINAL gated id (the wire-resume gate may have demoted/healed it), plus
+    // a fence-only claude ladder peek when that id is absent — the ladder's
+    // own ASSIGNMENT stays at its A12/V6-pinned post-adopt position below;
+    // the unprepared doors (interactive WS create, the coordinator's
+    // replacement create) resolve here. `resolve_create_resume_identity`'s
+    // loud claude ladder Err arm can therefore only fire on the restart door
+    // (the only unprepared restore:true caller) — the WS restore door's
+    // ladder stays at its A12/V6-pinned post-adopt position below, and a WS
+    // interactive create (restore falsy) can never reject here.
+    let fence_resume_session_id = match &prep {
+        Some(p) => {
+            let mut id = p.resume_session_id.clone();
+            // FENCE-ONLY ladder peek (restart-resumable-pane merge fix): the
+            // prepared restore door's `derive_launch_prep` deliberately does
+            // NOT run the claude ledger ladder (V6 keeps the ladder at its
+            // post-adopt/post-lease position below), so its resume id can
+            // miss the ledger-resolved durable identity the restart fence
+            // must consult. The unprepared doors resolve the SAME identity
+            // via `resolve_create_resume_identity` (whose claude arm
+            // canonicalizes then ladders); reproduce exactly that identity
+            // here as a pure read — the ladder's own ASSIGNMENT stays at its
+            // V6 position below, untouched.
+            if mode == "claude" && create.restore == Some(true) {
+                if id
+                    .as_deref()
+                    .is_some_and(|session_id| !is_canonical_claude_session_id(session_id))
+                {
+                    id = None;
+                }
+                if id.is_none() {
+                    id = resolve_claude_restore_session_id(state, &create.request_id);
+                }
+            }
+            id
+        }
+        None => match resolve_create_resume_identity(state, &create) {
+            Ok((_launch_intent, resume_session_id)) => resume_session_id,
+            Err(message) => {
+                return send_create_error(
+                    out,
+                    ErrorCode::RestoreUnavailable,
+                    message,
+                    &create.request_id,
+                )
+                .await
+            }
+        },
+    };
+    let effective_session_locator =
+        fence_resume_session_id
+            .as_ref()
+            .map(|session_id| SessionLocator {
+                provider: mode.clone(),
+                session_id: session_id.clone(),
+            });
+    // A coordinator-owned replacement reaches this helper with
+    // `restart_launch` while `RestartCoordinator::execute` already holds the
+    // same session mutex. Re-acquiring here would self-deadlock. Every
+    // external create path has no restart launch and must acquire normally.
+    let _restart_admission = if restart_launch.is_some() {
+        None
+    } else if let Some(locator) = effective_session_locator.as_ref() {
+        match state
+            .restart
+            .acquire_session_admission(&locator.provider, &locator.session_id)
+            .await
+        {
+            Ok(admission) => Some(admission),
+            Err(()) => {
+                tracing::warn!(
+                    target: "freshell_ws::restart",
+                    request_id = %create.request_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    "terminal.create.blocked_by_pending_restart_recovery"
+                );
+                return send_session_reserved(
+                    out,
+                    &create.request_id,
+                    freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
     // a create whose `createRequestId` already has a live terminal ADOPTS it —
@@ -2774,7 +3427,7 @@ pub(crate) async fn handle_create(
                 // Clone before the struct literal moves `create.request_id`
                 // (same discipline as the main spawn path's dedupe locals).
                 let dedupe_request_id = create.request_id.clone();
-                let created = ServerMessage::TerminalCreated(TerminalCreated {
+                let mut created = ServerMessage::TerminalCreated(TerminalCreated {
                     created_at: now_ms(),
                     request_id: create.request_id,
                     terminal_id: existing.clone(),
@@ -2783,6 +3436,7 @@ pub(crate) async fn handle_create(
                     notice: None,
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
+                    runtime: None,
                 });
                 // An adoption IS a successful create for this requestId:
                 // settle the server-wide dedupe entry exactly like the main
@@ -2799,6 +3453,7 @@ pub(crate) async fn handle_create(
                     create.restore,
                     |tid| state.registry.is_pty_running(tid),
                 );
+                state.restart.observe_server_message(&mut created);
                 return out.send(&created).await;
             }
             if state.registry.begin_keyed_create(&create.request_id) {
@@ -2823,7 +3478,7 @@ pub(crate) async fn handle_create(
     // byte-for-byte unchanged (§11 fence).
     let mut session_ref_lease: Option<SessionRefLeaseGuard> = None;
     if pane_reconcile_v1 {
-        if let Some(locator) = create_session_locator(&create) {
+        if let Some(locator) = effective_session_locator.clone() {
             use freshell_terminal::registry::SessionRefClaim;
             // Bounded: at most one ExpiredNeedsKill kill→confirm→re-claim
             // round per create; a second expiry answers reserved instead.
@@ -2864,7 +3519,7 @@ pub(crate) async fn handle_create(
                         // `create.request_id` (same discipline as the main
                         // spawn path's dedupe locals).
                         let dedupe_request_id = create.request_id.clone();
-                        let created = ServerMessage::TerminalCreated(TerminalCreated {
+                        let mut created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
                             request_id: create.request_id,
                             terminal_id: terminal_id.clone(),
@@ -2876,6 +3531,7 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
+                            runtime: None,
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -2893,6 +3549,7 @@ pub(crate) async fn handle_create(
                             create.restore,
                             |tid| state.registry.is_pty_running(tid),
                         );
+                        state.restart.observe_server_message(&mut created);
                         return out.send(&created).await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
@@ -2950,9 +3607,12 @@ pub(crate) async fn handle_create(
 
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
-    let shell = map_shell(create.shell);
-    let mode = create.mode.clone();
-
+    let shell = map_shell(
+        restart_launch
+            .as_ref()
+            .map(|launch| launch.shell)
+            .unwrap_or(create.shell),
+    );
     // Reject modes that are neither 'shell' nor a registered coding CLI — the
     // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
     // message `tr:160-165`), surfaced as an `error` frame with the generic
@@ -3061,19 +3721,19 @@ pub(crate) async fn handle_create(
     // live-registry-row scan -- but MODE-GENERIC: codex/opencode/amplifier had
     // no live-guard on ANY path, so this closes their gap too.
     //
-    // The guard arms on [`create_session_locator`] -- the SAME wire-identity
-    // derivation the D8 lease claims on: the accepted `sessionRef` first,
-    // else the PROMOTED legacy `resumeSessionId` rung (`{provider: mode,
-    // sessionId}`, the reconcile door's §5.2 uniform promotion rule). The
-    // legacy rung was previously unguarded here -- the wire-resume gate's
-    // liveness precondition SKIPS live candidates rather than refusing them,
-    // so a legacy-only carrier double-spawned onto a live session (the
-    // 2026-08-16 duplicate-tab incident, REST twin in
+    // The guard arms on [`effective_session_locator`] -- the SAME
+    // wire-identity derivation the D8 lease claims on: the accepted
+    // `sessionRef` first, else the PROMOTED legacy `resumeSessionId` rung
+    // (`{provider: mode, sessionId}`, the reconcile door's §5.2 uniform
+    // promotion rule). The legacy rung was previously unguarded here -- the
+    // wire-resume gate's liveness precondition SKIPS live candidates rather
+    // than refusing them, so a legacy-only carrier double-spawned onto a
+    // live session (the 2026-08-16 duplicate-tab incident, REST twin in
     // freshell-freshagent/terminal_tabs.rs). The `resume_session_id`
-    // equality filter keeps later-resolved identities (fresh-claude/amplifier
-    // mints, gate-healed ids, ladder-resolved ids) outside the guard -- they
-    // are freshly minted or single-source and keep their existing guards.
-    let d7_locator = create_session_locator(&create)
+    // equality filter keeps later-resolved identities (gate-healed ids,
+    // ladder-resolved ids) outside the guard -- they are freshly minted or
+    // single-source and keep their existing guards.
+    let d7_locator = effective_session_locator
         .filter(|loc| resume_session_id.as_deref() == Some(loc.session_id.as_str()));
     if let Some(live_sid) = d7_locator.as_ref().map(|loc| loc.session_id.as_str()) {
         // #540 (ks38): the identity-owner + Running-row join is now the shared
@@ -3361,7 +4021,10 @@ pub(crate) async fn handle_create(
     // app-server plan instead). Boot-snapshot settings (same documented caveat
     // as `defaultCwd` above). Shared with the auto-resume respawn seam
     // (Task 4) via `cli_provider_settings`.
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, sandbox) = restart_launch
+        .as_ref()
+        .map(|launch| restart_cli_provider_settings(&mode, launch))
+        .unwrap_or_else(|| cli_provider_settings(state, &mode));
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -3398,6 +4061,18 @@ pub(crate) async fn handle_create(
         // (restore:true codex with no derived resume session id): both plan
         // on-permit inline, byte-identical to today.
         Some(guard) => guard.take(),
+        // The legacy-echo replay shape preps nothing (prepare_launch skips
+        // it) and plans nothing here either: the pane's recorded route is
+        // PLAIN, so it reproduces `codex --resume <id>` with no app-server
+        // plan. Coordinator-owned replacement creates also carry the echo
+        // pair but arrive WITH `restart_launch` — the recorded route wins
+        // there (`plan_codex_managed_launch` consults it first), so the
+        // guard below deliberately only binds restart_launch-less creates.
+        None if restart_launch.is_none()
+            && codex_restore_replays_legacy_echo_route(&create, &mode) =>
+        {
+            None
+        }
         None => match plan_codex_managed_launch(
             state,
             &mode,
@@ -3405,6 +4080,8 @@ pub(crate) async fn handle_create(
             resume_session_id.as_deref(),
             freshell_codex::launch_lifecycle::LaunchClass::Interactive,
             None,
+            restart_launch.as_ref(),
+            replacement_ownership_id.as_deref(),
         )
         .await
         {
@@ -3427,6 +4104,14 @@ pub(crate) async fn handle_create(
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
+    let restart_launch_to_stamp = restart_launch.clone().unwrap_or_else(|| {
+        capture_terminal_restart_launch(
+            &mode,
+            create.shell,
+            (permission_mode.clone(), model.clone(), sandbox.clone()),
+            codex_launch.as_ref().map(|launch| &launch.plan),
+        )
+    });
 
     // ProviderTarget + host-native mcp cwd (`tr:911-914,1153,1203,1236,1262`).
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
@@ -3505,12 +4190,18 @@ pub(crate) async fn handle_create(
     // FRESHELL_TERMINAL_ID/+TAB/PANE. U6 resolution: the Rust server's canonical
     // port/token plumbing IS `PORT`/`AUTH_TOKEN` (main.rs), so the reference's
     // env-derived computation carries over verbatim.
-    let overrides = build_terminal_base_env(
+    let mut overrides = build_terminal_base_env(
         &RealEnv,
         &terminal_id,
         create.tab_id.as_deref(),
         create.pane_id.as_deref(),
     );
+    if let Some(replacement_ownership_id) = replacement_ownership_id {
+        overrides.insert(
+            freshell_freshagent::RESTART_REPLACEMENT_OWNERSHIP_ENV.to_string(),
+            replacement_ownership_id,
+        );
+    }
 
     // (`effective_shell`/`windows_like` are hoisted above the amplifier
     // pre-create block so its windows-arm reject evaluates the same predicate
@@ -3560,6 +4251,7 @@ pub(crate) async fn handle_create(
         ExitHookDeps {
             registry: state.registry.clone(),
             identity: state.identity.clone(),
+            restart: state.restart.clone(),
             pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
@@ -3778,6 +4470,9 @@ pub(crate) async fn handle_create(
         return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
             .await;
     }
+    state
+        .registry
+        .set_restart_launch(&terminal_id, restart_launch_to_stamp);
 
     // D8: arm the lease's TTL kill path — record the just-spawned child's pid
     // on the winner's lease immediately (its presence decides ExpiredNeedsKill
@@ -4111,7 +4806,7 @@ pub(crate) async fn handle_create(
     let dedupe_terminal_id = terminal_id.clone();
     let dedupe_restore = create.restore;
 
-    let created = ServerMessage::TerminalCreated(TerminalCreated {
+    let mut created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
         terminal_id,
@@ -4125,7 +4820,9 @@ pub(crate) async fn handle_create(
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
+        runtime: None,
     });
+    state.restart.observe_server_message(&mut created);
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters BEFORE the origin reply —
     // both are non-blocking sink pushes, so ordering here is cosmetic.
@@ -4337,6 +5034,8 @@ pub async fn respawn_agent_terminal(
         resume_session_id.as_deref(),
         freshell_codex::launch_lifecycle::LaunchClass::Interactive,
         None,
+        None,
+        None,
     )
     .await
     {
@@ -4495,6 +5194,7 @@ pub async fn respawn_agent_terminal(
         ExitHookDeps {
             registry: state.registry.clone(),
             identity: state.identity.clone(),
+            restart: state.restart.clone(),
             pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
             opencode_locator: state.opencode_locator.clone(),
             codex_locator: state.codex_locator.clone(),
@@ -5027,12 +5727,70 @@ async fn handle_pane_reconcile(
             }
         };
     }
+    for (pane, verdict) in request.panes.iter().zip(&mut verdicts) {
+        if verdict.verdict == freshell_protocol::ReconcileVerdict::Invalid {
+            continue;
+        }
+        let kind = match pane.kind.as_deref() {
+            Some("terminal") => freshell_protocol::AgentRuntimeKind::Terminal,
+            Some("fresh-agent") if pane_reconcile_fresh_agent_v1 => {
+                freshell_protocol::AgentRuntimeKind::FreshAgent
+            }
+            _ => continue,
+        };
+        // The reconciler has already resolved lineage/supersession against
+        // server identity homes. Fence that authoritative answer first; only
+        // fall back to the client claim for verdicts that carry no ref.
+        let effective_session = verdict
+            .session_ref
+            .clone()
+            .or_else(|| pane.session_ref.clone())
+            .or_else(|| {
+                let provider = pane.mode.as_deref().filter(|mode| !mode.is_empty())?;
+                let session_id = pane
+                    .resume_session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())?;
+                Some(SessionLocator {
+                    provider: provider.to_string(),
+                    session_id: session_id.to_string(),
+                })
+            });
+        let Some(effective_session) = effective_session else {
+            continue;
+        };
+        let locator = crate::restart::RuntimeLocator::new(
+            kind,
+            &effective_session.provider,
+            &effective_session.session_id,
+        );
+        if !state.restart.retirement_pending_for(&locator) {
+            continue;
+        }
+        tracing::warn!(
+            target: "freshell_ws::restart",
+            reconcile_id = %request.reconcile_id,
+            pane_key = %pane.pane_key,
+            provider = %effective_session.provider,
+            session_id = %effective_session.session_id,
+            kind = ?kind,
+            "pane.reconcile.blocked_by_pending_restart_retirement"
+        );
+        verdict.verdict = freshell_protocol::ReconcileVerdict::Error;
+        verdict.terminal_id = None;
+        verdict.session_ref = Some(effective_session);
+        verdict.corrected = None;
+        verdict.reason = Some("restart_retirement_pending".to_string());
+        verdict.duplicate = None;
+        verdict.runtime = None;
+    }
     // A `dead_session` verdict parks the pane in the client's dead-sessions
     // dialog awaiting user adjudication — the loud, user-facing end of the
     // restore ladder. Log each one with the claimed identity so the
     // adjudication is reconstructable from server logs alone (previously a
     // dead verdict left no trace: derivation is pure, and the wire frame is
-    // only visible to the requesting client).
+    // only visible to the requesting client). Runs AFTER the restart-
+    // retirement rewrite above so it logs the verdict the client will see.
     for v in &verdicts {
         if matches!(v.verdict, freshell_protocol::ReconcileVerdict::DeadSession) {
             tracing::warn!(
@@ -5046,12 +5804,13 @@ async fn handle_pane_reconcile(
             );
         }
     }
-    let result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
+    let mut result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
         reconcile_id: request.reconcile_id,
         boot_id: state.boot_id.as_ref().clone(),
         server_instance_id: state.server_instance_id.as_ref().clone(),
         verdicts,
     });
+    state.restart.observe_server_message(&mut result);
     send(ws_tx, &result).await
 }
 
@@ -5590,6 +6349,8 @@ pub(crate) fn fresh_agent_control_refusal(message: &ClientMessage) -> Option<Ser
         provider: agent_provider_wire(provider).to_string(),
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
+        // Capability refusal: no runtime is involved in the refused op.
+        runtime: None,
     }))
 }
 
@@ -5617,6 +6378,9 @@ fn rollback_refusal_frame(
             "{wording} not supported for {}",
             session_type_wire(op.session_type)
         ),
+        // Capability refusal: nothing is dispatched, so no live runtime is
+        // involved in the refused op (error-frame convention: untagged).
+        None,
     )
 }
 
@@ -6221,6 +6985,143 @@ fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
         return true;
     }
     false
+}
+
+pub(crate) async fn shutdown_terminal_for_restart(
+    state: &WsState,
+    terminal_id: &str,
+) -> Result<bool, String> {
+    // Quarantine a managed Codex sidecar and classify the PTY's expected exit
+    // in one manager critical section BEFORE closing its proxy. Restart then
+    // awaits the stronger sidecar barrier before removing the PTY row.
+    let managed_codex = state
+        .registry
+        .probe(terminal_id)
+        .and_then(|row| row.restart_launch)
+        .and_then(|launch| launch.codex_managed)
+        == Some(true);
+    if managed_codex {
+        let registry = state.registry.clone();
+        let terminal_id_owned = terminal_id.to_string();
+        let managed_retired =
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .shutdown_terminal_for_restart_with_expected_exit(terminal_id, move || {
+                    registry
+                        .mark_restart_retiring(&terminal_id_owned)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            format!(
+                                "managed Codex terminal disappeared before restart quarantine: \
+                                 {terminal_id_owned}"
+                            )
+                        })
+                })
+                .await?;
+        if !managed_retired {
+            return Err(format!(
+                "managed Codex launch ownership was unavailable for terminal {terminal_id}"
+            ));
+        }
+    } else if !state.registry.mark_restart_retiring(terminal_id) {
+        return Ok(false);
+    }
+    Ok(kill_and_broadcast(state, terminal_id))
+}
+
+pub(crate) async fn create_terminal_replacement(
+    state: &WsState,
+    request: &freshell_protocol::AgentRestart,
+    cwd: Option<String>,
+    launch: freshell_terminal::TerminalRestartLaunch,
+    replacement_ownership_id: Option<String>,
+) -> Result<String, String> {
+    // A10-style defense-in-depth (fix 1): the restart coordinator refuses
+    // replacement creation once the shutdown latch is set, but a latch flipped
+    // between that check and this gated spawn must not insert a PTY the
+    // shutdown `kill_all` snapshot already passed. Mirror the restore door
+    // (create_gate.rs): check BEFORE acquiring the spawn-gate permit…
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("server is shutting down; terminal replacement refused".to_string());
+    }
+    let create = TerminalCreate {
+        request_id: format!(
+            "agent-restart:{}:{}",
+            request.request_id,
+            uuid::Uuid::new_v4()
+        ),
+        mode: request.provider.clone(),
+        shell: launch.shell,
+        codex_durability: None,
+        cwd,
+        live_terminal: None,
+        pane_id: None,
+        recovery_intent: None,
+        restore: Some(true),
+        resume_session_id: Some(request.session_id.clone()),
+        session_ref: Some(freshell_protocol::SessionLocator {
+            provider: request.provider.clone(),
+            session_id: request.session_id.clone(),
+        }),
+        tab_id: None,
+    };
+    let timeout = std::time::Duration::from_millis(state.create_protect.spawn_timeout_ms);
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let _permit = state
+        .spawn_gate
+        .acquire(timeout, &mut cancel_rx)
+        .await
+        .map_err(|error| {
+            let (_, message) = spawn_gate_error_parts(error);
+            message.to_string()
+        })?;
+    // …and again AFTER the permit, before `handle_create` inserts anything
+    // (the latch may have flipped while the permit wait was queued).
+    if state
+        .shutdown_started
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("server is shutting down; terminal replacement refused".to_string());
+    }
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink: freshell_terminal::FrameSink = std::sync::Arc::new(move |message| {
+        let _ = reply_tx.send(message);
+    });
+    let mut out = crate::create_gate::CreateOutput::Channel(&sink);
+    let mut limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
+    // Conn-less door: the restart coordinator's replacement carries no client
+    // connection — the hollow default provenance records no new attribution
+    // (the ledger merge preserves the prior row's stamps).
+    let conn_identity = ConnectionIdentity::default();
+    let _ = handle_create_with_restart_launch(
+        create,
+        None,
+        None,
+        None,
+        &mut out,
+        state,
+        u64::MAX,
+        true,
+        &mut limiter,
+        Some(launch),
+        replacement_ownership_id,
+        &conn_identity,
+        now_ms(),
+    )
+    .await;
+    while let Ok(message) = reply_rx.try_recv() {
+        match message {
+            ServerMessage::TerminalCreated(created) => return Ok(created.terminal_id),
+            ServerMessage::Error(error) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("terminal replacement ended without a terminal.created result".to_string())
 }
 
 /// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
@@ -7059,6 +7960,144 @@ mod cli_create_helper_tests {
     }
 
     #[test]
+    fn plain_codex_restart_snapshot_preserves_the_cli_settings_strip() {
+        let configured = (
+            Some("on-request".to_string()),
+            Some("gpt-5.3-codex".to_string()),
+            Some("workspace-write".to_string()),
+        );
+        let snapshot = capture_terminal_restart_launch("codex", Shell::System, configured, None);
+
+        assert_eq!(snapshot.codex_managed, Some(false));
+        assert_eq!(
+            (
+                snapshot.permission_mode.as_deref(),
+                snapshot.model.as_deref(),
+                snapshot.sandbox.as_deref(),
+            ),
+            (None, None, None),
+            "configured Codex settings are not CLI argv inputs"
+        );
+        assert_eq!(
+            restart_cli_provider_settings("codex", &snapshot),
+            (None, None, None)
+        );
+        assert!(
+            !restart_uses_managed_codex_launch("codex", Some("1"), Some(&snapshot)),
+            "restart follows the captured plain route, not changed boot settings"
+        );
+    }
+
+    #[test]
+    fn managed_codex_restart_snapshot_routes_settings_only_to_the_app_server_plan() {
+        let plan = freshell_codex::launch_plan::plan_codex_launch(
+            &freshell_codex::launch_plan::CodexLaunchPlanInput {
+                cwd: Some("/workspace"),
+                resume_session_id: Some("durable-codex"),
+                model: Some("gpt-5.3-codex"),
+                sandbox: Some("workspace-write"),
+                approval_policy: Some("on-request"),
+            },
+        )
+        .unwrap();
+        let snapshot = capture_terminal_restart_launch(
+            "codex",
+            Shell::System,
+            (None, None, None),
+            Some(&plan),
+        );
+
+        assert_eq!(snapshot.codex_managed, Some(true));
+        assert_eq!(snapshot.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(snapshot.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(snapshot.permission_mode.as_deref(), Some("on-request"));
+        assert_eq!(
+            restart_cli_provider_settings("codex", &snapshot),
+            (None, None, None),
+            "managed Codex settings must not conflict with --remote on TUI argv"
+        );
+        assert!(
+            restart_uses_managed_codex_launch("codex", None, Some(&snapshot)),
+            "restart follows the captured managed route after a boot"
+        );
+    }
+
+    #[test]
+    fn restart_expected_exit_suppresses_crash_event_but_unrelated_exit_still_reports() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "T-restarting".to_string(),
+            stream_id: "S-restarting".to_string(),
+            mode: "codex".to_string(),
+            create_request_id: Some("cr-restarting".to_string()),
+            ..Default::default()
+        });
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "T-unrelated".to_string(),
+            stream_id: "S-unrelated".to_string(),
+            mode: "claude".to_string(),
+            create_request_id: Some("cr-unrelated".to_string()),
+            ..Default::default()
+        });
+        assert!(registry.mark_restart_retiring("T-restarting"));
+        let (auto_resume_tx, mut auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let identity = crate::identity::TerminalIdentityRegistry::new();
+        let ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled());
+
+        let restarting_hook = build_pty_exit_hook(
+            ExitHookDeps {
+                registry: registry.clone(),
+                identity: identity.clone(),
+                restart: crate::restart::RestartCoordinator::new(),
+                pane_ledger: std::sync::Arc::clone(&ledger),
+                opencode_locator: None,
+                codex_locator: None,
+                auto_resume_tx: auto_resume_tx.clone(),
+                amplifier_stub_gc: None,
+                terminal_meta: Default::default(),
+                broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            },
+            "T-restarting".to_string(),
+            "codex".to_string(),
+            None,
+        );
+        restarting_hook(137);
+        assert!(
+            auto_resume_rx.try_recv().is_err(),
+            "a proxy-triggered expected exit during restart must not become a CrashEvent"
+        );
+        assert!(
+            !registry.is_restart_retiring("T-restarting"),
+            "the expected-exit suppression must consume the tombstone so it \
+             cannot linger for the process lifetime"
+        );
+
+        let unrelated_hook = build_pty_exit_hook(
+            ExitHookDeps {
+                registry,
+                identity,
+                restart: crate::restart::RestartCoordinator::new(),
+                pane_ledger: ledger,
+                opencode_locator: None,
+                codex_locator: None,
+                auto_resume_tx,
+                amplifier_stub_gc: None,
+                terminal_meta: Default::default(),
+                broadcast_tx: std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0),
+            },
+            "T-unrelated".to_string(),
+            "claude".to_string(),
+            None,
+        );
+        unrelated_hook(1);
+        let unrelated = auto_resume_rx
+            .try_recv()
+            .expect("an unrelated natural crash must still report");
+        assert_eq!(unrelated.terminal_id, "T-unrelated");
+        assert_eq!(unrelated.exit_code, 1);
+    }
+
+    #[test]
     fn wrap_terminal_spawn_error_enoent_variants() {
         let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(
@@ -7168,6 +8207,7 @@ mod terminals_changed_tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,
@@ -7407,6 +8447,7 @@ mod terminal_meta_created_tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,
@@ -8009,6 +9050,7 @@ mod pane_reconcile_gate_tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: None,
@@ -8041,6 +9083,7 @@ mod pane_reconcile_gate_tests {
             false,
             false, // pane_reconcile_v1: NOT negotiated on this connection
             false,
+            false, // agent_restart_v1: NOT negotiated on this connection
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -8062,6 +9105,7 @@ mod pane_reconcile_gate_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,
@@ -8109,6 +9153,7 @@ mod pane_reconcile_gate_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -8130,6 +9175,7 @@ mod pane_reconcile_gate_tests {
                 &state,
                 1,
                 &conn_sink,
+                false,
                 false,
                 false,
                 false,
@@ -8390,6 +9436,7 @@ mod host_stats_dispatch_tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            restart: crate::restart::RestartCoordinator::new(),
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: crate::identity::TerminalIdentityRegistry::new(),
@@ -8473,6 +9520,7 @@ mod host_stats_dispatch_tests {
                 false,
                 false,
                 false,
+                false,
                 &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
@@ -8504,6 +9552,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -8522,6 +9571,7 @@ mod host_stats_dispatch_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,
@@ -8567,6 +9617,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -8591,6 +9642,7 @@ mod host_stats_dispatch_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,
@@ -8636,6 +9688,7 @@ mod host_stats_dispatch_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,

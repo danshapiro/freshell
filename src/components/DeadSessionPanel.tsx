@@ -7,6 +7,7 @@ import {
   resolveDeadSessionEntry,
 } from '@/store/panesSlice'
 import { closePaneWithCleanup } from '@/store/tabsSlice'
+import { clearReconcileRuntime } from '@/store/freshAgentSlice'
 import type { DeadSessionEntry } from '@/store/paneTypes'
 import { OVERLAY_Z } from '@/components/ui/overlay'
 
@@ -31,6 +32,12 @@ export function DeadSessionPanel() {
     // pane kind: the terminal reducer no-ops on fresh-agent content (and
     // vice versa), which would silently wedge the row.
     if (entry.kind === 'fresh-agent') {
+      if (entry.sessionRef) {
+        dispatch(clearReconcileRuntime({
+          provider: entry.sessionRef.provider,
+          sessionIds: [entry.sessionRef.sessionId],
+        }))
+      }
       dispatch(resetFreshAgentPaneForReconcileCreate({ tabId: entry.tabId, paneId: entry.paneId, intent: 'fresh' }))
     } else {
       dispatch(resetPaneForReconcileCreate({ tabId: entry.tabId, paneId: entry.paneId, intent: 'fresh' }))

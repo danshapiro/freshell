@@ -5,6 +5,7 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import type { AgentRestartReplacedMessage, RuntimeDescriptor } from '@shared/ws-protocol'
 import type {
   FreshAgentContentBlock,
   FreshAgentPermissionRequest,
@@ -14,6 +15,7 @@ import type {
   FreshAgentState,
   PendingCreateFailure,
 } from './freshAgentTypes'
+import { restartFreshAgentCreate } from './panesSlice'
 
 type FreshAgentSessionPayload = {
   sessionId: string
@@ -29,6 +31,7 @@ type SessionMutationPayload = {
   sessionId: string
   sessionType?: FreshAgentSessionType
   provider?: FreshAgentRuntimeProvider
+  runtime?: RuntimeDescriptor
 }
 
 const initialState: FreshAgentState = {
@@ -36,6 +39,7 @@ const initialState: FreshAgentState = {
   pendingCreates: {},
   pendingCreateFailures: {},
   availableModels: [],
+  retiredRuntimeGenerations: {},
 }
 
 function sessionKey(locator: FreshAgentSessionPayload): string {
@@ -46,15 +50,41 @@ function resolveSessionKey(
   state: FreshAgentState,
   payload: SessionMutationPayload,
 ): string | undefined {
+  if (
+    payload.runtime
+    && (state.retiredRuntimeGenerations?.[payload.runtime.runtimeId] ?? -1) >= payload.runtime.generation
+  ) {
+    return undefined
+  }
+  let key: string | undefined
   if (payload.sessionType && payload.provider) {
-    return sessionKey({
+    key = sessionKey({
       sessionId: payload.sessionId,
       sessionType: payload.sessionType,
       provider: payload.provider,
     })
+  } else {
+    key = Object.values(state.sessions).find((session) => session.sessionId === payload.sessionId)?.sessionKey
   }
 
-  return Object.values(state.sessions).find((session) => session.sessionId === payload.sessionId)?.sessionKey
+  const session = key ? state.sessions[key] : undefined
+  if (!session) return key
+  // Once a session has a live runtime fence, an untagged frame is no more
+  // trustworthy than one from a different runtime. This also protects direct
+  // reducer callers outside the WebSocket transport boundary.
+  if (!payload.runtime) return session.runtimeGeneration === undefined ? key : undefined
+  if (session.runtimeGeneration === undefined) {
+    session.runtimeId = payload.runtime.runtimeId
+    session.runtimeGeneration = payload.runtime.generation
+    return key
+  }
+  if (
+    session.runtimeId !== payload.runtime.runtimeId
+    || session.runtimeGeneration !== payload.runtime.generation
+  ) {
+    return undefined
+  }
+  return key
 }
 
 function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSessionStatus): FreshAgentSessionState {
@@ -99,14 +129,33 @@ function resolveOrEnsureSession(
   payload: SessionMutationPayload,
   status: FreshAgentSessionStatus = 'starting',
 ): FreshAgentSessionState | undefined {
+  if (
+    payload.runtime
+    && (state.retiredRuntimeGenerations?.[payload.runtime.runtimeId] ?? -1) >= payload.runtime.generation
+  ) {
+    return undefined
+  }
   const key = resolveSessionKey(state, payload)
   if (key && state.sessions[key]) return state.sessions[key]
+  if (key === undefined && Object.values(state.sessions).some((session) => (
+    session.sessionId === payload.sessionId
+    && (!payload.sessionType || session.sessionType === payload.sessionType)
+    && (!payload.provider || session.provider === payload.provider)
+  ))) {
+    // A matching session exists, but its runtime fence rejected this event.
+    return undefined
+  }
   if (!payload.sessionType || !payload.provider) return undefined
-  return ensureSession(state, {
+  const session = ensureSession(state, {
     sessionId: payload.sessionId,
     sessionType: payload.sessionType,
     provider: payload.provider,
   }, status)
+  if (payload.runtime) {
+    session.runtimeId = payload.runtime.runtimeId
+    session.runtimeGeneration = payload.runtime.generation
+  }
+  return session
 }
 
 function resetHydratedHistoryState(session: FreshAgentSessionState): void {
@@ -121,6 +170,22 @@ function resetHydratedHistoryState(session: FreshAgentSessionState): void {
   session.restoreFailureMessage = undefined
   session.streamingText = ''
   session.streamingActive = false
+}
+
+function resetRuntimeEphemeralState(
+  session: FreshAgentSessionState,
+  status: FreshAgentSessionStatus,
+): void {
+  session.snapshot = undefined
+  session.latestTurnId = undefined
+  session.streamingText = ''
+  session.streamingActive = false
+  session.pendingPermissions = {}
+  session.pendingQuestions = {}
+  session.lastError = undefined
+  session.lastErrorCode = undefined
+  session.lost = false
+  writeSessionStatus(session, status)
 }
 
 function requestRestoreHydrationRestart(session: FreshAgentSessionState): void {
@@ -170,6 +235,113 @@ const freshAgentSlice = createSlice({
   name: 'freshAgent',
   initialState,
   reducers: {
+    adoptReconcileRuntime(state, action: PayloadAction<{
+      provider: string
+      sessionIds: string[]
+      runtime: RuntimeDescriptor
+      allowServerTransition?: boolean
+    }>) {
+      const { provider, runtime, allowServerTransition } = action.payload
+      if (
+        (state.retiredRuntimeGenerations?.[runtime.runtimeId] ?? -1)
+        >= runtime.generation
+      ) {
+        return
+      }
+      const sessionIds = new Set(action.payload.sessionIds.filter(Boolean))
+      for (const session of Object.values(state.sessions)) {
+        if (session.provider !== provider || !sessionIds.has(session.sessionId)) continue
+        const currentGeneration = session.runtimeGeneration
+        if (currentGeneration !== undefined) {
+          const sameRuntime = session.runtimeId === runtime.runtimeId
+          if (sameRuntime && runtime.generation === currentGeneration) {
+            continue
+          }
+          if (sameRuntime ? runtime.generation < currentGeneration : (
+            !allowServerTransition && runtime.generation <= currentGeneration
+          )) {
+            continue
+          }
+          if (session.runtimeId) {
+            state.retiredRuntimeGenerations ??= {}
+            state.retiredRuntimeGenerations[session.runtimeId] = Math.max(
+              state.retiredRuntimeGenerations[session.runtimeId] ?? -1,
+              currentGeneration,
+            )
+          }
+        }
+        session.runtimeId = runtime.runtimeId
+        session.runtimeGeneration = runtime.generation
+        resetRuntimeEphemeralState(session, 'starting')
+      }
+    },
+
+    clearReconcileRuntime(state, action: PayloadAction<{
+      provider: string
+      sessionIds: string[]
+    }>) {
+      const sessionIds = new Set(action.payload.sessionIds.filter(Boolean))
+      state.retiredRuntimeGenerations ??= {}
+      for (const session of Object.values(state.sessions)) {
+        if (session.provider !== action.payload.provider || !sessionIds.has(session.sessionId)) continue
+        if (session.runtimeId && session.runtimeGeneration !== undefined) {
+          state.retiredRuntimeGenerations[session.runtimeId] = Math.max(
+            state.retiredRuntimeGenerations[session.runtimeId] ?? -1,
+            session.runtimeGeneration,
+          )
+        }
+        session.runtimeId = undefined
+        session.runtimeGeneration = undefined
+        resetRuntimeEphemeralState(session, 'starting')
+      }
+    },
+
+    applyAgentRestartReplaced(state, action: PayloadAction<AgentRestartReplacedMessage>) {
+      const replacement = action.payload
+      if (replacement.kind !== 'fresh-agent') return
+      state.retiredRuntimeGenerations ??= {}
+      state.retiredRuntimeGenerations[replacement.oldRuntimeId] = Math.max(
+        state.retiredRuntimeGenerations[replacement.oldRuntimeId] ?? -1,
+        replacement.oldGeneration,
+      )
+      for (const [oldKey, session] of Object.entries(state.sessions)) {
+        if (session.provider !== replacement.provider) continue
+        if (replacement.generation <= replacement.oldGeneration) continue
+        // Do not let an old broadcast repoint legacy session state. Durable
+        // sessionId is deliberately not a transport/runtime identifier.
+        if (session.runtimeId !== replacement.oldRuntimeId) continue
+        if (session.runtimeGeneration !== replacement.oldGeneration) continue
+
+        session.runtimeGeneration = replacement.generation
+        session.runtimeId = replacement.runtimeId
+        const previousSessionId = session.sessionId
+        // The replacement runtime is only a transport-generation fence. The
+        // provider session named by the server remains the durable route for
+        // history, mutations, and future attaches.
+        const nextLocator = {
+          sessionId: replacement.sessionId,
+          sessionType: session.sessionType,
+          provider: session.provider,
+        }
+        const nextKey = sessionKey(nextLocator)
+        session.sessionId = replacement.sessionId
+        session.sessionKey = nextKey
+        session.threadId = replacement.sessionId
+        resetRuntimeEphemeralState(session, 'starting')
+        if (nextKey !== oldKey) {
+          state.sessions[nextKey] = session
+          delete state.sessions[oldKey]
+        }
+        for (const pending of Object.values(state.pendingCreates)) {
+          if (pending.sessionId !== previousSessionId && pending.sessionKey !== oldKey) continue
+          pending.sessionId = replacement.sessionId
+          pending.sessionKey = nextKey
+          pending.sessionType = session.sessionType
+          pending.provider = session.provider
+        }
+      }
+    },
+
     registerPendingCreate(state, action: PayloadAction<{
       requestId: string
       expectsHistoryHydration: boolean
@@ -197,6 +369,7 @@ const freshAgentSlice = createSlice({
       sessionId: string
       sessionType?: FreshAgentSessionType
       provider?: FreshAgentRuntimeProvider
+      runtime?: RuntimeDescriptor
     }>) {
       const pending = state.pendingCreates[action.payload.requestId]
       const sessionType = action.payload.sessionType ?? pending?.sessionType
@@ -206,8 +379,35 @@ const freshAgentSlice = createSlice({
       const locator = { sessionId: action.payload.sessionId, sessionType, provider }
       const key = sessionKey(locator)
       const expectsHistoryHydration = pending?.expectsHistoryHydration ?? false
+      if (
+        action.payload.runtime
+        && (state.retiredRuntimeGenerations?.[action.payload.runtime.runtimeId] ?? -1)
+        >= action.payload.runtime.generation
+      ) {
+        return
+      }
       const session = ensureSession(state, locator, 'connected')
-      if (session.status === 'starting' || session.status === 'creating') {
+      let establishedRuntime = false
+      if (action.payload.runtime) {
+        if (
+          session.runtimeGeneration !== undefined
+          && (
+            session.runtimeId !== action.payload.runtime.runtimeId
+            || session.runtimeGeneration > action.payload.runtime.generation
+          )
+        ) {
+          return
+        }
+        establishedRuntime = (
+          session.runtimeId !== action.payload.runtime.runtimeId
+          || session.runtimeGeneration !== action.payload.runtime.generation
+        )
+        session.runtimeId = action.payload.runtime.runtimeId
+        session.runtimeGeneration = action.payload.runtime.generation
+      }
+      if (establishedRuntime) {
+        resetRuntimeEphemeralState(session, 'connected')
+      } else if (session.status === 'starting' || session.status === 'creating') {
         writeSessionStatus(session, 'connected')
       } else {
         writeSessionStatus(session, session.status)
@@ -360,13 +560,36 @@ const freshAgentSlice = createSlice({
       }
     },
 
-    freshAgentSnapshotReceived(state, action: PayloadAction<{ snapshot: FreshAgentSnapshot }>) {
+    freshAgentSnapshotReceived(state, action: PayloadAction<{
+      snapshot: FreshAgentSnapshot
+      runtime?: RuntimeDescriptor
+    }>) {
       const snapshot = action.payload.snapshot
+      if (
+        action.payload.runtime
+        && (state.retiredRuntimeGenerations?.[action.payload.runtime.runtimeId] ?? -1)
+        >= action.payload.runtime.generation
+      ) {
+        return
+      }
       const session = ensureSession(state, {
         sessionId: snapshot.threadId,
         sessionType: snapshot.sessionType,
         provider: snapshot.provider,
       }, snapshot.status as FreshAgentSessionStatus)
+      if (action.payload.runtime) {
+        if (
+          session.runtimeGeneration !== undefined
+          && (
+            session.runtimeId !== action.payload.runtime.runtimeId
+            || session.runtimeGeneration !== action.payload.runtime.generation
+          )
+        ) {
+          return
+        }
+        session.runtimeId = action.payload.runtime.runtimeId
+        session.runtimeGeneration = action.payload.runtime.generation
+      }
       // Truth-bearing frame: a snapshot answer proves the session exists —
       // revoke a stale `lost` flag from a transient dead-window race
       // (reconnect unwedge). This reducer is currently production-dormant (no
@@ -619,9 +842,40 @@ const freshAgentSlice = createSlice({
       writeSessionStatus(state.sessions[key], 'exited')
     },
   },
+  extraReducers: (builder) => {
+    builder.addCase(
+      restartFreshAgentCreate,
+      (state, action) => {
+        if (!action.payload.provider || !action.payload.sessionType) return
+        const sessionIds = new Set(action.payload.sessionIds?.filter(Boolean) ?? [])
+        if (sessionIds.size === 0) return
+        state.retiredRuntimeGenerations ??= {}
+        for (const session of Object.values(state.sessions)) {
+          if (
+            session.provider !== action.payload.provider
+            || session.sessionType !== action.payload.sessionType
+            || !sessionIds.has(session.sessionId)
+          ) {
+            continue
+          }
+          if (session.runtimeId && session.runtimeGeneration !== undefined) {
+            state.retiredRuntimeGenerations[session.runtimeId] = Math.max(
+              state.retiredRuntimeGenerations[session.runtimeId] ?? -1,
+              session.runtimeGeneration,
+            )
+          }
+          session.runtimeId = undefined
+          session.runtimeGeneration = undefined
+          resetRuntimeEphemeralState(session, 'starting')
+        }
+      },
+    )
+  },
 })
 
 export const {
+  adoptReconcileRuntime,
+  applyAgentRestartReplaced,
   addAssistantMessage,
   addPermissionRequest,
   addQuestionRequest,
@@ -630,6 +884,7 @@ export const {
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
+  clearReconcileRuntime,
   clearSessionLost,
   clearStreaming,
   createFailed,

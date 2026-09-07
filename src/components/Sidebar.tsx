@@ -461,11 +461,14 @@ export default function Sidebar({
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
+    const sessionLocator = { provider, sessionId: item.sessionId }
 
-    // 1. Dedup: if session is already open in a pane, focus it
+    // Normal selection is the focus-existing path. Context menus suppress
+    // duplicate-open commands, while a primary selection always brings the
+    // matching pane forward instead of silently doing nothing.
     const existing = findPaneForSession(
       state,
-      { provider, sessionId: item.sessionId },
+      sessionLocator,
       localServerInstanceId,
     )
     if (existing) {

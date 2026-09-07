@@ -94,27 +94,53 @@ impl FreshCodexState {
             .or_default()
             .clone()
     }
-    fn control_event(&self, session_id: &str, event: Value) {
+    fn control_event(
+        &self,
+        session_id: &str,
+        runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+        event: Value,
+    ) {
         self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
             provider: PROVIDER.into(),
             session_type: SESSION_TYPE.into(),
             session_id: session_id.into(),
             event,
+            runtime: runtime.cloned(),
         }));
     }
 
-    fn cancelled_control(&self, session_id: &str, request: &PendingRequest) {
-        self.control_event(session_id, json!({
+    fn cancelled_control(
+        &self,
+        session_id: &str,
+        runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+        request: &PendingRequest,
+    ) {
+        self.control_event(session_id, runtime, json!({
             "type": if request.question { "freshAgent.question.cancelled" } else { "freshAgent.permission.cancelled" },
             "sessionId": session_id, "requestId": request_key(&request.id),
         }));
     }
 
+    /// The session's live runtime descriptor for control-frame stamping
+    /// (z06a: a fenced session's untagged frames are refused client-side, so
+    /// every control event carries the descriptor while a session exists).
+    async fn control_runtime(
+        &self,
+        session_id: &str,
+    ) -> Option<freshell_protocol::RuntimeDescriptor> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .map(|s| s.runtime.clone())
+    }
+
     pub(super) async fn clear_controls(&self, session_id: &str) {
         let controls = self.session_controls(session_id).await;
         let mut pending = controls.lock().await;
+        let runtime = self.control_runtime(session_id).await;
         for request in pending.requests.drain(..) {
-            self.cancelled_control(session_id, &request);
+            self.cancelled_control(session_id, runtime.as_ref(), &request);
         }
     }
 
@@ -144,12 +170,14 @@ impl FreshCodexState {
     ) -> bool {
         match notification {
             CodexNotification::ServerRequest { id, method, params } => {
-                let client = self
-                    .sessions
-                    .lock()
-                    .await
-                    .get(session_id)
-                    .map(|s| s.client.clone());
+                let (client, runtime) = {
+                    let sessions = self.sessions.lock().await;
+                    let session = sessions.get(session_id);
+                    (
+                        session.map(|s| s.client.clone()),
+                        session.map(|s| s.runtime.clone()),
+                    )
+                };
                 if params.get("threadId").and_then(Value::as_str) != Some(session_id) {
                     if let Some(client) = client {
                         let _ = client
@@ -187,14 +215,14 @@ impl FreshCodexState {
                     json!({ "type": "freshAgent.permission.request", "sessionId": session_id, "requestId": request_key(id), "tool": { "name": request.public["toolName"], "input": request.public["input"] } })
                 };
                 pending.requests.push(request);
-                self.control_event(session_id, event);
+                self.control_event(session_id, runtime.as_ref(), event);
                 if was_empty {
                     let at = freshell_codex::next_monotonic_turn_complete_at(
                         pending.last_waiting_at,
                         now_ms(),
                     );
                     pending.last_waiting_at = Some(at);
-                    self.control_event(session_id, json!({ "type": "freshAgent.turn.waiting", "sessionId": session_id, "at": at }));
+                    self.control_event(session_id, runtime.as_ref(), json!({ "type": "freshAgent.turn.waiting", "sessionId": session_id, "at": at }));
                 }
                 tracing::info!(
                     provider = PROVIDER,
@@ -207,12 +235,13 @@ impl FreshCodexState {
             CodexNotification::Other { method, params } if method == "serverRequest/resolved" => {
                 if let Some(params) = params {
                     if params.get("threadId").and_then(Value::as_str) == Some(session_id) {
+                        let runtime = self.control_runtime(session_id).await;
                         let controls = self.session_controls(session_id).await;
                         let mut pending = controls.lock().await;
                         let id = params.get("requestId");
                         pending.requests.retain(|request| {
                             if id == Some(&request.id.to_json()) {
-                                self.cancelled_control(session_id, request);
+                                self.cancelled_control(session_id, runtime.as_ref(), request);
                                 false
                             } else {
                                 true
@@ -223,13 +252,14 @@ impl FreshCodexState {
                 true
             }
             CodexNotification::TurnCompleted(event) if event.thread_id == session_id => {
+                let runtime = self.control_runtime(session_id).await;
                 let controls = self.session_controls(session_id).await;
                 let mut pending = controls.lock().await;
                 pending.requests.retain(|request| {
                     if event.turn_id.as_deref().is_none_or(|id| {
                         request.params.get("turnId").and_then(Value::as_str) == Some(id)
                     }) {
-                        self.cancelled_control(session_id, request);
+                        self.cancelled_control(session_id, runtime.as_ref(), request);
                         false
                     } else {
                         true
@@ -344,7 +374,8 @@ impl FreshCodexState {
             return;
         }
         let request = pending.requests.remove(index);
-        self.cancelled_control(session_id, &request);
+        let runtime = self.control_runtime(session_id).await;
+        self.cancelled_control(session_id, runtime.as_ref(), &request);
         tracing::info!(
             provider = PROVIDER,
             session_id,

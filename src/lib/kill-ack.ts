@@ -504,6 +504,10 @@ export interface FreshAgentKillRequest {
   sessionId: string
   sessionType: string
   provider: string
+  /** Restart fence: only close when the server still runs exactly this
+   * runtime generation — a stale client must not close a newer restarted one. */
+  expectedRuntimeId?: string
+  expectedGeneration?: number
   cwd?: string
 }
 
@@ -525,6 +529,8 @@ export function sendFreshAgentKillAndAwait(
     sessionId: req.sessionId,
     sessionType: req.sessionType,
     provider: req.provider,
+    ...(req.expectedRuntimeId ? { expectedRuntimeId: req.expectedRuntimeId } : {}),
+    ...(req.expectedGeneration !== undefined ? { expectedGeneration: req.expectedGeneration } : {}),
     ...(req.cwd ? { cwd: req.cwd } : {}),
   })
   return awaitCloseFrame((msg) => {

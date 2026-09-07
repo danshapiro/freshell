@@ -21,6 +21,7 @@ const wsMocks = {
   onMessage: vi.fn(() => vi.fn()),
   onReconnect: vi.fn(() => vi.fn()),
   setHelloExtensionProvider: vi.fn(),
+  getServerCapabilities: vi.fn(() => ({ agentRestartV1: true })),
 }
 
 vi.mock('@/lib/ws-client', () => ({

@@ -56,6 +56,7 @@ const wsMocks = vi.hoisted(() => {
     }),
     onReconnect: vi.fn().mockReturnValue(() => {}),
     setHelloExtensionProvider: vi.fn(),
+    getServerCapabilities: vi.fn(() => ({ agentRestartV1: true })),
   }
 })
 
@@ -1587,6 +1588,20 @@ describe('ContextMenuProvider', () => {
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {
     const user = userEvent.setup()
     const store = createStoreWithOverlappingSessionWindows()
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        terminalId: 'term-1',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      },
+    }))
     render(
       <Provider store={store}>
         <ContextMenuProvider
@@ -1610,11 +1625,8 @@ describe('ContextMenuProvider', () => {
     await user.click(await screen.findByRole('button', { name: 'Open tabs' }))
 
     const openedTabs = store.getState().tabs.tabs.filter((tab) => tab.id !== 'tab-1')
-    expect(openedTabs).toHaveLength(2)
-    expect(openedTabs.map((tab) => tab.title)).toEqual([
-      'History Terminal Session',
-      'History Extra Session',
-    ])
+    expect(openedTabs).toHaveLength(1)
+    expect(openedTabs[0].title).toBe('History Extra Session')
   })
 
   it('copies resume command from sidebar session context menu', async () => {

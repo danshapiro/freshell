@@ -84,7 +84,10 @@ beforeAll(async () => {
 afterAll(() => {
   server?.kill('SIGTERM')
   server = undefined
-  fs.rmSync(scratch, { recursive: true, force: true })
+  // The fixture's SIGTERM'd child may still be holding scratch files closed
+  // asynchronously (windows/libuv driver order) — retry the removal instead
+  // of an immediate ENOTEMPTY/EPERM flake.
+  fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
 })
 
 describe('fake-opencode fixture fork sequence parity (ep3-r1 F3)', () => {

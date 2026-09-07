@@ -46,6 +46,7 @@ fn output(seq: i64) -> ServerMessage {
         seq_end: seq,
         data: format!("data-{seq}"),
         source: None,
+        runtime: None,
     })
 }
 fn notice(text: &str) -> Message {
@@ -156,6 +157,7 @@ async fn preludes_always_precede_replay_and_exit_follows_output() {
         freshell_protocol::TerminalExit {
             terminal_id: "term".into(),
             exit_code: 0,
+            runtime: None,
         },
     ));
     // Drive the exact queue selection used by the pump; no timing assumptions.
@@ -412,6 +414,7 @@ async fn superseding_attach_discards_old_queued_output_and_old_exit() {
         freshell_protocol::TerminalExit {
             terminal_id: "term".into(),
             exit_code: 0,
+            runtime: None,
         },
     ));
     let ready: ServerMessage = serde_json::from_value(serde_json::json!({
@@ -429,6 +432,7 @@ async fn superseding_attach_discards_old_queued_output_and_old_exit() {
         freshell_protocol::TerminalExit {
             terminal_id: "term".into(),
             exit_code: 0,
+            runtime: None,
         },
     ));
     let mut kinds = Vec::new();

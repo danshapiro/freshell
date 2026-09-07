@@ -746,8 +746,14 @@ impl WsTransport for ChannelTransport {
 
     fn close(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            // z06a-landing merge fix: closing this fake MUST NOT take the
+            // from_server receiver lock — the CodexAppServerClient read driver
+            // holds that lock across every parked `recv()` await, so an
+            // implementation that waits on it deadlocks any teardown that
+            // runs after the driver has been polled once (the kata kill path).
+            // The flag alone governs the fake; the driver's abandoned recv is
+            // reaped by `CodexAppServerClient::drop` (read task abort).
             self.closed.store(true, Ordering::SeqCst);
-            self.from_server.lock().await.close();
         })
     }
 }
@@ -850,6 +856,23 @@ mod tests {
 
     fn started_thread_result() -> Value {
         json!({ "thread": { "id": "019810de-1e5f-7db3-9c47-1c2a3b4c5d6e" }, "reasoningEffort": "none" })
+    }
+
+    /// Closing must not wedge on the parked read driver. The driver holds the
+    /// fake transport's receiver mutex across every idle `recv()` await, so a
+    /// close that took that lock would deadlock teardown the moment ANY await
+    /// let the driver reach recv first (the z06a-landing merge made that
+    /// deterministic on the codex kill path).
+    #[tokio::test]
+    async fn close_completes_with_the_read_driver_parked_in_recv() {
+        let (transport, _peer) = new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        tokio::task::yield_now().await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), client.close()).await;
+        assert!(
+            outcome.is_ok(),
+            "close() must complete with the read driver parked in recv"
+        );
     }
 
     #[tokio::test]

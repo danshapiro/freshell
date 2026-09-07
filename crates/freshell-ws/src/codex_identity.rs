@@ -249,8 +249,11 @@ pub(crate) fn broadcast_terminal_session_associated(
             provider: provider.to_string(),
             session_id: session_id.to_string(),
         },
+        runtime: None,
         previous_session_id,
     });
+    let mut associated = associated;
+    state.restart.observe_server_message(&mut associated);
     if let Ok(frame) = serde_json::to_string(&associated) {
         let _ = state.broadcast_tx.send(frame);
     }
