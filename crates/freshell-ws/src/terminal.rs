@@ -44,6 +44,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -3281,6 +3282,38 @@ pub(crate) struct LaunchPrep {
 /// (terminal.rs:1621-1689). Infallible: the only loud reject in the old
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
+fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-managed-terminal-v1\0");
+    hasher.update(domain);
+    hasher.update(b"\0");
+    hasher.update(create_request_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Present a standards-shaped v4 UUID while retaining deterministic bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod managed_runtime_id_tests {
+    use super::stable_managed_uuid;
+
+    #[test]
+    fn managed_ids_are_retry_stable_and_domain_separated() {
+        let a = stable_managed_uuid("create-pane-1", b"terminal");
+        let b = stable_managed_uuid("create-pane-1", b"terminal");
+        let stream = stable_managed_uuid("create-pane-1", b"stream");
+        let other = stable_managed_uuid("create-pane-2", b"terminal");
+        assert_eq!(a, b);
+        assert_ne!(a, stream);
+        assert_ne!(a, other);
+        assert_eq!(a.get_version_num(), 4);
+    }
+}
+
 pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchPrep {
     // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
     // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
@@ -4435,10 +4468,15 @@ pub(crate) async fn handle_create(
         .await;
     }
 
+    let mode = create.mode.clone();
+    // Managed create retries must be payload-identical across web-process
+    // replacement, so their terminal and stream IDs derive from the pane's
+    // durable createRequestId. Other creates retain their existing IDs.
+    let use_managed_runtime = state.registry.managed_runtime_connection(conn_id)
+        && matches!(mode.as_str(), "shell" | "claude");
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
-    let mode = create.mode.clone();
 
     // Reject modes that are neither 'shell' nor a registered coding CLI — the
     // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
@@ -4461,21 +4499,30 @@ pub(crate) async fn handle_create(
         .await;
     }
 
-    // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle
-    // validator); `streamId` via UUIDv4. A prepared managed restore already
-    // reserved the terminal id before off-permit planning, so reuse that one
-    // instead of minting/rerendering a second context.
-    let terminal_id = prepared_codex
-        .as_ref()
-        .and_then(PreparedCodexLaunch::terminal_id)
-        .map(str::to_string)
-        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    // A legacy prepared Codex restore already reserved its terminal ID before
+    // off-permit planning; the managed lane uses stable IDs for retry parity.
+    let (terminal_id, stream_id) = if use_managed_runtime {
+        (
+            stable_managed_uuid(&create.request_id, b"terminal")
+                .simple()
+                .to_string(),
+            stable_managed_uuid(&create.request_id, b"stream").to_string(),
+        )
+    } else {
+        (
+            prepared_codex
+                .as_ref()
+                .and_then(PreparedCodexLaunch::terminal_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+            Uuid::new_v4().to_string(),
+        )
+    };
     // b8ke delta round-2 F2: arm the registered start cancellation — from
     // here the watchdog's cancel kills this row.
     *terminal_start_tid_slot
         .lock()
         .expect("terminal start tid slot lock") = Some(terminal_id.clone());
-    let stream_id = Uuid::new_v4().to_string();
 
     // Resolve the effective cwd BEFORE any branch/mcp computation (`tr:1565` via
     // `resolve_create_cwd`): explicit `create.cwd`, else `settings.defaultCwd`,
@@ -5474,9 +5521,6 @@ pub(crate) async fn handle_create(
     // capability, against a server boot with an installed controller, may move
     // shell/Claude PTY ownership out of the web process. Other providers and
     // every non-negotiating connection retain the legacy local spawn path.
-    let use_managed_runtime = state.registry.managed_runtime_connection(conn_id)
-        && matches!(mode.as_str(), "shell" | "claude");
-
     // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
     // host-owned PTY makes the preallocated identity observable.
     let create_result: std::io::Result<()> = if use_managed_runtime {

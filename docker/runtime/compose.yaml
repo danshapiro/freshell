@@ -1,0 +1,24 @@
+# Controller-service topology only. Dynamic session-host containers are NOT
+# Compose services and are never targets of `compose down`; the supervisor
+# creates/stops them from durable registry receipts.
+name: freshell-managed-runtime
+services:
+  supervisor:
+    image: ${FRESHELL_SUPERVISOR_IMAGE:?set a pinned supervisor image}
+    restart: unless-stopped
+    volumes:
+      - supervisor-registry:/var/lib/freshell-supervisor
+      - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+  web:
+    image: ${FRESHELL_WEB_IMAGE:?set a pinned web image}
+    restart: unless-stopped
+    environment:
+      FRESHELL_MANAGED_RUNTIME_V1: "1"
+      FRESHELL_RUNTIME_CONTROL_SOCKET: /run/freshell-supervisor/supervisor.sock
+      FRESHELL_RUNTIME_CONTROL_SECRET_FILE: /run/freshell-supervisor/secret
+    volumes:
+      - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor:ro
+
+volumes:
+  supervisor-registry: {}

@@ -227,6 +227,16 @@ impl Default for RuntimeProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProviderBootstrapFile {
+    /// Canonical host path. This is a credential/config REFERENCE only; file
+    /// bytes never enter the supervisor registry or Docker JSON payload.
+    pub source_path: String,
+    /// Relative path under the soul-owned provider HOME.
+    pub provider_relative_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalLaunchSpec {
     pub terminal_id: String,
     pub stream_id: String,
@@ -247,6 +257,8 @@ pub struct TerminalLaunchSpec {
     pub create_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
 }
 
 impl TerminalLaunchSpec {
@@ -266,11 +278,33 @@ impl TerminalLaunchSpec {
                 "managed terminal launch has an empty required field",
             ));
         }
-        if self.env.len() > 512 || self.args.len() > 512 {
+        if self.env.len() > 512 || self.args.len() > 512 || self.provider_bootstrap_files.len() > 16
+        {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
-                "managed terminal launch exceeds argv/env bounds",
+                "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
+        }
+        for file in &self.provider_bootstrap_files {
+            let source = std::path::Path::new(&file.source_path);
+            let relative = std::path::Path::new(&file.provider_relative_path);
+            if !source.is_absolute()
+                || relative.is_absolute()
+                || file.provider_relative_path.is_empty()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "managed provider bootstrap file path is unsafe",
+                ));
+            }
         }
         Ok(())
     }

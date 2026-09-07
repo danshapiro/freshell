@@ -14,6 +14,8 @@ export type BrokerReceipt = {
   soulId: string
   imageRef: string
   runtimeDir: string
+  providerVolumeName?: string
+  workspacePath?: string
 }
 
 export type BrokerEvent = {
@@ -33,6 +35,9 @@ export type RestrictedDockerBrokerPolicy = {
   runtimeRootPrefix: string
   allowedHostBinaryPaths: Set<string>
   allowedImageRefs: Set<string>
+  allowTerminalWorkloads?: boolean
+  allowedWorkspaceRoots?: Set<string>
+  allowedBootstrapFiles?: Set<string>
   testRunId: string
   logPath: string
 }
@@ -147,6 +152,8 @@ export class RestrictedDockerBroker {
           soulId: validation.soulId,
           imageRef: validation.imageRef,
           runtimeDir: validation.runtimeDir,
+          ...(validation.providerVolumeName ? { providerVolumeName: validation.providerVolumeName } : {}),
+          ...(validation.workspacePath ? { workspacePath: validation.workspacePath } : {}),
         })
         this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false, containerId })
       } else {
@@ -186,7 +193,7 @@ export class RestrictedDockerBroker {
   }
 
   private validateCreate(body: Buffer):
-    | { ok: true; incarnationId: string; soulId: string; imageRef: string; runtimeDir: string }
+    | { ok: true; incarnationId: string; soulId: string; imageRef: string; runtimeDir: string; providerVolumeName?: string; workspacePath?: string }
     | { ok: false; reason: string } {
     let parsed: Record<string, any>
     try {
@@ -206,7 +213,9 @@ export class RestrictedDockerBroker {
     if (!incarnationId || !soulId) return { ok: false, reason: 'missing incarnation/soul labels' }
 
     const host = parsed.HostConfig ?? {}
-    if (host.NetworkMode !== 'none') return { ok: false, reason: 'runtime network must be none' }
+    const terminalWorkload = host.NetworkMode === 'bridge'
+    if (host.NetworkMode !== 'none' && !terminalWorkload) return { ok: false, reason: 'runtime network must be none or isolated bridge' }
+    if (terminalWorkload && !this.policy.allowTerminalWorkloads) return { ok: false, reason: 'terminal workload networking not enabled for this gate' }
     if ((host.PidMode ?? '') !== '') return { ok: false, reason: 'host pid namespace is forbidden' }
     if (host.ReadonlyRootfs !== true) return { ok: false, reason: 'runtime rootfs must be readonly' }
     if (host.Privileged === true) return { ok: false, reason: 'privileged runtime forbidden' }
@@ -219,11 +228,16 @@ export class RestrictedDockerBroker {
     if (host.PortBindings && Object.keys(host.PortBindings).length > 0) return { ok: false, reason: 'runtime ports are forbidden' }
 
     const binds = Array.isArray(host.Binds) ? host.Binds as string[] : []
-    if (binds.length !== 2) return { ok: false, reason: `expected exactly two runtime binds, found ${binds.length}` }
+    if (!terminalWorkload && binds.length !== 2) return { ok: false, reason: `expected exactly two fixture runtime binds, found ${binds.length}` }
     let binaryBind = false
     let runtimeDir = ''
+    let providerVolumeName = ''
+    let workspacePath = ''
     for (const bind of binds) {
-      const [source, destination, mode] = bind.split(':')
+      const parts = bind.split(':')
+      const mode = parts.pop() ?? ''
+      const destination = parts.pop() ?? ''
+      const source = parts.join(':')
       if (destination === '/runtime/freshell-session-host' && mode === 'ro' && this.policy.allowedHostBinaryPaths.has(source)) {
         binaryBind = true
         continue
@@ -232,13 +246,33 @@ export class RestrictedDockerBroker {
         runtimeDir = source
         continue
       }
+      if (terminalWorkload && destination === '/home/freshell/provider' && mode === 'rw' && /^freshell-provider-[a-f0-9]{24}$/.test(source)) {
+        providerVolumeName = source
+        continue
+      }
+      if (terminalWorkload && destination === source && mode === 'rw' && this.isAllowedWorkspacePath(source)) {
+        if (!workspacePath) workspacePath = source
+        continue
+      }
+      if (terminalWorkload && /^\/run\/freshell-bootstrap\/provider-\d+$/.test(destination) && mode === 'ro' && this.policy.allowedBootstrapFiles?.has(source)) {
+        continue
+      }
       return { ok: false, reason: `unapproved bind ${bind}` }
     }
     if (!binaryBind || !runtimeDir) return { ok: false, reason: 'required binary/runtime bind topology missing' }
-    if (binds.some((bind) => bind.includes('docker.sock') || bind.includes('/.freshell') || bind.includes('/.claude') || bind.includes('/.codex'))) {
-      return { ok: false, reason: 'management/provider-state mount is forbidden' }
+    if (terminalWorkload && (!providerVolumeName || !workspacePath)) return { ok: false, reason: 'terminal workload missing provider volume or approved workspace bind' }
+    if (binds.some((bind) => bind.includes('docker.sock') || bind.includes('/var/lib/freshell-supervisor') || bind.includes('/run/freshell-supervisor'))) {
+      return { ok: false, reason: 'management-state mount is forbidden' }
     }
-    return { ok: true, incarnationId, soulId, imageRef, runtimeDir }
+    return { ok: true, incarnationId, soulId, imageRef, runtimeDir, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
+  }
+
+  private isAllowedWorkspacePath(candidate: string): boolean {
+    const roots = this.policy.allowedWorkspaceRoots ?? new Set<string>()
+    for (const root of roots) {
+      if (candidate === root || isStrictDescendant(candidate, root)) return true
+    }
+    return false
   }
 
   private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string }): Promise<void> {

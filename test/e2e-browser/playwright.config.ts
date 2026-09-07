@@ -13,6 +13,10 @@ export const LOCAL_ONLY_SPECS = [{
   spec: 'mcp-qa-smoke-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts',
   classification: 'local-only-provider-binary',
+}, {
+  spec: 'runtime-terminal-continuity-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
 }]
 
 const continuityRequested = process.env.FRESHELL_SMOKE

@@ -436,6 +436,12 @@ async fn grant_execution(
             (pid, evidence)
         }
         (None, Some(terminal)) => {
+            prepare_provider_bootstrap_files(&terminal).map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("prepare provider bootstrap: {error}"),
+                )
+            })?;
             let hosted =
                 HostedPty::spawn(&state.state_dir, state.incarnation_id.clone(), &terminal)
                     .map_err(|e| {
@@ -475,6 +481,57 @@ async fn grant_execution(
         worker_launch_count: persisted.worker_launch_count,
         fixture_evidence: persisted.fixture_evidence.clone(),
     })
+}
+
+fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(), String> {
+    if terminal.provider_bootstrap_files.is_empty() {
+        return Ok(());
+    }
+    let home = terminal
+        .env
+        .get("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "provider bootstrap requires terminal HOME".to_string())?;
+    if !home.is_absolute() {
+        return Err("provider bootstrap HOME must be absolute".into());
+    }
+    for (index, file) in terminal.provider_bootstrap_files.iter().enumerate() {
+        let source = PathBuf::from(format!("/run/freshell-bootstrap/provider-{index}"));
+        let destination = home.join(&file.provider_relative_path);
+        if !destination.starts_with(&home) {
+            return Err("provider bootstrap destination escaped HOME".into());
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let bytes = std::fs::read(&source)
+            .map_err(|error| format!("read {}: {error}", source.display()))?;
+        let tmp = destination.with_extension(format!("freshell-tmp-{}", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write as _;
+        let mut out = options
+            .open(&tmp)
+            .map_err(|error| format!("create {}: {error}", tmp.display()))?;
+        out.write_all(&bytes).map_err(|error| error.to_string())?;
+        out.sync_all().map_err(|error| error.to_string())?;
+        std::fs::rename(&tmp, &destination).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(parent) = destination.parent() {
+            let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+        }
+    }
+    Ok(())
 }
 
 fn registry_like_error(error: String) -> RuntimeError {

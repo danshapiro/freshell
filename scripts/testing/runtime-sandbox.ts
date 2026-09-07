@@ -8,6 +8,7 @@ import path from 'node:path'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
+export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
 export const CONTROL_PROTOCOL_VERSION = 1
 
 export type RuntimeLimits = {
@@ -56,8 +57,19 @@ export class RuntimeGateAssertionError extends Error {
   }
 }
 
+export class RuntimeGateBlockedError extends Error {
+  constructor(
+    readonly caseId: string,
+    message: string,
+    readonly evidence?: unknown,
+  ) {
+    super(`[${caseId}] BLOCKED: ${message}`)
+  }
+}
+
 export class RuntimeHarness {
   readonly repoRoot: string
+  readonly phase: 1 | 2
   readonly runId: string
   readonly candidateSha: string
   readonly testRoot: string
@@ -82,8 +94,9 @@ export class RuntimeHarness {
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
 
-  constructor(repoRoot: string, runId = randomUUID()) {
+  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 = 1) {
     this.repoRoot = fs.realpathSync(repoRoot)
+    this.phase = phase
     this.runId = runId
     this.candidateSha = git(this.repoRoot, ['rev-parse', 'HEAD']).trim()
     this.testRoot = path.join('/tmp/frt', runId.slice(0, 12))
@@ -101,11 +114,15 @@ export class RuntimeHarness {
     fs.mkdirSync(this.evidenceDir, { recursive: true })
     fs.mkdirSync(this.incidentsDir, { recursive: true })
     fs.mkdirSync(this.browserDir, { recursive: true })
-    fs.writeFileSync(path.join(this.browserDir, 'not-applicable.json'), JSON.stringify({ reason: 'Phase 1 has no browser surface; the live gate exercises the supervisor/runtime IPC directly.' }, null, 2))
+    if (this.phase === 1) {
+      fs.writeFileSync(path.join(this.browserDir, 'not-applicable.json'), JSON.stringify({ reason: 'Phase 1 has no browser surface; the live gate exercises the supervisor/runtime IPC directly.' }, null, 2))
+    }
 
     const sourceManifest = JSON.parse(fs.readFileSync(path.join(this.repoRoot, 'test/runtime/gate-manifest.json'), 'utf8'))
     fs.writeFileSync(path.join(this.evidenceDir, 'manifest.json'), JSON.stringify({ ...sourceManifest, execution: { candidateSha: this.candidateSha, runId: this.runId, startedAt: new Date().toISOString() } }, null, 2))
-    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify({ phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }, null, 2))
+    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(this.phase === 1
+      ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
+      : { phase: 'phase-2', claude: { status: 'pending-live-gate' }, workloadImage: 'pinned' }, null, 2))
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
     this.ensureRuntimeImage()
@@ -119,6 +136,9 @@ export class RuntimeHarness {
       runtimeRootPrefix: path.join(this.testRoot, 'r'),
       allowedHostBinaryPaths: new Set([this.testHostBinary, this.releaseHostBinary]),
       allowedImageRefs: new Set([this.imageRef]),
+      allowTerminalWorkloads: this.phase >= 2,
+      allowedWorkspaceRoots: new Set(this.phase >= 2 ? this.phase2WorkspaceRoots() : []),
+      allowedBootstrapFiles: new Set(this.phase >= 2 ? this.phase2BootstrapFiles() : []),
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
     })
@@ -145,6 +165,10 @@ export class RuntimeHarness {
     for (const id of [...this.trackedContainers]) {
       try { this.removeContainerExact(id) } catch (error) { errors.push(`tracked container ${id}: ${String(error)}`) }
     }
+    const providerVolumes = new Set((this.broker?.receipts?.() ?? []).map((receipt) => receipt.providerVolumeName).filter((value): value is string => !!value))
+    for (const volume of providerVolumes) {
+      try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`provider volume ${volume}: ${String(error)}`) }
+    }
     for (const volume of [...this.trackedVolumes]) {
       try { docker(['volume', 'rm', volume]) } catch (error) { errors.push(`volume ${volume}: ${String(error)}`) }
     }
@@ -161,7 +185,7 @@ export class RuntimeHarness {
         ...this.trackedContainers,
         ...this.broker?.receiptIds?.() ?? [],
       ])],
-      volumes: [...this.trackedVolumes],
+      volumes: [...this.trackedVolumes, ...providerVolumes],
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }
@@ -205,6 +229,9 @@ export class RuntimeHarness {
     dbFailpoint?: string
     waitForHealth?: boolean
     reuseSecret?: boolean
+    installationBudget?: RuntimeLimits
+    projectBudget?: RuntimeLimits
+    env?: Record<string, string>
   }): Promise<SupervisorInstance> {
     const scenarioId = sanitizeName(options.scenarioId)
     const scenarioRoot = this.scenarioPath(scenarioId)
@@ -226,7 +253,7 @@ export class RuntimeHarness {
     }
     const controlSecret = fs.readFileSync(controlSecretFile, 'utf8').trim()
     const controlSocket = path.join(controlDir, 'supervisor.sock')
-    const volumeName = options.volumeName ?? `freshell-p1-${this.runId.slice(0, 8)}-${scenarioId}`
+    const volumeName = options.volumeName ?? `freshell-p${this.phase}-${this.runId.slice(0, 8)}-${scenarioId}`
     if (!this.trackedVolumes.has(volumeName)) {
       docker(['volume', 'create', volumeName])
       this.trackedVolumes.add(volumeName)
@@ -234,7 +261,7 @@ export class RuntimeHarness {
     const binaryKind = options.binaryKind ?? 'test'
     const supervisorBinary = binaryKind === 'test' ? this.testSupervisorBinary : this.releaseSupervisorBinary
     const hostBinary = binaryKind === 'test' ? this.testHostBinary : this.releaseHostBinary
-    const name = `freshell-p1-supervisor-${this.runId.slice(0, 8)}-${scenarioId}-${randomUUID().slice(0, 8)}`
+    const name = `freshell-p${this.phase}-supervisor-${this.runId.slice(0, 8)}-${scenarioId}-${randomUUID().slice(0, 8)}`
     const args = [
       'run', '-d', '--name', name,
       '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
@@ -243,8 +270,15 @@ export class RuntimeHarness {
       '-v', `${this.buildDir}:${this.buildDir}:ro`,
       '-v', `${volumeName}:/var/lib/freshell-supervisor:rw`,
     ]
+    if (this.phase >= 2) {
+      for (const root of this.phase2WorkspaceRoots()) {
+        if (root === this.testRoot || root === this.buildDir) continue
+        args.push('-v', `${root}:${root}:ro`)
+      }
+    }
     if (options.crashPoint) args.push('-e', `FRESHELL_RUNTIME_CRASH_POINT=${options.crashPoint}`)
     if (options.dbFailpoint) args.push('-e', `FRESHELL_RUNTIME_DB_FAILPOINT=${options.dbFailpoint}`)
+    for (const [key, value] of Object.entries(options.env ?? {})) args.push('-e', `${key}=${value}`)
     args.push(
       this.imageRef,
       supervisorBinary, 'serve',
@@ -255,8 +289,14 @@ export class RuntimeHarness {
       '--runtime-root', runtimeRoot,
       '--host-binary', hostBinary,
       '--image-ref', this.imageRef,
-      '--test-run-id', this.runId,
     )
+    if (options.installationBudget) {
+      args.push('--installation-budget-cpu-milli', String(options.installationBudget.cpuMilli), '--installation-budget-memory-bytes', String(options.installationBudget.memoryBytes), '--installation-budget-pids', String(options.installationBudget.pidsMax))
+    }
+    if (options.projectBudget) {
+      args.push('--project-budget-cpu-milli', String(options.projectBudget.cpuMilli), '--project-budget-memory-bytes', String(options.projectBudget.memoryBytes), '--project-budget-pids', String(options.projectBudget.pidsMax))
+    }
+    args.push('--test-run-id', this.runId)
     const containerId = docker(args).trim()
     if (!/^[0-9a-f]{64}$/.test(containerId)) throw new Error(`supervisor docker run returned invalid id: ${containerId}`)
     this.trackedSupervisorContainers.add(containerId)
@@ -293,6 +333,31 @@ export class RuntimeHarness {
     })
   }
 
+  async adminSendAndDrop(instance: SupervisorInstance, body: any, options: { requestId?: string; auth?: string } = {}): Promise<void> {
+    const envelope = {
+      protocolVersion: CONTROL_PROTOCOL_VERSION,
+      requestId: options.requestId ?? `request-${randomUUID()}`,
+      role: 'web',
+      auth: options.auth ?? instance.controlSecret,
+      body,
+    }
+    const payload = Buffer.from(JSON.stringify(envelope))
+    const frame = Buffer.allocUnsafe(4 + payload.length)
+    frame.writeUInt32BE(payload.length, 0)
+    payload.copy(frame, 4)
+    await new Promise<void>((resolve, reject) => {
+      const socket = net.createConnection(instance.controlSocket)
+      socket.once('error', reject)
+      socket.once('connect', () => {
+        socket.write(frame, (error) => {
+          if (error) return reject(error)
+          socket.destroy()
+          resolve()
+        })
+      })
+    })
+  }
+
   async adminEnvelopeRaw(instance: SupervisorInstance, envelope: Record<string, unknown>): Promise<AdminReply> {
     const payload = Buffer.from(JSON.stringify(envelope))
     const frame = Buffer.allocUnsafe(4 + payload.length)
@@ -322,23 +387,47 @@ export class RuntimeHarness {
     soulId: string
     limits?: RuntimeLimits
     fixture?: 'heartbeat' | 'descendant_spawner' | 'cpu_burner' | 'memory_allocator' | 'native_session' | 'security_probe'
+    terminal?: Record<string, unknown>
+    profile?: 'default_agent' | 'test_fixture' | 'custom'
+    projectKey?: string
+    nativeSessionId?: string
     expectedControlEpoch?: number
     provider?: string
     providerStoreId?: string
     creationSeedRef?: string
   }): any {
+    const terminal = params.terminal
     return {
       method: 'launch',
       params: {
         soulId: params.soulId,
-        provider: params.provider ?? 'phase1-fixture',
+        provider: params.provider ?? (terminal ? 'shell' : 'phase1-fixture'),
         providerStoreId: params.providerStoreId ?? `store-${this.runId}`,
         creationSeedRef: params.creationSeedRef ?? `seed-${params.soulId}`,
         limits: params.limits ?? defaultLimits(),
-        fixture: params.fixture ?? 'heartbeat',
+        ...(params.profile ? { profile: params.profile } : {}),
+        ...(params.projectKey ? { projectKey: params.projectKey } : {}),
+        ...(params.nativeSessionId ? { nativeSessionId: params.nativeSessionId } : {}),
+        ...(terminal ? { terminal } : { fixture: params.fixture ?? 'heartbeat' }),
         ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
       },
     }
+  }
+
+  terminalInputBody(soulId: string, data: string, expectedControlEpoch?: number): any {
+    return { method: 'terminal_input', params: { soulId, data, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
+  terminalResizeBody(soulId: string, cols: number, rows: number, expectedControlEpoch?: number): any {
+    return { method: 'terminal_resize', params: { soulId, cols, rows, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
+  terminalReadOutputBody(soulId: string, afterSeq = 0, maxBytes = 64 * 1024, expectedControlEpoch?: number): any {
+    return { method: 'terminal_read_output', params: { soulId, afterSeq, maxBytes, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
+  runtimeMetricsBody(soulId: string, expectedControlEpoch?: number): any {
+    return { method: 'runtime_metrics', params: { soulId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
   }
 
   stopBody(soulId: string, expectedControlEpoch?: number): any {
@@ -376,6 +465,26 @@ export class RuntimeHarness {
     if (!this.isContainerRunning(containerId)) return
     const result = spawnSync('docker', ['stop', '-t', '1', containerId], { encoding: 'utf8' })
     if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for tracked container ${containerId}`)
+  }
+
+  restartOwnedRuntimeExact(containerId: string): void {
+    if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to restart non-receipt container ${containerId}`)
+    const result = spawnSync('docker', ['restart', '-t', '1', containerId], { encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(result.stderr || `docker restart failed for owned runtime ${containerId}`)
+  }
+
+  execOwnedContainerExact(containerId: string, command: string[]): string {
+    if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
+      throw new Error(`refusing to exec non-owned container ${containerId}`)
+    }
+    return execFileSync('docker', ['exec', containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+  }
+
+  topOwnedContainerExact(containerId: string, psArgs: string[] = ['-eo', 'pid,ppid,sid,comm']): string {
+    if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
+      throw new Error(`refusing to inspect non-owned container ${containerId}`)
+    }
+    return execFileSync('docker', ['top', containerId, ...psArgs], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
   }
 
   async waitForFile(filePath: string, timeoutMs = 8_000): Promise<void> {
@@ -467,10 +576,35 @@ export class RuntimeHarness {
   }
 
   private ensureRuntimeImage(): void {
-    const inspect = spawnSync('docker', ['image', 'inspect', PHASE1_RUNTIME_IMAGE_TAG, '--format', '{{.Id}}'], { encoding: 'utf8' })
-    if (inspect.status !== 0) docker(['pull', PHASE1_RUNTIME_IMAGE_TAG])
-    this.imageRef = docker(['image', 'inspect', PHASE1_RUNTIME_IMAGE_TAG, '--format', '{{.Id}}']).trim()
+    const tag = this.phase === 1 ? PHASE1_RUNTIME_IMAGE_TAG : PHASE2_RUNTIME_IMAGE_TAG
+    let inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+    if (inspect.status !== 0) {
+      if (this.phase === 1) docker(['pull', tag])
+      else execFileSync('docker', ['build', '--pull=false', '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: this.repoRoot, stdio: 'inherit' })
+      inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
+    }
+    this.imageRef = inspect.stdout.trim()
     if (!/^sha256:[0-9a-f]{64}$/.test(this.imageRef)) throw new Error(`runtime image is not pinned: ${this.imageRef}`)
+  }
+
+  private phase2BootstrapFiles(): string[] {
+    const configured = process.env.FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE?.trim()
+    if (!configured) return []
+    try {
+      const resolved = fs.realpathSync(configured)
+      return fs.statSync(resolved).isFile() ? [resolved] : []
+    } catch {
+      return []
+    }
+  }
+
+  private phase2WorkspaceRoots(): string[] {
+    const roots = new Set<string>([this.repoRoot, this.testRoot])
+    try {
+      const common = git(this.repoRoot, ['rev-parse', '--git-common-dir']).trim()
+      roots.add(fs.realpathSync(path.isAbsolute(common) ? common : path.join(this.repoRoot, common)))
+    } catch {}
+    return [...roots]
   }
 
   private buildBinaries(): void {

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "runtimeBaseImage": {
+    "repository": "ubuntu",
+    "tag": "24.04",
+    "digest": "sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
+  },
+  "nodeSourceImage": {
+    "repository": "node",
+    "tag": "22.23.2-bookworm-slim",
+    "digest": "sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
+  },
+  "node": "22.23.2",
+  "providers": {
+    "claude": {
+      "package": "@anthropic-ai/claude-code",
+      "version": "2.1.263"
+    }
+  }
+}
