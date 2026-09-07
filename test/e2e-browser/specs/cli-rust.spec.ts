@@ -6,6 +6,7 @@ import path from 'node:path'
 import { test, expect } from '@playwright/test'
 import { ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-stdio-client.js'
 import { RustServer } from '../helpers/rust-server.js'
+import { TestHarness } from '../helpers/test-harness.js'
 
 type CliRun = { code: number | null; stdout: string; stderr: string }
 type ActionResult<T> = { status: string; data: T }
@@ -205,6 +206,55 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       expect(unsupported.stderr).toContain("Action 'run' is unavailable with the Rust Freshell server.")
     } finally {
       await fs.rm(scratchDir, { recursive: true, force: true })
+      await server.stop()
+    }
+  })
+
+  test('creates and splits Host Stats panes without allocating terminals', async ({ page }) => {
+    const server = new RustServer({ verbose: false })
+    const info = await server.start()
+
+    try {
+      ensureMcpServerBuilt(REPO_ROOT)
+      await page.goto(info.baseUrl + '/?token=' + info.token + '&e2e=1')
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      const inventory = () => runCliJson<unknown[]>(
+        info.baseUrl, info.token, ['list-terminals'],
+      )
+      expect(await inventory()).toEqual([])
+
+      const created = await runCliJson<ActionResult<{
+        tabId: string
+        paneId: string
+        terminalId?: string
+      }>>(
+        info.baseUrl, info.token,
+        ['new-tab', '--hostStats', '--name', 'CLI Host Stats'],
+      )
+      expect(created.status).toBe('ok')
+      expect(created.data.terminalId).toBeUndefined()
+      const regions = page.getByRole('region', { name: 'Host stats' })
+      await expect(regions).toHaveCount(1)
+      await expect(regions.first()).toBeVisible()
+      expect(await inventory()).toEqual([])
+
+      const split = await runCliJson<ActionResult<{
+        paneId: string
+        terminalId?: string
+      }>>(
+        info.baseUrl, info.token,
+        ['split-pane', '--target', created.data.paneId, '--hostStats=true'],
+      )
+      expect(split.status).toBe('ok')
+      expect(split.data.paneId).not.toBe(created.data.paneId)
+      expect(split.data.terminalId).toBeUndefined()
+      await expect(regions).toHaveCount(2)
+      await expect(regions.nth(1)).toBeVisible()
+      expect(await inventory()).toEqual([])
+    } finally {
       await server.stop()
     }
   })
