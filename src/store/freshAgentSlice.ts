@@ -301,36 +301,41 @@ const freshAgentSlice = createSlice({
       // revoke a stale `lost` flag from a transient dead-window race
       // (reconnect unwedge).
       session.lost = false
-      const shouldRestartHydration = Boolean(
-        session.historyLoaded
-          && action.payload.revision != null
-          && session.historyRevision != null
-          && action.payload.revision !== session.historyRevision,
-      )
-      if (shouldRestartHydration) {
-        resetHydratedHistoryState(session)
-        requestRestoreHydrationRestart(session)
-      }
-
-      session.latestTurnId = action.payload.latestTurnId
-      // A dropped (stale or equal-seq) frame skips the status write AND the
-      // streaming pair atomically — a stale snapshot can never clobber a live
-      // busy state after a reconnect.
+      // Fold order (LB-04): the seq gate runs FIRST. A dropped (stale or
+      // equal-seq) frame skips the status write AND every derived write
+      // atomically — the streaming pair, the hydration restart (which blanks
+      // streamingActive/streamingText via resetHydratedHistoryState), and the
+      // latestTurnId/historyRevision/historyLoaded bookkeeping all gate on the
+      // accepted boolean, so a stale snapshot after a reconnect can never
+      // clobber live state.
       const statusAccepted = writeSessionStatus(session, action.payload.status, action.payload.statusSeq)
-      session.historySessionId = action.payload.historySessionId ?? session.historySessionId
-      session.historyRevision = action.payload.revision ?? session.historyRevision
       if (statusAccepted) {
+        const shouldRestartHydration = Boolean(
+          session.historyLoaded
+            && action.payload.revision != null
+            && session.historyRevision != null
+            && action.payload.revision !== session.historyRevision,
+        )
+        if (shouldRestartHydration) {
+          resetHydratedHistoryState(session)
+          requestRestoreHydrationRestart(session)
+        }
+        // resetHydratedHistoryState also clears latestTurnId and the streaming
+        // pair — the accepted payload's values are re-applied after the reset.
+        session.latestTurnId = action.payload.latestTurnId
+        session.historySessionId = action.payload.historySessionId ?? session.historySessionId
+        session.historyRevision = action.payload.revision ?? session.historyRevision
         session.streamingActive = action.payload.streamingActive ?? false
         session.streamingText = action.payload.streamingText ?? ''
+        if (action.payload.latestTurnId === null && !session.awaitingDurableHistory) {
+          session.historyLoaded = true
+        } else if (action.payload.latestTurnId !== null) {
+          session.awaitingDurableHistory = false
+        }
       }
       session.restoreFailureCode = undefined
       session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
-      if (action.payload.latestTurnId === null && !session.awaitingDurableHistory) {
-        session.historyLoaded = true
-      } else if (action.payload.latestTurnId !== null) {
-        session.awaitingDurableHistory = false
-      }
     },
 
     materializeSession(state, action: PayloadAction<FreshAgentSessionMaterializedPayload>) {

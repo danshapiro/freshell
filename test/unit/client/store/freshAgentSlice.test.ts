@@ -3,6 +3,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   createFailed,
   freshAgentSnapshotReceived,
+  historyPageReceived,
   markSessionLost,
   materializeSession,
   registerPendingCreate,
@@ -261,6 +262,96 @@ describe('freshAgentSlice statusSeq gate', () => {
     }))
     expect(state.sessions[key].status).toBe('idle')
     expect(state.sessions[key].lastStatusSeq).toBe(5)
+  })
+
+  // Carried review re-check (task 003): when the seq gate DROPS a snapshot
+  // frame, the whole fold bundle must drop atomically — the hydration-restart
+  // predicate (historyRevision mismatch) must not run resetHydratedHistoryState
+  // and blank streamingActive/streamingText, and the latestTurnId /
+  // historyRevision / historyLoaded bookkeeping must not nudge. A dropped frame
+  // is older server truth: touching anything would break the clobber guarantee.
+  function hydratedBusyBaseline() {
+    let state = reducer(undefined, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: 'turn-42',
+      status: 'running',
+      statusSeq: 10,
+      streamingActive: true,
+      streamingText: 'half-written answer',
+    }))
+    state = reducer(state, historyPageReceived({
+      ...loc,
+      turns: [{
+        id: 'turn-42',
+        turnId: 'turn-42',
+        role: 'assistant',
+        summary: 'older answer',
+        items: [{ id: 'turn-42-text', kind: 'text', text: 'older answer' }],
+      }],
+      revision: 5,
+    }))
+    return state
+  }
+
+  it('a seq-dropped frame with a mismatching historyRevision must not blank streaming or nudge history bookkeeping', () => {
+    let state = hydratedBusyBaseline()
+    expect(state.sessions[key]).toMatchObject({
+      status: 'running',
+      latestTurnId: 'turn-42',
+      historyRevision: 5,
+      historyLoaded: true,
+      streamingActive: true,
+      streamingText: 'half-written answer',
+    })
+    expect(state.sessions[key].historyItems.map((turn) => turn.turnId)).toEqual(['turn-42'])
+
+    state = reducer(state, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: 'turn-99',
+      status: 'idle',
+      statusSeq: 9,
+      revision: 6,
+      streamingActive: false,
+      streamingText: '',
+    }))
+
+    const session = state.sessions[key]
+    expect(session.status).toBe('running')
+    expect(session.streamingActive).toBe(true)
+    expect(session.streamingText).toBe('half-written answer')
+    expect(session.latestTurnId).toBe('turn-42')
+    expect(session.historyRevision).toBe(5)
+    expect(session.historyLoaded).toBe(true)
+    expect(session.historyItems.map((turn) => turn.turnId)).toEqual(['turn-42'])
+    expect(session.restoreHydrationRequestId ?? 0).toBe(0)
+    expect(session.lastStatusSeq).toBe(10)
+    expect(session.statusVersion).toBe(1)
+  })
+
+  it('an accepted (newer-seq) frame with a mismatching historyRevision still restarts hydration', () => {
+    let state = hydratedBusyBaseline()
+
+    state = reducer(state, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: 'turn-99',
+      status: 'idle',
+      statusSeq: 11,
+      revision: 6,
+      streamingActive: false,
+      streamingText: '',
+    }))
+
+    const session = state.sessions[key]
+    expect(session.status).toBe('idle')
+    expect(session.lastStatusSeq).toBe(11)
+    expect(session.latestTurnId).toBe('turn-99')
+    expect(session.historyRevision).toBe(6)
+    expect(session.historyLoaded).toBe(false)
+    expect(session.historyItems).toEqual([])
+    expect(session.restoreHydrationRequestId).toBe(1)
+    expect(session.streamingActive).toBe(false)
+    expect(session.streamingText).toBe('')
+    expect(session.statusVersion).toBe(2)
   })
 })
 
