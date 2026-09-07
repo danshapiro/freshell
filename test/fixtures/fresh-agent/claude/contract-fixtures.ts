@@ -64,6 +64,13 @@ export const claudeContractSnapshot = {
   },
 } satisfies FreshAgentSnapshot
 
+// statusSeq-bearing variant: used only by the statusSeq contract cases; the
+// seq-less fixture above stays the pre-seq server shape (untouched).
+export const claudeContractSnapshotWithStatusSeq = {
+  ...claudeContractSnapshot,
+  statusSeq: 1234,
+} satisfies FreshAgentSnapshot
+
 export const claudeContractTurnPage = {
   sessionType: 'freshclaude',
   provider: 'claude',

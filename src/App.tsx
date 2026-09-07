@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEve
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
+import { resetStatusSeqBaselines } from '@/store/freshAgentSlice'
 import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
@@ -1050,6 +1051,10 @@ export default function App() {
             const firstReadyBaseline = !previousBootId && !previousServerInstanceId
             if (serverRestarted || instanceChanged || firstReadyBaseline) {
               dispatch(resetCompletionDedupeBaselines())
+              // The fresh-agent statusSeq is the same wall-clock-ms regime:
+              // a restarted server may re-mint a lower seq, so its per-session
+              // lastStatusSeq baselines reset on the same edge.
+              dispatch(resetStatusSeqBaselines())
             }
             // pane.reconcile adoption: capability re-captured per connection,
             // and the request re-sent on EVERY ready — a result is not

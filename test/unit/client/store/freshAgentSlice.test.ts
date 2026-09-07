@@ -6,6 +6,7 @@ import reducer, {
   markSessionLost,
   materializeSession,
   registerPendingCreate,
+  resetStatusSeqBaselines,
   sessionCreated,
   sessionError,
   sessionInit,
@@ -150,6 +151,116 @@ describe('freshAgentSlice', () => {
     const lostGhost = markSessionLost({ sessionId: 's-ghost', sessionType: 'freshclaude', provider: 'claude' })
     expect(() => reducer(undefined, lostGhost)).not.toThrow()
     expect(reducer(undefined, lostGhost).sessions).toEqual({})
+  })
+})
+
+describe('freshAgentSlice statusSeq gate', () => {
+  // Server-authoritative, provider-agnostic statusSeq (wall-clock-ms, strictly
+  // monotonic per session — the same regime as the turn-complete clock): the
+  // client folds a frame's status write only when its seq is strictly newer
+  // than the last accepted one, and dropped frames skip status /
+  // streamingActive / streamingText together. Seq-less frames (pre-seq
+  // servers, untracked defaults) keep the legacy unconditional fold.
+  const loc = { sessionId: 'thread-status-seq', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+  const key = makeFreshAgentSessionKey(loc)
+
+  function trackedRunningState() {
+    return reducer(undefined, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: null,
+      status: 'running',
+      statusSeq: 10,
+      streamingActive: true,
+      streamingText: 'working',
+    }))
+  }
+
+  it('folds a tracked status write (statusSeq: 10) and records lastStatusSeq', () => {
+    const session = trackedRunningState().sessions[key]
+    expect(session.status).toBe('running')
+    expect(session.streamingActive).toBe(true)
+    expect(session.streamingText).toBe('working')
+    expect(session.lastStatusSeq).toBe(10)
+    expect(session.statusVersion).toBe(1)
+  })
+
+  it('drops a stale frame (statusSeq: 9 after 10) — status/streaming/lastStatusSeq untouched, statusVersion not bumped', () => {
+    let state = trackedRunningState()
+    const versionAfterTracked = state.sessions[key].statusVersion
+    state = reducer(state, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: null,
+      status: 'idle',
+      statusSeq: 9,
+      streamingActive: false,
+      streamingText: 'stale',
+    }))
+    const session = state.sessions[key]
+    expect(session.status).toBe('running')
+    expect(session.streamingActive).toBe(true)
+    expect(session.streamingText).toBe('working')
+    expect(session.lastStatusSeq).toBe(10)
+    expect(session.statusVersion).toBe(versionAfterTracked)
+  })
+
+  it('drops an equal-seq frame (statusSeq: 10 after 10) — the fold requires strictly newer', () => {
+    let state = trackedRunningState()
+    const versionAfterTracked = state.sessions[key].statusVersion
+    state = reducer(state, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: null,
+      status: 'idle',
+      statusSeq: 10,
+      streamingActive: false,
+      streamingText: '',
+    }))
+    const session = state.sessions[key]
+    expect(session.status).toBe('running')
+    expect(session.streamingActive).toBe(true)
+    expect(session.lastStatusSeq).toBe(10)
+    expect(session.statusVersion).toBe(versionAfterTracked)
+  })
+
+  it('legacy: a seq-less write after a tracked write still folds unconditionally and leaves lastStatusSeq alone', () => {
+    let state = trackedRunningState()
+    state = reducer(state, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: null,
+      status: 'idle',
+      streamingActive: false,
+      streamingText: '',
+    }))
+    const session = state.sessions[key]
+    expect(session.status).toBe('idle')
+    expect(session.streamingActive).toBe(false)
+    expect(session.streamingText).toBe('')
+    expect(session.lastStatusSeq).toBe(10)
+  })
+
+  it('resetStatusSeqBaselines clears lastStatusSeq on every session', () => {
+    const otherLoc = { sessionId: 'thread-status-seq-b', sessionType: 'freshclaude' as const, provider: 'claude' as const }
+    const otherKey = makeFreshAgentSessionKey(otherLoc)
+    let state = trackedRunningState()
+    state = reducer(state, sessionSnapshotReceived({
+      ...otherLoc,
+      latestTurnId: null,
+      status: 'idle',
+      statusSeq: 20,
+    }))
+    expect(state.sessions[key].lastStatusSeq).toBe(10)
+    expect(state.sessions[otherKey].lastStatusSeq).toBe(20)
+    state = reducer(state, resetStatusSeqBaselines())
+    expect(state.sessions[key].lastStatusSeq).toBeUndefined()
+    expect(state.sessions[otherKey].lastStatusSeq).toBeUndefined()
+    // A tracked write after the reset folds again from a fresh baseline.
+    state = reducer(state, sessionSnapshotReceived({
+      ...loc,
+      latestTurnId: null,
+      status: 'idle',
+      statusSeq: 5,
+    }))
+    expect(state.sessions[key].status).toBe('idle')
+    expect(state.sessions[key].lastStatusSeq).toBe(5)
   })
 })
 

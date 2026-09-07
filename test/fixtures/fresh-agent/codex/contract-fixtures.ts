@@ -73,6 +73,13 @@ export const codexContractSnapshot = {
   },
 } satisfies FreshAgentSnapshot
 
+// statusSeq-bearing variant: used only by the statusSeq contract cases; the
+// seq-less fixture above stays the pre-seq server shape (untouched).
+export const codexContractSnapshotWithStatusSeq = {
+  ...codexContractSnapshot,
+  statusSeq: 1234,
+} satisfies FreshAgentSnapshot
+
 export const codexContractTurnPage = {
   sessionType: 'freshcodex',
   provider: 'codex',

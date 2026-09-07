@@ -53,6 +53,10 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   threadId: string
   status: FreshAgentSessionStatus
   statusVersion?: number
+  // Last accepted server-authoritative statusSeq (wall-clock-ms, strictly
+  // monotonic per session — the turn-complete clock regime). Undefined while
+  // every status write so far was seq-less (legacy fold).
+  lastStatusSeq?: number
   snapshot?: FreshAgentSnapshot
   latestTurnId?: string | null
   historySessionId?: string

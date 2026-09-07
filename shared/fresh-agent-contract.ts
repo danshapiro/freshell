@@ -249,6 +249,15 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   revision: z.number().int().nonnegative(),
   latestTurnId: z.string().nullable().optional(),
   status: z.string().min(1),
+  // Provider-agnostic, server-authoritative status sequence. Wall-clock
+  // milliseconds (NOT an ordinal counter), strictly monotonic per session via
+  // the server-side clamp `now <= last ? last + 1 : now` — the same regime as
+  // the turn-complete clock (server/fresh-agent/turn-complete-clock.ts). The
+  // client folds a status only when the seq is strictly newer than the last
+  // accepted one. Optional: pre-seq servers omit it and the client takes the
+  // legacy unconditional fold; untracked-default statuses (e.g. hardcoded-idle
+  // snapshot builders) emit WITHOUT a seq by design.
+  statusSeq: z.number().int().nonnegative().optional(),
   summary: z.string().optional(),
   capabilities: FreshAgentCapabilitiesSchema,
   settings: FreshAgentSettingsSchema.optional(),
@@ -263,8 +272,23 @@ export const FreshAgentSnapshotSchema = FreshAgentThreadLocatorSchema.extend({
   // Provider-advertised session commands. Optional on purpose: absence means
   // the provider has nothing to advertise (freshcodex, Rust port, offline),
   // and old servers/clients keep parsing unchanged (graceful absence).
+  // Emission is Node-server-only (2026-08-19-era, conditional); the Rust
+  // production builder never emits `commands`, so the field was never an
+  // exercised server→client precedent for additive-key tolerance (LB-01).
   commands: z.array(FreshAgentSessionCommandSchema).readonly().optional(),
 }).strict()
+
+// Contract split (LB-01): the snapshot object above is defined ONCE and both
+// variants are derived from it. `FreshAgentSnapshotSchema` stays `.strict()`
+// as the server-outbound choke and contract-test surface (zod STRICT rejects
+// unknown additive keys). Client-inbound REST parsing
+// (src/lib/api.ts getFreshAgentThreadSnapshot) uses this derived strip
+// variant so a long-lived old-bundle tab silently drops additive keys it
+// predates (statusSeq, and any future one) instead of throwing
+// FreshAgentApiContractError on every poll. Tolerance: new clients tolerate
+// old servers (statusSeq absent → legacy fold); old clients tolerate new
+// servers (unknown additive keys stripped).
+export const FreshAgentSnapshotClientSchema = FreshAgentSnapshotSchema.strip()
 
 export const FreshAgentTurnPageSchema = FreshAgentThreadLocatorSchema.extend({
   revision: z.number().int().nonnegative(),

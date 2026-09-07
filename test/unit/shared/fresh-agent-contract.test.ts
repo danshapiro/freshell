@@ -6,17 +6,20 @@ import {
   FreshAgentContractErrorSchema,
   FreshAgentRequestIdSchema,
   FreshAgentSessionCommandSchema,
+  FreshAgentSnapshotClientSchema,
   FreshAgentSnapshotSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
 } from '../../../shared/fresh-agent-contract.js'
 import {
   claudeContractSnapshot,
+  claudeContractSnapshotWithStatusSeq,
   claudeContractTurnBody,
   claudeContractTurnPage,
 } from '../../fixtures/fresh-agent/claude/contract-fixtures.js'
 import {
   codexContractSnapshot,
+  codexContractSnapshotWithStatusSeq,
   codexContractTurnBody,
   codexContractTurnPage,
 } from '../../fixtures/fresh-agent/codex/contract-fixtures.js'
@@ -89,6 +92,42 @@ describe('fresh-agent shared contract schemas', () => {
 
   it('registers the session-command schema for contract traceability', () => {
     expect(FRESH_AGENT_CONTRACT_SCHEMA_NAMES).toContain('FreshAgentSessionCommandSchema')
+  })
+
+  it('parses an optional statusSeq and round-trips it under BOTH the strict and client variants', () => {
+    for (const fixture of [claudeContractSnapshotWithStatusSeq, codexContractSnapshotWithStatusSeq]) {
+      expect(FreshAgentSnapshotSchema.parse(fixture).statusSeq).toBe(1234)
+      expect(FreshAgentSnapshotClientSchema.parse(fixture).statusSeq).toBe(1234)
+    }
+  })
+
+  it('still parses snapshots without statusSeq under both variants (optional — no regression)', () => {
+    expect('statusSeq' in FreshAgentSnapshotSchema.parse(claudeContractSnapshot)).toBe(false)
+    expect('statusSeq' in FreshAgentSnapshotSchema.parse(codexContractSnapshot)).toBe(false)
+    expect('statusSeq' in FreshAgentSnapshotClientSchema.parse(claudeContractSnapshot)).toBe(false)
+    expect('statusSeq' in FreshAgentSnapshotClientSchema.parse(codexContractSnapshot)).toBe(false)
+  })
+
+  it('client strip variant: silently strips an unknown future key instead of failing the poll (forward-compat)', () => {
+    // LB-01: a long-lived old-bundle tab must not hit a parse error on every
+    // snapshot poll when a newer server starts emitting additive keys.
+    const parsed = FreshAgentSnapshotClientSchema.parse({
+      ...claudeContractSnapshotWithStatusSeq,
+      futureField: true,
+    })
+    expect(parsed.statusSeq).toBe(1234)
+    expect((parsed as Record<string, unknown>).futureField).toBeUndefined()
+  })
+
+  it('strict server variant still rejects that same unknown key (the split did not relax the server choke)', () => {
+    const result = FreshAgentSnapshotSchema.safeParse({
+      ...codexContractSnapshotWithStatusSeq,
+      futureField: true,
+    })
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.message).join(' ')).toContain('futureField')
+    }
   })
 
   it('parses action results and contract errors with locator context', () => {

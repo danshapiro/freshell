@@ -1,7 +1,7 @@
 import type { CodingCliProviderName } from './coding-cli-types'
 import type { TokenSummary } from '@shared/ws-protocol'
 import {
-  FreshAgentSnapshotSchema,
+  FreshAgentSnapshotClientSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
 } from '@shared/fresh-agent-contract'
@@ -435,7 +435,11 @@ export async function getFreshAgentThreadSnapshot(
     ])}`,
     { ...options, signal },
   )
-  const parsed = FreshAgentSnapshotSchema.safeParse(data)
+  // Client-inbound parse uses the strip variant (LB-01): a long-lived old
+  // bundle silently drops additive keys it predates (e.g. statusSeq) instead
+  // of throwing a contract error on every poll. Genuinely malformed payloads
+  // still fail here and throw FreshAgentApiContractError.
+  const parsed = FreshAgentSnapshotClientSchema.safeParse(data)
   if (!parsed.success) {
     throw new FreshAgentApiContractError('Fresh-agent snapshot response did not match the shared contract.', parsed.error.issues)
   }
