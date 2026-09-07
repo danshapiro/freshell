@@ -102,7 +102,7 @@ function persistRecordedTurns(threadId, turns) {
   fs.writeFileSync(file, JSON.stringify(turns))
 }
 
-function makeRecordedTurn(turnId, promptText) {
+function makeRecordedTurn(turnId, promptText, startParams) {
   const nowSec = Math.floor(Date.now() / 1000)
   return {
     id: turnId,
@@ -116,6 +116,15 @@ function makeRecordedTurn(turnId, promptText) {
     startedAt: nowSec,
     completedAt: nowSec + 1,
     durationMs: 1000,
+    // kata z7j7 ADDITIVE: the turn/start params this turn was launched with —
+    // lets specs assert that per-send settings changed EXACTLY one turn
+    // (model/effort/sandbox/permission flow through).
+    start: startParams ? {
+      model: startParams.model,
+      effort: startParams.effort,
+      sandboxPolicy: startParams.sandboxPolicy,
+      approvalPolicy: startParams.approvalPolicy,
+    } : undefined,
   }
 }
 
@@ -311,7 +320,7 @@ function successResult(method, params) {
       const promptText = Array.isArray(params?.input)
         ? params.input.map((part) => (part && typeof part.text === 'string' ? part.text : '')).filter(Boolean).join('\n')
         : ''
-      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText)
+      const turn = makeRecordedTurn(`turn-${turns.length + 1}`, promptText, params)
       turns.push(turn)
       recordedTurnsByThread.set(threadId, turns)
       persistRecordedTurns(threadId, turns)
@@ -356,6 +365,28 @@ function successResult(method, params) {
     // AGENT-04 arm: the probed 0.147.0 response is an empty object; the whole
     // compact lifecycle then arrives as NOTIFICATIONS (emitCompactSequence,
     // called after this result is sent — mirrors the real server's ordering).
+    return {}
+  }
+  if (method === 'thread/revert') {
+    // kata 1wxv arm (codex 0.149.0 EXPERIMENTAL): thread/revert {threadId,
+    // beforeTurnId} — IN-PLACE, same-thread-id destructive history rollback.
+    // The recorded turns become the prefix STRICTLY BEFORE beforeTurnId (an
+    // accidental-empty prefix is LEGAL: it empties the thread). An unknown
+    // beforeTurnId (findIndex -1) leaves the history unchanged, mirroring the
+    // fork arm's silent-leniency. Loose `{}` result (fork's parse discipline);
+    // the `thread/reverted` notification broadcast rides the post-result seam
+    // in the message handler.
+    const threadId = params?.threadId
+    if (behavior.recordTurns) {
+      const turns = loadRecordedTurns(threadId)
+      const before = typeof params?.beforeTurnId === 'string' ? params.beforeTurnId : null
+      const cut = before ? turns.findIndex((turn) => turn?.id === before) : -1
+      if (cut !== -1) {
+        const kept = turns.slice(0, cut)
+        recordedTurnsByThread.set(threadId, kept)
+        persistRecordedTurns(threadId, kept)
+      }
+    }
     return {}
   }
   if (method === 'thread/archive' || method === 'thread/unarchive') {
@@ -460,6 +491,10 @@ if (behavior.spawnNativeChild) {
 const wss = new WebSocketServer({ host, port })
 const watches = new Map()
 const activeThreadIds = new Set()
+// kata 1wxv (LBC-1): thread/revert is paginated-only. Threads THIS process
+// started with historyMode:"paginated" on thread/start land here; any other
+// thread answers thread/revert with the VERIFIED -32600 refusal.
+const paginatedThreadIds = new Set()
 let forkCounter = 0
 
 function broadcastNotification(method, params) {
@@ -593,8 +628,20 @@ function claimCrossProcessCloseSocketOnce(method) {
 wss.on('connection', (socket) => {
   let initialized = false
   let initializedNotification = false
+  const pendingClientRequests = new Map()
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
+    if (message.method === undefined && ('result' in message || 'error' in message)) {
+      const pending = pendingClientRequests.get(message.id)
+      if (pending) {
+        pendingClientRequests.delete(message.id)
+        if (behavior.appendClientResponseLogPath) {
+          fs.appendFileSync(behavior.appendClientResponseLogPath, JSON.stringify(message) + '\n')
+        }
+        pending.resolve(message)
+      }
+      return
+    }
     if (!Object.prototype.hasOwnProperty.call(message, 'id')) {
       if (message.method === 'initialized') {
         initializedNotification = true
@@ -709,6 +756,24 @@ wss.on('connection', (socket) => {
       }
     }
 
+    // kata 1wxv (LBC-1, VERIFIED): thread/revert refuses a legacy-mode thread —
+    // only a thread THIS process started with historyMode:"paginated" may be
+    // reverted. Threads freshell starts always set the mode (Task 2), so this
+    // refusal exercises only the pre-feature legacy back-catalog.
+    if (
+      method === 'thread/revert'
+      && !paginatedThreadIds.has(String(message.params?.threadId ?? ''))
+    ) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32600,
+          message: 'thread/revert only supports paginated threads',
+        },
+      }))
+      return
+    }
+
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
@@ -737,6 +802,14 @@ wss.on('connection', (socket) => {
         // The compact RPC result is empty; the lifecycle rides notifications.
         await emitCompactNotificationSequence(message.params?.threadId)
       }
+      if (method === 'turn/interrupt') {
+        for (const [id, pending] of pendingClientRequests) {
+          if (pending.threadId !== message.params?.threadId) continue
+          pendingClientRequests.delete(id)
+          broadcastNotification('serverRequest/resolved', { threadId: pending.threadId, requestId: id })
+          pending.resolve({ cancelled: true })
+        }
+      }
       if (method === 'turn/start' && behavior.recordTurns && result?.turn?.id) {
         // recordTurns opt-in: a recorded turn closes with the real turn
         // lifecycle notifications (turn/started → turn/completed{completed})
@@ -750,10 +823,24 @@ wss.on('connection', (socket) => {
           threadId: message.params?.threadId,
           turn: { id: result.turn.id, status: 'inProgress' },
         })
+        const prompt = (message.params?.input ?? []).filter((part) => part.type === 'text').map((part) => part.text).join('\n')
+        const userRequest = behavior.serverRequestsByPrompt?.[prompt]
+        let interrupted = false
+        if (userRequest) {
+          const id = userRequest.id ?? `request-${result.turn.id}`
+          const response = await new Promise((resolve) => {
+            pendingClientRequests.set(id, { resolve, threadId: message.params.threadId })
+            socket.send(JSON.stringify({ id, method: userRequest.method, params: {
+              threadId: message.params.threadId, turnId: result.turn.id, itemId: `item-${result.turn.id}`,
+              ...userRequest.params,
+            } }))
+          })
+          interrupted = response.cancelled === true
+        }
         await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
-          turn: { id: result.turn.id, status: 'completed' },
+          turn: { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
         })
       }
       if (method === 'initialize') {
@@ -762,8 +849,21 @@ wss.on('connection', (socket) => {
       if (method === 'thread/start') {
         const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
         activeThreadIds.add(thread.id)
+        // kata 1wxv (LBC-1): threads started paginated are the only threads
+        // thread/revert accepts (the refusal gate above consults this set).
+        if (message.params?.historyMode === 'paginated') {
+          paginatedThreadIds.add(thread.id)
+        }
         broadcastNotification('thread/started', {
           thread,
+        })
+      }
+      if (method === 'thread/revert') {
+        // kata 1wxv: the real app-server announces an applied revert to every
+        // connected client (the result above already answered the requester).
+        broadcastNotification('thread/reverted', {
+          threadId: message.params?.threadId,
+          beforeTurnId: message.params?.beforeTurnId,
         })
       }
       if (method === 'thread/resume') {

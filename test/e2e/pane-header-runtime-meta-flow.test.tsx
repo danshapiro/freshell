@@ -25,6 +25,7 @@ import {
   resolveLocalSettings,
 } from '@shared/settings'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { installPaneGeometry } from '../helpers/pane-geometry'
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
@@ -36,6 +37,8 @@ const wsMocks = vi.hoisted(() => {
       messageHandlers.add(callback)
       return () => messageHandlers.delete(callback)
     }),
+    // Interest is transient and negotiated; this suite does not exercise it.
+    sendTerminalInterest: vi.fn(() => false),
     onReconnect: vi.fn(() => () => {}),
     setHelloExtensionProvider: vi.fn(),
     isReady: false,
@@ -59,6 +62,7 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsMocks.send,
     connect: wsMocks.connect,
+    sendTerminalInterest: wsMocks.sendTerminalInterest,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
@@ -348,6 +352,15 @@ function createStore(options?: {
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
   HTMLElement.prototype.scrollIntoView = vi.fn()
+})
+
+const paneGeometry: { current: ReturnType<typeof installPaneGeometry> | null } = { current: null }
+beforeEach(() => {
+  paneGeometry.current = installPaneGeometry()
+})
+afterEach(() => {
+  paneGeometry.current?.restore()
+  paneGeometry.current = null
 })
 
 describe('pane header runtime metadata flow (e2e)', () => {

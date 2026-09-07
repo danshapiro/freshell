@@ -143,6 +143,13 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-success/15')
   })
 
+  it('bumps green fill opacity in dark mode for active attention tab with highlight', () => {
+    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="highlight" />)
+    const el = getTabElement()
+    expect(el?.className).toContain('bg-success/15')
+    expect(el?.className).toContain('dark:bg-success/25')
+  })
+
   it('applies attention classes on active tab with darken', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="darken" />)
     const el = getTabElement()

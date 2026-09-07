@@ -3,7 +3,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
 import { resetStatusSeqBaselines } from '@/store/freshAgentSlice'
-import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
+import { setLocalSettings, setServerConfigDir, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
   patchSessionRunningStateFromTerminalMeta,
@@ -20,7 +20,8 @@ import {
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
-import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
+import { reassertAllOpenPanes } from '@/lib/kill-ack'
+import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -34,6 +35,7 @@ import {
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
+import { checkServerBuildId } from '@/lib/server-build-check'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import { useThemeEffect } from '@/hooks/useTheme'
@@ -45,7 +47,8 @@ import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotific
 import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
-import { startTabRegistrySync } from '@/store/tabRegistrySync'
+import { startTabRegistrySync, getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
+import { startSessionGreyTouchWatcher } from '@/store/sessionGreyTouch'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
@@ -56,6 +59,7 @@ import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { DeadSessionPanel } from '@/components/DeadSessionPanel'
+import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
@@ -76,6 +80,8 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
+import { hostStatsReset, hostStatsSnapshotReceived, hostStatsSubscribedSet, resolveHostStatsRefresh, failHostStatsRefresh } from '@/store/hostStatsSlice'
+import { subscribeHostStats } from '@/lib/host-stats-ws'
 import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -127,6 +133,8 @@ function isVersionInfo(value: unknown): value is VersionInfo {
 type ConfigFallbackInfo = {
   reason: 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR' | 'ENOENT'
   backupExists: boolean
+  /** Profile-aware backup path (when the server provides it). */
+  backupPath?: string
 }
 
 type BootstrapPlatformInfo = {
@@ -160,6 +168,13 @@ const ReadyMessageSchema = z.object({
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
   bootId: z.string().min(1).optional(),
+  // The server's baked build identity (additive/optional — old servers omit
+  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
+  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
+  // there, never fail the WHOLE ready frame and silently disable restart
+  // detection. Only a non-string TYPE can fail the frame, which no real
+  // server emits (the helper additionally treats "unknown" as a no-op).
+  buildId: z.string().optional(),
   // Server capability ack (present iff our hello opted in). Deliberately a
   // loose record: an unexpected capabilities shape must never fail the WHOLE
   // ready frame and silently disable restart detection.
@@ -504,6 +519,7 @@ export default function App() {
     let cleanedUp = false
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
+    let stopSessionGreyTouch: (() => void) | null = null
     let stopWsDisconnectSync: (() => void) | null = null
     let bootstrapDataLoading = false
     let sidebarWindowLoading = false
@@ -543,6 +559,7 @@ export default function App() {
         // fetches (cleanup + stopTabRegistrySync are already assigned by now).
         cleanup?.()
         stopTabRegistrySync?.()
+        stopSessionGreyTouch?.()
       }
 
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
@@ -562,7 +579,9 @@ export default function App() {
             configFallback?: {
               reason?: unknown
               backupExists?: unknown
+              backupPath?: unknown
             }
+            configDir?: string
           }
           let bootstrapData: BootstrapData | undefined
           let lastBootstrapError: unknown
@@ -630,7 +649,14 @@ export default function App() {
               setConfigFallback({
                 reason: parseConfigFallbackReason(bootstrapData.configFallback.reason),
                 backupExists: !!bootstrapData.configFallback.backupExists,
+                backupPath:
+                  typeof bootstrapData.configFallback.backupPath === 'string'
+                    ? bootstrapData.configFallback.backupPath
+                    : undefined,
               })
+            }
+            if (typeof bootstrapData.configDir === 'string' && bootstrapData.configDir) {
+              dispatch(setServerConfigDir(bootstrapData.configDir))
             }
           }
           return true
@@ -705,6 +731,10 @@ export default function App() {
       // early messages.
       const ws = getWsClient()
       stopTabRegistrySync = startTabRegistrySync(appStore, ws)
+      // Grey-transition touch: sessions leaving non-grey status (any of the
+      // four tiers) get an activity ratchet, so the default sort floats them
+      // to the top of the grey agents. Store-only; no WS dependency.
+      stopSessionGreyTouch = startSessionGreyTouchWatcher(appStore)
 
       // Set up hello extension to include session IDs for prioritized repair
       ws.setHelloExtensionProvider(() => ({
@@ -714,6 +744,13 @@ export default function App() {
           appStore.getState().panes,
         ),
         client: { mobile: isMobileRef.current },
+        // D8 (restore-open-sessions-only): the connection's provenance identity
+        // — the same deviceId/clientInstanceId `tabs.sync.push` frames carry —
+        // so the server can stamp connection-scoped ledger bind rows. The
+        // provider is re-invoked per (re)connect, so a lease-collision rotation
+        // re-stamps on the next hello.
+        deviceId: appStore.getState().tabRegistry.deviceId,
+        clientInstanceId: getCurrentTabRegistryClientInstanceId(),
       }))
 
       const requestCodexActivityList = () => {
@@ -791,6 +828,8 @@ export default function App() {
         resetClaudeActivityOverlay()
         resetAmplifierActivityOverlay()
         resetOpencodeActivityOverlay()
+        // The hoststats subscription died with the socket; keep last-known values.
+        dispatch(hostStatsReset())
         dispatch(setStatus('disconnected'))
       }) ?? null
 
@@ -1030,6 +1069,12 @@ export default function App() {
             if (!newBootId) {
               log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
             }
+            // Server-build mismatch detection: the server stamps the git
+            // commit it was built from (ready.buildId, additive/optional);
+            // we compare it against our own Vite-baked
+            // __FRESHELL_BUILD_ID__ and reload ONCE on a mismatch (sentinel
+            // loop-guard lives in src/lib/server-build-check.ts).
+            checkServerBuildId({ serverBuildId: ready.data.buildId })
             const bootIdRestart = !!previousBootId && previousBootId !== newBootId
             const instanceChanged = !!previousServerInstanceId
               && !!nextServerInstanceId
@@ -1103,6 +1148,21 @@ export default function App() {
             } else {
               ws.clearReconcileCreateHold()
             }
+            // Focused-episode-7 round 3 (Finding F2; round-4 widened to
+            // fresh-agent panes) — the per-ready open re-assertion sweep:
+            // assert every session pane the client is DISPLAYING, so the
+            // server consumes any standing close record that contradicts the
+            // displayed layout (the healed shape is a committed close whose
+            // ack was lost mid-socket-death — incl. across a page reload,
+            // which drops the send queue). One idempotent message per
+            // displayed pane EXCEPT a pane whose close acknowledgement is
+            // outstanding (round-5 F1: the queued close flushed immediately
+            // above, inside the ws-client's ready handling, and an
+            // open-assert behind it would consume the just-committed close
+            // evidence before its ack arrives). Each send listens for its
+            // bounded correlated `pane.opened.result` (round-5 F3): a failed
+            // consume is marked, logged, and retried by the next sweep.
+            reassertAllOpenPanes(appStore.getState().panes.layouts)
           }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
@@ -1112,6 +1172,15 @@ export default function App() {
           requestClaudeActivityList()
           requestAmplifierActivityList()
           requestOpencodeActivityList()
+          // hoststats: the old socket's subscription died; keep last live/manual
+          // values and resubscribe iff any Host Stats panes are mounted.
+          dispatch(hostStatsReset())
+          // `?.` mirrors the state.freshAgent?.sessions precedent: App-level
+          // folds run against deliberately partial stores in App unit tests.
+          if ((appStore.getState().hostStats?.mountedPanes ?? 0) > 0) {
+            subscribeHostStats()
+            dispatch(hostStatsSubscribedSet(true))
+          }
           lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
@@ -1432,6 +1501,7 @@ export default function App() {
           setConfigFallback({
             reason: parseConfigFallbackReason(msg.reason),
             backupExists: !!msg.backupExists,
+            backupPath: typeof msg.backupPath === 'string' ? msg.backupPath : undefined,
           })
         }
 
@@ -1444,6 +1514,31 @@ export default function App() {
         }
         if (msg.type === 'extension.server.stopped') {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
+        }
+
+        // hoststats.* frames are server-validated; the client trusts them and
+        // folds without runtime revalidation (shared/ws-protocol.ts header).
+        if (msg.type === 'hoststats.snapshot') {
+          const snapshot = msg as HostStatsSnapshotMessage
+          dispatch(hostStatsSnapshotReceived({
+            at: snapshot.at,
+            live: snapshot.live,
+            manualAt: snapshot.manualAt ?? null,
+            manual: snapshot.manual ?? null,
+          }))
+        }
+        if (msg.type === 'hoststats.refresh.response') {
+          const resp = msg as HostStatsRefreshResponseMessage
+          // Ref-map semantics keyed by requestId; unknown ids are ignored by
+          // the resolve/fail thunks without throwing.
+          const requestId = typeof resp.requestId === 'string' ? resp.requestId : ''
+          if (requestId) {
+            if (resp.ok === true && typeof resp.at === 'number' && resp.manual) {
+              dispatch(resolveHostStatsRefresh({ requestId, at: resp.at, manual: resp.manual }))
+            } else if (resp.ok === false) {
+              dispatch(failHostStatsRefresh({ requestId, error: typeof resp.error === 'string' ? resp.error : 'refresh failed' }))
+            }
+          }
         }
 
         handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
@@ -1544,6 +1639,7 @@ export default function App() {
       clearReconcileResultWait()
       cleanup?.()
       stopTabRegistrySync?.()
+      stopSessionGreyTouch?.()
       stopWsDisconnectSync?.()
       void cleanupPromise
     }
@@ -1758,7 +1854,7 @@ export default function App() {
               <p>
                 Config file was invalid ({describeConfigFallbackReason(configFallback.reason)}), so freshell loaded defaults.
                 {configFallback.backupExists
-                  ? ' Backup found at ~/.freshell/config.backup.json.'
+                  ? ` Backup found at ${configFallback.backupPath ?? '~/.freshell/config.backup.json'}.`
                   : ' No backup file was found.'}
               </p>
             </div>
@@ -1970,6 +2066,7 @@ npm run serve`}</pre>
         </div>
       )}
       <AuthRequiredModal />
+      <TerminalInterestReporter workspaceVisible={view === 'terminal'} />
       <DeadSessionPanel />
       <ReconcileWarmingBanner />
       {showSetupWizard && (

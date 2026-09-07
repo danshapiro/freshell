@@ -3,7 +3,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { resetPaneForReconcileCreate } from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
@@ -49,6 +49,7 @@ const {
   saveServerSettingsPatchSpy,
   cancelCreateSpy,
   cancelWsCreateSpy,
+  wsMessageHandlers,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -69,14 +70,73 @@ const {
   })),
   cancelCreateSpy: vi.fn(),
   cancelWsCreateSpy: vi.fn(),
+  wsMessageHandlers: new Set<(msg: unknown) => void>(),
 }))
+
+/** Deliver a server frame to every subscribed ws handler (the kill-ack waits). */
+function emitWsMessage(msg: unknown) {
+  for (const handler of [...wsMessageHandlers]) handler(msg)
+}
+
+/** Answer every in-flight pane.closed with success (delta-r7-r3, F2: the
+ * healthy-server close acknowledgment the close gate awaits). */
+function ackPaneClosesMocked() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; createRequestId?: string }
+    if (m?.type === 'pane.closed' && m.createRequestId) {
+      emitWsMessage({
+        type: 'pane.closed.result',
+        createRequestId: m.createRequestId,
+        success: true,
+      })
+    }
+  }
+}
+
+/** Answer the in-flight fresh-agent kills with success. */
+function ackFreshAgentKillsMocked() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; sessionId?: string; sessionType?: string; provider?: string }
+    if (m?.type === 'freshAgent.kill' && m.sessionId) {
+      emitWsMessage({
+        type: 'freshAgent.killed',
+        sessionId: m.sessionId,
+        sessionType: m.sessionType,
+        provider: m.provider,
+        success: true,
+      })
+    }
+  }
+}
+
+/** Answer every in-flight panes.closed batch with success (focused-episode-7
+ * round 4, F2: a fresh-agent pane's removal flows the SAME close gate — the
+ * last-pane cascade's closeTab sends the batch envelope, and the gate awaits
+ * its correlated answer). */
+function ackPanesClosedBatchesMocked() {
+  for (const [msg] of mockSend.mock.calls) {
+    const m = msg as { type?: string; requestId?: string }
+    if (m?.type === 'panes.closed' && m.requestId) {
+      emitWsMessage({
+        type: 'panes.closed.result',
+        requestId: m.requestId,
+        success: true,
+      })
+    }
+  }
+}
 
 // Mock the ws-client module
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
     cancelCreate: cancelWsCreateSpy,
-    onMessage: () => () => {},
+    onMessage: (handler: (msg: unknown) => void) => {
+      wsMessageHandlers.add(handler)
+      return () => {
+        wsMessageHandlers.delete(handler)
+      }
+    },
   }),
 }))
 
@@ -142,6 +202,9 @@ vi.mock('lucide-react', () => ({
   ),
   LayoutGrid: ({ className }: { className?: string }) => (
     <svg data-testid="layout-grid-icon" className={className} />
+  ),
+  Gauge: ({ className }: { className?: string }) => (
+    <svg data-testid="gauge-icon" className={className} />
   ),
   Maximize2: ({ className }: { className?: string }) => (
     <svg data-testid="maximize-icon" className={className} />
@@ -419,7 +482,7 @@ describe('PaneContainer', () => {
   })
 
   describe('terminal cleanup on pane close', () => {
-    it('sends terminal.detach message when closing a pane with terminalId', () => {
+    it('closing a pane sends the plain identity-driven detach AND the pane-close evidence keyed by the pane\'s createRequestId (delta-round-7 F2 / delta-r7-r2 F2)', async () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
       const terminalId = 'term-123'
@@ -433,12 +496,12 @@ describe('PaneContainer', () => {
           {
             type: 'leaf',
             id: pane1Id,
-            content: createTerminalContent({ terminalId }),
+            content: createTerminalContent({ terminalId, createRequestId: 'req-pane-1' }),
           },
           {
             type: 'leaf',
             id: pane2Id,
-            content: createTerminalContent({ terminalId: 'term-456' }),
+            content: createTerminalContent({ terminalId: 'term-456', createRequestId: 'req-pane-2' }),
           },
         ],
       }
@@ -457,14 +520,26 @@ describe('PaneContainer', () => {
       const closeButtons = screen.getAllByTitle('Close pane')
       fireEvent.click(closeButtons[0])
 
-      // Should have sent terminal.detach with the correct terminalId
+      // The durable, NON-retiring pane-close record rides its own message,
+      // keyed by the closing pane's createRequestId — sent FIRST, and the
+      // gate (delta-r7-r3 F2) awaits the server's answer before the layout
+      // loses the pane (the detach follows after the ack).
       expect(mockSend).toHaveBeenCalledWith({
-        type: 'terminal.detach',
-        terminalId: terminalId,
+        type: 'pane.closed',
+        createRequestId: 'req-pane-1',
+        terminalId,
+      })
+      ackPaneClosesMocked()
+      // The detach stays identity-driven (about the TERMINAL, never the pane).
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith({
+          type: 'terminal.detach',
+          terminalId: terminalId,
+        })
       })
     })
 
-    it('sends exactly one terminal.detach when closing a pane with terminalId', () => {
+    it('sends exactly one terminal.detach when closing a pane with terminalId', async () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
       const terminalId = 'term-123'
@@ -478,12 +553,12 @@ describe('PaneContainer', () => {
           {
             type: 'leaf',
             id: pane1Id,
-            content: createTerminalContent({ terminalId }),
+            content: createTerminalContent({ terminalId, createRequestId: 'req-pane-1' }),
           },
           {
             type: 'leaf',
             id: pane2Id,
-            content: createTerminalContent({ terminalId: 'term-456' }),
+            content: createTerminalContent({ terminalId: 'term-456', createRequestId: 'req-pane-2' }),
           },
         ],
       }
@@ -499,13 +574,107 @@ describe('PaneContainer', () => {
       )
 
       // Click the close button on the first pane
+      const closeButtons = screen.getAllByTitle('Close pane')
+      fireEvent.click(closeButtons[0])
+
+      ackPaneClosesMocked()
+      await waitFor(() => {
+        const detachMessages = mockSend.mock.calls
+          .map(([msg]) => msg as { type?: string; terminalId?: string })
+          .filter((msg) => msg?.type === 'terminal.detach')
+        expect(detachMessages).toHaveLength(1)
+      })
+    })
+
+    // Delta-round-7 (Finding F2) — the strongest false-positive guard: a
+    // NON-close layout reduction that drops a terminal handle (here: the
+    // reconcile resume/fresh create reset, which PRESERVES the still-open
+    // pane's createRequestId while swapping out its dead handle) must send a
+    // PLAIN detach. Carrying the preserved createRequestId would mark the
+    // still-open pane's durable record as closed and wrongly ghost it from
+    // future recovery offers.
+    it('a reconcile create reset (NOT a pane close) detaches WITHOUT any createRequestId', () => {
+      const pane1Id = 'pane-1'
+      const rootNode: PaneNode = {
+        type: 'leaf',
+        id: pane1Id,
+        content: createTerminalContent({
+          terminalId: 'term-stale',
+          createRequestId: 'req-preserved',
+          sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+          mode: 'claude',
+        }),
+      }
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': pane1Id },
+      })
+
+      store.dispatch(
+        resetPaneForReconcileCreate({
+          tabId: 'tab-1',
+          paneId: pane1Id,
+          intent: 'respawn',
+          sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+        }),
+      )
+
+      const detachMessages = mockSend.mock.calls
+        .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
+        .filter((msg) => msg?.type === 'terminal.detach')
+      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-stale' }])
+      // …and NO pane-close evidence: nothing was closed (delta-r7-r2 F2).
+      expect(
+        mockSend.mock.calls.some(([msg]) => (msg as { type?: string })?.type === 'pane.closed'),
+      ).toBe(false)
+      // The pane is STILL open with its createRequestId preserved.
+      const layout = (store.getState() as { panes: PanesState }).panes.layouts['tab-1']
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content.createRequestId : undefined).toBe('req-preserved')
+    })
+
+    // The fallback arm: a closed pane that somehow carries NO createRequestId
+    // detaches as plainly as any legacy client — never a malformed record key.
+    it('closing a pane without a createRequestId sends a plain createRequestId-less detach', () => {
+      const pane1Id = 'pane-1'
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: pane1Id,
+            content: createTerminalContent({ terminalId: 'term-no-crid' }),
+          },
+          {
+            type: 'leaf',
+            id: 'pane-2',
+            content: createTerminalContent({ terminalId: 'term-456', createRequestId: 'req-pane-2' }),
+          },
+        ],
+      }
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': pane1Id },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
       const closeButtons = screen.getAllByTitle('Close pane')
       fireEvent.click(closeButtons[0])
 
       const detachMessages = mockSend.mock.calls
-        .map(([msg]) => msg as { type?: string; terminalId?: string })
+        .map(([msg]) => msg as { type?: string; terminalId?: string; createRequestId?: string })
         .filter((msg) => msg?.type === 'terminal.detach')
-      expect(detachMessages).toHaveLength(1)
+      expect(detachMessages).toEqual([{ type: 'terminal.detach', terminalId: 'term-no-crid' }])
+      // A pane with no createRequestId never produces a record key
+      // (delta-r7-r2 F2): no pane.closed either.
+      expect(
+        mockSend.mock.calls.some(([msg]) => (msg as { type?: string })?.type === 'pane.closed'),
+      ).toBe(false)
     })
 
     it('does not send terminal.detach when closing a pane without terminalId', () => {
@@ -725,6 +894,9 @@ describe('PaneContainer', () => {
       mockApiPatch.mockResolvedValueOnce({
         status: 'ok',
         message: 'pane not found',
+      }).mockResolvedValue({
+        status: 'ok',
+        message: 'pane not found',
       })
 
       const leafNode: PaneNode = {
@@ -753,10 +925,48 @@ describe('PaneContainer', () => {
       await waitFor(() => {
         expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
       })
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent('pane not found')
+      }, { timeout: 5_000 })
+      expect(mockApiPatch).toHaveBeenCalledTimes(4)
       expect(await screen.findByLabelText('Rename pane')).toHaveValue('Ops desk')
-      expect(screen.getByRole('alert')).toHaveTextContent('pane not found')
       expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
       expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
+    })
+
+    it('retries the rename when the pane is not yet mirrored and commits once it lands', async () => {
+      mockApiPatch
+        .mockResolvedValueOnce({ status: 'ok', message: 'pane not found' })
+        .mockResolvedValueOnce({
+          status: 'ok',
+          data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: true },
+          message: 'pane renamed',
+        })
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+      renderWithStore(<PaneContainer tabId="tab-1" node={leafNode} />, store)
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
+      }, { timeout: 5_000 })
+      expect(mockApiPatch).toHaveBeenCalledTimes(2)
+      expect(mockApiPatch).toHaveBeenNthCalledWith(2, '/api/panes/pane-1', { name: 'Ops desk' })
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     })
 
     it('does not update local pane titles when the pane rename API rejects the request', async () => {
@@ -1059,6 +1269,105 @@ describe('PaneContainer', () => {
         provider: 'opencode',
         cwd: '/repo/session-state',
       })
+    })
+
+    it('closes the fresh-agent pane only once the killed answer confirms the durable close', async () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent-ack',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-ack-close',
+          sessionId: 'thread-codex-ack',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent-ack' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      // The kill is in flight; the pane must NOT be dropped before the
+      // correlated answer arrives (focused-episode-6 round 2, Finding 6).
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'thread-codex-ack' }),
+      )
+      expect(
+        (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>)?.id,
+      ).toBe('pane-fresh-agent-ack')
+
+      ackFreshAgentKillsMocked()
+      // Focused-episode-7 round 4 (F2): the kill's retiring envelope and the
+      // pane-gate's per-REMOVAL close coexist — the last-pane cascade's
+      // closeTab sends the batch envelope covering the fresh-agent identity
+      // and awaits ITS correlated answer before the layout moves.
+      await waitFor(() => {
+        expect(mockSend).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: 'panes.closed',
+            panes: [{ createRequestId: 'req-fresh-ack-close' }],
+          }),
+        )
+      })
+      ackPanesClosedBatchesMocked()
+      await waitFor(() => {
+        expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+      })
+    })
+
+    it('keeps the fresh-agent pane standing when the kill answers success:false', async () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent-fail',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-fail-close',
+          sessionId: 'thread-codex-fail',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent-fail' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      emitWsMessage({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-codex-fail',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(
+        store.getState().panes.layouts['tab-1'],
+        'an unacknowledged/unrecorded close is not a close: the pane stays',
+      ).toBeTruthy()
     })
 
     it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {
@@ -1840,7 +2149,7 @@ describe('PaneContainer', () => {
           expect(paneContent.sessionType).toBe('freshcodex')
           expect(paneContent.provider).toBe('codex')
           expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
-          expect(paneContent.model).toBe('gpt-5.5')
+          expect(paneContent.model).toBe('gpt-6-astra')
           expect(paneContent.effort).toBe('max')
         }
       })
@@ -1853,12 +2162,12 @@ describe('PaneContainer', () => {
       }))
     })
 
-    it('normalizes stale Freshcodex effort from provider settings against the active model', async () => {
+    it('normalizes saved Freshcodex effort from provider settings against the active model', async () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(
         node,
         undefined,
-        { codex: { model: 'gpt-5.4-flash' } },
+        { codex: { model: 'gpt-5.6-luna' } },
         ['claude', 'codex'],
         { claude: true, codex: true },
         { freshcodex: { effort: 'xhigh' } },
@@ -1882,8 +2191,8 @@ describe('PaneContainer', () => {
         const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
         expect(paneContent.kind).toBe('fresh-agent')
         if (paneContent.kind === 'fresh-agent') {
-          expect(paneContent.model).toBe('gpt-5.4-flash')
-          expect(paneContent.effort).toBe('high')
+          expect(paneContent.model).toBe('gpt-5.6-luna')
+          expect(paneContent.effort).toBe('max')
         }
       })
     })

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  FRESHCODEX_DEFAULT_MODEL,
   FRESHOPENCODE_DEFAULT_EFFORT,
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   getFreshAgentThinkingOptions,
@@ -26,6 +27,25 @@ describe('fresh-agent-models freshopencode static menu', () => {
 
   it('returns undefined for resolveFreshAgentModelOption when the model is not in the empty static menu', () => {
     expect(resolveFreshAgentModelOption('freshopencode', 'opencode-go/glm-5.2')).toBeUndefined()
+  })
+})
+
+describe('fresh-agent-models freshcodex static menu', () => {
+  it('tracks the current Codex model availability list', () => {
+    expect(FRESHCODEX_DEFAULT_MODEL).toBe('gpt-6-astra')
+    expect(FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE.freshcodex.map((option) => option.value)).toEqual([
+      'gpt-6-astra',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.3-codex-spark',
+    ])
+  })
+
+  it('falls back retired or unknown freshcodex models to the current default', () => {
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4')).toBe('gpt-6-astra')
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'gpt-5.4-mini')).toBe('gpt-6-astra')
+    expect(normalizeFreshAgentModel('freshcodex', 'codex', 'unknown-model')).toBe('gpt-6-astra')
   })
 })
 

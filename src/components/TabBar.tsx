@@ -4,8 +4,8 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { getTabDisplayTitle } from '@/lib/tab-title'
-import { sendTerminalKill } from '@/lib/terminal-kill'
-import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
+import { sendTerminalKillAndAwait } from '@/lib/kill-ack'
+import { collectPaneEntries, collectTerminalCloseTargets } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
 import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
@@ -292,15 +292,9 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     return out
   }, [repoIconsByCwd])
 
-  const getTerminalIdsForTab = useCallback((tab: Tab): string[] => {
+  const getTerminalCloseTargetsForTab = useCallback((tab: Tab) => {
     const layout = paneLayouts[tab.id]
-    if (layout) {
-      const ids = collectTerminalIds(layout)
-      if (ids.length > 0) {
-        return Array.from(new Set(ids))
-      }
-    }
-    return []
+    return layout ? collectTerminalCloseTargets(layout) : []
   }, [paneLayouts])
 
   const getBusyPaneIds = useCallback((tab: Tab): string[] => getBusyPaneIdsForTab({
@@ -401,9 +395,28 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         }}
         onClose={(e) => {
           if (e.shiftKey) {
-            const terminalIds = getTerminalIdsForTab(tab)
-            for (const terminalId of terminalIds) {
-              sendTerminalKill(terminalId)
+            const targets = getTerminalCloseTargetsForTab(tab)
+            if (targets.length > 0) {
+              // Focused-episode-6 round 2 (Findings 6+7): AWAIT every
+              // terminal's durable close before dropping the tab — a kill
+              // whose close envelope failed leaves BOTH the terminal running
+              // AND the tab standing (the failed pane's own notice explains
+              // it; `terminal.killed{success:false}`), never a live-but-not-
+              // open session. A 5s-timeout arm resolves as failure for the UI
+              // only; the server close stays authoritative.
+              void (async () => {
+                const acks = await Promise.all(
+                  targets.map((t) =>
+                    sendTerminalKillAndAwait(t.terminalId, {
+                      createRequestId: t.createRequestId,
+                    }),
+                  ),
+                )
+                if (acks.every((ack) => ack.ok)) {
+                  dispatch(closeTab(tab.id))
+                }
+              })()
+              return
             }
           }
           dispatch(closeTab(tab.id))
@@ -431,7 +444,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     getDisplayTitle,
     getBusyPaneIds,
     getPaneEntries,
-    getTerminalIdsForTab,
+    getTerminalCloseTargetsForTab,
     iconsOnTabs,
     multirowTabs,
     uniformTabWidthPx,

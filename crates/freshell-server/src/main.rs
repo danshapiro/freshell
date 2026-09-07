@@ -18,6 +18,7 @@
 
 mod ai_router;
 mod ai_title;
+mod attachments;
 mod auto_title;
 mod auto_title_sweep;
 mod boot;
@@ -27,6 +28,7 @@ mod existence;
 mod existence_by_id;
 mod extensions;
 mod files;
+mod host_stats;
 mod identity_sink;
 mod instance_id;
 mod legacy_local_seed;
@@ -91,58 +93,26 @@ fn load_dotenv_from(dir: &Path) {
     let _ = dotenvy::from_path(dir.join(".env"));
 }
 
-/// Task 16 (`PATCH /api/panes/:id` cascade): the production
-/// [`freshell_freshagent::RenamePersistence`] — `persistSyncableTerminalRename`'s
-/// `configStore` writes (`server/agent-api/router.ts:681-683`) through the
-/// live settings store. The terminal write is a plain `{titleOverride}`
-/// patch (terminal overrides have no source ladder). The session write
-/// carries `titleSource:'user'` — a DELIBERATE divergence from Node's plain
-/// `{titleOverride}` patch (`persistSyncableTerminalRename`,
-/// `router.ts:679-681`), ledgered as EDEV-10 in `port/oracle/DEVIATIONS.md`:
-/// a pane rename is a USER rename, and leaving the ladder rung unfinalized
-/// lets the auto-title sweep's first-message pass permanently steal a rename
-/// that lands before the session finalizes (pinned RED-first by
-/// `auto_title_sweep::tests::pane_rename_cascade_before_finalization_survives_next_sweep_pass`).
-/// This matches the `user` rung both servers already write on the
-/// terminals-route cascade (`terminals.rs:1000-1004`; Node
-/// `rename-cascade.ts:26`).
-struct SettingsRenamePersistence(settings_store::SettingsStore);
-
-impl freshell_freshagent::RenamePersistence for SettingsRenamePersistence {
-    fn patch_terminal_override_title(
-        &self,
-        terminal_id: &str,
-        title: &str,
-    ) -> freshell_freshagent::BoxFuture<()> {
-        let store = self.0.clone();
-        let terminal_id = terminal_id.to_string();
-        let title = serde_json::json!(title);
-        Box::pin(async move {
-            let _ = store
-                .patch_terminal_override(&terminal_id, &[("titleOverride", Some(title))])
-                .await;
-        })
-    }
-
-    fn patch_session_override_title(
-        &self,
-        key: &str,
-        title: &str,
-    ) -> freshell_freshagent::BoxFuture<()> {
-        let store = self.0.clone();
-        let key = key.to_string();
-        let title = serde_json::json!(title);
-        Box::pin(async move {
-            let _ = store
-                .patch_session_override(
-                    &key,
-                    &[
-                        ("titleOverride", Some(title)),
-                        ("titleSource", Some(serde_json::json!("user"))),
-                    ],
-                )
-                .await;
-        })
+/// Delta-r6-r4 (focused-episode-6 round 3, Finding 2): the close-evidence
+/// retention gate input — every pane identity the retained snapshot
+/// generations reference, scanned from the SAME `tabs-snapshots` store the
+/// recovery route reads. A scan ERROR maps to `None` = "references unknown"
+/// = the gate keeps EVERYTHING this pass (over-pruning the only closed
+/// verdict for a pane a retained snapshot still claims is never acceptable).
+fn snapshot_close_evidence_references(
+    home: &Option<PathBuf>,
+) -> Option<freshell_ws::tabs_persist::RetainedSnapshotReferences> {
+    let root = home.as_ref()?.join(".freshell").join("tabs-snapshots");
+    match freshell_ws::tabs_persist::retained_snapshot_references(&root) {
+        Ok(refs) => Some(refs),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "pane_ledger_snapshot_reference_scan_failed: close-evidence retention keeps \
+                 everything this pass (references unknown)"
+            );
+            None
+        }
     }
 }
 
@@ -387,6 +357,28 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
+    // the Rust host-stats collector — freshell-platform readers over
+    // freshell-ws's trait bridge. Constructed here (not at the ~1311
+    // subagent-cadence spawn the plan cites, which sits inside the
+    // session-index block BELOW `ws_state`): the concrete instance must be
+    // Arc'd and injected INTO `WsState::host_stats` when that literal builds.
+    // NO cadence spawns here — `terminal.rs`'s `hoststats.subscribe`
+    // 0->1 edge calls the collector's `set_active(true)`, which owns
+    // spawn/abort internally (zero-cost idle). The interest registry clone
+    // shared into WsState is the SAME instance the collector's cadence
+    // delivers snapshots through (subscribed connections only — never
+    // `broadcast_tx`). `boot_anchor` backs `freshell.uptimeSec`.
+    let host_stats_interest =
+        freshell_ws::host_stats_interest::HostStatsInterestRegistry::default();
+    let host_stats_collector: std::sync::Arc<
+        dyn freshell_ws::host_stats_collector::HostStatsCollector,
+    > = std::sync::Arc::new(host_stats::HostStatsCollectorService::new(
+        host_stats::HostStatsCollectorConfig::from_env(),
+        registry.clone(),
+        host_stats_interest.clone(),
+        std::time::Instant::now(),
+    ));
     // Slice 1 (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md \u00a79 Risk 1): the
     // Agent-API's terminal-mode `POST /api/tabs` shares THIS SAME registry --
     // never a second one -- so an Agent-API-created shell terminal is a first-class
@@ -634,12 +626,6 @@ async fn main() -> ExitCode {
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_opencode_locator(opencode_locator.clone())
         .with_codex_locator(codex_locator.clone())
-        // Task 16 (`PATCH /api/panes/:id` cascade): the configStore seam over
-        // the live settings store, plus the SAME handler-scoped
-        // `terminals.changed` revision counter the WS lifecycle and REST
-        // `/api/terminals` broadcasts stamp — one monotonic sequence.
-        .with_rename_persistence(Arc::new(SettingsRenamePersistence(settings_store.clone())))
-        .with_shared_terminals_revision(Arc::clone(&terminals_revision))
         // Fix round 1 (Task 23 gap): REST-pipeline creates (`POST /api/tabs`,
         // pane split, restore) get the SAME create-time meta seed -> async git
         // enrich -> `terminal.meta.updated` broadcast the WS `terminal.create`
@@ -1047,6 +1033,12 @@ async fn main() -> ExitCode {
         layout: layout_store.clone(),
         screenshots: screenshots.clone(),
         subagent_interest: subagent_interest.clone(),
+        // Task 9: the SAME interest registry the collector's cadence delivers
+        // through + the injected concrete collector.
+        host_stats: freshell_ws::host_stats_collector::WsHostStatsState {
+            interest: host_stats_interest.clone(),
+            collector: Some(host_stats_collector.clone()),
+        },
         terminals_revision: Arc::clone(&terminals_revision),
         sessions_revision: Arc::clone(&sessions_revision),
         cli_commands: Arc::clone(&cli_commands),
@@ -1088,15 +1080,30 @@ async fn main() -> ExitCode {
         // root was derived from. No home => the ledger is disabled and the
         // closure is never consulted; answering false (defer) is still safe.
         let scan_home = home.clone();
-        let report = pane_ledger.boot_scan(now, &move |provider, session_id| {
-            scan_home
-                .as_deref()
-                .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
-        });
+        // Delta-r6-r4 Finding 2: close evidence outlives its TTL exactly as
+        // long as a retained snapshot can reference it (no absolute-age
+        // re-offer gap).
+        let snapshot_refs = snapshot_close_evidence_references(&home);
+        let report = pane_ledger.boot_scan(
+            now,
+            &move |provider, session_id| {
+                scan_home
+                    .as_deref()
+                    .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
+            },
+            snapshot_refs.as_ref(),
+        );
         if !report.quarantined.is_empty() {
             tracing::error!(
                 count = report.quarantined.len(),
                 "pane_ledger_boot: rows quarantined (see per-row errors above)"
+            );
+        }
+        if !report.scan_errors.is_empty() {
+            tracing::error!(
+                count = report.scan_errors.len(),
+                "pane_ledger_boot: store scan faults during boot hygiene \
+                 (see per-path pane_ledger_scan_fault errors above)"
             );
         }
     }
@@ -1177,6 +1184,9 @@ async fn main() -> ExitCode {
                         .collect();
                     // Same Option handling as the boot-scan closure above:
                     // no home => defer (false) — never the destructive branch.
+                    // Delta-r6-r4 Finding 2: the close-evidence reference gate
+                    // rides the same snapshot store scan (fresh every pass).
+                    let snapshot_refs = snapshot_close_evidence_references(&home);
                     ledger.gc(
                         now,
                         &|provider, session_id| {
@@ -1185,6 +1195,7 @@ async fn main() -> ExitCode {
                             })
                         },
                         Some(&live),
+                        snapshot_refs.as_ref(),
                     );
                 })
                 .await;
@@ -1552,6 +1563,17 @@ async fn main() -> ExitCode {
         home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
     };
 
+    // `POST /api/fresh-agent/attachments` (`fresh-agent-extras-router.ts:260-287`):
+    // the paperclip upload route the fresh-agent composer POSTs raw file bytes
+    // to before every attachment-bearing send. `home` is the SAME boot-resolved
+    // value as checkpoints above (uploads live under
+    // `<home>/.freshell/attachments/`) -- a `None` home falls back to the
+    // cwd-relative `.` likewise.
+    let attachments_state = attachments::AttachmentsApiState {
+        auth_token: Arc::clone(&auth_token),
+        home: Arc::new(home.clone().unwrap_or_else(|| PathBuf::from("."))),
+    };
+
     // SAFE-02: the global authenticated API rate limiter (checklist:
     // `docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:539`).
     // ONE process-wide token bucket, wired below as the outermost-but-one
@@ -1582,6 +1604,7 @@ async fn main() -> ExitCode {
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
         .merge(session_metadata::router(session_metadata_state))
         .merge(checkpoints::router(checkpoints_state))
+        .merge(attachments::router(attachments_state))
         // R1/R2/R3/R4: the ONE `/api/settings` router (GET+PATCH+PUT), backed by
         // the live `settings_store` \u2014 replaces the old split between this boot
         // module's frozen GET and the freshcodex slice's disconnected PATCH.
@@ -2434,17 +2457,24 @@ fn kilroy_enabled_flag() -> bool {
 /// declare now that the hardened resolve response surface
 /// (degraded/providerErrors/unsearchedProviders/homeDir, warming default)
 /// landed — see `docs/plans/2026-07-30-rust-resolve-parity-hardened.md`
-/// Tasks 2-6 (SYNC-06).
+/// Tasks 2-6 (SYNC-06). `featureFlags.hostStatsAvailable` mirrors Node's
+/// `process.platform !== 'win32'` as boot-static `cfg!(not(target_os =
+/// "windows"))`.
 fn build_platform_payload(
     available_clis: serde_json::Value,
     ai_enabled: bool,
 ) -> serde_json::Value {
     let platform = detect_platform_proc(host_os_live(), read_proc_version().as_deref());
+    // Boot-static host-stats availability (mirrors Node's
+    // `process.platform !== 'win32'` in `detectFeatureFlags`): the collector
+    // reads /proc + /sys, so Windows reports `false`; no /proc probe at boot —
+    // readers degrade to `available: false` on failure.
+    let host_stats_available = cfg!(not(target_os = "windows"));
     serde_json::json!({
         "platform": platform,
         "availableClis": available_clis,
         "hostName": read_host_name(),
-        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true },
+        "featureFlags": { "kilroy": kilroy_enabled_flag(), "aiEnabled": ai_enabled, "sessionResolve": true, "hostStatsAvailable": host_stats_available },
     })
 }
 
@@ -3085,6 +3115,7 @@ mod sessions_sweep_tests {
             tabs: freshell_ws::tabs::TabsRegistry::new(),
             screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
             subagent_interest: Default::default(),
+            host_stats: Default::default(),
             terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             cli_commands: Arc::new(Vec::new()),
@@ -3581,12 +3612,16 @@ mod tests {
     #[test]
     fn platform_payload_feature_flags_shape_matches_legacy() {
         // `server/platform-router.ts#detectFeatureFlags`: `{ kilroy, aiEnabled,
-        // sessionResolve }`, camelCase, no extra fields — mirrored 1:1 in the
-        // Rust payload. `sessionResolve` is TRUE: the hardened resolve
-        // response surface (degraded/providerErrors/unsearchedProviders/
+        // sessionResolve, hostStatsAvailable }`, camelCase, no extra fields —
+        // mirrored 1:1 in the Rust payload. `sessionResolve` is TRUE: the
+        // hardened resolve response surface
+        // (degraded/providerErrors/unsearchedProviders/
         // homeDir, warming default) landed via the hardened plan Tasks 2-6
-        // (SYNC-06), so the flag is genuinely earned. `KILROY_ENABLED` is pinned
-        // off under the shared lock so the assertion is environment-independent.
+        // (SYNC-06), so the flag is genuinely earned. `hostStatsAvailable` is
+        // boot-static on the build target (`cfg!(not(target_os = "windows"))`,
+        // mirroring Node's `process.platform !== 'win32'`). `KILROY_ENABLED` is
+        // pinned off under the shared lock so the assertion is
+        // environment-independent.
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3595,7 +3630,7 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": true, "sessionResolve": true, "hostStatsAvailable": cfg!(not(target_os = "windows")) })
         );
     }
 
@@ -3609,7 +3644,21 @@ mod tests {
         let payload = build_platform_payload(serde_json::json!({}), cell.enabled());
         assert_eq!(
             payload["featureFlags"],
-            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true })
+            serde_json::json!({ "kilroy": false, "aiEnabled": false, "sessionResolve": true, "hostStatsAvailable": cfg!(not(target_os = "windows")) })
+        );
+    }
+
+    #[test]
+    fn host_stats_flag_present_in_platform_payload() {
+        // Host-stats collection reads Linux `/proc` + `/sys`; both servers expose
+        // a boot-static availability flag so clients can degrade to
+        // `available: false` instead of probing — Node mirrors
+        // `process.platform !== 'win32'` (server/platform-router.ts), Rust uses
+        // the build target. Present-and-boolean regardless of host runtime.
+        let payload = build_platform_payload(serde_json::json!({}), false);
+        assert_eq!(
+            payload["featureFlags"]["hostStatsAvailable"],
+            serde_json::json!(cfg!(not(target_os = "windows")))
         );
     }
 

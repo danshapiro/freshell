@@ -9,6 +9,7 @@ export const RegistryPaneKindSchema = z.enum([
   'browser',
   'editor',
   'picker',
+  'host-stats',
   'claude-chat',
   'fresh-agent',
   'extension',

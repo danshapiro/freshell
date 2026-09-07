@@ -643,18 +643,20 @@ describe('fresh-agent-model-capabilities static catalog mapping', () => {
       status: 'fresh',
     })
     expect(capabilities?.models.map((model) => model.id)).toEqual([
-      'gpt-5.5',
-      'gpt-5.4-flash',
+      'gpt-6-astra',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
       'gpt-5.3-codex-spark',
     ])
     expect(capabilities?.models[0]).toMatchObject({
-      displayName: 'GPT-5.5',
+      displayName: 'GPT-6 Astra',
       provider: 'codex',
       supportsEffort: true,
-      supportedEffortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'max'],
+      supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
       supportsAdaptiveThinking: false,
     })
-    expect(capabilities?.models[1]?.supportedEffortLevels).toEqual(['none', 'minimal', 'low', 'medium', 'high'])
+    expect(capabilities?.models[1]?.supportedEffortLevels).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
     for (const model of capabilities?.models ?? []) {
       expect(model.source).toEqual({ id: 'openai', displayName: 'openai' })
     }

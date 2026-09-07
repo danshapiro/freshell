@@ -1466,6 +1466,40 @@ describe('FreshAgentTranscript', () => {
       const chip = screen.getByRole('button', { name: /Jump to your message/ })
       expect(chip).toHaveTextContent('First user message here')
     })
+
+    it('shows only the first line of a multi-line user message, with the full text as tooltip', () => {
+      const MULTILINE = [
+        {
+          id: 'u1',
+          role: 'user' as const,
+          summary: 'First line of command\nSecond line of command\nThird line',
+          items: [{
+            id: 'i1',
+            kind: 'text' as const,
+            text: 'First line of command\nSecond line of command\nThird line',
+          }],
+        },
+        {
+          id: 'a1',
+          role: 'assistant' as const,
+          summary: 'reply',
+          items: [{ id: 'i2', kind: 'text' as const, text: 'A'.repeat(200) }],
+        },
+      ]
+      const { container } = render(<FreshAgentTranscript turns={MULTILINE} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      mockScroll(scroller, 400, 1000, 200)
+      const userTurns = container.querySelectorAll('[data-turn-role="user"]')
+      mockRect(scroller, 0)
+      mockRect(userTurns[0], -100)
+      fireEvent.scroll(scroller)
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      expect(chip).toHaveTextContent('First line of command')
+      expect(chip).not.toHaveTextContent('Second line of command')
+      expect(chip).toHaveAttribute('title', 'First line of command\nSecond line of command\nThird line')
+      expect(chip).toHaveAttribute('aria-label', 'Jump to your message: First line of command\nSecond line of command\nThird line')
+    })
   })
 
   describe('turn actions', () => {
@@ -1511,6 +1545,42 @@ describe('FreshAgentTranscript', () => {
       expect(menu).toHaveTextContent('Copy turn text')
       fireEvent.click(screen.getByRole('menuitem', { name: 'Fork conversation from here' }))
       expect(onFork).toHaveBeenCalledWith('turn-2')
+    })
+
+    it('yields to the provider menu for a fine-pointer right-click on a code block inside a turn', () => {
+      const { container } = render(
+        <FreshAgentTranscript
+          canFork={false}
+          turns={[{
+            id: 'turn-code',
+            turnId: 'turn-code',
+            role: 'assistant' as const,
+            summary: 'code answer',
+            items: [{
+              id: 'item-code',
+              kind: 'text' as const,
+              text: 'Here is the fix:\n\n```ts\nconst x: number = 1\n```',
+            }],
+          }]}
+        />,
+      )
+
+      // Assistant text renders as markdown: the fenced code block produces the
+      // specialized `.prose pre code` sub-region.
+      const codeEl = container.querySelector('article .prose pre code') as HTMLElement | null
+      expect(codeEl, 'assistant fenced code block renders .prose pre code').not.toBeNull()
+
+      // The transcript article yields WITHOUT preventDefault and without its
+      // turn menu — the provider's capture-phase handler already opened the
+      // context-sensitive fresh-agent menu for this gesture.
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+      act(() => {
+        codeEl!.dispatchEvent(event)
+      })
+
+      expect(event.defaultPrevented).toBe(false)
+      expect(screen.queryByRole('menu', { name: 'Turn context menu' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
     })
 
     it('offers rewind only on user turns and passes the turn through', () => {
@@ -2354,5 +2424,118 @@ describe('FreshAgentTranscript', () => {
         expect(stashed.textContent).not.toContain('hidden internals')
       })
     })
+  })
+})
+
+describe('rolled-back section (kata 1wxv decision 6)', () => {
+  afterEach(() => cleanup())
+
+  function markerTurns(): FreshAgentTurn[] {
+    // Two undone STEPS = four marker ROWS (a user row and an assistant row each).
+    return [
+      { id: 'u2', turnId: 'u2', role: 'user', summary: 'second prompt', items: [{ id: 'u2-i1', kind: 'text', text: 'second prompt' }], rolledBack: true },
+      { id: 'a2', turnId: 'a2', role: 'assistant', summary: 'second answer', items: [{ id: 'a2-i1', kind: 'text', text: 'second answer' }], rolledBack: true },
+      { id: 'u3', turnId: 'u3', role: 'user', summary: 'third prompt', items: [{ id: 'u3-i1', kind: 'text', text: 'third prompt' }], rolledBack: true },
+      { id: 'a3', turnId: 'a3', role: 'assistant', summary: 'third answer', items: [{ id: 'a3-i1', kind: 'text', text: 'third answer' }], rolledBack: true },
+    ]
+  }
+
+  it('renders nothing when rolledBackTurns is empty', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[{ id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i1', kind: 'text', text: 'first prompt' }] }]}
+        rolledBackTurns={[]}
+      />,
+    )
+
+    expect(screen.getByText('first prompt')).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Rolled back turns' })).toBeNull()
+  })
+
+  it('renders the marker rows with the USER-STEP count label (r3 correction 5)', () => {
+    // The label matches the server's rollback.undoneDepth: steps (user-role marker
+    // groups), never the raw marker-row count (4) and never entries.len().
+    render(<FreshAgentTranscript turns={[]} rolledBackTurns={markerTurns()} />)
+
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+    expect(section).toHaveTextContent('Rolled back (2)')
+    expect(section).not.toHaveTextContent('Rolled back (4)')
+    expect(section).toHaveTextContent('second prompt')
+    expect(section).toHaveTextContent('second answer')
+    expect(section).toHaveTextContent('third prompt')
+    expect(section).toHaveTextContent('third answer')
+  })
+
+  it('per-row Redo to here fires onRedoToTurn only on redoable user rows when canRedo', () => {
+    const onRedoToTurn = vi.fn()
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo
+        redoableTurnIds={['u2', 'u3']}
+        onRedoToTurn={onRedoToTurn}
+      />,
+    )
+
+    // Only the two redoable USER rows expose the button; assistant rows never do.
+    const redoButtons = screen.getAllByRole('button', { name: 'Redo to here' })
+    expect(redoButtons).toHaveLength(2)
+    fireEvent.click(redoButtons[0])
+    expect(onRedoToTurn).toHaveBeenCalledWith('u2')
+    fireEvent.click(redoButtons[1])
+    expect(onRedoToTurn).toHaveBeenCalledWith('u3')
+  })
+
+  it('delta-r1 F6: frozen prior-epoch markers (absent from redoableTurnIds) expose NO Redo to here', () => {
+    // undo → send destroys redo → a NEW epoch's undos land behind the frozen ones:
+    // the marker union is [frozen u2/a2 rows, current u3/a3 rows] — only the current
+    // epoch's tail is restorable, so only ITS user rows carry the affordance.
+    const onRedoToTurn = vi.fn()
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo
+        redoableTurnIds={['u3']}
+        onRedoToTurn={onRedoToTurn}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    const redoButtons = screen.getAllByRole('button', { name: 'Redo to here' })
+    expect(redoButtons).toHaveLength(1)
+    fireEvent.click(redoButtons[0])
+    expect(onRedoToTurn).toHaveBeenCalledWith('u3')
+    expect(onRedoToTurn).toHaveBeenCalledTimes(1)
+  })
+
+  it('delta-r1 F6 legacy harmlessness: an absent redoableTurnIds (legacy server surface) exposes NO per-marker redo, even with canRedo', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo
+        onRedoToTurn={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
+  })
+
+  it('exposes no Redo to here affordance when canRedo is false', () => {
+    render(
+      <FreshAgentTranscript
+        turns={[]}
+        rolledBackTurns={markerTurns()}
+        canRedo={false}
+        redoableTurnIds={['u2', 'u3']}
+        onRedoToTurn={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Rolled back turns' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Redo to here' })).toBeNull()
   })
 })

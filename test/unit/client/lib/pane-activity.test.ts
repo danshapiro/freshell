@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { collectBusySessionKeys, collectPaneIdentityActivity, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
-import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import { collectBusySessionKeys, collectPaneIdentityActivity, isFreshAgentBusy, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
+import type { FreshAgentPaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { Tab } from '@/store/types'
 import {
@@ -97,6 +97,38 @@ describe('pane activity', () => {
       amplifierActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
     }).isBusy).toBe(false)
+  })
+
+  it('isFreshAgentBusy is false for a stuck freshcodex session', () => {
+    // Contract pin: 'stuck' is not in any busy set. streamingActive is fixed
+    // false so STATUS alone discriminates (the setSessionStatus('stuck') fold
+    // clears streamingActive atomically, so this is the exact post-deadman
+    // store shape) — the running control proves the fixture is busy-shaped.
+    const content: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      createRequestId: 'req-stuck',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: 'thread-stuck-1',
+      status: 'running',
+    }
+    const running = freshAgentSession({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: 'thread-stuck-1',
+      status: 'running',
+      streamingActive: false,
+    })
+    expect(isFreshAgentBusy(content, running)).toBe(true)
+
+    const stuck = freshAgentSession({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: 'thread-stuck-1',
+      status: 'stuck',
+      streamingActive: false,
+    })
+    expect(isFreshAgentBusy(content, stuck)).toBe(false)
   })
 
   it('does not show fresh-agent panes as busy when no live session exists (no reload blue-flash)', () => {

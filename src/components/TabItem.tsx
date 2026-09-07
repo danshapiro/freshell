@@ -165,7 +165,7 @@ export default function TabItem({
               needsAttention && tabAttentionStyle !== 'none' && (
                 tabAttentionStyle === 'darken'
                   ? 'border-t-[3px] border-t-muted-foreground bg-foreground/[0.08] shadow-[inset_0_4px_8px_hsl(var(--foreground)/0.1)]'
-                  : 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
+                  : 'border-t-[3px] border-t-success bg-success/15 dark:bg-success/25 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
               ),
               needsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
             )

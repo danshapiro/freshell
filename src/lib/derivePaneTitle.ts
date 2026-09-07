@@ -27,6 +27,18 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
 
   if (content.kind === 'browser') {
     if (!content.url) return 'Browser'
+    // Raw-file byte-lane URLs (image viewer panes, file:// iframe lane):
+    // title by the served file's basename instead of falling through to
+    // 'Browser' (these relative URLs have no hostname).
+    const rawMatch = content.url.match(/^\/(?:api\/files\/raw|local-file)\?path=([^&]+)/)
+    if (rawMatch) {
+      try {
+        const segment = basenameSegment(decodeURIComponent(rawMatch[1]))
+        return segment ?? 'Browser'
+      } catch {
+        return 'Browser'
+      }
+    }
     try {
       const url = new URL(content.url)
       return url.hostname || 'Browser'
@@ -37,6 +49,10 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
 
   if (content.kind === 'extension') {
     return content.extensionName
+  }
+
+  if (content.kind === 'host-stats') {
+    return 'System Status'
   }
 
   // Terminal content — coding-agent (non-shell) terminals name by working directory

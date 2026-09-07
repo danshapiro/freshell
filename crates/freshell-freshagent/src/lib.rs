@@ -39,6 +39,7 @@
 pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
+pub(crate) mod codex_sidecar_tracking;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
@@ -46,7 +47,7 @@ pub mod model_capabilities;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
-pub mod rename_persistence;
+pub mod rollback_record;
 pub mod session_lease;
 pub mod snapshot;
 pub mod spawn_gate;
@@ -66,11 +67,17 @@ pub use claude_snapshot::{
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
-    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
-    SinkWrite,
+    BindProvenance, ClaimCommit, CloseAnswer, FreshAgentBindingUpsert, FreshAgentSettings,
+    PaneIdentitySink, ProvenanceUpdate, SharedPaneIdentitySink, SinkAliasClearWrite,
+    SinkCloseError, SinkCloseWrite, SinkCommitWrite, SinkWrite,
 };
 pub use opencode_ws::FreshOpencodeState;
-pub use rename_persistence::{BoxFuture, RenamePersistence, SYNCABLE_TERMINAL_MODES};
+pub use rollback_record::{
+    now_ms, rollback_ack_frame, rollback_broadcast_frame, rollback_error_frame, RollbackDirection,
+    RollbackEntry, RollbackModeReq, RollbackRecord, RollbackRequest, CODEX_OLD_CLI_COPY,
+    LEDGER_WRITE_REFUSAL_COPY, OPENCODE_OLD_CLI_COPY, REDO_DESTROYED_MESSAGE, REDO_EMPTY_MESSAGE,
+    REDO_REMOVED_HISTORY_COPY, ROLLBACK_BUSY_MESSAGE, ROLLBACK_RECORD_VERSION, UNDO_EMPTY_MESSAGE,
+};
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
 
@@ -305,21 +312,6 @@ pub struct FreshAgentState {
     /// snapshot) everywhere it isn't wired, matching the other Slice-1/3a
     /// fields' "unwired == degrades honestly" convention.
     pub layout: layout_store::LayoutStore,
-    /// Task 16 (`PATCH /api/panes/:id` cascade): the injected `configStore`
-    /// seam (`persistSyncableTerminalRename`'s terminal/session override
-    /// writes, `router.ts:681-683`) — `freshell-server`'s `main.rs` wires its
-    /// `SettingsRenamePersistence` here via [`Self::with_rename_persistence`].
-    /// `None` until wired (the `amplifier_locator` Option-until-wired
-    /// convention): the rename still lands in the layout store, only the
-    /// persistence cascade is skipped (Node's own `!configStore` guard,
-    /// `router.ts:668`).
-    pub(crate) rename_persistence: Option<Arc<dyn rename_persistence::RenamePersistence>>,
-    /// Task 16: the SAME handler-scoped `terminals.changed` revision counter
-    /// the WS lifecycle + REST `/api/terminals` broadcasts stamp (`main.rs`),
-    /// wired via [`Self::with_shared_terminals_revision`] so the rename
-    /// cascade's broadcast draws from the ONE monotonic sequence. `None`
-    /// until wired — the cascade then skips the broadcast honestly.
-    pub(crate) terminals_revision: Option<Arc<AtomicI64>>,
     /// Fix round 1 (Task 23 gap): the injectable post-create seam Node covers
     /// with the registry's `'terminal.created'` EVENT (`server/index.ts:647-655`
     /// -> `seedFromTerminal` for EVERY terminal, REST creates included). The
@@ -334,7 +326,7 @@ pub struct FreshAgentState {
     /// WS `terminal.create` path gets. Fired by
     /// [`terminal_tabs::spawn_terminal_pane`] after every successful
     /// REST-pipeline create (tab create, pane split, restore). `None` until
-    /// wired (the `rename_persistence` convention): creates proceed, only the
+    /// wired (the Option-until-wired convention): creates proceed, only the
     /// meta seeding is skipped.
     pub(crate) terminal_created_hook: Option<TerminalCreatedHook>,
     /// The `GET`/`POST /api/fresh-agent/model-capabilities/*` registry
@@ -443,8 +435,6 @@ impl FreshAgentState {
             on_stale_resume: None,
             sidecar_liveness: None,
             layout: layout_store::LayoutStore::default(),
-            rename_persistence: None,
-            terminals_revision: None,
             terminal_created_hook: None,
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
@@ -624,33 +614,14 @@ impl FreshAgentState {
         self
     }
 
-    /// Task 16 (`PATCH /api/panes/:id` cascade): wire in the production
-    /// [`RenamePersistence`] (`freshell-server`'s `SettingsRenamePersistence`
-    /// over the live settings store). Unwired == the rename route still
-    /// renames the store and broadcasts `ui.command{pane.rename}`, it just
-    /// skips the syncable-terminal persistence cascade.
-    pub fn with_rename_persistence(mut self, persistence: Arc<dyn RenamePersistence>) -> Self {
-        self.rename_persistence = Some(persistence);
-        self
-    }
-
     /// Fix round 1 (Task 23 gap): wire the post-create hook `freshell-server`
     /// uses to run the WS-parity meta seed -> async git enrich ->
     /// `terminal.meta.updated` broadcast for every REST-pipeline create (see
     /// the field doc for why this seam exists). Unwired == creates proceed,
-    /// meta seeding skipped. Mirrors [`Self::with_rename_persistence`].
+    /// meta seeding skipped. Mirrors the established `with_*` builder pattern
+    /// (e.g. [`Self::with_shared_sessions_revision`]).
     pub fn with_terminal_created_hook(mut self, hook: TerminalCreatedHook) -> Self {
         self.terminal_created_hook = Some(hook);
-        self
-    }
-
-    /// Task 16: share the ONE handler-scoped `terminals.changed` revision
-    /// counter (`main.rs`'s `terminals_revision`, also stamped by the WS
-    /// lifecycle and REST `/api/terminals` broadcasts) so the rename
-    /// cascade's `terminals.changed` never regresses the client's
-    /// revision watermark. Mirrors [`Self::with_shared_sessions_revision`].
-    pub fn with_shared_terminals_revision(mut self, revision: Arc<AtomicI64>) -> Self {
-        self.terminals_revision = Some(revision);
         self
     }
 
@@ -872,6 +843,9 @@ impl FreshAgentState {
                 thread_id,
                 &json!({}),
                 &json!([]),
+                // A placeholder id never has a rollback record (rollback needs a
+                // materialized session).
+                None,
             ));
         }
 
@@ -891,7 +865,19 @@ impl FreshAgentState {
             .await
             .map_err(OpencodeSnapshotError::Serve)?;
 
-        Ok(build_opencode_snapshot_json(thread_id, &info, &messages))
+        // Kata 1wxv Task 5: the DURABLE rollback record (memory-fast sync read
+        // over the ledger's write-through index) sources the marker bucket,
+        // `canRedo`, `undoneDepth`, and the revision floor — durable even after
+        // a native send deletes the reverted tail (decision 6).
+        let rollback = self
+            .identity_sink()
+            .and_then(|s| s.load_rollback(PROVIDER, thread_id));
+        Ok(build_opencode_snapshot_json(
+            thread_id,
+            &info,
+            &messages,
+            rollback.as_ref(),
+        ))
     }
 }
 
@@ -1447,7 +1433,13 @@ fn opencode_turn_summary(items: &[Value]) -> (String, &'static str) {
 /// `tool`, `file`, and `patch` parts all become visible transcript items today; only
 /// structural (`step-start`/`step-finish`) and truly unrecognized part types are dropped,
 /// matching the reference's own `return []` default.
-fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
+///
+/// kata 1wxv Task 3: the projection is factored as the shared per-message turn
+/// builder — the rollback record's marker entries and `rolledBackTurns` bucket use the
+/// SAME projection as `turns[]`, so markers match the transcript the model saw.
+/// `None` for a message the transcript itself drops (an unknown role carrying
+/// displayable items) — call sites `filter_map`.
+pub(crate) fn opencode_message_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
     let info = message.get("info").cloned().unwrap_or_else(|| json!({}));
     let id = info
         .get("id")
@@ -1507,13 +1499,49 @@ fn build_opencode_turn_json(message: &Value, ordinal: usize) -> Option<Value> {
 /// snapshot carries NO `statusSeq` by design — the `idle` above is an untracked
 /// default, and only tracked status folds mint a seq (the never-mint-from-defaults
 /// rule); the client folds seq-less snapshots via the legacy unconditional path.
-fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value) -> Value {
+fn build_opencode_snapshot_json(
+    thread_id: &str,
+    info: &Value,
+    messages: &Value,
+    // Kata 1wxv Task 5: the durable rollback record (None when the session never
+    // rolled back through this server's ledger).
+    rollback: Option<&RollbackRecord>,
+) -> Value {
     let messages = messages.as_array().cloned().unwrap_or_default();
-    let turns: Vec<Value> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(ordinal, message)| build_opencode_turn_json(message, ordinal))
-        .collect();
+    // kata 1wxv Task 3 (VERIFIED wire shape, load-bearing correction item 2): the
+    // serve returns the reverted tail rows UNFLAGGED in the message list; the
+    // boundary is TOP-LEVEL `session.revert.messageID` (omitted when inactive —
+    // there is no `info.revert` anywhere). `turns[]` is EXACTLY what the model sees
+    // next (messages strictly before the pointer); a stale/unknown pointer keeps
+    // the whole list in `turns[]` (never silently empties the transcript).
+    // Task 5 (r3): with a ledger record the marker bucket is the record's
+    // entries UNION (frozen prior epochs ++ the recorded current tail) — the
+    // provider-tail projection below remains ONLY as the record-less fallback
+    // (an out-of-band revert this ledger never observed).
+    let boundary = info
+        .get("revert")
+        .and_then(|r| r.get("messageID"))
+        .and_then(Value::as_str)
+        .and_then(|pointer| {
+            messages
+                .iter()
+                .position(|m| m.pointer("/info/id").and_then(Value::as_str) == Some(pointer))
+        })
+        .unwrap_or(messages.len());
+    let mut turns: Vec<Value> = Vec::new();
+    let mut rolled_back: Vec<Value> = Vec::new();
+    for (ordinal, message) in messages.iter().enumerate() {
+        let Some(turn) = opencode_message_turn_json(message, ordinal) else {
+            continue;
+        };
+        if ordinal < boundary {
+            turns.push(turn);
+        } else {
+            let mut turn = turn;
+            turn["rolledBack"] = json!(true);
+            rolled_back.push(turn);
+        }
+    }
     let session_id = info
         .get("id")
         .and_then(Value::as_str)
@@ -1552,6 +1580,20 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
             "worktrees": false,
             "diffs": true,
             "childThreads": false,
+            // Kata 1wxv Task 5: static stamps (LBC-2 verified the revert/unrevert
+            // routes); an old-CLI runtime failure classifies at OP time to
+            // UNSUPPORTED_CAPABILITY (Task 1's pinned copy), never at stamp time.
+            "undo": true,
+            "redo": true,
+            // kata z7j7: model/effort are per-send (merged into the POST
+            // /session/:id/prompt_async body); sandbox/permissionMode have no
+            // opencode wire concept.
+            "settingScopes": {
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            },
         }),
     );
     snapshot.insert("tokenUsage".to_string(), opencode_token_usage(info));
@@ -1561,8 +1603,30 @@ fn build_opencode_snapshot_json(thread_id: &str, info: &Value, messages: &Value)
     snapshot.insert("diffs".to_string(), json!([]));
     snapshot.insert("childThreads".to_string(), json!([]));
     snapshot.insert("turns".to_string(), json!(turns));
+    if rollback.is_none() && !rolled_back.is_empty() {
+        // Record-less fallback ONLY: the provider-tail projection covers an
+        // out-of-band revert this ledger never observed. The strict contract key
+        // is optional — a legacy-server payload simply never carries it.
+        snapshot.insert("rolledBackTurns".to_string(), json!(rolled_back));
+    }
     snapshot.insert("extensions".to_string(), json!({ "opencode": {} }));
-    Value::Object(snapshot)
+    let mut snapshot = Value::Object(snapshot);
+    if let Some(record) = rollback {
+        // LEDGER-SOURCED bucket (r3): the entries union (frozen prior epochs ++
+        // the recorded current tail) — durable even after a native send deletes
+        // the reverted tail (decision 6). `canRedo` is the STORED bit (the only
+        // source); the record doubles as the revision floor so a stale serve
+        // timestamp never lets the client's monotonic watermark drop the
+        // post-rollback snapshot.
+        let floored = crate::rollback_record::stamp_rollback_snapshot(
+            &mut snapshot,
+            revision,
+            record,
+            record.can_redo(),
+        );
+        snapshot["revision"] = json!(floored);
+    }
+    snapshot
 }
 
 /// The fresh-agent sub-router, pre-bound to its state. Merges in
@@ -1679,6 +1743,7 @@ fn serve_error_status(err: &ServeError) -> StatusCode {
     match err {
         ServeError::NotHealthy { .. }
         | ServeError::Transport(_)
+        | ServeError::Undelivered(_)
         | ServeError::ProcessExited { .. }
         | ServeError::Spawn(_)
         | ServeError::StartupFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -2114,19 +2179,23 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
 /// `PATCH /api/panes/:id` (`router.ts:1396-1427`): renames a pane in the
 /// SHARED server-side layout store (Task 16 — kills D10's fake acknowledgement,
 /// which answered `{paneId, tabRenamed:false}` for ANY id without touching any
-/// state). Node behavior, clause for clause:
+/// state). Behavior, clause for clause:
 ///
 /// 1. name validation (blank → 400 `name required`; >500 → 400 length message);
-/// 2. `getPaneSnapshot` BEFORE the rename (the cascade reads PRE-rename content);
-/// 3. `renamePane` outcome — a miss answers 200 `ok({message})`
+/// 2. `renamePane` outcome — a miss answers 200 `ok({message})`
 ///    (`'pane not found'` / `'no layout snapshot'`, `router.ts:1411`+`:1423`);
-/// 4. on success, the best-effort syncable-terminal cascade
-///    ([`rename_persistence::persist_syncable_terminal_rename`]);
-/// 5. `tabRenamed` = the tab has exactly one pane — computed against the
+/// 3. `tabRenamed` = the tab has exactly one pane — computed against the
 ///    client snapshot where the pane resolved (multi-client store; Node reads
 ///    its single snapshot); broadcast
 ///    `ui.command{pane.rename,{tabId,paneId,title}}`; respond
 ///    `ok({tabId, paneId, tabRenamed}, 'pane renamed')`.
+///
+/// b5fb: the rename is LAYOUT-ONLY. Pane labels never touch the terminal
+/// registry title or durable session/terminal title overrides — the
+/// syncable-terminal persistence cascade (`persistSyncableTerminalRename`,
+/// formerly `rename_persistence::persist_syncable_terminal_rename`) was
+/// removed, and `PATCH /api/sessions/:key` is now the sole durable
+/// session-rename surface.
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -2147,9 +2216,6 @@ async fn rename_pane(
         );
     }
 
-    // Snapshot BEFORE the rename (`router.ts:1407`) so the cascade sees the
-    // pane's pre-rename content (terminalId/mode/session fields).
-    let pane_snapshot = state.layout.get_pane_snapshot(&pane_id);
     let outcome = state.layout.rename_pane(&pane_id, &name);
 
     let Some(tab_id) = outcome.tab_id else {
@@ -2160,10 +2226,6 @@ async fn rename_pane(
     };
     // `result.paneId || paneId` (`router.ts:1420`).
     let pane_id = outcome.pane_id.unwrap_or(pane_id);
-
-    if let Some(snapshot) = pane_snapshot.as_ref() {
-        rename_persistence::persist_syncable_terminal_rename(&state, snapshot, &name).await;
-    }
 
     // `tabRenamed` = single-pane tab (`router.ts:1414-1415`), computed from
     // the client snapshot where the pane actually RESOLVED (multi-client
@@ -2300,6 +2362,16 @@ async fn send_keys(
                         .map(str::to_string),
                     resolves_pending: Some(pane.placeholder_id.clone()),
                     supersedes: None,
+                    // D8 (restore-open-sessions-only): REST/MCP lineage rows
+                    // intentionally stamp NO provenance — no browser client
+                    // connection exists at bind time, so there is nothing true
+                    // to attribute. Delta-r2 Finding 2: `Clear` (not merely
+                    // no-stamps) — a headless re-bind of a browser-stamped row
+                    // must ERASE the stale browser attribution instead of
+                    // inheriting it under a refreshed `updated_at`; rows
+                    // without attribution are never offered by the recovery
+                    // judgment (`recovery_inventory.rs`).
+                    provenance: identity_sink::ProvenanceUpdate::Clear,
                     settings: identity_sink::FreshAgentSettings {
                         model: pane.model.clone(),
                         sandbox: None,
@@ -2442,7 +2514,28 @@ async fn capture(
         .cloned()
     {
         Some(pane) => pane,
-        None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
+        None => {
+            // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to
+            // `fresh-agent` by a remote client's layout sync): mirror the Node
+            // capture route's pane-kind gate (router.ts:955-959) — every
+            // non-terminal layout kind answers the 422 validation wording the
+            // `content_panes` branch in terminal_tabs.rs already emits, rather
+            // than falling through to an unhandled 500 (Node, pre-fix) or a
+            // misleading 404. Runtime-backed fresh-agent panes resolved above;
+            // layout-visible terminal kinds and unknown ids keep 404
+            // `pane not found`.
+            if let Some(snap) = state.layout.get_pane_snapshot(&pane_id) {
+                if let Some(kind) = snap.kind.as_deref().filter(|k| *k != "terminal") {
+                    return fail_json(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!(
+                            "pane kind \"{kind}\" does not support capture-pane; use screenshot-pane"
+                        ),
+                    );
+                }
+            }
+            return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
+        }
     };
     let Some(durable_id) = pane.durable_id else {
         // No turn yet → empty transcript (text/plain), matching a fresh pane.
@@ -2674,6 +2767,17 @@ impl InFlightRegistry {
             held,
         })
     }
+
+    /// Snapshot membership check — never an acquisition. Claude's `handle_send`
+    /// parks while a rollback names this durable id (kata 1wxv task 4 review C1):
+    /// a session-map resolve miss inside the rollback's teardown→respawn window
+    /// must WAIT for the re-insert, never refuse with SESSION_NOT_FOUND.
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.keys
+            .lock()
+            .expect("in-flight registry lock")
+            .contains(key)
+    }
 }
 
 /// RAII release for an [`InFlightRegistry`] acquisition: removes its held key(s)
@@ -2689,6 +2793,25 @@ impl Drop for InFlightGuard {
         for key in &self.held {
             keys.remove(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod in_flight_registry_tests {
+    use super::*;
+
+    #[test]
+    fn contains_tracks_acquire_and_drop_without_acquiring() {
+        let registry = InFlightRegistry::new();
+        assert!(!registry.contains("dur-1"));
+        let guard = registry.try_acquire("dur-1").expect("first acquire");
+        assert!(registry.contains("dur-1"));
+        // contains is a snapshot, NOT an acquisition: a second try_acquire still
+        // refuses (single-flight) while contains never blocks.
+        assert!(registry.try_acquire("dur-1").is_none());
+        assert!(registry.contains("dur-1"));
+        drop(guard);
+        assert!(!registry.contains("dur-1"));
     }
 }
 
@@ -3209,7 +3332,7 @@ mod tests {
 
     use freshell_opencode::{
         Endpoint, EventSource, EventStreamHandle, PortAllocator, ServeDeps, ServeHttp,
-        ServeHttpRequest, ServeHttpResponse,
+        ServeHttpError, ServeHttpRequest, ServeHttpResponse,
     };
 
     /// Fakes `GET /session/:id` (session info) and `GET /session/:id/message` (the page)
@@ -3223,7 +3346,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let body = if req.url.contains("/message") {
                 serde_json::to_vec(&self.messages_body).unwrap()
@@ -3244,7 +3371,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             Box::pin(async move {
                 if req.url.contains("/global/health") {
@@ -3426,7 +3557,11 @@ mod tests {
             &'a self,
             req: ServeHttpRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
         > {
             let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
                 && (req.url.ends_with("/session") || req.url.contains("/session?"));
@@ -3504,6 +3639,15 @@ mod tests {
         // SEND's requestId and the REST path stamped `None`; the placeholder
         // is the lineage source of truth on both paths now.
         assert_eq!(b.create_request_id.as_deref(), Some("r1"));
+        // Delta-r2 Finding 2 pin: the REST/MCP materialization lane is
+        // EXPLICITLY headless — its write must CLEAR any prior browser stamps
+        // on the row, never inherit them (a kept stamp under the refreshed
+        // `updated_at` would launder the row into the D8 recovery offer).
+        assert_eq!(
+            b.provenance,
+            identity_sink::ProvenanceUpdate::Clear,
+            "the REST lineage write is a provenance Clear"
+        );
         // A settings-bearing row keeps "recorded" status under the new keying.
         drop(bindings);
         assert!(fake.was_recorded("opencode", "ses_1"));
@@ -3836,7 +3980,7 @@ mod tests {
     }
 
     #[test]
-    fn build_opencode_turn_json_renders_both_tool_and_text_parts_in_one_message() {
+    fn opencode_message_turn_json_renders_both_tool_and_text_parts_in_one_message() {
         let message = json!({
             "info": { "id": "msg-1", "role": "assistant" },
             "parts": [
@@ -3844,7 +3988,7 @@ mod tests {
                 { "type": "text", "id": "x-1", "text": "Ran the command." },
             ],
         });
-        let turn = build_opencode_turn_json(&message, 0).expect("turn builds");
+        let turn = opencode_message_turn_json(&message, 0).expect("turn builds");
         let items = turn["items"].as_array().expect("items array");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["kind"], json!("dynamic_tool"));
@@ -3915,13 +4059,301 @@ mod tests {
     fn resolve_probe_timeout_ms_missing_env_is_default() {
         assert_eq!(resolve_probe_timeout_ms(None, None), 10_000);
     }
+
+    // ── kata 1wxv Task 3: the FUNCTIONAL active-prefix / tail-marker filter ──────
+    //
+    // The serve returns the reverted tail rows UNFLAGGED in the message list; the
+    // VERIFIED wire shape puts the boundary at TOP-LEVEL `session.revert.messageID`
+    // (no `info.revert` exists anywhere). `turns[]` is EXACTLY what the model sees
+    // next (messages strictly before the pointer); the tail becomes
+    // `rolledBackTurns` markers in conversation order, each stamped rolledBack:true.
+
+    fn three_turn_opencode_messages() -> Value {
+        json!([
+            { "info": { "id": "msg_u1", "role": "user" }, "parts": [{ "type": "text", "text": "prompt one" }] },
+            { "info": { "id": "msg_a1", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer one" }] },
+            { "info": { "id": "msg_u2", "role": "user" }, "parts": [{ "type": "text", "text": "prompt two" }] },
+            { "info": { "id": "msg_a2", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer two" }] },
+            { "info": { "id": "msg_u3", "role": "user" }, "parts": [{ "type": "text", "text": "prompt three" }] },
+            { "info": { "id": "msg_a3", "role": "assistant" }, "parts": [{ "type": "text", "text": "answer three" }] },
+        ])
+    }
+
+    #[test]
+    fn opencode_snapshot_filters_turns_to_the_active_prefix_and_marks_the_tail() {
+        // Top-LEVEL session.revert.messageID = the middle USER message; the message
+        // list is served in FULL (tail unflagged, exactly like the real provider).
+        let info = json!({ "id": "ses_x", "title": "t", "revert": { "messageID": "msg_u2" } });
+        // No ledger record (kata 1wxv Task 5): the provider tail is the marker
+        // projection source ONLY in the record-less (out-of-band revert) case.
+        let snap =
+            build_opencode_snapshot_json("ses_x", &info, &three_turn_opencode_messages(), None);
+
+        let turns = snap["turns"].as_array().expect("turns array");
+        let ids: Vec<&str> = turns.iter().filter_map(|t| t["turnId"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["msg_u1", "msg_a1"],
+            "turns[] == the active prefix ONLY (strictly before the pointer) — a \
+             regression to mapping every served message into turns[] fails here"
+        );
+
+        let markers = snap["rolledBackTurns"]
+            .as_array()
+            .expect("the marker bucket is present while a tail is rolled back");
+        let marker_ids: Vec<&str> = markers
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(
+            marker_ids,
+            vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
+            "the tail rows in their ORIGINAL conversation order"
+        );
+        assert!(
+            markers.iter().all(|t| t["rolledBack"] == json!(true)),
+            "every marker is stamped rolledBack:true (decision 6)"
+        );
+    }
+
+    #[test]
+    fn opencode_snapshot_marker_order_is_stable_across_repeated_undos() {
+        // Revert the LAST user message, build; then revert the MIDDLE user message,
+        // build: the second snapshot's rolledBackTurns order equals the surviving
+        // tail's conversation order — never wire/undo order ([u3,a3,u2,a2]).
+        let first = build_opencode_snapshot_json(
+            "ses_x",
+            &json!({ "id": "ses_x", "revert": { "messageID": "msg_u3" } }),
+            &three_turn_opencode_messages(),
+            None,
+        );
+        let first_ids: Vec<&str> = first["rolledBackTurns"]
+            .as_array()
+            .expect("markers after the first undo")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(first_ids, vec!["msg_u3", "msg_a3"]);
+
+        let second = build_opencode_snapshot_json(
+            "ses_x",
+            &json!({ "id": "ses_x", "revert": { "messageID": "msg_u2" } }),
+            &three_turn_opencode_messages(),
+            None,
+        );
+        let second_ids: Vec<&str> = second["rolledBackTurns"]
+            .as_array()
+            .expect("markers after the second undo")
+            .iter()
+            .filter_map(|t| t["turnId"].as_str())
+            .collect();
+        assert_eq!(
+            second_ids,
+            vec!["msg_u2", "msg_a2", "msg_u3", "msg_a3"],
+            "markers follow the surviving tail's conversation order across repeated undos"
+        );
+        // No revert pointer (legacy behavior): everything stays in turns[], no bucket.
+        let plain = build_opencode_snapshot_json(
+            "ses_x",
+            &json!({ "id": "ses_x" }),
+            &three_turn_opencode_messages(),
+            None,
+        );
+        assert_eq!(
+            plain["turns"].as_array().expect("turns").len(),
+            6,
+            "no pointer ⇒ no filtering (legacy-server parity)"
+        );
+        assert!(
+            plain.get("rolledBackTurns").is_none(),
+            "the marker bucket is omitted entirely when nothing is rolled back"
+        );
+    }
+
+    // ── kata 1wxv Task 5: snapshot rollback surfacing (opencode) ──────────────
+    //
+    // Stamps are static `{undo:true, redo:true}` (LBC-2 verified the
+    // revert/unrevert routes). The marker bucket IS the ledger record's
+    // entries union (r3 — frozen prior epochs ++ the current serve-revert
+    // tail, recorded at write time); `turns[]` still comes from the
+    // provider's active prefix. `canRedo` is the STORED bit (the only source);
+    // `undoneDepth` is the USER-role step count of the bucket (r3 finding 5 —
+    // the same step count the client's `Rolled back (N)` label shows), never
+    // `entries.len()`.
+
+    /// Build a ledger entry's removed-turns from fixture messages (the verbatim
+    /// FreshAgentTurn JSON the Task 3 handler records at write time).
+    fn opencode_record_entry(
+        msgs: &[Value],
+        prompt: &str,
+    ) -> crate::rollback_record::RollbackEntry {
+        let removed_turns = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| opencode_message_turn_json(m, i).expect("marker turn"))
+            .collect();
+        crate::rollback_record::RollbackEntry {
+            removed_turns,
+            prompt_text: prompt.into(),
+            at_ms: 90,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn opencode_snapshot_stamps_capabilities_and_the_ledger_marker_bucket() {
+        let msgs = three_turn_opencode_messages();
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(opencode_record_entry(&[msgs[2].clone()], "prompt two"), 100);
+        record.set_can_redo(true, 100);
+        // The serve carries NO revert pointer: the bucket is PROVABLY
+        // ledger-sourced (a provider-tail projection would show nothing).
+        let info = json!({ "id": "ses_x", "title": "t", "time": { "updated": 5 } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
+        assert_eq!(snap["capabilities"]["undo"], json!(true));
+        // kata z7j7: opencode advertises per-send model/effort; sandbox and
+        // permissionMode have no opencode wire contract.
+        assert_eq!(
+            snap["capabilities"]["settingScopes"],
+            json!({
+                "model": "per-send",
+                "effort": "per-send",
+                "sandbox": "unsupported",
+                "permissionMode": "unsupported",
+            })
+        );
+        assert_eq!(snap["capabilities"]["redo"], json!(true));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["msg_u2"] })
+        );
+        let bucket = snap["rolledBackTurns"].as_array().expect("bucket");
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(bucket[0]["turnId"], json!("msg_u2"));
+        assert!(
+            bucket.iter().all(|t| t["rolledBack"] == json!(true)),
+            "every marker is stamped rolledBack:true (decision 6)"
+        );
+        assert_eq!(
+            snap["turns"].as_array().expect("turns").len(),
+            6,
+            "turns[] still comes from the provider state (no pointer ⇒ the full list)"
+        );
+        assert_eq!(
+            snap["revision"],
+            json!(100),
+            "the record's lastOpAtMs is the revision floor (basis 5 loses)"
+        );
+    }
+
+    #[test]
+    fn opencode_snapshot_undone_depth_counts_user_steps_not_entries() {
+        // r3 finding 5: a REBUILT single entry carrying the two-step tail
+        // ([u2, a2, u3, a3] — Task 3's union rebuild over a two-step undo).
+        let msgs = three_turn_opencode_messages();
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(
+            opencode_record_entry(
+                &[
+                    msgs[2].clone(),
+                    msgs[3].clone(),
+                    msgs[4].clone(),
+                    msgs[5].clone(),
+                ],
+                "prompt two",
+            ),
+            100,
+        );
+        record.set_can_redo(true, 100);
+        let info = json!({ "id": "ses_x", "time": { "updated": 5 } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 2, "redoableTurnIds": ["msg_u2", "msg_u3"] }),
+            "two undone USER steps — never entries.len(); every current-epoch user row is redoable"
+        );
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 4);
+    }
+
+    #[test]
+    fn opencode_snapshot_destroyed_redo_keeps_the_marked_bucket_alive() {
+        let msgs = three_turn_opencode_messages();
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(opencode_record_entry(&[msgs[2].clone()], "prompt two"), 100);
+        record.set_can_redo(true, 100);
+        record.destroy_redo(120); // decision 5: kills redo, NEVER the markers (decision 6)
+        let info = json!({ "id": "ses_x", "time": { "updated": 5 } });
+        let snap = build_opencode_snapshot_json("ses_x", &info, &msgs, Some(&record));
+        assert_eq!(
+            snap["rollback"],
+            json!({ "canRedo": false, "undoneDepth": 1, "redoableTurnIds": [] }),
+            "the stored bit cleared; the bucket's user-step count is untouched; no marker is redoable"
+        );
+        assert_eq!(snap["rolledBackTurns"].as_array().expect("bucket").len(), 1);
+        assert_eq!(
+            snap["revision"],
+            json!(120),
+            "the destroy also lifts the floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_surfaces_the_durable_rollback_record() {
+        let session_body = json!({
+            "id": "ses_rb",
+            "title": "rolled back session",
+            "time": { "created": 1_700_000_000_000i64, "updated": 1_700_000_005_000i64 },
+        });
+        // The serve knows NOTHING about a revert pointer — the marker bucket
+        // must still surface from the ledger.
+        let messages_body = json!([
+            { "info": { "id": "msg-1", "role": "user" }, "parts": [{ "type": "text", "text": "hi" }] },
+            { "info": { "id": "msg-2", "role": "assistant" }, "parts": [{ "type": "text", "text": "hello" }] },
+        ]);
+        let st = state_with_fixed_session_http(session_body, messages_body).await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let marker_source = json!({ "info": { "id": "msg-9", "role": "user" }, "parts": [{ "type": "text", "text": "later" }] });
+        let mut record = crate::rollback_record::RollbackRecord::empty(50);
+        record.push_entry(
+            opencode_record_entry(&[marker_source], "later"),
+            1_702_000_000_000,
+        );
+        record.set_can_redo(true, 1_702_000_000_000);
+        crate::identity_sink::PaneIdentitySink::record_rollback(
+            fake.as_ref(),
+            "opencode",
+            "ses_rb",
+            record,
+        )
+        .await
+        .expect("record write");
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_rb", None)
+            .await
+            .expect("snapshot builds");
+        assert_eq!(snapshot["capabilities"]["undo"], json!(true));
+        assert_eq!(snapshot["capabilities"]["redo"], json!(true));
+        assert_eq!(
+            snapshot["rollback"],
+            json!({ "canRedo": true, "undoneDepth": 1, "redoableTurnIds": ["msg-9"] })
+        );
+        assert_eq!(snapshot["rolledBackTurns"][0]["turnId"], json!("msg-9"));
+        assert_eq!(snapshot["rolledBackTurns"][0]["rolledBack"], json!(true));
+        assert_eq!(
+            snapshot["revision"],
+            json!(1_702_000_000_000i64),
+            "a stale serve timestamp never beats the record floor"
+        );
+    }
 }
 
 // ── PATCH /api/panes/:id (rename pane) ───────────────────────────────────
 
 #[cfg(test)]
-#[path = "rename_cascade_tests.rs"]
-mod rename_cascade_tests;
+#[path = "rename_route_tests.rs"]
+mod rename_route_tests;
 
 #[cfg(test)]
 mod rename_pane_tests {

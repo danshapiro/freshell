@@ -7,6 +7,7 @@
 //! `dead_code` allow (the idiomatic pattern for `tests/common/mod.rs`).
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,14 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use freshell_ws::WsState;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
+
+/// Frame-receive / poll budget for the WS e2e suites. DEFLAKE (the-usual
+/// test-flake-hardening): `auto_resume_e2e` and `restore_spawn_gate` flaked at
+/// 5–10s budgets only under heavy machine load (evidence: run-state receipts
+/// of the 2026-09 host-pressure-pane run; f3wp prior art f2c505e9f). Assertions
+/// are unchanged; only the wait budget grew — a genuinely missing frame still
+/// fails, ~25s later.
+pub const FRAME_BUDGET: Duration = Duration::from_secs(30);
 
 /// Launcher-assigned amplifier identity (F7/V9): tests that create
 /// amplifier terminals now WRITE stub dirs into the amplifier home.
@@ -76,9 +85,16 @@ pub fn test_settings_value() -> serde_json::Value {
 /// `mode:"amplifier"` create genuinely spawns — the same recording-script
 /// convention as `freshell-freshagent`'s Slice 3a tests, minus the argv file
 /// (these tests assert on wire frames, not argv).
+///
+/// Each call writes a **unique** script path (PID + atomic counter) so parallel
+/// tests in the same binary never collide with ETXTBSY ("Text file busy") when
+/// one test writes the script while another is executing a prior copy.
+static SLEEPER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    let seq = SLEEPER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-identity-frames-sleeper-{name}-{}.sh",
+        "freshell-identity-frames-sleeper-{name}-{}-{seq}.sh",
         std::process::id()
     ));
     std::fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper script");
@@ -172,6 +188,7 @@ pub async fn spawn_server_with_specs_and_shared_settings(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -251,6 +268,7 @@ pub async fn spawn_server_with_specs(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -332,6 +350,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -371,16 +390,37 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
 }
 
 /// [`spawn_server_with_specs`], with the auto-resume hub SPAWNED (Task 5) on
-/// an injected backoff schedule. Delays ride the spawn helper — NOT the
+/// an injected backoff schedule, plus the harness-default identity-grace
+/// schedule (`vec![25, 25]` — tiny, so a genuinely identity-less crashing
+/// pane still exercises the grace path cheaply; claude-driven tests never
+/// engage it because their preallocated identity is present at the crash
+/// decision). Delays ride the spawn helper — NOT the
 /// `FRESHELL_AUTO_RESUME_DELAYS_MS` env — because the harness is in-process
 /// and a `std::env::set_var` would leak across parallel tests in the same
 /// binary. Task 2's event tests keep using
 /// [`spawn_server_with_specs_and_auto_resume_rx`] (hub OFF, rx taken by the
-/// test).
+/// test). Thin wrapper over [`spawn_server_with_specs_hub_and_state`]
+/// dropping the returned state.
 pub async fn spawn_server_with_specs_and_auto_resume_hub(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
     delays: Vec<u64>,
 ) -> (String, freshell_terminal::TerminalRegistry) {
+    let (url, registry, _state) =
+        spawn_server_with_specs_hub_and_state(cli_commands, delays, vec![25, 25]).await;
+    (url, registry)
+}
+
+/// [`spawn_server_with_specs`], with the auto-resume hub SPAWNED on injected
+/// backoff AND identity-grace schedules (kata kmbs, Task 2), additionally
+/// handing back a CLONE of the `WsState` (the
+/// [`spawn_server_with_specs_and_state`] precedent) so tests can drive
+/// connection-independent server-side seams directly — the grace-success e2e
+/// upserts `state.identity` mid-grace. Same env-leak rationale as above.
+pub async fn spawn_server_with_specs_hub_and_state(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    delays: Vec<u64>,
+    identity_grace_delays: Vec<u64>,
+) -> (String, freshell_terminal::TerminalRegistry, WsState) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -417,11 +457,16 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         ping_interval_ms: 30_000,
+        // DEFLAKE-keep (the-usual test-flake-hardening): the server-side hello
+        // timeout stays 5s — no evidence it fired in the load flakes (2026-09
+        // host-pressure-pane receipts); a separate door from the widened
+        // client-side read budgets (see FRAME_BUDGET).
         hello_timeout_ms: 5_000,
         allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
         ws_max_payload_bytes: 16 * 1024 * 1024,
@@ -439,13 +484,14 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    freshell_ws::auto_resume::spawn_auto_resume_hub_with_delays(
+    freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(
         state.clone(),
         auto_resume_rx,
         delays,
+        identity_grace_delays,
     );
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -454,7 +500,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws", addr = addr), registry)
+    (format!("ws://{addr}/ws", addr = addr), registry, state)
 }
 
 /// [`spawn_server_with_specs`], additionally handing back a CLONE of the
@@ -499,6 +545,7 @@ pub async fn spawn_server_with_specs_and_state(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -589,6 +636,7 @@ pub async fn spawn_server_with_ledger(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -675,6 +723,7 @@ pub async fn spawn_server_with_specs_and_activity(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -760,6 +809,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(cli_commands),
@@ -867,6 +917,7 @@ pub async fn spawn_server_with_create_protect_probes(
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(Vec::new()),
@@ -908,23 +959,56 @@ pub type TestWs =
 /// handshake frame (the 4th handshake message; `config_fallback` is None in
 /// this harness, so the handshake is exactly 4 frames).
 pub async fn connect_and_capture_inventory(url: &str) -> (TestWs, serde_json::Value) {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("ws connect");
-    ws.send(WsMessage::Text(
+    connect_with_hello(
+        url,
         serde_json::json!({
             "type": "hello",
             "token": AUTH_TOKEN,
             "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
-        })
-        .to_string(),
-    ))
+        }),
+    )
     .await
-    .expect("send hello");
+}
+
+/// `connect_and_capture_inventory` variant whose hello carries the D8
+/// provenance identity (`deviceId`/`clientInstanceId`) — the stamp source for
+/// connection-scoped ledger rows.
+pub async fn connect_and_capture_inventory_with_identity(
+    url: &str,
+    device_id: &str,
+    client_instance_id: &str,
+) -> (TestWs, serde_json::Value) {
+    connect_with_hello(
+        url,
+        serde_json::json!({
+            "type": "hello",
+            "token": AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "deviceId": device_id,
+            "clientInstanceId": client_instance_id,
+        }),
+    )
+    .await
+}
+
+async fn connect_with_hello(url: &str, hello: serde_json::Value) -> (TestWs, serde_json::Value) {
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    ws.send(WsMessage::Text(hello.to_string()))
+        .await
+        .expect("send hello");
 
     let mut inventory = serde_json::Value::Null;
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the loop.
+    // The 4-frame handshake cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..4u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next())
             .await
             .expect("handshake message within timeout")
             .expect("stream not ended")
@@ -956,6 +1040,10 @@ pub async fn create_shell_terminal(ws: &mut TestWs, request_id: &str) -> String 
     .await
     .expect("send terminal.create");
 
+    // DEFLAKE-keep (the-usual test-flake-hardening): the 10s outer budget and
+    // 5s per-read here stay narrow — the suites using this helper did not
+    // flake, and widening would only raise their failure latency (see
+    // FRAME_BUDGET's doc comment for the widened set).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -1051,6 +1139,10 @@ pub async fn attach_with(
 }
 
 pub async fn wait_for_attach_ready(ws: &mut TestWs, attach_request_id: &str) {
+    // DEFLAKE-keep (the-usual test-flake-hardening): the 10s outer budget and
+    // 5s per-read here stay narrow — the suites using this helper did not
+    // flake, and widening would only raise their failure latency (see
+    // FRAME_BUDGET's doc comment for the widened set).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -1087,8 +1179,16 @@ pub async fn send_input(ws: &mut TestWs, terminal_id: &str, data: &str) {
 
 /// Read text frames until one with `type == wanted` arrives (bounded).
 pub async fn next_frame_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
+    // DEFLAKE (delta-r2 M1): ONE deadline per CALL (Instant::now() +
+    // FRAME_BUDGET), each read wrapped in timeout(remaining.max(1ms), ...) —
+    // the per-frame FRAME_BUDGET form multiplied the budget across the 20-frame
+    // loop (a genuinely missing frame fails in ≤ FRAME_BUDGET, restored
+    // exactly). The 20-message cap stays as the secondary bound; panic strings
+    // unchanged.
+    let deadline = std::time::Instant::now() + FRAME_BUDGET;
     for _ in 0..20u8 {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
             .expect("stream not ended")

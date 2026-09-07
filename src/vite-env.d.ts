@@ -10,3 +10,5 @@ interface ImportMeta {
 }
 
 declare const __PERF_LOGGING__: string
+
+declare const __FRESHELL_BUILD_ID__: string

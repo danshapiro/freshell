@@ -9,6 +9,11 @@ import {
   FreshAgentUnprovableThreadRevisionError,
   FreshAgentTurnNotFoundError,
 } from '../../../../server/fresh-agent/runtime-manager.js'
+import {
+  __setFreshAgentObservabilitySinkForTest,
+  hashForLogs,
+} from '../../../../server/fresh-agent/observability.js'
+import { freshAgentObservabilityLogger } from '../../../../server/logger.js'
 
 const DISPLAY_SECRET = 'task-3-persisted-display-secret'
 
@@ -479,6 +484,13 @@ describe('Codex fresh-agent adapter', () => {
       provider: 'codex',
       threadId: 'thread-new-1',
       revision: 7,
+    })
+    // kata z7j7: every knob per-send (the adapter merges them into turn/start).
+    expect(snapshot.capabilities.settingScopes).toEqual({
+      model: 'per-send',
+      effort: 'per-send',
+      sandbox: 'per-send',
+      permissionMode: 'per-send',
     })
     expect(snapshot.turns).toHaveLength(2)
     expect(snapshot.turns[0]).toMatchObject({ role: 'user', ordinal: 0 })
@@ -1000,10 +1012,10 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       model: 'gpt-5-codex',
     })
-    await adapter.send?.('thread-new-1', {
+      await adapter.send?.('thread-new-1', {
       requestId: 'send-model-1',
       text: 'Use the small model',
-      settings: { model: 'gpt-5.4-flash' },
+      settings: { model: 'gpt-5.6-luna' },
     })
 
     const snapshot = await adapter.getSnapshot?.({
@@ -1013,8 +1025,8 @@ describe('Codex fresh-agent adapter', () => {
     }, 7) as any
     expect(snapshot.turns).toHaveLength(3)
     expect(snapshot.turns[0]).not.toHaveProperty('model')
-    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.4-flash' })
-    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.4-flash' })
+    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.6-luna' })
+    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.6-luna' })
   })
 
   it('subscribes to Codex lifecycle notifications and projects matching thread updates', async () => {
@@ -1470,7 +1482,7 @@ describe('Codex fresh-agent adapter', () => {
       permissionMode: 'on-request',
       sandbox: 'workspace-write',
       effort: 'max',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
     })
 
     await adapter.send?.('thread-new-1', {
@@ -1488,7 +1500,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       approvalPolicy: 'on-request',
       sandboxPolicy: { type: 'workspaceWrite' },
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       effort: 'xhigh',
     })
     expect(runtime.interruptTurn).toHaveBeenCalledWith({
@@ -1547,18 +1559,21 @@ describe('Codex fresh-agent adapter', () => {
     await expect(adapter.create({
       requestId: 'req-1',
       sessionType: 'freshcodex',
-      model: 'gpt-5.4-flash',
-      effort: 'xhigh',
+      model: 'gpt-6-astra',
+      effort: 'none',
     })).resolves.toEqual({ sessionId: 'thread-new-1', sessionRef: { provider: 'codex', sessionId: 'thread-new-1' } })
 
     await adapter.send?.('thread-new-1', { text: 'reply ok' })
 
     expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4-flash',
+      model: 'gpt-6-astra',
     }))
     expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4-flash',
-      effort: 'high',
+      model: 'gpt-6-astra',
+      // 'none' is undeclared for GPT-6 Astra (['low','medium','high','xhigh','max']),
+      // so the effort normalizes to the model's declared default ('max' → wire
+      // 'xhigh') — the effort clamp against the REQUESTED model.
+      effort: 'xhigh',
     }))
   })
 
@@ -1800,5 +1815,250 @@ describe('Codex fresh-agent adapter', () => {
     // The subscription's lifecycle handler still delivers post-recovery events to the listener.
     lifecycleHandler?.({ kind: 'thread_status_changed', threadId: 'thread-new-1', status: { type: 'active', activeFlags: [] } })
     expect(listener).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+  })
+})
+
+describe('wedged-sidecar deadman (quiet window)', () => {
+  const QUIET_MS = 1_000
+
+  function makeDeadmanStubRuntime(
+    threadStatus: unknown = { type: 'idle' },
+    options: { inProgressTurnId?: string } = {},
+  ) {
+    const handlers: {
+      lifecycle?: (event: any) => void
+      turnStarted?: (event: any) => void
+      turnCompleted?: (event: any) => void
+      exit?: () => void
+    } = {}
+    const thread = { ...makeCodexThread('thread-1'), status: threadStatus }
+    const inProgressTurn = options.inProgressTurnId
+      ? [{ ...makeCodexTurn(options.inProgressTurnId), status: 'inProgress' }]
+      : []
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-1' }),
+      interruptTurn: vi.fn(),
+      onThreadLifecycle: vi.fn((handler: any) => { handlers.lifecycle = handler; return vi.fn() }),
+      onTurnStarted: vi.fn((handler: any) => { handlers.turnStarted = handler; return vi.fn() }),
+      onTurnCompleted: vi.fn((handler: any) => { handlers.turnCompleted = handler; return vi.fn() }),
+      onExit: vi.fn((handler: any) => { handlers.exit = handler; return vi.fn() }),
+      readThread: vi.fn().mockResolvedValue({ thread: { ...thread, turns: inProgressTurn } }),
+      listThreadTurns: vi.fn().mockResolvedValue({ turns: [], nextCursor: null, revision: 7 }),
+      readThreadTurn: vi.fn().mockResolvedValue(null),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    }
+    return { runtime, handlers }
+  }
+
+  async function subscribeAndSend(adapter: ReturnType<typeof createCodexFreshAgentAdapter>) {
+    const listener = vi.fn()
+    await adapter.subscribe?.('thread-1', listener)
+    await adapter.send?.('thread-1', { requestId: 'req-1', text: 'hello' } as any)
+    return listener
+  }
+
+  it('emits a stuck status after the quiet window elapses with a turn in flight (and never a turn-complete edge)', async () => {
+    vi.useFakeTimers()
+    try {
+      const { runtime } = makeDeadmanStubRuntime()
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 1)
+      expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
+      await vi.advanceTimersByTimeAsync(2)
+      expect(listener).toHaveBeenCalledTimes(1)
+      // eaw7: the deadman fire is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'stuck', statusSeq: expect.any(Number),
+      }))
+      expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not fire for turns completing before the quiet window (normal long turns within bound unaffected)', async () => {
+    vi.useFakeTimers()
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime()
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      await vi.advanceTimersByTimeAsync(Math.floor(QUIET_MS / 2))
+      handlers.turnCompleted?.({ threadId: 'thread-1', params: { turn: { status: 'completed' } } })
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.session.snapshot', status: 'idle' }))
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+      await vi.advanceTimersByTimeAsync(QUIET_MS * 3)
+      expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
+      expect(listener).toHaveBeenCalledTimes(2) // idle snapshot + one turn-complete; nothing after
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resets the quiet window on lifecycle and turn/started events', async () => {
+    vi.useFakeTimers()
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime()
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 100)
+      handlers.lifecycle?.({ kind: 'thread_status_changed', threadId: 'thread-1', status: { type: 'active', activeFlags: [] } })
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 100)
+      handlers.turnStarted?.({ threadId: 'thread-1', turnId: 'turn-1' })
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 1)
+      expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
+      await vi.advanceTimersByTimeAsync(2)
+      // eaw7: the deadman fire is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'stuck', statusSeq: expect.any(Number),
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('disarms on sidecar exit without emitting stuck', async () => {
+    vi.useFakeTimers()
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime()
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 100)
+      handlers.exit?.()
+      // eaw7: the on_exit self-heal is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'exited', statusSeq: expect.any(Number),
+      }))
+      await vi.advanceTimersByTimeAsync(QUIET_MS * 3)
+      expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports stuck through REST snapshots until events resume (resolution clears the flag)', async () => {
+    vi.useFakeTimers()
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime({ type: 'active', activeFlags: [] })
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      await vi.advanceTimersByTimeAsync(QUIET_MS + 1)
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
+      const stuckNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 7)
+      expect(stuckNow.status).toBe('stuck')
+      handlers.turnCompleted?.({ threadId: 'thread-1', params: { turn: { status: 'completed' } } })
+      // the provider truth moves to idle after the completion commits:
+      runtime.readThread.mockResolvedValue({ thread: { ...makeCodexThread('thread-1'), status: { type: 'idle' }, turns: [] } })
+      const resolvedNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 8)
+      expect(resolvedNow.status).toBe('idle')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('arms a snapshot-observed running thread once and is not starved by snapshot polls', async () => {
+    vi.useFakeTimers()
+    try {
+      const { runtime } = makeDeadmanStubRuntime({ type: 'active', activeFlags: ['turn-1'] }, { inProgressTurnId: 'turn-1' })
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = vi.fn()
+      await adapter.subscribe?.('thread-1', listener)
+      // attach-mid-turn: snapshot re-seeds the in-flight turn and arms the deadman
+      await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 7)
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 50)
+      // a later snapshot poll must NOT reset the window
+      await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 8)
+      await vi.advanceTimersByTimeAsync(60)
+      // eaw7: the deadman fire is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'stuck', statusSeq: expect.any(Number),
+      }))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('logs fresh_agent_stuck_deadman armed/fired/resolved with hashed ids (fired at warn)', async () => {
+    vi.useFakeTimers()
+    const infoSpy = vi.fn()
+    const warnSpy = vi.fn()
+    __setFreshAgentObservabilitySinkForTest({ info: infoSpy, warn: warnSpy })
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime()
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      await vi.advanceTimersByTimeAsync(QUIET_MS + 1)
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const [payload] = warnSpy.mock.calls[0]
+      expect(payload).toMatchObject({
+        event: 'fresh_agent_stuck_deadman',
+        component: 'fresh-agent-observability',
+        provider: 'codex',
+        phase: 'fired',
+        sessionIdHash: hashForLogs('thread-1'),
+        quietWindowMs: QUIET_MS,
+      })
+      expect(JSON.stringify(payload)).not.toContain('thread-1')
+      handlers.turnCompleted?.({ threadId: 'thread-1', params: { turn: { status: 'completed' } } })
+      const phases = infoSpy.mock.calls.map(([p]) => (p as any).phase)
+      expect(phases).toContain('armed')
+      expect(phases).toContain('resolved')
+      void listener
+    } finally {
+      // The module exposes a setter only, so restore its default explicitly:
+      // re-set the real logger the sink was initialized with (observability.ts).
+      __setFreshAgentObservabilitySinkForTest(freshAgentObservabilityLogger)
+      vi.useRealTimers()
+    }
+  })
+
+  it('self-clears the stuck flag when push activity resumes mid-turn (resolved: activity)', async () => {
+    vi.useFakeTimers()
+    const infoSpy = vi.fn()
+    const warnSpy = vi.fn()
+    __setFreshAgentObservabilitySinkForTest({ info: infoSpy, warn: warnSpy })
+    try {
+      const { runtime, handlers } = makeDeadmanStubRuntime({ type: 'active', activeFlags: ['turn-1'] })
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any, quietWindowMs: QUIET_MS } as any)
+      const listener = await subscribeAndSend(adapter)
+      const stuckCalls = () => listener.mock.calls.filter(([message]) => (message as any)?.status === 'stuck')
+      // The full quiet window elapses with the turn still in flight: stuck fires.
+      await vi.advanceTimersByTimeAsync(QUIET_MS + 1)
+      expect(stuckCalls()).toHaveLength(1)
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const stuckNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 7)
+      expect(stuckNow.status).toBe('stuck')
+      // Lane-visible push activity resumes while the turn is still running.
+      handlers.lifecycle?.({ kind: 'thread_status_changed', threadId: 'thread-1', status: { type: 'active', activeFlags: ['turn-1'] } })
+      // (a) No re-fire/duplicate stuck edge rides along with the resumed activity.
+      expect(stuckCalls()).toHaveLength(1)
+      // (b) The snapshot overlay is gone: provider truth is reported again.
+      const resumedNow: any = await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 8)
+      expect(resumedNow.status).toBe('running')
+      // (c) The resolution was logged as activity-driven.
+      const resolutions = infoSpy.mock.calls
+        .map(([payload]) => payload as any)
+        .filter((payload) => payload.event === 'fresh_agent_stuck_deadman' && payload.phase === 'resolved')
+      expect(resolutions).toEqual([
+        expect.objectContaining({
+          resolution: 'activity',
+          sessionIdHash: hashForLogs('thread-1'),
+          quietWindowMs: QUIET_MS,
+        }),
+      ])
+      // The window re-armed: no premature re-fire at window − ε, and a further
+      // full window of silence fires exactly once more.
+      await vi.advanceTimersByTimeAsync(QUIET_MS - 1)
+      expect(stuckCalls()).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(2)
+      expect(stuckCalls()).toHaveLength(2)
+    } finally {
+      // The module exposes a setter only, so restore its default explicitly:
+      // re-set the real logger the sink was initialized with (observability.ts).
+      __setFreshAgentObservabilitySinkForTest(freshAgentObservabilityLogger)
+      vi.useRealTimers()
+    }
   })
 })

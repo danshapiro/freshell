@@ -1,6 +1,6 @@
+import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists and migrates legacy anchors
+import './env-load.js' // Loads .env (at the bootstrap anchor) before any other module's top-level env readers evaluate
 import { createFreshAgentExtrasRouter } from './fresh-agent-extras-router.js'
-import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
-import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -18,6 +18,7 @@ import { AI_CONFIG } from './ai-prompts.js'
 import { getFreshellConfigDir } from './freshell-home.js'
 import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
+import { HostStatsService } from './host-stats/service.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
@@ -102,6 +103,10 @@ import {
   CodexAppServerRuntime,
   runCodexStartupReaper,
 } from './coding-cli/codex-app-server/runtime.js'
+import {
+  CodexSidecarReconciler,
+  resolveCodexSidecarReapGraceMs,
+} from './coding-cli/codex-app-server/sidecar-reattach.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import { startCodexObservability } from './coding-cli/codex-observability.js'
 import { installCodexChildExitHandlers, snapshotCodexChildren } from './coding-cli/codex-child-registry.js'
@@ -229,10 +234,15 @@ async function main() {
     },
     getShellTaskStatus: async () => startupState.snapshot().tasks,
     getPerfLogging: () => perfConfig.enabled,
+    getConfigDir: () => getFreshellConfigDir(),
     getConfigFallback: async () => {
       const readError = configStore.getLastReadError()
       if (!readError) return undefined
-      return { reason: readError, backupExists: await configStore.backupExists() }
+      return {
+        reason: readError,
+        backupExists: await configStore.backupExists(),
+        backupPath: configStore.getBackupPath(),
+      }
     },
   }))
   app.use('/api', createClientLogsRouter())
@@ -277,16 +287,28 @@ async function main() {
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
+  // 4g2a: the boot reconciler holds verified prior-generation sidecars claimable for restore
+  // (planner wiring lands with it); the hourly observability tick sweeps whatever stays
+  // unclaimed once the grace window expires.
+  const codexSidecarReconciler = new CodexSidecarReconciler({
+    reapGraceMs: resolveCodexSidecarReapGraceMs(process.env.FRESHELL_CODEX_SIDECAR_REAP_GRACE_MS),
+  })
   try {
-    await runCodexStartupReaper({ serverInstanceId })
+    await runCodexStartupReaper({ serverInstanceId, holdReconciler: codexSidecarReconciler })
   } catch (err) {
     // I4: boot must never die in the reaper. Unresolved records are retried by the hourly
     // observability tick and on the next boot.
     log.warn({ err }, 'Codex startup reaper failed; continuing startup (fail-open)')
   }
+  // One structured boot line: survivors held claimable, claims in flight, and the grace window.
+  log.info(
+    { codexSidecarReconciler: codexSidecarReconciler.snapshot() },
+    'Codex sidecar reconciler state after the boot reaper pass',
+  )
   // Boot + hourly codex-log-db line (WAL size, holder count, quarantine count), hourly retry of
-  // pending reaper records, and the quarantine rescan trigger. Observation-only; unref()'d timer.
-  const codexObservability = startCodexObservability({ serverInstanceId })
+  // pending reaper records, the reconciler sweep, and the quarantine rescan trigger.
+  // Observation-only; unref()'d timer.
+  const codexObservability = startCodexObservability({ serverInstanceId, reconciler: codexSidecarReconciler })
   const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
@@ -402,7 +424,12 @@ async function main() {
       },
     ]),
   })
-  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
+  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }), { reconciler: codexSidecarReconciler })
+  // Host pressure service: constructed provider-less (sources need the handler, which
+  // needs the service) and wired via setSources after wsHandler exists below.
+  const hostStats = new HostStatsService()
+  // Same source as the handler's readWsHandlerConfig maxConnections (ws-handler.ts).
+  const wsHandlerMaxConnections = Number(process.env.MAX_CONNECTIONS || 50)
   const wsHandler = new WsHandler(
     server,
     registry,
@@ -416,7 +443,11 @@ async function main() {
         const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
         const readError = configStore.getLastReadError()
         const configFallback = readError
-          ? { reason: readError, backupExists: await configStore.backupExists() }
+          ? {
+              reason: readError,
+              backupExists: await configStore.backupExists(),
+              backupPath: configStore.getBackupPath(),
+            }
           : undefined
         return {
           settings: currentSettings,
@@ -439,8 +470,13 @@ async function main() {
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
       opencodeLatestTurnCompletionsProvider: () => opencodeActivity.tracker.listLatestCompletions(),
+      hostStats,
     },
   )
+  hostStats.setSources({
+    getPtyCounts: () => ({ running: registry.getDiagnosticCounts().terminals.running, max: registry.getMaxTerminals() }),
+    getWsClientCounts: () => ({ clients: wsHandler.connectionCount(), max: wsHandlerMaxConnections }),
+  })
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
   const isCompiledBuild = __dirname.endsWith(path.join('dist', 'server'))
@@ -806,7 +842,6 @@ async function main() {
     registry,
     wsHandler,
     terminalMetadata,
-    codingCliIndexer,
     terminalViewService: createTerminalViewService({ configStore, registry }),
   }))
 
@@ -1261,6 +1296,7 @@ async function main() {
 
     // 3. Stop any coalesced sessions publish timers
     sessionsSync.shutdown()
+    hostStats.stop()
 
     // 4. Gracefully shut down terminals and planner-owned Codex app-server sidecars.
     try {

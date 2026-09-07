@@ -16,6 +16,8 @@ export interface ShellBootstrapRouterDeps {
   getPerfState?: () => Promise<BootstrapPayload['perf'] | undefined>
   getPerfLogging?: () => boolean | Promise<boolean>
   getConfigFallback?: () => Promise<BootstrapPayload['configFallback'] | undefined>
+  /** Effective server config dir (profile-aware). */
+  getConfigDir?: () => string
   readModelScheduler?: ReadModelWorkScheduler
 }
 
@@ -77,6 +79,7 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
             shell,
             ...(perf ? { perf } : {}),
             ...(configFallback ? { configFallback } : {}),
+            ...(deps.getConfigDir ? { configDir: deps.getConfigDir() } : {}),
           } satisfies BootstrapPayload
         },
       })

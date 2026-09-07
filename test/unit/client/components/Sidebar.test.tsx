@@ -66,7 +66,42 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
+// Mock fetchRepoIconMeta as a synchronous action (not a thunk) to prevent
+// async state updates that trigger React act() warnings in jsdom. The mock
+// reducer sets byCwd[cwd] = { status: 'loading' } so the probe test can verify
+// the entry was created.
+vi.mock('@/store/repoIconsSlice', async () => {
+  const actual = await vi.importActual<typeof import('@/store/repoIconsSlice')>('@/store/repoIconsSlice')
+  return {
+    ...actual,
+    default: (state: any = { byCwd: {} }, action: any) => {
+      if (action.type === 'repoIcons/fetchMeta' && action.payload) {
+        return {
+          ...state,
+          byCwd: {
+            ...state.byCwd,
+            [action.payload]: { status: 'loading' },
+          },
+        }
+      }
+      return state
+    },
+    fetchRepoIconMeta: Object.assign(
+      (cwd: string) => ({ type: 'repoIcons/fetchMeta', payload: cwd }) as any,
+      { pending: { type: 'repoIcons/fetchMeta/pending' }, fulfilled: { type: 'repoIcons/fetchMeta/fulfilled' }, rejected: { type: 'repoIcons/fetchMeta/rejected' } },
+    ) as any,
+  }
+})
+
 import { searchSessions as mockSearchSessions } from '@/lib/api'
+
+vi.mock('@/components/icons/RepoIcon', () => ({
+  default: ({ info, className }: any) => (
+    <span data-testid="repo-icon" data-repo-key={info?.repoKey} data-class={className} />
+  ),
+}))
+
+import repoIconsReducer from '@/store/repoIconsSlice'
 
 const sessionId = (label: string) => {
   const hex = createHash('md5').update(label).digest('hex')
@@ -114,6 +149,8 @@ function createTestStore(options?: {
   remoteOpen?: RegistryTabRecord[]
   sameDeviceOpen?: RegistryTabRecord[]
   freshAgentSessions?: Record<string, FreshAgentSessionState>
+  repoIcons?: Record<string, any>
+  panesSettings?: Partial<(typeof defaultSettings)['panes']>
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -160,6 +197,7 @@ function createTestStore(options?: {
       terminalDirectory: terminalDirectoryReducer,
       tabRegistry: tabRegistryReducer,
       freshAgent: freshAgentReducer,
+      repoIcons: repoIconsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -181,6 +219,7 @@ function createTestStore(options?: {
           panes: {
             ...defaultSettings.panes,
             sessionOpenMode: options?.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
+            ...options?.panesSettings,
           },
         },
         loaded: true,
@@ -246,6 +285,9 @@ function createTestStore(options?: {
       freshAgent: {
         ...freshAgentReducer(undefined, { type: '@@test/init' }),
         sessions: options?.freshAgentSessions ?? {},
+      },
+      repoIcons: {
+        byCwd: options?.repoIcons ?? {},
       },
     },
   })
@@ -875,7 +917,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           .querySelectorAll<HTMLButtonElement>(`button[data-session-id="${activeSessionId}"]`),
       )
       expect(rows).toHaveLength(1)
-      expect(rows.filter((row) => row.classList.contains('bg-muted'))).toHaveLength(1)
+      expect(rows.filter((row) => row.classList.contains('bg-emerald-100'))).toHaveLength(1)
     })
 
     it('treats pane resumeSessionId as open and active even when tab has none', async () => {
@@ -932,7 +974,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const button = screen.getByText('Pane-owned session').closest('button')
       expect(button).not.toBeNull()
       expect(button).toHaveAttribute('data-has-tab', 'true')
-      expect(button).toHaveClass('bg-muted')
+      expect(button).toHaveClass('bg-emerald-100')
     })
 
     it('does not treat non-UUID Claude pane resumeSessionId as canonical tab identity', async () => {
@@ -5287,6 +5329,297 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(button).toBeInTheDocument()
       expect(button).not.toHaveAttribute('data-remote-status')
       expect(button.querySelector('span[aria-hidden="true"].rounded-full')).toBeNull()
+    })
+  })
+
+  describe('Sidebar repo icons', () => {
+    it('renders a repo icon for a session with resolved repo icon meta', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/myproject',
+          sessions: [
+            {
+              sessionId: sessionId('repo-icon-session'),
+              projectPath: '/home/user/myproject',
+              lastActivityAt: Date.now(),
+              title: 'Repo icon session',
+              cwd: '/home/user/myproject',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({
+        projects,
+        repoIcons: {
+          '/home/user/myproject': {
+            status: 'ready',
+            repoRoot: '/home/user/myproject',
+            repoName: 'myproject',
+            hasIcon: false,
+          },
+        },
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /repo icon session/i })
+      const repoIcon = button.querySelector('[data-testid="repo-icon"]')
+      expect(repoIcon).toBeTruthy()
+      expect(repoIcon).toHaveAttribute('data-repo-key', '/home/user/myproject')
+      expect(repoIcon?.getAttribute('data-class')).toContain('h-3.5')
+      expect(repoIcon?.getAttribute('data-class')).toContain('w-3.5')
+      const providerIcon = button.querySelector('svg')
+      if (repoIcon && providerIcon) {
+        expect(repoIcon.compareDocumentPosition(providerIcon) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      }
+    })
+
+    it('does not render a repo icon when repoIconsOnTabs is off', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/myproject',
+          sessions: [
+            {
+              sessionId: sessionId('no-repo-icon-session'),
+              projectPath: '/home/user/myproject',
+              lastActivityAt: Date.now(),
+              title: 'No repo icon session',
+              cwd: '/home/user/myproject',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({
+        projects,
+        repoIcons: {
+          '/home/user/myproject': {
+            status: 'ready',
+            repoRoot: '/home/user/myproject',
+            repoName: 'myproject',
+            hasIcon: false,
+          },
+        },
+        panesSettings: { repoIconsOnTabs: false },
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /no repo icon session/i })
+      expect(button.querySelector('[data-testid="repo-icon"]')).toBeNull()
+    })
+
+    it('dispatches fetchRepoIconMeta for sessions when repoIcons state is empty', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/myproject',
+          sessions: [
+            {
+              sessionId: sessionId('probe-session'),
+              projectPath: '/home/user/myproject',
+              lastActivityAt: Date.now(),
+              title: 'Probe session',
+              cwd: '/home/user/myproject',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({ projects, repoIcons: {} })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const entry = store.getState().repoIcons.byCwd['/home/user/myproject']
+      expect(entry).toBeTruthy()
+      expect(entry.status).toMatch(/loading|error|ready/)
+    })
+  })
+
+  describe('Sidebar row green/blue treatments', () => {
+    it('applies green fill and left border for an active open session', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: sessionId('active-open'),
+              projectPath: '/home/user/project',
+              lastActivityAt: Date.now(),
+              title: 'Active open session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+      const tabs = [{ id: 'tab-1', resumeSessionId: sessionId('active-open'), mode: 'claude' }]
+      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1' })
+      renderSidebar(store, [])
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+
+      const button = screen.getByRole('button', { name: /active open session/i })
+      expect(button).toHaveClass('bg-emerald-100')
+      expect(button).toHaveClass('border-l-2')
+      expect(button).toHaveClass('border-l-emerald-500')
+      expect(button).toHaveClass('dark:bg-emerald-900/40')
+      expect(button).not.toHaveClass('bg-muted')
+    })
+
+    it('applies blue fill and left border for an active busy session', async () => {
+      const now = Date.now()
+      const terminalId = 'term-busy-1'
+      const busySid = sessionId('active-busy')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: busySid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now,
+              title: 'Active busy session',
+              cwd: '/home/user/project',
+              provider: 'codex',
+            },
+          ],
+        },
+      ]
+      const tabs = [{ id: 'tab-1', terminalId, resumeSessionId: busySid, mode: 'codex' }]
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId, title: 'Codex', createdAt: now, status: 'running', hasClients: true,
+          mode: 'codex', sessionRef: { provider: 'codex', sessionId: busySid },
+        },
+      ]
+      const store = createTestStore({
+        projects, tabs, terminals, activeTabId: 'tab-1',
+        codexActivity: { byTerminalId: { [terminalId]: { terminalId, sessionId: 's1', phase: 'busy', lastActivityAt: 10 } } },
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+
+      const button = screen.getByRole('button', { name: /active busy session/i })
+      expect(button).toHaveClass('bg-blue-100')
+      expect(button).toHaveClass('border-l-2')
+      expect(button).toHaveClass('border-l-blue-500')
+      expect(button).toHaveClass('dark:bg-blue-900/40')
+    })
+
+    it('applies transparent border and no color treatment for an inactive closed session', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: sessionId('inactive-closed'),
+              projectPath: '/home/user/project',
+              lastActivityAt: Date.now(),
+              title: 'Inactive closed session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+      const store = createTestStore({ projects })
+      renderSidebar(store, [])
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+
+      const button = screen.getByRole('button', { name: /inactive closed session/i })
+      expect(button).not.toHaveClass('bg-muted')
+      expect(button).not.toHaveClass('border-l-emerald-500')
+      expect(button).not.toHaveClass('border-l-blue-500')
+      expect(button).toHaveClass('border-l-transparent')
+    })
+
+    it('applies light green fill for an inactive open session', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: sessionId('inactive-open'),
+              projectPath: '/home/user/project',
+              lastActivityAt: Date.now(),
+              title: 'Inactive open session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+      const tabs = [{ id: 'tab-1', resumeSessionId: sessionId('inactive-open'), mode: 'claude' }]
+      const store = createTestStore({ projects, tabs })
+      renderSidebar(store, [])
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+
+      const button = screen.getByRole('button', { name: /inactive open session/i })
+      expect(button).toHaveClass('bg-emerald-50')
+      expect(button).toHaveClass('border-l-2')
+      expect(button).toHaveClass('border-l-emerald-500/70')
+      expect(button).toHaveClass('dark:bg-emerald-900/20')
+    })
+
+    it('applies light blue fill and left border for an inactive busy session', async () => {
+      const now = Date.now()
+      const terminalId = 'term-inactive-busy'
+      const busySid = sessionId('inactive-busy')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: busySid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now,
+              title: 'Inactive busy session',
+              cwd: '/home/user/project',
+              provider: 'codex',
+            },
+            {
+              sessionId: sessionId('other-session'),
+              projectPath: '/home/user/project',
+              lastActivityAt: now,
+              title: 'Other active session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+      const tabs: Array<{ id: string; mode: string; terminalId?: string; resumeSessionId?: string }> = [
+        { id: 'tab-active', mode: 'shell' },
+        { id: 'tab-busy', mode: 'codex', terminalId, resumeSessionId: busySid },
+      ]
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId, title: 'Codex', createdAt: now, status: 'running', hasClients: true,
+          mode: 'codex', sessionRef: { provider: 'codex', sessionId: busySid },
+        },
+      ]
+      const store = createTestStore({
+        projects, tabs, terminals, activeTabId: 'tab-active',
+        codexActivity: { byTerminalId: { [terminalId]: { terminalId, sessionId: 's1', phase: 'busy', lastActivityAt: 10 } } },
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+
+      const button = screen.getByRole('button', { name: /inactive busy session/i })
+      expect(button).toHaveClass('bg-blue-50')
+      expect(button).toHaveClass('border-l-2')
+      expect(button).toHaveClass('border-l-blue-500/70')
+      expect(button).toHaveClass('dark:bg-blue-900/20')
     })
   })
 })

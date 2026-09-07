@@ -15,6 +15,7 @@ import { useCoarsePointer } from '@/lib/pointer'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { FreshAgentSessionMenuRow, FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
+import { RESERVED_ROLLBACK_SLASH_NAMES } from '@shared/fresh-agent-slash-commands'
 
 export type FreshAgentAttachment = {
   /** Server-side saved path, present once uploaded. */
@@ -46,6 +47,13 @@ type FreshAgentComposerProps = {
   canInterrupt?: boolean
   commands?: FreshAgentSlashCommandMenu
   onCommand?: (command: FreshAgentSlashCommand, args: string) => void
+  /**
+   * kata 1wxv (r3 correction 8): reserved rollback names (`/undo`, `/redo`) that
+   * fail catalog resolution are intercepted on the submit path BEFORE they can
+   * fall through to onSend — the view routes the direction to the pinned
+   * capability notice. The text never reaches the model.
+   */
+  onReservedRollbackCommand?: (direction: 'undo' | 'redo') => void
   focusOnReady?: boolean
   thinking?: boolean
 }
@@ -54,6 +62,8 @@ export type FreshAgentComposerHandle = {
   focus: () => void
   insertText: (text: string) => void
   appendText: (text: string) => void
+  /** kata 1wxv decision 4: refill = OVERWRITE the current contents, focus, caret to end. */
+  replaceText: (text: string) => void
 }
 
 /**
@@ -158,6 +168,24 @@ function isTextEntryElement(value: Element | null): boolean {
 }
 
 /**
+ * Maps a failed upload response to the attachment chip's error text. The
+ * server-oracle messages win (data.error / data.message), except two statuses
+ * get clearer client-side wording: 404 means the attachments route is absent
+ * on this server (e.g. a build without it), and 413 trips the 10 MB cap —
+ * express's error body there is an unparseable HTML page, so the size limit is
+ * spelled out here instead.
+ */
+export function attachmentUploadErrorMessage(
+  status: number,
+  data: { error?: string; message?: string } | null,
+  filename: string,
+): string {
+  if (status === 404) return 'Attachments are not supported by this server'
+  if (status === 413) return `"${filename}" exceeds the 10 MB attachment size limit`
+  return data?.error || data?.message || `upload failed (${status})`
+}
+
+/**
  * Raw binary upload. Deliberately NOT base64-in-JSON: the server's global
  * express.json caps JSON bodies at 1mb, so attachments ship as
  * application/octet-stream (which the JSON parser ignores) with the filename
@@ -173,8 +201,11 @@ async function uploadAttachment(file: globalThis.File): Promise<{ path: string; 
     headers,
   })
   if (!res.ok) {
-    const data = await res.json().catch(() => null) as { error?: string; message?: string } | null
-    throw new Error(data?.error || data?.message || `upload failed (${res.status})`)
+    const data = (await res.json().catch(() => null)) as {
+      error?: string
+      message?: string
+    } | null
+    throw new Error(attachmentUploadErrorMessage(res.status, data, file.name))
   }
   return res.json() as Promise<{ path: string; bytes: number }>
 }
@@ -193,6 +224,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   canInterrupt = false,
   commands = EMPTY_SLASH_COMMAND_MENU,
   onCommand,
+  onReservedRollbackCommand,
   placeholder,
   focusOnReady = false,
   thinking = false,
@@ -207,6 +239,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   const [fileSuggestions, setFileSuggestions] = useState<FileSuggestion[]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [attachments, setAttachments] = useState<FreshAgentAttachment[]>([])
+  const [queueExpanded, setQueueExpanded] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const filterRef = useRef<HTMLInputElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -227,6 +260,18 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       if (disabled) return
       setText((current) => `${current}${value}`)
       requestAnimationFrame(() => textareaRef.current?.focus())
+    },
+    // Rollback refill (decision 4): the removed prompt comes back as an
+    // OVERWRITE — never an append — with focus + caret at end for immediate
+    // editing. The existing persist effect syncs sessionStorage.
+    replaceText: (value: string) => {
+      setText(value)
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (!el) return
+        el.focus()
+        el.setSelectionRange(el.value.length, el.value.length)
+      })
     },
   }), [disabled])
 
@@ -374,6 +419,23 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     return true
   }, [commands, executeCommand])
 
+  // kata 1wxv (r3 correction 8): `/undo` and `/redo` are RESERVED names for every
+  // fresh-agent provider. A typed reserved name the capability-filtered catalog
+  // cannot resolve (freshcodex `/redo`; any capability-false pane) is intercepted
+  // HERE — pre-catalog-resolution, before any onSend fallthrough — so it never
+  // reaches the model as text. Exactly like a resolved command, the text is
+  // pushed to history and the box cleared; the view owns the notice copy.
+  const tryReservedRollbackCommand = useCallback((trimmed: string): boolean => {
+    const parsed = parseSlashCommand(trimmed)
+    if (!parsed) return false
+    if (!(RESERVED_ROLLBACK_SLASH_NAMES as readonly string[]).includes(parsed.name)) return false
+    onReservedRollbackCommand?.(parsed.name as 'undo' | 'redo')
+    pushHistory(trimmed)
+    setText('')
+    closeMenu()
+    return true
+  }, [closeMenu, onReservedRollbackCommand, pushHistory])
+
   // Selecting a provider session row inserts the canonical `/name ` text via
   // the same setText typing uses, closes the menu, and refocuses the input.
   // It NEVER dispatches (onCommand) and NEVER sends (onSend) — the following
@@ -441,12 +503,13 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     if (!trimmed && readyAttachments.length === 0) return
     if (attachments.some((entry) => entry.status === 'uploading')) return
     if (trimmed.startsWith('/') && executeSlashText(trimmed)) return
+    if (trimmed.startsWith('/') && tryReservedRollbackCommand(trimmed)) return
     onSend?.(trimmed, readyAttachments.map((entry) => entry.path as string))
     if (trimmed) pushHistory(trimmed)
     setAttachments((current) => current.filter((entry) => entry.status === 'error'))
     setText('')
     closeMenu()
-  }, [attachments, closeMenu, disabled, executeSlashText, isShellInput, onSend, onShellCommand, pushHistory, text])
+  }, [attachments, closeMenu, disabled, executeSlashText, isShellInput, onSend, onShellCommand, pushHistory, text, tryReservedRollbackCommand])
 
   const recallHistory = useCallback((direction: 1 | -1): boolean => {
     const history = historyRef.current
@@ -500,6 +563,11 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
         } else {
           executeCommand(selected.command)
         }
+      } else if (menuMode === 'chat') {
+        // The open (but empty) slash menu consumes Enter, so a typed reserved
+        // rollback name with no catalog resolution (freshcodex /redo) must be
+        // intercepted here too — sendText would never see the keyboard path.
+        tryReservedRollbackCommand(text.trim())
       }
       return true
     }
@@ -528,6 +596,7 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
     menuLength,
     menuMode,
     text,
+    tryReservedRollbackCommand,
     visibleRows,
   ])
 
@@ -656,24 +725,37 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       ) : null}
 
       {queuedMessages.length > 0 ? (
-        <div className="fresh-agent-queued-message mb-2 flex items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground">
+        <div className="fresh-agent-queued-message mb-2 flex flex-wrap items-center gap-2 rounded-md border border-dashed border-border/70 px-2 py-1 text-xs text-muted-foreground">
           <span role="status" aria-label="Queued messages" className="min-w-0 flex-1">
             {queuedMessages.length} queued
           </span>
-          {onCancelQueued ? (
-            <span className="flex shrink-0 items-center gap-1" role="group" aria-label="Queued message actions">
-              {queuedMessages.map((_, index) => (
-                <button
-                  key={index}
-                  type="button"
-                  className="-m-2 p-2 hover:text-destructive sm:m-0 sm:p-0"
-                  aria-label={`Remove queued message ${index + 1}`}
-                  onClick={() => onCancelQueued(index)}
-                >
-                  <X className="h-3 w-3" />
-                </button>
+          <button
+            type="button"
+            aria-label={queueExpanded ? 'Hide queued messages' : 'Show queued messages'}
+            aria-expanded={queueExpanded}
+            onClick={() => setQueueExpanded((expanded) => !expanded)}
+            className="min-h-9 underline underline-offset-2"
+          >
+            {queueExpanded ? 'Hide' : 'Review'}
+          </button>
+          {queueExpanded ? (
+            <ol className="max-h-44 w-full space-y-2 overflow-y-auto" aria-label="Queued message actions">
+              {queuedMessages.map((message, index) => (
+                <li key={index} className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">{message}</span>
+                  {onCancelQueued ? (
+                    <button
+                      type="button"
+                      className="p-2 hover:text-destructive"
+                      aria-label={`Remove queued message ${index + 1}`}
+                      onClick={() => onCancelQueued(index)}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  ) : null}
+                </li>
               ))}
-            </span>
+            </ol>
           ) : null}
         </div>
       ) : null}

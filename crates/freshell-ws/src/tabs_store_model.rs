@@ -245,12 +245,13 @@ pub fn archive_timestamp(now_ms: i64) -> String {
 
 // ── Record validation (TabRegistryRecordSchema port, types.ts:57-83) ─────────
 
-/// The seven legal pane kinds (`RegistryPaneKindSchema`, types.ts:7-15).
-const PANE_KINDS: [&str; 7] = [
+/// The eight legal pane kinds (`RegistryPaneKindSchema`, types.ts:7-16).
+const PANE_KINDS: [&str; 8] = [
     "terminal",
     "browser",
     "editor",
     "picker",
+    "host-stats",
     "claude-chat",
     "fresh-agent",
     "extension",

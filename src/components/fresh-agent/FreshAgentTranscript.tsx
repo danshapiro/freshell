@@ -1,5 +1,5 @@
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Loader2, X } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Loader2, Redo2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
@@ -20,6 +20,7 @@ import {
   type FreshAgentTurnContextMenuState,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
+import { isFreshAgentSpecializedRegion } from '@/components/context-menu/context-menu-utils'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
 import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
@@ -719,9 +720,25 @@ type TurnActionProps = {
   canFork: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  /** kata 1wxv: the per-turn "undo to here" affordance (decision 3). */
+  canRollback?: boolean
+  rollbackBusy?: boolean
+  onRollbackToTurn?: (turnId: string) => void
   onTurnContextMenu?: (event: React.MouseEvent, turn: FreshAgentTurn) => void
   /** Coarse-pointer path: open the bottom action sheet for this turn. */
   onOpenActions?: (turn: FreshAgentTurn) => void
+}
+
+/**
+ * Build the per-article long-press bundle: the raw `buildLongPressHandlers`
+ * product with `notifyOverlayOpened` split out of the DOM spread (it is not a
+ * DOM handler — React warns on unknown DOM props). The wrapper also gives the
+ * transcript a concrete, non-generic `ReturnType` for the ref-persisted
+ * instance below.
+ */
+function buildTurnLongPress(onLongPress: () => void) {
+  const { notifyOverlayOpened, ...handlers } = buildLongPressHandlers<HTMLElement>(onLongPress)
+  return { handlers, notifyOverlayOpened }
 }
 
 function FreshAgentTurnArticle({
@@ -759,11 +776,28 @@ function FreshAgentTurnArticle({
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
-  const longPress = useMemo(() => (
-    actions.onOpenActions
-      ? buildLongPressHandlers<HTMLElement>(() => actions.onOpenActions?.(actionTurn))
-      : null
-  ), [actions, actionTurn])
+  //
+  // Gesture state must survive transcript rerenders: live snapshot refreshes
+  // rebuild `actions` with fresh identities on ordinary rerenders, and
+  // rebuilding the closure mid-gesture would orphan the armed timer and the
+  // release-suppression flag — the DOM would then call the NEW closure's
+  // onTouchEnd while the OLD closure held the state. The builder is therefore
+  // created at most once per mounted article and reads the LATEST handler and
+  // turn through refs, so gesture state persists while behavior stays current.
+  const openActionsRef = useRef(actions.onOpenActions)
+  openActionsRef.current = actions.onOpenActions
+  const actionTurnRef = useRef(actionTurn)
+  actionTurnRef.current = actionTurn
+  const longPressRef = useRef<ReturnType<typeof buildTurnLongPress> | null>(null)
+  if (longPressRef.current === null && actions.onOpenActions) {
+    longPressRef.current = buildTurnLongPress(() => {
+      openActionsRef.current?.(actionTurnRef.current)
+    })
+  }
+  // Spread + ownership marker key off the CURRENT render's availability: a
+  // coarse→fine pointer flip stops advertising/handling long-press even though
+  // the instance persists for the article's lifetime.
+  const longPress = actions.onOpenActions ? longPressRef.current : null
   return (
     <article
       className={cn(
@@ -774,27 +808,49 @@ function FreshAgentTurnArticle({
       data-turn-role={turn.role}
       data-turn-index={index}
       data-turn-continuation={continuation ? 'true' : 'false'}
+      // Ownership marker for the global ContextMenuProvider: present exactly
+      // when this article's own long-press handlers exist (coarse pointers),
+      // so the provider skips its long-press/probe path for turn gestures.
+      // Fine pointers (incl. hybrid iPad+trackpad) never set it and keep the
+      // provider's long-press fallback.
+      data-longpress-owned={longPress ? 'true' : undefined}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
-        // stopPropagation matters: freshell has a global contextmenu handler
-        // that renders the app menu over ours otherwise (live-test finding).
+        // The global ContextMenuProvider's document listener is capture-phase,
+        // so stopPropagation could never beat it — the real protection today is
+        // the provider's early-return carve-out for article[data-turn-role]
+        // targets. stopPropagation is kept as cheap, correct event hygiene.
         if (actions.onOpenActions) {
           event.preventDefault()
           event.stopPropagation()
+          // The sheet opens mid-touch via this native-contextmenu route (no
+          // long-press timer involved): mark the overlay open so the gesture's
+          // touchend suppresses the synthesized compat click.
+          longPress?.notifyOverlayOpened?.()
           actions.onOpenActions(actionTurn)
           return
         }
         if (!actions.onTurnContextMenu) return
+        // Fine-pointer right-click into a specialized sub-region (markdown
+        // code block, tool input/output, diff): yield WITHOUT cancelling the
+        // event or opening the turn menu — the provider's capture-phase
+        // handler already opened its context-sensitive fresh-agent menu for
+        // this gesture (on coarse pointers the sheet branch above owns the
+        // whole turn and never yields).
+        if (isFreshAgentSpecializedRegion(event.target as HTMLElement | null)) return
         event.preventDefault()
         event.stopPropagation()
         actions.onTurnContextMenu(event, actionTurn)
       }}
-      {...(longPress ?? {})}
+      {...(longPress?.handlers ?? {})}
     >
       <FreshAgentTurnActions
         turn={actionTurn}
         canFork={actions.canFork}
+        canRollback={actions.canRollback}
+        rollbackBusy={actions.rollbackBusy}
         onForkFromTurn={actions.onForkFromTurn}
+        onRollbackToTurn={actions.onRollbackToTurn}
         onRewindToTurn={actions.onRewindToTurn}
         onOpenActions={actions.onOpenActions}
       />
@@ -869,6 +925,20 @@ export type FreshAgentTranscriptProps = {
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
+  /** kata 1wxv: rollback affordances on live turns feed TurnActionProps; the
+   * marker bucket + its per-row redo feed the rolled-back section (decision 6). */
+  canRollback?: boolean
+  rollbackBusy?: boolean
+  onRollbackToTurn?: (turnId: string) => void
+  rolledBackTurns?: FreshAgentTurn[]
+  canRedo?: boolean
+  onRedoToTurn?: (turnId: string) => void
+  /** Delta-r1 F6: the SERVER-AUTHORED per-marker redo gate (`rollback.redoableTurnIds`
+   * from the snapshot — the exact turn ids at the ends of the redoable steps of the
+   * CURRENT epoch). Absent (a legacy server surface) or canRedo:false ⇒ no marker
+   * offers the affordance: frozen prior-epoch markers are NOT redoable (providers
+   * only restore the current epoch's tail). */
+  redoableTurnIds?: readonly string[]
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -882,6 +952,13 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
+  canRollback = false,
+  rollbackBusy = false,
+  onRollbackToTurn,
+  rolledBackTurns = [],
+  canRedo = false,
+  onRedoToTurn,
+  redoableTurnIds,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
@@ -890,6 +967,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
   const coarsePointer = useCoarsePointer()
+  // F6: the per-marker redo gate set — membership-tested per user marker row.
+  const redoableTurnIdSet = useMemo(
+    () => (redoableTurnIds ? new Set(redoableTurnIds) : null),
+    [redoableTurnIds],
+  )
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
     showThinking,
@@ -975,9 +1057,12 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     canFork,
     onForkFromTurn,
     onRewindToTurn,
+    canRollback,
+    rollbackBusy,
+    onRollbackToTurn,
     onTurnContextMenu: coarsePointer ? undefined : handleTurnContextMenu,
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
-  }), [canFork, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn])
+  }), [canFork, canRollback, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn, onRollbackToTurn, rollbackBusy])
 
   useImperativeHandle(ref, () => ({
     scrollByLine: (direction) => {
@@ -1070,7 +1155,36 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
             className="fresh-agent-activity-caption my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground"
           >
             {tailCaption.text}
-          </div>
+          </div>        ) : null}
+        {rolledBackTurns.length > 0 ? (
+          <section aria-label="Rolled back turns" className="mx-2 mt-2 rounded-md border border-dashed border-border/60 bg-muted/30 p-2 opacity-80">
+            <p className="px-1 pb-1 text-xs font-medium text-muted-foreground">
+              Rolled back ({rolledBackTurns.filter((t) => t.role === 'user').length}) — gone from the conversation; kept in history.
+              {/* r2/r3: the count is rollback STEPS (user-role marker groups), not raw marker rows —
+                  one undone turn-step contributes a user row AND an assistant row. This is exactly
+                  the user-step count the server's rollback.undoneDepth computes (r3 correction 5):
+                  same bucket, same rule, never entries.len(). */}
+            </p>
+            {rolledBackTurns.map((turn, index) => (
+              <div key={`${getFreshAgentDisplayTurnKey(turn)}:${index}`} className="flex items-start justify-between gap-2 rounded px-1 py-1">
+                <div className="min-w-0">
+                  <span className="mr-2 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">rolled back</span>
+                  <span className="text-sm text-muted-foreground">{turn.summary || turnPlainText(turn)}</span>
+                </div>
+                {canRedo && onRedoToTurn && turn.role === 'user' && redoableTurnIdSet?.has(turn.turnId ?? turn.id) ? (
+                  <button
+                    type="button"
+                    onClick={() => onRedoToTurn(turn.turnId ?? turn.id)}
+                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    aria-label="Redo to here"
+                    title={`Restore this turn and the rolled-back turns before it (“${turn.summary.slice(0, 60)}”)`}
+                  >
+                    <Redo2 className="h-3 w-3" />
+                  </button>
+                ) : null}
+              </div>
+            ))}
+          </section>
         ) : null}
       </div>
       {glomTarget ? (
@@ -1082,20 +1196,23 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           title={glomTarget.text}
         >
           <ChevronUp className="h-3 w-3 shrink-0" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate">{glomTarget.text}</span>
+          <span className="min-w-0 flex-1 truncate">{glomTarget.text.split('\n')[0]}</span>
         </button>
       ) : null}
       <FreshAgentTurnContextMenu
         state={contextMenu}
         canFork={canFork}
+        canRollback={canRollback}
+        rollbackBusy={rollbackBusy}
         onForkFromTurn={onForkFromTurn}
+        onRollbackToTurn={onRollbackToTurn}
         onRewindToTurn={onRewindToTurn}
         onClose={() => setContextMenu(null)}
       />
       {sheetTurn ? (
         <FreshAgentActionSheet
           title={turnPlainText(sheetTurn).slice(0, 80) || getTurnLabel(sheetTurn, agentLabel)}
-          items={buildTurnActionItems(sheetTurn, { canFork, onForkFromTurn, onRewindToTurn })}
+          items={buildTurnActionItems(sheetTurn, { canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn })}
           onClose={() => setSheetTurn(null)}
         />
       ) : null}

@@ -295,6 +295,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
         subagent_interest: Default::default(),
+        host_stats: Default::default(),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         cli_commands: Arc::new(vec![codex_cli_spec()]),
@@ -718,6 +719,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
                 created_at: 1_700_000_000_000,
                 updated_at: 1_700_000_000_001,
                 state: SidecarRecordState::Active,
+                lane: None,
             })
             .expect("write survivor record");
         let (reconciler, report) = SidecarReconciler::boot_reconcile(store.clone());

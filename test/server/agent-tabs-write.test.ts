@@ -54,6 +54,32 @@ describe('tab endpoints', () => {
     expect(layoutStore.attachPaneContent).toHaveBeenCalled()
   })
 
+  it('creates host-stats tabs without spawning a terminal', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const attachPaneContent = vi.fn()
+    const layoutStore = {
+      createTab,
+      attachPaneContent,
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler: { broadcastUiCommand: () => {} } }))
+    const res = await request(app).post('/api/tabs').send({ name: 'stats', hostStats: true })
+
+    expect(res.body.status).toBe('ok')
+    expect(registry.create).not.toHaveBeenCalled()
+    expect(createTab).toHaveBeenCalledWith(expect.objectContaining({ hostStats: true }))
+    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', { kind: 'host-stats' })
+    expect(res.body.data.terminalId).toBeUndefined()
+  })
+
   it('allocates and passes an OpenCode control endpoint when creating an opencode tab', async () => {
     const app = express()
     app.use(express.json())
@@ -773,5 +799,33 @@ describe('tab endpoints', () => {
     expect(res.body.message).toMatch(/Invalid terminal mode/)
     // The half-created tab is cleaned up rather than left dangling.
     expect(closeTab).toHaveBeenCalledWith('tab_1')
+  })
+
+  it('PATCH /api/tabs/:id is layout-only: no override or registry writes, tab.rename broadcast only', async () => {
+    const app = express()
+    app.use(express.json())
+    const renameTab = vi.fn(() => ({ tabId: 'tab_1' }))
+    const broadcastUiCommand = vi.fn()
+    const patchTerminalOverride = vi.fn()
+    const patchSessionOverride = vi.fn()
+    const updateTitle = vi.fn()
+    app.use('/api', createAgentApiRouter({
+      layoutStore: { renameTab } as any,
+      registry: { updateTitle } as any,
+      wsHandler: { broadcastUiCommand },
+      configStore: { patchTerminalOverride, patchSessionOverride } as any,
+    }))
+
+    const res = await request(app).patch('/api/tabs/tab_1').send({ name: 'Org label' })
+
+    expect(res.status).toBe(200)
+    expect(renameTab).toHaveBeenCalledWith('tab_1', 'Org label')
+    expect(broadcastUiCommand).toHaveBeenCalledWith({
+      command: 'tab.rename',
+      payload: { id: 'tab_1', title: 'Org label' },
+    })
+    expect(patchTerminalOverride).not.toHaveBeenCalled()
+    expect(patchSessionOverride).not.toHaveBeenCalled()
+    expect(updateTitle).not.toHaveBeenCalled()
   })
 })

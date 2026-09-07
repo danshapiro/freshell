@@ -245,6 +245,24 @@ async fn split_browser_pane_registers_cheap_content_no_terminal() {
     assert_eq!(body["message"], json!("pane split (non-terminal)"));
 }
 
+#[tokio::test]
+async fn split_host_stats_pane_registers_cheap_content_no_terminal() {
+    let state = state_with_registry();
+    let router = app(state.clone());
+    let (_tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
+
+    let (status, body) = post(
+        router,
+        &format!("/api/panes/{pane_id}/split"),
+        json!({ "hostStats": true }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["data"]["terminalId"].is_null());
+    assert_eq!(body["message"], json!("pane split (non-terminal)"));
+}
+
 /// kata ejh6: `POST /api/panes/:id/split` REFUSES a body carrying the legacy
 /// `resumeSessionId` field at the door-top — 400 with the frozen text,
 /// presence-based for EVERY JSON value type, and (finding 3) the layout must

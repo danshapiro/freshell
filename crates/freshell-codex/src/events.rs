@@ -25,24 +25,29 @@ use crate::protocol::{turn_status, CodexTurnEvent};
 
 /// The normalized thread status a snapshot carries (`normalizeCodexThreadStatus`,
 /// `adapter.ts:246-254`): `active→running`, `notLoaded→starting`, `systemError→exited`,
-/// `idle→idle`, and any non-object / unknown → `idle`.
+/// `idle→idle`, and any non-object / unknown → `idle`. `Stuck` is never produced by the
+/// normalization: it is THIS server's wedged-sidecar quiet-deadman flag (a live sidecar
+/// that went silent with a turn in flight), surfaced server-side only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexStatus {
     Running,
     Starting,
     Idle,
     Exited,
+    Stuck,
 }
 
 impl CodexStatus {
     /// The wire string the reference emits (`sdk.session.snapshot.status` /
-    /// `sdk.status.status`).
+    /// `sdk.status.status`). `Stuck` → `"stuck"`, matching the Node lane's
+    /// `freshAgent.status {status:'stuck'}` wire shape byte-for-byte.
     pub fn as_str(self) -> &'static str {
         match self {
             CodexStatus::Running => "running",
             CodexStatus::Starting => "starting",
             CodexStatus::Idle => "idle",
             CodexStatus::Exited => "exited",
+            CodexStatus::Stuck => "stuck",
         }
     }
 }

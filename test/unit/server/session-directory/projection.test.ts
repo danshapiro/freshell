@@ -81,4 +81,40 @@ describe('session-directory projection', () => {
       lastActivityAtChanged,
     )).toBe(true)
   })
+
+  it('treats title-override provenance as comparable: a rename and a clear both fire sessions.changed', () => {
+    // b5fb: provenance changes must produce a detectable snapshot diff —
+    // otherwise a rename/clear writes the override but no client is told to
+    // refetch the directory page that carries the reset-flow fields.
+    const bare: ProjectGroup[] = [{ projectPath: '/repo', sessions: [{ ...baseSession }] }]
+    const renamed: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{
+        ...baseSession,
+        title: 'Accidental pane label',
+        titleOverridden: true,
+        providerTitle: baseSession.title,
+        titleOverrideSource: 'user',
+      }],
+    }]
+
+    // Rename applied → the override title AND its provenance appear.
+    expect(hasSessionDirectorySnapshotChange(bare, renamed)).toBe(true)
+    // Clear → back to the parsed title with provenance gone.
+    expect(hasSessionDirectorySnapshotChange(renamed, bare)).toBe(true)
+
+    // Discriminating case: provenance ALONE differs (the displayed title is
+    // identical on both sides). Equality must still detect it — this is what
+    // pins titleOverridden/providerTitle/titleOverrideSource as comparable.
+    const provenanceOnly: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{
+        ...baseSession,
+        titleOverridden: true,
+        providerTitle: baseSession.title,
+        titleOverrideSource: 'user',
+      }],
+    }]
+    expect(hasSessionDirectorySnapshotChange(bare, provenanceOnly)).toBe(true)
+  })
 })

@@ -164,6 +164,36 @@ fn ready_carries_server_instance_id_and_boot_id() {
 }
 
 #[test]
+fn ready_carries_build_id_and_omits_it_when_absent() {
+    // deliverable: `ready` accepts an additive optional `buildId` (the git
+    // commit the server binary was built from) and OMITS it from the wire
+    // when absent — frozen-transcript inertness, same rule as `bootId`.
+    let with = r#"{"type":"ready","timestamp":"2026-07-05T04:20:52.546Z","serverInstanceId":"srv-abc","buildId":"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"}"#;
+    match server_roundtrip(with, "ready") {
+        ServerMessage::Ready(r) => {
+            assert_eq!(
+                r.build_id.as_deref(),
+                Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2")
+            );
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    let without =
+        r#"{"type":"ready","timestamp":"2026-07-05T04:20:52.546Z","serverInstanceId":"srv-abc"}"#;
+    let msg: ServerMessage = serde_json::from_str(without).unwrap();
+    let reser = serde_json::to_value(&msg).unwrap();
+    assert!(
+        reser.get("buildId").is_none(),
+        "ready must omit buildId when absent: {reser}"
+    );
+    match msg {
+        ServerMessage::Ready(r) => assert_eq!(r.build_id, None),
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_inventory_and_settings_parse_from_transcript() {
     let transcript = read_json("port/oracle/fixtures/handshake-transcript.json");
     let entries = transcript["transcript"].as_array().unwrap();

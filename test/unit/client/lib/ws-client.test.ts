@@ -91,6 +91,7 @@ describe('WsClient.connect', () => {
     expect(hello.capabilities).toEqual({
       uiScreenshotV1: true,
       terminalOutputBatchV1: true,
+      terminalInterestV1: true,
       paneReconcileV1: true,
       paneReconcileFreshAgentV1: true,
     })
@@ -672,5 +673,86 @@ describe('WsClient.connect', () => {
     vi.advanceTimersByTime(5000)
     expect(MockWebSocket.instances).toHaveLength(1)
     expect(getWsClient()).not.toBe(c)
+  })
+})
+
+describe('WsClient.sendTerminalInterest', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    MockWebSocket.instances = []
+    // @ts-expect-error - test override
+    globalThis.WebSocket = MockWebSocket
+    localStorage.setItem('freshell.auth-token', 't')
+    ;(window as any).setTimeout = globalThis.setTimeout
+    ;(window as any).clearTimeout = globalThis.clearTimeout
+  })
+
+  afterEach(() => {
+    resetWsClientForTests()
+    vi.clearAllTimers()
+    vi.useRealTimers()
+  })
+
+  const openReady = async (c: WsClient, negotiated: boolean) => {
+    const p = c.connect()
+    MockWebSocket.instances[MockWebSocket.instances.length - 1]._open()
+    MockWebSocket.instances[MockWebSocket.instances.length - 1]._message({
+      type: 'ready',
+      ...(negotiated ? { capabilities: { terminalInterestV1: true } } : {}),
+    })
+    await p
+  }
+  const snap = { focusedTerminalId: 'A', visibleTerminalIds: ['A', 'B'] }
+  const lastSocket = () => MockWebSocket.instances[MockWebSocket.instances.length - 1]
+
+  it('refuses before ready and sends nothing but the handshake', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    lastSocket()._open()
+    expect(c.sendTerminalInterest(snap)).toBe(false)
+    expect(lastSocket().sent.map((x) => JSON.parse(x).type)).toEqual(['hello'])
+    lastSocket()._message({ type: 'ready', capabilities: { terminalInterestV1: true } })
+    await p
+    expect(lastSocket().sent.map((x) => JSON.parse(x).type)).toEqual(['hello'])
+  })
+
+  it('refuses when the server did not negotiate the capability', async () => {
+    const c = new WsClient('ws://example/ws')
+    await openReady(c, false)
+    expect(c.sendTerminalInterest(snap)).toBe(false)
+    expect(lastSocket().sent.some((x) => JSON.parse(x).type === 'terminal.interest')).toBe(false)
+  })
+
+  it('sends monotonic socket-owned revisions immediately once negotiated', async () => {
+    const c = new WsClient('ws://example/ws')
+    await openReady(c, true)
+    expect(c.sendTerminalInterest(snap)).toBe(true)
+    expect(c.sendTerminalInterest(snap)).toBe(true)
+    const interests = lastSocket().sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.interest')
+    expect(interests.map((m) => m.revision)).toEqual([1, 2])
+    expect(interests[0].focusedTerminalId).toBe('A')
+    expect(interests[0].visibleTerminalIds).toEqual(['A', 'B'])
+  })
+
+  it('never queues across disconnect and restarts revisions on the new socket', async () => {
+    const c = new WsClient('ws://example/ws')
+    await openReady(c, true)
+    expect(c.sendTerminalInterest(snap)).toBe(true)
+
+    lastSocket()._close(1006, 'drop')
+    expect(c.sendTerminalInterest(snap)).toBe(false)
+
+    await openReady(c, true)
+    const frames = lastSocket().sent.map((x) => JSON.parse(x))
+    expect(frames.filter((m) => m.type === 'terminal.interest')).toHaveLength(0)
+
+    expect(c.sendTerminalInterest(snap)).toBe(true)
+    const interest = lastSocket().sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.interest')
+    expect(interest).toHaveLength(1)
+    expect(interest[0].revision).toBe(1)
   })
 })

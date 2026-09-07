@@ -140,7 +140,7 @@ function ConfigField({ item, field, onConfigChange, cwdDrafts, cwdErrors }: Conf
         id={fieldId}
         type="text"
         value={field.value as string}
-        placeholder={field.key === 'model' ? (item.id === 'codex' ? 'e.g. gpt-5.5' : 'e.g. claude-3-5-sonnet') : undefined}
+        placeholder={field.key === 'model' ? (item.id === 'codex' ? 'e.g. gpt-6-astra' : 'e.g. claude-3-5-sonnet') : undefined}
         aria-label={field.label}
         onChange={(e) => onConfigChange(item, field.key, e.target.value)}
         className="h-8 w-full px-2 text-xs bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border sm:max-w-[14rem]"
@@ -272,6 +272,8 @@ export function ExtensionsManager({ className, includeCli = true }: ExtensionsMa
   const items = useAppSelector(selectManagedItems)
   const disabledList = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? [])
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
+  const serverConfigDir = useAppSelector((s) => s.settings?.serverConfigDir ?? null)
+  const extensionsDirHint = `${serverConfigDir ?? '~/.freshell'}/extensions/`
 
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set())
   const [cwdDrafts, setCwdDrafts] = useState<Record<string, string>>({})
@@ -414,7 +416,7 @@ export function ExtensionsManager({ className, includeCli = true }: ExtensionsMa
           <p className="text-lg font-medium">No extensions installed</p>
           {includeCli && (
             <p className="text-sm mt-1">
-              Drop a directory with a <code className="rounded bg-muted px-1 py-0.5 text-xs">freshell.json</code> into <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.freshell/extensions/</code> and restart.
+              Drop a directory with a <code className="rounded bg-muted px-1 py-0.5 text-xs">freshell.json</code> into <code className="rounded bg-muted px-1 py-0.5 text-xs">{extensionsDirHint}</code> and restart.
             </p>
           )}
         </div>
