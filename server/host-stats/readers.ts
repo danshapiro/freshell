@@ -170,8 +170,10 @@ export type CpuTimes = {
 
 function parseProcStatCpuFields(fields: number[]): { total: number; busy: number; steal: number } | null {
   // user nice system idle iowait irq softirq steal [guest guest_nice]
+  // guest/guest_nice are EXCLUDED from the total: the kernel already charges guest
+  // execution to user/nice (account_guest_time), so summing them double-counts that time.
   if (fields.length < 8 || fields.some((f) => !Number.isFinite(f))) return null
-  const total = fields.reduce((sum, value) => sum + value, 0)
+  const total = fields.slice(0, 8).reduce((sum, value) => sum + value, 0)
   const busy = total - fields[3] - fields[4] // idle + iowait
   return { total, busy, steal: fields[7] }
 }

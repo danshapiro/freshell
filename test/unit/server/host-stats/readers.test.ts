@@ -280,6 +280,9 @@ describe('readCpuTimes', () => {
     const times = readCpuTimes(PROC)
     expect(times).not.toBeNull()
     // aggregate: total = 4705+356+1622+164331+2020+80+345+777, busy = total - idle(164331) - iowait(2020)
+    // fixture row carries guest=900 guest_nice=45: Linux already charges guest execution to
+    // user/nice (kernel account_guest_time), so the total must EXCLUDE the guest fields
+    // (summing them would read 175181 / busy 8830).
     expect(times!.total).toBe(174236)
     expect(times!.busy).toBe(7885)
     expect(times!.steal).toBe(777) // steal>0 is a fixture requirement

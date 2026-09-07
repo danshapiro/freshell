@@ -1566,6 +1566,9 @@ mod tests {
     #[test]
     fn host_stats_fixture_cpu_times_parse_exact() {
         let times = readers::read_cpu_times(&proc_fixture()).expect("fixture stat parses");
+        // Aggregate fixture row carries guest=900 guest_nice=45; the kernel already
+        // charges guest execution to user/nice (account_guest_time), so the total must
+        // EXCLUDE the guest fields (summing them would read 175181.0 / busy 8830.0).
         assert_eq!(times.total, 174236.0);
         assert_eq!(times.busy, 7885.0);
         assert_eq!(times.steal, 777.0); // steal>0 is a fixture requirement

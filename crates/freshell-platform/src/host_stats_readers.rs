@@ -178,10 +178,12 @@ pub struct CpuTimes {
 
 fn parse_proc_stat_cpu_fields(fields: &[f64]) -> Option<(f64, f64, f64)> {
     // user nice system idle iowait irq softirq steal [guest guest_nice]
+    // guest/guest_nice are EXCLUDED from the total: the kernel already charges guest
+    // execution to user/nice (account_guest_time), so summing them double-counts that time.
     if fields.len() < 8 || fields.iter().any(|f| !f.is_finite()) {
         return None;
     }
-    let total: f64 = fields.iter().sum();
+    let total: f64 = fields[..8].iter().sum();
     let busy = total - fields[3] - fields[4]; // idle + iowait
     Some((total, busy, fields[7]))
 }
