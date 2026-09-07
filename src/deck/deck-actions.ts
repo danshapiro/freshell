@@ -37,6 +37,10 @@ export function executeDeckStop(target: StopTarget, escalate: boolean): void {
       sessionId: target.sessionId,
       sessionType: target.sessionType,
       provider: target.provider,
+      ...(target.runtimeId && target.runtimeGeneration !== undefined ? {
+        expectedRuntimeId: target.runtimeId,
+        expectedGeneration: target.runtimeGeneration,
+      } : {}),
       ...(target.cwd ? { cwd: target.cwd } : {}),
     })
     return

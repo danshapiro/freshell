@@ -13,6 +13,7 @@ import type { DeadSessionEntry, PaneNode, ReconcileWarmingState } from '@/store/
 import { buildRestoreError } from '@shared/session-contract'
 import { DeadSessionPanel } from '@/components/DeadSessionPanel'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
+import { clearReconcileRuntime } from '@/store/freshAgentSlice'
 
 // --- ws-client mock: capture sent frames, support multiple onMessage subscribers ---
 
@@ -213,6 +214,7 @@ describe('DeadSessionPanel + ReconcileWarmingBanner', () => {
       },
     })
     await userEvent.click(screen.getByRole('button', { name: /start fresh here/i }))
+    expect(dispatchedTypes(store)).toContain(clearReconcileRuntime.type)
     expect(dispatchedTypes(store)).toContain(resetFreshAgentPaneForReconcileCreate.type)
     const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'p1')
     expect(leaf.content.kind).toBe('fresh-agent')
@@ -271,7 +273,6 @@ describe('DeadSessionPanel + ReconcileWarmingBanner', () => {
   it('N warming panes produce exactly ONE banner with the count', () => {
     renderWithStore({ reconcileWarming: { count: 7, paneRefs: sevenRefs() } })
     expect(screen.getAllByRole('status')).toHaveLength(1)
-    expect(screen.getByRole('status')).toHaveTextContent(/waiting for session index/i)
     expect(screen.getByRole('status')).toHaveTextContent(/7/)
   })
 

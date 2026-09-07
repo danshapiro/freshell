@@ -1536,7 +1536,7 @@ export default function App() {
           }
         }
 
-        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
+        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws, appStore.getState)
       })
 
       cleanup = () => {

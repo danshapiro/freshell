@@ -1368,6 +1368,7 @@ dependencies = [
 name = "freshell-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -1458,6 +1459,7 @@ dependencies = [
 name = "freshell-ws"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "freshell-activity",

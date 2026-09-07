@@ -321,6 +321,7 @@ mod tests {
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            restart: crate::restart::RestartCoordinator::new(),
             config_fallback: None,
             opencode_locator: None,
             codex_locator: Some(StdArc::new(CodexLocator::new(data_home))),

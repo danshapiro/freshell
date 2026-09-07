@@ -411,6 +411,7 @@ fn respawn_state_with_probe(
         spawn_gate: Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,

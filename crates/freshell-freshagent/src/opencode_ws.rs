@@ -77,7 +77,8 @@ use freshell_protocol::{
 use freshell_terminal::FrameSink;
 
 use crate::{
-    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, SharedPaneIdentitySink,
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, FreshRuntimeIdentity,
+    SharedFreshRuntimeRegistry, SharedPaneIdentitySink,
 };
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`).
@@ -150,6 +151,12 @@ pub struct FreshOpencodeState {
     /// its only wait point is the per-session mutex, so a send issued mid-rollback
     /// blocks behind it, then proceeds and destroys redo (no circular wait).
     rollback_in_flight: crate::InFlightRegistry,
+    runtime_identity: FreshRuntimeIdentity,
+    /// Exact sessions removed from the public alias map while restart finishes
+    /// their remote abort and local task joins. A failed abort remains keyed by
+    /// the selected runtime so the same request retries the retirement instead
+    /// of being misclassified as stale.
+    restart_retirements: Arc<TokioMutex<HashMap<String, OpencodeRestartRetirement>>>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -160,6 +167,7 @@ pub struct FreshOpencodeState {
 #[derive(Clone)]
 struct OpencodeCreateRecord {
     placeholder_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
 }
 
 /// What the session's registered driving task is running (delta-review round 2,
@@ -297,11 +305,16 @@ impl TurnTask {
 /// One live (or not-yet-materialized) freshopencode WS session.
 struct OpencodeSession {
     placeholder_id: String,
+    runtime: freshell_protocol::RuntimeDescriptor,
     /// `None` until the first `freshAgent.send` materializes it (`adapter.ts:349`).
     real_session_id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    /// Non-destructive preflight fence held from the atomic restart snapshot
+    /// until the coordinator either durably journals shutdown or aborts
+    /// preflight. Mutating controls must not cross this boundary.
+    restart_reservation: Option<String>,
     /// The detached, kind-tagged task driving the current/most-recent operation
     /// (`manager.run_turn` for a send, the POST/await-idle/settle drive for a
     /// compact), so `freshAgent.kill`/`freshAgent.interrupt` can abort it. Not
@@ -369,6 +382,11 @@ struct OpencodeSession {
     provenance: Option<crate::BindProvenance>,
 }
 
+struct OpencodeRestartRetirement {
+    requested_session_id: String,
+    session: Arc<TokioMutex<OpencodeSession>>,
+}
+
 /// Why [`FreshOpencodeState::resume_durable_session`] could not produce a live session for
 /// a `freshAgent.attach` id not tracked in [`FreshOpencodeState::sessions`].
 enum ResumeOpencodeError {
@@ -387,16 +405,19 @@ enum ResumeOpencodeError {
 impl OpencodeSession {
     fn new(
         placeholder_id: String,
+        runtime: freshell_protocol::RuntimeDescriptor,
         cwd: Option<String>,
         model: Option<String>,
         effort: Option<String>,
     ) -> Self {
         Self {
             placeholder_id,
+            runtime,
             real_session_id: None,
             cwd,
             model,
             effort,
+            restart_reservation: None,
             turn_task: None,
             turn_aborted: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
@@ -422,7 +443,13 @@ impl FreshOpencodeState {
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            runtime_identity: FreshRuntimeIdentity::default(),
+            restart_retirements: Arc::new(TokioMutex::new(HashMap::new())),
         }
+    }
+
+    pub fn set_runtime_registry(&self, registry: SharedFreshRuntimeRegistry) {
+        self.runtime_identity.set_registry(registry);
     }
 
     /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
@@ -634,6 +661,7 @@ impl FreshOpencodeState {
                     runtime_provider: PROVIDER.to_string(),
                     session_id: cached.placeholder_id.clone(),
                     session_type: SESSION_TYPE.to_string(),
+                    runtime: Some(cached.runtime),
                     session_ref: Some(SessionLocator {
                         provider: PROVIDER.to_string(),
                         session_id: cached.placeholder_id,
@@ -664,8 +692,17 @@ impl FreshOpencodeState {
         let model = normalize_opencode_model(msg.model.as_deref());
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, &placeholder);
 
-        let mut session = OpencodeSession::new(placeholder.clone(), msg.cwd.clone(), model, effort);
+        let mut session = OpencodeSession::new(
+            placeholder.clone(),
+            runtime.clone(),
+            msg.cwd.clone(),
+            model,
+            effort,
+        );
         // D8: park the connection provenance ON the session — the binding row
         // is written at materialization (first send), well after this create
         // returns. A HOLLOW `Some` (a partially initialized client's hello,
@@ -685,6 +722,7 @@ impl FreshOpencodeState {
                 &request_id,
                 OpencodeCreateRecord {
                     placeholder_id: placeholder.clone(),
+                    runtime: runtime.clone(),
                 },
             )
             .await;
@@ -712,6 +750,7 @@ impl FreshOpencodeState {
             runtime_provider: PROVIDER.to_string(),
             session_id: placeholder.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: placeholder,
@@ -855,16 +894,19 @@ impl FreshOpencodeState {
                 &request_id,
                 OpencodeCreateRecord {
                     placeholder_id: durable_id.clone(),
+                    runtime: session_arc.lock().await.runtime.clone(),
                 },
             )
             .await;
 
+        let runtime = session_arc.lock().await.runtime.clone();
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
             runtime_provider: PROVIDER.to_string(),
             session_id: durable_id.clone(),
             session_type: SESSION_TYPE.to_string(),
+            runtime: Some(runtime),
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: durable_id,
@@ -889,11 +931,10 @@ impl FreshOpencodeState {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
 
-        let session_arc = {
-            let guard = self.sessions.lock().await;
-            guard.get(&session_id).cloned()
-        };
+        let sessions = self.sessions.lock().await;
+        let session_arc = sessions.get(&session_id).cloned();
         let Some(session_arc) = session_arc else {
+            drop(sessions);
             self.send_error(
                 &request_id,
                 "SESSION_NOT_FOUND",
@@ -903,6 +944,22 @@ impl FreshOpencodeState {
         };
 
         let mut session = session_arc.lock().await;
+        drop(sessions);
+        if session.restart_reservation.is_some()
+            || !crate::control_targets_runtime(
+                msg.expected_runtime_id.as_deref(),
+                msg.expected_generation,
+                &session.runtime,
+            )
+        {
+            drop(session);
+            self.send_error(
+                &request_id,
+                "STALE_RUNTIME",
+                "opencode control targets a replaced runtime",
+            );
+            return;
+        }
 
         // Retire-on-kill (delta-review round 5, the resolution arm): a send that
         // took this session's Arc just before `handle_kill`'s map removal parks
@@ -1019,9 +1076,10 @@ impl FreshOpencodeState {
             .real_session_id
             .clone()
             .unwrap_or_else(|| session.placeholder_id.clone());
-        self.broadcast(&event_frame(
+        self.broadcast(&runtime_event_frame(
             &busy_session_id,
             snapshot_event(&busy_session_id, "running"),
+            &session.runtime,
         ));
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
@@ -1047,6 +1105,9 @@ impl FreshOpencodeState {
             };
             let durable_id = created.id;
             session.real_session_id = Some(durable_id.clone());
+            session.runtime =
+                self.runtime_identity
+                    .register(PROVIDER, &durable_id, &session.runtime.runtime_id);
             if let Some(dir) = created.directory.filter(|d| !d.is_empty()) {
                 session.cwd = Some(dir);
             } else if let Some(cwd) = cwd.clone() {
@@ -1089,7 +1150,13 @@ impl FreshOpencodeState {
 
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&materialized_frame(&session.placeholder_id, &durable_id));
+            // The runtime descriptor rides the frame so restart-fenced clients can
+            // tell this materialization's generation from a replacement's.
+            self.broadcast(&materialized_frame(
+                &session.placeholder_id,
+                &durable_id,
+                Some(&session.runtime),
+            ));
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -1098,16 +1165,18 @@ impl FreshOpencodeState {
                 manager.clone(),
                 durable_id.clone(),
                 session.turn_errored.clone(),
+                session.runtime.clone(),
             ));
             durable_id
         };
 
         session.model = model.clone();
         session.effort = effort.clone();
+        session.cwd = cwd.clone();
 
         // P1.13: settings-change refresh -- once durable, every send's committed
-        // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
-        // durable-before-answer). No pending resolution or supersession here.
+        // model/effort/cwd re-snapshot the binding row (AWAITED BEFORE send.accepted
+        // -- durable-before-answer). No pending resolution or supersession here.
         if acked_session_id.starts_with("ses_") {
             // D8: same session-carried stamps (a per-send refresh re-asserts
             // them via `Replace`; a conn-less refresh lane carries `None` →
@@ -1154,6 +1223,7 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let runtime = session.runtime.clone();
 
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
@@ -1176,6 +1246,7 @@ impl FreshOpencodeState {
                 &turn_aborted,
                 &turn_errored,
                 &last_turn_complete_at,
+                &runtime,
             );
         });
         session.turn_task = Some(TurnTask {
@@ -1217,11 +1288,161 @@ impl FreshOpencodeState {
             session_id.to_string(),
             Arc::new(TokioMutex::new(OpencodeSession::new(
                 session_id.to_string(),
+                freshell_protocol::RuntimeDescriptor {
+                    runtime_id: format!("insert-live-session-for-test-{session_id}"),
+                    generation: 1,
+                },
                 None,
                 None,
                 None,
             ))),
         );
+    }
+
+    /// Provider-authoritative restart inputs for the exact live OpenCode
+    /// session object. Both placeholder and durable aliases resolve the same
+    /// record, whose fields are refreshed after every settings-bearing send.
+    pub async fn capture_restart_resume_plan(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Option<crate::FreshAgentRestartResumePlan> {
+        let session = self.sessions.lock().await.get(session_id).cloned()?;
+        let session = session.lock().await;
+        if session.runtime.runtime_id != expected_runtime_id {
+            return None;
+        }
+        Some(crate::FreshAgentRestartResumePlan {
+            session_type: freshell_protocol::SessionType::Freshopencode,
+            settings: crate::FreshAgentSettings {
+                model: session.model.clone(),
+                sandbox: None,
+                permission_mode: None,
+                effort: session.effort.clone(),
+                cwd: session.cwd.clone(),
+            },
+        })
+    }
+
+    /// Atomically fence mutating controls and snapshot both the authoritative
+    /// resume settings and the cross-boot remote-abort target. The reservation
+    /// is non-destructive: the provider keeps running until the coordinator
+    /// durably records shutdown, and preflight failure can release it.
+    pub async fn reserve_restart_preflight(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+        reservation_token: &str,
+    ) -> Result<
+        (
+            crate::FreshAgentRestartResumePlan,
+            Option<(String, Option<String>)>,
+        ),
+        String,
+    > {
+        let sessions = self.sessions.lock().await;
+        let session_arc = sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "selected OpenCode session is no longer live".to_string())?;
+        let mut session = session_arc.lock().await;
+        drop(sessions);
+        if session.runtime.runtime_id != expected_runtime_id {
+            return Err("selected OpenCode runtime changed before preflight".to_string());
+        }
+        match session.restart_reservation.as_deref() {
+            Some(token) if token == reservation_token => {}
+            Some(_) => {
+                return Err("selected OpenCode runtime is reserved by another restart".to_string())
+            }
+            None => session.restart_reservation = Some(reservation_token.to_string()),
+        }
+        let plan = crate::FreshAgentRestartResumePlan {
+            session_type: freshell_protocol::SessionType::Freshopencode,
+            settings: crate::FreshAgentSettings {
+                model: session.model.clone(),
+                sandbox: None,
+                permission_mode: None,
+                effort: session.effort.clone(),
+                cwd: session.cwd.clone(),
+            },
+        };
+        let action = session
+            .real_session_id
+            .clone()
+            .map(|real_id| (real_id, session.cwd.clone()));
+        Ok((plan, action))
+    }
+
+    /// Release a non-destructive preflight reservation after journal failure.
+    pub async fn release_restart_preflight(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+        reservation_token: &str,
+    ) {
+        let sessions = self.sessions.lock().await;
+        let session_arc = sessions.get(session_id).cloned();
+        let Some(session_arc) = session_arc else {
+            return;
+        };
+        let mut session = session_arc.lock().await;
+        drop(sessions);
+        if session.runtime.runtime_id == expected_runtime_id
+            && session.restart_reservation.as_deref() == Some(reservation_token)
+        {
+            session.restart_reservation = None;
+        }
+    }
+
+    /// Capture the exact remote-session abort needed if restart crosses a
+    /// server-process boot. An unmaterialized placeholder owns no remote
+    /// writer and therefore returns `Ok(None)`.
+    pub async fn capture_restart_remote_abort(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        let session_arc = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "selected OpenCode session is no longer live".to_string())?;
+        let session = session_arc.lock().await;
+        if session.runtime.runtime_id != expected_runtime_id {
+            return Err("selected OpenCode runtime changed before fence capture".to_string());
+        }
+        Ok(session
+            .real_session_id
+            .clone()
+            .map(|real_id| (real_id, session.cwd.clone())))
+    }
+
+    /// Complete a persisted OpenCode retirement after the sessions/quarantine
+    /// maps from the originating process are gone. The shared serve process is
+    /// never killed: only the exact durable remote session is aborted.
+    pub async fn recover_restart_remote_abort(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> crate::RestartShutdownOutcome {
+        let manager = self.fresh_agent.ensure_manager().await;
+        let route = cwd.map(str::to_string);
+        match manager.abort(session_id, &route).await {
+            Ok(()) => crate::RestartShutdownOutcome::Stopped,
+            Err(error) => {
+                let message =
+                    format!("OpenCode predecessor remote abort failed for {session_id}: {error}");
+                tracing::warn!(
+                    error = %error,
+                    session_id,
+                    "freshagent.opencode.restart_boot_abort_failed"
+                );
+                crate::RestartShutdownOutcome::RetirementIncomplete { message }
+            }
+        }
     }
 
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
@@ -1266,6 +1487,38 @@ impl FreshOpencodeState {
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
+        };
+        // Restart fence (kata z06a) BEFORE any enumeration/close: a kill
+        // carrying an expected runtime descriptor, or landing while a
+        // non-destructive restart preflight reservation parks the session,
+        // targets a replaced (or replacing) runtime — answer STALE_RUNTIME
+        // and touch NOTHING. A fenced kill naming an id the map no longer
+        // holds answers SESSION_NOT_FOUND (never silently "succeeds" at
+        // closing nothing). Only the session lock is taken here; the
+        // sessions-map guard is already released (round-6 lock order).
+        let killed_runtime = if let Some(session_arc) = &session_arc {
+            let s = session_arc.lock().await;
+            if s.restart_reservation.is_some()
+                || !crate::control_targets_runtime(
+                    msg.expected_runtime_id.as_deref(),
+                    msg.expected_generation,
+                    &s.runtime,
+                )
+            {
+                drop(s);
+                self.send_error(
+                    &None,
+                    "STALE_RUNTIME",
+                    "opencode control targets a replaced runtime",
+                );
+                return;
+            }
+            Some(s.runtime.clone())
+        } else if msg.expected_runtime_id.is_some() || msg.expected_generation.is_some() {
+            self.send_error(&None, "SESSION_NOT_FOUND", "opencode session not found");
+            return;
+        } else {
+            None
         };
         let mut retire_ids: Vec<String> = Vec::new();
         let mut marker_ids: Vec<String> = Vec::new();
@@ -1378,6 +1631,7 @@ impl FreshOpencodeState {
                             session_id: msg.session_id,
                             session_type: SESSION_TYPE.to_string(),
                             success: false,
+                            runtime: killed_runtime.clone(),
                         }));
                         return;
                     }
@@ -1464,6 +1718,14 @@ impl FreshOpencodeState {
             }
         }
 
+        // Fix 8: a killed session's runtime is finally gone — unpin its
+        // descriptor into the bounded retired history (late frames for it
+        // stay fenced).
+        if let Some(runtime) = &killed_runtime {
+            self.runtime_identity
+                .unregister(PROVIDER, &msg.session_id, &runtime.runtime_id);
+        }
+
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`) -- a later
         // duplicate `create` for the same requestId must genuinely mint a fresh
@@ -1487,7 +1749,195 @@ impl FreshOpencodeState {
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
             success: !close_reported_failure && !close_invariant_broken,
+            runtime: killed_runtime,
         }));
+    }
+
+    /// Restart-only teardown fenced to the exact runtime selected by the
+    /// coordinator. A materialized durable session is first aborted through the
+    /// shared serve manager, so no remote turn can keep writing while the
+    /// replacement resumes the same durable id. Both placeholder and durable
+    /// aliases are then removed while the sessions map is locked, and only when
+    /// they still point at that runtime.
+    pub async fn shutdown_for_restart(&self, session_id: &str, expected_runtime_id: &str) -> bool {
+        self.shutdown_for_restart_detailed(session_id, expected_runtime_id)
+            .await
+            == crate::RestartShutdownOutcome::Stopped
+    }
+
+    pub async fn shutdown_reserved_for_restart_detailed(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+        reservation_token: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let session_arc = {
+            let mut retirements = self.restart_retirements.lock().await;
+            if let Some(retirement) = retirements.get(expected_runtime_id) {
+                Arc::clone(&retirement.session)
+            } else {
+                let mut sessions = self.sessions.lock().await;
+                let Some(session_arc) = sessions.get(session_id).cloned() else {
+                    return crate::RestartShutdownOutcome::Stale;
+                };
+                let session = session_arc.lock().await;
+                if session.runtime.runtime_id != expected_runtime_id
+                    || session.restart_reservation.as_deref() != Some(reservation_token)
+                {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                drop(session);
+                sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
+                retirements.insert(
+                    expected_runtime_id.to_string(),
+                    OpencodeRestartRetirement {
+                        requested_session_id: session_id.to_string(),
+                        session: Arc::clone(&session_arc),
+                    },
+                );
+                session_arc
+            }
+        };
+        self.continue_restart_retirement(session_id, expected_runtime_id, session_arc)
+            .await
+    }
+
+    pub async fn shutdown_for_restart_detailed(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+    ) -> crate::RestartShutdownOutcome {
+        let session_arc = {
+            // The retirement map is acquired first everywhere in this method.
+            // Remove every public alias in the same critical section that
+            // installs quarantine, then release BOTH global maps before any
+            // manager startup or network request.
+            let mut retirements = self.restart_retirements.lock().await;
+            if let Some(retirement) = retirements.get(expected_runtime_id) {
+                let session = retirement.session.lock().await;
+                let matches_session = retirement.requested_session_id == session_id
+                    || session.placeholder_id == session_id
+                    || session.real_session_id.as_deref() == Some(session_id);
+                drop(session);
+                if !matches_session {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                Arc::clone(&retirement.session)
+            } else {
+                if retirements
+                    .values()
+                    .any(|retirement| retirement.requested_session_id == session_id)
+                {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                let mut sessions = self.sessions.lock().await;
+                let Some(session_arc) = sessions.get(session_id).cloned() else {
+                    return crate::RestartShutdownOutcome::Stale;
+                };
+                let mut session = session_arc.lock().await;
+                if session.runtime.runtime_id != expected_runtime_id {
+                    return crate::RestartShutdownOutcome::Stale;
+                }
+                session.restart_reservation =
+                    Some(format!("restart-retirement:{expected_runtime_id}"));
+                drop(session);
+                sessions.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
+                retirements.insert(
+                    expected_runtime_id.to_string(),
+                    OpencodeRestartRetirement {
+                        requested_session_id: session_id.to_string(),
+                        session: Arc::clone(&session_arc),
+                    },
+                );
+                session_arc
+            }
+        };
+
+        self.continue_restart_retirement(session_id, expected_runtime_id, session_arc)
+            .await
+    }
+
+    async fn continue_restart_retirement(
+        &self,
+        session_id: &str,
+        expected_runtime_id: &str,
+        session_arc: Arc<TokioMutex<OpencodeSession>>,
+    ) -> crate::RestartShutdownOutcome {
+        let mut session = session_arc.lock().await;
+        if let Some(real_id) = session.real_session_id.clone() {
+            // Set the completion fence before the remote abort. The abort can
+            // synchronously produce an idle edge that lets `run_turn` return;
+            // such a predecessor completion must never chime while restart is
+            // preparing its replacement.
+            session.turn_aborted.store(true, Ordering::SeqCst);
+            let manager = self.fresh_agent.ensure_manager().await;
+            if let Err(error) = manager.abort(&real_id, &session.cwd).await {
+                let message =
+                    format!("OpenCode predecessor remote abort failed for {real_id}: {error}");
+                tracing::warn!(
+                    error = %error,
+                    session_id = %real_id,
+                    runtime_id = %expected_runtime_id,
+                    "freshagent.opencode.restart_abort_failed"
+                );
+                drop(session);
+                return crate::RestartShutdownOutcome::RetirementIncomplete { message };
+            }
+        }
+
+        if let Some(task) = session.turn_task.take() {
+            // ep4-r6 F2: abort + join + settle-wait (a compact drive's
+            // pre-drive-redo compensation must have landed before the
+            // restart answers).
+            task.abort_and_settle().await;
+        }
+        if let Some(bridge) = session.serve_bridge.take() {
+            bridge.abort();
+            let _ = bridge.await;
+        }
+        if let Some(real) = session.real_session_id.as_deref() {
+            self.leases.clear_binding(PROVIDER, real);
+        }
+        self.leases.clear_binding(PROVIDER, session_id);
+        let placeholder = session.placeholder_id.clone();
+        drop(session);
+        self.create_dedup
+            .clear_for_session(|record| record.placeholder_id == placeholder)
+            .await;
+        self.restart_retirements
+            .lock()
+            .await
+            .remove(expected_runtime_id);
+        // Fix 8: the retirement reached `Stopped` — the predecessor runtime is
+        // finally gone, so its descriptor unpins into the bounded retired
+        // history. (The restart transaction's own coordinator-side retirement
+        // usually got there first; this call is idempotent.)
+        self.runtime_identity
+            .unregister(PROVIDER, session_id, expected_runtime_id);
+        crate::RestartShutdownOutcome::Stopped
+    }
+
+    /// Server-shutdown bookkeeping drain (fix 1): a quarantined OpenCode
+    /// restart retirement owns NO local process — its fenced remote abort is
+    /// the NEXT BOOT's cross-boot recovery job (the durable pending row owns
+    /// it), so there is nothing here to confirm dead. Log the abandoned
+    /// entries loudly (never claim a quiet quiescence) and clear the map.
+    pub async fn drain_restart_retirements(&self) {
+        let drained: Vec<(String, String)> = {
+            let mut retirements = self.restart_retirements.lock().await;
+            retirements
+                .drain()
+                .map(|(runtime_id, retirement)| (runtime_id, retirement.requested_session_id))
+                .collect()
+        };
+        if !drained.is_empty() {
+            tracing::error!(
+                provider = PROVIDER,
+                entries = drained.len(),
+                retired = ?drained,
+                "agent.restart.opencode_quarantine_drain_bookkeeping"
+            );
+        }
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
@@ -1500,17 +1950,36 @@ impl FreshOpencodeState {
     /// a not-yet-materialized session (`abortForState` no-ops when there's no
     /// `realSessionId`, but the reference still emits idle unconditionally).
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
-        let session_arc = {
-            let guard = self.sessions.lock().await;
-            guard.get(&msg.session_id).cloned()
-        };
+        let sessions = self.sessions.lock().await;
+        let session_arc = sessions.get(&msg.session_id).cloned();
         let Some(session_arc) = session_arc else {
+            drop(sessions);
             self.send_error(&None, "SESSION_NOT_FOUND", "opencode session not found");
             return;
         };
 
-        let (real_id, route, turn_aborted) = {
+        let (real_id, route, turn_aborted, runtime) = {
             let mut session = session_arc.lock().await;
+            drop(sessions);
+            // Restart fence (kata z06a): a control bearing a stale expected
+            // runtime (or landing while a restart preflight reservation parks
+            // the session) must not touch the replaced/replacing runtime —
+            // answer STALE_RUNTIME so the caller retries the live generation.
+            if session.restart_reservation.is_some()
+                || !crate::control_targets_runtime(
+                    msg.expected_runtime_id.as_deref(),
+                    msg.expected_generation,
+                    &session.runtime,
+                )
+            {
+                drop(session);
+                self.send_error(
+                    &None,
+                    "STALE_RUNTIME",
+                    "opencode control targets a replaced runtime",
+                );
+                return;
+            }
             session.turn_aborted.store(true, Ordering::SeqCst);
             if let Some(task) = session.turn_task.take() {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
@@ -1521,15 +1990,17 @@ impl FreshOpencodeState {
                 session.real_session_id.clone(),
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
+                session.runtime.clone(),
             )
         };
 
         let Some(real_id) = real_id else {
             // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
             // still fires (adapter.ts:530), stamped with whatever id the client sent.
-            self.broadcast(&event_frame(
+            self.broadcast(&runtime_event_frame(
                 &msg.session_id,
                 snapshot_event(&msg.session_id, "idle"),
+                &runtime,
             ));
             return;
         };
@@ -1537,7 +2008,11 @@ impl FreshOpencodeState {
         let manager = self.fresh_agent.ensure_manager().await;
         match manager.abort(&real_id, &route).await {
             Ok(()) => {
-                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                self.broadcast(&runtime_event_frame(
+                    &real_id,
+                    snapshot_event(&real_id, "idle"),
+                    &runtime,
+                ));
             }
             Err(_) => {
                 // adapter.ts:525-528 -- the abort never landed, so the turn may still
@@ -1671,6 +2146,7 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let runtime = session.runtime.clone();
 
         // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
         self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
@@ -1855,6 +2331,7 @@ impl FreshOpencodeState {
                 &turn_aborted,
                 &turn_errored,
                 &last_turn_complete_at,
+                &runtime,
             );
             if let Err(err) = result {
                 fresh_agent.broadcast(&event_frame(
@@ -2052,8 +2529,12 @@ impl FreshOpencodeState {
             .clone()
             .filter(|d| !d.is_empty())
             .or(route.clone());
+        // Mint the child's runtime identity up front (restart fencing): the
+        // serve-SSE bridge and every later control both fence on THIS descriptor.
+        let child_runtime = self.runtime_identity.mint_and_register(PROVIDER, &child.id);
         let mut child_session = OpencodeSession::new(
             child.id.clone(),
+            child_runtime,
             child_cwd.clone(),
             model.clone(),
             effort.clone(),
@@ -2064,6 +2545,7 @@ impl FreshOpencodeState {
             manager,
             child.id.clone(),
             child_session.turn_errored.clone(),
+            child_session.runtime.clone(),
         ));
         self.sessions
             .lock()
@@ -2159,6 +2641,15 @@ impl FreshOpencodeState {
     ) {
         use crate::rollback_record::*;
 
+        // z06a: stamp every answer with the live runtime descriptor (a fenced
+        // pane drops untagged frames); the try-lock peek never blocks (the
+        // handler's own session lock is taken below) and a racy miss answers
+        // untagged, exactly like an absent session.
+        let rollback_runtime = match self.sessions.lock().await.get(&op.session_id).cloned() {
+            Some(arc) => arc.try_lock().ok().map(|session| session.runtime.clone()),
+            None => None,
+        };
+
         // Rollback-vs-rollback single-flight, acquired FIRST (lock order:
         // rollback_in_flight, then the per-session mutex — never the reverse).
         let Some(_guard) = self.rollback_in_flight.try_acquire(&op.session_id) else {
@@ -2166,6 +2657,7 @@ impl FreshOpencodeState {
                 &op,
                 "INTERNAL_ERROR",
                 &format!("rollback already in progress for {}", op.session_id),
+                rollback_runtime.as_ref(),
             ));
             return;
         };
@@ -2178,6 +2670,7 @@ impl FreshOpencodeState {
                     "opencode fresh-agent session {} is not available.",
                     op.session_id
                 ),
+                rollback_runtime.as_ref(),
             ));
             return;
         };
@@ -2193,6 +2686,7 @@ impl FreshOpencodeState {
                     "OpenCode session {} has not materialized; cannot roll back.",
                     session.placeholder_id
                 ),
+                rollback_runtime.as_ref(),
             ));
             return;
         };
@@ -2201,6 +2695,7 @@ impl FreshOpencodeState {
                 &op,
                 "BUSY_TURN",
                 ROLLBACK_BUSY_MESSAGE,
+                rollback_runtime.as_ref(),
             ));
             return;
         }
@@ -2211,6 +2706,7 @@ impl FreshOpencodeState {
                 &op,
                 "INVALID_ROLLBACK_TARGET",
                 "rollback toTurn requires a turnId",
+                rollback_runtime.as_ref(),
             ));
             return;
         }
@@ -2223,6 +2719,7 @@ impl FreshOpencodeState {
                     &op,
                     "INTERNAL_ERROR",
                     &err.to_string(),
+                    rollback_runtime.as_ref(),
                 ));
                 return;
             }
@@ -2234,6 +2731,7 @@ impl FreshOpencodeState {
                     &op,
                     "INTERNAL_ERROR",
                     &err.to_string(),
+                    rollback_runtime.as_ref(),
                 ));
                 return;
             }
@@ -2268,6 +2766,7 @@ impl FreshOpencodeState {
                                 &op,
                                 "NOTHING_TO_UNDO",
                                 UNDO_EMPTY_MESSAGE,
+                                rollback_runtime.as_ref(),
                             ));
                             return;
                         }
@@ -2282,6 +2781,7 @@ impl FreshOpencodeState {
                                 &op,
                                 "INVALID_ROLLBACK_TARGET",
                                 &format!("turn {t} is not in the active conversation"),
+                                rollback_runtime.as_ref(),
                             ));
                             return;
                         }
@@ -2305,6 +2805,7 @@ impl FreshOpencodeState {
                                 &format!(
                                     "turn {t} is not a user message; toTurn undo targets user turns only"
                                 ),
+                                rollback_runtime.as_ref(),
                             ));
                             return;
                         }
@@ -2367,7 +2868,13 @@ impl FreshOpencodeState {
                 // fresh chain is redoable.
                 record.set_can_redo(true, now);
                 if !self
-                    .persist_record_or_refuse(&op, &real_id, record.clone(), &reply_sink)
+                    .persist_record_or_refuse(
+                        &op,
+                        &real_id,
+                        record.clone(),
+                        &reply_sink,
+                        rollback_runtime.as_ref(),
+                    )
                     .await
                 {
                     return; // provider history NEVER mutated on this path
@@ -2385,6 +2892,7 @@ impl FreshOpencodeState {
                             verb: "revert",
                         },
                         reply_sink.clone(),
+                        rollback_runtime.as_ref(),
                     )
                     .await
                 {
@@ -2403,6 +2911,7 @@ impl FreshOpencodeState {
                     &real_id,
                     &removed_ids,
                     can_redo,
+                    rollback_runtime.as_ref(),
                 ));
                 reply_sink(rollback_ack_frame(
                     &op,
@@ -2411,6 +2920,7 @@ impl FreshOpencodeState {
                     &removed_ids,
                     can_redo,
                     None,
+                    rollback_runtime.as_ref(),
                 ));
             }
             RollbackDirection::Redo => {
@@ -2419,6 +2929,7 @@ impl FreshOpencodeState {
                         &op,
                         "REDO_UNAVAILABLE",
                         REDO_EMPTY_MESSAGE,
+                        rollback_runtime.as_ref(),
                     ));
                     return;
                 };
@@ -2434,6 +2945,7 @@ impl FreshOpencodeState {
                             &op,
                             "REDO_UNAVAILABLE",
                             REDO_DESTROYED_MESSAGE,
+                            rollback_runtime.as_ref(),
                         ));
                         return;
                     }
@@ -2442,6 +2954,7 @@ impl FreshOpencodeState {
                             &op,
                             "REDO_UNAVAILABLE",
                             REDO_EMPTY_MESSAGE,
+                            rollback_runtime.as_ref(),
                         ));
                         return;
                     }
@@ -2454,6 +2967,7 @@ impl FreshOpencodeState {
                         &op,
                         "REDO_UNAVAILABLE",
                         REDO_EMPTY_MESSAGE,
+                        rollback_runtime.as_ref(),
                     ));
                     return;
                 }
@@ -2477,6 +2991,7 @@ impl FreshOpencodeState {
                                     &op,
                                     "INVALID_ROLLBACK_TARGET",
                                     &format!("turn {t} is not in the rolled-back tail"),
+                                    rollback_runtime.as_ref(),
                                 ));
                                 return;
                             }
@@ -2523,7 +3038,13 @@ impl FreshOpencodeState {
                     .any(|e| e.epoch == record.current_epoch && !e.removed_turns.is_empty());
                 record.set_can_redo(!record.redo_destroyed && current_tail_non_empty, now);
                 if !self
-                    .persist_record_or_refuse(&op, &real_id, record.clone(), &reply_sink)
+                    .persist_record_or_refuse(
+                        &op,
+                        &real_id,
+                        record.clone(),
+                        &reply_sink,
+                        rollback_runtime.as_ref(),
+                    )
                     .await
                 {
                     return; // provider history NEVER mutated on this path
@@ -2541,6 +3062,7 @@ impl FreshOpencodeState {
                             verb: "redo",
                         },
                         reply_sink.clone(),
+                        rollback_runtime.as_ref(),
                     )
                     .await
                 {
@@ -2564,6 +3086,7 @@ impl FreshOpencodeState {
                     &real_id,
                     &restored_ids,
                     can_redo,
+                    rollback_runtime.as_ref(),
                 ));
                 reply_sink(rollback_ack_frame(
                     &op,
@@ -2572,6 +3095,7 @@ impl FreshOpencodeState {
                     &restored_ids,
                     can_redo,
                     None,
+                    rollback_runtime.as_ref(),
                 ));
             }
         }
@@ -2594,6 +3118,7 @@ impl FreshOpencodeState {
     /// Mutation-RPC ERROR legs compensate ONLY on an HTTP ANSWER (a 4xx/5xx the serve
     /// provably sent back — the revert provably did not apply); transport legs (no
     /// answer at all) are treated like (c): keep the ledger.
+    #[allow(clippy::too_many_arguments)] // one rollback step's whole context, handed here to keep callers readable
     async fn mutate_and_verify(
         &self,
         manager: &OpencodeServeManager,
@@ -2602,6 +3127,7 @@ impl FreshOpencodeState {
         route: &freshell_opencode::Route,
         plan: OpencodeMutationPlan<'_>,
         reply_sink: FrameSink,
+        rollback_runtime: Option<&freshell_protocol::RuntimeDescriptor>,
     ) -> bool {
         let result = match plan.boundary {
             Some(target) => manager.revert(real_id, target, route).await,
@@ -2624,7 +3150,7 @@ impl FreshOpencodeState {
                 self.compensate_opencode_record(real_id, plan.previous, plan.now)
                     .await;
             }
-            reply_sink(map_opencode_serve_error(op, &err));
+            reply_sink(map_opencode_serve_error(op, &err, rollback_runtime));
             return false;
         }
         // POST-VERIFY (unknown/stale messageID is a silent 200 no-op serve-side).
@@ -2642,6 +3168,7 @@ impl FreshOpencodeState {
                     op,
                     "INTERNAL_ERROR",
                     &format!("{verb} issued but the post-rollback verification read failed: {err}"),
+                    rollback_runtime,
                 ));
                 return false;
             }
@@ -2661,6 +3188,7 @@ impl FreshOpencodeState {
                 &format!(
                     "the serve accepted the {verb} but the rollback pointer did not move (unknown or stale messageID)"
                 ),
+                rollback_runtime,
             ));
             return false;
         }
@@ -2677,6 +3205,7 @@ impl FreshOpencodeState {
         real_id: &str,
         record: crate::rollback_record::RollbackRecord,
         reply_sink: &FrameSink,
+        rollback_runtime: Option<&freshell_protocol::RuntimeDescriptor>,
     ) -> bool {
         if let Some(sink) = self.identity_sink() {
             if let Err(e) = sink.record_rollback(PROVIDER, real_id, record).await {
@@ -2685,6 +3214,7 @@ impl FreshOpencodeState {
                     op,
                     "INTERNAL_ERROR",
                     crate::rollback_record::LEDGER_WRITE_REFUSAL_COPY,
+                    rollback_runtime,
                 ));
                 return false;
             }
@@ -2762,7 +3292,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running, real_session_id) = {
+        let (status_session_id, running, real_session_id, runtime) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) -- only
@@ -2780,6 +3310,7 @@ impl FreshOpencodeState {
                         manager,
                         real_id,
                         session.turn_errored.clone(),
+                        session.runtime.clone(),
                     ));
                 }
             }
@@ -2793,7 +3324,12 @@ impl FreshOpencodeState {
                 .as_ref()
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
-            (status_session_id, running, session.real_session_id.clone())
+            (
+                status_session_id,
+                running,
+                session.real_session_id.clone(),
+                session.runtime.clone(),
+            )
         };
 
         // Attach addressed by the PLACEHOLDER id of an already-materialized session:
@@ -2803,14 +3339,19 @@ impl FreshOpencodeState {
         // (materialize-on-send) -- the client fold updates slice AND pane content.
         if let Some(real_id) = real_session_id.as_ref() {
             if real_id != &msg.session_id {
-                self.broadcast(&materialized_frame(&msg.session_id, real_id));
+                self.broadcast(&materialized_frame(
+                    &msg.session_id,
+                    real_id,
+                    Some(&runtime),
+                ));
             }
         }
 
         let status = if running { "running" } else { "idle" };
-        self.broadcast(&event_frame(
+        self.broadcast(&runtime_event_frame(
             &status_session_id,
             snapshot_event(&status_session_id, status),
+            &runtime,
         ));
     }
 
@@ -2971,8 +3512,12 @@ impl FreshOpencodeState {
             .or(serve_dir)
             .or_else(|| cwd.map(str::to_string));
 
+        let runtime = self
+            .runtime_identity
+            .mint_and_register(PROVIDER, session_id);
         let mut session = OpencodeSession::new(
             session_id.to_string(),
+            runtime.clone(),
             cwd.clone(),
             rec.model.clone(),
             rec.effort.clone(),
@@ -3000,6 +3545,7 @@ impl FreshOpencodeState {
             manager,
             session_id.to_string(),
             session.turn_errored.clone(),
+            runtime,
         ));
         let session_arc = Arc::new(TokioMutex::new(session));
 
@@ -3132,6 +3678,7 @@ impl FreshOpencodeState {
         manager: OpencodeServeManager,
         real_id: String,
         turn_errored: Arc<AtomicBool>,
+        runtime: freshell_protocol::RuntimeDescriptor,
     ) -> tokio::task::JoinHandle<()> {
         let fresh_agent = self.fresh_agent.clone();
         let mut rx = manager.subscribe(&real_id);
@@ -3169,7 +3716,7 @@ impl FreshOpencodeState {
                                 error_event(session_id, message)
                             }
                         };
-                        fresh_agent.broadcast(&event_frame(&real_id, inner));
+                        fresh_agent.broadcast(&runtime_event_frame(&real_id, inner, &runtime));
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
                     // surfaces `ServeError::SidecarLost`, which already excludes the
@@ -3228,7 +3775,20 @@ fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: None,
     })
+}
+
+fn runtime_event_frame(
+    session_id: &str,
+    inner: Value,
+    runtime: &freshell_protocol::RuntimeDescriptor,
+) -> ServerMessage {
+    let mut frame = event_frame(session_id, inner);
+    if let ServerMessage::FreshAgentEvent(event) = &mut frame {
+        event.runtime = Some(runtime.clone());
+    }
+    frame
 }
 
 /// `{type:'sdk.session.snapshot',...} → freshAgent.session.snapshot` (sdk-events.ts:49-50;
@@ -3261,6 +3821,13 @@ fn turn_complete_event(session_id: &str, at: i64) -> Value {
 /// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
 /// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
 /// session's monotonic turn-complete clock.
+/// The shared turn settle tail (`adapter.ts:371-393`): `emitStatus(state, 'idle')`
+/// — unconditional, whether the turn succeeded or the upstream call itself errored
+/// — then the positive `freshAgent.turn.complete` chime ONLY when the idle-wait
+/// actually succeeded AND the turn was neither interrupted (`turn_aborted`, set by
+/// `handle_interrupt`) nor errored (`turn_errored`, set by the serve-stream bridge
+/// on an observed `session.error`). Frames carry the session's runtime descriptor
+/// so restart-fenced clients can attribute them to the originating generation.
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
@@ -3268,8 +3835,13 @@ fn settle_turn_outcome(
     turn_aborted: &AtomicBool,
     turn_errored: &AtomicBool,
     last_turn_complete_at: &StdMutex<Option<i64>>,
+    runtime: &freshell_protocol::RuntimeDescriptor,
 ) {
-    fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
+    fresh_agent.broadcast(&runtime_event_frame(
+        real_id,
+        snapshot_event(real_id, "idle"),
+        runtime,
+    ));
     if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
         let at = {
             let mut guard = last_turn_complete_at
@@ -3279,7 +3851,11 @@ fn settle_turn_outcome(
             *guard = Some(at);
             at
         };
-        fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+        fresh_agent.broadcast(&runtime_event_frame(
+            real_id,
+            turn_complete_event(real_id, at),
+            runtime,
+        ));
     }
 }
 
@@ -3288,12 +3864,17 @@ fn settle_turn_outcome(
 /// re-key frame. Shared by the materialize-on-send path and the tracked attach arm
 /// (Task 5: re-key a placeholder-addressed pane BEFORE its real-id-stamped ack
 /// snapshot, so the pane can correlate the ack it is about to receive).
-fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage {
+fn materialized_frame(
+    previous_session_id: &str,
+    real_id: &str,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+) -> ServerMessage {
     ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
         previous_session_id: previous_session_id.to_string(),
         provider: PROVIDER.to_string(),
         session_id: real_id.to_string(),
         session_type: SESSION_TYPE.to_string(),
+        runtime: runtime.cloned(),
         session_ref: Some(SessionLocator {
             provider: PROVIDER.to_string(),
             session_id: real_id.to_string(),
@@ -3370,15 +3951,22 @@ fn marker_turn_id(turn: &Value) -> Option<&str> {
 fn map_opencode_serve_error(
     op: &crate::rollback_record::RollbackRequest,
     err: &ServeError,
+    rollback_runtime: Option<&freshell_protocol::RuntimeDescriptor>,
 ) -> ServerMessage {
     if matches!(err, ServeError::Http { status: 404, .. }) {
         crate::rollback_record::rollback_error_frame(
             op,
             "UNSUPPORTED_CAPABILITY",
             crate::rollback_record::OPENCODE_OLD_CLI_COPY,
+            rollback_runtime,
         )
     } else {
-        crate::rollback_record::rollback_error_frame(op, "INTERNAL_ERROR", &err.to_string())
+        crate::rollback_record::rollback_error_frame(
+            op,
+            "INTERNAL_ERROR",
+            &err.to_string(),
+            rollback_runtime,
+        )
     }
 }
 
@@ -3569,6 +4157,145 @@ mod tests {
                 } else {
                     b"{}".to_vec()
                 }
+            } else {
+                b"{}".to_vec()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// Models a durable OpenCode turn that remains active remotely until the
+    /// per-session abort endpoint is called. Restart must quiesce this remote
+    /// writer before a replacement is allowed to resume the same durable id.
+    struct RestartActiveTurnHttp {
+        aborts: AtomicUsize,
+        prompt_started: AtomicBool,
+        remote_busy: AtomicBool,
+    }
+    impl RestartActiveTurnHttp {
+        fn new() -> Self {
+            Self {
+                aborts: AtomicUsize::new(0),
+                prompt_started: AtomicBool::new(false),
+                remote_busy: AtomicBool::new(false),
+            }
+        }
+    }
+
+    struct RetryableRestartAbortHttp {
+        next_session: AtomicUsize,
+        aborts: AtomicUsize,
+    }
+    impl ServeHttp for RetryableRestartAbortHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            ServeHttpResponse,
+                            freshell_opencode::serve::ServeHttpError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = serde_json::to_vec(&json!({ "id": format!("ses_retry_{n}") })).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/abort") && self.aborts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async {
+                    Err(freshell_opencode::serve::ServeHttpError::Ambiguous(
+                        "temporary remote abort failure".to_string(),
+                    ))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    struct BlockingRestartAbortHttp {
+        next_session: AtomicUsize,
+        abort_started: Arc<tokio::sync::Notify>,
+        abort_release: Arc<tokio::sync::Notify>,
+    }
+    impl ServeHttp for BlockingRestartAbortHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            ServeHttpResponse,
+                            freshell_opencode::serve::ServeHttpError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = serde_json::to_vec(&json!({ "id": format!("ses_block_{n}") })).unwrap();
+                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/abort") {
+                let started = Arc::clone(&self.abort_started);
+                let release = Arc::clone(&self.abort_release);
+                return Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+    impl ServeHttp for RestartActiveTurnHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            ServeHttpResponse,
+                            freshell_opencode::serve::ServeHttpError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                serde_json::to_vec(&json!({ "id": "ses_restart_active", "directory": null }))
+                    .unwrap()
+            } else if req.url.contains("/prompt_async") {
+                self.prompt_started.store(true, Ordering::SeqCst);
+                self.remote_busy.store(true, Ordering::SeqCst);
+                b"{}".to_vec()
+            } else if req.url.contains("/abort") {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+                self.remote_busy.store(false, Ordering::SeqCst);
+                b"{}".to_vec()
+            } else if req.url.contains("/session/status") {
+                if self.remote_busy.load(Ordering::SeqCst) {
+                    serde_json::to_vec(&json!({ "ses_restart_active": { "type": "busy" } }))
+                        .unwrap()
+                } else {
+                    b"{}".to_vec()
+                }
+            } else if req.url.contains("/session/ses_restart_active") {
+                serde_json::to_vec(&json!({ "id": "ses_restart_active", "directory": null }))
+                    .unwrap()
             } else {
                 b"{}".to_vec()
             };
@@ -3938,6 +4665,8 @@ mod tests {
 
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
         FreshAgentSend {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4094,6 +4823,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4162,6 +4893,8 @@ mod tests {
         };
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4208,6 +4941,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4250,6 +4985,8 @@ mod tests {
         // The evicted-session arm: a durable id no longer in the session map
         // still retires the row it names (idempotent when no row exists).
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_evicted".to_string(),
             session_type: SessionType::Freshopencode,
@@ -4308,6 +5045,8 @@ mod tests {
         let st2 = st.clone();
         let kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: AgentProvider::Opencode,
                 session_id: placeholder.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -4388,6 +5127,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4473,6 +5214,8 @@ mod tests {
         // The ledger fails every write (disk-full/permission shape).
         fake.set_fail_writes(true);
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4560,6 +5303,8 @@ mod tests {
         fake.fail_retires_as_persisted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4632,6 +5377,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4694,6 +5441,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4772,6 +5521,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4850,6 +5601,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4923,6 +5676,8 @@ mod tests {
         // The close the user MEANT (before this attach): row Closed + fence.
         state
             .handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -5062,6 +5817,8 @@ mod tests {
         let st2 = st.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: placeholder.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -5149,6 +5906,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5240,6 +5999,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5919,6 +6680,8 @@ mod tests {
         let real_id = session_arc.lock().await.real_session_id.clone().unwrap();
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: real_id.clone(),
             session_type: SessionType::Freshopencode,
@@ -5936,12 +6699,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_shutdown_removes_only_the_exact_opencode_runtime_and_all_aliases() {
+        let (st, killed) = state().await;
+        st.handle_create(create_msg("req-restart"), None).await;
+        let placeholder = "freshopencode-req-restart";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+        let (real_id, runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+
+        assert!(
+            !st.shutdown_for_restart(&real_id, "fresh-runtime-stale")
+                .await
+        );
+        assert!(st.has_live_session(&real_id).await);
+        assert!(st.shutdown_for_restart(&real_id, &runtime_id).await);
+        assert!(!st.has_live_session(&real_id).await);
+        assert!(!st.has_live_session(placeholder).await);
+        assert!(
+            !killed.load(Ordering::SeqCst),
+            "per-session restart must preserve the shared serve sidecar"
+        );
+    }
+
+    /// Shutdown drain (fix 1): the OpenCode restart quarantine is bookkeeping
+    /// only — no local process to confirm dead (the durable pending row's
+    /// fenced remote abort is the NEXT BOOT's cross-boot recovery job) — so
+    /// the server-shutdown drain must log the abandoned entries loudly and
+    /// clear the map without touching the shared serve sidecar.
+    #[tokio::test]
+    async fn shutdown_drains_opencode_restart_bookkeeping_loudly() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+        let runtime = freshell_protocol::RuntimeDescriptor {
+            runtime_id: "fresh-runtime-test-opencode-drain".to_string(),
+            generation: 1,
+        };
+        st.restart_retirements.lock().await.insert(
+            runtime.runtime_id.clone(),
+            OpencodeRestartRetirement {
+                requested_session_id: "ses_drain_bookkeeping".to_string(),
+                session: Arc::new(TokioMutex::new(OpencodeSession::new(
+                    "freshopencode-req-drain".to_string(),
+                    runtime,
+                    None,
+                    None,
+                    None,
+                ))),
+            },
+        );
+        assert_eq!(st.restart_retirements.lock().await.len(), 1);
+
+        st.drain_restart_retirements().await;
+
+        assert!(
+            st.restart_retirements.lock().await.is_empty(),
+            "the bookkeeping drain must clear the quarantine map"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_shutdown_aborts_active_remote_turn_before_replacement_can_resume() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(RestartActiveTurnHttp::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(
+            deps,
+            ServeConfig {
+                idle_poll_interval: Duration::from_millis(20),
+                ..ServeConfig::default()
+            },
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-restart-active"), None)
+            .await;
+        let placeholder = "freshopencode-req-restart-active";
+        st.handle_send(send_msg(placeholder, "keep working")).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !http.prompt_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old durable turn starts remotely");
+
+        let (durable_id, old_runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+        while rx.try_recv().is_ok() {}
+
+        assert!(st.shutdown_for_restart(&durable_id, &old_runtime_id).await);
+        assert_eq!(
+            http.aborts.load(Ordering::SeqCst),
+            1,
+            "successful restart shutdown must call the durable session abort endpoint"
+        );
+        assert!(
+            !http.remote_busy.load(Ordering::SeqCst),
+            "the predecessor's remote turn must be quiescent before replacement"
+        );
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                frame["event"]["type"] != "freshAgent.turn.complete",
+                "restart shutdown must suppress predecessor completion: {frame}"
+            );
+        }
+
+        let mut replacement = create_msg("req-restart-replacement");
+        replacement.resume_session_id = Some(durable_id.clone());
+        st.handle_create(replacement, None).await;
+        let replacement_runtime_id = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(&durable_id).unwrap().lock().await;
+            session.runtime.runtime_id.clone()
+        };
+        assert_ne!(replacement_runtime_id, old_runtime_id);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                frame["runtime"]["runtimeId"] != old_runtime_id,
+                "the quiesced predecessor must not re-emit under its replacement: {frame}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_abort_failure_is_detailed_retryable_and_same_runtime_retry_finishes() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(RetryableRestartAbortHttp {
+            next_session: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
+        });
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(AtomicBool::new(false)),
+                }),
+                http: http.clone(),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-restart-retry"), None)
+            .await;
+        let placeholder = "freshopencode-req-restart-retry";
+        st.handle_send(send_msg(placeholder, "working")).await;
+        let (durable_id, runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+
+        let first = st
+            .shutdown_for_restart_detailed(&durable_id, &runtime_id)
+            .await;
+        assert!(matches!(
+            first,
+            crate::RestartShutdownOutcome::RetirementIncomplete { ref message }
+                if message.contains("temporary remote abort failure")
+        ));
+        assert!(
+            !st.has_live_session(&durable_id).await,
+            "a quarantined predecessor must not remain available for new work"
+        );
+
+        assert_eq!(
+            st.shutdown_for_restart_detailed(&durable_id, &runtime_id)
+                .await,
+            crate::RestartShutdownOutcome::Stopped
+        );
+        assert_eq!(http.aborts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn restart_remote_abort_does_not_hold_the_global_sessions_lock() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let abort_started = Arc::new(tokio::sync::Notify::new());
+        let abort_release = Arc::new(tokio::sync::Notify::new());
+        let manager = OpencodeServeManager::new(
+            ServeDeps {
+                spawner: Arc::new(TrackedSpawner {
+                    killed: Arc::new(AtomicBool::new(false)),
+                }),
+                http: Arc::new(BlockingRestartAbortHttp {
+                    next_session: AtomicUsize::new(0),
+                    abort_started: Arc::clone(&abort_started),
+                    abort_release: Arc::clone(&abort_release),
+                }),
+                ports: Arc::new(FakeAllocator),
+                events: Arc::new(NoopEventSource),
+            },
+            ServeConfig::default(),
+        );
+        manager.ensure_started().await.unwrap();
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-restart-blocked"), None)
+            .await;
+        st.handle_send(send_msg("freshopencode-req-restart-blocked", "working"))
+            .await;
+        st.handle_create(create_msg("req-restart-unrelated"), None)
+            .await;
+        let (durable_id, runtime_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get("freshopencode-req-restart-blocked")
+                .unwrap()
+                .lock()
+                .await;
+            (
+                session.real_session_id.clone().unwrap(),
+                session.runtime.runtime_id.clone(),
+            )
+        };
+
+        let retiring = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.shutdown_for_restart_detailed(&durable_id, &runtime_id)
+                    .await
+            })
+        };
+        abort_started.notified().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            st.has_live_session("freshopencode-req-restart-unrelated"),
+        )
+        .await
+        .expect("unrelated session access must not wait for remote abort")
+        .then_some(())
+        .expect("unrelated session remains live");
+        abort_release.notify_one();
+        assert_eq!(
+            retiring.await.unwrap(),
+            crate::RestartShutdownOutcome::Stopped
+        );
+    }
+
+    #[tokio::test]
     async fn kill_of_unknown_session_still_broadcasts_success() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let st = FreshOpencodeState::new(fresh_agent);
 
         st.handle_kill(FreshAgentKill {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "does-not-exist".to_string(),
             session_type: SessionType::Freshopencode,
@@ -5952,6 +6991,190 @@ mod tests {
         let frame: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(frame["type"], "freshAgent.killed");
         assert_eq!(frame["success"], true);
+    }
+
+    #[tokio::test]
+    async fn stale_opencode_controls_cannot_mutate_a_replacement_runtime() {
+        let (st, _killed) = state().await;
+        let placeholder = "freshopencode-req-stale-control";
+        st.handle_create(create_msg("req-stale-control"), None)
+            .await;
+        let mut rx = st.fresh_agent.broadcast_tx.subscribe();
+        let replacement = {
+            let sessions = st.sessions.lock().await;
+            let mut session = sessions.get(placeholder).unwrap().lock().await;
+            session.runtime.generation = 2;
+            session.runtime.clone()
+        };
+
+        let mut send = send_msg(placeholder, "stale turn");
+        send.expected_runtime_id = Some(replacement.runtime_id.clone());
+        send.expected_generation = Some(1);
+        st.handle_send(send).await;
+        let send_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(send_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        let interrupt_error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert!(interrupt_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("STALE_RUNTIME"));
+
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: Some(replacement.runtime_id.clone()),
+            expected_generation: Some(1),
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        assert!(st.sessions.lock().await.contains_key(placeholder));
+        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["message"].as_str().unwrap().contains("STALE_RUNTIME"));
+
+        st.handle_kill(FreshAgentKill {
+            expected_runtime_id: Some(replacement.runtime_id),
+            expected_generation: Some(replacement.generation),
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        let killed: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(killed["runtime"]["generation"], 2);
+    }
+
+    #[tokio::test]
+    async fn restart_preflight_reservation_atomically_freezes_opencode_settings() {
+        let (st, _killed) = state().await;
+        let placeholder = "freshopencode-req-preflight-settings";
+        st.handle_create(create_msg("req-preflight-settings"), None)
+            .await;
+        let mut rx = st.fresh_agent.broadcast_tx.subscribe();
+        let runtime = {
+            let sessions = st.sessions.lock().await;
+            let mut session = sessions.get(placeholder).unwrap().lock().await;
+            session.model = Some("old-model".to_string());
+            session.effort = Some("low".to_string());
+            session.cwd = Some("/old/cwd".to_string());
+            session.runtime.clone()
+        };
+        let (plan, action) = st
+            .reserve_restart_preflight(placeholder, &runtime.runtime_id, "reservation-1")
+            .await
+            .unwrap();
+        assert_eq!(plan.settings.model.as_deref(), Some("old-model"));
+        assert_eq!(plan.settings.effort.as_deref(), Some("low"));
+        assert_eq!(plan.settings.cwd.as_deref(), Some("/old/cwd"));
+        assert_eq!(action, None);
+
+        st.handle_send(FreshAgentSend {
+            expected_runtime_id: Some(runtime.runtime_id.clone()),
+            expected_generation: Some(runtime.generation),
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            text: "must not dispatch".to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some("req-blocked-send".to_string()),
+            settings: Some(freshell_protocol::FreshAgentSendSettings {
+                cwd: Some("/new/cwd".to_string()),
+                effort: Some("high".to_string()),
+                model: Some("new-model".to_string()),
+                permission_mode: None,
+                sandbox: None,
+            }),
+        })
+        .await;
+        let error: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(error["type"], "error");
+        assert!(error["message"].as_str().unwrap().contains("STALE_RUNTIME"));
+        let sessions = st.sessions.lock().await;
+        let session = sessions.get(placeholder).unwrap().lock().await;
+        assert_eq!(session.model.as_deref(), Some("old-model"));
+        assert_eq!(session.effort.as_deref(), Some("low"));
+        assert_eq!(session.cwd.as_deref(), Some("/old/cwd"));
+        drop(session);
+        drop(sessions);
+
+        st.release_restart_preflight(placeholder, &runtime.runtime_id, "reservation-1")
+            .await;
+        assert!(st
+            .sessions
+            .lock()
+            .await
+            .get(placeholder)
+            .unwrap()
+            .lock()
+            .await
+            .restart_reservation
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_preflight_release_requires_the_exact_runtime_and_token_tuple() {
+        // The restart coordinator's terminal-outcome hook releases reservations
+        // through this seam with the tuple recorded at preflight; a release
+        // carrying anything but the exact (runtime, token) pair must leave the
+        // reservation held so a live restart is never un-fenced mid-transaction.
+        let (st, _killed) = state().await;
+        let placeholder = "freshopencode-req-release-tuple";
+        st.handle_create(create_msg("req-release-tuple"), None)
+            .await;
+        let runtime = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get(placeholder).unwrap().lock().await;
+            session.runtime.clone()
+        };
+        st.reserve_restart_preflight(placeholder, &runtime.runtime_id, "reservation-exact")
+            .await
+            .unwrap();
+        let held = || async {
+            st.sessions
+                .lock()
+                .await
+                .get(placeholder)
+                .unwrap()
+                .lock()
+                .await
+                .restart_reservation
+                .clone()
+        };
+
+        st.release_restart_preflight(placeholder, &runtime.runtime_id, "reservation-other")
+            .await;
+        assert_eq!(held().await.as_deref(), Some("reservation-exact"));
+
+        st.release_restart_preflight(placeholder, "other-runtime", "reservation-exact")
+            .await;
+        assert_eq!(held().await.as_deref(), Some("reservation-exact"));
+
+        st.release_restart_preflight(placeholder, &runtime.runtime_id, "reservation-exact")
+            .await;
+        assert_eq!(held().await, None);
+
+        // The freed runtime can be reserved by the next restart immediately.
+        st.reserve_restart_preflight(placeholder, &runtime.runtime_id, "reservation-next")
+            .await
+            .unwrap();
+        assert_eq!(held().await.as_deref(), Some("reservation-next"));
     }
 
     #[tokio::test]
@@ -5990,8 +7213,16 @@ mod tests {
         // Direct-map seeding with the minimal OpencodeSession construction the
         // same module's tests use (`insert_compact_session` et al.), keyed
         // under BOTH ids the way materialization mirrors the map.
-        let mut session =
-            OpencodeSession::new("freshopencode-req-live".to_string(), None, None, None);
+        let mut session = OpencodeSession::new(
+            "freshopencode-req-live".to_string(),
+            freshell_protocol::RuntimeDescriptor {
+                runtime_id: "fresh-runtime-test-req-live".to_string(),
+                generation: 1,
+            },
+            None,
+            None,
+            None,
+        );
         session.real_session_id = Some("ses_live".to_string());
         let session_arc = Arc::new(TokioMutex::new(session));
         {
@@ -6084,6 +7315,86 @@ mod tests {
             b.create_request_id.as_deref(),
             Some("r1"),
             "lineage is keyed by the CREATE requestId (placeholder-derived), never the send's"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_plan_keeps_live_opencode_settings_after_ledger_write_failure() {
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("restart-ledger-failure");
+        create.cwd = Some("/tmp/restart-ledger-failure-opencode".to_string());
+        create.model = Some("provider/nondefault".to_string());
+        create.effort = Some("high".to_string());
+        state.handle_create(create, None).await;
+        state
+            .handle_send(send_msg(
+                "freshopencode-restart-ledger-failure",
+                "materialize",
+            ))
+            .await;
+        let mut reconfigured = send_msg(
+            "freshopencode-restart-ledger-failure",
+            "reconfigure-live-route",
+        );
+        reconfigured.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: Some("/tmp/restart-live-route-opencode".to_string()),
+            effort: Some("low".to_string()),
+            model: Some("provider/reconfigured".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(reconfigured).await;
+
+        let (durable, runtime_id) = state
+            .sessions
+            .lock()
+            .await
+            .values()
+            .find_map(|session| {
+                session.try_lock().ok().and_then(|session| {
+                    session
+                        .real_session_id
+                        .clone()
+                        .map(|durable| (durable, session.runtime.runtime_id.clone()))
+                })
+            })
+            .expect("materialized durable session");
+        assert!(
+            !fake
+                .settings
+                .lock()
+                .unwrap()
+                .contains_key(&("opencode".to_string(), durable.clone())),
+            "the failed write must leave no fallback ledger row"
+        );
+        let plan = state
+            .capture_restart_resume_plan(&durable, &runtime_id)
+            .await
+            .expect("the live OpenCode runtime remains authoritative");
+        assert_eq!(plan.session_type, SessionType::Freshopencode);
+        assert_eq!(
+            plan.settings.model.as_deref(),
+            Some("provider/reconfigured")
+        );
+        assert_eq!(plan.settings.effort.as_deref(), Some("low"));
+        assert_eq!(
+            plan.settings.cwd.as_deref(),
+            Some("/tmp/restart-live-route-opencode"),
+            "restart must capture the exact current route, not the create-time cwd"
+        );
+        assert_eq!(plan.settings.sandbox, None);
+        assert_eq!(plan.settings.permission_mode, None);
+        assert!(
+            state
+                .capture_restart_resume_plan(&durable, "stale-runtime")
+                .await
+                .is_none(),
+            "restart preflight must stay fenced to the selected runtime"
         );
     }
 
@@ -6280,6 +7591,8 @@ mod tests {
         // the map never held this session; the row is durable).
         state
             .handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6423,6 +7736,8 @@ mod tests {
         // durable serve session the local map never tracked — retired by name).
         state
             .handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6507,6 +7822,8 @@ mod tests {
         // The close the user will MEAN: row Closed + fence, before the resume.
         state
             .handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6541,6 +7858,8 @@ mod tests {
         // the commit decides.
         state
             .handle_kill(FreshAgentKill {
+                expected_runtime_id: None,
+                expected_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -7812,6 +9131,8 @@ mod tests {
         // Interrupt promptly, long before the (deliberately slow) natural idle would land.
         tokio::time::sleep(Duration::from_millis(10)).await;
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -8230,8 +9551,16 @@ mod tests {
 
     /// Insert a directly-materialized session (no send drove it) with the given model.
     async fn insert_compact_session(st: &FreshOpencodeState, id: &str, model: Option<&str>) {
-        let mut session =
-            OpencodeSession::new(id.to_string(), None, model.map(str::to_string), None);
+        let mut session = OpencodeSession::new(
+            id.to_string(),
+            freshell_protocol::RuntimeDescriptor {
+                runtime_id: format!("fresh-runtime-test-{id}"),
+                generation: 1,
+            },
+            None,
+            model.map(str::to_string),
+            None,
+        );
         session.real_session_id = Some(id.to_string());
         st.sessions
             .lock()
@@ -8731,6 +10060,8 @@ mod tests {
         // Kill the drive mid-cold-start (the ep4-r5 window): the task is
         // aborted before compact() returns.
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -8823,6 +10154,8 @@ mod tests {
         }
 
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -8911,6 +10244,8 @@ mod tests {
         // destroy MUST stand (the interrupt/kill tests never seeded rollback
         // state; this window is F4's finding).
         st.handle_interrupt(FreshAgentInterrupt {
+            expected_runtime_id: None,
+            expected_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_real".to_string(),
             session_type: SessionType::Freshopencode,
@@ -9427,6 +10762,8 @@ mod tests {
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
+            expected_runtime_id: None,
+            expected_generation: None,
             cwd: None,
         })
         .await;
@@ -9484,6 +10821,8 @@ mod tests {
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
+            expected_runtime_id: None,
+            expected_generation: None,
             cwd: None,
         })
         .await;
@@ -9604,6 +10943,8 @@ mod tests {
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
+            expected_runtime_id: None,
+            expected_generation: None,
             cwd: None,
         })
         .await;
@@ -9766,6 +11107,10 @@ mod tests {
     ) {
         let mut session = OpencodeSession::new(
             id.to_string(),
+            freshell_protocol::RuntimeDescriptor {
+                runtime_id: format!("fresh-runtime-test-{id}"),
+                generation: 1,
+            },
             cwd.map(str::to_string),
             model.map(str::to_string),
             effort.map(str::to_string),
@@ -10609,7 +11954,16 @@ mod tests {
             .expect("healthy fake serve starts");
         fresh_agent.set_manager_for_test(manager).await;
         let st = FreshOpencodeState::new(fresh_agent);
-        let mut session = OpencodeSession::new("ses_real".to_string(), None, None, None);
+        let mut session = OpencodeSession::new(
+            "ses_real".to_string(),
+            freshell_protocol::RuntimeDescriptor {
+                runtime_id: "fresh-runtime-test-ses_real".to_string(),
+                generation: 1,
+            },
+            None,
+            None,
+            None,
+        );
         session.real_session_id = Some("ses_real".to_string());
         st.sessions
             .lock()
@@ -11104,6 +12458,10 @@ mod tests {
             "freshopencode-placeholder-1".to_string(),
             Arc::new(TokioMutex::new(OpencodeSession::new(
                 "freshopencode-placeholder-1".to_string(),
+                freshell_protocol::RuntimeDescriptor {
+                    runtime_id: "fresh-runtime-test-placeholder-1".to_string(),
+                    generation: 1,
+                },
                 None,
                 None,
                 None,

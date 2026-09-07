@@ -6,7 +6,7 @@ import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
-import type { CodingCliProviderName } from '@/store/types'
+import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 type SessionMatchLocator = {
@@ -14,6 +14,10 @@ type SessionMatchLocator = {
   sessionId: string
 }
 type SessionRef = Pick<SessionMatchLocator, 'provider' | 'sessionId'>
+export type SessionWorkspaceState = {
+  tabs: Pick<RootState['tabs'], 'tabs'>
+  panes: Pick<RootState['panes'], 'layouts'>
+}
 type SessionMatchCandidate = {
   tabId: string
   paneId: string | undefined
@@ -374,7 +378,7 @@ export function findTabIdForSession(
  * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
  */
 export function findPaneForSession(
-  state: RootState,
+  state: SessionWorkspaceState,
   target: SessionMatchLocator,
   localServerInstanceId?: string,
 ): { tabId: string; paneId: string | undefined } | undefined {
@@ -402,6 +406,25 @@ export function findPaneForSession(
 
   const bestMatch = selectBestSessionMatch(candidates, sanitizedTarget, localServerInstanceId)
   return bestMatch ? { tabId: bestMatch.tabId, paneId: bestMatch.paneId } : undefined
+}
+
+/**
+ * Return only project sessions whose canonical provider/session identity is
+ * absent from every tab and pane in the current workspace.
+ */
+export function findUnopenedProjectSessions(
+  state: SessionWorkspaceState,
+  project: Pick<ProjectGroup, 'sessions'>,
+  localServerInstanceId?: string,
+): CodingCliSession[] {
+  return project.sessions.filter((session) => !findPaneForSession(
+    state,
+    {
+      provider: session.provider || 'claude',
+      sessionId: session.sessionId,
+    },
+    localServerInstanceId,
+  ))
 }
 
 /**

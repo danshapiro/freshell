@@ -460,6 +460,7 @@ mod tests {
             created_at,
             resume_session_id: resume_session_id.map(str::to_string),
             cwd: None,
+            restart_launch: None,
         }
     }
 
@@ -1053,6 +1054,7 @@ mod tests {
         let auth_token = std::sync::Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         crate::WsState {
+            restart: crate::restart::RestartCoordinator::new(),
             pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             layout: Default::default(),
             identity: TerminalIdentityRegistry::new(),

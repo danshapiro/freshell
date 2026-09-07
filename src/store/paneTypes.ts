@@ -86,6 +86,10 @@ export type TerminalPaneContent = {
   kind: 'terminal'
   /** Backend terminal ID (undefined until created) */
   terminalId?: string
+  /** Server-owned live runtime identity used by generation-fenced restart. */
+  runtimeId?: string
+  /** Monotonic server-owned generation for runtime replacement. */
+  runtimeGeneration?: number
   /** Idempotency key for terminal.create requests */
   createRequestId: string
   /** Current terminal status */
@@ -209,6 +213,10 @@ export type FreshAgentPaneContent = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionId?: string
+  /** Server-owned live runtime identity used by generation-fenced restart. */
+  runtimeId?: string
+  /** Monotonic server-owned generation for runtime replacement. */
+  runtimeGeneration?: number
   createRequestId: string
   status: SdkSessionStatus
   resumeSessionId?: string

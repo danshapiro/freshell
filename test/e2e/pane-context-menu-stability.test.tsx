@@ -18,10 +18,19 @@ import { installPaneGeometry } from '../helpers/pane-geometry'
 
 const wsMocks = {
   send: vi.fn(),
+  requestAgentRestart: vi.fn(),
+  retryAgentRestart: vi.fn(() => true),
+  isAgentRestartRetryExhausted: vi.fn(() => false),
+  isAgentRestartRecoveryPending: vi.fn(() => false),
+  bindAgentRestartStore: vi.fn(),
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn(() => vi.fn()),
   onReconnect: vi.fn(() => vi.fn()),
   setHelloExtensionProvider: vi.fn(),
+  // The pane menu's Restart item is gated on the server-advertised
+  // agentRestartV1 capability; the suite runs against a Linux (gate-open)
+  // server shape, so advertise it.
+  getServerCapabilities: vi.fn(() => ({ agentRestartV1: true })),
 }
 
 const terminalInstances = vi.hoisted(() => [] as Array<{
@@ -138,6 +147,26 @@ function createTerminalLeaf(id: string, terminalId: string): Extract<PaneNode, {
       status: 'running',
       mode: 'shell',
       shell: 'system',
+    },
+  }
+}
+
+function createResumableTerminalLeaf(): Extract<PaneNode, { type: 'leaf' }> {
+  return {
+    type: 'leaf',
+    id: 'pane-1',
+    content: {
+      kind: 'terminal',
+      terminalId: 'runtime-claude-1',
+      runtimeId: 'runtime-claude-1',
+      runtimeGeneration: 6,
+      createRequestId: 'req-runtime-claude-1',
+      status: 'running',
+      mode: 'claude',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: 'durable-claude-1',
+      },
     },
   }
 }
@@ -282,6 +311,161 @@ describe('pane context menu stability (e2e)', () => {
 
     expect(screen.getByRole('menu')).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
+  })
+
+  it('restarts a resumable built-in agent from its pane header menu', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+
+    expect(wsMocks.requestAgentRestart).toHaveBeenCalledWith({
+      type: 'agent.restart',
+      requestId: expect.any(String),
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      liveId: 'runtime-claude-1',
+      expectedGeneration: 6,
+    })
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.kill',
+      terminalId: 'runtime-claude-1',
+    }))
+  })
+
+  it('keeps a retryable post-shutdown restart active until its replacement arrives', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+    const onMessage = wsMocks.onMessage.mock.calls.at(-1)?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+    const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
+
+    wsMocks.isAgentRestartRecoveryPending.mockReturnValueOnce(true)
+    act(() => onMessage?.({
+      type: 'agent.restart.started',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtime: {
+        runtimeId: 'runtime-claude-1',
+        generation: 6,
+      },
+    }))
+    act(() => onMessage?.({
+      type: 'agent.restart.failed',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtimeId: 'runtime-claude-1',
+      generation: 6,
+      code: 'REPLACEMENT_FAILED',
+      message: 'replacement is temporarily unavailable',
+      retryable: true,
+    }))
+    expect(screen.getByText(/will retry this restart automatically/i)).toBeInTheDocument()
+
+    act(() => onMessage?.({
+      type: 'agent.restart.replaced',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      oldRuntimeId: 'runtime-claude-1',
+      oldGeneration: 6,
+      runtimeId: 'runtime-claude-2',
+      generation: 7,
+    }))
+    expect(screen.queryByText(/will retry this restart automatically/i)).not.toBeInTheDocument()
+  })
+
+  it('offers Retry now after automatic restart recovery is exhausted', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+    const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
+    const onMessage = wsMocks.onMessage.mock.calls.at(-1)?.[0]
+    wsMocks.isAgentRestartRecoveryPending.mockReturnValueOnce(true)
+    wsMocks.isAgentRestartRetryExhausted.mockReturnValueOnce(true)
+    act(() => onMessage?.({
+      type: 'agent.restart.failed',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtimeId: 'runtime-claude-1',
+      generation: 6,
+      code: 'REPLACEMENT_FAILED',
+      message: 'replacement is temporarily unavailable',
+      retryable: true,
+    }))
+
+    expect(screen.getByText(/automatic restart recovery retries are exhausted/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Retry now' }))
+    expect(wsMocks.retryAgentRestart).toHaveBeenCalledWith(restart.requestId)
+  })
+
+  it('does not promise automatic recovery for a retryable preflight failure', async () => {
+    const store = createStore(createResumableTerminalLeaf())
+    const user = userEvent.setup()
+    const { container } = renderFlow(store)
+    const onMessage = wsMocks.onMessage.mock.calls.at(-1)?.[0]
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-1"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    await user.pointer({ target: header, keys: '[MouseRight]' })
+    await settleMenu()
+    await user.click(screen.getByRole('menuitem', { name: 'Restart pane' }))
+    const restart = wsMocks.requestAgentRestart.mock.calls.at(-1)?.[0]
+
+    act(() => onMessage?.({
+      type: 'agent.restart.failed',
+      requestId: restart.requestId,
+      provider: 'claude',
+      sessionId: 'durable-claude-1',
+      kind: 'terminal',
+      runtimeId: 'runtime-claude-1',
+      generation: 6,
+      code: 'PREFLIGHT_FAILED',
+      message: 'session index is still warming; retry restart shortly',
+      retryable: true,
+    }))
+
+    expect(screen.getByText(/session index is still warming/i)).toBeInTheDocument()
+    expect(screen.queryByText(/retry this restart automatically/i)).not.toBeInTheDocument()
   })
 
   it('keeps the terminal menu open when right-clicking inside an inactive terminal body', async () => {

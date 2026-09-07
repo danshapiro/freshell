@@ -8,7 +8,40 @@
 mod common;
 use common::*;
 
+use freshell_protocol::{AgentRestart, AgentRestartFailureCode, AgentRuntimeKind};
 use freshell_ws::pane_ledger::BindingWrite;
+use freshell_ws::restart::{RestartFailure, RestartRuntime, RuntimeLocator};
+
+struct RetirementBlocked;
+
+#[async_trait::async_trait]
+impl RestartRuntime for RetirementBlocked {
+    type ResumePlan = ();
+
+    async fn preflight(&self, _request: &AgentRestart) -> Result<(), RestartFailure> {
+        Ok(())
+    }
+
+    async fn shutdown_for_restart(
+        &self,
+        _request: &AgentRestart,
+        _plan: &(),
+    ) -> Result<(), RestartFailure> {
+        Err(RestartFailure::new(
+            AgentRestartFailureCode::ShutdownFailed,
+            "predecessor still owns the transcript",
+            true,
+        ))
+    }
+
+    async fn create_replacement(
+        &self,
+        _request: &AgentRestart,
+        _plan: (),
+    ) -> Result<String, RestartFailure> {
+        panic!("blocked retirement must not create a replacement")
+    }
+}
 
 fn unique_ledger_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -176,6 +209,69 @@ async fn claude_restore_resolves_via_the_ledger_across_a_restart() {
     );
     // Cleanup: don't leave generation 2's sleeper running for 30s.
     registry2.kill(created2["terminalId"].as_str().unwrap());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ledger_resolved_claude_restore_is_blocked_before_spawn_by_restart_recovery() {
+    let dir = unique_ledger_dir("ladder-restart-fence");
+    let (url, registry, ledger, state) =
+        spawn_server_with_ledger_and_state(vec![sleeper_cli_spec("claude")], &dir).await;
+    let session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id,
+            terminal_id: "dead-before-restart",
+            mode: "claude",
+            cwd: None,
+            create_request_id: Some("req-ledger-fenced"),
+            origin_create_request_id: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    let old = state.restart.register_initial(
+        RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", session_id),
+        "dead-before-restart",
+    );
+    state
+        .restart
+        .execute(
+            AgentRestart {
+                request_id: "pending-ledger-retirement".to_string(),
+                provider: "claude".to_string(),
+                session_id: session_id.to_string(),
+                kind: AgentRuntimeKind::Terminal,
+                live_id: old.runtime_id,
+                expected_generation: old.generation,
+            },
+            &RetirementBlocked,
+        )
+        .await;
+
+    use futures_util::SinkExt;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-ledger-fenced",
+            "mode": "claude",
+            "shell": "system",
+            "restore": true,
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let blocked = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(blocked["code"], "SESSION_RESERVED");
+    assert_eq!(blocked["requestId"], "req-ledger-fenced");
+    assert!(
+        registry.inventory().is_empty(),
+        "the authoritative ledger identity must be fenced before spawn"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

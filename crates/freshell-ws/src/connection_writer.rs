@@ -496,6 +496,7 @@ impl WriterPump {
                             from_seq: range.from_seq,
                             to_seq: range.to_seq,
                             reason: freshell_protocol::TerminalOutputGapReason::QueueOverflow,
+                            runtime: None,
                         });
                     let json = serde_json::to_string(&message)
                         .map_err(|_| WriterExit::SerializationFailed)?;

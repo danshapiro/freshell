@@ -59,6 +59,7 @@ pub mod pane_identity_binder;
 pub mod pane_ledger;
 pub mod reconcile;
 pub mod reconcile_freshagent;
+pub mod restart;
 pub mod resume_validation;
 pub mod screenshot;
 pub mod spawn_gate;
@@ -323,6 +324,9 @@ pub struct WsState {
     /// (legacy `createdByRequestId` parity — see
     /// [`crate::create_dedupe::CreateDedupe`]).
     pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>,
+    /// Server-owned runtime generations plus idempotent restart transaction
+    /// results. Shared by every connection in this boot.
+    pub restart: crate::restart::RestartCoordinator,
     /// Server-wide PTY spawn gate (restart-storm / WSL-outage RCA §6.3
     /// protection). One per server process, shared across all WS
     /// connections. See [`crate::spawn_gate::SpawnGate`].
@@ -534,7 +538,7 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false, false).await
+    build_handshake_with_capabilities(state, false, false, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -557,6 +561,7 @@ pub async fn build_handshake_with_capabilities(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     terminal_interest_v1: bool,
+    agent_restart_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
@@ -567,11 +572,13 @@ pub async fn build_handshake_with_capabilities(
             build_id: ready_build_id(),
             capabilities: (pane_reconcile_v1
                 || pane_reconcile_fresh_agent_v1
-                || terminal_interest_v1)
+                || terminal_interest_v1
+                || agent_restart_v1)
                 .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
                     terminal_interest_v1: terminal_interest_v1.then_some(true),
+                    agent_restart_v1: agent_restart_v1.then_some(true),
                 }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
@@ -620,6 +627,9 @@ pub async fn build_handshake_with_capabilities(
         // headers re-hydrate their git/session badges from this snapshot.
         terminal_meta: state.terminal_meta.list(crate::terminal::now_ms()),
     }));
+    for message in &mut messages {
+        state.restart.observe_server_message(message);
+    }
     messages
 }
 
@@ -791,14 +801,32 @@ async fn handle_socket(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // Restart transactions are additive within the frozen protocol (the
+    // ready advertisement is the positive version guard: older servers strip
+    // this unknown hello key and therefore never authorize a new client to
+    // send `agent.restart`).
+    let agent_restart_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("agentRestartV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
+
+    // The restart advertisement is additionally gated on the server platform
+    // being able to recover a persisted replacement fence (Linux /proc
+    // ownership scanning): where recovery can never succeed the capability is
+    // withheld entirely, so a client never learns to send `agent.restart`
+    // (preflight independently rejects with UNSUPPORTED_PLATFORM for
+    // hand-rolled senders).
     for msg in build_handshake_with_capabilities(
         &state,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         terminal_interest_v1,
+        agent_restart_v1 && crate::restart::restart_fence_recovery_supported(),
     )
     .await
     {
@@ -857,6 +885,7 @@ async fn handle_socket(
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
+        agent_restart_v1,
         origin_kind,
         conn_identity,
         terminal_interest_v1,
@@ -968,6 +997,7 @@ pub(crate) fn test_ws_state() -> WsState {
         opencode_locator: None,
         codex_locator: None,
         activity: None,
+        restart: crate::restart::RestartCoordinator::new(),
         session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
@@ -1039,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false, false).await;
+        let negotiated = build_handshake_with_capabilities(&s, true, false, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1053,9 +1083,28 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false).await;
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
+    }
+
+    #[tokio::test]
+    async fn handshake_advertises_restart_only_when_negotiated() {
+        let s = state();
+        let upgraded = build_handshake_with_capabilities(&s, false, false, false, true).await;
+        let ready = serde_json::to_value(&upgraded[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "agentRestartV1": true })
+        );
+
+        let older_v7_shape =
+            build_handshake_with_capabilities(&s, false, false, false, false).await;
+        let ready = serde_json::to_value(&older_v7_shape[0]).unwrap();
+        assert!(
+            ready.get("capabilities").is_none(),
+            "an older v7 server has no positive restart negotiation"
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
 
 // Mock localStorage BEFORE importing slices (persistMiddleware reads it at import time)
 const localStorageMock = (() => {
@@ -37,6 +38,16 @@ import {
   setFreshAgentReconcileActive,
 } from '@/lib/pane-reconcile'
 import type { UnknownAction } from '@reduxjs/toolkit'
+import freshAgentReducer, {
+  addPermissionRequest,
+  addQuestionRequest,
+  registerPendingCreate,
+  sessionError,
+  sessionSnapshotReceived,
+  setSessionStatus,
+  setStreaming,
+} from '@/store/freshAgentSlice'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 
 const FA_CREATE_REQUEST_ID = 'fa-cr-p9'
 const DURABLE = '11111111-1111-4111-8111-111111111111'
@@ -255,6 +266,202 @@ describe('buildReconcileRequestForPanes is kind-agnostic', () => {
 })
 
 describe('foldVerdicts fresh-agent routing', () => {
+  it('keeps pane and session runtime fences aligned across attach, events, and recreate', () => {
+    const store = configureStore({
+      reducer: { panes: panesReducer, freshAgent: freshAgentReducer },
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab1',
+      paneId: 'p1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: FA_CREATE_REQUEST_ID,
+        sessionId: DURABLE,
+        sessionRef: { provider: 'claude', sessionId: DURABLE },
+        status: 'connected',
+        runtimeId: 'fresh-old',
+        runtimeGeneration: 7,
+        serverInstanceId: 'srv-1',
+      },
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      latestTurnId: 'turn-from-old-runtime',
+      status: 'running',
+      streamingActive: true,
+      streamingText: 'old partial output',
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }))
+    store.dispatch(sessionError({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      code: 'OLD_RUNTIME_ERROR',
+      message: 'old runtime failed',
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      status: 'running',
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }))
+    store.dispatch(setStreaming({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      active: true,
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }))
+    store.dispatch(addPermissionRequest({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      requestId: 'approval-old',
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    } as never))
+    store.dispatch(addQuestionRequest({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      requestId: 'question-old',
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    } as never))
+
+    const attachRequest = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
+    foldVerdicts(store.dispatch, attachRequest, resultFor(attachRequest, [{
+      paneKey: attachRequest.panes[0].paneKey,
+      verdict: 'attach',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      runtime: { runtimeId: 'fresh-new', generation: 8 },
+    }]))
+    const sessionKey = `freshclaude:claude:${DURABLE}`
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      runtimeId: 'fresh-new',
+      runtimeGeneration: 8,
+      status: 'starting',
+      latestTurnId: undefined,
+      streamingText: '',
+      streamingActive: false,
+      pendingPermissions: {},
+      pendingQuestions: {},
+      lastError: undefined,
+      lastErrorCode: undefined,
+    })
+    expect(store.getState().freshAgent.retiredRuntimeGenerations['fresh-old']).toBe(7)
+    foldVerdicts(store.dispatch, attachRequest, resultFor(attachRequest, [{
+      paneKey: attachRequest.panes[0].paneKey,
+      verdict: 'attach',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+    }]))
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      runtimeId: 'fresh-new', runtimeGeneration: 8,
+    })
+    const attachedPane = store.getState().panes.layouts.tab1
+    expect(attachedPane.type === 'leaf' && attachedPane.content.kind === 'fresh-agent'
+      ? attachedPane.content.runtimeId
+      : undefined).toBe('fresh-new')
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      runtime: { runtimeId: 'fresh-old', generation: 7 },
+      event: { type: 'freshAgent.status', status: 'running' },
+    }, undefined, store.getState)
+    expect(store.getState().freshAgent.sessions[sessionKey].status).toBe('starting')
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      runtime: { runtimeId: 'fresh-new', generation: 8 },
+      event: { type: 'freshAgent.status', status: 'running' },
+    }, undefined, store.getState)
+    expect(store.getState().freshAgent.sessions[sessionKey].status).toBe('running')
+
+    const newRuntime = { runtimeId: 'fresh-new', generation: 8 }
+    store.dispatch(sessionError({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      code: 'NEW_RUNTIME_ERROR',
+      message: 'new runtime failed before respawn',
+      runtime: newRuntime,
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      status: 'running',
+      runtime: newRuntime,
+    }))
+    store.dispatch(setStreaming({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      active: true,
+      runtime: newRuntime,
+    }))
+    store.dispatch(addPermissionRequest({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      requestId: 'approval-new',
+      runtime: newRuntime,
+    } as never))
+    store.dispatch(addQuestionRequest({
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      requestId: 'question-new',
+      runtime: newRuntime,
+    } as never))
+
+    const respawnRequest = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
+    foldVerdicts(store.dispatch, respawnRequest, resultFor(respawnRequest, [{
+      paneKey: respawnRequest.panes[0].paneKey,
+      verdict: 'respawn',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }]))
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      status: 'starting',
+      latestTurnId: undefined,
+      streamingText: '',
+      streamingActive: false,
+      pendingPermissions: {},
+      pendingQuestions: {},
+      lastError: undefined,
+      lastErrorCode: undefined,
+    })
+    expect(store.getState().freshAgent.sessions[sessionKey].runtimeId).toBeUndefined()
+    expect(store.getState().freshAgent.retiredRuntimeGenerations['fresh-new']).toBe(8)
+
+    store.dispatch(registerPendingCreate({
+      requestId: FA_CREATE_REQUEST_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      expectsHistoryHydration: true,
+    }))
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: FA_CREATE_REQUEST_ID,
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      runtime: { runtimeId: 'fresh-created', generation: 9 },
+    }, undefined, store.getState)
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      runtimeId: 'fresh-created', runtimeGeneration: 9,
+    })
+  })
+
   it('attach dispatches applyFreshAgentReconcileAttach with the verdict sessionRef', () => {
     const { req, dispatch, dispatched } = freshAgentFoldHarness([
       ['attach', { sessionRef: { provider: 'claude', sessionId: DURABLE }, corrected: true }],

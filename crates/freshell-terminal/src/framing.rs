@@ -111,6 +111,7 @@ pub fn frame_to_terminal_output(
         terminal_id: terminal_id.to_string(),
         attach_request_id: None,
         source: Some(source),
+        runtime: None,
     })
 }
 
@@ -198,6 +199,7 @@ mod tests {
             terminal_id: "term".into(),
             attach_request_id: None,
             source: Some(OutputSource::Live),
+            runtime: None,
         }));
         assert_eq!(reassemble_stream(&all, "stream"), "line-1\r\nline-2\r\n");
     }

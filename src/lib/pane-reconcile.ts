@@ -39,6 +39,10 @@ import {
 } from '@/store/panesSlice'
 import { clearSessionLost } from '@/store/freshAgentSlice'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import {
+  adoptReconcileRuntime,
+  clearReconcileRuntime,
+} from '@/store/freshAgentSlice'
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
 const MAX_RECONCILE_PANES = 200
@@ -177,6 +181,7 @@ function toFreshAgentReconcilePane(
     kind: 'fresh-agent',
     mode: content.provider,
     createRequestId: content.createRequestId,
+    ...(content.serverInstanceId ? { serverInstanceId: content.serverInstanceId } : {}),
     ...(sessionRef ? { sessionRef } : {}),
     ...(content.status ? { status: content.status } : {}),
   }
@@ -296,6 +301,11 @@ function foldFreshAgentVerdict(
   outcome: FoldOutcome,
 ): boolean {
   const { tabId, paneId } = paneRefFromOwnKey(pane.paneKey)
+  const provider = pane.mode
+  const paneSessionIds = [
+    pane.sessionRef?.sessionId,
+    pane.resumeSessionId,
+  ].filter((sessionId): sessionId is string => Boolean(sessionId))
 
   switch (verdict.verdict) {
     case 'attach': {
@@ -307,6 +317,7 @@ function foldFreshAgentVerdict(
         paneId,
         sessionRef: verdict.sessionRef,
         serverInstanceId: result.serverInstanceId,
+        runtime: verdict.runtime,
         corrected: verdict.corrected,
         duplicate: verdict.duplicate ? true : undefined,
       }))
@@ -317,10 +328,25 @@ function foldFreshAgentVerdict(
         sessionId: verdict.sessionRef.sessionId,
         provider: verdict.sessionRef.provider as FreshAgentRuntimeProvider,
       }))
+      if (verdict.runtime) {
+        dispatch(adoptReconcileRuntime({
+          provider,
+          sessionIds: [...paneSessionIds, verdict.sessionRef.sessionId],
+          runtime: verdict.runtime,
+          allowServerTransition: Boolean(
+            pane.serverInstanceId
+            && pane.serverInstanceId !== result.serverInstanceId
+          ),
+        }))
+      }
       outcome.attached++
       return true
     }
     case 'respawn': {
+      dispatch(clearReconcileRuntime({
+        provider,
+        sessionIds: [...paneSessionIds, ...(verdict.sessionRef?.sessionId ? [verdict.sessionRef.sessionId] : [])],
+      }))
       dispatch(resetFreshAgentPaneForReconcileCreate({
         tabId,
         paneId,
@@ -332,6 +358,10 @@ function foldFreshAgentVerdict(
       return true
     }
     case 'fresh': {
+      dispatch(clearReconcileRuntime({
+        provider,
+        sessionIds: paneSessionIds,
+      }))
       dispatch(resetFreshAgentPaneForReconcileCreate({
         tabId,
         paneId,
@@ -378,7 +408,7 @@ function foldFreshAgentVerdict(
     case 'error': {
       // Fresh-agent verdicts never emit 'error' today, but the fold must
       // not crash if one arrives — identical handling to the terminal arm.
-      if (verdict.reason === 'index_warming') {
+      if (verdict.reason === 'index_warming' || verdict.reason === 'restart_retirement_pending') {
         warmingRefs.push({ tabId, paneId })
         outcome.warming++
       } else {
@@ -465,6 +495,7 @@ export function foldVerdicts(
           terminalId: verdict.terminalId,
           serverInstanceId: result.serverInstanceId,
           sessionRef: verdict.sessionRef,
+          runtime: verdict.runtime,
           corrected: verdict.corrected,
           duplicate: verdict.duplicate ? true : undefined,
         }))
@@ -531,7 +562,7 @@ export function foldVerdicts(
         break
       }
       case 'error': {
-        if (verdict.reason === 'index_warming') {
+        if (verdict.reason === 'index_warming' || verdict.reason === 'restart_retirement_pending') {
           warmingRefs.push({ tabId, paneId })
           outcome.warming++
         } else {

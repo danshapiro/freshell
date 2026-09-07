@@ -54,137 +54,20 @@ pub fn now_epoch_ms() -> u64 {
 /// match (the pid-reuse guard). Sequence:
 ///
 /// 1. Scan the ownership-tagged `/proc` set (sidecar + SDK-spawned grandchildren).
-/// 2. Graceful SIGTERM to the recorded child first (catchable — lets the SDK cleanly
-///    kill its own CLI grandchild), poll ≤500ms, SIGKILL fallback.
-/// 3. Sweep the captured tree (SIGTERM rounds, SIGKILL escalation) until every member
-///    is confirmed dead-by-starttime, folding in any still-readable tagged newcomers.
+/// 2. Sweep the captured tree in graceful SIGTERM rounds, folding in any
+///    still-readable tagged newcomers while ancestry is intact.
+/// 3. Escalate stubborn members to SIGKILL and confirm every captured
+///    `(pid,starttime)` incarnation is gone.
 ///
 /// Returns `true` only when the whole captured tree is confirmed gone; callers may
 /// `force_release` ONLY then. Non-Linux: no `/proc` — returns `false` (hold closed).
-#[cfg(target_os = "linux")]
 pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership_id: &str) -> bool {
-    // 1. Capture the tagged tree BEFORE any kill (see YAMA note above).
-    let mut tree: Vec<(i32, u64)> = scan_tagged_pids(ownership_env, ownership_id)
-        .into_iter()
-        .filter_map(|p| proc_starttime(p).map(|st| (p, st)))
-        .collect();
-    if !tree.iter().any(|(p, _)| *p == pid as i32) {
-        if let Some(st) = proc_starttime(pid as i32) {
-            tree.push((pid as i32, st));
-        }
-    }
-
-    // 2. Graceful SIGTERM to the recorded child, poll, SIGKILL fallback.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    if !wait_pid_gone(pid).await {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-        if !wait_pid_gone(pid).await {
-            return false;
-        }
-    }
-
-    // 3. Sweep the captured tree until confirmed empty (bounded; SIGKILL escalation
-    //    after 20 SIGTERM rounds). Re-scan folds in still-readable tagged newcomers
-    //    (covers the YAMA=0 case and children spawned after the initial capture).
-    for round in 0..24u8 {
-        tree.retain(|(p, st)| proc_starttime(*p) == Some(*st));
-        for p in scan_tagged_pids(ownership_env, ownership_id) {
-            if !tree.iter().any(|(q, _)| *q == p) {
-                if let Some(st) = proc_starttime(p) {
-                    tree.push((p, st));
-                }
-            }
-        }
-        if tree.is_empty() {
-            return true;
-        }
-        let sig = if round < 20 {
-            libc::SIGTERM
-        } else {
-            libc::SIGKILL
-        };
-        for (p, _) in &tree {
-            unsafe {
-                libc::kill(*p, sig);
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    tree.retain(|(p, st)| proc_starttime(*p) == Some(*st));
-    tree.is_empty()
-}
-
-#[cfg(not(target_os = "linux"))]
-pub async fn kill_and_confirm_tree_dead(
-    _pid: u32,
-    _ownership_env: &str,
-    _ownership_id: &str,
-) -> bool {
-    false
-}
-
-/// ESRCH-or-zombie poll: is `pid` dead (gone or unreaped-zombie) within 20 × 25ms?
-/// A zombie is dead-but-unreaped (tokio reaps it eventually) — it holds no pipes and
-/// writes nothing, so it counts as gone here.
-#[cfg(target_os = "linux")]
-async fn wait_pid_gone(pid: u32) -> bool {
-    for _ in 0..20u8 {
-        if proc_starttime(pid as i32).is_none() {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    proc_starttime(pid as i32).is_none()
-}
-
-/// The process's `starttime` (field 22 of `/proc/<pid>/stat`, world-readable — no
-/// ptrace needed), or `None` when the pid is gone, a zombie, or dead (`Z`/`X` state).
-/// `(pid, starttime)` uniquely identifies a process incarnation: a recycled pid gets a
-/// new starttime, so comparing both is the pid-reuse guard.
-#[cfg(target_os = "linux")]
-fn proc_starttime(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm (field 2) may contain spaces/parens: split at the LAST ')' — the remainder
-    // starts at field 3 (state), so starttime (field 22) is index 19 there.
-    let rest = stat.rsplit(')').next()?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    match fields.first() {
-        Some(&"Z") | Some(&"X") | None => return None,
-        Some(_) => {}
-    }
-    fields.get(19)?.parse().ok()
-}
-
-/// All live pids whose `/proc/<pid>/environ` carries `{env}={id}` (the ownership tag
-/// the sidecar AND its SDK-spawned grandchildren inherit). Readable only for processes
-/// this process may ptrace (YAMA) — see [`kill_and_confirm_tree_dead`]'s capture-first
-/// design for why that constraint is handled there.
-#[cfg(target_os = "linux")]
-fn scan_tagged_pids(ownership_env: &str, ownership_id: &str) -> Vec<i32> {
-    let needle = format!("{ownership_env}={ownership_id}");
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<i32>() else {
-            continue;
-        };
-        let environ = std::path::Path::new("/proc").join(name).join("environ");
-        let Ok(bytes) = std::fs::read(environ) else {
-            continue;
-        };
-        if bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()) {
-            out.push(pid);
-        }
-    }
-    out
+    let mut barrier = freshell_codex::transport::OwnedProcessTreeBarrier::capture(
+        pid,
+        ownership_env,
+        ownership_id,
+    );
+    barrier.terminate_and_confirm().await
 }
 
 /// The answer to a [`FreshAgentSessionLeases::claim`].

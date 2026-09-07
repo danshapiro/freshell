@@ -90,7 +90,10 @@ function createStore(seedIdleBaselines: Record<string, number> = {}) {
 type Store = ReturnType<typeof createStore>
 
 /** Fold t1 -> t2 exactly as TerminalView's terminal.replaced handler does. */
-function foldReplacement(store: Store) {
+function foldReplacement(
+  store: Store,
+  runtime?: { runtimeId: string; generation: number },
+) {
   store.dispatch(foldTerminalReplacement({
     paneId: PANE_ID,
     newTerminalId: NEW_ID,
@@ -104,6 +107,7 @@ function foldReplacement(store: Store) {
     paneId: PANE_ID,
     terminalId: NEW_ID,
     serverInstanceId: undefined,
+    runtime,
   }))
 }
 
@@ -187,6 +191,34 @@ describe('turn completion across terminal.replaced fold', () => {
     expect(resolvePaneActivity(activityInput({
       [OLD_ID]: { terminalId: OLD_ID, phase: 'busy', updatedAt: 1_000 },
     }))).toEqual({ isBusy: false, source: null })
+  })
+
+  it('rebinds a generation-fenced pane only when the replacement descriptor is folded', () => {
+    const store = createStore()
+    const oldRuntime = { runtimeId: OLD_ID, generation: 1 }
+    store.dispatch(applyReconcileAttach({
+      tabId: TAB_ID,
+      paneId: PANE_ID,
+      terminalId: OLD_ID,
+      runtime: oldRuntime,
+    }))
+
+    foldReplacement(store)
+    let content = findPaneContent(
+      store.getState().panes.layouts[TAB_ID]!,
+      PANE_ID,
+    ) as TerminalPaneContent
+    expect(content.terminalId).toBe(OLD_ID)
+
+    const replacementRuntime = { runtimeId: NEW_ID, generation: 2 }
+    foldReplacement(store, replacementRuntime)
+    content = findPaneContent(
+      store.getState().panes.layouts[TAB_ID]!,
+      PANE_ID,
+    ) as TerminalPaneContent
+    expect(content.terminalId).toBe(NEW_ID)
+    expect(content.runtimeId).toBe(NEW_ID)
+    expect(content.runtimeGeneration).toBe(2)
   })
 
   it('the fold does not emit a terminal.detach for the old terminalId', () => {

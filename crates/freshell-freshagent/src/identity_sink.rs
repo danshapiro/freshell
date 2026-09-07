@@ -16,7 +16,7 @@ use crate::rollback_record::ROLLBACK_RECORD_VERSION;
 
 /// Resume-invocation record (campaign plan §4.2): exactly what the
 /// provider-native resume command needs.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FreshAgentSettings {
     pub model: Option<String>,
     pub sandbox: Option<String>,
@@ -1183,7 +1183,6 @@ impl FakeIdentitySink {
         self.bindings.lock().unwrap().push(upsert);
     }
 }
-
 #[cfg(test)]
 impl PaneIdentitySink for FakeIdentitySink {
     fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {

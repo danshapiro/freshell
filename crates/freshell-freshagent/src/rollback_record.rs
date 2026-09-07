@@ -405,19 +405,30 @@ fn session_type_wire(session_type: SessionType) -> &'static str {
 /// The shared `freshAgent.event` envelope: `event` rides opaquely inside;
 /// top-level provider/sessionType/sessionId are the locator the client
 /// requires (the codex `emit_fresh_agent_error` precedent).
-fn rollback_envelope(op: &RollbackRequest, live_session_id: &str, event: Value) -> ServerMessage {
+fn rollback_envelope(
+    op: &RollbackRequest,
+    live_session_id: &str,
+    event: Value,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+) -> ServerMessage {
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event,
         provider: agent_provider_wire(op.provider).to_string(),
         session_id: live_session_id.to_string(),
         session_type: session_type_wire(op.session_type).to_string(),
+        runtime: runtime.cloned(),
     })
 }
 
 /// `freshAgent.event{freshAgent.error{code,message,requestId,rollback:true}}`
 /// stamped from `op`. The `rollback:true` stamp routes the client to the
 /// notice channel, not the pane error surface.
-pub fn rollback_error_frame(op: &RollbackRequest, code: &str, message: &str) -> ServerMessage {
+pub fn rollback_error_frame(
+    op: &RollbackRequest,
+    code: &str,
+    message: &str,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
+) -> ServerMessage {
     rollback_envelope(
         op,
         &op.session_id,
@@ -429,6 +440,7 @@ pub fn rollback_error_frame(op: &RollbackRequest, code: &str, message: &str) -> 
             "requestId": op.request_id,
             "rollback": true,
         }),
+        runtime,
     )
 }
 
@@ -443,6 +455,7 @@ pub fn rollback_ack_frame(
     removed_turn_ids: &[String],
     can_redo: bool,
     new_session_id: Option<&str>,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
 ) -> ServerMessage {
     let mut event = match op.direction {
         RollbackDirection::Undo => json!({
@@ -479,7 +492,7 @@ pub fn rollback_ack_frame(
     if let Some(new_session_id) = new_session_id {
         event["newSessionId"] = json!(new_session_id);
     }
-    rollback_envelope(op, live_session_id, event)
+    rollback_envelope(op, live_session_id, event, runtime)
 }
 
 /// Broadcast (every connection incl. the requester; converges sibling clients
@@ -491,6 +504,7 @@ pub fn rollback_broadcast_frame(
     live_session_id: &str,
     removed_turn_ids: &[String],
     can_redo: bool,
+    runtime: Option<&freshell_protocol::RuntimeDescriptor>,
 ) -> ServerMessage {
     let event = match op.direction {
         RollbackDirection::Undo => json!({
@@ -512,7 +526,7 @@ pub fn rollback_broadcast_frame(
             event
         }
     };
-    rollback_envelope(op, live_session_id, event)
+    rollback_envelope(op, live_session_id, event, runtime)
 }
 
 /// Kata 1wxv Task 5 snapshot surfacing — the shared half every provider's

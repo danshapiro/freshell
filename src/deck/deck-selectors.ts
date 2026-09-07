@@ -270,7 +270,7 @@ export function findApproveTarget(state: RootState, tabId: string): ApproveTarge
 }
 
 export type StopTarget =
-  | { kind: 'fresh-agent'; sessionId: string; sessionType: FreshAgentPaneContent['sessionType']; provider: FreshAgentPaneContent['provider']; cwd?: string }
+  | { kind: 'fresh-agent'; sessionId: string; sessionType: FreshAgentPaneContent['sessionType']; provider: FreshAgentPaneContent['provider']; runtimeId?: string; runtimeGeneration?: number; cwd?: string }
   | { kind: 'terminal'; paneId: string; terminalId: string; content: TerminalPaneContent }
 
 export function findStopTarget(state: RootState, tabId: string): StopTarget | null {
@@ -293,6 +293,10 @@ export function findStopTarget(state: RootState, tabId: string): StopTarget | nu
         sessionId: entry.content.sessionId,
         sessionType: entry.content.sessionType,
         provider: entry.content.provider,
+        ...(entry.content.runtimeId && entry.content.runtimeGeneration !== undefined ? {
+          runtimeId: entry.content.runtimeId,
+          runtimeGeneration: entry.content.runtimeGeneration,
+        } : {}),
         ...(cwd ? { cwd } : {}),
       }
     }

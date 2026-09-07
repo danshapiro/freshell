@@ -13,6 +13,8 @@ import {
 import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { applyAgentRestartReplaced as applyPaneAgentRestartReplaced } from '@/store/panesSlice'
+import { applyAgentRestartReplaced as applyFreshAgentRestartReplaced } from '@/store/freshAgentSlice'
 import {
   applyReconcileAttach,
   applyReattachToLiveTerminal,
@@ -633,6 +635,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
+  useEffect(() => {
+    ws.bindAgentRestartStore?.(appStore, {
+      applyPaneAgentRestartReplaced,
+      applyFreshAgentRestartReplaced,
+      updateTab,
+      clearTerminalLifecycle,
+    })
+  }, [appStore, ws])
   // Playwright can opt a pane into state-only mode so activity chrome tests
   // don't race the live terminal create/attach lifecycle.
   const suppressNetworkEffects = typeof window !== 'undefined'
@@ -2741,6 +2751,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     return isCurrent
   }, [recordTerminalPerfAuditEvent])
 
+  const isCurrentRuntimeMessage = useCallback((msg: { runtime?: { runtimeId: string, generation: number } }) => {
+    const content = contentRef.current
+    const generation = content?.runtimeGeneration
+    if (!content || generation === undefined) return true
+    const runtime = msg.runtime
+    return runtime !== undefined && runtime.runtimeId === content.runtimeId && runtime.generation === generation
+  }, [])
+
   const isCurrentAttachStreamMessage = useCallback((msg: {
     type: string
     terminalId: string
@@ -3375,6 +3393,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         terminalId: undefined,
         serverInstanceId: undefined,
         streamId: undefined,
+        runtimeId: undefined,
+        runtimeGeneration: undefined,
         createRequestId: pending.requestId,
         status: 'creating',
         restoreError: undefined,
@@ -3839,6 +3859,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output.batch' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -4066,6 +4087,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -4135,6 +4157,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -4199,6 +4222,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.stream.changed' && msg.terminalId === tid) {
+          if (!isCurrentRuntimeMessage(msg)) return
           if (!isCurrentAttachMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation stream change', {
@@ -4234,6 +4258,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
+          const currentRuntimeGeneration = contentRef.current?.runtimeGeneration
+          if (
+            currentRuntimeGeneration !== undefined
+            && (
+              !msg.runtime
+              || msg.runtime.runtimeId !== contentRef.current?.runtimeId
+              || msg.runtime.generation !== currentRuntimeGeneration
+            )
+          ) {
+            return
+          }
           if (!isCurrentAttachMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
@@ -4258,6 +4293,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             geometryEpochRef.current,
           )
           const previousStreamId = getTerminalCheckpointStreamId()
+          const attachRuntime = msg.runtime
+          if (attachRuntime) {
+            updateContent({
+              runtimeId: attachRuntime.runtimeId,
+              runtimeGeneration: attachRuntime.generation,
+            })
+          }
           const activeAttach = currentAttachRef.current
           const expectedStreamId = activeAttach?.expectedStreamId ?? previousStreamId
           const expectedGeometryAuthority = activeAttach?.expectedGeometryAuthority ?? geometryAuthorityRef.current
@@ -4453,6 +4495,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // this point; see terminal-restore.ts).
           clearTerminalRestoreRequestId(reqId)
           const newId = msg.terminalId as string
+          const currentRuntimeGeneration = contentRef.current?.runtimeGeneration
+          if (
+            currentRuntimeGeneration !== undefined
+            && (
+              !msg.runtime
+              || msg.runtime.runtimeId !== contentRef.current?.runtimeId
+              || msg.runtime.generation < currentRuntimeGeneration
+            )
+          ) {
+            return
+          }
           const handled = handledCreatedMessageRef.current
           if (handled?.requestId === reqId && handled.terminalId === newId) {
             if (debugRef.current) {
@@ -4487,6 +4540,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: contentRef.current?.resumeSessionId,
           })
           const createdSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
+          const createdRuntime = msg.runtime
           const createdCwd = typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined
           const createdSessionUpdates = buildSessionAssociationContentUpdates(contentRef.current, createdSessionRef)
           // Resume-validation: a notice means the server dropped a stale
@@ -4498,6 +4552,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           lastKnownTerminalIdRef.current = newId
           updateContent({
             terminalId: newId,
+            ...(createdRuntime
+              ? {
+                runtimeId: createdRuntime.runtimeId,
+                runtimeGeneration: createdRuntime.generation,
+              }
+              : {}),
             serverInstanceId: serverInstanceIdRef.current,
             streamId: undefined,
             status: 'running',
@@ -4676,8 +4736,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             // for server-supplied rebinds (mirrors pane-reconcile.ts:428-436).
             // applyReconcileAttach unconditionally overwrites serverInstanceId
             // (panesSlice.ts:1904), so supply the current one. The replaced
-            // frame carries no verdict data, so sessionRef/corrected/duplicate
-            // stay unset — the reducer preserves the pane's sessionRef.
+            // frame carries no reconcile verdict data, so
+            // sessionRef/corrected/duplicate stay unset — the reducer
+            // preserves the pane's sessionRef. The runtime descriptor is
+            // load-bearing once the pane has negotiated generation fencing:
+            // omitting it would make applyReconcileAttach reject the rebind.
             // Bind-before-attach holds: the reducer's epoch bump re-fires the
             // create-or-attach effect after this rebind.
             dispatch(applyReconcileAttach({
@@ -4685,6 +4748,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               paneId: paneIdRef.current,
               terminalId: msg.newTerminalId,
               serverInstanceId: serverInstanceIdRef.current,
+              runtime: msg.runtime,
             }))
           }
           return
@@ -5171,6 +5235,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 terminalId: undefined,
                 serverInstanceId: undefined,
                 streamId: undefined,
+                runtimeId: undefined,
+                runtimeGeneration: undefined,
                 createRequestId: newRequestId,
                 status: 'creating',
                 // Codex panes keep a breadcrumb instead of silently clearing
@@ -5234,6 +5300,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               terminalId: undefined,
               serverInstanceId: undefined,
               streamId: undefined,
+              runtimeId: undefined,
+              runtimeGeneration: undefined,
               createRequestId: newRequestId,
               status: 'creating',
             })

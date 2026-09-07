@@ -53,6 +53,10 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   sessionKey: string
   threadId: string
   status: FreshAgentSessionStatus
+  /** Server-owned live runtime identity for restart generation fencing. */
+  runtimeId?: string
+  /** Monotonic server-owned runtime generation. */
+  runtimeGeneration?: number
   statusVersion?: number
   snapshot?: FreshAgentSnapshot
   latestTurnId?: string | null
@@ -94,4 +98,6 @@ export type FreshAgentState = {
   pendingCreates: Record<string, FreshAgentPendingCreate>
   pendingCreateFailures: Record<string, PendingCreateFailure>
   availableModels: Array<{ value: string; displayName: string; description: string }>
+  /** Ephemeral old-runtime fence populated by committed restart replacements. */
+  retiredRuntimeGenerations?: Record<string, number>
 }

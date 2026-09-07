@@ -45,8 +45,12 @@ struct FakeRuntime {
     fail_ensure_ready: AtomicBool,
     fail_prepare_retention: AtomicBool,
     shutdown_calls: AtomicU32,
+    shutdown_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    shutdown_failures_remaining: AtomicU32,
+    shutdown_finished: AtomicBool,
     ownership_updates: Mutex<Vec<(String, u64)>>,
     noted_session_ids: Mutex<Vec<String>>,
+    replacement_ownership_ids: Mutex<Vec<Option<String>>>,
 }
 
 impl FakeRuntime {
@@ -82,13 +86,34 @@ impl FakeRuntime {
             fail_ensure_ready: AtomicBool::new(false),
             fail_prepare_retention: AtomicBool::new(false),
             shutdown_calls: AtomicU32::new(0),
+            shutdown_gate: Mutex::new(None),
+            shutdown_failures_remaining: AtomicU32::new(0),
+            shutdown_finished: AtomicBool::new(false),
             ownership_updates: Mutex::new(Vec::new()),
             noted_session_ids: Mutex::new(Vec::new()),
+            replacement_ownership_ids: Mutex::new(Vec::new()),
         })
+    }
+
+    fn block_shutdown(&self) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *self.shutdown_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    fn fail_next_shutdown(&self) {
+        self.shutdown_failures_remaining.store(1, Ordering::SeqCst);
     }
 }
 
 impl CodexLaunchRuntime for FakeRuntime {
+    fn set_replacement_ownership_id(&self, ownership_id: Option<&str>) {
+        self.replacement_ownership_ids
+            .lock()
+            .unwrap()
+            .push(ownership_id.map(str::to_string));
+    }
+
     fn ensure_ready(
         &self,
         cwd: Option<String>,
@@ -137,6 +162,20 @@ impl CodexLaunchRuntime for FakeRuntime {
     fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.shutdown_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            if self
+                .shutdown_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err("fake runtime: ownership barrier incomplete".to_string());
+            }
+            self.shutdown_finished.store(true, Ordering::SeqCst);
             Ok(())
         })
     }
@@ -183,6 +222,26 @@ async fn fresh_plan_starts_a_real_proxy_with_candidate_persistence_on() {
         Some(true)
     );
 
+    launch.sidecar.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn fenced_plan_stamps_the_runtime_before_sidecar_readiness() {
+    let runtime = FakeRuntime::start().await;
+    let planner = planner_for(runtime.clone());
+    let launch = planner
+        .plan_create_fenced(
+            &CodexLaunchPlanInput::default(),
+            Some("restart-replacement-owner"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.replacement_ownership_ids.lock().unwrap().as_slice(),
+        &[Some("restart-replacement-owner".to_string())]
+    );
+    assert_eq!(runtime.ensure_ready_calls.lock().unwrap().len(), 1);
     launch.sidecar.shutdown().await.unwrap();
 }
 
@@ -452,6 +511,181 @@ async fn manager_adopts_by_terminal_id_and_tears_down_on_exit() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn manager_restart_teardown_is_awaitable_through_proxy_close_and_runtime_death() {
+    let runtime = FakeRuntime::start().await;
+    let release_shutdown = runtime.block_shutdown();
+    let factory_runtime = runtime.clone();
+    let manager = Arc::new(CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    })));
+
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
+        .await
+        .unwrap();
+    let remote_ws_url = launch.remote_ws_url.clone();
+    manager.adopt("term-restart", launch, 7).await.unwrap();
+    let (tui, _) = connect_async(&remote_ws_url).await.unwrap();
+
+    let teardown = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.shutdown_terminal_for_restart("term-restart").await })
+    };
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while runtime.shutdown_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restart teardown never reached the managed runtime"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        !teardown.is_finished(),
+        "restart teardown returned while the predecessor runtime still owned its process tree"
+    );
+    drop(tui);
+    release_shutdown.notify_waiters();
+    assert!(
+        timeout(RECV_TIMEOUT, teardown)
+            .await
+            .expect("restart teardown timed out")
+            .expect("restart teardown task panicked")
+            .expect("restart teardown failed"),
+        "the managed terminal launch must be found and retired"
+    );
+    assert!(
+        runtime.shutdown_finished.load(Ordering::SeqCst),
+        "restart returned before runtime shutdown completed"
+    );
+    assert!(
+        connect_async(&remote_ws_url).await.is_err(),
+        "restart returned while the predecessor proxy still accepted connections"
+    );
+}
+
+#[tokio::test]
+async fn manager_restart_quarantines_and_marks_expected_exit_before_proxy_shutdown() {
+    let runtime = FakeRuntime::start().await;
+    let release_shutdown = runtime.block_shutdown();
+    let factory_runtime = runtime.clone();
+    let manager = Arc::new(CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    })));
+
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
+        .await
+        .unwrap();
+    let remote_ws_url = launch.remote_ws_url.clone();
+    manager
+        .adopt("term-expected-exit", launch, 11)
+        .await
+        .unwrap();
+    let (_tui, _) = connect_async(&remote_ws_url).await.unwrap();
+
+    let expected_exit_marked = Arc::new(AtomicBool::new(false));
+    let teardown = {
+        let manager = Arc::clone(&manager);
+        let expected_exit_marked = Arc::clone(&expected_exit_marked);
+        tokio::spawn(async move {
+            manager
+                .shutdown_terminal_for_restart_with_expected_exit("term-expected-exit", || {
+                    expected_exit_marked.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        })
+    };
+
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while runtime.shutdown_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restart teardown never reached the managed runtime"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        expected_exit_marked.load(Ordering::SeqCst),
+        "the terminal exit must be classified before proxy close/runtime shutdown"
+    );
+    assert!(
+        manager.is_terminal_restart_retiring("term-expected-exit"),
+        "the manager must quarantine ownership throughout slow teardown"
+    );
+
+    release_shutdown.notify_waiters();
+    assert!(timeout(RECV_TIMEOUT, teardown)
+        .await
+        .expect("restart teardown timed out")
+        .expect("restart teardown task panicked")
+        .expect("restart teardown failed"));
+}
+
+#[tokio::test]
+async fn manager_restart_teardown_retains_failed_retirement_for_same_terminal_retry() {
+    let runtime = FakeRuntime::start().await;
+    runtime.fail_next_shutdown();
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    }));
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            5,
+            LaunchClass::Interactive,
+        )
+        .await
+        .unwrap();
+    manager
+        .adopt("term-restart-retry", launch, 9)
+        .await
+        .unwrap();
+
+    let expected_exit_marked = AtomicBool::new(false);
+    let first = manager
+        .shutdown_terminal_for_restart_with_expected_exit("term-restart-retry", || {
+            expected_exit_marked.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+    assert!(
+        first.is_err(),
+        "the injected incomplete barrier must be retryable"
+    );
+    assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 1);
+    assert!(expected_exit_marked.load(Ordering::SeqCst));
+    assert!(
+        manager.is_terminal_restart_retiring("term-restart-retry"),
+        "failed teardown must retain expected-exit quarantine"
+    );
+
+    assert!(
+        manager
+            .shutdown_terminal_for_restart("term-restart-retry")
+            .await
+            .expect("same-terminal retirement retry failed"),
+        "the quarantined launch must remain addressable by terminal id"
+    );
+    assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 2);
+    assert!(runtime.shutdown_finished.load(Ordering::SeqCst));
+    assert!(!manager.is_terminal_restart_retiring("term-restart-retry"));
 }
 
 #[tokio::test]
@@ -1901,4 +2135,86 @@ async fn notify_terminal_exit_retains_under_retention_flag() {
         );
     }
     wait_pid_gone(pid_b).await;
+}
+
+// ── restart fencing: the ownership-tree barrier confirms descendant teardown ──
+
+/// Restart retirement must not return while the old tree still lives: the
+/// spawn-time captured `OwnedProcessTreeBarrier` escalates SIGTERM → SIGKILL
+/// against the ownership-tagged tree (folding in later-spawned descendants
+/// every round), so a SIGTERM-trapping helper child of the app-server wrapper
+/// is confirmed dead before `shutdown` reports success.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_runtime_shutdown_confirms_reparent_prone_descendant_death() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let wrapper = temp.path().join("codex-app-server-with-descendant");
+    let descendant_pid_file = temp
+        .path()
+        .join("codex-app-server-with-descendant.descendant.pid");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
+    std::fs::write(
+        &wrapper,
+        format!(
+            r#"#!/usr/bin/env bash
+(
+  trap '' TERM
+  echo "$BASHPID" > "${{0}}.descendant.pid"
+  while true; do :; done
+) &
+exec node "{}" "$@"
+"#,
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&wrapper, permissions).unwrap();
+
+    let runtime = Arc::new(SpawnedCodexAppServerRuntime::with_command(
+        wrapper.display().to_string(),
+    ));
+    let factory_runtime = runtime.clone();
+    let planner = CodexLaunchPlanner::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    }));
+    let launch = planner
+        .plan_create(&CodexLaunchPlanInput::default())
+        .await
+        .expect("wrapper app-server became ready");
+
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while !descendant_pid_file.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed Codex descendant fixture did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let descendant_pid: i32 = std::fs::read_to_string(&descendant_pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    launch
+        .sidecar
+        .shutdown()
+        .await
+        .expect("captured managed runtime tree was retired");
+    let descendant_alive = unsafe { libc::kill(descendant_pid, 0) == 0 };
+    if descendant_alive {
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+    }
+    assert!(
+        !descendant_alive,
+        "managed restart teardown returned while a SIGTERM-ignoring descendant survived"
+    );
 }

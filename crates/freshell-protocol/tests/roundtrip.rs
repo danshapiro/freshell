@@ -358,6 +358,165 @@ fn rich_client_messages() {
         ClientMessage::Ping => {}
         other => panic!("expected Ping, got {other:?}"),
     }
+
+    // agent.restart — immutable durable locator + live generation fence.
+    let wire = r#"{"type":"agent.restart","requestId":"restart-1","provider":"claude","sessionId":"durable-1","kind":"terminal","liveId":"term-1","expectedGeneration":7}"#;
+    match client_roundtrip(wire, "agent.restart") {
+        ClientMessage::AgentRestart(restart) => {
+            assert_eq!(restart.request_id, "restart-1");
+            assert_eq!(restart.provider, "claude");
+            assert_eq!(restart.session_id, "durable-1");
+            assert_eq!(restart.kind, AgentRuntimeKind::Terminal);
+            assert_eq!(restart.live_id, "term-1");
+            assert_eq!(restart.expected_generation, 7);
+        }
+        other => panic!("expected AgentRestart, got {other:?}"),
+    }
+
+    for (wire, expected_type) in [
+        (
+            r#"{"type":"freshAgent.send","provider":"codex","sessionId":"durable-1","sessionType":"freshcodex","expectedRuntimeId":"runtime-7","expectedGeneration":7,"text":"hi"}"#,
+            "freshAgent.send",
+        ),
+        (
+            r#"{"type":"freshAgent.interrupt","provider":"claude","sessionId":"durable-1","sessionType":"kilroy","expectedRuntimeId":"runtime-7","expectedGeneration":7}"#,
+            "freshAgent.interrupt",
+        ),
+        (
+            r#"{"type":"freshAgent.kill","provider":"opencode","sessionId":"durable-1","sessionType":"freshopencode","expectedRuntimeId":"runtime-7","expectedGeneration":7}"#,
+            "freshAgent.kill",
+        ),
+    ] {
+        let message = client_roundtrip(wire, expected_type);
+        let (runtime_id, generation) = match message {
+            ClientMessage::FreshAgentSend(message) => {
+                (message.expected_runtime_id, message.expected_generation)
+            }
+            ClientMessage::FreshAgentInterrupt(message) => {
+                (message.expected_runtime_id, message.expected_generation)
+            }
+            ClientMessage::FreshAgentKill(message) => {
+                (message.expected_runtime_id, message.expected_generation)
+            }
+            other => panic!("expected runtime-fenced control, got {other:?}"),
+        };
+        assert_eq!(runtime_id.as_deref(), Some("runtime-7"));
+        assert_eq!(generation, Some(7));
+    }
+}
+
+#[test]
+fn restart_server_messages_roundtrip_with_correlated_generations() {
+    let started = r#"{"type":"agent.restart.started","requestId":"restart-1","provider":"claude","sessionId":"durable-1","kind":"terminal","runtimeId":"term-1","generation":7}"#;
+    match server_roundtrip(started, "agent.restart.started") {
+        ServerMessage::AgentRestartStarted(message) => {
+            assert_eq!(message.runtime.runtime_id, "term-1");
+            assert_eq!(message.runtime.generation, 7);
+        }
+        other => panic!("expected AgentRestartStarted, got {other:?}"),
+    }
+
+    let replaced = r#"{"type":"agent.restart.replaced","requestId":"restart-1","provider":"claude","sessionId":"durable-1","kind":"terminal","oldRuntimeId":"term-1","oldGeneration":7,"runtimeId":"term-2","generation":8}"#;
+    match server_roundtrip(replaced, "agent.restart.replaced") {
+        ServerMessage::AgentRestartReplaced(message) => {
+            assert_eq!(message.old_runtime.old_runtime_id, "term-1");
+            assert_eq!(message.old_runtime.old_generation, 7);
+            assert_eq!(message.runtime.runtime_id, "term-2");
+            assert_eq!(message.runtime.generation, 8);
+        }
+        other => panic!("expected AgentRestartReplaced, got {other:?}"),
+    }
+
+    let failed = r#"{"type":"agent.restart.failed","requestId":"restart-1","provider":"claude","sessionId":"durable-1","kind":"terminal","runtimeId":"term-1","generation":7,"code":"UNRESUMABLE","message":"durable session is unavailable","retryable":false,"recoveryPending":true}"#;
+    match server_roundtrip(failed, "agent.restart.failed") {
+        ServerMessage::AgentRestartFailed(message) => {
+            assert_eq!(message.code, AgentRestartFailureCode::Unresumable);
+            assert!(!message.retryable);
+            assert!(message.recovery_pending);
+        }
+        other => panic!("expected AgentRestartFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn runtime_descriptors_roundtrip_on_lifecycle_surfaces() {
+    let created = r#"{"type":"terminal.created","createdAt":1,"requestId":"create-1","terminalId":"term-1","runtime":{"runtimeId":"term-1","generation":7}}"#;
+    match server_roundtrip(created, "terminal.created") {
+        ServerMessage::TerminalCreated(message) => {
+            assert_eq!(
+                message.runtime,
+                Some(RuntimeDescriptor {
+                    runtime_id: "term-1".to_string(),
+                    generation: 7,
+                })
+            );
+        }
+        other => panic!("expected TerminalCreated, got {other:?}"),
+    }
+
+    let attach = r#"{"type":"terminal.attach.ready","headSeq":0,"replayFromSeq":1,"replayToSeq":0,"streamId":"stream-1","terminalId":"term-1","runtime":{"runtimeId":"term-1","generation":7}}"#;
+    match server_roundtrip(attach, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 7);
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    let inventory = r#"{"type":"terminal.inventory","bootId":"boot-1","terminals":[{"terminalId":"term-1","createdAt":1,"lastActivityAt":2,"mode":"claude","status":"running","title":"Claude","runtime":{"runtimeId":"term-1","generation":7}}],"terminalMeta":[]}"#;
+    match server_roundtrip(inventory, "terminal.inventory") {
+        ServerMessage::TerminalInventory(message) => {
+            assert_eq!(message.terminals[0].runtime.as_ref().unwrap().generation, 7);
+        }
+        other => panic!("expected TerminalInventory, got {other:?}"),
+    }
+
+    let output = r#"{"type":"terminal.output","data":"aGk=","seqStart":1,"seqEnd":1,"streamId":"stream-1","terminalId":"term-1","runtime":{"runtimeId":"term-1","generation":7}}"#;
+    match server_roundtrip(output, "terminal.output") {
+        ServerMessage::TerminalOutput(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 7);
+        }
+        other => panic!("expected TerminalOutput, got {other:?}"),
+    }
+
+    let exit = r#"{"type":"terminal.exit","exitCode":0,"terminalId":"term-1","runtime":{"runtimeId":"term-1","generation":7}}"#;
+    match server_roundtrip(exit, "terminal.exit") {
+        ServerMessage::TerminalExit(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 7);
+        }
+        other => panic!("expected TerminalExit, got {other:?}"),
+    }
+
+    let fresh_created = r#"{"type":"freshAgent.created","provider":"claude","requestId":"create-1","runtimeProvider":"claude","sessionId":"live-1","sessionType":"freshclaude","runtime":{"runtimeId":"live-1","generation":4}}"#;
+    match server_roundtrip(fresh_created, "freshAgent.created") {
+        ServerMessage::FreshAgentCreated(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 4);
+        }
+        other => panic!("expected FreshAgentCreated, got {other:?}"),
+    }
+
+    let fresh_event = r#"{"type":"freshAgent.event","event":{"type":"freshAgent.status","status":"idle"},"provider":"claude","sessionId":"live-1","sessionType":"freshclaude","runtime":{"runtimeId":"live-1","generation":4}}"#;
+    match server_roundtrip(fresh_event, "freshAgent.event") {
+        ServerMessage::FreshAgentEvent(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 4);
+        }
+        other => panic!("expected FreshAgentEvent, got {other:?}"),
+    }
+
+    let fresh_killed = r#"{"type":"freshAgent.killed","provider":"claude","sessionId":"live-1","sessionType":"freshclaude","success":true,"runtime":{"runtimeId":"live-1","generation":4}}"#;
+    match server_roundtrip(fresh_killed, "freshAgent.killed") {
+        ServerMessage::FreshAgentKilled(message) => {
+            assert_eq!(message.runtime.unwrap().generation, 4);
+        }
+        other => panic!("expected FreshAgentKilled, got {other:?}"),
+    }
+
+    let reconcile = r#"{"type":"pane.reconcile.result","reconcileId":"rec-1","bootId":"boot-1","serverInstanceId":"srv-1","verdicts":[{"paneKey":"pane-1","verdict":"attach","terminalId":"term-1","runtime":{"runtimeId":"term-1","generation":7}}]}"#;
+    match server_roundtrip(reconcile, "pane.reconcile.result") {
+        ServerMessage::PaneReconcileResult(message) => {
+            assert_eq!(message.verdicts[0].runtime.as_ref().unwrap().generation, 7);
+        }
+        other => panic!("expected PaneReconcileResult, got {other:?}"),
+    }
 }
 
 #[test]
@@ -573,6 +732,7 @@ fn terminal_created_notice_is_optional_and_additive() {
         restore_error: None,
         session_ref: None,
         notice: None,
+        runtime: None,
     };
     let json = serde_json::to_value(ServerMessage::TerminalCreated(created.clone())).unwrap();
     assert!(json.get("notice").is_none());

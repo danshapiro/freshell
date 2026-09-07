@@ -229,6 +229,11 @@ export const RUST_ONLY_SPECS = [
   /pane-ledger-restart-rust\.spec\.ts$/,
   // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
   /freshclaude-restart-parity-rust\.spec\.ts$/,
+  // z06a restart-hardening: resumable panes restart while preserving
+  // scrollback/identity. Owns its RustServer through the launch-rust.sh
+  // scratch-server pattern against a fake claude CLI (never requires real
+  // provider auth), so it must not run in fixture-default projects.
+  /restart-resumable-pane-rust\.spec\.ts$/,
   // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
   // restartAbrupt(); hidden panes must rebind without being revealed.
   /hidden-pane-rebind-rust\.spec\.ts$/,
@@ -416,6 +421,11 @@ export default defineConfig({
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
+        // z06a restart-hardening: resumable panes restart while preserving
+        // scrollback/identity across the runtime fence. Owns its RustServer
+        // through the launch-rust.sh scratch-server pattern against a fake
+        // claude CLI; rust-only (never fixture-default).
+        /restart-resumable-pane-rust\.spec\.ts$/,
         // TERM-15/TERM-16 — terminal-mode CLI activity (blue/busy), the
         // server-authoritative terminal.turn.complete, and the NEW
         // terminal.idle edge, all on the Rust activity engine

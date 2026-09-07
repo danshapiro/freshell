@@ -129,6 +129,24 @@ pub enum AgentProvider {
     Amplifier,
 }
 
+/// The two Rust-owned coding-agent runtime families that can participate in
+/// the fenced restart transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRuntimeKind {
+    Terminal,
+    FreshAgent,
+}
+
+/// Server-owned live runtime identity. `generation` is stable for the life of
+/// `runtime_id` and increases when a durable agent session is replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDescriptor {
+    pub runtime_id: String,
+    pub generation: u64,
+}
+
 /// fresh-agent session flavour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

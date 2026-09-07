@@ -1,4 +1,5 @@
-//! Server → client messages (`ServerMessage`, 63 discriminants).
+//! Server → client messages (`ServerMessage`; count asserted by the frozen
+//! inventory — see `ws-message-inventory.json`).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -8,9 +9,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::common::{
-    AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
-    CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
-    TurnCompletionSnapshot,
+    AgentProvider, AgentRuntimeKind, AmplifierActivityRecord, ClaudeActivityRecord,
+    CodexActivityRecord, CodexDurability, ErrorCode, OpencodeActivityRecord, RuntimeDescriptor,
+    SessionLocator, TerminalMetaRecord, TurnCompletionSnapshot,
 };
 use crate::settings::ServerSettings;
 
@@ -18,6 +19,12 @@ use crate::settings::ServerSettings;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    #[serde(rename = "agent.restart.failed")]
+    AgentRestartFailed(AgentRestartFailed),
+    #[serde(rename = "agent.restart.replaced")]
+    AgentRestartReplaced(AgentRestartReplaced),
+    #[serde(rename = "agent.restart.started")]
+    AgentRestartStarted(AgentRestartStarted),
     // Extension surface (not in the frozen T0 inventory — see
     // `EXTENSION_SERVER_MESSAGE_TYPES`): the amplifier activity family the
     // frozen client already consumes, mirroring the legacy zod schemas.
@@ -174,7 +181,10 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 67] = [
+    "agent.restart.failed",
+    "agent.restart.replaced",
+    "agent.restart.started",
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -296,6 +306,106 @@ pub enum RuntimeStatus {
 pub enum TerminalRunStatus {
     Running,
     Exited,
+}
+
+/// Machine-readable terminal result for an `agent.restart` transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AgentRestartFailureCode {
+    /// The connection did not negotiate `agentRestartV1`, so the server did
+    /// not begin a restart transaction.
+    CapabilityNotNegotiated,
+    Unresumable,
+    RuntimeNotFound,
+    StaleGeneration,
+    RequestIdConflict,
+    PreflightFailed,
+    ShutdownFailed,
+    ReplacementFailed,
+    /// The server's platform cannot prove a persisted replacement fence
+    /// quiescent (recovery requires Linux `/proc` ownership scanning), so the
+    /// restart was never started and the durable session was never touched.
+    UnsupportedPlatform,
+    /// Restart ingress was over capacity (an oversized request field, a full
+    /// durable pending-recovery journal, a full per-session restart queue, or
+    /// the global in-flight cap) and the request was refused before any task
+    /// spawn, lock allocation, or journal write. `retryable` distinguishes
+    /// transient capacity (true) from a request that can never fit (false).
+    Overloaded,
+}
+
+/// Old-runtime descriptor flattened with `old*` wire names on a committed
+/// replacement event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OldRuntimeDescriptor {
+    pub old_runtime_id: String,
+    pub old_generation: u64,
+}
+
+impl From<RuntimeDescriptor> for OldRuntimeDescriptor {
+    fn from(value: RuntimeDescriptor) -> Self {
+        Self {
+            old_runtime_id: value.runtime_id,
+            old_generation: value.generation,
+        }
+    }
+}
+
+impl OldRuntimeDescriptor {
+    pub fn as_runtime_descriptor(&self) -> RuntimeDescriptor {
+        RuntimeDescriptor {
+            runtime_id: self.old_runtime_id.clone(),
+            generation: self.old_generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestartStarted {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    #[serde(flatten)]
+    pub runtime: RuntimeDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestartReplaced {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    #[serde(flatten)]
+    pub old_runtime: OldRuntimeDescriptor,
+    #[serde(flatten)]
+    pub runtime: RuntimeDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRestartFailed {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub kind: AgentRuntimeKind,
+    #[serde(flatten)]
+    pub runtime: RuntimeDescriptor,
+    pub code: AgentRestartFailureCode,
+    pub message: String,
+    pub retryable: bool,
+    /// True only when the server durably retained a post-retirement
+    /// transaction that the same request (or a correlated follower) can
+    /// continue, or when durability of the transaction record itself is
+    /// indeterminate (the journal rename landed but the parent-directory sync
+    /// failed) so the retained row is reconciled by server recovery. Clients
+    /// must not infer this phase from a separately delivered
+    /// `agent.restart.started` edge because reconnect can reorder delivery.
+    #[serde(default)]
+    pub recovery_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -751,6 +861,8 @@ pub struct FreshAgentCreated {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -761,6 +873,8 @@ pub struct FreshAgentEvent {
     pub provider: String,
     pub session_id: String,
     pub session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -784,6 +898,8 @@ pub struct FreshAgentKilled {
     pub session_id: String,
     pub session_type: String,
     pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -808,6 +924,8 @@ pub struct FreshAgentSessionMaterialized {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 // --- pane.reconcile.result ----------------------------------------------------
@@ -822,7 +940,8 @@ pub enum ReconcileVerdict {
     DeadSession,
     Invalid,
     /// Terminal per-pane error state (replaces the deleted `retry`):
-    /// reason is one of "index_warming" | "provider_unavailable".
+    /// reason is one of "index_warming" | "provider_unavailable" |
+    /// "restart_retirement_pending".
     Error,
 }
 
@@ -842,7 +961,9 @@ pub struct PaneVerdict {
     /// Present iff the server overrode a differing client claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrected: Option<bool>,
-    /// fresh / dead_session / error / invalid: machine-readable code.
+    /// fresh / dead_session / error / invalid: machine-readable code. Error
+    /// reasons include `index_warming`, `provider_unavailable`, and
+    /// `restart_retirement_pending`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Row 2b (invariant I6): a newer duplicate generation exists for the same
@@ -850,6 +971,9 @@ pub struct PaneVerdict {
     /// merely flags the duplicate `terminalId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duplicate: Option<String>,
+    /// Live runtime fence for attach/reconcile verdicts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 /// Sent ONLY in response to `pane.reconcile.request` — the server never
@@ -895,6 +1019,11 @@ pub struct ReadyCapabilities {
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_interest_v1: Option<bool>,
+    /// Restart transaction support. A v7+ client must treat absence as
+    /// unsupported and must not send `agent.restart`; older servers simply
+    /// strip the hello opt-in and omit this advertisement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_restart_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1048,6 +1177,8 @@ pub struct TerminalAttachReady {
     pub requested_since_seq: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1098,6 +1229,8 @@ pub struct TerminalCreated {
     pub restore_error: Option<TerminalRestoreError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1105,6 +1238,8 @@ pub struct TerminalCreated {
 pub struct TerminalExit {
     pub exit_code: i64,
     pub terminal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1133,6 +1268,8 @@ pub struct InventoryTerminal {
     pub runtime_status: Option<RuntimeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1177,6 +1314,8 @@ pub struct TerminalOutput {
     pub attach_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<OutputSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1204,6 +1343,8 @@ pub struct TerminalOutputBatch {
     pub source: OutputSource,
     pub stream_id: String,
     pub terminal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1216,6 +1357,8 @@ pub struct TerminalOutputGap {
     pub to_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1226,6 +1369,9 @@ pub struct TerminalReplaced {
     pub exit_code: i64,
     pub attempt: u32,
     pub max_attempts: u32,
+    /// Server-owned identity fence for the replacement generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1233,6 +1379,8 @@ pub struct TerminalReplaced {
 pub struct TerminalSessionAssociated {
     pub session_ref: SessionLocator,
     pub terminal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
     /// Present only on a server-authoritative mid-session rebind; names the
     /// session id this association supersedes. Optional+additive on the wire
     /// (WS_PROTOCOL_VERSION deliberately not bumped -- see plan

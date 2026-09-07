@@ -256,6 +256,45 @@ async fn main() -> ExitCode {
     // (`freshell_ws::build_handshake`), mirroring the original's
     // per-connection `configFallback` (`server/index.ts:372-380`).
     let config_fallback = settings_store.config_fallback();
+    let restart = match home
+        .as_ref()
+        .map(|root| root.join(".freshell").join("restart-transactions.json"))
+    {
+        Some(path) => match freshell_ws::restart::RestartCoordinator::new_persistent(path) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "agent.restart.persistence.load_failed: refusing startup"
+                );
+                eprintln!(
+                    "freshell-server: restart transaction journal unavailable; \
+                     refusing to start: {error}"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => freshell_ws::restart::RestartCoordinator::disabled_for_persistence(
+            "restart state has no durable home directory",
+        ),
+    };
+    // Platform gate (fix 4): off-Linux the persisted replacement fence can
+    // never be quiesced, so pending restart rows stay fail-closed forever.
+    // Surface that loudly at boot instead of silently sitting on rows that
+    // can never recover (the capability is also withheld from the handshake
+    // and every preflight is rejected with UNSUPPORTED_PLATFORM).
+    if !freshell_ws::restart::restart_fence_recovery_supported() {
+        let pending_count = restart.pending_recoveries().len();
+        if pending_count > 0 {
+            tracing::error!(
+                count = pending_count,
+                "agent.restart.pending_rows_platform_unsupported: restart transaction \
+                 journal has pending rows, but this platform cannot prove replacement-fence \
+                 quiescence (recovery requires Linux /proc ownership scanning); rows remain \
+                 fail-closed pending"
+            );
+        }
+    }
 
     // Task 2 (AI key cell): process-local mirror of Node's `AI_CONFIG`
     // (`server/ai-prompts.ts:13-23`). Boot semantics = `server/index.ts:251`:
@@ -340,15 +379,42 @@ async fn main() -> ExitCode {
     // `fresh_agent_state` and wired at `new()`-time so the
     // `fresh_opencode_state` clone (taken immediately below) shares it too.
     let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
+    let restart_retirement_probe = restart.clone();
+    let restart_admission_gate = restart.clone();
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
-            .with_layout(layout_store.clone());
+            .with_layout(layout_store.clone())
+            .with_restart_retirement_probe(Arc::new(move |provider, session_id| {
+                restart_retirement_probe.retirement_pending_for(
+                    &freshell_ws::restart::RuntimeLocator::new(
+                        freshell_protocol::AgentRuntimeKind::Terminal,
+                        provider,
+                        session_id,
+                    ),
+                )
+            }))
+            .with_restart_admission_gate(Arc::new(move |provider, session_id| {
+                let restart = restart_admission_gate.clone();
+                Box::pin(async move {
+                    restart
+                        .acquire_session_admission(provider, session_id)
+                        .await
+                        .map(|permit| {
+                            Box::new(permit) as freshell_freshagent::RestartAdmissionPermit
+                        })
+                })
+            }));
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
         freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
     fresh_opencode_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    let fresh_runtime_registry: freshell_freshagent::SharedFreshRuntimeRegistry =
+        Arc::new(restart.clone());
+    fresh_codex_state.set_runtime_registry(Arc::clone(&fresh_runtime_registry));
+    fresh_claude_state.set_runtime_registry(Arc::clone(&fresh_runtime_registry));
+    fresh_opencode_state.set_runtime_registry(fresh_runtime_registry);
 
     // The shared, connection-independent terminal registry: terminals are owned by
     // `terminalId` here (not by the socket that created them), so a second/reconnected
@@ -825,6 +891,11 @@ async fn main() -> ExitCode {
     );
     // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
     let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Task 6 (fix 1): the restart coordinator consults the SAME latch for WS
+    // ingress rejection and replacement-creation refusal, so restart work
+    // latches shut the instant the signal handler flips this flag — before
+    // the graceful sequence below even starts its phased drain.
+    restart.set_shutdown_latch(std::sync::Arc::clone(&shutdown_started));
     // P1.13: inject the ledger-backed identity sink into the fresh-agent
     // states (constructed earlier, before the ledger exists — the
     // post-construction setter exists precisely for this ordering). All
@@ -1054,7 +1125,41 @@ async fn main() -> ExitCode {
         spawn_gate: std::sync::Arc::clone(&spawn_gate),
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: restart.clone(),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
+    };
+    let _restart_runtime_registration = restart.set_runtime(std::sync::Arc::new(
+        freshell_ws::restart::ProductionRestartRuntime::new(ws_state.clone()),
+    ));
+    {
+        let recovery_broadcast_tx = Arc::clone(&broadcast_tx);
+        let _boot_recovery_report = complete_restart_boot_recovery(
+            session_index.clone(),
+            restart.clone(),
+            move |message| {
+                if let Ok(frame) = serde_json::to_string(message) {
+                    let _ = recovery_broadcast_tx.send(frame);
+                }
+            },
+        )
+        .await;
+    };
+    // Always-on recovery driver (fix 2): runs for the process lifetime, parks
+    // on the coordinator's recovery Notify, and is woken the moment any
+    // runtime-created retryable pending row lands — recovery no longer needs
+    // a boot-pass backlog or a browser resend.
+    let restart_recovery_driver_task = {
+        let recovery_broadcast_tx = Arc::clone(&broadcast_tx);
+        tokio::spawn(freshell_ws::restart::run_restart_recovery_driver(
+            restart.clone(),
+            Arc::clone(&shutdown_started),
+            Arc::clone(&shutdown_notify),
+            move |message| {
+                if let Ok(frame) = serde_json::to_string(message) {
+                    let _ = recovery_broadcast_tx.send(frame);
+                }
+            },
+        ))
     };
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
@@ -1282,27 +1387,11 @@ async fn main() -> ExitCode {
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
     //
-    // Warm the cache in the background so the first real request never pays
-    // the cold full-sweep cost. The scan itself runs in `spawn_blocking`
-    // (inside `SessionIndex::snapshot`), so this never delays serving other
-    // requests while it's in flight.
+    // When restart transactions were loaded, the boot gate above warmed the
+    // cache before recovering them, so recovery never mistakes a cold index
+    // for missing durable state. An ordinary boot with no pending transaction
+    // deliberately leaves the first scan lazy.
     if let Some(index) = &session_index {
-        let warm_index = Arc::clone(index);
-        // DIAG-01: log the initial warm sweep's count + duration (an
-        // equivalent call to `index.warm()`'s own body -- `snapshot()` is
-        // what `warm()` calls internally -- but keeping the return value
-        // here lets this main.rs-scoped call site report a real count
-        // instead of discarding it).
-        tokio::spawn(async move {
-            let start = std::time::Instant::now();
-            let items = warm_index.snapshot().await;
-            tracing::info!(
-                event = "session_index_warm",
-                count = items.len(),
-                duration_ms = start.elapsed().as_millis() as u64,
-                "session index warm sweep complete"
-            );
-        });
         // SESSION-09: start the periodic sessions.changed sweep -- see
         // `spawn_sessions_sweep`'s doc comment for the full parity rationale.
         // `ws_state` is Clone (cheap: every field is an Arc/primitive), so
@@ -1892,7 +1981,82 @@ async fn main() -> ExitCode {
         std::sync::Arc::clone(&shutdown_started),
     )
     .await;
+    // The SAFE-11 watchdog was armed the instant the signal arrived; every
+    // graceful phase below runs under ONE shared deadline so no phase can
+    // consume the budget of a later one (whole-branch review M-2).
+    let graceful_deadline = tokio::time::Instant::now() + SHUTDOWN_HARD_TIMEOUT;
     rebind.shutdown_all().await;
+    // Stop background restart recovery before child-process cleanup. A pass
+    // already inside a provider ownership barrier is allowed to finish, so a
+    // replacement cannot appear after the cleanup sweep has taken its process
+    // snapshot. The driver normally exits on the first wakeup after
+    // `shutdown_notify` fires, so this bound is small; the shared graceful
+    // deadline remains the outer limit if a provider operation wedges (the
+    // abort below only detaches a wedged inner pass — convergence belongs to
+    // the durable pending rows next boot). (`shutdown_signal` already latched
+    // `shutdown_started` and notified waiters; re-asserting here is idempotent
+    // and keeps this drain correct under any future serve path.)
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+    shutdown_notify.notify_waiters();
+    let mut recovery_driver_task = restart_recovery_driver_task;
+    let driver_stop_deadline = std::cmp::min(
+        graceful_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+    if tokio::time::timeout_at(driver_stop_deadline, &mut recovery_driver_task)
+        .await
+        .is_err()
+    {
+        tracing::error!("agent.restart.recovery_driver.shutdown_timeout");
+        recovery_driver_task.abort();
+        let _ = recovery_driver_task.await;
+    }
+
+    // Task 6 (fix 1): graceful shutdown OWNS every registered restart
+    // transaction before provider/terminal cleanup. The latch was already
+    // asserted by `shutdown_signal` (which flips the SAME Arc wired into the
+    // coordinator at construction); re-asserting is idempotent and keeps this
+    // ordering correct under any future serve path. Then JOIN the registered
+    // in-flight set so `registry.kill_all()` below can never reap the
+    // selected old runtime of a mid-flight transaction, and DRAIN the
+    // codex/claude restart quarantines through their confirmed process-tree
+    // barriers — quarantined runtimes are outside the providers' `sessions`
+    // maps, so their ordinary shutdown sweeps never see them.
+    //
+    // LB-02 (+ review M-2 clamping): the SAFE-11 watchdog
+    // (SHUTDOWN_HARD_TIMEOUT, armed at signal arrival) bounds the ENTIRE
+    // graceful sequence, so these phases run under ONE shared spend deadline:
+    // the transaction join gets ≤ 3,000 ms, then the quarantine drains share
+    // ≤ 2,000 ms across both providers in parallel (per-entry budgets are
+    // clamped by the shared deadline inside each drain) — each clamped so the
+    // earlier (WS-close flush, rebind, driver-stop) phases can never push a
+    // later one past the watchdog. Truncation logs loudly and leaves
+    // convergence to the durable pending rows + fenced cross-boot recovery
+    // next boot.
+    restart.begin_restart_shutdown();
+    let join_deadline = std::cmp::min(
+        graceful_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_millis(3_000),
+    );
+    if tokio::time::timeout_at(join_deadline, restart.join_in_flight_transactions())
+        .await
+        .is_err()
+    {
+        // Do NOT abort stragglers: replacement creation is latched shut, so a
+        // still-running transaction can only be finishing its retirement —
+        // the cleanup sweep below reaps it, and its durable row owns
+        // cross-boot convergence.
+        tracing::error!("agent.restart.shutdown.transactions_join_timeout");
+    }
+    let drain_deadline = std::cmp::min(
+        graceful_deadline,
+        tokio::time::Instant::now() + std::time::Duration::from_millis(2_000),
+    );
+    tokio::join!(
+        fresh_codex_state.drain_restart_retirements(drain_deadline),
+        fresh_claude_state.drain_restart_retirements(drain_deadline),
+    );
+
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
     // drained, `joinCodexShutdownOwners` reaps `registry.shutdownGracefully()`
@@ -1945,6 +2109,11 @@ async fn main() -> ExitCode {
     // create_gate.rs's shutdown_started checks.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let _ = registry.kill_all();
+    // Task 6 (fix 1): clear the OpenCode restart quarantine bookkeeping. A
+    // quarantined opencode entry owns NO local process — its fenced remote
+    // abort is the next boot's cross-boot recovery job — so this drain logs
+    // the abandoned entries loudly rather than pretending local quiescence.
+    fresh_opencode_state.drain_restart_retirements().await;
     fresh_agent_state.shutdown().await;
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
@@ -2506,6 +2675,96 @@ fn resolve_client_dir() -> PathBuf {
     PathBuf::from("dist/client")
 }
 
+/// Publish the first session-index snapshot before running boot work whose
+/// preflight treats a cold index as retryable `Unknown`.
+///
+/// The callback still runs when no provider home resolved (and therefore no
+/// index exists), preserving the previous no-index recovery behavior. In the
+/// normal production path, however, an already-stopped pending restart gets
+/// one deterministic recovery attempt against disk truth instead of depending
+/// on a surviving client to resend after the background warm happens to finish.
+async fn warm_initial_session_index_then<F, Fut>(
+    session_index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
+    after_warm: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if let Some(index) = session_index {
+        // DIAG-01: preserve the initial warm sweep's count + duration.
+        let start = std::time::Instant::now();
+        let items = index.snapshot().await;
+        tracing::info!(
+            event = "session_index_warm",
+            count = items.len(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            "session index warm sweep complete"
+        );
+    }
+    after_warm().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartBootRecoveryReport {
+    pending_before: usize,
+    pending_after: usize,
+}
+
+/// Complete one deterministic recovery attempt for every restart transaction
+/// loaded at boot before auto-resume, reconciliation, or create paths become
+/// reachable.
+///
+/// A retryable provider fence does not make the whole server unavailable
+/// forever: once that bounded attempt returns, startup continues with the
+/// journal intact and the coordinator keeps that locator's create/reconcile
+/// admission plus replacement adoption fail-closed. Unrelated locators remain
+/// available. Normal boots with no pending transaction also avoid paying for
+/// an eager session index scan.
+async fn complete_restart_boot_recovery<F>(
+    session_index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
+    restart: freshell_ws::restart::RestartCoordinator,
+    mut emit: F,
+) -> RestartBootRecoveryReport
+where
+    F: FnMut(&freshell_protocol::ServerMessage) + Send + 'static,
+{
+    let pending_before = restart.pending_recoveries().len();
+    if pending_before == 0 {
+        return RestartBootRecoveryReport {
+            pending_before,
+            pending_after: 0,
+        };
+    }
+
+    tracing::info!(pending_before, "agent.restart.boot_recovery.started");
+    let recovery_restart = restart.clone();
+    warm_initial_session_index_then(session_index, move || async move {
+        recovery_restart
+            .recover_pending_registered(|message| emit(message))
+            .await;
+    })
+    .await;
+
+    let pending_after = restart.pending_recoveries().len();
+    if pending_after == 0 {
+        tracing::info!(
+            pending_before,
+            pending_after,
+            "agent.restart.boot_recovery.completed"
+        );
+    } else {
+        tracing::warn!(
+            pending_before,
+            pending_after,
+            "agent.restart.boot_recovery.incomplete"
+        );
+    }
+    RestartBootRecoveryReport {
+        pending_before,
+        pending_after,
+    }
+}
+
 /// SESSION-09 sweep cadence (identity ticker fallback). The sessions sweep is
 /// now event-driven: `SessionWatcher` feeds inotify events into the index's
 /// dirty-marking, and `subscribe_changes()` wakes the sweep loop on each
@@ -2723,8 +2982,14 @@ fn spawn_sessions_sweep(
 #[cfg(test)]
 mod sessions_sweep_tests {
     use super::*;
+    use freshell_protocol::{
+        AgentRestart, AgentRestartFailureCode, AgentRuntimeKind, ServerMessage,
+    };
     use freshell_sessions::directory_index::{
         ClaudeSource, IndexedSession, SessionIndex, SessionSource,
+    };
+    use freshell_ws::restart::{
+        RestartCoordinator, RestartFailure, RestartRuntime, RuntimeLocator,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2906,6 +3171,316 @@ mod sessions_sweep_tests {
         );
 
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    struct PendingUntilColdIndexWarms {
+        index: Arc<SessionIndex>,
+        recovery_attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RestartRuntime for PendingUntilColdIndexWarms {
+        type ResumePlan = ();
+
+        async fn preflight(
+            &self,
+            _request: &AgentRestart,
+        ) -> Result<Self::ResumePlan, RestartFailure> {
+            Ok(())
+        }
+
+        async fn shutdown_for_restart(
+            &self,
+            _request: &AgentRestart,
+            _plan: &Self::ResumePlan,
+        ) -> Result<(), RestartFailure> {
+            Ok(())
+        }
+
+        async fn create_replacement(
+            &self,
+            _request: &AgentRestart,
+            _plan: Self::ResumePlan,
+        ) -> Result<String, RestartFailure> {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ReplacementFailed,
+                "server stopped after teardown",
+                true,
+            ))
+        }
+
+        async fn recover_replacement(
+            &self,
+            request: &AgentRestart,
+            _context: Option<&freshell_ws::restart::RestartResumeContext>,
+        ) -> Result<String, RestartFailure> {
+            self.recovery_attempts.fetch_add(1, Ordering::SeqCst);
+            let ready = self.index.peek().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.provider == request.provider && item.session_id == request.session_id
+                })
+            });
+            if ready {
+                Ok("term-after-cold-index".to_string())
+            } else {
+                Err(RestartFailure::new(
+                    AgentRestartFailureCode::PreflightFailed,
+                    "session index is still warming; retry restart shortly",
+                    true,
+                ))
+            }
+        }
+    }
+
+    /// Regression: production boot must publish the first real disk snapshot
+    /// before it asks the registered adapter to recover an already-stopped
+    /// runtime. Otherwise the honest cold-index `Unknown` becomes one
+    /// retryable failure with no client left to resend the request.
+    #[tokio::test]
+    async fn cold_index_warms_before_pending_restart_recovery() {
+        let claude_home = unique_temp_dir("restart-cold-index").join(".claude");
+        let session_id = "66666666-6666-4666-8666-666666666666";
+        write_claude_session(
+            &claude_home,
+            session_id,
+            "/tmp/restart-cold-index",
+            "2026-07-29T00:00:00.000Z",
+        );
+        let index = Arc::new(SessionIndex::new(vec![
+            Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>,
+        ]));
+        assert!(index.peek().is_none(), "regression requires a cold index");
+
+        let request = AgentRestart {
+            request_id: "boot-cold-index-r1".to_string(),
+            provider: "claude".to_string(),
+            session_id: session_id.to_string(),
+            kind: AgentRuntimeKind::Terminal,
+            live_id: "term-before-restart".to_string(),
+            expected_generation: 1,
+        };
+        let runtime = Arc::new(PendingUntilColdIndexWarms {
+            index: Arc::clone(&index),
+            recovery_attempts: AtomicUsize::new(0),
+        });
+        let restart_state_path = claude_home.parent().unwrap().join("restart-state.json");
+        let coordinator = RestartCoordinator::new_persistent(restart_state_path.clone()).unwrap();
+        coordinator.register_initial(
+            RuntimeLocator::new(
+                AgentRuntimeKind::Terminal,
+                request.provider.clone(),
+                request.session_id.clone(),
+            ),
+            &request.live_id,
+        );
+        coordinator.execute(request.clone(), runtime.as_ref()).await;
+        assert_eq!(coordinator.pending_recoveries().len(), 1);
+        drop(coordinator);
+
+        let coordinator = RestartCoordinator::new_persistent(restart_state_path).unwrap();
+        assert_eq!(
+            coordinator.pending_recoveries().len(),
+            1,
+            "the stopped runtime must still be pending after coordinator reopen"
+        );
+        let _registration = coordinator.set_runtime(runtime.clone());
+        let emitted = std::sync::Mutex::new(Vec::new());
+
+        warm_initial_session_index_then(Some(Arc::clone(&index)), || async {
+            coordinator
+                .recover_pending_registered(|message| {
+                    emitted.lock().unwrap().push(message.clone());
+                })
+                .await;
+        })
+        .await;
+
+        assert_eq!(runtime.recovery_attempts.load(Ordering::SeqCst), 1);
+        assert!(coordinator.pending_recoveries().is_empty());
+        assert!(matches!(
+            emitted.lock().unwrap().last(),
+            Some(ServerMessage::AgentRestartReplaced(replaced))
+                if replaced.runtime.runtime_id == "term-after-cold-index"
+        ));
+
+        std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
+    }
+
+    struct BootRecoveryBarrier {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    struct RetirementAlwaysPending;
+
+    #[async_trait::async_trait]
+    impl RestartRuntime for RetirementAlwaysPending {
+        type ResumePlan = ();
+
+        async fn preflight(
+            &self,
+            _request: &AgentRestart,
+        ) -> Result<Self::ResumePlan, RestartFailure> {
+            Ok(())
+        }
+
+        async fn shutdown_for_restart(
+            &self,
+            _request: &AgentRestart,
+            _plan: &Self::ResumePlan,
+        ) -> Result<(), RestartFailure> {
+            Err(RestartFailure::new(
+                AgentRestartFailureCode::ShutdownFailed,
+                "retirement fence is still active",
+                true,
+            ))
+        }
+
+        async fn create_replacement(
+            &self,
+            _request: &AgentRestart,
+            _plan: Self::ResumePlan,
+        ) -> Result<String, RestartFailure> {
+            unreachable!("retirement never completed")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RestartRuntime for BootRecoveryBarrier {
+        type ResumePlan = ();
+
+        async fn preflight(
+            &self,
+            _request: &AgentRestart,
+        ) -> Result<Self::ResumePlan, RestartFailure> {
+            Ok(())
+        }
+
+        async fn shutdown_for_restart(
+            &self,
+            _request: &AgentRestart,
+            _plan: &Self::ResumePlan,
+        ) -> Result<(), RestartFailure> {
+            unreachable!("boot recovery uses the persisted retirement path")
+        }
+
+        async fn create_replacement(
+            &self,
+            _request: &AgentRestart,
+            _plan: Self::ResumePlan,
+        ) -> Result<String, RestartFailure> {
+            unreachable!("boot recovery uses recover_replacement")
+        }
+
+        async fn recover_persisted_retirement(
+            &self,
+            _request: &AgentRestart,
+            _context: Option<&freshell_ws::restart::RestartResumeContext>,
+            _fence: Option<&freshell_ws::restart::RestartRetirementFence>,
+        ) -> Result<(), RestartFailure> {
+            self.entered.wait().await;
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn recover_replacement(
+            &self,
+            _request: &AgentRestart,
+            _context: Option<&freshell_ws::restart::RestartResumeContext>,
+        ) -> Result<String, RestartFailure> {
+            Ok("term-after-boot-gate".to_string())
+        }
+    }
+
+    /// The production readiness boundary must await the complete registered
+    /// restart-recovery attempt. This pins the real boot helper instead of
+    /// merely testing that recovery was eventually spawned in the background.
+    #[tokio::test]
+    async fn restart_boot_gate_finishes_recovery_before_readiness_can_continue() {
+        let coordinator = RestartCoordinator::new();
+        coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "boot-gate-session"),
+            "term-before-boot-gate",
+        );
+        let request = AgentRestart {
+            request_id: "boot-gate-r1".to_string(),
+            provider: "claude".to_string(),
+            session_id: "boot-gate-session".to_string(),
+            kind: AgentRuntimeKind::Terminal,
+            live_id: "term-before-boot-gate".to_string(),
+            expected_generation: 1,
+        };
+        coordinator.execute(request, &RetirementAlwaysPending).await;
+        assert_eq!(coordinator.pending_recoveries().len(), 1);
+
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runtime = Arc::new(BootRecoveryBarrier {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let _registration = coordinator.set_runtime(runtime);
+        let recovery = tokio::spawn(complete_restart_boot_recovery(None, coordinator, |_| {}));
+
+        entered.wait().await;
+        assert!(
+            !recovery.is_finished(),
+            "readiness must remain behind an in-progress retirement fence"
+        );
+        release.notify_one();
+
+        let report = recovery.await.unwrap();
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.pending_after, 0);
+    }
+
+    /// A provider fence may remain retryably blocked after the boot attempt.
+    /// Global startup may continue once that attempt has returned, with the
+    /// durable journal and its session-scoped create/reconcile fence intact
+    /// for an explicit retry rather than hanging unrelated sessions forever
+    /// or falsely reporting successful recovery.
+    #[tokio::test]
+    async fn restart_boot_gate_releases_readiness_after_retryable_failure() {
+        let coordinator = RestartCoordinator::new();
+        coordinator.register_initial(
+            RuntimeLocator::new(AgentRuntimeKind::Terminal, "claude", "blocked-boot-session"),
+            "term-before-blocked-boot",
+        );
+        let request = AgentRestart {
+            request_id: "blocked-boot-r1".to_string(),
+            provider: "claude".to_string(),
+            session_id: "blocked-boot-session".to_string(),
+            kind: AgentRuntimeKind::Terminal,
+            live_id: "term-before-blocked-boot".to_string(),
+            expected_generation: 1,
+        };
+        coordinator.execute(request, &RetirementAlwaysPending).await;
+        let _registration = coordinator.set_runtime(Arc::new(RetirementAlwaysPending));
+
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            complete_restart_boot_recovery(None, coordinator.clone(), |_| {}),
+        )
+        .await
+        .expect("retryable recovery must return control to startup");
+
+        assert_eq!(report.pending_before, 1);
+        assert_eq!(report.pending_after, 1);
+        assert_eq!(
+            coordinator.pending_recoveries().len(),
+            1,
+            "retryable retirement remains durable for a later request"
+        );
+        assert!(coordinator.retirement_pending_for(&RuntimeLocator::new(
+            AgentRuntimeKind::Terminal,
+            "claude",
+            "blocked-boot-session",
+        )));
+        assert!(!coordinator.retirement_pending_for(&RuntimeLocator::new(
+            AgentRuntimeKind::Terminal,
+            "claude",
+            "unrelated-session",
+        )));
     }
 
     /// The corpus-composition bug this reproduces: a REAL session-directory
@@ -3099,6 +3674,7 @@ mod sessions_sweep_tests {
                 serde_json::from_value(settings_json).unwrap(),
             )),
             broadcast_tx: Arc::clone(&broadcast_tx),
+            restart: freshell_ws::restart::RestartCoordinator::new(),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             auto_resume_cancels: Default::default(),
             fresh_codex: freshell_freshagent::FreshCodexState::new(

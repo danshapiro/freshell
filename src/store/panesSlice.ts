@@ -21,7 +21,11 @@ import {
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import {
+  buildPaneRefreshTarget,
+  paneMatchesAgentRuntimeReplacement,
+  paneRefreshTargetMatchesContent,
+} from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
@@ -30,6 +34,7 @@ import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type Rest
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import type { AgentRestartReplacedMessage } from '@shared/ws-protocol'
 
 
 const log = createLogger('PanesSlice')
@@ -45,6 +50,15 @@ type FreshAgentSessionMaterializedPayload = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   sessionRef?: SessionLocator
+}
+
+export type RestartFreshAgentCreatePayload = {
+  tabId: string
+  paneId: string
+  content?: FreshAgentPaneContent
+  sessionIds?: string[]
+  sessionType?: FreshAgentPaneContent['sessionType']
+  provider?: FreshAgentPaneContent['provider']
 }
 
 function buildPreservedSessionRef(
@@ -80,6 +94,12 @@ function normalizePaneContent(
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
+      runtimeId: typeof input.runtimeId === 'string' ? input.runtimeId : undefined,
+      runtimeGeneration: typeof input.runtimeGeneration === 'number'
+        && Number.isInteger(input.runtimeGeneration)
+        && input.runtimeGeneration >= 0
+        ? input.runtimeGeneration
+        : undefined,
       createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
         ? input.createRequestId
         : previousCreateRequestId || nanoid(),
@@ -183,6 +203,12 @@ function normalizePaneContent(
             ? {}
             : { resumeSessionId: input.resumeSessionId }),
           serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+          runtimeId: typeof input.runtimeId === 'string' ? input.runtimeId : undefined,
+          runtimeGeneration: typeof input.runtimeGeneration === 'number'
+            && Number.isInteger(input.runtimeGeneration)
+            && input.runtimeGeneration >= 0
+            ? input.runtimeGeneration
+            : undefined,
           restoreError: existingRestoreError,
           initialCwd: input.initialCwd,
           createError: input.createError,
@@ -257,6 +283,12 @@ function normalizePaneContent(
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
+      runtimeId: typeof input.runtimeId === 'string' ? input.runtimeId : undefined,
+      runtimeGeneration: typeof input.runtimeGeneration === 'number'
+        && Number.isInteger(input.runtimeGeneration)
+        && input.runtimeGeneration >= 0
+        ? input.runtimeGeneration
+        : undefined,
       createRequestId,
       status,
       ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
@@ -689,6 +721,8 @@ function clearTerminalContentForRecreate(
   node.content.terminalId = undefined
   node.content.serverInstanceId = undefined
   node.content.streamId = undefined
+  node.content.runtimeId = undefined
+  node.content.runtimeGeneration = undefined
   node.content.status = 'creating'
   node.content.createRequestId = nextRequestId
   if (!sanitizeSessionRef(node.content.sessionRef)) {
@@ -762,6 +796,25 @@ function findReconcilePaneContent(
   const content = leaf?.content
   if (content?.kind === 'terminal' || content?.kind === 'fresh-agent') return content
   return undefined
+}
+
+function canAdoptReconcileRuntime(
+  content: TerminalPaneContent | FreshAgentPaneContent,
+  runtime: { runtimeId: string; generation: number } | undefined,
+  nextServerInstanceId: string | undefined,
+): boolean {
+  const currentGeneration = content.runtimeGeneration
+  if (currentGeneration === undefined) return true
+  if (!runtime) return false
+  if (runtime.runtimeId === content.runtimeId) return runtime.generation >= currentGeneration
+  if (
+    content.serverInstanceId
+    && nextServerInstanceId
+    && content.serverInstanceId !== nextServerInstanceId
+  ) {
+    return true
+  }
+  return runtime.generation > currentGeneration
 }
 
 function freshAgentPaneMatchesMaterializedSession(
@@ -1063,7 +1116,14 @@ function mergeTerminalState(
  */
 function stripStaleIds(content: PaneContent): PaneContentInput {
   if (content.kind === 'terminal') {
-    const { terminalId: _terminalId, createRequestId: _createRequestId, status: _status, ...rest } = content
+    const {
+      terminalId: _terminalId,
+      runtimeId: _runtimeId,
+      runtimeGeneration: _runtimeGeneration,
+      createRequestId: _createRequestId,
+      status: _status,
+      ...rest
+    } = content
     return rest
   }
   if (content.kind === 'browser') {
@@ -1076,6 +1136,8 @@ function stripStaleIds(content: PaneContent): PaneContentInput {
       createRequestId: _createRequestId,
       status: _status,
       serverInstanceId: _serverInstanceId,
+      runtimeId: _runtimeId,
+      runtimeGeneration: _runtimeGeneration,
       createError: _createError,
       reconcileEpoch: _reconcileEpoch,
       pendingReconcile: _pendingReconcile,
@@ -1227,6 +1289,56 @@ export const panesSlice = createSlice({
   name: 'panes',
   initialState,
   reducers: {
+    /**
+     * Fold one server-committed runtime replacement into every local viewer.
+     * The old live identity and generation are both fenced, so replayed or
+     * out-of-order broadcasts are idempotent and cannot repoint a newer pane.
+     */
+    applyAgentRestartReplaced: (
+      state,
+      action: PayloadAction<AgentRestartReplacedMessage>,
+    ) => {
+      const replacement = action.payload
+      for (const [tabId, root] of Object.entries(state.layouts)) {
+        let changed = false
+        const replace = (node: PaneNode): PaneNode => {
+          if (node.type === 'split') {
+            const left = replace(node.children[0])
+            const right = replace(node.children[1])
+            if (left === node.children[0] && right === node.children[1]) return node
+            return { ...node, children: [left, right] }
+          }
+          if (!paneMatchesAgentRuntimeReplacement(node.content, replacement)) return node
+
+          changed = true
+          if (node.content.kind === 'terminal') {
+            // Commit the generation before the live ID so a render/effect
+            // always observes a fully fenced descriptor.
+            node.content.runtimeGeneration = replacement.generation
+            node.content.runtimeId = replacement.runtimeId
+            node.content.terminalId = replacement.runtimeId
+            node.content.streamId = undefined
+            node.content.status = 'running'
+            node.content.restoreError = undefined
+            // TerminalView intentionally excludes terminalId from its network
+            // effect dependencies because terminal.created attaches inline.
+            // A restart fold uses the existing volatile epoch to trigger the
+            // one replacement rebind without duplicating ordinary attaches.
+            node.content.reconcileEpoch = (node.content.reconcileEpoch ?? 0) + 1
+          } else {
+            node.content.runtimeGeneration = replacement.generation
+            node.content.runtimeId = replacement.runtimeId
+            node.content.status = 'connected'
+            node.content.createError = undefined
+            node.content.restoreError = undefined
+          }
+          return node
+        }
+        state.layouts[tabId] = replace(root)
+        if (changed) reconcileRefreshRequestsForTab(state, tabId)
+      }
+    },
+
     initLayout: (
       state,
       action: PayloadAction<{ tabId: string; content: PaneContentInput; paneId?: string }>
@@ -1847,7 +1959,7 @@ export const panesSlice = createSlice({
 
     restartFreshAgentCreate: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string }>
+      action: PayloadAction<RestartFreshAgentCreatePayload>
     ) => {
       const { tabId, paneId } = action.payload
       const root = state.layouts[tabId]
@@ -1862,14 +1974,19 @@ export const panesSlice = createSlice({
           if (node.id !== paneId || node.content.kind !== 'fresh-agent') {
             return node
           }
+          const replacement = action.payload.content ?? {
+            ...node.content,
+            sessionId: undefined,
+            createRequestId: nanoid(),
+            status: 'creating',
+            createError: undefined,
+          }
           return {
             ...node,
             content: normalizePaneContent({
-              ...node.content,
-              sessionId: undefined,
-              createRequestId: nanoid(),
-              status: 'creating',
-              createError: undefined,
+              ...replacement,
+              runtimeId: undefined,
+              runtimeGeneration: undefined,
             }, node.content),
           }
         }
@@ -2320,6 +2437,7 @@ export const panesSlice = createSlice({
         terminalId: string
         serverInstanceId?: string
         sessionRef?: SessionLocator
+        runtime?: { runtimeId: string, generation: number }
         corrected?: boolean
         duplicate?: boolean
       }>
@@ -2328,9 +2446,14 @@ export const panesSlice = createSlice({
       if (!terminalId) return
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
+      if (!canAdoptReconcileRuntime(content, action.payload.runtime, serverInstanceId)) return
 
       foldLiveTerminalAttach(content, terminalId)
       content.serverInstanceId = serverInstanceId
+      if (action.payload.runtime) {
+        content.runtimeId = action.payload.runtime.runtimeId
+        content.runtimeGeneration = action.payload.runtime.generation
+      }
       const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
       if (sessionRef) {
         content.sessionRef = sessionRef
@@ -2386,6 +2509,8 @@ export const panesSlice = createSlice({
       content.terminalId = undefined
       content.serverInstanceId = undefined
       content.streamId = undefined
+      content.runtimeId = undefined
+      content.runtimeGeneration = undefined
       content.status = 'creating'
       content.restoreError = undefined
 
@@ -2444,6 +2569,7 @@ export const panesSlice = createSlice({
         paneId: string
         sessionRef?: SessionLocator
         serverInstanceId?: string
+        runtime?: { runtimeId: string, generation: number }
         corrected?: boolean
         duplicate?: boolean
       }>
@@ -2452,11 +2578,16 @@ export const panesSlice = createSlice({
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
       if (!sessionRef?.sessionId || sessionRef.provider !== content.provider) return // malformed verdict — no-op
+      if (!canAdoptReconcileRuntime(content, action.payload.runtime, serverInstanceId)) return
       content.sessionId = sessionRef.sessionId
       content.sessionRef = { provider: sessionRef.provider, sessionId: sessionRef.sessionId }
       content.resumeSessionId = sessionRef.sessionId
       content.status = 'connected'
       content.serverInstanceId = serverInstanceId
+      if (action.payload.runtime) {
+        content.runtimeId = action.payload.runtime.runtimeId
+        content.runtimeGeneration = action.payload.runtime.generation
+      }
       content.restoreError = undefined
       content.createError = undefined
       content.pendingReconcile = undefined
@@ -2497,6 +2628,8 @@ export const panesSlice = createSlice({
       }
       content.sessionId = undefined
       content.serverInstanceId = undefined
+      content.runtimeId = undefined
+      content.runtimeGeneration = undefined
       content.status = 'creating'
       content.restoreError = undefined
       content.createError = undefined
@@ -2658,6 +2791,8 @@ export const panesSlice = createSlice({
           node.content.terminalId = undefined
           node.content.serverInstanceId = undefined
           node.content.streamId = undefined
+          node.content.runtimeId = undefined
+          node.content.runtimeGeneration = undefined
           node.content.status = 'creating'
           node.content.createRequestId = createRequestId
           node.content.sessionRef = expectedSessionRef
@@ -2680,6 +2815,7 @@ export const panesSlice = createSlice({
 })
 
 export const {
+  applyAgentRestartReplaced,
   initLayout,
   restoreLayout,
   resetLayout,

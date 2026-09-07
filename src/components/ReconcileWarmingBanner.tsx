@@ -8,9 +8,9 @@ import { OVERLAY_Z } from '@/components/ui/overlay'
 
 /**
  * ONE warming banner for ALL panes whose reconcile verdicts came back
- * index_warming (council rule 5) — never one banner per pane. This state
- * is EXPECTED on cold boots: the session index scan can take minutes, so
- * "Retry now" is the prominent recovery path, not an edge case.
+ * retryable reconciliation deferrals — never one banner per pane. This state
+ * is expected while the session index warms or a predecessor runtime finishes
+ * retirement, so "Retry now" is the prominent recovery path.
  */
 export function ReconcileWarmingBanner() {
   const dispatch = useAppDispatch()
@@ -71,7 +71,7 @@ export function ReconcileWarmingBanner() {
       className={`fixed top-3 left-1/2 -translate-x-1/2 ${OVERLAY_Z.menu} flex items-center gap-3 bg-background border border-border rounded-md shadow-lg px-4 py-2`}
     >
       <span className="text-sm">
-        Waiting for session index — {warming.count} pane(s)
+        Waiting for session recovery — {warming.count} pane(s)
       </span>
       <button
         onClick={handleRetry}

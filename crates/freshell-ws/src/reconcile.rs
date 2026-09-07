@@ -72,6 +72,7 @@ fn invalid(pane: &ReconcilePane, reason: &str) -> PaneVerdict {
         corrected: None,
         reason: Some(reason.to_string()),
         duplicate: None,
+        runtime: None,
     }
 }
 
@@ -84,6 +85,7 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         corrected: None,
         reason: None,
         duplicate: None,
+        runtime: None,
     }
 }
 

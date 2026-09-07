@@ -169,6 +169,7 @@ async fn spawn_combined_server(
         spawn_gate: Arc::clone(&gate),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        restart: freshell_ws::restart::RestartCoordinator::new(),
         config_fallback: None,
         opencode_locator: None,
         codex_locator: None,

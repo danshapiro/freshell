@@ -42,14 +42,14 @@
 //! this crate keeps its no-tokio boundary (`freshell-ws` backs the sink with a tokio
 //! mpsc sender feeding the socket).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
-    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
+    GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator, Shell,
     TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalModesSync, TerminalOutput,
     TerminalRunStatus,
 };
@@ -265,6 +265,10 @@ struct TerminalShared {
     /// handshake design §5.1). `None` for creates that carried no key (e.g.
     /// REST ingress, which mints none — design §5.5 precondition 2).
     create_request_id: Option<String>,
+    /// Exact launch inputs needed to recreate this terminal after a
+    /// restart-specific teardown. Captured from the values that built the
+    /// running PTY rather than re-reading mutable server defaults later.
+    restart_launch: Option<TerminalRestartLaunch>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
     /// Whether the client EXPLICITLY released its last reference to this
@@ -313,6 +317,7 @@ impl TerminalShared {
             description: self.description.clone(),
             runtime_status: None,
             session_ref: None,
+            runtime: None,
         }
     }
 }
@@ -336,6 +341,19 @@ pub struct IdentityProbeRow {
     /// The terminal's working directory — carried so the §5.4 adopt branch can
     /// echo the EXISTING terminal's cwd on its `terminal.created` frame.
     pub cwd: Option<String>,
+    pub restart_launch: Option<TerminalRestartLaunch>,
+}
+
+/// Runtime-authoritative terminal launch values retained for exact restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRestartLaunch {
+    pub shell: Shell,
+    pub permission_mode: Option<String>,
+    pub model: Option<String>,
+    pub sandbox: Option<String>,
+    /// `None` for non-Codex/legacy records, `Some(false)` for plain Codex,
+    /// and `Some(true)` when settings were routed through the app-server plan.
+    pub codex_managed: Option<bool>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
@@ -554,6 +572,66 @@ fn session_ref_key(locator: &SessionLocator) -> String {
     format!("{}\u{0}{}", locator.provider, locator.session_id)
 }
 
+/// Cap on [`TerminalRegistry::restart_retiring_terminals`]. Kill-path restarts
+/// emit no CrashEvent, so their tombstones are abandoned by design — nothing
+/// ever calls [`TerminalRegistry::consume_restart_retiring`] for them. The cap
+/// bounds that abandonment; well under one entry per plausible restart storm
+/// in a boot.
+const MAX_RESTART_RETIRING_TOMBSTONES: usize = 4_096;
+
+/// Boot-scoped restart-retirement tombstones with FIFO bounding: `set`
+/// answers membership, `order` tracks insertion order so an insert past
+/// [`MAX_RESTART_RETIRING_TOMBSTONES`] evicts the OLDEST entry. Consume-time
+/// removal is a positional [`VecDeque::remove`] — O(n) but capped at 4,096
+/// entries, chosen deliberately over `swap_remove_*` (and over a rebuild) so
+/// eviction order survives any pattern of out-of-order consumes
+/// (implementer's-choice note, plan task 10).
+#[derive(Debug, Default)]
+struct RestartRetiringSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RestartRetiringSet {
+    /// Insert a tombstone, evicting the OLDEST one (loudly) when the cap is
+    /// exceeded. A re-marked id keeps its original position — no later event
+    /// for that id could have superseded the queued CrashEvent it fences.
+    fn insert(&mut self, terminal_id: &str) {
+        if !self.set.insert(terminal_id.to_string()) {
+            return;
+        }
+        self.order.push_back(terminal_id.to_string());
+        while self.order.len() > MAX_RESTART_RETIRING_TOMBSTONES {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if self.set.remove(&evicted) {
+                tracing::warn!(
+                    terminal_id = %evicted,
+                    cap = MAX_RESTART_RETIRING_TOMBSTONES,
+                    "terminal.restart_retiring_tombstone_evicted"
+                );
+            }
+        }
+    }
+
+    /// Read-only membership probe ([`TerminalRegistry::is_restart_retiring`]).
+    fn contains(&self, terminal_id: &str) -> bool {
+        self.set.contains(terminal_id)
+    }
+
+    /// Remove a tombstone; `true` iff it was present (consume-once).
+    fn remove(&mut self, terminal_id: &str) -> bool {
+        if !self.set.remove(terminal_id) {
+            return false;
+        }
+        if let Some(pos) = self.order.iter().position(|id| id == terminal_id) {
+            self.order.remove(pos);
+        }
+        true
+    }
+}
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -621,6 +699,23 @@ pub struct TerminalRegistry {
     /// KNOWN dead (registered but not Running) is pruned instead of
     /// answering `BoundElsewhere`, so a dead winner never strands losers.
     session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
+    /// Boot-scoped tombstones for terminals whose PTY exit is owned by an
+    /// explicit `agent.restart` transaction. These intentionally outlive the
+    /// registry row: a natural-exit CrashEvent may already be queued when the
+    /// restart begins and wake after `kill()` removes the predecessor. Terminal
+    /// ids are never reused within a boot, so retaining the id is the only
+    /// fail-closed answer; the set resets with the process. A tombstone is
+    /// CONSUMED at the first suppression point that fences its queued
+    /// CrashEvent (the exit hook's expected-exit branch in `freshell-ws`,
+    /// `auto_resume::resumable_session_ref`, `auto_resume::pre_respawn_guard`)
+    /// via [`Self::consume_restart_retiring`]; tombstones whose restart never
+    /// queues a consumable CrashEvent (the kill path emits none) are abandoned
+    /// and FIFO-bounded at [`MAX_RESTART_RETIRING_TOMBSTONES`]. Safety:
+    /// because ids are never reused within a boot, and post-commit stale
+    /// events are separately fenced by `pre_respawn_guard`'s
+    /// `session_owned_live` check, consuming at the first suppression point
+    /// cannot un-fence a later event for the same id.
+    restart_retiring_terminals: Arc<Mutex<RestartRetiringSet>>,
 }
 
 impl Default for TerminalRegistry {
@@ -768,6 +863,7 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
+            restart_retiring_terminals: Arc::new(Mutex::new(RestartRetiringSet::default())),
         }
     }
 
@@ -1085,6 +1181,7 @@ impl TerminalRegistry {
             mode: mode.to_string(),
             resume_session_id: resume_session_id.map(str::to_string),
             create_request_id: create_request_id.map(str::to_string),
+            restart_launch: None,
             subscribers: HashMap::new(),
             released_by_client: true,
         }));
@@ -1285,6 +1382,7 @@ impl TerminalRegistry {
             replay_reset_reason: None,
             requested_since_seq: Some(since_seq),
             session_ref,
+            runtime: None,
         });
         sink(ready);
 
@@ -1350,6 +1448,7 @@ impl TerminalRegistry {
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: s.exit_code.unwrap_or(0),
                 terminal_id: terminal_id.to_string(),
+                runtime: None,
             });
             sink(exit);
             s.subscribers.remove(&conn_id);
@@ -1626,6 +1725,7 @@ impl TerminalRegistry {
             let exit = ServerMessage::TerminalExit(TerminalExit {
                 exit_code: 0,
                 terminal_id: terminal_id.to_string(),
+                runtime: None,
             });
             for sub in s.subscribers.values() {
                 (sub.sink)(exit.clone());
@@ -1700,6 +1800,60 @@ impl TerminalRegistry {
             .contains_key(terminal_id)
     }
 
+    /// Classify this terminal's next PTY exit as restart-owned before any
+    /// action (such as closing a managed Codex proxy) can make the PTY exit.
+    ///
+    /// Returns `false` only for an unknown terminal. The row may already have
+    /// reached `Exited` in a natural-exit race; it is still fenced because its
+    /// CrashEvent may be waiting in the auto-resume queue.
+    ///
+    /// If the table is at [`MAX_RESTART_RETIRING_TOMBSTONES`] the OLDEST
+    /// tombstone is evicted (FIFO) with a
+    /// `terminal.restart_retiring_tombstone_evicted` warn — the
+    /// abandoned-entry bound for kill-path restarts that emit no CrashEvent.
+    pub fn mark_restart_retiring(&self, terminal_id: &str) -> bool {
+        let exists = self
+            .inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id);
+        if !exists {
+            return false;
+        }
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .insert(terminal_id);
+        true
+    }
+
+    /// Whether auto-resume and the PTY exit hook must treat `terminal_id` as
+    /// owned by an explicit restart transaction rather than a natural crash.
+    /// Read-only probe — tests, diagnostics, and multi-decision sites that
+    /// must not consume; the suppression points use
+    /// [`Self::consume_restart_retiring`].
+    pub fn is_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .contains(terminal_id)
+    }
+
+    /// Consume the tombstone at a suppression point (the exit hook's
+    /// expected-exit branch, `auto_resume::resumable_session_ref`, and
+    /// `auto_resume::pre_respawn_guard`): the queued CrashEvent the tombstone
+    /// exists to fence has been fenced, so it must not linger for the process
+    /// lifetime. Returns `true` iff the tombstone was present — consume-once;
+    /// a second consume is an idempotent `false`, so whichever suppression
+    /// point wins the race owns the removal.
+    pub fn consume_restart_retiring(&self, terminal_id: &str) -> bool {
+        self.restart_retiring_terminals
+            .lock()
+            .expect("restart-retiring terminals lock")
+            .remove(terminal_id)
+    }
+
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
     /// the NATURAL-exit path (the kill path stays in [`kill`](Self::kill), which
     /// removes the record first so this lookup misses, mirroring the original's
@@ -1752,6 +1906,7 @@ impl TerminalRegistry {
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
             terminal_id: terminal_id.to_string(),
+            runtime: None,
         });
         for sub in s.subscribers.values() {
             (sub.sink)(exit.clone());
@@ -1830,6 +1985,7 @@ impl TerminalRegistry {
                     created_at: s.created_at,
                     resume_session_id: s.resume_session_id.clone(),
                     cwd: s.cwd.clone(),
+                    restart_launch: s.restart_launch.clone(),
                 }
             })
             .collect()
@@ -1974,6 +2130,7 @@ impl TerminalRegistry {
             mode,
             resume_session_id: opts.resume_session_id,
             create_request_id,
+            restart_launch: None,
             subscribers: HashMap::new(),
             released_by_client: true,
         }));
@@ -2082,8 +2239,26 @@ impl TerminalRegistry {
                 created_at: s.created_at,
                 resume_session_id: s.resume_session_id.clone(),
                 cwd: s.cwd.clone(),
+                restart_launch: s.restart_launch.clone(),
             }
         })
+    }
+
+    /// Stamp the exact provider/shell inputs used for a newly-created PTY.
+    /// Called before the corresponding `terminal.created` frame is exposed.
+    pub fn set_restart_launch(&self, terminal_id: &str, launch: TerminalRestartLaunch) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|handle| Arc::clone(&handle.shared))
+        };
+        let Some(shared) = shared else {
+            return false;
+        };
+        shared.lock().expect("terminal lock").restart_launch = Some(launch);
+        true
     }
 
     /// A terminal's stamped `createRequestId`, if any.
@@ -3071,6 +3246,7 @@ mod tests {
             terminal_id: "T".to_string(),
             attach_request_id: None,
             source: Some(OutputSource::Live),
+            runtime: None,
         }
     }
 
@@ -3456,6 +3632,174 @@ mod tests {
         assert!(got_exit);
         // Killing an unknown terminal is a no-op false.
         assert!(!reg.kill("T"));
+    }
+
+    #[test]
+    fn restart_retirement_fence_survives_terminal_removal_without_affecting_siblings() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-restarting", "S-restarting");
+        reg.insert_headless("T-unrelated", "S-unrelated");
+
+        assert!(
+            reg.mark_restart_retiring("T-restarting"),
+            "a live terminal must accept the restart-retiring fence"
+        );
+        assert!(reg.is_restart_retiring("T-restarting"));
+        assert!(
+            !reg.is_restart_retiring("T-unrelated"),
+            "the fence must be terminal-scoped"
+        );
+
+        assert!(reg.kill("T-restarting"));
+        assert!(
+            reg.is_restart_retiring("T-restarting"),
+            "the tombstone must outlive row removal so a crash event already queued \
+             before restart cannot auto-resume after the backoff"
+        );
+        assert!(!reg.mark_restart_retiring("T-missing"));
+    }
+
+    #[test]
+    fn consume_restart_retiring_removes_the_tombstone_once() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-1", "S-1");
+        assert!(reg.mark_restart_retiring("T-1"));
+        assert!(reg.is_restart_retiring("T-1"));
+
+        assert!(
+            reg.consume_restart_retiring("T-1"),
+            "the first consume removes the tombstone and reports the removal"
+        );
+        assert!(
+            !reg.is_restart_retiring("T-1"),
+            "a consumed tombstone no longer fences CrashEvents"
+        );
+        assert!(
+            !reg.consume_restart_retiring("T-1"),
+            "consume is idempotent: the second consume is a no-op false"
+        );
+        assert!(
+            !reg.consume_restart_retiring("T-never-marked"),
+            "consuming an id that was never marked is a no-op false"
+        );
+    }
+
+    #[test]
+    fn abandoned_restart_retiring_tombstones_are_fifo_bounded() {
+        // Kill-path restarts emit no CrashEvent, so nothing ever consumes
+        // their tombstones -- the set must not grow for the whole process
+        // lifetime. Past the cap the OLDEST entry is evicted (FIFO), loudly.
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let newest = format!("T-{MAX_RESTART_RETIRING_TOMBSTONES}");
+        for i in 0..=MAX_RESTART_RETIRING_TOMBSTONES {
+            let id = format!("T-{i}");
+            reg.insert_headless(&id, &format!("S-{i}"));
+            assert!(reg.mark_restart_retiring(&id));
+        }
+
+        {
+            let tombstones = reg.restart_retiring_terminals.lock().unwrap();
+            assert_eq!(
+                tombstones.set.len(),
+                MAX_RESTART_RETIRING_TOMBSTONES,
+                "the set is clamped to the cap"
+            );
+            assert_eq!(
+                tombstones.order.len(),
+                MAX_RESTART_RETIRING_TOMBSTONES,
+                "the insertion-order queue is clamped to the same cap"
+            );
+            assert_eq!(
+                tombstones.order.front().map(String::as_str),
+                Some("T-1"),
+                "the oldest surviving entry sits at the queue front (FIFO)"
+            );
+            assert_eq!(
+                tombstones.order.back().map(String::as_str),
+                Some(newest.as_str()),
+                "the newest entry sits at the queue back"
+            );
+        }
+        assert!(
+            !reg.is_restart_retiring("T-0"),
+            "the oldest tombstone is evicted once the cap is exceeded"
+        );
+        assert!(reg.is_restart_retiring("T-1"));
+        assert!(reg.is_restart_retiring(&newest));
+
+        let captured = events.lock().unwrap();
+        let evictions: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message == "terminal.restart_retiring_tombstone_evicted")
+            .collect();
+        assert_eq!(
+            evictions.len(),
+            1,
+            "exactly one entry crossed the cap in this test, and the eviction is loud"
+        );
+        assert_eq!(
+            evictions[0].fields.get("terminal_id").map(String::as_str),
+            Some("T-0")
+        );
+    }
+
+    #[test]
+    fn remarking_restart_retiring_keeps_one_entry_and_survives_eviction_cycles() {
+        // Re-marking a live tombstone must not double-book the FIFO order
+        // queue (a duplicate entry would consume an eviction slot twice); a
+        // re-mark AFTER an eviction is a fresh insert that fences again.
+        // (Task-10 review nit pin.) The capture guard is NOT for assertion:
+        // every thread evaluating the eviction `warn!` callsite must hold a
+        // subscriber so the callsite's (process-global) interest is never
+        // rebuilt against a null subscriber mid-run, which would starve the
+        // sibling FIFO test's capture.
+        let (_events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-dup", "S-dup");
+        assert!(reg.mark_restart_retiring("T-dup"));
+        assert!(reg.mark_restart_retiring("T-dup"));
+        {
+            let tombstones = reg.restart_retiring_terminals.lock().unwrap();
+            assert_eq!(
+                tombstones
+                    .order
+                    .iter()
+                    .filter(|id| id.as_str() == "T-dup")
+                    .count(),
+                1,
+                "a re-marked tombstone keeps ONE order entry (no duplicate slot)"
+            );
+        }
+        assert!(
+            reg.consume_restart_retiring("T-dup"),
+            "one consume still removes a double-marked tombstone"
+        );
+        assert!(!reg.is_restart_retiring("T-dup"));
+
+        reg.insert_headless("T-revived", "S-revived");
+        assert!(reg.mark_restart_retiring("T-revived"));
+        for i in 0..MAX_RESTART_RETIRING_TOMBSTONES {
+            let id = format!("T-flood-{i}");
+            reg.insert_headless(&id, &format!("S-flood-{i}"));
+            reg.mark_restart_retiring(&id);
+        }
+        assert!(
+            !reg.is_restart_retiring("T-revived"),
+            "T-revived was evicted by the FIFO flood"
+        );
+        assert!(
+            reg.mark_restart_retiring("T-revived"),
+            "a re-mark after eviction inserts fresh"
+        );
+        assert!(
+            reg.is_restart_retiring("T-revived"),
+            "the revived tombstone fences CrashEvents again"
+        );
+        assert!(
+            reg.consume_restart_retiring("T-revived"),
+            "the revived tombstone is consumable"
+        );
     }
 
     #[test]
@@ -5603,6 +5947,7 @@ mod tests {
             created_at: 0,
             resume_session_id: resume_session_id.map(str::to_string),
             cwd: None,
+            restart_launch: None,
         }
     }
 
