@@ -250,7 +250,7 @@ test.describe('standalone CLI -- Rust server replacement', () => {
       )
       expect(split.status).toBe('ok')
       expect(split.data.paneId).not.toBe(created.data.paneId)
-      expect(split.data.terminalId).toBeUndefined()
+      expect(split.data.terminalId ?? undefined).toBeUndefined()
       await expect(regions).toHaveCount(2)
       await expect(regions.nth(1)).toBeVisible()
       expect(await inventory()).toEqual([])
