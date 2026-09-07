@@ -57,6 +57,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             let soul_id = stable_soul_id(create_key)?;
             let cwd = canonical_cwd(request.spec.cwd.as_deref())?;
             let workspace = workspace_root(&cwd);
+            let (run_as_uid, run_as_gid) = (MANAGED_PROVIDER_UID, MANAGED_PROVIDER_GID);
             let git_common_dir = git_common_dir(&workspace);
             let project_key = stable_project_key(&workspace);
             // Phase 2 persists the launch spec in the supervisor registry.
@@ -113,6 +114,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     args: managed_provider_args(&request.mode, request.spec.args),
                     env,
                     cwd: cwd.to_string_lossy().into_owned(),
+                    run_as_uid,
+                    run_as_gid,
                     cols: request.spec.cols,
                     rows: request.spec.rows,
                     project_key,
@@ -328,6 +331,9 @@ fn stable_project_key(path: &Path) -> String {
 fn stable_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))[..32].to_string()
 }
+
+const MANAGED_PROVIDER_UID: u32 = 65_534;
+const MANAGED_PROVIDER_GID: u32 = 0;
 
 fn canonical_cwd(cwd: Option<&str>) -> Result<PathBuf, String> {
     let path = cwd

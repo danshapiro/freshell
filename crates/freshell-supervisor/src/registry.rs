@@ -1118,6 +1118,8 @@ mod tests {
             args: Vec::new(),
             env: std::collections::BTreeMap::new(),
             cwd: workspace_path.to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
             cols: 80,
             rows: 24,
             project_key: "bootstrap-test".into(),

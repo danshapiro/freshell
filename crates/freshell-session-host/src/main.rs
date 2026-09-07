@@ -484,25 +484,39 @@ async fn grant_execution(
 }
 
 fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(), String> {
-    if terminal.provider_bootstrap_files.is_empty() {
-        return Ok(());
-    }
     let home = terminal
         .env
         .get("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "provider bootstrap requires terminal HOME".to_string())?;
-    if !home.is_absolute() {
-        return Err("provider bootstrap HOME must be absolute".into());
+        .ok_or_else(|| "managed provider requires terminal HOME".to_string())?;
+    if home != PathBuf::from("/home/freshell/provider") {
+        return Err("managed provider HOME must be /home/freshell/provider".into());
     }
+    if !home.is_dir() {
+        return Err("managed provider HOME volume is not mounted".into());
+    }
+    // chmod while uid 0 still owns the rootless volume inode; after chown
+    // the trusted host intentionally lacks FOWNER.
+    set_mode(&home, 0o700)?;
+    set_owner(&home, terminal.run_as_uid, terminal.run_as_gid)?;
+
     for (index, file) in terminal.provider_bootstrap_files.iter().enumerate() {
         let source = PathBuf::from(format!("/run/freshell-bootstrap/provider-{index}"));
-        let destination = home.join(&file.provider_relative_path);
+        let relative = PathBuf::from(&file.provider_relative_path);
+        let destination = home.join(&relative);
         if !destination.starts_with(&home) {
             return Err("provider bootstrap destination escaped HOME".into());
         }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        if let Some(relative_parent) = relative.parent() {
+            let mut current = home.clone();
+            for component in relative_parent.components() {
+                if let std::path::Component::Normal(component) = component {
+                    current.push(component);
+                    std::fs::create_dir_all(&current).map_err(|error| error.to_string())?;
+                    set_mode(&current, 0o700)?;
+                    set_owner(&current, terminal.run_as_uid, terminal.run_as_gid)?;
+                }
+            }
         }
         let bytes = std::fs::read(&source)
             .map_err(|error| format!("read {}: {error}", source.display()))?;
@@ -520,18 +534,37 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
             .map_err(|error| format!("create {}: {error}", tmp.display()))?;
         out.write_all(&bytes).map_err(|error| error.to_string())?;
         out.sync_all().map_err(|error| error.to_string())?;
+        set_mode(&tmp, 0o600)?;
+        set_owner(&tmp, terminal.run_as_uid, terminal.run_as_gid)?;
         std::fs::rename(&tmp, &destination).map_err(|error| error.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| error.to_string())?;
-        }
         if let Some(parent) = destination.parent() {
             let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("path contains NUL: {}", path.display()))?;
+    // SAFETY: path_c is NUL terminated and remains alive for the call.
+    let rc = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "chown {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn set_owner(_path: &Path, _uid: u32, _gid: u32) -> Result<(), String> {
+    Err("managed provider uid/gid isolation requires Unix".into())
 }
 
 fn registry_like_error(error: String) -> RuntimeError {

@@ -247,6 +247,12 @@ pub struct TerminalLaunchSpec {
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     pub cwd: String,
+    /// Numeric unprivileged identity used for the provider PTY child.
+    /// The rootless Docker backend uses uid 65534 with gid 0: the mapped
+    /// workspace remains group-writable while root-owned 0600 control files
+    /// stay inaccessible. The trusted session host is the only uid-0 process.
+    pub run_as_uid: u32,
+    pub run_as_gid: u32,
     pub cols: u16,
     pub rows: u16,
     pub project_key: String,
@@ -270,12 +276,13 @@ impl TerminalLaunchSpec {
             || self.cwd.is_empty()
             || self.project_key.is_empty()
             || self.workspace_path.is_empty()
+            || self.run_as_uid == 0
             || self.cols == 0
             || self.rows == 0
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
-                "managed terminal launch has an empty required field",
+                "managed terminal launch has an empty/root-uid required field",
             ));
         }
         if self.env.len() > 512 || self.args.len() > 512 || self.provider_bootstrap_files.len() > 16
