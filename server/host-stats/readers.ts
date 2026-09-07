@@ -83,12 +83,40 @@ function safeReaddir(dirPath: string): string[] | null {
 }
 
 /**
- * Resolve THIS process's cgroup leaf from <procRoot>/self/cgroup. The cgroup fs root has NO
- * limit files by design, so callers must always resolve the leaf and never read the fs root.
+ * Directory probe; false instead of throwing. Used by resolveCgroupLeaf to
+ * detect a v2 membership whose path is not present under the mounted
+ * cgroupfs (a mount rooted at the container's own cgroup).
+ */
+function safeIsDir(dirPath: string): boolean {
+  try {
+    return fs.statSync(dirPath).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve THIS process's cgroup leaf from <procRoot>/self/cgroup.
+ *
+ * cgroup v2 namespace contract: a PRIVATE cgroup namespace (Docker's default
+ * on cgroup-v2 hosts) rewrites this process's v2 membership to '0::/', and
+ * the namespace-visible cgroupfs mount exposes the container's OWN cgroup at
+ * the filesystem root — its memory.current/memory.max/pids.max/pids.current
+ * live AT <cgroupRoot> itself. Those limit files exist only at the root of a
+ * namespace-rooted mount: the REAL cgroup2 root of a non-namespaced host has
+ * none of them (only statistics/pressure files), so reads resolved to the fs
+ * root degrade to the same null/threads-max fallbacks as before there. Three
+ * v2 shapes therefore resolve to the fs root (path ''): membership '0::/',
+ * a membership path that does not exist under <cgroupRoot> (a mount rooted
+ * at the container's cgroup while /proc still reports the host path), and a
+ * '../'-relative membership (out-of-namespace — reads at the closest visible
+ * ancestor, never above <cgroupRoot>). cgroup v1 is unchanged: v1 has no
+ * namespace membership rewrite and the v1 fs root DOES carry
+ * (garbage-sentinel) limit files, so v1 never resolves to the fs root.
  */
 type CgroupLeaf = { version: 'v1' | 'v2'; path: string } | null
 
-function resolveCgroupLeaf(procRoot: string, v1Controller: string): CgroupLeaf {
+function resolveCgroupLeaf(procRoot: string, v1Controller: string, cgroupRoot: string): CgroupLeaf {
   const text = safeRead(path.join(procRoot, 'self', 'cgroup'))
   if (text === null) return null
   const lines = splitLines(text)
@@ -96,7 +124,16 @@ function resolveCgroupLeaf(procRoot: string, v1Controller: string): CgroupLeaf {
   const v2 = lines.find((line) => line.startsWith('0::'))
   if (v2) {
     const leaf = v2.slice('0::'.length).replace(/^\/+/, '')
-    if (leaf === '') return null // process sits at the cgroup2 root: no limit files there
+    // '' is a cgroup-namespace root; a membership path absent from the mounted
+    // cgroupfs is the same namespace shape seen through /proc; a '../'-relative
+    // membership is the kernel's encoding for a cgroup outside the visible
+    // namespace (cgroup_namespaces(7)) and must never resolve ABOVE the
+    // injected root. All three read at the fs root — the closest visible
+    // ancestor; on a real non-namespaced host the root has no limit files, so
+    // the readers' null fallbacks fire exactly as before.
+    if (leaf === '' || leaf.split('/').includes('..') || !safeIsDir(path.join(cgroupRoot, leaf))) {
+      return { version: 'v2', path: '' }
+    }
     return { version: 'v2', path: leaf }
   }
   // v1: "<hierarchy>:<controller[,controller...]>:/path"
@@ -197,8 +234,10 @@ export function readMeminfo(
  * Resolves THIS process's cgroup leaf from <procRoot>/self/cgroup and reads its memory files.
  * v2: '0::/path' -> <cgroupRoot>/path/memory.current + memory.max ('max' -> null limit).
  * v1: 'memory' controller line -> <cgroupRoot>/memory/path/usage_in_bytes + limit_in_bytes
- * (garbage limit >= 2^60 -> null). The cgroup fs root has NO limit files by design, so the
- * leaf is always resolved; never read the fs root. None/unreadable -> null.
+ * (garbage limit >= 2^60 -> null). A v2 membership of '0::/' (cgroup-namespace root,
+ * Docker's default) or one whose path is not mounted resolves to the cgroupfs fs root
+ * itself; on a non-namespaced host that root has no limit files, so null falls through
+ * as before. None/unreadable -> null.
  *
  * NOTE (frozen contract): parameter order here is (cgroupRoot, procRoot) — the opposite of
  * readPidsLimit(procRoot, cgroupRoot). Callers: read the signatures, do not assume.
@@ -208,7 +247,7 @@ export function readCgroupMemory(
   procRoot: string = PROC_ROOT,
 ): { limitBytes: number | null; currentBytes: number } | null {
   try {
-    const leaf = resolveCgroupLeaf(procRoot, 'memory')
+    const leaf = resolveCgroupLeaf(procRoot, 'memory', cgroupRoot)
     if (!leaf) return null
     if (leaf.version === 'v2') {
       const dir = path.join(cgroupRoot, leaf.path)
@@ -429,14 +468,15 @@ export function readPidCount(procRoot: string = PROC_ROOT): number | null {
  * The BINDING process cap: cgroup v2 leaf pids.max ('max' -> unlimited -> fall back), else
  * cgroup v1 pids.max, else '/proc/sys/kernel/threads-max'.
  * '/proc/sys/kernel/pid_max' is a PID-number wrap boundary, NOT a creatable-process cap, and
- * is deliberately never used (validated R3M2).
+ * is deliberately never used (validated R3M2). v2 leaf resolution is namespace-aware: see
+ * resolveCgroupLeaf.
  *
  * NOTE (frozen contract): parameter order here is (procRoot, cgroupRoot) — the opposite of
  * readCgroupMemory(cgroupRoot, procRoot). Callers: read the signatures, do not assume.
  */
 export function readPidsLimit(procRoot: string = PROC_ROOT, cgroupRoot: string = CGROUP_ROOT): number | null {
   try {
-    const leaf = resolveCgroupLeaf(procRoot, 'pids')
+    const leaf = resolveCgroupLeaf(procRoot, 'pids', cgroupRoot)
     if (leaf) {
       const dir = leaf.version === 'v2' ? path.join(cgroupRoot, leaf.path) : path.join(cgroupRoot, 'pids', leaf.path)
       const text = safeRead(path.join(dir, 'pids.max'))
@@ -467,8 +507,11 @@ export type PidsConstraint = { current: number; max: number }
  * reading. No qualified node -> null (callers fall back to the system-wide
  * readPidCount/readPidsLimit pair). Deepest node wins ties (deterministic).
  *
- * The cgroup fs root has NO limit files by design; resolveCgroupLeaf already
- * yields null for a process sitting at the cgroup2 root.
+ * The v2 chain INCLUDES the fs-root node: under a private cgroup namespace
+ * (Docker's default on v2) resolveCgroupLeaf yields path '' and that root IS
+ * the container's cgroup, with real limit files; on a non-namespaced host the
+ * root carries no pids files, so the depth-0 node is simply skipped. The v1
+ * walk is unchanged (v1 has no namespace membership rewrite).
  *
  * NOTE (frozen contract): parameter order here is (procRoot, cgroupRoot) — the
  * opposite of readCgroupMemory(cgroupRoot, procRoot). Callers: read the
@@ -479,13 +522,15 @@ export function readPidsConstraint(
   cgroupRoot: string = CGROUP_ROOT,
 ): PidsConstraint | null {
   try {
-    const leaf = resolveCgroupLeaf(procRoot, 'pids')
+    const leaf = resolveCgroupLeaf(procRoot, 'pids', cgroupRoot)
     if (!leaf) return null
-    // Deepest-first chain; the fs-root segment is never read (no limit files).
+    // Deepest-first chain; v2 walks one node past the leaf chain to the fs
+    // root (namespace-visible cgroup), v1 stops at depth 1 as before.
     const segments = leaf.path.split('/').filter((segment) => segment.length > 0)
+    const minDepth = leaf.version === 'v2' ? 0 : 1
     let best: PidsConstraint | null = null
     let bestRatio = -1
-    for (let depth = segments.length; depth >= 1; depth--) {
+    for (let depth = segments.length; depth >= minDepth; depth--) {
       const nodePath = segments.slice(0, depth).join('/')
       const dir =
         leaf.version === 'v2' ? path.join(cgroupRoot, nodePath) : path.join(cgroupRoot, 'pids', nodePath)
