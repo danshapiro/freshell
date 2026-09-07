@@ -32,6 +32,17 @@ import {
 
 const log = createLogger('fresh-agent-ws')
 
+// WS fresh-agent events arrive untyped (`Record<string, unknown>`), so the
+// server-authoritative statusSeq needs a finite-number guard at this boundary:
+// anything else (absent, wrong type, non-finite) reads as seq-less and the
+// store takes the legacy unconditional fold, keeping pre-seq servers working.
+// Exported so the REST snapshot lane shares the same guard instead of
+// duplicating the extraction logic.
+export function readStatusSeq(frame: { statusSeq?: unknown }): number | undefined {
+  const seq = frame.statusSeq
+  return typeof seq === 'number' && Number.isFinite(seq) ? seq : undefined
+}
+
 type FreshAgentCreatedMessage = {
   type: 'freshAgent.created'
   requestId: string
@@ -207,6 +218,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         ...locator,
         latestTurnId: (event.latestTurnId as string | null | undefined) ?? null,
         status: event.status as never,
+        statusSeq: readStatusSeq(event),
         historySessionId: event.timelineSessionId as string | undefined,
         revision: event.revision as number | undefined,
         streamingActive: event.streamingActive as boolean | undefined,
@@ -237,6 +249,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(setSessionStatus({
         ...locator,
         status: event.status as never,
+        statusSeq: readStatusSeq(event),
       }))
       return true
     case 'freshAgent.turn.complete': {
