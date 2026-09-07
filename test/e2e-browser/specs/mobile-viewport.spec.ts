@@ -247,7 +247,7 @@ test.describe('Mobile Viewport', () => {
     // Verify the permission banner is visible on mobile
     const banner = page.getByRole('alert', { name: /permission request for bash/i })
     await expect(banner).toBeVisible({ timeout: 10_000 })
-    await expect(banner).toContainText('Permission requested: Bash')
+    await expect(banner).toContainText('echo mobile-permission-test')
 
     // Verify Allow and Deny buttons are visible and clickable on mobile
     const allowBtn = banner.getByRole('button', { name: /allow tool use/i })
