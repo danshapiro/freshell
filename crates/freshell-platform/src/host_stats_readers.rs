@@ -698,7 +698,8 @@ pub fn read_pid_count(proc_root: &Path) -> Option<u64> {
 /// fall back), else cgroup v1 `pids.max`, else
 /// `/proc/sys/kernel/threads-max`. `/proc/sys/kernel/pid_max` is a PID-number
 /// wrap boundary, NOT a creatable-process cap, and is deliberately never used
-/// (validated R3M2).
+/// (validated R3M2). v2 leaf resolution is namespace-aware: see
+/// [`resolve_cgroup_leaf`].
 ///
 /// NOTE (frozen contract): parameter order here is (proc_root, cgroup_root)
 /// — the opposite of [`read_cgroup_memory`]. Callers: read the signatures,
