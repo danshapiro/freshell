@@ -116,20 +116,22 @@ function restHeaders(info: { token: string }): Record<string, string> {
 }
 
 /**
- * git init; commit a.txt = "one\n"; dirty it to "two\n". The identity flags
- * are MANDATORY everywhere — never rely on ~/.gitconfig (hermetic CI).
+ * git init; commit a.txt = "one\n"; dirty it to "two\n". The identity and
+ * signing-off flags are MANDATORY everywhere — never rely on ~/.gitconfig
+ * (identities) or global commit.gpgsign (hermetic across hosts; delta
+ * review round 2 Minor finding).
  */
 async function initDirtyGitRepo(dir: string): Promise<void> {
   await run('git', ['init', '-q'], { cwd: dir })
   await fs.writeFile(path.join(dir, 'a.txt'), 'one\n')
   await run('git', ['add', '.'], { cwd: dir })
-  await run('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { cwd: dir })
+  await run('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'init'], { cwd: dir })
   await fs.writeFile(path.join(dir, 'a.txt'), 'two\n')
 }
 
 async function commitAll(dir: string, message: string): Promise<void> {
   await run('git', ['add', '.'], { cwd: dir })
-  await run('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', message], { cwd: dir })
+  await run('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-qm', message], { cwd: dir })
 }
 
 async function connect(page: Page, info: { baseUrl: string; token: string }): Promise<TestHarness> {
