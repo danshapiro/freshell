@@ -297,6 +297,12 @@ export const RUST_ONLY_SPECS = [
   // Reconnect-revive acceptance: socket-drop/freeze revival; drives
   // RustServer + forceDisconnect + SIGSTOP (docs/plans/2026-08-22-reconnect-revive.md).
   /reconnect-revive-rust\.spec\.ts$/,
+  // AGENT-13 — fresh-agent exec/diff API parity + the real-route diff-panel
+  // e2e (docs/plans/2026-09-06-ekc6.md, plan Task 4; checklist
+  // docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md:353).
+  // Rust-only: owns per-test RustServers (isolated HOME, ephemeral port); the
+  // routes under test exist only on the Rust server.
+  /fresh-agent-extras-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -542,6 +548,10 @@ export default defineConfig({
         // Reconnect-revive acceptance: socket-drop/freeze revival; drives
         // RustServer + forceDisconnect + SIGSTOP (see RUST_ONLY_SPECS entry).
         /reconnect-revive-rust\.spec\.ts$/,
+        // AGENT-13 (see the RUST_ONLY_SPECS entry): fresh-agent exec/diff REST
+        // parity + FreshAgentDiffPanel driven against the REAL Rust /diff
+        // route (docs/plans/2026-09-06-ekc6.md, plan Task 4).
+        /fresh-agent-extras-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
