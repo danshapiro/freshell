@@ -54,6 +54,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
+use freshell_codex::next_monotonic_status_seq;
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
     FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
@@ -529,13 +530,15 @@ struct ClaudeSession {
     #[allow(clippy::type_complexity)]
     rollback_probe_slot:
         Arc<std::sync::Mutex<Option<(String, tokio::sync::oneshot::Sender<QuiesceVerdict>)>>>,
-    /// The session's tracked status (the stdout consumer's fold: the reference
-    /// bridge's turn lifecycle — `running` on `sdk.assistant`, `idle` on every
-    /// `sdk.result` — plus the raw `sdk.status` wire values folded on top).
-    /// Read by the attach-ack sites so a reconnect ack tells the truth instead of
-    /// the hardcoded "idle" that used to wedge stale-busy/stale-idle panes.
-    /// Starts "idle" — a fresh/just-resumed session has announced nothing else.
-    last_status: Arc<std::sync::Mutex<String>>,
+    /// The session's tracked (status, statusSeq) pair (the stdout consumer's fold:
+    /// the reference bridge's turn lifecycle — `running` on `sdk.assistant`, `idle`
+    /// on every `sdk.result` — plus the raw `sdk.status` wire values folded on top,
+    /// minting a strictly-monotonic wall-clock-ms `statusSeq` at every fold via
+    /// [`fold_tracked_status`]). Read by the attach-ack sites so a reconnect ack
+    /// tells the truth instead of the hardcoded "idle" that used to wedge
+    /// stale-busy/stale-idle panes. Starts ("idle", None) — a fresh/just-resumed
+    /// session has announced nothing else (the seq mints at its first fold or ack).
+    last_status: Arc<std::sync::Mutex<(String, Option<i64>)>>,
 }
 
 /// The sidecar's signed answer to a `rollback.quiesce` probe (ep4-r3). All
@@ -562,10 +565,31 @@ struct ClaudeConfiguration {
 }
 
 impl ClaudeSession {
+    /// The (status, statusSeq) pair an ATTACH ACK stamps: the session's TRACKED
+    /// status with its tracked seq, minting the session's FIRST seq when the
+    /// truthful starting "idle" has never folded (minting the first seq of a
+    /// tracked status IS a tracked fold — never the cordoned untracked-default
+    /// path [`crate::claude_snapshot::build_claude_snapshot_json`] takes). A
+    /// re-announce REUSES the recorded seq: an ack is not a status change and
+    /// must not bump the client's accept baseline.
+    fn tracked_status_for_ack(&self) -> (String, i64) {
+        let mut guard = self.last_status.lock().expect("last status lock");
+        let seq = match guard.1 {
+            Some(seq) => seq,
+            None => {
+                let seq = next_monotonic_status_seq(None, now_ms());
+                guard.1 = Some(seq);
+                seq
+            }
+        };
+        (guard.0.clone(), seq)
+    }
+
     /// The session's tracked status (the stdout consumer's turn-lifecycle +
-    /// `sdk.status` fold) — the truth the attach acks speak.
+    /// `sdk.status` fold) — the truth the attach acks speak. eaw7: reads the
+    /// status half of the tracked (status, statusSeq) pair.
     fn current_status(&self) -> String {
-        self.last_status.lock().expect("last status lock").clone()
+        self.last_status.lock().expect("last status lock").0.clone()
     }
 }
 
@@ -936,8 +960,9 @@ impl FreshClaudeState {
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_lock = Arc::new(TokioMutex::new(()));
-        // Fresh session: nothing announced yet; the consumer's status fold owns it.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        // Fresh session: nothing announced yet; the consumer's status fold owns it
+        // (the seq mints at the first tracked fold or attach ack).
+        let last_status = Arc::new(std::sync::Mutex::new(("idle".to_string(), None)));
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
@@ -3468,8 +3493,10 @@ impl FreshClaudeState {
         let broadcast_id = Arc::new(std::sync::Mutex::new(op.session_id.clone()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         // The respawn is fresh: nothing announced yet; the consumer's status
-        // fold owns the tracked status from here.
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        // fold owns the tracked status from here (the seq mints at its first
+        // tracked fold or attach ack — the eaw7 tracked (status, statusSeq)
+        // pair).
+        let last_status = Arc::new(std::sync::Mutex::new(("idle".to_string(), None)));
         let consumer = self.spawn_consumer(
             reader,
             map_key.clone(),
@@ -3775,27 +3802,29 @@ impl FreshClaudeState {
         let Some(map_key) = self.cli_index.lock().await.get(durable).cloned() else {
             return false;
         };
-        let rebound_status = {
+        let rebound = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(session) => {
                     // Alias, don't move: flip only the envelope stamp. The status the
                     // ack speaks is the consumer's tracked-status fold — truth at
                     // ack time (a completed turn settles it; a live compaction or
-                    // in-flight turn announces truthfully).
+                    // in-flight turn announces truthfully) — stamped with the
+                    // tracked (status, statusSeq) pair.
                     *session.broadcast_id.lock().expect("broadcast id lock") = durable.to_string();
-                    Some(session.current_status())
+                    Some(session.tracked_status_for_ack())
                 }
                 None => None,
             }
         };
-        let Some(status) = rebound_status else {
+        let Some((status, status_seq)) = rebound else {
             return false;
         };
         self.broadcast(&status_snapshot_frame(
             durable,
             durable,
             &status,
+            Some(status_seq),
             session_type,
         ));
         true
@@ -3967,8 +3996,8 @@ impl FreshClaudeState {
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_lock = Arc::new(TokioMutex::new(()));
         // Freshly resumed session: the tracked status starts "idle" (truthful — no
-        // turn can be in flight before the client sends).
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        // turn can be in flight before the client sends) with no seq folded yet.
+        let last_status = Arc::new(std::sync::Mutex::new(("idle".to_string(), None)));
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
@@ -4077,23 +4106,29 @@ impl FreshClaudeState {
             }
         }
 
-        // Read the tracked status through the same `current_status()` helper the
-        // rebind arm uses (the session was registered above; the lease-revocation
+        // Read the tracked status through the same `tracked_status_for_ack()` helper
+        // the rebind arm uses (the session was registered above; the lease-revocation
         // teardown already returned). Identical to the hardcoded "idle" it replaces
         // for a fresh resume — truthful by construction. The None fallback covers a
         // sidecar that died before this read (already EOF-evicted by its consumer):
-        // nothing was ever announced, so "idle" stays the truthful default.
-        let last_announced = self
-            .sessions
-            .lock()
-            .await
-            .get(&msg.session_id)
-            .map(ClaudeSession::current_status)
-            .unwrap_or_else(|| "idle".to_string());
+        // nothing was ever announced, so "idle" stays the truthful default — and it
+        // stays SEQ-LESS, an untracked fallback: only tracked folds mint a statusSeq
+        // (the never-mint-from-defaults rule, mirrored from the cordoned REST builders).
+        let (last_announced, status_seq) = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&msg.session_id) {
+                Some(session) => {
+                    let (status, seq) = session.tracked_status_for_ack();
+                    (status, Some(seq))
+                }
+                None => ("idle".to_string(), None),
+            }
+        };
         self.broadcast(&status_snapshot_frame(
             &msg.session_id,
             durable,
             &last_announced,
+            status_seq,
             &session_type,
         ));
         Ok(())
@@ -4242,13 +4277,14 @@ impl FreshClaudeState {
     /// `pending` (Task 2): the shared pending approval/question handle the consumer
     /// folds `sdk.permission.*`/`sdk.question.*` lines into BEFORE the normalize/
     /// broadcast step (so a respond racing the event never sees stale membership).
-    /// `last_status`: the shared tracked-status handle the attach acks read; the
-    /// consumer folds the turn lifecycle (`sdk.assistant` → "running", every
-    /// `sdk.result` → "idle" — the reference bridge's semantics) and the raw
+    /// `last_status`: the shared tracked (status, statusSeq) handle the attach acks
+    /// read; the consumer folds the turn lifecycle (`sdk.assistant` → "running",
+    /// every `sdk.result` → "idle" — the reference bridge's semantics) and the raw
     /// `sdk.status` wire values on top into it BEFORE the broadcast step (so an
-    /// ack racing a status event never understates the tracked status). The
-    /// result-edge settle means a mid-turn "compacting" can never wedge the
-    /// tracker past the turn's completion.
+    /// ack racing a status event never understates the tracked status), minting a
+    /// strictly-monotonic `statusSeq` at every differing fold. The result-edge
+    /// settle means a mid-turn "compacting" can never wedge the tracker past the
+    /// turn's completion.
     #[allow(clippy::too_many_arguments)] // Session-scoped wiring handed to the detached consumer; four call sites.
     fn spawn_consumer(
         &self,
@@ -4259,7 +4295,7 @@ impl FreshClaudeState {
         settings: Option<crate::identity_sink::FreshAgentSettings>,
         broadcast_id: Arc<std::sync::Mutex<String>>,
         pending: Arc<std::sync::Mutex<ClaudePending>>,
-        last_status: Arc<std::sync::Mutex<String>>,
+        last_status: Arc<std::sync::Mutex<(String, Option<i64>)>>,
         // kata 1wxv Task 4: the session's shared busy truth — cleared by the
         // EXACTLY-four contract edges (`sdk.result` any subtype, `sdk.status`
         // idle, EOF/death below, completed handle_interrupt at the write site).
@@ -4329,8 +4365,11 @@ impl FreshClaudeState {
                         )
                         .await;
                     let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                    // The preseeded init is NOT a status-bearing frame and the respawn's
+                    // tracker is fresh ("idle", None) — seq arg None mirrors the in-stream
+                    // init path exactly (the first tracked fold mints).
                     if let Some(frame) =
-                        sdk_line_to_frame(&adoption.preseeded_init, &stamp, &session_type)
+                        sdk_line_to_frame(&adoption.preseeded_init, &stamp, &session_type, None)
                     {
                         let _ = broadcast_tx.send(frame);
                     }
@@ -4592,16 +4631,19 @@ impl FreshClaudeState {
                 // for the rest of the session's life — and the raw sdk.status wire
                 // value folds on top (:351-352 compacting announces truthfully
                 // mid-turn; the stream-end idle is a no-op after the last result).
+                // Each fold runs through the (status, statusSeq) tracker: the frame
+                // below carries the seq minted HERE, and the attach acks read the
+                // same pair (one per-session sequence end to end).
                 match value.get("type").and_then(Value::as_str) {
                     Some("sdk.assistant") => {
-                        *last_status.lock().expect("last status lock") = "running".to_string();
+                        fold_tracked_status(&last_status, "running");
                     }
                     Some("sdk.result") => {
-                        *last_status.lock().expect("last status lock") = "idle".to_string();
+                        fold_tracked_status(&last_status, "idle");
                     }
                     Some("sdk.status") => {
                         if let Some(status) = value.get("status").and_then(Value::as_str) {
-                            *last_status.lock().expect("last status lock") = status.to_string();
+                            fold_tracked_status(&last_status, status);
                         }
                     }
                     _ => {}
@@ -4639,7 +4681,11 @@ impl FreshClaudeState {
                 // Task 10b: stamp the envelope from the SHARED handle (not the captured
                 // map key) so an attach-by-durable rebind flips live event routing.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
-                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
+                // The tracked seq AFTER this line's own fold: status-bearing frames
+                // (the fold above already minted for exactly these) carry it; every
+                // other frame ignores it (None when nothing has ever folded).
+                let tracked_seq = last_status.lock().expect("last status lock").1;
+                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type, tracked_seq) {
                     let _ = broadcast_tx.send(frame);
                 }
             }
@@ -5169,8 +5215,18 @@ fn frame_request_id(value: &Value) -> Option<String> {
 /// the inner `type` `sdk.X → freshAgent.X` (only the known set — matching sdk-events.ts,
 /// which passes unknown types through unchanged and thus never surfaces them as fresh-agent
 /// events), preserving every other field, then wraps it in the envelope. Control lines
-/// (`created` / `create.failed`) and unknown types return `None`.
-fn sdk_line_to_frame(value: &Value, session_id: &str, session_type: &str) -> Option<String> {
+/// (`created` / `create.failed`) and unknown types return `None`. Status-bearing frames
+/// (`freshAgent.session.snapshot` / `freshAgent.status` — the two variants the shared
+/// contract carries `statusSeq` on) are stamped with the session's tracked seq (the
+/// `status_seq` parameter) whenever one exists; the wire key is EXACTLY camelCase
+/// `"statusSeq"` (the shared fresh-agent contract), never `status_seq`, and the key
+/// is ABSENT when no tracked fold has minted one yet (legacy unconditional fold).
+fn sdk_line_to_frame(
+    value: &Value,
+    session_id: &str,
+    session_type: &str,
+    status_seq: Option<i64>,
+) -> Option<String> {
     let sdk_type = value.get("type").and_then(Value::as_str)?;
     let fresh_type = normalize_sdk_type(sdk_type)?;
 
@@ -5178,6 +5234,15 @@ fn sdk_line_to_frame(value: &Value, session_id: &str, session_type: &str) -> Opt
     // `{ ...providerEvent, type }` spread).
     let mut inner: Map<String, Value> = value.as_object()?.clone();
     inner.insert("type".to_string(), json!(fresh_type));
+
+    if matches!(
+        fresh_type,
+        "freshAgent.session.snapshot" | "freshAgent.status"
+    ) {
+        if let Some(seq) = status_seq {
+            inner.insert("statusSeq".to_string(), json!(seq));
+        }
+    }
 
     let msg = ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: Value::Object(inner),
@@ -5270,21 +5335,29 @@ fn is_canonical_claude_uuid(s: &str) -> bool {
 /// The codex-shape status snapshot (`freshAgent.session.snapshot`) claude emits as the
 /// attach ack (rebind + resume-on-attach arms): provider-agnostic client-side
 /// (`fresh-agent-ws.ts:196-206`), it settles the pane to the session's REAL tracked
-/// status and hands the durable UUID over via `timelineSessionId`.
+/// status and hands the durable UUID over via `timelineSessionId`. The tracked
+/// `statusSeq` rides along under the EXACT camelCase wire key (`"statusSeq"`, never
+/// `status_seq`) whenever the announced status came from the tracked pair — the
+/// key is ABSENT only for the untracked "idle" fallback (never mint from defaults).
 fn status_snapshot_frame(
     session_id: &str,
     timeline_session_id: &str,
     status: &str,
+    status_seq: Option<i64>,
     session_type: &str,
 ) -> ServerMessage {
+    let mut event = json!({
+        "type": "freshAgent.session.snapshot",
+        "sessionId": session_id,
+        "latestTurnId": Value::Null,
+        "status": status,
+        "timelineSessionId": timeline_session_id,
+    });
+    if let Some(seq) = status_seq {
+        event["statusSeq"] = json!(seq);
+    }
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
-        event: json!({
-            "type": "freshAgent.session.snapshot",
-            "sessionId": session_id,
-            "latestTurnId": Value::Null,
-            "status": status,
-            "timelineSessionId": timeline_session_id,
-        }),
+        event,
         provider: PROVIDER.to_string(),
         session_id: session_id.to_string(),
         session_type: session_type.to_string(),
@@ -5663,6 +5736,34 @@ fn reap_owned_claude_sidecars(_ownership_id: &str) {
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────
 
+/// `Date.now()` — epoch milliseconds (the status-sequence clock's `now`). Duplicated
+/// from `codex.rs`/`opencode_ws.rs`'s identical private helpers, same module-private
+/// rationale as `now_iso` below.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Fold a status into the session's tracked (status, statusSeq) pair and return the
+/// seq to stamp (`foldStatus`, sdk-bridge.ts): a re-fold of the SAME status reuses the
+/// recorded seq (a re-announce is not a status change and must not bump the client's
+/// accept baseline); a differing status — or the session's first tracked fold — mints
+/// strictly above via [`next_monotonic_status_seq`] (wall-clock milliseconds).
+fn fold_tracked_status(tracker: &std::sync::Mutex<(String, Option<i64>)>, status: &str) -> i64 {
+    let mut guard = tracker.lock().expect("last status lock");
+    if guard.0 == status {
+        if let Some(seq) = guard.1 {
+            return seq;
+        }
+    }
+    let seq = next_monotonic_status_seq(guard.1, now_ms());
+    guard.0 = status.to_string();
+    guard.1 = Some(seq);
+    seq
+}
+
 /// The kill-family session teardown, shared by the kill's own removal, the
 /// round-5 post-close sweep, and the claim lanes' late-orphan unwinds:
 /// abort + join the consumer, send the graceful sidecar shutdown line, then
@@ -5761,7 +5862,7 @@ pub(crate) mod tests {
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                last_status: Arc::new(std::sync::Mutex::new(("idle".to_string(), None))),
             },
         );
     }
@@ -5928,11 +6029,14 @@ pub(crate) mod tests {
         .unwrap_or_else(|_| panic!("freshAgent.event with inner type {inner_type} within budget"))
     }
 
-    /// Bounded drain until a `freshAgent.status` broadcast carrying `status` arrives.
-    /// The consumer folds the tracked status BEFORE it broadcasts the matching
-    /// wire frame, so observing this frame proves the fold the attach acks read
-    /// has landed — the arrangement races nothing.
-    async fn await_status_on_wire(rx: &mut tokio::sync::broadcast::Receiver<String>, status: &str) {
+    /// Bounded drain until a `freshAgent.status` broadcast carrying `status` arrives;
+    /// returns the frame. The consumer folds the tracked status BEFORE it broadcasts
+    /// the matching wire frame, so observing this frame proves the fold the attach acks
+    /// read has landed — the arrangement races nothing.
+    async fn await_status_on_wire(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        status: &str,
+    ) -> Value {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = match rx.recv().await {
@@ -5948,12 +6052,12 @@ pub(crate) mod tests {
                     && frame["event"]["type"] == "freshAgent.status"
                     && frame["event"]["status"] == status
                 {
-                    return;
+                    return frame;
                 }
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("freshAgent.status{{status:{status}}} within budget"));
+        .unwrap_or_else(|_| panic!("freshAgent.status{{status:{status}}} within budget"))
     }
 
     /// Bounded drain until a TOP-LEVEL `error` ServerMessage arrives; returns its message.
@@ -6260,6 +6364,82 @@ pub(crate) mod tests {
         drop(env);
     }
 
+    /// eaw7 (fresh-agent-rust statusSeq): every tracked claude status the server emits —
+    /// the `freshAgent.status` broadcast AND the attach/rebind ack — carries the
+    /// session's monotonic `statusSeq` (the wire key is EXACTLY camelCase
+    /// `"statusSeq"`, wall-clock ms): a same-status announce REUSES the recorded seq,
+    /// a differing status mints strictly above it. This is the server half of the
+    /// reconnect staleness gate: the client folds a status write only when
+    /// `statusSeq > lastStatusSeq`, so the ack and the broadcasts must speak ONE
+    /// per-session sequence or a stale snapshot could still clobber a live busy.
+    #[tokio::test]
+    async fn status_frames_and_attach_acks_carry_a_monotonic_status_seq() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_create(dedup_create_msg("req-status-seq"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-status-seq").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let durable = "6d6d6d6d-6d6d-46d6-8d6d-6d6d6d6d6d6d";
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), session_id.clone());
+
+        // Fold a real wire status through the consumer; the broadcast of that fold
+        // carries the session's first minted seq under the camelCase key.
+        st.handle_send(send_msg(&session_id, "__set_status__:compacting"))
+            .await;
+        let compacting = await_status_on_wire(&mut rx, "compacting").await;
+        let compacting_seq = compacting["event"]["statusSeq"]
+            .as_i64()
+            .expect("a tracked status broadcast carries a numeric statusSeq");
+        assert!(
+            compacting["event"].get("status_seq").is_none(),
+            "the wire key is exactly camelCase \"statusSeq\", never status_seq: {compacting}"
+        );
+
+        // The rebind ack announces the SAME tracked status — it stamps the recorded
+        // (status, statusSeq) pair (an announce reuses the tracked seq; only a
+        // differing fold mints).
+        st.handle_attach(attach_msg_with_resume("late-attacher-seq", durable))
+            .await;
+        let ack = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(ack["event"]["status"], "compacting");
+        assert_eq!(
+            ack["event"]["statusSeq"],
+            json!(compacting_seq),
+            "the attach ack stamps the tracked (status, statusSeq) pair: {ack}"
+        );
+
+        // A differing status fold mints STRICTLY above the previous seq...
+        st.handle_send(send_msg(&session_id, "__set_status__:idle"))
+            .await;
+        let idle = await_status_on_wire(&mut rx, "idle").await;
+        let idle_seq = idle["event"]["statusSeq"]
+            .as_i64()
+            .expect("the later status broadcast carries a numeric statusSeq");
+        assert!(
+            idle_seq > compacting_seq,
+            "statusSeq is strictly monotonic per session: {idle_seq} <= {compacting_seq}"
+        );
+
+        // ...and the ack after that fold speaks the NEWER pair.
+        st.handle_attach(attach_msg_with_resume("late-attacher-seq-2", durable))
+            .await;
+        let ack2 = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(ack2["event"]["status"], "idle");
+        assert_eq!(
+            ack2["event"]["statusSeq"],
+            json!(idle_seq),
+            "the second ack stamps the newer tracked pair: {ack2}"
+        );
+        drop(env);
+    }
+
     /// Pins the DEFAULT: a freshly resumed session has folded no non-idle status, so
     /// its resume-for-attach ack must still announce `"idle"`. Truth by construction
     /// (the tracked status starts "idle"), not a hardcoded literal — a regression that
@@ -6285,6 +6465,13 @@ pub(crate) mod tests {
             "a freshly resumed session's ack must announce idle (the tracked default): {frame}"
         );
         assert_eq!(frame["event"]["timelineSessionId"], durable);
+        // eaw7: the ack's "idle" IS the session's tracked status (not an untracked
+        // hardcoded default), so it carries the session's statusSeq even when the
+        // broadcast fold has not raced ahead of the ack.
+        assert!(
+            frame["event"]["statusSeq"].is_i64(),
+            "the fresh-resume ack carries the session's numeric statusSeq: {frame}"
+        );
         drop(env);
     }
 
@@ -6377,7 +6564,8 @@ pub(crate) mod tests {
             "cwd": "/tmp/x",
             "tools": [{ "name": "Read" }],
         });
-        let frame = sdk_line_to_frame(&line, "nano_placeholder_1234567", "freshclaude").unwrap();
+        let frame =
+            sdk_line_to_frame(&line, "nano_placeholder_1234567", "freshclaude", None).unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["type"], "freshAgent.event");
         assert_eq!(wire["provider"], "claude");
@@ -6395,11 +6583,87 @@ pub(crate) mod tests {
     fn turn_complete_frame_carries_the_success_edge() {
         // The status-guarded chime the sidecar emits ONLY on result subtype=success.
         let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 });
-        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude").unwrap();
+        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude", None).unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["type"], "freshAgent.event");
         assert_eq!(wire["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(wire["event"]["at"], 42);
+    }
+
+    #[test]
+    fn fold_tracked_status_reuses_same_status_and_mints_strictly_above_on_change() {
+        let tracker = std::sync::Mutex::new(("idle".to_string(), None));
+        // The first tracked fold mints (wall-clock ms — just assert positivity here;
+        // the strictly-monotonic clamp itself is pinned in freshell-codex's events
+        // tests).
+        let first = fold_tracked_status(&tracker, "running");
+        assert!(first > 0);
+        // A re-announce of the SAME status reuses the recorded seq — an announce is
+        // not a change and must not bump the client's accept baseline.
+        assert_eq!(fold_tracked_status(&tracker, "running"), first);
+        // A differing status mints strictly above (the clamp covers any same-ms fold).
+        let second = fold_tracked_status(&tracker, "idle");
+        assert!(second > first, "{second} <= {first}");
+        // ...and the tracker holds the newest pair for the ack readers.
+        assert_eq!(
+            *tracker.lock().expect("last status lock"),
+            ("idle".to_string(), Some(second))
+        );
+    }
+
+    /// eaw7 statusSeq: `sdk.status` and `sdk.session.snapshot` frames carry the
+    /// session's tracked seq under the EXACT camelCase wire key.
+    #[test]
+    fn status_bearing_frames_carry_the_tracked_status_seq() {
+        let status_line =
+            json!({ "type": "sdk.status", "sessionId": "s-1", "status": "compacting" });
+        let frame = sdk_line_to_frame(&status_line, "s-1", "freshclaude", Some(4242)).unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["type"], "freshAgent.status");
+        assert_eq!(wire["event"]["statusSeq"], json!(4242));
+        assert!(
+            wire["event"].get("status_seq").is_none(),
+            "the wire key is exactly camelCase \"statusSeq\", never status_seq: {wire}"
+        );
+
+        let snapshot_line =
+            json!({ "type": "sdk.session.snapshot", "sessionId": "s-1", "status": "idle" });
+        let frame = sdk_line_to_frame(&snapshot_line, "s-1", "freshclaude", Some(4242)).unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["type"], "freshAgent.session.snapshot");
+        assert_eq!(wire["event"]["statusSeq"], json!(4242));
+    }
+
+    /// Additive optionality: with no tracked seq the key is ABSENT (never serialized
+    /// as null) so pre-seq clients take the legacy unconditional fold.
+    #[test]
+    fn status_bearing_frames_omit_status_seq_when_none_is_tracked() {
+        let status_line = json!({ "type": "sdk.status", "sessionId": "s-1", "status": "idle" });
+        let frame = sdk_line_to_frame(&status_line, "s-1", "freshclaude", None).unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["type"], "freshAgent.status");
+        assert!(
+            wire["event"].get("statusSeq").is_none(),
+            "no tracked seq => no statusSeq key at all: {wire}"
+        );
+    }
+
+    /// Only the two status-bearing contract variants are stamped: even WITH a tracked
+    /// seq available, non-status frames (e.g. `sdk.assistant`) must not grow the key.
+    #[test]
+    fn non_status_frames_never_carry_status_seq() {
+        let line = json!({
+            "type": "sdk.assistant",
+            "sessionId": "s-1",
+            "content": [{ "type": "text", "text": "part" }],
+        });
+        let frame = sdk_line_to_frame(&line, "s-1", "freshclaude", Some(4242)).unwrap();
+        let wire: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(wire["event"]["type"], "freshAgent.assistant");
+        assert!(
+            wire["event"].get("statusSeq").is_none(),
+            "non-status frames are never stamped: {wire}"
+        );
     }
 
     /// Delta-review round 5 (AGENT-06): the `sdk.question.request` →
@@ -6421,7 +6685,7 @@ pub(crate) mod tests {
                 "extraTop": { "nested": "kept" }
             }]
         });
-        let frame = sdk_line_to_frame(&line, "s", "freshclaude").unwrap();
+        let frame = sdk_line_to_frame(&line, "s", "freshclaude", None).unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(wire["event"]["type"], "freshAgent.question.request");
         assert_eq!(
@@ -6440,13 +6704,15 @@ pub(crate) mod tests {
         assert!(sdk_line_to_frame(
             &json!({ "type": "created", "sessionId": "x" }),
             "x",
-            "freshclaude"
+            "freshclaude",
+            None
         )
         .is_none());
         assert!(sdk_line_to_frame(
             &json!({ "type": "create.failed", "message": "boom" }),
             "x",
-            "freshclaude"
+            "freshclaude",
+            None
         )
         .is_none());
     }
@@ -6465,7 +6731,7 @@ pub(crate) mod tests {
         ];
         let frames: Vec<Value> = death_stream
             .iter()
-            .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude"))
+            .filter_map(|l| sdk_line_to_frame(l, "s", "freshclaude", None))
             .map(|f| serde_json::from_str(&f).unwrap())
             .collect();
         let inner_types: Vec<&str> = frames
@@ -6481,6 +6747,7 @@ pub(crate) mod tests {
             &json!({ "type": "sdk.turn.complete", "sessionId": "s", "at": 1 }),
             "s",
             "freshclaude",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -10323,7 +10590,7 @@ rl.on('line', (line) => {
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                last_status: Arc::new(std::sync::Mutex::new(("idle".to_string(), None))),
             },
         );
     }
@@ -10760,7 +11027,7 @@ rl.on('line', (line) => {
             None,
             Arc::new(std::sync::Mutex::new("fold-session".to_string())),
             Arc::clone(&pending),
-            Arc::new(std::sync::Mutex::new("idle".to_string())),
+            Arc::new(std::sync::Mutex::new(("idle".to_string(), None))),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11617,7 +11884,7 @@ rl.on('line', (line) => {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_lock = Arc::new(TokioMutex::new(()));
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let last_status = Arc::new(std::sync::Mutex::new(("idle".to_string(), None)));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
             reader,
@@ -11699,7 +11966,7 @@ rl.on('line', (line) => {
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
-                last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
+                last_status: Arc::new(std::sync::Mutex::new(("idle".to_string(), None))),
             },
         );
         st.cli_index
@@ -11757,7 +12024,7 @@ rl.on('line', (line) => {
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_lock = Arc::new(TokioMutex::new(()));
-        let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        let last_status = Arc::new(std::sync::Mutex::new(("idle".to_string(), None)));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
         let consumer = st.spawn_consumer(
             reader,
@@ -14266,7 +14533,20 @@ rl.on('line', (line) => {
         // INSIDE the write await. (ChildStdin has no userspace buffer, so a
         // parked write means the KERNEL pipe is full; the per-iteration
         // timeout IS the full-pipe signal — deterministic, no guessing.)
+        //
+        // Host-portable capacity: the classic 64KiB default is NOT universal
+        // (e.g. garageserver runs with an 8KiB default pipe capacity), so the
+        // sanity floor reads the pipe's ACTUAL capacity (F_GETPIPE_SZ) — the
+        // rig's real requirement is "a write parked because the pipe is full",
+        // unchanged; only the hard-coded constant is gone.
+        use std::os::unix::io::AsRawFd as _;
         use tokio::io::AsyncWriteExt as _;
+        let pipe_capacity = unsafe { libc::fcntl(session.stdin.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        assert!(
+            (4096..).contains(&pipe_capacity),
+            "F_GETPIPE_SZ returned an implausible pipe capacity: {pipe_capacity}"
+        );
+        let pipe_capacity = pipe_capacity as usize;
         let junk = [b'x'; 4096];
         let mut filled = 0usize;
         loop {
@@ -14279,8 +14559,8 @@ rl.on('line', (line) => {
             }
         }
         assert!(
-            filled >= 65536,
-            "the classic 64KiB pipe accepted a full buffer before refusing ({filled})"
+            filled >= pipe_capacity,
+            "the pipe filled below its reported capacity before refusing ({filled} < {pipe_capacity})"
         );
         drop(guard);
         pid

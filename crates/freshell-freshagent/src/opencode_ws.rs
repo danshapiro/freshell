@@ -63,7 +63,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Mutex as TokioMutex;
 
-use freshell_codex::next_monotonic_turn_complete_at;
+use freshell_codex::{next_monotonic_status_seq, next_monotonic_turn_complete_at};
 use freshell_opencode::{
     normalize_opencode_effort, normalize_opencode_model, ChangedReason, OpencodeServeManager,
     SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
@@ -323,6 +323,12 @@ struct OpencodeSession {
     /// PR-3: the strictly-monotonic turn-complete clock's last stamped value for this
     /// session (`state.lastTurnCompleteAt`, `turn-complete-clock.ts`).
     last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
+    /// eaw7: the strictly-monotonic per-session STATUS sequence's last minted value
+    /// (wall-clock ms; the tracked-pair sibling of `last_turn_complete_at`,
+    /// `state.lastStatusSeq`). `None` until the session's first tracked status fold;
+    /// cloned into the serve-SSE bridge and the turn settle tail (both mint status
+    /// edges), and minted at the attach ack.
+    last_status_seq: Arc<StdMutex<Option<i64>>>,
     /// PR-3: the persistent serve-SSE-bridge task started ONCE at materialization
     /// (`adapter.ts bindServeStream`, called from `materializeOrSend:349`), forwarding
     /// `session.status`/`session.idle`/`message.*`/`session.error` into
@@ -401,6 +407,7 @@ impl OpencodeSession {
             turn_aborted: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
+            last_status_seq: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
             killed: Arc::new(AtomicBool::new(false)),
             close_pending: 0,
@@ -1015,13 +1022,15 @@ impl FreshOpencodeState {
         // `emitStatus(state, 'running')` (adapter.ts:336) -- BEFORE any session
         // materialization, stamped with whatever id is currently known (the placeholder
         // on a session's first send, the durable id thereafter).
+        // eaw7: the optimistic bracket stays seq-less (not a tracked fold); the
+        // authoritative running/idle edges mint via the serve fold + settle.
         let busy_session_id = session
             .real_session_id
             .clone()
             .unwrap_or_else(|| session.placeholder_id.clone());
         self.broadcast(&event_frame(
             &busy_session_id,
-            snapshot_event(&busy_session_id, "running"),
+            snapshot_event(&busy_session_id, "running", None),
         ));
 
         let acked_session_id = if let Some(real_id) = session.real_session_id.clone() {
@@ -1098,6 +1107,7 @@ impl FreshOpencodeState {
                 manager.clone(),
                 durable_id.clone(),
                 session.turn_errored.clone(),
+                session.last_status_seq.clone(),
             ));
             durable_id
         };
@@ -1154,6 +1164,7 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let last_status_seq = session.last_status_seq.clone();
 
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
@@ -1176,6 +1187,7 @@ impl FreshOpencodeState {
                 &turn_aborted,
                 &turn_errored,
                 &last_turn_complete_at,
+                &last_status_seq,
             );
         });
         session.turn_task = Some(TurnTask {
@@ -1527,9 +1539,10 @@ impl FreshOpencodeState {
         let Some(real_id) = real_id else {
             // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
             // still fires (adapter.ts:530), stamped with whatever id the client sent.
+            // eaw7: seq-less — no tracked fold ran for this edge.
             self.broadcast(&event_frame(
                 &msg.session_id,
-                snapshot_event(&msg.session_id, "idle"),
+                snapshot_event(&msg.session_id, "idle", None),
             ));
             return;
         };
@@ -1537,7 +1550,12 @@ impl FreshOpencodeState {
         let manager = self.fresh_agent.ensure_manager().await;
         match manager.abort(&real_id, &route).await {
             Ok(()) => {
-                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                // eaw7: seq-less — the abort ack is not a tracked fold (the in-flight
+                // turn's own settle still mints the session's authoritative idle).
+                self.broadcast(&event_frame(
+                    &real_id,
+                    snapshot_event(&real_id, "idle", None),
+                ));
             }
             Err(_) => {
                 // adapter.ts:525-528 -- the abort never landed, so the turn may still
@@ -1671,9 +1689,15 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let last_status_seq = session.last_status_seq.clone();
 
         // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
-        self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
+        // eaw7: the optimistic bracket stays seq-less (not a tracked fold); the
+        // authoritative running/idle edges mint via the serve fold + settle.
+        self.broadcast(&event_frame(
+            &real_id,
+            snapshot_event(&real_id, "running", None),
+        ));
 
         let manager = self.fresh_agent.ensure_manager().await;
         // Subscribe BEFORE the POST so the compact's idle edge cannot be missed (the
@@ -1695,7 +1719,11 @@ impl FreshOpencodeState {
         let Some(model_pair) = model_pair else {
             // Never leave the pane stuck busy on the failure path (and nothing was
             // ever registered on turn_task — the failure is inline, pre-spawn).
-            self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+            // eaw7: seq-less — this inline failure idle is not a tracked fold.
+            self.broadcast(&event_frame(
+                &real_id,
+                snapshot_event(&real_id, "idle", None),
+            ));
             self.emit_fresh_agent_error(
                 &real_id,
                 "OPENCODE_COMPACT_FAILED",
@@ -1746,7 +1774,12 @@ impl FreshOpencodeState {
                 // Never leave the pane stuck busy on the refusal (nothing was
                 // ever registered on turn_task — the refusal is inline,
                 // pre-spawn).
-                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                // eaw7: seq-less — this inline refusal idle is not a tracked fold
+                // (identical class to the model-pair failure idle below).
+                self.broadcast(&event_frame(
+                    &real_id,
+                    snapshot_event(&real_id, "idle", None),
+                ));
                 self.emit_fresh_agent_error(
                     &real_id,
                     "OPENCODE_COMPACT_FAILED",
@@ -1855,6 +1888,7 @@ impl FreshOpencodeState {
                 &turn_aborted,
                 &turn_errored,
                 &last_turn_complete_at,
+                &last_status_seq,
             );
             if let Err(err) = result {
                 fresh_agent.broadcast(&event_frame(
@@ -2064,6 +2098,7 @@ impl FreshOpencodeState {
             manager,
             child.id.clone(),
             child_session.turn_errored.clone(),
+            child_session.last_status_seq.clone(),
         ));
         self.sessions
             .lock()
@@ -2762,7 +2797,7 @@ impl FreshOpencodeState {
             },
         };
 
-        let (status_session_id, running, real_session_id) = {
+        let (status_session_id, running, real_session_id, last_status_seq) = {
             let mut session = session_arc.lock().await;
 
             // Ensure the serve-SSE bridge is running (restart it if it died) -- only
@@ -2780,6 +2815,7 @@ impl FreshOpencodeState {
                         manager,
                         real_id,
                         session.turn_errored.clone(),
+                        session.last_status_seq.clone(),
                     ));
                 }
             }
@@ -2793,7 +2829,12 @@ impl FreshOpencodeState {
                 .as_ref()
                 .map(|t| !t.is_finished())
                 .unwrap_or(false);
-            (status_session_id, running, session.real_session_id.clone())
+            (
+                status_session_id,
+                running,
+                session.real_session_id.clone(),
+                session.last_status_seq.clone(),
+            )
         };
 
         // Attach addressed by the PLACEHOLDER id of an already-materialized session:
@@ -2808,9 +2849,13 @@ impl FreshOpencodeState {
         }
 
         let status = if running { "running" } else { "idle" };
+        // eaw7: the attach ACK announces the session's TRACKED status (turn-task
+        // liveness) — mint strictly monotonic so the pane's reconnect gate orders it
+        // against every serve-fold/settle edge of the session.
+        let status_seq = mint_status_seq(&last_status_seq);
         self.broadcast(&event_frame(
             &status_session_id,
-            snapshot_event(&status_session_id, status),
+            snapshot_event(&status_session_id, status, Some(status_seq)),
         ));
     }
 
@@ -3000,6 +3045,7 @@ impl FreshOpencodeState {
             manager,
             session_id.to_string(),
             session.turn_errored.clone(),
+            session.last_status_seq.clone(),
         ));
         let session_arc = Arc::new(TokioMutex::new(session));
 
@@ -3127,11 +3173,14 @@ impl FreshOpencodeState {
     /// session, and flip `turn_errored` on an observed `session.error` (`state.turnErrored`,
     /// adapter.ts bindServeStream:278-282). Started ONCE, right after materialization
     /// (`bindServeStream(state)`, adapter.ts:349); aborted by `handle_kill`.
+    /// `last_status_seq` (eaw7): the session's tracked statusSeq cell — every SSE
+    /// snapshot fold mints strictly above the session's last minted seq.
     fn spawn_serve_bridge(
         &self,
         manager: OpencodeServeManager,
         real_id: String,
         turn_errored: Arc<AtomicBool>,
+        last_status_seq: Arc<StdMutex<Option<i64>>>,
     ) -> tokio::task::JoinHandle<()> {
         let fresh_agent = self.fresh_agent.clone();
         let mut rx = manager.subscribe(&real_id);
@@ -3149,7 +3198,10 @@ impl FreshOpencodeState {
                                     SnapshotStatus::Running => "running",
                                     SnapshotStatus::Idle => "idle",
                                 };
-                                snapshot_event(session_id, status_str)
+                                // eaw7: the serve fold is a tracked status edge —
+                                // mint from the session's shared cell.
+                                let seq = mint_status_seq(&last_status_seq);
+                                snapshot_event(session_id, status_str, Some(seq))
                             }
                             SdkProviderEvent::Changed { session_id, reason } => {
                                 let reason_str = match reason {
@@ -3218,6 +3270,18 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Mint the session's next tracked statusSeq — the clamp makes every mint strictly
+/// greater than the session's last (same-millisecond folds and backwards clock steps
+/// included). Only TRACKED status edges call this (the attach ack, the serve-SSE
+/// bridge fold, the turn settle); optimistic announces stay seq-less, never minting
+/// from an untracked edge.
+fn mint_status_seq(last_status_seq: &StdMutex<Option<i64>>) -> i64 {
+    let mut guard = last_status_seq.lock().expect("last_status_seq mutex");
+    let seq = next_monotonic_status_seq(*guard, now_ms());
+    *guard = Some(seq);
+    seq
+}
+
 // ── PR-3: `freshAgent.event` frame builders (sdk-events.ts + serve-events.ts shapes) ─
 
 /// Wrap `inner` in a `freshAgent.event` envelope (mirrors codex.rs's
@@ -3233,8 +3297,17 @@ fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
 
 /// `{type:'sdk.session.snapshot',...} → freshAgent.session.snapshot` (sdk-events.ts:49-50;
 /// emitted both by `emitStatus` and by `bindServeStream`'s SSE mapping, adapter.ts:301-303).
-fn snapshot_event(session_id: &str, status: &str) -> Value {
-    json!({ "type": "freshAgent.session.snapshot", "sessionId": session_id, "status": status })
+/// eaw7: the tracked statusSeq rides along under the EXACT camelCase wire key
+/// (`"statusSeq"`, never `status_seq`) whenever the emission is a tracked fold
+/// (Some); non-tracked announces (the optimistic send/compact running brackets, the
+/// interrupt idle) stay seq-less — never mint from defaults, never serialize a null.
+fn snapshot_event(session_id: &str, status: &str, status_seq: Option<i64>) -> Value {
+    let mut event =
+        json!({ "type": "freshAgent.session.snapshot", "sessionId": session_id, "status": status });
+    if let Some(seq) = status_seq {
+        event["statusSeq"] = json!(seq);
+    }
+    event
 }
 
 /// `sdk.session.changed → freshAgent.session.changed` (sdk-events.ts:51-52; the transcript
@@ -3260,7 +3333,9 @@ fn turn_complete_event(session_id: &str, at: i64) -> Value {
 /// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
 /// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
 /// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
-/// session's monotonic turn-complete clock.
+/// session's monotonic turn-complete clock. The settle idle is a TRACKED status fold:
+/// its statusSeq mints from the session's shared cell (the same cell the serve-SSE
+/// bridge folds mint from).
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
@@ -3268,8 +3343,13 @@ fn settle_turn_outcome(
     turn_aborted: &AtomicBool,
     turn_errored: &AtomicBool,
     last_turn_complete_at: &StdMutex<Option<i64>>,
+    last_status_seq: &StdMutex<Option<i64>>,
 ) {
-    fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
+    let status_seq = mint_status_seq(last_status_seq);
+    fresh_agent.broadcast(&event_frame(
+        real_id,
+        snapshot_event(real_id, "idle", Some(status_seq)),
+    ));
     if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
         let at = {
             let mut guard = last_turn_complete_at
@@ -5769,6 +5849,17 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("no snapshot frame observed for {real_id}"));
         assert_eq!(snapshot["event"]["status"], "idle");
+        // eaw7 statusSeq: the attach ack announces the session's TRACKED status
+        // (turn-task liveness), so it carries the session's numeric statusSeq under
+        // the exact camelCase wire key — the reconnect staleness gate's server half.
+        assert!(
+            snapshot["event"]["statusSeq"].is_i64(),
+            "the attach ack snapshot carries a numeric statusSeq: {snapshot}"
+        );
+        assert!(
+            snapshot["event"].get("status_seq").is_none(),
+            "the wire key is exactly \"statusSeq\", never status_seq: {snapshot}"
+        );
     }
 
     /// Task 5 (reconnect-revive): a pane restored from the persisted layout may still be
@@ -7928,6 +8019,97 @@ mod tests {
         assert!(
             !saw_complete,
             "an errored turn must never emit turn.complete"
+        );
+    }
+
+    /// eaw7 (fresh-agent-rust statusSeq): the opencode tracked status edges mint from
+    /// ONE per-session strictly-monotonic statusSeq — the turn settle idle AND the
+    /// serve-SSE bridge folds read the same session cell, so the client-side
+    /// `statusSeq > lastStatusSeq` gate orders every status-bearing frame of a
+    /// session end to end (a stale replay can never clobber a newer status).
+    #[tokio::test]
+    async fn serve_folds_and_settle_mint_a_strictly_monotonic_status_seq() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(StatusPollFakeHttp::new(1)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-seq"), None).await;
+        let placeholder = "freshopencode-req-seq";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Await the next status snapshot of `status` carrying a numeric statusSeq.
+        async fn await_seq_snapshot(
+            rx: &mut tokio::sync::broadcast::Receiver<String>,
+            status: &str,
+        ) -> i64 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let raw = rx.recv().await.expect("bus stays open");
+                    let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    if frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.session.snapshot"
+                        && frame["event"]["status"] == status
+                    {
+                        if let Some(seq) = frame["event"]["statusSeq"].as_i64() {
+                            return seq;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("a {status} snapshot carrying statusSeq within budget"))
+        }
+
+        // The settle tail's idle snapshot is the first MINTED edge (the send bracket's
+        // optimistic running announce is not a tracked fold and stays seq-less).
+        let settle_seq = await_seq_snapshot(&mut rx, "idle").await;
+
+        // The serve-SSE bridge fold lane: server-pushed busy/idle edges fold through
+        // the SAME session cell and mint strictly above the settle seq.
+        manager.dispatch_event(freshell_opencode::ParsedServeEvent {
+            kind: "session.status".to_string(),
+            session_id: Some("ses_1".to_string()),
+            properties: {
+                let mut m = serde_json::Map::new();
+                m.insert("status".to_string(), json!({ "type": "busy" }));
+                m
+            },
+            raw: serde_json::Map::new(),
+        });
+        let busy_seq = await_seq_snapshot(&mut rx, "running").await;
+        assert!(
+            busy_seq > settle_seq,
+            "the serve-fold busy mints strictly above the settle seq: {busy_seq} <= {settle_seq}"
+        );
+
+        manager.dispatch_event(freshell_opencode::ParsedServeEvent {
+            kind: "session.idle".to_string(),
+            session_id: Some("ses_1".to_string()),
+            properties: serde_json::Map::new(),
+            raw: serde_json::Map::new(),
+        });
+        let idle_seq = await_seq_snapshot(&mut rx, "idle").await;
+        assert!(
+            idle_seq > busy_seq,
+            "the serve-fold idle mints strictly above the busy seq: {idle_seq} <= {busy_seq}"
         );
     }
 
@@ -10220,7 +10402,8 @@ mod tests {
     #[test]
     fn event_frame_shapes_match_legacy_wire_contract() {
         let snapshot = serde_json::from_str::<serde_json::Value>(
-            &serde_json::to_string(&event_frame("s-1", snapshot_event("s-1", "running"))).unwrap(),
+            &serde_json::to_string(&event_frame("s-1", snapshot_event("s-1", "running", None)))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(snapshot["type"], "freshAgent.event");
@@ -10230,6 +10413,10 @@ mod tests {
         assert_eq!(snapshot["event"]["type"], "freshAgent.session.snapshot");
         assert_eq!(snapshot["event"]["sessionId"], "s-1");
         assert_eq!(snapshot["event"]["status"], "running");
+        assert!(
+            snapshot["event"].get("statusSeq").is_none(),
+            "no tracked seq => the key is absent, never serialized as null: {snapshot}"
+        );
 
         let changed = serde_json::from_str::<serde_json::Value>(
             &serde_json::to_string(&event_frame(
@@ -10255,6 +10442,29 @@ mod tests {
         .unwrap();
         assert_eq!(complete["event"]["type"], "freshAgent.turn.complete");
         assert_eq!(complete["event"]["at"], 42);
+    }
+
+    /// eaw7 statusSeq: `snapshot_event` stamps the tracked seq under the exact
+    /// camelCase wire key; the per-session mint is strictly monotonic through the
+    /// clamp (same-ms folds included).
+    #[test]
+    fn snapshot_event_stamps_status_seq_and_the_mint_is_strictly_monotonic() {
+        let frame = snapshot_event("s-1", "running", Some(4242));
+        assert_eq!(frame["statusSeq"], json!(4242));
+        assert!(
+            frame.get("status_seq").is_none(),
+            "the wire key is exactly \"statusSeq\", never status_seq: {frame}"
+        );
+
+        let cell = StdMutex::new(None);
+        let first = mint_status_seq(&cell);
+        assert!(first > 0);
+        let second = mint_status_seq(&cell);
+        assert!(
+            second > first,
+            "two mints in the same millisecond still strictly increase: {second} <= {first}"
+        );
+        assert_eq!(*cell.lock().expect("last_status_seq mutex"), Some(second));
     }
 
     #[test]

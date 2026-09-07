@@ -429,6 +429,9 @@ export function normalizeOpencodeSnapshot(input: {
    * adapter holds live state whose initial status reconcile completed. Absent
    * when the caller has no live-state notion (e.g. turn pages). */
   statusFromLiveState?: boolean
+  /** Server-authoritative status sequence from the adapter's per-session tracker.
+   * Present only when `status` came from a tracked fold; undefined omits the key. */
+  statusSeq?: number
   /** Sidecar-advertised session commands captured for this session's directory;
    * absent until the create-time catalog fetch lands (graceful absence). */
   commands?: readonly FreshAgentSessionCommand[]
@@ -449,6 +452,7 @@ export function normalizeOpencodeSnapshot(input: {
     revision: Number.isFinite(info.time?.updated) ? Number(info.time.updated) : turns.length,
     latestTurnId: turns.at(-1)?.turnId ?? null,
     status: input.status ?? 'idle',
+    ...(input.statusSeq !== undefined ? { statusSeq: input.statusSeq } : {}),
     summary: typeof info.title === 'string' ? info.title : undefined,
     capabilities: {
       send: true,

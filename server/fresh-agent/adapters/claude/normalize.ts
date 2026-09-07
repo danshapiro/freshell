@@ -215,6 +215,9 @@ export function normalizeClaudeThreadSnapshot(input: {
   resolved: Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }>
   liveSession?: SdkSessionState
   status: SdkSessionStatus
+  /** Server-authoritative status sequence; present only when `status` came from a
+   * tracked fold (live session). Conditional spread so undefined omits the key. */
+  statusSeq?: number
 }): FreshAgentClaudeSnapshot {
   const sessionId = input.liveSession?.sessionId ?? input.resolved.liveSessionId ?? input.threadId
   const turns = input.resolved.turns
@@ -230,6 +233,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     revision: input.resolved.revision,
     latestTurnId: turns.at(-1)?.turnId ?? null,
     status: input.status,
+    ...(input.statusSeq !== undefined ? { statusSeq: input.statusSeq } : {}),
     capabilities: {
       send: true,
       interrupt: input.status !== 'exited',

@@ -25,7 +25,7 @@ import {
   parseCodexDisplayIdHandle,
 } from './normalize.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
-import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
+import { nextMonotonicStatusSeq, nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 import { hashForLogs, recordFreshAgentObservabilityEvent } from '../../observability.js'
 
 type CodexThreadLifecycleEvent =
@@ -269,7 +269,7 @@ function normalizeCodexThreadStatus(status: unknown): string {
   return 'idle'
 }
 
-function makeCodexStatusEvent(sessionId: string, status: unknown, revision?: number) {
+function makeCodexStatusEvent(sessionId: string, status: unknown, revision?: number, statusSeq?: number) {
   return {
     type: 'sdk.session.snapshot',
     sessionId,
@@ -277,6 +277,8 @@ function makeCodexStatusEvent(sessionId: string, status: unknown, revision?: num
     status: normalizeCodexThreadStatus(status),
     timelineSessionId: sessionId,
     revision,
+    // Conditional spread so an undefined seq omits the wire key entirely.
+    ...(statusSeq !== undefined ? { statusSeq } : {}),
   }
 }
 
@@ -317,6 +319,25 @@ export function createCodexFreshAgentAdapter(deps: {
   // Per-thread (not per-subscription) so the monotonic turn-complete clamp survives a WS
   // reconnect, matching how Claude/OpenCode keep it on session state.
   const lastTurnCompleteAtByThread = new Map<string, number>()
+  // Tracked (status, statusSeq) pair per thread — same placement rationale as the
+  // turn-complete clock: the client statusSeq gate survives a WS reconnect, so the
+  // server-side mint baseline must too.
+  const lastStatusByThread = new Map<string, string>()
+  const lastStatusSeqByThread = new Map<string, number>()
+  /** Mint the tracked (status, statusSeq) pair for a thread: a re-fold of the SAME
+   * status reuses the recorded seq (a no-change fold must not bump the client accept
+   * baseline); a differing status clamps strictly above the last mint and records
+   * both sides of the pair. */
+  const mintStatusSeq = (threadId: string, status: string): number => {
+    if (lastStatusByThread.get(threadId) === status) {
+      const recorded = lastStatusSeqByThread.get(threadId)
+      if (recorded !== undefined) return recorded
+    }
+    const seq = nextMonotonicStatusSeq(lastStatusSeqByThread.get(threadId), Date.now())
+    lastStatusByThread.set(threadId, status)
+    lastStatusSeqByThread.set(threadId, seq)
+    return seq
+  }
   const settingsByThread = new Map<string, Partial<FreshAgentCreateRequest>>()
   const runtimeByThread = new Map<string, CodexRuntimePort>()
   const threadIdsByRuntime = new Map<CodexRuntimePort, Set<string>>()
@@ -697,6 +718,8 @@ export function createCodexFreshAgentAdapter(deps: {
   const clearThreadState = (threadId: string) => {
     activeTurnByThread.delete(threadId)
     lastTurnCompleteAtByThread.delete(threadId)
+    lastStatusByThread.delete(threadId)
+    lastStatusSeqByThread.delete(threadId)
     settingsByThread.delete(threadId)
     modelByTurnByThread.delete(threadId)
     submittedInputsByThread.delete(threadId)
@@ -745,7 +768,9 @@ export function createCodexFreshAgentAdapter(deps: {
     const listeners = deadmanListenersByThread.get(sessionId)
     if (!listeners) return
     for (const listener of listeners) {
-      listener({ type: 'sdk.status', sessionId, status: 'stuck' })
+      // The deadman 'stuck' edge is a server-driven status transition — a tracked
+      // fold, so it carries the tracked pair like every other stamped frame.
+      listener({ type: 'sdk.status', sessionId, status: 'stuck', statusSeq: mintStatusSeq(sessionId, 'stuck') })
     }
   }
 
@@ -993,11 +1018,20 @@ export function createCodexFreshAgentAdapter(deps: {
         if (event.kind === 'thread_started') {
           if (event.thread.id !== sessionId) return
           feedQuietWindow(sessionId)
-          listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
+          listener(makeCodexStatusEvent(
+            sessionId,
+            event.thread.status,
+            event.thread.updatedAt,
+            mintStatusSeq(sessionId, normalizeCodexThreadStatus(event.thread.status)),
+          ))
           return
         }
         if (event.kind === 'thread_closed') {
           if (event.threadId !== sessionId) return
+          // Mint BEFORE clearing: thread_closed is terminal, so the exited fold must
+          // still clamp against the thread's last tracked seq. clearThreadState then
+          // drops both maps so nothing leaks for the dead thread.
+          const statusSeq = mintStatusSeq(sessionId, 'exited')
           clearThreadState(sessionId)
           disarmQuietWindow(sessionId, 'thread_closed')
           void releaseRuntime(sessionId).catch(() => undefined)
@@ -1005,6 +1039,7 @@ export function createCodexFreshAgentAdapter(deps: {
             type: 'sdk.status',
             sessionId,
             status: 'exited',
+            statusSeq,
           })
           return
         }
@@ -1016,7 +1051,7 @@ export function createCodexFreshAgentAdapter(deps: {
         } else {
           feedQuietWindow(sessionId)
         }
-        listener(makeCodexStatusEvent(sessionId, event.status))
+        listener(makeCodexStatusEvent(sessionId, event.status, undefined, mintStatusSeq(sessionId, status)))
       })
 
       // onTurnCompleted fires after the turn is committed to the app-server's
@@ -1028,7 +1063,7 @@ export function createCodexFreshAgentAdapter(deps: {
         if (event.threadId !== sessionId) return
         activeTurnByThread.delete(sessionId)
         disarmQuietWindow(sessionId, 'turn_complete')
-        listener(makeCodexStatusEvent(sessionId, 'idle'))
+        listener(makeCodexStatusEvent(sessionId, 'idle', undefined, mintStatusSeq(sessionId, 'idle')))
 
         // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
         // turn/completed fires for interrupts/failures too, so chime only on a
@@ -1060,7 +1095,7 @@ export function createCodexFreshAgentAdapter(deps: {
         // keep delivering events. Just emit the terminal status to clear BLUE (no chime; a
         // crash is not a positive completion).
         disarmQuietWindow(sessionId, 'exit')
-        listener({ type: 'sdk.status', sessionId, status: 'exited' })
+        listener({ type: 'sdk.status', sessionId, status: 'exited', statusSeq: mintStatusSeq(sessionId, 'exited') })
       })
 
       return () => {
@@ -1226,6 +1261,9 @@ export function createCodexFreshAgentAdapter(deps: {
         : []
       const rawStatus = normalizeCodexThreadStatus(rawSnapshot.thread?.status)
       const activeTurnId = findActiveTurnId(rawSnapshot)
+      // A REST read is also a status observation: fold it through the per-thread
+      // tracker so the snapshot stamps the tracked (status, statusSeq) pair — same
+      // status reuses the recorded seq, a changed status mints strictly above it.
       if (activeTurnId) {
         activeTurnByThread.set(thread.threadId, activeTurnId)
       } else if (rawStatus !== 'running') {
@@ -1247,6 +1285,7 @@ export function createCodexFreshAgentAdapter(deps: {
         threadId: thread.threadId,
         revision: revisionNumber,
         status: withStuckOverlay(thread.threadId, rawStatus),
+        statusSeq: mintStatusSeq(thread.threadId, withStuckOverlay(thread.threadId, rawStatus)),
         transcript: {
           turns,
         },
@@ -1372,6 +1411,8 @@ export function createCodexFreshAgentAdapter(deps: {
       submittedInputsByThread.clear()
       submittedAliasByThread.clear()
       lastTurnCompleteAtByThread.clear()
+      lastStatusByThread.clear()
+      lastStatusSeqByThread.clear()
       await Promise.all(runtimes.map((runtime) => runtime.shutdown?.()))
     },
   }

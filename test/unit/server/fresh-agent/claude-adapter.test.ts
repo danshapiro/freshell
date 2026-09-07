@@ -282,4 +282,69 @@ describe('Claude fresh-agent adapter', () => {
       { name: 'compact', description: 'Compact the conversation', argumentHint: '', aliases: ['compress-messages'] },
     ])
   })
+
+  it('stamps the live snapshot with the session\'s tracked statusSeq', async () => {
+    const liveSession = makeClaudeLiveSession({
+      sessionId: 'sdk-seq-1',
+      lastStatusSeq: 4242,
+    })
+    const sdkBridge = {
+      getSession: vi.fn((threadId: string) => (threadId === liveSession.sessionId ? liveSession : undefined)),
+      findSessionByCliSessionId: vi.fn(() => undefined),
+    }
+    const agentHistorySource = {
+      resolve: vi.fn().mockResolvedValue(makeClaudeRestoreResolution()),
+    }
+
+    const adapter = createClaudeFreshAgentAdapter({
+      sdkBridge: sdkBridge as any,
+      agentHistorySource: agentHistorySource as any,
+      historyService: {
+        getSnapshot: vi.fn(),
+        getThreadTurnPage: vi.fn(),
+        getTurnBody: vi.fn(),
+      } as any,
+    })
+
+    const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      threadId: liveSession.sessionId,
+    })
+
+    expect(snapshot?.status).toBe(liveSession.status)
+    expect(snapshot?.statusSeq).toBe(4242)
+  })
+
+  it('omits statusSeq entirely on the disk-only idle fallback snapshot (untracked default stays seq-less)', async () => {
+    const sdkBridge = {
+      getSession: vi.fn(() => undefined),
+      findSessionByCliSessionId: vi.fn(() => undefined),
+    }
+    const agentHistorySource = {
+      resolve: vi.fn().mockResolvedValue(makeClaudeRestoreResolution()),
+    }
+    const historyService = {
+      getSnapshot: vi.fn().mockResolvedValue({ revision: 7, latestTurnId: null, turns: [] }),
+      getThreadTurnPage: vi.fn(),
+      getTurnBody: vi.fn(),
+    }
+
+    const adapter = createClaudeFreshAgentAdapter({
+      sdkBridge: sdkBridge as any,
+      agentHistorySource: agentHistorySource as any,
+      historyService: historyService as any,
+    })
+
+    const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      threadId: 'durable-thread-1',
+    })
+
+    expect(snapshot?.status).toBe('idle')
+    // Absence, not just undefined: the untracked 'idle' default never mints, so the
+    // wire key itself must be omitted (old clients must not see a tracked-looking seq).
+    expect(snapshot && 'statusSeq' in snapshot).toBe(false)
+  })
 })

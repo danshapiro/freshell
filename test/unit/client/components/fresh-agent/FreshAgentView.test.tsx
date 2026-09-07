@@ -3292,6 +3292,150 @@ describe('FreshAgentView', () => {
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('running')
   })
 
+  it('drops a REST snapshot whose statusSeq is stale so the newer tracked running status survives', async () => {
+    // The statusSeq gate is what must stop this fold, NOT the statusVersion
+    // barrier: the tracked baseline (seq 10) is seeded BEFORE render, so the
+    // request-time statusVersion capture equals the resolve-time value and
+    // only the seq gate stands between this stale snapshot and a clobber.
+    const store = createStore()
+    const sessionId = 'thread-rest-stale-seq'
+    const snapshot = createDeferred<Record<string, unknown>>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(snapshot.promise)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-rest-stale-seq',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'running',
+      statusSeq: 10,
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    })
+    const sessionKey = `freshcodex:codex:${sessionId}`
+    const versionAtRequest = (
+      store.getState().freshAgent.sessions[sessionKey] as { statusVersion?: number } | undefined
+    )?.statusVersion
+    await act(async () => {
+      snapshot.resolve({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: sessionId,
+        sessionId,
+        status: 'idle',
+        statusSeq: 9,
+        revision: 126,
+        latestTurnId: null,
+        capabilities: { send: true, interrupt: true, fork: true },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+        turns: [],
+        pendingApprovals: [],
+        pendingQuestions: [],
+      })
+    })
+
+    // The pane-level display status still follows the resolved snapshot (the
+    // same split assertion as the statusVersion-barrier race test above);
+    // the store session — which drives the busy indicator — is what the seq
+    // gate protects.
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    })
+    const session = store.getState().freshAgent.sessions[sessionKey]
+    expect(session?.status).toBe('running')
+    expect(session?.statusVersion).toBe(versionAtRequest)
+    expect(session?.lastStatusSeq).toBe(10)
+  })
+
+  it('folds a REST snapshot whose statusSeq is newer than the accepted baseline', async () => {
+    const store = createStore()
+    const sessionId = 'thread-rest-fresh-seq'
+    const snapshot = createDeferred<Record<string, unknown>>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(snapshot.promise)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        sessionId,
+        sessionRef: { provider: 'codex', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-rest-fresh-seq',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'running',
+      statusSeq: 10,
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    })
+    const sessionKey = `freshcodex:codex:${sessionId}`
+    const versionAtRequest = (
+      store.getState().freshAgent.sessions[sessionKey] as { statusVersion?: number } | undefined
+    )?.statusVersion
+    await act(async () => {
+      snapshot.resolve({
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        threadId: sessionId,
+        sessionId,
+        status: 'idle',
+        statusSeq: 11,
+        revision: 126,
+        latestTurnId: null,
+        capabilities: { send: true, interrupt: true, fork: true },
+        tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+        turns: [],
+        pendingApprovals: [],
+        pendingQuestions: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().freshAgent.sessions[sessionKey]?.status).toBe('idle')
+    })
+    const session = store.getState().freshAgent.sessions[sessionKey]
+    expect(session?.statusVersion).toBe((versionAtRequest ?? 0) + 1)
+    expect(session?.lastStatusSeq).toBe(11)
+    expect(getFreshAgentPaneContent(store).status).toBe('idle')
+  })
+
   it('clears stale opencode busy state from a live-reconciled idle HTTP snapshot', async () => {
     const store = createStore()
     const sessionId = 'ses_1'

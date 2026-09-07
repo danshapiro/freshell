@@ -1012,10 +1012,10 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       model: 'gpt-5-codex',
     })
-    await adapter.send?.('thread-new-1', {
+      await adapter.send?.('thread-new-1', {
       requestId: 'send-model-1',
       text: 'Use the small model',
-      settings: { model: 'gpt-5.4-flash' },
+      settings: { model: 'gpt-5.6-luna' },
     })
 
     const snapshot = await adapter.getSnapshot?.({
@@ -1025,8 +1025,8 @@ describe('Codex fresh-agent adapter', () => {
     }, 7) as any
     expect(snapshot.turns).toHaveLength(3)
     expect(snapshot.turns[0]).not.toHaveProperty('model')
-    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.4-flash' })
-    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.4-flash' })
+    expect(snapshot.turns[1]).toMatchObject({ role: 'user', model: 'gpt-5.6-luna' })
+    expect(snapshot.turns[2]).toMatchObject({ role: 'assistant', model: 'gpt-5.6-luna' })
   })
 
   it('subscribes to Codex lifecycle notifications and projects matching thread updates', async () => {
@@ -1082,11 +1082,12 @@ describe('Codex fresh-agent adapter', () => {
       sessionId: 'thread-new-1',
       status: 'idle',
     }))
-    expect(listener).toHaveBeenCalledWith({
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
       type: 'sdk.status',
       sessionId: 'thread-new-1',
       status: 'exited',
-    })
+      statusSeq: expect.any(Number),
+    }))
 
     unsubscribe?.()
     expect(off).toHaveBeenCalledTimes(1)
@@ -1311,6 +1312,59 @@ describe('Codex fresh-agent adapter', () => {
     }
   })
 
+  it('keeps the status sequence monotonic per thread across a re-subscribe (WS reconnect)', async () => {
+    // Same regime as the turn-complete clock above: WS fresh-agent subscriptions are
+    // torn down and recreated on reconnect, but the client store's statusSeq gate
+    // state survives. The per-thread (status, statusSeq) tracker must therefore live
+    // on adapter state, not the subscribe closure, or a same-ms / backward-clock status
+    // edge right after a reconnect is dropped as stale.
+    let lifecycleHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn((handler) => {
+        lifecycleHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(9000)
+    try {
+      const firstListener = vi.fn()
+      const unsub1 = await adapter.subscribe?.('thread-new-1', firstListener)
+      lifecycleHandler?.({
+        kind: 'thread_status_changed',
+        threadId: 'thread-new-1',
+        status: { type: 'active', activeFlags: [] },
+      })
+      unsub1?.()
+
+      // Reconnect: a brand-new subscription to the same thread, same wall-clock ms.
+      const secondListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', secondListener)
+      lifecycleHandler?.({
+        kind: 'thread_status_changed',
+        threadId: 'thread-new-1',
+        status: { type: 'idle' },
+      })
+
+      const firstSeq = firstListener.mock.calls
+        .map(([e]) => e)
+        .find((e) => e?.type === 'sdk.session.snapshot')?.statusSeq
+      const secondSeq = secondListener.mock.calls
+        .map(([e]) => e)
+        .find((e) => e?.type === 'sdk.session.snapshot')?.statusSeq
+      expect(firstSeq).toBe(9000)
+      expect(secondSeq).toBeGreaterThan(firstSeq)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
   it('resets the per-thread turn-complete clock on shutdown (not just on reconnect)', async () => {
     // shutdown() must clear *all* per-thread state, including the turn-complete clock,
     // so a reused-in-process adapter never clamps a fresh completion against a stale
@@ -1428,7 +1482,7 @@ describe('Codex fresh-agent adapter', () => {
       permissionMode: 'on-request',
       sandbox: 'workspace-write',
       effort: 'max',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
     })
 
     await adapter.send?.('thread-new-1', {
@@ -1446,7 +1500,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       approvalPolicy: 'on-request',
       sandboxPolicy: { type: 'workspaceWrite' },
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       effort: 'xhigh',
     })
     expect(runtime.interruptTurn).toHaveBeenCalledWith({
@@ -1505,18 +1559,21 @@ describe('Codex fresh-agent adapter', () => {
     await expect(adapter.create({
       requestId: 'req-1',
       sessionType: 'freshcodex',
-      model: 'gpt-5.4-flash',
-      effort: 'xhigh',
+      model: 'gpt-6-astra',
+      effort: 'none',
     })).resolves.toEqual({ sessionId: 'thread-new-1', sessionRef: { provider: 'codex', sessionId: 'thread-new-1' } })
 
     await adapter.send?.('thread-new-1', { text: 'reply ok' })
 
     expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4-flash',
+      model: 'gpt-6-astra',
     }))
     expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'gpt-5.4-flash',
-      effort: 'high',
+      model: 'gpt-6-astra',
+      // 'none' is undeclared for GPT-6 Astra (['low','medium','high','xhigh','max']),
+      // so the effort normalizes to the model's declared default ('max' → wire
+      // 'xhigh') — the effort clamp against the REQUESTED model.
+      effort: 'xhigh',
     }))
   })
 
@@ -1695,7 +1752,12 @@ describe('Codex fresh-agent adapter', () => {
 
     exitHandler?.(undefined, 'app_server_exit')
 
-    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sdk.status',
+      sessionId: 'thread-new-1',
+      status: 'exited',
+      statusSeq: expect.any(Number),
+    }))
     // A crash is NOT a positive completion: it clears BLUE but must never chime green.
     expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
 
@@ -1735,7 +1797,12 @@ describe('Codex fresh-agent adapter', () => {
 
     // Sidecar crashes mid-turn.
     exitHandler?.(undefined, 'app_server_exit')
-    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sdk.status',
+      sessionId: 'thread-new-1',
+      status: 'exited',
+      statusSeq: expect.any(Number),
+    }))
     expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
     // Recovery, not teardown: a crash must NOT release/shutdown the runtime.
     expect(runtime.shutdown).not.toHaveBeenCalled()
@@ -1802,7 +1869,10 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
       await vi.advanceTimersByTimeAsync(2)
       expect(listener).toHaveBeenCalledTimes(1)
-      expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-1', status: 'stuck' })
+      // eaw7: the deadman fire is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'stuck', statusSeq: expect.any(Number),
+      }))
       expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
     } finally {
       vi.useRealTimers()
@@ -1840,7 +1910,10 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       await vi.advanceTimersByTimeAsync(QUIET_MS - 1)
       expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
       await vi.advanceTimersByTimeAsync(2)
-      expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-1', status: 'stuck' })
+      // eaw7: the deadman fire is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'stuck', statusSeq: expect.any(Number),
+      }))
     } finally {
       vi.useRealTimers()
     }
@@ -1854,7 +1927,10 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       const listener = await subscribeAndSend(adapter)
       await vi.advanceTimersByTimeAsync(QUIET_MS - 100)
       handlers.exit?.()
-      expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-1', status: 'exited' })
+      // eaw7: the on_exit self-heal is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'exited', statusSeq: expect.any(Number),
+      }))
       await vi.advanceTimersByTimeAsync(QUIET_MS * 3)
       expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'stuck' }))
     } finally {
@@ -1895,7 +1971,10 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       // a later snapshot poll must NOT reset the window
       await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' } as any, 8)
       await vi.advanceTimersByTimeAsync(60)
-      expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-1', status: 'stuck' })
+      // eaw7: the deadman fire is a TRACKED status edge — stamped statusSeq.
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.status', sessionId: 'thread-1', status: 'stuck', statusSeq: expect.any(Number),
+      }))
     } finally {
       vi.useRealTimers()
     }

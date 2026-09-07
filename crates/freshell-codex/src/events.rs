@@ -79,6 +79,22 @@ pub fn next_monotonic_turn_complete_at(last_at: Option<i64>, now: i64) -> i64 {
     }
 }
 
+/// `nextMonotonicStatusSeq(lastAt, now)` (the statusSeq sibling of
+/// [`next_monotonic_turn_complete_at`], `turn-complete-clock.ts`): the per-session
+/// status sequence is wall-clock MILLISECONDS, not an ordinal counter — clamp
+/// `now` to be strictly greater than the session's previous mint, so two status
+/// folds in the same millisecond (or a backwards NTP step) never collide or
+/// regress within the process. A server restart may re-mint from a lower clock
+/// value; the client compensates by clearing its `lastStatusSeq` baselines on
+/// `bootId`/`serverInstanceId` change, so cross-restart ordering is out of scope
+/// here by design.
+pub fn next_monotonic_status_seq(last_at: Option<i64>, now: i64) -> i64 {
+    match last_at {
+        Some(last) if now <= last => last + 1,
+        _ => now,
+    }
+}
+
 /// The adapter-level events a codex subscription emits downstream (the `sdk.*` provider
 /// events, `adapter.ts:876-946`), normalized to the fields the runtime/oracle care about.
 #[derive(Clone, Debug, PartialEq)]
@@ -433,6 +449,27 @@ mod tests {
             1002,
             "backwards clock step still strictly increases"
         );
+    }
+
+    // ── the strictly-monotonic status sequence (`nextMonotonicStatusSeq`,
+    //    turn-complete-clock.ts) ───────────────────────────────────────────────
+
+    #[test]
+    fn status_seq_mints_now_when_no_last_is_tracked() {
+        assert_eq!(next_monotonic_status_seq(None, 1000), 1000);
+    }
+
+    #[test]
+    fn status_seq_mints_now_when_the_last_is_before_now() {
+        assert_eq!(next_monotonic_status_seq(Some(500), 1000), 1000);
+    }
+
+    #[test]
+    fn status_seq_clamps_to_last_plus_one_at_or_after_the_clock() {
+        // Same-millisecond fold: strictly above the session's previous mint.
+        assert_eq!(next_monotonic_status_seq(Some(1000), 1000), 1001);
+        // A backwards clock step still strictly increases (never regresses).
+        assert_eq!(next_monotonic_status_seq(Some(2000), 1000), 2001);
     }
 
     // ── thread-status normalization ────────────────────────────────────────────────────

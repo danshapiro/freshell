@@ -762,6 +762,139 @@ describe('fresh-agent-ws', () => {
     expect(Object.keys(session.pendingQuestions)).toEqual(['question-repeat'])
     expect(session.pendingQuestions['question-repeat'].questions[0].question).toBe('Proceed?')
   })
+
+  describe('statusSeq threading', () => {
+    function createSeqHarness(sessionId: string) {
+      const store = createFreshAgentStore()
+      const key = `freshclaude:claude:${sessionId}`
+      const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        event: { sessionId, ...event },
+      })
+      const session = () => store.getState().freshAgent.sessions[key]
+      return { sendEvent, session }
+    }
+
+    it('folds a snapshot-carried statusSeq and records it as the accept baseline', () => {
+      const { sendEvent, session } = createSeqHarness('claude-thread-seq-record')
+
+      expect(sendEvent({
+        type: 'freshAgent.session.snapshot',
+        latestTurnId: 'turn-1',
+        status: 'running',
+        revision: 1,
+        streamingActive: true,
+        streamingText: 'partial',
+        statusSeq: 20,
+      })).toBe(true)
+
+      expect(session()).toMatchObject({
+        status: 'running',
+        streamingActive: true,
+        streamingText: 'partial',
+        lastStatusSeq: 20,
+        statusVersion: 1,
+      })
+    })
+
+    it('drops stale-seq status and snapshot frames so busy survives a reconnect', () => {
+      const { sendEvent, session } = createSeqHarness('claude-thread-seq-stale')
+
+      expect(sendEvent({
+        type: 'freshAgent.session.snapshot',
+        latestTurnId: 'turn-1',
+        status: 'running',
+        revision: 1,
+        streamingActive: true,
+        streamingText: 'partial',
+        statusSeq: 20,
+      })).toBe(true)
+
+      // A stale status frame (seq older than the accepted baseline) is dropped
+      // wholesale: status AND the streaming pair skip together, statusVersion
+      // does not bump.
+      expect(sendEvent({ type: 'freshAgent.status', status: 'idle', statusSeq: 10 })).toBe(true)
+
+      // A stale snapshot (the reconnect clobber case) is dropped the same way.
+      expect(sendEvent({
+        type: 'freshAgent.session.snapshot',
+        latestTurnId: 'turn-1',
+        status: 'idle',
+        revision: 1,
+        streamingActive: false,
+        statusSeq: 10,
+      })).toBe(true)
+
+      expect(session()).toMatchObject({
+        status: 'running',
+        streamingActive: true,
+        streamingText: 'partial',
+        lastStatusSeq: 20,
+        statusVersion: 1,
+      })
+    })
+
+    it('treats a wrong-type statusSeq as seq-less so the legacy unconditional fold applies', () => {
+      const { sendEvent, session } = createSeqHarness('claude-thread-seq-wrong-type')
+
+      expect(sendEvent({
+        type: 'freshAgent.session.snapshot',
+        latestTurnId: 'turn-1',
+        status: 'running',
+        revision: 1,
+        statusSeq: 20,
+      })).toBe(true)
+
+      // A string seq is not a finite number: the transport reads it as seq-less
+      // and the write folds unconditionally (pre-seq-server compatibility).
+      expect(sendEvent({ type: 'freshAgent.status', status: 'idle', statusSeq: '20' })).toBe(true)
+
+      expect(session()).toMatchObject({
+        status: 'idle',
+        lastStatusSeq: 20,
+        statusVersion: 2,
+      })
+    })
+
+    it('folds events carrying no statusSeq unconditionally', () => {
+      const { sendEvent, session } = createSeqHarness('claude-thread-seq-absent')
+
+      expect(sendEvent({
+        type: 'freshAgent.session.snapshot',
+        latestTurnId: 'turn-1',
+        status: 'running',
+        revision: 1,
+        statusSeq: 20,
+      })).toBe(true)
+
+      expect(sendEvent({ type: 'freshAgent.status', status: 'idle' })).toBe(true)
+
+      expect(session()).toMatchObject({
+        status: 'idle',
+        lastStatusSeq: 20,
+        statusVersion: 2,
+      })
+
+      // Seq-less snapshot folds unconditionally too (legacy server snapshot).
+      expect(sendEvent({
+        type: 'freshAgent.session.snapshot',
+        latestTurnId: 'turn-2',
+        status: 'running',
+        revision: 2,
+        streamingActive: true,
+      })).toBe(true)
+
+      expect(session()).toMatchObject({
+        status: 'running',
+        streamingActive: true,
+        lastStatusSeq: 20,
+        statusVersion: 3,
+      })
+    })
+  })
 })
 
 describe('rollback folds (kata 1wxv)', () => {

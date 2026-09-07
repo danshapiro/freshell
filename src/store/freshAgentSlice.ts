@@ -79,9 +79,20 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
   }
 }
 
-function writeSessionStatus(session: FreshAgentSessionState, status: FreshAgentSessionStatus): void {
+// Returns true when the status write was accepted. Fold order (LB-04): the
+// statusSeq gate runs FIRST — a frame carrying a finite server-authoritative
+// statusSeq that is not strictly newer than the last accepted seq is dropped
+// wholesale (callers skip status/streamingActive/streamingText together;
+// statusVersion bumps only on accepted writes). Missing or non-finite seq
+// takes the legacy unconditional fold so pre-seq servers keep working.
+function writeSessionStatus(session: FreshAgentSessionState, status: FreshAgentSessionStatus, statusSeq?: number): boolean {
+  if (statusSeq !== undefined && Number.isFinite(statusSeq)) {
+    if (session.lastStatusSeq !== undefined && statusSeq <= session.lastStatusSeq) return false
+    session.lastStatusSeq = statusSeq
+  }
   session.status = status
   session.statusVersion = (session.statusVersion ?? 0) + 1
+  return true
 }
 
 function ensureSession(
@@ -278,6 +289,7 @@ const freshAgentSlice = createSlice({
     sessionSnapshotReceived(state, action: PayloadAction<SessionMutationPayload & {
       latestTurnId: string | null
       status: FreshAgentSessionStatus
+      statusSeq?: number
       historySessionId?: string
       revision?: number
       streamingActive?: boolean
@@ -289,31 +301,41 @@ const freshAgentSlice = createSlice({
       // revoke a stale `lost` flag from a transient dead-window race
       // (reconnect unwedge).
       session.lost = false
-      const shouldRestartHydration = Boolean(
-        session.historyLoaded
-          && action.payload.revision != null
-          && session.historyRevision != null
-          && action.payload.revision !== session.historyRevision,
-      )
-      if (shouldRestartHydration) {
-        resetHydratedHistoryState(session)
-        requestRestoreHydrationRestart(session)
+      // Fold order (LB-04): the seq gate runs FIRST. A dropped (stale or
+      // equal-seq) frame skips the status write AND every derived write
+      // atomically — the streaming pair, the hydration restart (which blanks
+      // streamingActive/streamingText via resetHydratedHistoryState), and the
+      // latestTurnId/historyRevision/historyLoaded bookkeeping all gate on the
+      // accepted boolean, so a stale snapshot after a reconnect can never
+      // clobber live state.
+      const statusAccepted = writeSessionStatus(session, action.payload.status, action.payload.statusSeq)
+      if (statusAccepted) {
+        const shouldRestartHydration = Boolean(
+          session.historyLoaded
+            && action.payload.revision != null
+            && session.historyRevision != null
+            && action.payload.revision !== session.historyRevision,
+        )
+        if (shouldRestartHydration) {
+          resetHydratedHistoryState(session)
+          requestRestoreHydrationRestart(session)
+        }
+        // resetHydratedHistoryState also clears latestTurnId and the streaming
+        // pair — the accepted payload's values are re-applied after the reset.
+        session.latestTurnId = action.payload.latestTurnId
+        session.historySessionId = action.payload.historySessionId ?? session.historySessionId
+        session.historyRevision = action.payload.revision ?? session.historyRevision
+        session.streamingActive = action.payload.streamingActive ?? false
+        session.streamingText = action.payload.streamingText ?? ''
+        if (action.payload.latestTurnId === null && !session.awaitingDurableHistory) {
+          session.historyLoaded = true
+        } else if (action.payload.latestTurnId !== null) {
+          session.awaitingDurableHistory = false
+        }
       }
-
-      session.latestTurnId = action.payload.latestTurnId
-      writeSessionStatus(session, action.payload.status)
-      session.historySessionId = action.payload.historySessionId ?? session.historySessionId
-      session.historyRevision = action.payload.revision ?? session.historyRevision
-      session.streamingActive = action.payload.streamingActive ?? false
-      session.streamingText = action.payload.streamingText ?? ''
       session.restoreFailureCode = undefined
       session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
-      if (action.payload.latestTurnId === null && !session.awaitingDurableHistory) {
-        session.historyLoaded = true
-      } else if (action.payload.latestTurnId !== null) {
-        session.awaitingDurableHistory = false
-      }
     },
 
     materializeSession(state, action: PayloadAction<FreshAgentSessionMaterializedPayload>) {
@@ -373,7 +395,9 @@ const freshAgentSlice = createSlice({
       // dispatch site); the line is armor for any future HTTP-snapshot fold.
       session.lost = false
       session.snapshot = snapshot
-      writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus)
+      // The contract snapshot carries an optional statusSeq: a stale snapshot
+      // arriving after a reconnect must not clobber a newer tracked status.
+      writeSessionStatus(session, snapshot.status as FreshAgentSessionStatus, snapshot.statusSeq)
       session.latestTurnId = snapshot.latestTurnId
       session.historyRevision = snapshot.revision
       session.turns = snapshot.turns
@@ -392,17 +416,28 @@ const freshAgentSlice = createSlice({
       session.awaitingDurableHistory = false
     },
 
-    setSessionStatus(state, action: PayloadAction<SessionMutationPayload & { status: FreshAgentSessionStatus }>) {
+    setSessionStatus(state, action: PayloadAction<SessionMutationPayload & { status: FreshAgentSessionStatus; statusSeq?: number }>) {
       const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
       if (!session) return
-      writeSessionStatus(session, action.payload.status)
+      const statusAccepted = writeSessionStatus(session, action.payload.status, action.payload.statusSeq)
       // A terminal/idle status ends the turn: clear streaming too, else busy stays
       // true (isFreshAgentBusy = streamingActive || running) and the pane is stuck
       // blue after a natural stream-end / freshAgent.status:idle broadcast.
       // 'stuck' (wedged-sidecar deadman) ends the busy assertion the same way —
       // without emitting any completion edge.
-      if (action.payload.status === 'idle' || action.payload.status === 'exited' || action.payload.status === 'stuck') {
+      if (statusAccepted && (action.payload.status === 'idle' || action.payload.status === 'exited' || action.payload.status === 'stuck')) {
         session.streamingActive = false
+      }
+    },
+
+    // Restart safety: statusSeq is wall-clock-ms, so a restarted server can
+    // re-mint a LOWER seq than a clamp-inflated pre-restart baseline. App.tsx
+    // dispatches this beside resetCompletionDedupeBaselines() when
+    // bootId/serverInstanceId changes, so a fresh status after a restart is
+    // never dropped as stale.
+    resetStatusSeqBaselines(state) {
+      for (const session of Object.values(state.sessions)) {
+        session.lastStatusSeq = undefined
       }
     },
 
@@ -640,6 +675,7 @@ export const {
   removePermission,
   removeQuestion,
   removeSession,
+  resetStatusSeqBaselines,
   restoreRetryRequested,
   sessionCreated,
   sessionError,

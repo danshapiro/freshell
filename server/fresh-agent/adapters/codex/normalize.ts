@@ -749,6 +749,9 @@ export function normalizeCodexThreadSnapshot(input: {
   threadId: string
   revision: number
   status: string
+  /** Server-authoritative status sequence minted by the adapter's per-thread
+   * tracker; conditional spread so undefined omits the key. */
+  statusSeq?: number
   transcript: { turns: FreshAgentTurn[] }
   rawSnapshot: CodexRawSnapshot
 }) {
@@ -760,6 +763,7 @@ export function normalizeCodexThreadSnapshot(input: {
     threadId: input.threadId,
     revision: input.revision,
     status: input.status,
+    ...(input.statusSeq !== undefined ? { statusSeq: input.statusSeq } : {}),
     summary: input.rawSnapshot.summary ?? input.rawSnapshot.thread?.preview ?? '',
     capabilities: {
       send: !isRunning,

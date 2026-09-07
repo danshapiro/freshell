@@ -1062,6 +1062,10 @@ pub(crate) fn build_claude_snapshot_json(
         // state): this adapter is disk-only and always reports "idle" -- live status
         // is authoritative via the WS status events, so the client ignores this on
         // live sessions.
+        // eaw7: the snapshot carries NO `statusSeq` by design — this status is an
+        // untracked default, and only tracked status folds mint a seq (the
+        // never-mint-from-defaults rule); the client folds seq-less snapshots via
+        // the legacy unconditional path.
         "status": "idle",
         "capabilities": {
             "send": true,

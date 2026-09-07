@@ -19,3 +19,21 @@
 export function nextMonotonicTurnCompleteAt(lastAt: number | undefined, now: number): number {
   return lastAt !== undefined && now <= lastAt ? lastAt + 1 : now
 }
+
+/**
+ * Returns a per-session strictly-monotonic status sequence number.
+ *
+ * The provider-agnostic `statusSeq` reuses the exact same regime as the
+ * turn-complete `at` above: wall-clock milliseconds (NOT an ordinal counter),
+ * clamped per session so it is strictly greater than the previously minted seq.
+ * Same-clock ties and backward clock steps (NTP) would otherwise make a real
+ * later status look `<= last` and be dropped as stale by the client fold gate.
+ *
+ * The clamp guarantees monotonicity only *within a process*; a restarted server
+ * can re-mint from a lower wall clock. That cross-restart gap is closed on the
+ * client, which clears its per-session status baselines on bootId /
+ * serverInstanceId change (dispatched beside resetCompletionDedupeBaselines).
+ */
+export function nextMonotonicStatusSeq(lastAt: number | undefined, now: number): number {
+  return lastAt !== undefined && now <= lastAt ? lastAt + 1 : now
+}

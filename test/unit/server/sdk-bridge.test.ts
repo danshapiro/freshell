@@ -297,6 +297,170 @@ describe('SdkBridge', () => {
     })
   })
 
+  describe('statusSeq (server-authoritative per-session status sequence)', () => {
+    const initMessage = () => ({
+      type: 'system',
+      subtype: 'init',
+      session_id: 'cli-123',
+      model: 'claude-sonnet-4-5-20250929',
+      cwd: '/tmp',
+      tools: [],
+      uuid: 'test-uuid',
+    })
+    const assistantMessage = () => ({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }], model: 'claude-sonnet-4-5-20250929' },
+      parent_tool_use_id: null,
+      uuid: 'test-uuid',
+      session_id: 'cli-123',
+    })
+    const successResultMessage = () => ({
+      type: 'result',
+      subtype: 'success',
+      duration_ms: 1,
+      is_error: false,
+      num_turns: 1,
+      session_id: 'cli-123',
+      uuid: 'test-uuid',
+    })
+
+    it('mints a strictly increasing statusSeq across connected → running → idle and stamps the sdk.status push with the tracked pair', async () => {
+      let wallClock = 1000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => wallClock)
+      try {
+        mockKeepStreamOpen = true
+        const session = await bridge.createSession({ cwd: '/tmp' })
+        // The create fold (starting) mints the session's first seq at the wall clock.
+        expect(session.lastStatusSeq).toBe(1000)
+
+        const received: any[] = []
+        bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+        const state = bridge.getSession(session.sessionId)!
+
+        wallClock = 2000
+        pushLiveSdkMessage(initMessage())
+        await new Promise((r) => setTimeout(r, 50))
+        expect(state.status).toBe('connected')
+        expect(state.lastStatusSeq).toBe(2000)
+
+        wallClock = 3000
+        pushLiveSdkMessage(assistantMessage())
+        await new Promise((r) => setTimeout(r, 50))
+        expect(state.status).toBe('running')
+        expect(state.lastStatusSeq).toBe(3000)
+
+        wallClock = 4000
+        pushLiveSdkMessage(successResultMessage())
+        await new Promise((r) => setTimeout(r, 50))
+        expect(state.status).toBe('idle')
+        expect(state.lastStatusSeq).toBe(4000)
+
+        // Natural stream end folds idle → the sdk.status push carries the tracked
+        // (status, statusSeq) pair — the same pair a REST snapshot stamps.
+        wallClock = 5000
+        mockStreamEndResolve?.()
+        await new Promise((r) => setTimeout(r, 50))
+        const idlePush = received.find((m) => m.type === 'sdk.status' && m.status === 'idle')
+        expect(idlePush).toBeDefined()
+        expect(idlePush.statusSeq).toBe(state.lastStatusSeq)
+        expect(state.lastStatusSeq).toBe(4000)
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('still increases by exactly +1 per transition when Date.now does not advance (clamp)', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1000)
+      try {
+        mockKeepStreamOpen = true
+        const session = await bridge.createSession({ cwd: '/tmp' })
+        // starting fold mints at the frozen wall clock.
+        expect(session.lastStatusSeq).toBe(1000)
+
+        const received: any[] = []
+        bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+        pushLiveSdkMessage(initMessage())
+        pushLiveSdkMessage(assistantMessage())
+        pushLiveSdkMessage(successResultMessage())
+        await new Promise((r) => setTimeout(r, 100))
+        // Natural stream end: idle folds onto idle, reusing the tracked seq.
+        mockStreamEndResolve?.()
+        await new Promise((r) => setTimeout(r, 100))
+
+        const state = bridge.getSession(session.sessionId)!
+        // connected (1001) → running (1002) → idle (1003): the clamp keeps each
+        // transition strictly above the last even though the wall clock never moved.
+        expect(state.status).toBe('idle')
+        expect(state.lastStatusSeq).toBe(1003)
+        const idlePush = received.find((m) => m.type === 'sdk.status' && m.status === 'idle')
+        expect(idlePush).toBeDefined()
+        expect(idlePush.statusSeq).toBe(1003)
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('mints a fresh seq when sendUserMessage reserves a turn (running must be newer than the pre-send idle)', async () => {
+      let wallClock = 1000
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => wallClock)
+      try {
+        mockKeepStreamOpen = true
+        const session = await bridge.createSession({ cwd: '/tmp' })
+        bridge.subscribe(session.sessionId, () => {})
+        const state = bridge.getSession(session.sessionId)!
+
+        // Drive the session to idle at the frozen clock (1001 connected, 1002
+        // running, 1003 idle per the same-transition clamp).
+        pushLiveSdkMessage(initMessage())
+        pushLiveSdkMessage(assistantMessage())
+        pushLiveSdkMessage(successResultMessage())
+        await new Promise((r) => setTimeout(r, 100))
+        expect(state.status).toBe('idle')
+        expect(state.lastStatusSeq).toBe(1003)
+
+        // The send reserves the turn: the truthful new 'running' status MUST mint
+        // strictly above the idle pair — otherwise every running-statused frame of
+        // the turn carries (running, 1003) and the client gate (statusSeq <=
+        // lastStatusSeq) drops them as stale, hiding the busy indicator.
+        expect(bridge.sendUserMessage(session.sessionId, 'hello')).toBe(true)
+        expect(state.status).toBe('running')
+        expect(state.lastStatusSeq).toBeGreaterThan(1003)
+        const reservationSeq = state.lastStatusSeq!
+
+        // The first assistant edge of the new turn is a same-status fold and reuses
+        // the reservation's minted pair (no useless re-mint).
+        pushLiveSdkMessage(assistantMessage())
+        await new Promise((r) => setTimeout(r, 100))
+        expect(state.status).toBe('running')
+        expect(state.lastStatusSeq).toBe(reservationSeq)
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
+    it('mints a statusSeq for the exited fold so a later exited snapshot carries the sequence', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(5000)
+      try {
+        mockKeepStreamOpen = true
+        const session = await bridge.createSession({ cwd: '/tmp' })
+        expect(session.lastStatusSeq).toBe(5000)
+        const received: any[] = []
+        bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+        pushLiveSdkMessage(initMessage())
+        await new Promise((r) => setTimeout(r, 50))
+        const state = bridge.getSession(session.sessionId)!
+        expect(state.status).toBe('connected')
+        expect(state.lastStatusSeq).toBe(5001)
+
+        bridge.killSession(session.sessionId)
+        expect(state.status).toBe('exited')
+        expect(state.lastStatusSeq).toBe(5002)
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+  })
+
   describe('SDK message translation', () => {
     it('translates system init to sdk.session.init', async () => {
       mockKeepStreamOpen = true

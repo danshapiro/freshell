@@ -11,6 +11,9 @@ export type FreshAgentProviderEvent =
     revision?: number
     streamingActive?: boolean
     streamingText?: string
+    /** Server-authoritative per-session status sequence (wall-clock ms, strictly
+     * monotonic). Present only when the status came from a tracked fold. */
+    statusSeq?: number
   }
   | {
     type: 'freshAgent.session.changed'
@@ -31,7 +34,7 @@ export type FreshAgentProviderEvent =
   | { type: 'freshAgent.permission.request'; sessionId: string; requestId: string; subtype: string; tool?: { name: string; input?: Record<string, unknown> }; toolUseID?: string; suggestions?: unknown[]; blockedPath?: string; decisionReason?: string }
   | { type: 'freshAgent.permission.cancelled'; sessionId: string; requestId: string }
   | { type: 'freshAgent.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
-  | { type: 'freshAgent.status'; sessionId: string; status: SdkSessionStatus }
+  | { type: 'freshAgent.status'; sessionId: string; status: SdkSessionStatus; statusSeq?: number }
   | { type: 'freshAgent.turn.complete'; sessionId: string; at: number }
   | { type: 'freshAgent.turn.waiting'; sessionId: string; at: number }
   | { type: 'freshAgent.error'; sessionId: string; message: string; code?: string }

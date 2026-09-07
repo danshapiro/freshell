@@ -22,7 +22,7 @@ import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-
 import { clearPendingCreateFailure, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { readStatusSeq, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { getRebindQueue } from '@/lib/rebind-queue'
 import { getSnapshotScheduler, makeSnapshotKey, type SnapshotTrigger } from '@/lib/fresh-agent-snapshot-scheduler'
@@ -2198,6 +2198,12 @@ export function FreshAgentView({
           sessionType: requestSessionType,
           provider,
           status: sessionStatus,
+          // Thread the contract-parsed snapshot statusSeq into the store fold
+          // so a stale REST answer drops at the same seq gate as WS frames
+          // (fold order LB-04: seq gate first, the heuristics above are the
+          // second barrier). readStatusSeq is the shared finite guard — any
+          // non-finite/absent seq reads as seq-less and legacy-folds.
+          statusSeq: readStatusSeq(resolved),
         }))
       }
       if (
