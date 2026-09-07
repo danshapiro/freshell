@@ -155,3 +155,92 @@ fn network_rates_keep_error_and_drop_totals_and_deltas_distinct() {
     assert_eq!(next.rx_dropped_delta, 1);
     assert_eq!(next.tx_dropped_delta, 1);
 }
+
+fn write_host_memory(root: &Path) {
+    write_fixture(
+        &root.join("proc"),
+        "meminfo",
+        "MemTotal: 64000000 kB\n\
+         MemAvailable: 32000000 kB\n\
+         SwapTotal: 8000000 kB\n\
+         SwapFree: 8000000 kB\n",
+    );
+}
+
+#[test]
+fn finite_cgroup_memory_wins_without_mixing_host_totals() {
+    let root = tempfile::tempdir().unwrap();
+    write_host_memory(root.path());
+    write_fixture(
+        &root.path().join("proc"),
+        "self/cgroup",
+        "0::/freshell-test\n",
+    );
+    let cgroup = root.path().join("sys/fs/cgroup/freshell-test");
+    write_fixture(&cgroup, "memory.max", "8000000000\n");
+    write_fixture(&cgroup, "memory.current", "500000000\n");
+
+    let memory = fixture_collector(root.path()).ctx.read_memory_section();
+    assert!(memory.available);
+    assert_eq!(memory.source, "cgroup");
+    assert_eq!(memory.total_bytes, 8_000_000_000);
+    assert_eq!(memory.used_bytes, 500_000_000);
+    assert_eq!(memory.available_bytes, 7_500_000_000);
+    assert_eq!(memory.cgroup_limit_bytes, Some(8_000_000_000));
+    assert_eq!(memory.swap_total_bytes, Some(8_000_000 * 1024));
+    assert_eq!(memory.swap_used_bytes, Some(0));
+}
+
+#[test]
+fn unlimited_cgroup_memory_uses_host_used_and_available_values() {
+    let root = tempfile::tempdir().unwrap();
+    write_host_memory(root.path());
+    write_fixture(
+        &root.path().join("proc"),
+        "self/cgroup",
+        "0::/freshell-test\n",
+    );
+    let cgroup = root.path().join("sys/fs/cgroup/freshell-test");
+    write_fixture(&cgroup, "memory.max", "max\n");
+    write_fixture(&cgroup, "memory.current", "500000000\n");
+
+    let memory = fixture_collector(root.path()).ctx.read_memory_section();
+    assert!(memory.available);
+    assert_eq!(memory.source, "host");
+    assert_eq!(memory.total_bytes, 64_000_000 * 1024);
+    assert_eq!(memory.used_bytes, 32_000_000 * 1024);
+    assert_eq!(memory.available_bytes, 32_000_000 * 1024);
+    assert_eq!(memory.cgroup_limit_bytes, None);
+    assert_eq!(memory.swap_total_bytes, Some(8_000_000 * 1024));
+    assert_eq!(memory.swap_used_bytes, Some(0));
+}
+
+#[test]
+fn absent_cgroup_memory_uses_host_meminfo() {
+    let root = tempfile::tempdir().unwrap();
+    write_host_memory(root.path());
+
+    let memory = fixture_collector(root.path()).ctx.read_memory_section();
+    assert!(memory.available);
+    assert_eq!(memory.source, "host");
+    assert_eq!(memory.total_bytes, 64_000_000 * 1024);
+    assert_eq!(memory.used_bytes, 32_000_000 * 1024);
+    assert_eq!(memory.available_bytes, 32_000_000 * 1024);
+    assert_eq!(memory.cgroup_limit_bytes, None);
+    assert_eq!(memory.swap_total_bytes, Some(8_000_000 * 1024));
+    assert_eq!(memory.swap_used_bytes, Some(0));
+}
+
+#[test]
+fn missing_memory_sources_produce_an_unavailable_full_shape() {
+    let root = tempfile::tempdir().unwrap();
+    let memory = fixture_collector(root.path()).ctx.read_memory_section();
+
+    assert!(!memory.available);
+    assert_eq!(memory.total_bytes, 0);
+    assert_eq!(memory.used_bytes, 0);
+    assert_eq!(memory.available_bytes, 0);
+    assert_eq!(memory.cgroup_limit_bytes, None);
+    assert_eq!(memory.swap_total_bytes, None);
+    assert_eq!(memory.swap_used_bytes, None);
+}
