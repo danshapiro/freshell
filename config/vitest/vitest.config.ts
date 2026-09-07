@@ -30,6 +30,7 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./test/setup/dom.ts'],
     exclude: [
+      'test/runtime/**',
       '**/node_modules/**',
       '**/server-node-modules/**',
       '**/bundled-node/**',

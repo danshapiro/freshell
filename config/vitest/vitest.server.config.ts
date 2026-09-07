@@ -38,6 +38,7 @@ export default defineConfig({
       'test/integration/extension-system.test.ts',
     ],
     exclude: [
+      'test/runtime/**',
       'docs/plans/**',
       'test/integration/server/codex-real-provider-smoke.test.ts',
       'test/integration/server/opencode-serve-real-provider-smoke.test.ts',

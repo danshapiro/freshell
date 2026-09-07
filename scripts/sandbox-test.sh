@@ -9,6 +9,10 @@
 # Usage:
 #   scripts/sandbox-test.sh "cargo test -p freshell-ws"
 #   scripts/sandbox-test.sh --corpus "cargo test -p freshell-sessions -- --ignored perf"
+#   scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex ..."
+#
+# --runtime-suite is the stricter managed-runtime lifecycle mode: no network,
+# no real provider corpus, no Docker/admin socket, read-only container root.
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
@@ -19,13 +23,34 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
 
 MOUNT_CORPUS=0
-if [ "${1:-}" = "--corpus" ]; then
-  MOUNT_CORPUS=1
-  shift
+RUNTIME_SUITE=0
+while [ "$#" -gt 0 ]; do
+  case "${1}" in
+    --corpus)
+      MOUNT_CORPUS=1
+      shift
+      ;;
+    --runtime-suite)
+      RUNTIME_SUITE=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ "${MOUNT_CORPUS}" -eq 1 ] && [ "${RUNTIME_SUITE}" -eq 1 ]; then
+  echo "[sandbox] --runtime-suite may not mount the real --corpus provider data" >&2
+  exit 2
 fi
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: $0 [--corpus] \"<command to run inside the sandbox>\"" >&2
+  echo "usage: $0 [--corpus | --runtime-suite] \"<command to run inside the sandbox>\"" >&2
   exit 2
 fi
 CMD="$1"
@@ -35,18 +60,23 @@ if ! docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1; then
   "${REPO_ROOT}/scripts/sandbox-build.sh"
 fi
 
-# A dedicated, isolated bridge network — not Docker's implicit default
-# "bridge" network. Functionally identical isolation (own network namespace,
-# no host port exposure, never --network=host); a dedicated name just makes
-# intent explicit and doesn't depend on the daemon's default-network state.
-NETWORK_NAME="freshell-sandbox"
-if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
-  docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
+# Ordinary destructive tests keep the established dedicated bridge network.
+# Managed-runtime lifecycle tests are stricter: no network at all. Neither mode
+# ever uses the host network.
+NETWORK_ARGS=()
+if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+  NETWORK_ARGS=(--network none)
+else
+  NETWORK_NAME="freshell-sandbox"
+  if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
+    docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
+  fi
+  NETWORK_ARGS=(--network "${NETWORK_NAME}")
 fi
 
 DOCKER_ARGS=(
   run --rm
-  --network "${NETWORK_NAME}"
+  "${NETWORK_ARGS[@]}"
   --pids-limit 512
   --memory 8g
   -v "${REPO_ROOT}:/workspace"
@@ -56,6 +86,16 @@ DOCKER_ARGS=(
   -v freshell-sandbox-node-modules:/workspace/node_modules
   -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
 )
+
+if [ "${RUNTIME_SUITE}" -eq 1 ]; then
+  DOCKER_ARGS+=(
+    --read-only
+    --tmpfs /tmp:rw,nosuid,nodev,size=512m
+    --tmpfs /home/sandbox/.cache:rw,nosuid,nodev,size=256m
+    --security-opt no-new-privileges
+    -e FRESHELL_SANDBOX_MODE=runtime-suite
+  )
+fi
 
 if [ "${MOUNT_CORPUS}" -eq 1 ]; then
   if [ -d "${HOME}/.codex/sessions" ]; then

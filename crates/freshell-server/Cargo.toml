@@ -14,6 +14,14 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Phase 1 handoff marker only. This flag is disabled by default and intentionally
+# has no dependency or routing wiring yet; enabling it MUST NOT cause a legacy
+# process launch to be described as managed. Phase 2/3 will attach the runtime
+# client only after their live continuity/provider gates pass.
+default = []
+managed-runtime-v1 = []
+
 [[bin]]
 name = "freshell-server"
 path = "src/main.rs"

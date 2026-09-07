@@ -24,7 +24,7 @@ export default defineConfig({
       'test/unit/electron/**/*.test.ts',
       'test/unit/electron/**/*.test.tsx',
     ],
-    exclude: ['docs/plans/**'],
+    exclude: ['docs/plans/**', 'test/runtime/**'],
     testTimeout: 30000,
     hookTimeout: 30000,
     alias: {
