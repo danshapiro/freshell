@@ -240,12 +240,22 @@ async function requestJson(url: string, init?: RequestInit): Promise<Response> {
   throw new Error(`Timed out requesting ${url}: ${String(lastError)}`)
 }
 
-async function writeFakeClaudeSdk(root: string): Promise<string> {
-  const modulePath = path.join(root, 'fake-claude-sdk.mjs')
+async function writeFakeClaudeSdk(root: string): Promise<{ modulePath: string; relativeSpecifier: string }> {
+  const fileName = `checkout-free-fake-claude-sdk-${randomUUID()}.mjs`
+  const modulePath = path.join(root, fileName)
   await writeFile(modulePath, `
 export function query() {
   let emitted = false
   return {
+    async supportedModels() {
+      return [{
+        value: 'checkout-free-relocated-model',
+        displayName: 'Checkout-Free Relocated Model',
+        supportedEffortLevels: ['medium'],
+        supportsAdaptiveThinking: true,
+      }]
+    },
+    async close() {},
     async next() {
       if (emitted) return { done: true, value: undefined }
       emitted = true
@@ -258,7 +268,7 @@ export function query() {
   }
 }
 `)
-  return modulePath
+  return { modulePath, relativeSpecifier: `./${fileName}` }
 }
 
 describe('checkout-free Electron runtime acceptance', () => {
@@ -280,12 +290,10 @@ describe('checkout-free Electron runtime acceptance', () => {
     const outsideRoot = await mkdtemp(path.join(tmpdir(), 'freshell-electron-runtime-'))
     const runtime = path.join(outsideRoot, 'runtime')
     const emptyCwd = path.join(outsideRoot, 'cwd')
-    const fakeRoot = path.join(outsideRoot, 'fixtures')
     await cp(staged, runtime, { recursive: true })
     await writeFile(path.join(outsideRoot, 'root-marker'), 'outside checkout')
     await mkdir(emptyCwd, { recursive: true })
-    await mkdir(fakeRoot, { recursive: true })
-    const fakeSdk = await writeFakeClaudeSdk(fakeRoot)
+    const fakeSdk = await writeFakeClaudeSdk(path.join(runtime, 'claude-sidecar'))
     expect(existsSync(path.join(outsideRoot, 'node_modules'))).toBe(false)
     expect(path.resolve(outsideRoot)).not.toBe(path.resolve(PROJECT_ROOT))
 
@@ -306,6 +314,7 @@ describe('checkout-free Electron runtime acceptance', () => {
         FRESHELL_CLIENT_DIR: path.join(runtime, 'client'),
         FRESHELL_CLAUDE_NODE: nodeBinary,
         FRESHELL_CLAUDE_SIDECAR: sidecarEntry,
+        FRESHELL_CLAUDE_SDK_QUERY_MODULE: fakeSdk.relativeSpecifier,
         FRESHELL_MCP_NODE: nodeBinary,
         FRESHELL_MCP_ENTRY: mcpEntry,
         NODE_PATH: '',
@@ -323,6 +332,26 @@ describe('checkout-free Electron runtime acceptance', () => {
       const info = await infoResponse.json() as Record<string, unknown>
       expect(info.runtime).toBe('rust')
       expect(info.commit).toEqual(expect.any(String))
+
+      const modelCapabilities = await requestJson(`${baseUrl}/api/fresh-agent/model-capabilities/freshclaude`, {
+        headers: { 'x-auth-token': AUTHENTICATION_TOKEN },
+      })
+      expect(modelCapabilities.status).toBe(200)
+      const catalog = await modelCapabilities.json() as Record<string, unknown>
+      expect(catalog).toMatchObject({
+        ok: true,
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        status: 'fresh',
+      })
+      expect(catalog.models).toEqual([{
+        id: 'checkout-free-relocated-model',
+        displayName: 'Checkout-Free Relocated Model',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['medium'],
+        supportsAdaptiveThinking: true,
+      }])
 
       const spa = await requestJson(`${baseUrl}/`)
       expect(spa.status).toBe(200)
@@ -397,7 +426,7 @@ describe('checkout-free Electron runtime acceptance', () => {
         env: {
           ...process.env,
           NODE_PATH: '',
-          FRESHELL_CLAUDE_SDK_QUERY_MODULE: pathToFileURL(fakeSdk).href,
+          FRESHELL_CLAUDE_SDK_QUERY_MODULE: pathToFileURL(fakeSdk.modulePath).href,
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       })

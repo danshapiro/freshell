@@ -62,6 +62,8 @@ export const RUNTIME_LAYOUT = Object.freeze({
   nodeBinary: 'node/bin/node',
   nodeBinaryWindows: 'node/bin/node.exe',
   claudeEntry: 'claude-sidecar/index.mjs',
+  claudeSessionSettings: 'claude-sidecar/session-settings.mjs',
+  claudeModelCatalog: 'claude-sidecar/model-catalog.mjs',
   claudePackage: 'claude-sidecar/package.json',
   claudeLock: 'claude-sidecar/package-lock.json',
   claudeDependencies: 'claude-sidecar/node_modules',
@@ -115,6 +117,8 @@ export function getRuntimeAllowlist(
     nodeBinary,
     RUNTIME_LAYOUT.clientIndex,
     RUNTIME_LAYOUT.claudeEntry,
+    RUNTIME_LAYOUT.claudeSessionSettings,
+    RUNTIME_LAYOUT.claudeModelCatalog,
     RUNTIME_LAYOUT.claudePackage,
     RUNTIME_LAYOUT.claudeLock,
     `${RUNTIME_LAYOUT.claudeDependencies}/@anthropic-ai/claude-agent-sdk/package.json`,
@@ -652,7 +656,14 @@ function copySidecar(
   platform: ElectronRuntimePlatform,
   arch: ElectronRuntimeArch,
 ): void {
-  for (const name of ['index.mjs', 'permission-channel.mjs', 'package.json', 'package-lock.json']) {
+  for (const name of [
+    'index.mjs',
+    'permission-channel.mjs',
+    'session-settings.mjs',
+    'model-catalog.mjs',
+    'package.json',
+    'package-lock.json',
+  ]) {
     const source = path.join(sourceDir, name)
     if (existsSync(source)) copyRequiredFile(source, path.join(destinationDir, name))
   }
@@ -769,6 +780,12 @@ export async function stageElectronRuntime(
   await ensureNodeBinary(options, nodeVersion, platform, arch, paths.nodeBinary, runtimeDir)
   copySidecar(sidecarDir, paths.claudeSidecarDir, sidecarNodeModulesDir, sidecarLock, platform, arch)
   copyMcp(mcpDistDir, paths.mcpDir, paths.nodeClientRuntimeDir, rootNodeModulesDir, sourceRootLock, rootPackageJson, releaseVersion, platform, arch)
+
+  for (const required of getRuntimeAllowlist(platform).requiredFiles) {
+    if (!existsSync(path.join(runtimeDir, required))) {
+      throw new Error(`Electron runtime staging is missing required file: ${required}`)
+    }
+  }
 
   const files = listFiles(runtimeDir)
   const unapproved = findUnapprovedRuntimePaths(files, platform)

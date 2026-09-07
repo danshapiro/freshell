@@ -17,7 +17,6 @@
 //! agent turn or modifies an existing session.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -164,10 +163,7 @@ fn claude_probe_error(message: impl Into<String>) -> CapabilityError {
 impl ModelCatalogProbe for ClaudeCatalogProbe {
     fn probe<'a>(&'a self, _cwd: Option<&'a str>) -> BoxFuture<'a, CatalogOut> {
         Box::pin(async move {
-            let entry = PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../freshell-claude-sidecar/model-catalog.mjs"
-            ));
+            let entry = crate::claude::sidecar_entry_path().with_file_name("model-catalog.mjs");
             let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".into());
             let mut command = tokio::process::Command::new(node);
             command

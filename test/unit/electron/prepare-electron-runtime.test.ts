@@ -60,7 +60,12 @@ function createSourceFixture(root: string): {
   writeFileSync(path.join(claudeSidecarDir, 'session-settings.mjs'), 'export const configureSession = () => ({ staged: true })\n')
   writeFileSync(path.join(claudeSidecarDir, 'model-catalog.mjs'), 'export const probeModelCatalog = () => [{ value: "staged-model" }]\n')
   writeFileSync(path.join(claudeSidecarDir, 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
-  writeFileSync(path.join(claudeSidecarDir, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3 }))
+  writeFileSync(path.join(claudeSidecarDir, 'package-lock.json'), JSON.stringify({
+    lockfileVersion: 3,
+    packages: {
+      'node_modules/@anthropic-ai/claude-agent-sdk': { version: '1.0.0' },
+    },
+  }))
   mkdirSync(path.join(claudeSidecarDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true })
   writeFileSync(path.join(claudeSidecarDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '1.0.0' }))
 
@@ -69,6 +74,7 @@ function createSourceFixture(root: string): {
   writeFileSync(path.join(mcpDistDir, 'freshell-mcp', 'server.js'), 'import "@modelcontextprotocol/sdk/server/stdio.js"\n')
   writeFileSync(path.join(mcpDistDir, 'freshell-mcp', 'freshell-tool.js'), 'export const executeAction = () => ({})\n')
   writeFileSync(path.join(mcpDistDir, 'node-client-runtime', 'keys.js'), 'export {}\n')
+  writeFileSync(path.join(mcpDistDir, 'node-client-runtime', 'action-capabilities.js'), 'export {}\n')
 
   const packageLock = {
     name: 'freshell',
@@ -172,6 +178,10 @@ describe('prepare-electron-runtime staging', () => {
     })
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'session-settings.mjs'), 'utf8')).toContain('staged')
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'model-catalog.mjs'), 'utf8')).toContain('staged-model')
+    expect(receipt.files).toEqual(expect.arrayContaining([
+      'claude-sidecar/session-settings.mjs',
+      'claude-sidecar/model-catalog.mjs',
+    ]))
     expect(readFileSync(path.join(outputRoot, 'mcp', 'server.js'), 'utf8')).toContain('modelcontextprotocol')
     expect(readFileSync(path.join(outputRoot, 'node-client-runtime', 'keys.js'), 'utf8')).toContain('export')
     expect(receipt).toMatchObject({ severity: 'info', event: 'electron_runtime_prepared' })

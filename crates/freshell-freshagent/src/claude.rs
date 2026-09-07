@@ -4392,7 +4392,7 @@ async fn read_created(
 /// Resolve the sidecar entry (`index.mjs`). `FRESHELL_CLAUDE_SIDECAR` overrides; otherwise
 /// the vendored package sits beside this crate at `crates/freshell-claude-sidecar/index.mjs`
 /// (baked from `CARGO_MANIFEST_DIR` so it is cwd-independent).
-fn sidecar_entry_path() -> PathBuf {
+pub(crate) fn sidecar_entry_path() -> PathBuf {
     if let Ok(path) = std::env::var("FRESHELL_CLAUDE_SIDECAR") {
         if !path.is_empty() {
             return PathBuf::from(path);
