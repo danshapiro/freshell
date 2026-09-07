@@ -157,6 +157,20 @@ The old environment-tag `/proc` scan remains in legacy cleanup code, but the
 new supervisor never uses it as kill authority. In the hardened sweep the tag
 scan is verification-only after exact recorded-PID handling.
 
+## Provider acceptance order and test-cost policy
+
+The execution order was revised after the initial Phase 2 shell/Claude implementation: **OpenCode is the first real coding-provider acceptance lane** because its free-tier path makes repeated restart/resource/recovery testing sustainable. The existing shell/Claude wiring on this branch is transitional infrastructure, not permission to declare the provider portion of Phase 2 complete before the OpenCode live gate passes.
+
+For managed OpenCode, strict per-soul resource isolation requires **one OpenCode provider runtime per soul**. The legacy shared `OpencodeServeManager` is not a valid backing for two managed souls because a shared process cannot satisfy independent hard memory/CPU limits.
+
+Routine real-provider tests use these cost controls:
+
+- OpenCode: free-tier path first/default, with the resolved provider/model recorded.
+- Claude: **Haiku**, lowest available thinking/reasoning setting.
+- Codex: **GPT-5.6 Luna**, lowest available thinking/reasoning setting.
+
+No gate may silently upgrade to a more expensive model or higher reasoning level. If the required low-cost model/configuration is unavailable, the lane is `BLOCKED` unless the test is explicitly about another model; such an override must be named in the scenario and recorded in evidence. Provider receipts record the actual model and reasoning/thinking setting when exposed by the provider.
+
 ## Phase 2 managed terminal routing
 
 Phase 2 wires `freshell-runtime-client` into the Rust server behind the Cargo
@@ -166,7 +180,7 @@ a healthy authenticated supervisor is required before the server advertises
 connection. Feature-off, controller-unavailable, Node-server, and non-negotiated
 connections stay byte-for-byte on their legacy ownership path.
 
-Negotiated **shell and Claude CLI terminals** use a browser-facing
+The current transitional implementation has negotiated **shell and Claude CLI terminals** using a browser-facing
 `TerminalRegistry` facade with no `PtyTerminal`/OS kill handle. The session host
 owns the PTY reader/writer/waiter and continuously drains output into a bounded
 1 MiB in-memory ring plus 64 MiB rotating spool (configurable with bounded
@@ -252,8 +266,7 @@ is not complete until it has zero calls into these legacy ownership paths.
 - Transactional resource admission, named profiles, bounded host replay/spool,
   durable input request dedupe, provider-home/worktree mounts, and safe
   credential-file bootstrap are Phase 2 contracts.
-- Browser continuity and real-Claude live receipts are the environment-dependent
-  release gates P2-G01/P2-G04.
+- Browser continuity remains P2-G01. Under the revised execution order, P2-G04 is the real-OpenCode continuity receipt; Claude and Codex become subsequent provider lanes using the test-cost policy above.
 - Gate evidence is intentionally untracked under `.runtime-evidence/<candidate-sha>/<run-id>/`
   so each tested commit carries its own reproducible evidence rather than a
   stale checked-in success claim.
