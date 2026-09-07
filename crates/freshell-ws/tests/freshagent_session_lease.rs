@@ -75,6 +75,7 @@ impl Drop for IsolatedCodexEnv {
 
 #[test]
 fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
+    let _lock = LEASE_ENV_LOCK.blocking_lock();
     let original: Vec<_> = ISOLATED_CODEX_ENV_KEYS
         .iter()
         .map(std::env::var_os)
@@ -83,7 +84,6 @@ fn isolated_codex_env_restores_every_mutated_variable_during_unwind() {
     let mut installed_home = None;
 
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _lock = LEASE_ENV_LOCK.blocking_lock();
         let _env = IsolatedCodexEnv::install();
         installed_opt_in = std::env::var_os("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES");
         installed_home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
