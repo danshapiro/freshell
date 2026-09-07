@@ -515,6 +515,8 @@ async function sendOpencodeTurn(
 /** Send one freshcodex turn and wait until its snapshot rows render. */
 async function sendCodexTurnAndWaitRows(
   page: Page,
+  harness: TestHarness,
+  tabId: string,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
@@ -524,6 +526,9 @@ async function sendCodexTurnAndWaitRows(
     paneRoot.locator('article[data-turn-index]'),
     `${expectedRowCount} snapshot rows after "${text}"`,
   ).toHaveCount(expectedRowCount, { timeout: 30_000 })
+  // The snapshot can paint before the provider completion edge clears busy;
+  // settle the lane before the next send or rollback gesture.
+  await waitForPaneStatus(harness, tabId, 'idle')
 }
 
 // ── Rollback-spec helpers (no donor) ────────────────────────────────────────
@@ -784,8 +789,8 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.harness, lane.tabId, 4, 'codex turn two')
       const snap = (): Promise<any | null> => fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')
       expect(userRows(await snap())).toBe(2)
 
