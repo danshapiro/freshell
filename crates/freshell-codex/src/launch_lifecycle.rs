@@ -1487,6 +1487,7 @@ mod tests {
             created_at: unix_millis(),
             updated_at: unix_millis(),
             state: SidecarRecordState::Active,
+            lane: None,
         };
         let error = persist_record_or_terminate_exact_child(&store, &row, &mut child)
             .await
