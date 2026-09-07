@@ -5,7 +5,7 @@
   "prepared_on": "2026-09-06",
   "inspected_commit": "78b8d9d7ae6c02f81646fe22f11bd7e286f0054c",
   "source_document": "freshell-durable-souls-five-phase-execution-plan.md",
-  "source_document_sha256": "0a62246f1763ff3c305202b6baa973e11f5f656f30d5bdb99362e338718f280a",
+  "source_document_sha256": "195b1f51af5c850021a5591fd7001c2ab9d6a8b84002b9622aaa86f5fc72ec47",
   "intended_repository_path": "test/runtime/gate-manifest.json",
   "required_scenario_count": 56,
   "implementation_task_count": 31,
@@ -40,7 +40,25 @@
       "cleanup.json"
     ],
     "evidence_root": ".runtime-evidence/<candidate-sha>/<run-id>/",
-    "notes": "Phase 1 browser/provider entries may explicitly record not applicable. From Phase 2, required native-provider and browser cases must execute. An explicit NOT_APPLICABLE artifact is not permission to skip a required test."
+    "notes": "Phase 1 browser/provider entries may explicitly record not applicable. From Phase 2, required native-provider and browser cases must execute. An explicit NOT_APPLICABLE artifact is not permission to skip a required test.",
+    "provider_test_cost_policy": {
+      "opencode": {
+        "default_lane": "free_tier",
+        "rule": "Use the real OpenCode free-tier path first/default whenever it supports the behavior under test; record the resolved provider/model."
+      },
+      "claude": {
+        "model": "Haiku",
+        "thinking_or_reasoning": "lowest_available",
+        "rule": "Do not silently upgrade to Sonnet/Opus or a higher thinking/reasoning setting."
+      },
+      "codex": {
+        "model": "GPT-5.6 Luna",
+        "thinking_or_reasoning": "lowest_available",
+        "rule": "Do not silently upgrade to a higher-cost model or higher thinking/reasoning setting."
+      },
+      "unavailable_required_configuration": "BLOCKED",
+      "override_rule": "Only a test explicitly about another model may override; the scenario and evidence must name the resolved model and reasoning/thinking setting."
+    }
   },
   "parameter_expansion": {
     "required": true,
@@ -74,7 +92,7 @@
     ],
     "applicability_rule": "Expand actual supported modes and ingresses from the capability manifest. Explicit capability-negative behavior is tested, not marked as an executed positive resume test.",
     "phase_1": "Real compiled supervisor/host, Docker, OS fixture processes, ownership and fault injection. No external coding-provider substitution is claimed.",
-    "phase_2": "Includes an actual Claude CLI and real browser; fixture loads establish measured resource boundaries.",
+    "phase_2": "Includes an actual OpenCode CLI/server on its free-tier path and a real browser; fixture loads establish measured resource boundaries. Claude and Codex are subsequent provider lanes governed by the provider test-cost policy.",
     "phase_3": "Every enabled mode executes real create and native resume; each supported ingress must traverse the production launch path. Error/rare-race variants may use actual fixture processes as specified.",
     "phase_4": "Real browser, server, supervisor and host with enabled real-provider smoke set, plus deterministic multi-soul stress fixtures.",
     "phase_5": "Every enabled family proves automatic native recovery is not loss; actual isolated provider state used for the genuine-loss test, complete live mode/ingress campaign and fixture chaos.",
@@ -233,7 +251,7 @@
         },
         {
           "id": "P2.5",
-          "title": "first real coding CLI and server adapter"
+          "title": "first real coding CLI/server adapter: OpenCode free-tier"
         },
         {
           "id": "P2.6",
@@ -265,8 +283,8 @@
         {
           "id": "P2-G04",
           "required": true,
-          "procedure": "Start a real Claude coding CLI, complete a synthetic turn, begin a controlled long tool command, restart web while the tool is running, then send a follow-up.",
-          "pass_assertion": "Same native session and OS incarnation; original tool completes once; follow-up succeeds; no new CLI launch hidden behind restoration.",
+          "procedure": "Start a real OpenCode coding CLI/server on its free-tier path, complete a synthetic turn, begin a controlled long tool command, restart web while the tool is running, then send a follow-up.",
+          "pass_assertion": "Same OpenCode native session and OS incarnation; original tool completes once; follow-up succeeds; no new OpenCode provider launch hidden behind restoration.",
           "status": "NOT_RUN"
         },
         {

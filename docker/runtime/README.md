@@ -42,3 +42,9 @@ When web/supervisor are themselves containers, an enabled Claude credential
 reference must be mounted read-only into both controller containers at that
 same canonical host path. `compose.yaml` carries this exact-file mount; it
 never mounts the containing `.claude` directory or host home.
+
+## Real-provider acceptance order
+
+OpenCode is the first real-provider Phase 2 acceptance lane and should use its free-tier path for repeated continuity/resource tests. A Claude binary being present in this image does not make Claude the first acceptance dependency; it is retained for later provider coverage. Managed OpenCode must be one provider runtime per soul rather than the legacy shared serve process.
+
+Routine later-provider tests are cost-pinned: Claude uses **Haiku** at the lowest available thinking/reasoning setting; Codex uses **GPT-5.6 Luna** at the lowest available thinking/reasoning setting. Tests must record the resolved model/setting and must block rather than silently upgrade to a more expensive model/configuration.

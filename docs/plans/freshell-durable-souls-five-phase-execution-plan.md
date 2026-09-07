@@ -317,9 +317,23 @@ Before forwarding semantic commands, persist a request ID, protected input paylo
 
 ### P2.5 — first real coding CLI and server adapter
 
-Use the existing Claude CLI terminal path as the first real-provider managed slice, with its normal session-identity hooks and approval settings. Do not add a canned mock adapter and call that the live-provider gate. Route both WS and REST terminal creation through one managed launch service, preserving dedupe, cwd, environment allowlists, terminal IDs, and pane provenance.
+Use **OpenCode as the first real-provider managed slice**. The reason is operational as well as architectural: OpenCode has a free-tier path, so the high-frequency continuity/restart/resource gates can run repeatedly without making provider spend the limiting factor. Use OpenCode's real CLI/server/session behavior and real native session identity; do not add a canned mock adapter and call that the live-provider gate. Route both WS and REST terminal creation through one managed launch service, preserving dedupe, cwd, environment allowlists, terminal IDs, pane provenance, and per-soul provider state.
+
+OpenCode must run **one provider runtime per soul** for this lane. Do not reuse the legacy shared `OpencodeServeManager` process for two souls and then claim per-agent memory/CPU isolation; the process and all descendants for a managed OpenCode soul belong inside that soul's runtime enclosure. Phase 2's first native-provider continuity gate therefore proves OpenCode process continuity, native-session continuity, provider-home persistence, and per-soul isolation before Claude or Codex are used as acceptance dependencies.
 
 The new `ManagedRuntime` capability is negotiated before the browser creates/restores managed terminals. Keep the existing restore-create hold during startup reconciliation. Managed handles must not enter legacy R06/R11 kill/auto-resume code. Phase 3 supplies comprehensive provider resume; Phase 2 must already prove live-process continuity without replacements.
+
+#### Provider test-cost policy
+
+Use the least-cost real model/configuration that still exercises the provider's true session and tool path. This is a test invariant, not an optional optimization:
+
+- **OpenCode:** use its free-tier path for the first and default repeated live-provider gates whenever that path supports the behavior under test. Record the actual provider/model selected by OpenCode in the gate receipt.
+- **Claude:** all routine continuity, resume, recovery, permission, and tool-path testing uses **Haiku** at the provider's lowest available thinking/reasoning setting. Do not silently fall back or upgrade to Sonnet/Opus for these gates.
+- **Codex:** all routine continuity, resume, recovery, permission, and tool-path testing uses **GPT-5.6 Luna** at the **lowest available thinking/reasoning setting**. Do not silently fall back or upgrade to a higher-cost model or thinking level.
+- A test whose explicit subject is model selection/model-specific behavior may override the preceding model only when the scenario names that override and the evidence records the resolved model and reasoning/thinking setting.
+- If a requested low-cost model/setting is unavailable, mark the provider lane **BLOCKED** with the resolved availability error; do not substitute a more expensive model and call the required gate passed.
+
+Every real-provider gate records provider, CLI version, resolved model, resolved thinking/reasoning setting (when the provider exposes one), native session ID, and whether a paid or free-tier path was used.
 
 ### P2.6 — OOM, exit, and test fixtures
 
@@ -334,7 +348,7 @@ Create a managed browser fixture with separate `restartWeb`, `crashWeb`, `restar
 | P2-G01 | Through the real browser, open a managed shell running a heartbeat and a long child command. Gracefully restart web, then SIGKILL web, ten cycles total. | Same soul, incarnation, container, host boot, and child process identity; output advances; input remains usable; one tab/view association. |
 | P2-G02 | Close all browsers and stop web for 60 seconds while output is produced; reconnect with old and expired cursors. | Worker continues; output replay is ordered/deduped; explicit reset on expired cursor; queues/spool stay within configured bounds. |
 | P2-G03 | Restart and crash the supervisor while web and the worker run. | Same provider incarnation keeps running; new supervisor adopts it; stale epoch control is rejected. |
-| P2-G04 | Start a real Claude coding CLI, complete a synthetic turn, begin a controlled long tool command, restart web while the tool is running, then send a follow-up. | Same native session and OS incarnation; original tool completes once; follow-up succeeds; no new CLI launch hidden behind restoration. |
+| P2-G04 | Start a real OpenCode coding CLI/server on its free-tier path, complete a synthetic turn, begin a controlled long tool command, restart web while the tool is running, then send a follow-up. | Same OpenCode native session and OS incarnation; original tool completes once; follow-up succeeds; no new OpenCode provider launch hidden behind restoration. |
 | P2-G05 | Run CPU burners with four descendants under a 500-milliCPU fixture profile while an independent sentinel runs. Measure 30 seconds after warmup. | Effective `cpu.max` matches; aggregate CPU time stays at or below 0.60 CPU-seconds/second over the window; throttling counters increase when schedulable; sentinel remains responsive. If host starvation prevents proving throttling, mark infrastructure blocked, not pass. |
 | P2-G06 | Grow touched memory beyond the 256 MiB fixture cap, including a child-only allocation case. | Effective memory/swap bounds match; cgroup OOM/exit observed; web and unrelated sentinel survive; no unbounded allocation; no false lost verdict. |
 | P2-G07 | Spawn bounded descendants until the PID/thread ceiling rejects more; also test a double-fork/setsid descendant. | Effective process ceiling enforced; every descendant remains in the same quota boundary; complete owned cleanup. |
