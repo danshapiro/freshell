@@ -17,6 +17,11 @@ export default defineConfig({
     include: ['test/integration/electron/**/*.test.ts'],
     exclude: ['docs/plans/**'],
     passWithNoTests: false,
+    // The checkout-free runtime test runs in the canonical sandbox, whose PID
+    // limit is intentionally bounded. Vitest's default fork pool eagerly
+    // creates one worker per host CPU and can exhaust that limit before the
+    // acceptance test reports a result.
+    pool: 'threads',
     testTimeout: 120_000,
     hookTimeout: 120_000,
   },
