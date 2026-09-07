@@ -271,6 +271,36 @@ In the `preloadedState` object (after the `freshAgent` block ending at line 249)
       const button = screen.getByRole('button', { name: /no repo icon session/i })
       expect(button.querySelector('[data-testid="repo-icon"]')).toBeNull()
     })
+
+    it('dispatches fetchRepoIconMeta for sessions when repoIcons state is empty', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/myproject',
+          sessions: [
+            {
+              sessionId: sessionId('probe-session'),
+              projectPath: '/home/user/myproject',
+              lastActivityAt: Date.now(),
+              title: 'Probe session',
+              cwd: '/home/user/myproject',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({ projects, repoIcons: {} })
+      const dispatchSpy = vi.spyOn(store, 'dispatch')
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      // The probe effect should dispatch fetchRepoIconMeta for the session's cwd
+      expect(dispatchSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'repoIcons/fetchMeta/pending' }),
+      )
+    })
   })
 ```
 
@@ -278,7 +308,7 @@ In the `preloadedState` object (after the `freshAgent` block ending at line 249)
 
 Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx -t "Sidebar repo icons"`
 
-Expected: FAIL because `SidebarItem` does not yet render a `RepoIcon`, and `createTestStore` does not yet include the `repoIcons` reducer (the `options?.repoIcons` reference will be `undefined`).
+Expected: FAIL because `SidebarItem` does not yet render a `RepoIcon` — the mock `data-testid="repo-icon"` will not be found inside the button.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -342,7 +372,7 @@ Add the probe `useEffect` (after `sortedItems` is declared at line 374 and `busy
     if (!repoIconsOnTabs) return
     const cwds = new Set<string>()
     for (const item of sortedItems) {
-      const cwd = item.cwd ?? item.repoPath
+      const cwd = item.repoPath ?? item.cwd
       if (cwd) cwds.add(cwd)
     }
     for (const cwd of cwds) {
@@ -359,7 +389,7 @@ After the `item={item}` prop, add:
 
 ```typescript
                         repoIconInfo={
-                          repoIconInfoByCwd[item.cwd ?? item.repoPath ?? '']
+                          repoIconInfoByCwd[item.repoPath ?? item.cwd ?? '']
                         }
 ```
 
@@ -486,6 +516,7 @@ Add these tests to `test/unit/client/components/Sidebar.test.tsx`, inside the `d
       expect(button).toHaveClass('bg-emerald-100')
       expect(button).toHaveClass('border-l-2')
       expect(button).toHaveClass('border-l-emerald-500')
+      expect(button).toHaveClass('dark:bg-emerald-900/40')
       expect(button).not.toHaveClass('bg-muted')
     })
 
@@ -527,9 +558,10 @@ Add these tests to `test/unit/client/components/Sidebar.test.tsx`, inside the `d
       expect(button).toHaveClass('bg-blue-100')
       expect(button).toHaveClass('border-l-2')
       expect(button).toHaveClass('border-l-blue-500')
+      expect(button).toHaveClass('dark:bg-blue-900/40')
     })
 
-    it('applies muted background for an inactive closed session', async () => {
+    it('applies transparent border and no color treatment for an inactive closed session', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -581,6 +613,50 @@ Add these tests to `test/unit/client/components/Sidebar.test.tsx`, inside the `d
       expect(button).toHaveClass('bg-emerald-50')
       expect(button).toHaveClass('border-l-2')
       expect(button).toHaveClass('border-l-emerald-500/70')
+      expect(button).toHaveClass('dark:bg-emerald-900/20')
+    })
+
+    it('applies light blue fill and left border for an inactive busy session', async () => {
+      const now = Date.now()
+      const terminalId = 'term-inactive-busy'
+      const busySid = sessionId('inactive-busy')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: busySid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now,
+              title: 'Inactive busy session',
+              cwd: '/home/user/project',
+              provider: 'codex',
+            },
+          ],
+        },
+      ]
+      const tabs: Array<{ id: string; mode: string; terminalId?: string; resumeSessionId?: string }> = [
+        { id: 'tab-other', mode: 'shell' },
+      ]
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId, title: 'Codex', createdAt: now, status: 'running', hasClients: true,
+          mode: 'codex', sessionRef: { provider: 'codex', sessionId: busySid },
+        },
+      ]
+      const store = createTestStore({
+        projects, tabs, terminals,
+        codexActivity: { byTerminalId: { [terminalId]: { terminalId, sessionId: 's1', phase: 'busy', lastActivityAt: 10 } } },
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => { vi.advanceTimersByTime(100) })
+
+      const button = screen.getByRole('button', { name: /inactive busy session/i })
+      expect(button).toHaveClass('bg-blue-50')
+      expect(button).toHaveClass('border-l-2')
+      expect(button).toHaveClass('border-l-blue-500/70')
+      expect(button).toHaveClass('dark:bg-blue-900/20')
     })
   })
 ```
@@ -632,23 +708,26 @@ In `src/components/Sidebar.tsx`, replace the `SidebarItem` button className (lin
           )}
 ```
 
-**Update `docs/index.html`** to reflect the sidebar visual change. In the `.sv-session` CSS rule (around line 415), add a left-border accent for open sessions:
+**Update `docs/index.html`** to reflect the sidebar visual change. The sidebar mock uses `.sb-item` (around line 192), NOT `.sv-session` (which is the Projects tab). Add a left-border accent and green fill for open session rows:
+
+In the `.sb-item` CSS rule (around line 192), add:
 
 ```css
-.sv-session { padding: 12px 16px 12px 38px; border-left: 3px solid transparent; border-bottom: 1px solid hsl(var(--border) / .3); transition: background-color .15s, border-color .15s; }
-.sv-session.open { border-left-color: hsl(142 71% 45%); background: hsl(142 71% 45% / .08); }
-.sv-session.open:hover { background: hsl(142 71% 45% / .12); }
-.dark .sv-session.open { background: hsl(142 71% 45% / .15); border-left-color: hsl(142 71% 45%); }
-.dark .sv-session.open:hover { background: hsl(142 71% 45% / .2); }
+.sb-item { border-left: 3px solid transparent; transition: background-color .15s, border-color .15s; }
+.sb-item.open { border-left-color: hsl(142 71% 45%); background: hsl(142 71% 45% / .08); }
+.sb-item.open:hover { background: hsl(142 71% 45% / .12); }
+.dark .sb-item.open { background: hsl(142 71% 45% / .15); }
+.dark .sb-item.open:hover { background: hsl(142 71% 45% / .2); }
+.sb-item-repo-icon { display: inline-block; width: 14px; height: 14px; border-radius: 2px; background: hsl(210 60% 55%); margin-right: 6px; flex-shrink: 0; }
 ```
 
-And in the session row HTML (around lines 833-836), add the `open` class to sessions that represent open tabs, and add a repo-icon placeholder before the provider badge:
+And in the sidebar HTML (around lines 650-651), add the `open` class and a repo-icon span before the `sb-item-icon` div for the first two rows (representing open tabs):
 
 ```html
-<div class="sv-session open"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-repo-icon" style="display:inline-block;width:14px;height:14px;border-radius:2px;background:hsl(210 60% 55%);vertical-align:middle;margin-right:4px"></span><span class="sv-session-title">Add dark mode toggle</span><span class="sv-session-provider claude">Claude Code</span><span class="sv-session-time">2 min ago</span></div>...
+<div class="sb-item open"><span class="sb-item-repo-icon"></span><div class="sb-item-icon"><svg viewBox="...
 ```
 
-(Add the `sv-repo-icon` span and `open` class to the first two session rows — the ones that represent open tabs. Leave the remaining rows without the `open` class.)
+(Add the `open` class and `sb-item-repo-icon` span to the first two `sb-item` rows. Leave the remaining rows unchanged.)
 
 - [ ] **Step 4: Run the focused test**
 
@@ -668,7 +747,15 @@ Run: `npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx te
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 7: Run typecheck and lint**
+
+The changes add new imports, props, and JSX to `Sidebar.tsx`. Run TypeScript and accessibility lint to catch type errors and a11y violations before committing:
+
+Run: `npx tsc --noEmit && npm run lint`
+
+Expected: PASS (no type errors, no new a11y violations)
+
+- [ ] **Step 8: Commit the task**
 
 ```bash
 git add src/components/Sidebar.tsx test/unit/client/components/Sidebar.test.tsx docs/index.html
@@ -686,10 +773,10 @@ aligned. Matches the pane header's border-l-2 idiom for light and dark."
 
 ## Post-Implementation Notes
 
-**Manual visual verification (both themes):** The unit tests verify that the correct CSS class tokens (including `dark:` overrides) are present, but they run in jsdom which has no real rendering engine. Before marking the work complete, start a dev server (`NODE_ENV=development PORT=3344 npm run dev`) and visually verify in a browser that:
+**Manual visual verification (both themes):** The unit tests verify that the correct CSS class tokens (including `dark:` overrides) are present, but they run in jsdom which has no real rendering engine. Before marking the work complete, start a dev server on a unique port following the repo's process safety procedure (record PID, log to file, stop by PID when done), and visually verify in a browser that:
 1. The green tab highlight is clearly visible in dark mode (Task 1)
 2. Repo icons appear in the sidebar before the provider icon, sized the same as the pane header (Task 2)
 3. Sidebar rows show green fill + green left-border for open sessions, blue fill + blue left-border for busy sessions, in both light and dark mode (Task 3)
 Toggle between light and dark mode (UI Settings → Theme) to confirm both look correct.
 
-**E2e screenshot baselines:** The sidebar visual changes (green fill, left borders, repo icons) will change pixel content in `test/e2e-browser/specs/screenshot-baselines.spec.ts` (`default-layout.png`, `sidebar-collapsed.png`). These baselines use `maxDiffPixelRatio: 0.05` and will likely fail. Re-baselining requires a running server and browser (`npm run test:e2e:local -- --update`), which is outside the unit TDD scope. The baselines should be re-captured after the changes are verified locally. This is a follow-up step, not a task.
+**E2e screenshot baselines:** The sidebar visual changes (green fill, left borders, repo icons) will change pixel content in `test/e2e-browser/specs/screenshot-baselines.spec.ts` (`default-layout.png`, `sidebar-collapsed.png`). These baselines use `maxDiffPixelRatio: 0.05` and will likely fail. Re-baselining requires a running server and browser (`npm run test:e2e:local -- --update-snapshots`), which is outside the unit TDD scope. The baselines should be re-captured after the changes are verified locally. This is a follow-up step, not a task.
