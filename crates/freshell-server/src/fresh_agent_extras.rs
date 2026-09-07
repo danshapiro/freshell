@@ -48,10 +48,15 @@
 //!
 //! Body parsing replicates express's `json()` middleware (mounted at
 //! `fresh-agent-extras-router.ts:266`) rather than using axum's `Json`
-//! extractor: a missing, empty, or non-JSON content-type body is treated as
-//! `{}` (validation then fails with command-is-required); a JSON content-type
-//! with malformed bytes returns `400 {"error":"invalid JSON body"}`
-//! (divergence 1 — Node serves express's HTML SyntaxError page there).
+//! extractor: parsing applies ONLY to an exactly-`application/json`
+//! content-type (parameters stripped, trimmed, case-folded — express's
+//! default matcher does NOT accept `application/*+json` structured-suffix
+//! vendor types). A missing, empty, or non-matching content-type body, and
+//! valid JSON whose top level is not an object, are all treated as `{}`
+//! (validation then fails with command-is-required); an
+//! exactly-`application/json` content-type with malformed bytes returns
+//! `400 {"error":"invalid JSON body"}` (divergence 1 — Node serves
+//! express's HTML SyntaxError page there).
 //!
 //! - Auth failure → 401 via `crate::boot::unauthorized()`.
 //! - `command` missing, non-string, null, or whitespace-only (Node:
@@ -82,12 +87,16 @@
 //!
 //! ## `run_bounded` — shared bounded-subprocess helper (built here; Task 2 reuses)
 //!
-//! Spawns `program` via `tokio::process::Command` with piped stdout/stderr,
-//! drains BOTH pipes to EOF concurrently with `wait()` (so a verbose child
-//! cannot deadlock on a full pipe buffer), retains at most `per_pipe_cap`
-//! bytes of each pipe (drain-and-cap: the child is NEVER killed on overflow,
-//! it runs to completion), and wraps `wait()` in `timeout`: on expiry the
-//! child is killed + reaped and the result is `exit_code: None,
+//! Spawns `program` via `tokio::process::Command` with piped stdin, stdout,
+//! and stderr. The child stdin handle is held open — never written, never
+//! closed early — until the child exits or is reaped, matching Node
+//! execFile's open-pipe semantics (a stdin-reading command blocks rather
+//! than seeing an immediate EOF). Both output pipes drain to EOF
+//! concurrently with `wait()` (so a verbose child cannot deadlock on a full
+//! pipe buffer), retaining at most `per_pipe_cap` bytes of each pipe
+//! (drain-and-cap: the child is NEVER killed on overflow, it runs to
+//! completion), and `wait()` is wrapped in `timeout`: on expiry the child
+//! is killed + reaped and the result is `exit_code: None,
 //! timed_out: true`. Lossy UTF-8 decoding happens at the route layer, not
 //! here, so the helper stays byte-oriented for both routes.
 //!
@@ -106,10 +115,14 @@
 //! - **#7 non-UTF-8 subprocess output** is lossy-decoded (U+FFFD) — Node
 //!   coerces via Buffer→string with the same replacement behavior.
 //! - **#8 maxBuffer kill** (`/exec`): Node kills the child mid-stream on
-//!   overflow; this port drains with retained-output caps and maps an
-//!   overflowed pipe to the SAME observable `exitCode: 1, truncated: true`,
-//!   capped-output body (the child's wall-clock lifetime is longer; no
-//!   response-shape difference). For `/diff` the truncation point is never
+//!   overflow; this port drains with retained-output caps and forces
+//!   `exitCode: 1` on any overflowed run — the drain-and-cap equivalent of
+//!   Node's signal-kill code collapse. `truncated` is NOT part of this
+//!   mapping: it derives independently from the trimmed combined length on
+//!   both stacks (validator-A case 12's overflow body
+//!   `{exitCode: 1, truncated: true}` is pinned byte-for-byte). The child's
+//!   wall-clock lifetime is longer under drain-and-cap; there is no
+//!   response-shape difference. For `/diff` the truncation point is never
 //!   reported in the body, so no mapping is needed there.
 //! - **#1 malformed-JSON exec body** → `400 {"error":"invalid JSON body"}`
 //!   where Node serves express's HTML SyntaxError page (embeds absolute
@@ -304,8 +317,10 @@ async fn post_exec(
 
     // execFile('bash', ['-lc', command], { cwd, timeout, maxBuffer,
     // env: process.env }) (`:28-32`): a dedicated argv (never string-split),
-    // the full inherited process env (tokio inherits by default), null
-    // stdin, a 30s timeout, and per-pipe retained caps.
+    // the full inherited process env (tokio inherits by default), Node's
+    // execFile stdin semantics (an open pipe the parent never writes to or
+    // closes — held open across the wait inside `run_bounded`), a 30s
+    // timeout, and per-pipe retained caps.
     let output = match run_bounded(
         "bash",
         &["-lc", command],
@@ -368,24 +383,23 @@ async fn post_exec(
     .into_response()
 }
 
-/// Express's `json()` middleware parses only when the content-type matches
-/// `application/json` (type-is also honors `application/*+json` structured
-/// suffixes); anything else — or a missing content-type — skips parsing.
+/// Express's `json()` middleware is mounted with body-parser's default
+/// `type: 'application/json'`, so it parses ONLY when the request
+/// content-type — media parameters stripped, trimmed, case-folded — is
+/// exactly `application/json`. Structured-suffix vendor types
+/// (`application/cloudevents+json`, `application/hal+json`, ...) do NOT
+/// match that expected pattern, so their bodies are skipped and the handler
+/// sees `{}`; a missing content-type skips parsing too.
 fn is_json_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|raw| {
-            let mime = raw
-                .split(';')
+            raw.split(';')
                 .next()
                 .unwrap_or("")
                 .trim()
-                .to_ascii_lowercase();
-            match mime.split_once('/') {
-                Some(("application", subtype)) => subtype == "json" || subtype.ends_with("+json"),
-                _ => false,
-            }
+                .eq_ignore_ascii_case("application/json")
         })
 }
 
@@ -431,11 +445,19 @@ async fn run_bounded(
     let mut child = Command::new(program)
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
+    // Node's execFile leaves the child's stdin an open pipe the parent
+    // never writes to and never closes (fresh-agent-extras-router.ts:28-32),
+    // so a stdin-reading command blocks until it finishes reading or the
+    // timeout kill — it never sees an immediate EOF. Take the handle and
+    // hold it across the wait below; dropping it earlier would deliver that
+    // EOF. Both routes want this: `/exec` per Node parity, and `/diff`'s
+    // `git diff` never reads stdin so the open pipe is inert there.
+    let child_stdin = child.stdin.take().expect("stdin was piped");
     let mut child_stdout = child.stdout.take().expect("stdout was piped");
     let mut child_stderr = child.stderr.take().expect("stderr was piped");
 
@@ -456,6 +478,11 @@ async fn run_bounded(
             }
         },
     );
+    // The child has exited or been killed + reaped above; only now is it
+    // safe to close our end of its stdin — closing it mid-run would change
+    // observable behavior for stdin-reading commands (early EOF).
+    drop(child_stdin);
+
     let (stdout, stdout_overflowed) = stdout?;
     let (stderr, stderr_overflowed) = stderr?;
 
@@ -733,9 +760,9 @@ mod tests {
     async fn read_capped_retains_prefix_to_cap_and_drains_overflow_to_eof() {
         // 10_000 bytes exceeds the internal 8KiB read chunk, so a 9_000 cap
         // boundary lands mid-chunk, exercising partial-chunk retention. The
-        // implementation has no overflow flag; its contract (module docs) is
-        // prefix retention up to the cap plus drain-to-EOF — the latter
-        // asserted via the exhausted slice reader.
+        // contract (module docs) is prefix retention up to the cap plus
+        // drain-to-EOF — the latter asserted via the exhausted slice
+        // reader, the former via the retained prefix and overflow flag.
         let input: Vec<u8> = (0u32..10_000).map(|i| (i % 251) as u8).collect();
         let cap = 9_000;
         let mut reader: &[u8] = &input[..];
@@ -780,6 +807,42 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "timeout kill+reap must return promptly, took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_stdin_is_an_open_silent_pipe_not_eof() {
+        // Node's execFile leaves the child's stdin an open pipe the parent
+        // never writes to and never closes
+        // (fresh-agent-extras-router.ts:28-32), so a stdin-reading command
+        // blocks for input rather than seeing an immediate EOF. The
+        // discrimination is encoded in OUTPUT, not wall clock, so the pin
+        // is deterministic under load: a bounded `read -t` against an open
+        // silent pipe TIMES OUT (bash status >128), while against an EOF'd
+        // (null) stdin it fails instantly (status 1). With `Stdio::null()`
+        // this test FAILS red (`read-got-eof` instead of `read-timed-out`).
+        let dir = tempfile::tempdir().unwrap();
+        let output = run_bounded(
+            "bash",
+            &[
+                "-lc",
+                "read -t 0.01 line; s=$?; \
+                 if [ $s -gt 128 ]; then echo read-timed-out; \
+                 elif [ $s -eq 0 ]; then echo read-got-data; \
+                 else echo read-got-eof; fi",
+            ],
+            dir.path().to_str().unwrap(),
+            Duration::from_secs(5), // safety net only — never hit
+            1_024,
+        )
+        .await
+        .unwrap();
+        assert!(!output.timed_out);
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "read-timed-out\n",
+            "a held-open silent stdin pipe must time out a bounded read, not EOF it"
         );
     }
 
@@ -960,6 +1023,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_mixed_stdout_stderr_fold_uses_single_separator() {
+        // Fold boundary pin (task 2 review M2): stdout + "\n" + stderr,
+        // THEN trim — mixed output joins the streams with exactly one
+        // newline, no doubling, no leading/trailing whitespace.
+        let dir = tempfile::tempdir().unwrap();
+        let resp = call_exec(
+            dir.path(),
+            exec_headers(Some(TOKEN), Some("application/json")),
+            &json_body("printf out; printf err >&2", Some(dir.path())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(
+            value,
+            json!({ "output": "out\nerr", "exitCode": 0, "truncated": false })
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_bounded_stdin_read_completes_under_held_open_stdin() {
+        // execFile stdin parity (task 2 review I2): the child's stdin is an
+        // open pipe the parent never writes to or closes, so an UNBOUNDED
+        // `read` hangs to the 30s timeout kill — but a command that bounds
+        // its own read completes normally: the held-open pipe carries no
+        // data, and output capture is unaffected.
+        let dir = tempfile::tempdir().unwrap();
+        let resp = call_exec(
+            dir.path(),
+            exec_headers(Some(TOKEN), Some("application/json")),
+            &json_body(
+                "read -t 0.2 line || true; echo after-stdin",
+                Some(dir.path()),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value = body_json(resp).await;
+        assert_eq!(
+            value,
+            json!({ "output": "after-stdin", "exitCode": 0, "truncated": false })
+        );
+    }
+
+    #[tokio::test]
     async fn exec_without_cwd_runs_in_state_home() {
         // Documented divergence 4: default cwd is the boot-resolved home
         // (here the tempdir passed as state home), vs Node's os.homedir()
@@ -1045,5 +1153,76 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let value = body_json(resp).await;
         assert_eq!(value, json!({ "error": "invalid JSON body" }));
+    }
+
+    #[tokio::test]
+    async fn exec_vendor_suffix_json_content_type_is_skipped_not_parsed() {
+        // Task 2 review I1: express's json() default type is EXACTLY
+        // `application/json` — type-is's expected pattern does NOT match
+        // `application/*+json` structured-suffix vendor types, so
+        // body-parser skips parsing and the handler sees `{}` →
+        // command-is-required (it must NOT parse the body and execute).
+        let dir = tempfile::tempdir().unwrap();
+        let command_body = json_body("echo should-not-run", Some(dir.path()));
+        for content_type in ["application/cloudevents+json", "application/hal+json"] {
+            let resp = call_exec(
+                dir.path(),
+                exec_headers(Some(TOKEN), Some(content_type)),
+                &command_body,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "content_type: {content_type}"
+            );
+            let value = body_json(resp).await;
+            assert_eq!(value, json!({ "error": "command is required" }));
+        }
+        // Positive control: the same body IS parsed and executed under the
+        // exact type, with parameters or in any casing.
+        for content_type in ["application/json; charset=utf-8", "APPLICATION/JSON"] {
+            let resp = call_exec(
+                dir.path(),
+                exec_headers(Some(TOKEN), Some(content_type)),
+                &command_body,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "content_type: {content_type}"
+            );
+            let value = body_json(resp).await;
+            assert_eq!(value["output"], "should-not-run");
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_valid_non_object_json_body_is_400_command_required() {
+        // Task 2 review Minor: valid JSON whose top level is not an object
+        // has no `command` key (Node: JSON.parse then `body.command` is
+        // undefined), so it collapses to `{}` → command-is-required — NOT
+        // the invalid-JSON envelope. (Divergence-1 class for top-level
+        // primitives, which body-parser strict mode rejects with an HTML
+        // page; exact match for arrays, which body-parser parses.)
+        let dir = tempfile::tempdir().unwrap();
+        let bodies: [&[u8]; 3] = [b"5", b"\"x\"", b"[1]"];
+        for body in bodies {
+            let resp = call_exec(
+                dir.path(),
+                exec_headers(Some(TOKEN), Some("application/json")),
+                body,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "body: {}",
+                String::from_utf8_lossy(body)
+            );
+            let value = body_json(resp).await;
+            assert_eq!(value, json!({ "error": "command is required" }));
+        }
     }
 }
