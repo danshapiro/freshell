@@ -418,6 +418,7 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -977,6 +978,7 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   })
   .optional()
 

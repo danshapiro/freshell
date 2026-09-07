@@ -34,6 +34,8 @@ mod instance_id;
 mod legacy_local_seed;
 mod logging;
 mod managed_ports;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_runtime;
 mod migrations;
 mod net_bind;
 mod network;
@@ -357,6 +359,20 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    #[cfg(feature = "managed-runtime-v1")]
+    {
+        let controller = managed_runtime::ServerManagedRuntimeController::from_env()
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "managed_runtime.init_failed");
+                error
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("managed runtime initialization failed: {error}");
+                std::process::exit(1);
+            });
+        registry.set_managed_controller(controller);
+    }
     // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
     // the Rust host-stats collector — freshell-platform readers over
     // freshell-ws's trait bridge. Constructed here (not at the ~1311

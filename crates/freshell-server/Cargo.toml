@@ -20,7 +20,7 @@ publish.workspace = true
 # process launch to be described as managed. Phase 2/3 will attach the runtime
 # client only after their live continuity/provider gates pass.
 default = []
-managed-runtime-v1 = []
+managed-runtime-v1 = ["dep:freshell-runtime-client", "dep:freshell-runtime-protocol"]
 
 [[bin]]
 name = "freshell-server"
@@ -48,6 +48,8 @@ freshell-sessions = { path = "../freshell-sessions" }
 # The shared terminal registry constructed into WsState (terminals owned by
 # terminalId across connections — the multi-client / reconnection backbone).
 freshell-terminal = { path = "../freshell-terminal" }
+freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
+freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

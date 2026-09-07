@@ -2629,6 +2629,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "managedRuntimeV1": {
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "type": "boolean"
             },

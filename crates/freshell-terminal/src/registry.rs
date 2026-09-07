@@ -42,8 +42,10 @@
 //! this crate keeps its no-tokio boundary (`freshell-ws` backs the sink with a tokio
 //! mpsc sender feeding the socket).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -361,12 +363,91 @@ pub struct DirectoryEntry {
     pub snapshot: String,
 }
 
+/// Durable identity of a terminal whose OS process is owned by the external
+/// managed-runtime supervisor/session-host rather than this web-server process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedTerminalDescriptor {
+    pub soul_id: String,
+    pub incarnation_id: String,
+    pub terminal_id: String,
+    pub stream_id: String,
+    pub mode: String,
+    pub cwd: String,
+    pub resume_session_id: Option<String>,
+    pub create_request_id: Option<String>,
+}
+
+/// Launch request handed across the terminal crate's transport-agnostic seam.
+/// The controller is responsible for turning this already-resolved SpawnSpec into
+/// one supervisor-owned session-host workload; it must never respawn locally.
+#[derive(Debug, Clone)]
+pub struct ManagedTerminalLaunch {
+    pub spec: SpawnSpec,
+    pub env: BTreeMap<String, String>,
+    pub terminal_id: String,
+    pub stream_id: String,
+    pub mode: String,
+    pub resume_session_id: Option<String>,
+    pub create_request_id: Option<String>,
+}
+
+pub type ManagedTerminalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedOutputChunk {
+    pub seq_start: i64,
+    pub seq_end: i64,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedOutputRead {
+    pub reset_required: bool,
+    pub truncated: bool,
+    pub retained_from_seq: i64,
+    pub head_seq: i64,
+    pub chunks: Vec<ManagedOutputChunk>,
+}
+
+/// Async control seam implemented by `freshell-server` with
+/// `freshell-runtime-client`. Keeping the trait here lets the existing registry
+/// remain the browser-facing replay/fan-out owner while the web server has no PTY,
+/// PID, Docker socket, or direct kill authority for managed rows.
+pub trait ManagedTerminalController: Send + Sync {
+    fn launch<'a>(
+        &'a self,
+        request: ManagedTerminalLaunch,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>>;
+    fn input<'a>(
+        &'a self,
+        terminal: ManagedTerminalDescriptor,
+        data: String,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>>;
+    fn resize<'a>(
+        &'a self,
+        terminal: ManagedTerminalDescriptor,
+        cols: u16,
+        rows: u16,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>>;
+    fn stop<'a>(
+        &'a self,
+        terminal: ManagedTerminalDescriptor,
+    ) -> ManagedTerminalFuture<'a, Result<(), String>>;
+    fn read_output<'a>(
+        &'a self,
+        terminal: ManagedTerminalDescriptor,
+        after_seq: i64,
+        max_bytes: u64,
+    ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>>;
+}
+
 /// The registry's control handle for one terminal: the shared stream state plus the
 /// PTY (for input/resize/kill). `pty` is `Option` so tests can register a headless
 /// terminal and drive the stream logic deterministically without a real child.
 struct TerminalHandle {
     shared: Arc<Mutex<TerminalShared>>,
     pty: Option<PtyTerminal>,
+    managed: Option<ManagedTerminalDescriptor>,
 }
 
 /// Registration options for a terminal record with NO backing PTY.
@@ -621,6 +702,12 @@ pub struct TerminalRegistry {
     /// KNOWN dead (registered but not Running) is pruned instead of
     /// answering `BoundElsewhere`, so a dead winner never strands losers.
     session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
+    /// Installed only when the Rust server explicitly opts into managed-runtime-v1.
+    /// Legacy backends leave this empty and preserve every existing spawn path.
+    managed_controller: Arc<std::sync::RwLock<Option<Arc<dyn ManagedTerminalController>>>>,
+    /// Connections that negotiated the additive `managedRuntimeV1` capability.
+    /// Capability is per socket so old clients never enter a managed create path.
+    managed_runtime_connections: Arc<Mutex<std::collections::HashSet<u64>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -768,6 +855,8 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
+            managed_controller: Arc::new(std::sync::RwLock::new(None)),
+            managed_runtime_connections: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -934,6 +1023,9 @@ impl TerminalRegistry {
                 .terminals
                 .iter()
                 .filter_map(|(id, handle)| {
+                    if handle.managed.is_some() {
+                        return None; // managed runtime lifetime is supervisor-owned
+                    }
                     let s = handle.shared.lock().expect("terminal lock");
                     if s.status != TerminalRunStatus::Running {
                         return None; // only running
@@ -976,7 +1068,7 @@ impl TerminalRegistry {
         // caller (log line, test) depends on kill ORDER across multiple victims.
         candidates.sort();
         for id in &candidates {
-            self.kill_internal(id, "idle");
+            self.kill_internal(id, "idle", false);
         }
         // DIAG-01: a single summary event per sweep -- only when it actually
         // killed something (a no-op sweep, the common case on a 30s cadence,
@@ -1147,6 +1239,7 @@ impl TerminalRegistry {
             TerminalHandle {
                 shared,
                 pty: Some(pty),
+                managed: None,
             },
         );
         inner.revision += 1;
@@ -1394,6 +1487,7 @@ impl TerminalRegistry {
     /// PTYs keep running (background sessions), reattachable by a future socket.
     pub fn remove_connection(&self, conn_id: u64) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.set_managed_runtime_connection(conn_id, false);
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
             let inner = self.inner.lock().expect("registry lock");
             inner
@@ -1577,6 +1671,17 @@ impl TerminalRegistry {
         })
     }
 
+    /// Remove a managed facade only AFTER its supervisor stop transaction has
+    /// returned `VerifiedEmpty`. This is the sole managed-row removal door;
+    /// ordinary `kill()` refuses managed rows to prevent web-owned callbacks
+    /// from pretending they terminated the external workload.
+    pub fn remove_managed_after_stop(&self, terminal_id: &str) -> bool {
+        if !self.is_managed(terminal_id) {
+            return false;
+        }
+        self.kill_internal(terminal_id, "managed_stop", true)
+    }
+
     /// `registry.kill()` (`terminal-registry.ts:3997-4033`): remove the terminal, send
     /// `terminal.exit{exitCode:0}` to every attached connection, and SIGKILL+reap the
     /// PTY. Bumps the inventory revision. Returns whether the terminal existed.
@@ -1585,16 +1690,26 @@ impl TerminalRegistry {
     /// `terminal.kill`); see [`Self::kill_internal`] for the `by`-tagged
     /// event other callers (idle-reap, shutdown) use.
     pub fn kill(&self, terminal_id: &str) -> bool {
-        self.kill_internal(terminal_id, "api")
+        self.kill_internal(terminal_id, "api", false)
     }
 
     /// Shared kill implementation. `by` distinguishes the caller for the
     /// `terminal.killed` DIAG-01 event (`"api"` | `"idle"` | `"shutdown"`)
     /// without adding a public parameter to [`Self::kill`] (preserving that
     /// method's existing signature for `freshell-ws` and any other caller).
-    fn kill_internal(&self, terminal_id: &str, by: &'static str) -> bool {
+    fn kill_internal(&self, terminal_id: &str, by: &'static str, allow_managed: bool) -> bool {
         let handle = {
             let mut inner = self.inner.lock().expect("registry lock");
+            if !allow_managed
+                && inner
+                    .terminals
+                    .get(terminal_id)
+                    .is_some_and(|handle| handle.managed.is_some())
+            {
+                tracing::warn!(terminal_id = %terminal_id, by = by,
+                    "managed_terminal_legacy_kill_refused: supervisor stop is required");
+                return false;
+            }
             match inner.terminals.remove(terminal_id) {
                 Some(handle) => {
                     inner.revision += 1;
@@ -1680,10 +1795,14 @@ impl TerminalRegistry {
     pub fn kill_all(&self) -> usize {
         let ids: Vec<String> = {
             let inner = self.inner.lock().expect("registry lock");
-            inner.terminals.keys().cloned().collect()
+            inner
+                .terminals
+                .iter()
+                .filter_map(|(id, handle)| handle.managed.is_none().then(|| id.clone()))
+                .collect()
         };
         ids.iter()
-            .filter(|id| self.kill_internal(id, "shutdown"))
+            .filter(|id| self.kill_internal(id, "shutdown", false))
             .count()
     }
 
@@ -1937,6 +2056,300 @@ impl TerminalRegistry {
             .collect()
     }
 
+    /// Install or clear the asynchronous managed-runtime controller. The legacy
+    /// server leaves this unset, preserving local PTY ownership byte-for-byte.
+    pub fn set_managed_controller(&self, controller: Option<Arc<dyn ManagedTerminalController>>) {
+        *self
+            .managed_controller
+            .write()
+            .expect("managed controller lock") = controller;
+    }
+
+    pub fn has_managed_controller(&self) -> bool {
+        self.managed_controller
+            .read()
+            .expect("managed controller lock")
+            .is_some()
+    }
+
+    /// Per-connection capability latch. A managed controller being installed is
+    /// insufficient on its own: only sockets that negotiated managedRuntimeV1
+    /// may route create/input/resize/stop through it.
+    pub fn set_managed_runtime_connection(&self, conn_id: u64, enabled: bool) {
+        let mut connections = self
+            .managed_runtime_connections
+            .lock()
+            .expect("managed runtime connections lock");
+        if enabled {
+            connections.insert(conn_id);
+        } else {
+            connections.remove(&conn_id);
+        }
+    }
+
+    pub fn managed_runtime_connection(&self, conn_id: u64) -> bool {
+        self.managed_runtime_connections
+            .lock()
+            .expect("managed runtime connections lock")
+            .contains(&conn_id)
+    }
+
+    pub fn managed_descriptor(&self, terminal_id: &str) -> Option<ManagedTerminalDescriptor> {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .get(terminal_id)
+            .and_then(|handle| handle.managed.clone())
+    }
+
+    pub fn is_managed(&self, terminal_id: &str) -> bool {
+        self.managed_descriptor(terminal_id).is_some()
+    }
+
+    /// Register the browser-facing facade for a supervisor-owned PTY. This row
+    /// deliberately has no `PtyTerminal`: server shutdown therefore has no OS
+    /// process handle it could accidentally reap.
+    pub fn register_managed(&self, descriptor: ManagedTerminalDescriptor) {
+        let created_at = now_ms();
+        let shared = Arc::new(Mutex::new(TerminalShared {
+            terminal_id: descriptor.terminal_id.clone(),
+            stream_id: descriptor.stream_id.clone(),
+            replay: VecDeque::new(),
+            replay_chars: 0,
+            max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
+            scanner: BarrierScanner::new(),
+            modes: ModeTracker::new(),
+            noise: NoiseScanner::new(),
+            head_seq: 0,
+            status: TerminalRunStatus::Running,
+            exit_code: None,
+            created_at,
+            last_activity_at: created_at,
+            last_meaningful_activity_at: created_at,
+            cols: 120,
+            rows: 30,
+            geometry_epoch: 1,
+            has_client_geometry: false,
+            cwd: Some(descriptor.cwd.clone()),
+            title: "Shell".to_string(),
+            description: None,
+            mode: descriptor.mode.clone(),
+            resume_session_id: descriptor.resume_session_id.clone(),
+            create_request_id: descriptor.create_request_id.clone(),
+            subscribers: HashMap::new(),
+            // Managed terminal liveness is owned by the supervisor; a dropped
+            // browser is never an idle-reap signal.
+            released_by_client: false,
+        }));
+        let mut inner = self.inner.lock().expect("registry lock");
+        inner.terminals.insert(
+            descriptor.terminal_id.clone(),
+            TerminalHandle {
+                shared,
+                pty: None,
+                managed: Some(descriptor),
+            },
+        );
+        inner.revision += 1;
+    }
+
+    /// Merge one host-spooled output chunk into the ordinary replay/fan-out
+    /// machinery. Re-reading the same host cursor is harmless: seqEnd <= head
+    /// is dropped before it can be duplicated in replay.
+    pub fn ingest_managed_output(
+        &self,
+        terminal_id: &str,
+        seq_start: i64,
+        seq_end: i64,
+        data: String,
+    ) -> bool {
+        let (shared, stream_id) = {
+            let inner = self.inner.lock().expect("registry lock");
+            let Some(handle) = inner.terminals.get(terminal_id) else {
+                return false;
+            };
+            if handle.managed.is_none() {
+                return false;
+            }
+            let shared = Arc::clone(&handle.shared);
+            let stream_id = handle
+                .managed
+                .as_ref()
+                .map(|m| m.stream_id.clone())
+                .unwrap_or_default();
+            (shared, stream_id)
+        };
+        {
+            let s = shared.lock().expect("terminal lock");
+            if seq_end <= s.head_seq {
+                return true;
+            }
+        }
+        ingest(
+            &shared,
+            ServerMessage::TerminalOutput(TerminalOutput {
+                data,
+                seq_start,
+                seq_end,
+                stream_id,
+                terminal_id: terminal_id.to_string(),
+                attach_request_id: None,
+                source: None,
+            }),
+        );
+        true
+    }
+
+    pub fn managed_output_cursor(&self, terminal_id: &str) -> Option<i64> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            let handle = inner.terminals.get(terminal_id)?;
+            handle.managed.as_ref()?;
+            Arc::clone(&handle.shared)
+        };
+        let value = shared.lock().expect("terminal lock").head_seq;
+        Some(value)
+    }
+
+    pub async fn launch_managed(
+        &self,
+        request: ManagedTerminalLaunch,
+    ) -> Result<ManagedTerminalDescriptor, String> {
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
+        controller.launch(request).await
+    }
+
+    pub async fn managed_input(&self, terminal_id: &str, data: String) -> Result<(), String> {
+        let terminal = self
+            .managed_descriptor(terminal_id)
+            .ok_or_else(|| "managed terminal not found".to_string())?;
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
+        controller.input(terminal, data).await
+    }
+
+    pub async fn managed_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
+        let terminal = self
+            .managed_descriptor(terminal_id)
+            .ok_or_else(|| "managed terminal not found".to_string())?;
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
+        controller.resize(terminal, cols, rows).await
+    }
+
+    pub async fn managed_stop(&self, terminal_id: &str) -> Result<(), String> {
+        let terminal = self
+            .managed_descriptor(terminal_id)
+            .ok_or_else(|| "managed terminal not found".to_string())?;
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
+        controller.stop(terminal).await
+    }
+
+    /// Pull bounded host-spooled output and merge it into the ordinary
+    /// terminal replay/fan-out path. The host is still the sole PTY reader;
+    /// this is a control-plane read of already-drained output.
+    pub async fn refresh_managed_output(
+        &self,
+        terminal_id: &str,
+        max_bytes: u64,
+    ) -> Result<ManagedOutputRead, String> {
+        let terminal = self
+            .managed_descriptor(terminal_id)
+            .ok_or_else(|| "managed terminal not found".to_string())?;
+        let after_seq = self.managed_output_cursor(terminal_id).unwrap_or(0);
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone()
+            .ok_or_else(|| "managed runtime controller unavailable".to_string())?;
+        let mut read = controller
+            .read_output(terminal, after_seq, max_bytes)
+            .await?;
+        if read.reset_required {
+            // The host's retained window moved past our cursor. Reset only the
+            // web-side replay projection; the durable host spool remains
+            // authoritative. Prefix a visible marker to the first retained
+            // frame so a reconnect never silently pretends continuity.
+            let shared = {
+                let inner = self.inner.lock().expect("registry lock");
+                inner
+                    .terminals
+                    .get(terminal_id)
+                    .map(|handle| Arc::clone(&handle.shared))
+            };
+            if let Some(shared) = shared {
+                let mut state = shared.lock().expect("terminal lock");
+                state.replay.clear();
+                state.replay_chars = 0;
+                state.head_seq = read.retained_from_seq.saturating_sub(1);
+                state.scanner = BarrierScanner::new();
+                state.modes = ModeTracker::new();
+                state.noise = NoiseScanner::new();
+            }
+            if let Some(first) = read.chunks.first_mut() {
+                first.data = format!(
+                    "\r\n[Earlier terminal output was truncated while Freshell was disconnected.]\r\n{}",
+                    first.data
+                );
+            }
+        }
+        for chunk in &read.chunks {
+            self.ingest_managed_output(
+                terminal_id,
+                chunk.seq_start,
+                chunk.seq_end,
+                chunk.data.clone(),
+            );
+        }
+        Ok(read)
+    }
+
+    /// Managed terminal facades currently attached to one socket. Used by the
+    /// WS poller to keep live output flowing without giving the web process a
+    /// PTY reader or process handle.
+    pub fn managed_attached_to(&self, conn_id: u64) -> Vec<String> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .terminals
+            .iter()
+            .filter_map(|(terminal_id, handle)| {
+                let managed = handle.managed.as_ref()?;
+                let state = handle.shared.lock().expect("terminal lock");
+                if managed.terminal_id != *terminal_id {
+                    tracing::error!(terminal_id = %terminal_id, descriptor_terminal_id = %managed.terminal_id,
+                        "managed_terminal_descriptor_key_mismatch");
+                    return None;
+                }
+                state.subscribers.contains_key(&conn_id).then(|| terminal_id.clone())
+            })
+            .collect()
+    }
+
     /// Register a terminal record with NO backing PTY — see [`HeadlessTerminal`]
     /// for exactly who this seam exists for. The row (including its
     /// `create_request_id` stamp) is inserted atomically under the registry
@@ -1981,7 +2394,11 @@ impl TerminalRegistry {
             let mut inner = self.inner.lock().expect("registry lock");
             inner.terminals.insert(
                 opts.terminal_id.clone(),
-                TerminalHandle { shared, pty: None },
+                TerminalHandle {
+                    shared,
+                    pty: None,
+                    managed: None,
+                },
             );
             inner.revision += 1;
         }
@@ -5768,5 +6185,53 @@ mod tests {
             )
             .expect("valid create after a failed spawn must succeed (reservation released)");
         registry.kill("T-amp-fail-b");
+    }
+
+    #[test]
+    fn managed_facade_is_never_reaped_by_legacy_idle_or_shutdown_paths() {
+        let registry = TerminalRegistry::new();
+        registry.set_auto_kill_idle_minutes(1);
+        registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-managed".into(),
+            incarnation_id: "incarnation-managed".into(),
+            terminal_id: "T-managed".into(),
+            stream_id: "S-managed".into(),
+            mode: "shell".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: Some("req-managed".into()),
+        });
+        registry.backdate_last_activity("T-managed", now_ms() - 48 * 60 * 60_000);
+
+        assert!(registry.enforce_idle_kills().is_empty());
+        assert_eq!(registry.kill_all(), 0);
+        assert!(registry.is_live("T-managed"));
+        assert!(registry.is_managed("T-managed"));
+    }
+
+    #[test]
+    fn managed_output_replay_dedupes_repeated_host_cursor_reads() {
+        let registry = TerminalRegistry::new();
+        registry.register_managed(ManagedTerminalDescriptor {
+            soul_id: "soul-output".into(),
+            incarnation_id: "incarnation-output".into(),
+            terminal_id: "T-output".into(),
+            stream_id: "S-output".into(),
+            mode: "shell".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: None,
+            create_request_id: None,
+        });
+
+        assert!(registry.ingest_managed_output("T-output", 1, 1, "one\n".into()));
+        assert!(registry.ingest_managed_output("T-output", 1, 1, "duplicate\n".into()));
+        assert!(registry.ingest_managed_output("T-output", 2, 2, "two\n".into()));
+        let row = registry
+            .directory()
+            .into_iter()
+            .find(|row| row.terminal_id == "T-output")
+            .unwrap();
+        assert_eq!(row.snapshot, "one\ntwo\n");
+        assert_eq!(registry.managed_output_cursor("T-output"), Some(2));
     }
 }

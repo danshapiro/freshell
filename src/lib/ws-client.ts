@@ -511,7 +511,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true, managedRuntimeV1: true },
           ...helloExtensions,
         })
       }
