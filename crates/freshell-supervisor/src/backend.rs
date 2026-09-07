@@ -1,7 +1,9 @@
+pub mod docker;
+
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
 use freshell_runtime_protocol::{
-    DockerDaemonId, IncarnationId, InstallationId, RuntimeLimits, SoulId,
+    DockerDaemonId, IncarnationId, InstallationId, RuntimeLimits, SoulId, TerminalLaunchSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,6 +40,8 @@ pub struct CreateRuntimeSpec {
     pub runtime_dir: PathBuf,
     pub limits: RuntimeLimits,
     pub test_run_id: String,
+    pub terminal: Option<TerminalLaunchSpec>,
+    pub provider_volume_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +240,19 @@ impl RuntimeBackend for DockerEngineBackend {
         }
         let binary = canonical_regular_file(&spec.host_binary_path)?;
         let runtime_dir = canonical_dir(&spec.runtime_dir)?;
+        if !spec.provider_volume_name.starts_with("freshell-provider-")
+            || spec.provider_volume_name.len() > 96
+        {
+            return Err(BackendError::InvalidConfig(
+                "provider volume name is not installation-scoped".into(),
+            ));
+        }
+        let terminal_mounts = spec
+            .terminal
+            .as_ref()
+            .map(docker::terminal_mounts)
+            .transpose()
+            .map_err(BackendError::InvalidConfig)?;
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let daemon_id = self.daemon_id().await?;
@@ -246,6 +263,31 @@ impl RuntimeBackend for DockerEngineBackend {
             .ok_or_else(|| BackendError::InvalidConfig("memory+swap overflow".into()))?;
         let requested_limits = serde_json::to_string(&spec.limits)
             .map_err(|e| BackendError::Malformed(e.to_string()))?;
+        let mut binds = vec![
+            format!("{}:/runtime/freshell-session-host:ro", binary.display()),
+            format!("{}:/run/freshell:rw", runtime_dir.display()),
+        ];
+        let network_mode = if spec.terminal.is_some() {
+            "bridge"
+        } else {
+            "none"
+        };
+        if let Some(mounts) = &terminal_mounts {
+            binds.push(format!(
+                "{}:{}:rw",
+                mounts.workspace.display(),
+                mounts.workspace.display()
+            ));
+            if let Some(git) = &mounts.git_common_dir {
+                if !git.starts_with(&mounts.workspace) {
+                    binds.push(format!("{}:{}:rw", git.display(), git.display()));
+                }
+            }
+            binds.push(format!(
+                "{}:/home/freshell/provider:rw",
+                spec.provider_volume_name
+            ));
+        }
         let body = json!({
             "Image": spec.image_ref,
             "Cmd": [
@@ -266,7 +308,7 @@ impl RuntimeBackend for DockerEngineBackend {
             },
             "HostConfig": {
                 "AutoRemove": false,
-                "NetworkMode": "none",
+                "NetworkMode": network_mode,
                 "PidMode": "",
                 "ReadonlyRootfs": true,
                 "Privileged": false,
@@ -277,11 +319,8 @@ impl RuntimeBackend for DockerEngineBackend {
                 "Memory": spec.limits.memory_bytes,
                 "MemorySwap": memory_swap,
                 "PidsLimit": spec.limits.pids_max,
-                "Binds": [
-                    format!("{}:/runtime/freshell-session-host:ro", binary.display()),
-                    format!("{}:/run/freshell:rw", runtime_dir.display())
-                ],
-                "Tmpfs": {"/tmp":"rw,noexec,nosuid,nodev,size=64m"}
+                "Binds": binds,
+                "Tmpfs": {"/tmp":"rw,noexec,nosuid,nodev,size=128m"}
             }
         });
         // The name is diagnostic only and is deliberately unique per create attempt.
@@ -527,6 +566,8 @@ struct ExpectedConfig {
     host_binary_path: String,
     runtime_dir: String,
     limits: RuntimeLimits,
+    terminal: Option<TerminalLaunchSpec>,
+    provider_volume_name: String,
 }
 
 impl ExpectedConfig {
@@ -539,6 +580,8 @@ impl ExpectedConfig {
             host_binary_path: binary.to_string_lossy().into_owned(),
             runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             limits: spec.limits,
+            terminal: spec.terminal.clone(),
+            provider_volume_name: spec.provider_volume_name.clone(),
         }
     }
 }
@@ -552,6 +595,8 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         host_binary_path: handle.host_binary_path().to_string_lossy().into_owned(),
         runtime_dir: handle.runtime_dir().to_string_lossy().into_owned(),
         limits: handle.requested_limits(),
+        terminal: handle.terminal().cloned(),
+        provider_volume_name: handle.provider_volume_name().to_owned(),
     })
 }
 
@@ -597,7 +642,12 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
     let host_config = value
         .get("HostConfig")
         .ok_or_else(|| BackendError::OwnershipMismatch("missing HostConfig".into()))?;
-    if host_config.get("NetworkMode").and_then(Value::as_str) != Some("none") {
+    let expected_network = if handle.terminal().is_some() {
+        "bridge"
+    } else {
+        "none"
+    };
+    if host_config.get("NetworkMode").and_then(Value::as_str) != Some(expected_network) {
         return Err(BackendError::OwnershipMismatch(
             "network mode changed".into(),
         ));
@@ -640,6 +690,43 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         return Err(BackendError::OwnershipMismatch(
             "runtime mount topology changed".into(),
         ));
+    }
+    if let Some(terminal) = handle.terminal() {
+        let expected =
+            docker::terminal_mounts(terminal).map_err(BackendError::OwnershipMismatch)?;
+        let workspace = expected.workspace.to_string_lossy();
+        let has_workspace = mounts.iter().any(|m| {
+            m.get("Source").and_then(Value::as_str) == Some(workspace.as_ref())
+                && m.get("Destination").and_then(Value::as_str) == Some(workspace.as_ref())
+        });
+        if !has_workspace {
+            return Err(BackendError::OwnershipMismatch(
+                "workspace mount changed".into(),
+            ));
+        }
+        if let Some(git) = expected.git_common_dir {
+            if !git.starts_with(&expected.workspace) {
+                let git_text = git.to_string_lossy();
+                let has_git = mounts.iter().any(|m| {
+                    m.get("Source").and_then(Value::as_str) == Some(git_text.as_ref())
+                        && m.get("Destination").and_then(Value::as_str) == Some(git_text.as_ref())
+                });
+                if !has_git {
+                    return Err(BackendError::OwnershipMismatch(
+                        "git common-dir mount changed".into(),
+                    ));
+                }
+            }
+        }
+        let has_provider = mounts.iter().any(|m| {
+            m.get("Name").and_then(Value::as_str) == Some(handle.provider_volume_name())
+                && m.get("Destination").and_then(Value::as_str) == Some("/home/freshell/provider")
+        });
+        if !has_provider {
+            return Err(BackendError::OwnershipMismatch(
+                "provider home volume changed".into(),
+            ));
+        }
     }
     Ok(())
 }

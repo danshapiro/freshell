@@ -172,6 +172,10 @@ pub enum RuntimeErrorCode {
     HostAuthenticationFailed,
     StaleExecutionGrant,
     InvalidRuntimeLimits,
+    BlockedResource,
+    CommandAmbiguous,
+    OutputCursorExpired,
+    UnsupportedWorkload,
     FaultInjected,
 }
 
@@ -199,6 +203,163 @@ impl RuntimeLimits {
         }
         Ok(self)
     }
+}
+
+/// Named resource profile saved with a managed soul. The numeric limits remain
+/// authoritative; the profile records user intent and supports future edits without
+/// silently changing a running incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProfile {
+    DefaultAgent,
+    TestFixture,
+    Custom,
+}
+
+impl Default for RuntimeProfile {
+    fn default() -> Self {
+        // Backward-compatible wire default for Phase 1 callers, which supplied
+        // explicit numeric limits before named profiles existed. New managed
+        // terminal callers always send an explicit profile.
+        Self::Custom
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalLaunchSpec {
+    pub terminal_id: String,
+    pub stream_id: String,
+    pub mode: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub project_key: String,
+    pub workspace_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
+}
+
+impl TerminalLaunchSpec {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.terminal_id.is_empty()
+            || self.stream_id.is_empty()
+            || self.mode.is_empty()
+            || self.program.is_empty()
+            || self.cwd.is_empty()
+            || self.project_key.is_empty()
+            || self.workspace_path.is_empty()
+            || self.cols == 0
+            || self.rows == 0
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed terminal launch has an empty required field",
+            ));
+        }
+        if self.env.len() > 512 || self.args.len() > 512 {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed terminal launch exceeds argv/env bounds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandState {
+    Queued,
+    Dispatching,
+    ProviderAcked,
+    Completed,
+    Ambiguous,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOutputFrame {
+    pub terminal_id: String,
+    pub stream_epoch: String,
+    pub seq_start: u64,
+    pub seq_end: u64,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOutputBatch {
+    pub incarnation_id: IncarnationId,
+    pub terminal_id: String,
+    pub stream_epoch: String,
+    pub retained_from_seq: u64,
+    pub head_seq: u64,
+    pub reset_required: bool,
+    pub truncated: bool,
+    #[serde(default)]
+    pub frames: Vec<RuntimeOutputFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMetrics {
+    pub cpu_usage_usec: u64,
+    pub cpu_throttled_usec: u64,
+    pub cpu_nr_throttled: u64,
+    pub memory_current_bytes: u64,
+    pub memory_peak_bytes: u64,
+    pub memory_oom: u64,
+    pub memory_oom_kill: u64,
+    pub pids_current: u64,
+    pub pids_max: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInputRequest {
+    pub soul_id: SoulId,
+    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResizeRequest {
+    pub soul_id: SoulId,
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalReadOutputRequest {
+    pub soul_id: SoulId,
+    pub after_seq: u64,
+    pub max_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMetricsRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,9 +417,35 @@ pub struct LaunchRequest {
     pub provider_store_id: String,
     pub creation_seed_ref: String,
     pub limits: RuntimeLimits,
-    pub fixture: FixtureKind,
+    #[serde(default)]
+    pub profile: RuntimeProfile,
+    #[serde(default = "default_project_key")]
+    pub project_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<FixtureKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalLaunchSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
+}
+
+fn default_project_key() -> String {
+    "default".to_string()
+}
+
+impl LaunchRequest {
+    pub fn validate_workload(&self) -> Result<(), RuntimeError> {
+        match (&self.fixture, &self.terminal) {
+            (Some(_), None) => Ok(()),
+            (None, Some(terminal)) => terminal.validate(),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "launch must specify exactly one fixture or terminal workload",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +474,10 @@ pub enum AdminCommand {
     Launch(LaunchRequest),
     Stop(StopRequest),
     Inventory,
+    TerminalInput(TerminalInputRequest),
+    TerminalResize(TerminalResizeRequest),
+    TerminalReadOutput(TerminalReadOutputRequest),
+    RuntimeMetrics(RuntimeMetricsRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +495,12 @@ pub struct RuntimeView {
     pub execution_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_limits: Option<RuntimeLimits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<RuntimeProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +528,12 @@ pub enum AdminResult {
         view: RuntimeView,
     },
     Inventory(Vec<RuntimeView>),
+    TerminalInput {
+        state: CommandState,
+    },
+    TerminalResize,
+    TerminalOutput(RuntimeOutputBatch),
+    RuntimeMetrics(RuntimeMetrics),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,7 +557,10 @@ pub enum HostCommand {
         control_epoch: u64,
         execution_generation: u64,
         grant_id: GrantId,
-        fixture: FixtureKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fixture: Option<FixtureKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal: Option<TerminalLaunchSpec>,
     },
     Stop {
         incarnation_id: IncarnationId,
@@ -365,6 +571,24 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
     },
     Status {
+        incarnation_id: IncarnationId,
+    },
+    TerminalInput {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        data: String,
+    },
+    TerminalResize {
+        incarnation_id: IncarnationId,
+        cols: u16,
+        rows: u16,
+    },
+    TerminalReadOutput {
+        incarnation_id: IncarnationId,
+        after_seq: u64,
+        max_bytes: u64,
+    },
+    RuntimeMetrics {
         incarnation_id: IncarnationId,
     },
 }
@@ -386,6 +610,12 @@ pub enum HostResult {
     },
     Stopped,
     SecurityProbe(serde_json::Value),
+    TerminalInput {
+        state: CommandState,
+    },
+    TerminalResize,
+    TerminalOutput(RuntimeOutputBatch),
+    RuntimeMetrics(RuntimeMetrics),
     Status {
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,

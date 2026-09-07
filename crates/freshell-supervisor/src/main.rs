@@ -1,5 +1,6 @@
 use freshell_runtime_protocol::InstallationId;
 use freshell_supervisor::{
+    admission::{AdmissionBudget, AdmissionPolicy},
     registry::Registry,
     service::{default_backend, serve_control, Supervisor, SupervisorConfig},
 };
@@ -34,6 +35,28 @@ async fn run() -> Result<(), String> {
         .map(InstallationId::parse)
         .transpose()
         .map_err(|e| e.to_string())?;
+    let defaults = AdmissionPolicy::default();
+    let admission = AdmissionPolicy {
+        installation: AdmissionBudget::new(
+            optional_u64_arg(rest, "--installation-budget-cpu-milli")?
+                .unwrap_or(defaults.installation.cpu_milli),
+            optional_u64_arg(rest, "--installation-budget-memory-bytes")?
+                .unwrap_or(defaults.installation.memory_bytes),
+            optional_u64_arg(rest, "--installation-budget-pids")?
+                .unwrap_or(defaults.installation.pids_max),
+        )
+        .validate()
+        .map_err(str::to_owned)?,
+        project: AdmissionBudget::new(
+            optional_u64_arg(rest, "--project-budget-cpu-milli")?
+                .unwrap_or(defaults.project.cpu_milli),
+            optional_u64_arg(rest, "--project-budget-memory-bytes")?
+                .unwrap_or(defaults.project.memory_bytes),
+            optional_u64_arg(rest, "--project-budget-pids")?.unwrap_or(defaults.project.pids_max),
+        )
+        .validate()
+        .map_err(str::to_owned)?,
+    };
     let control_secret = std::fs::read_to_string(&control_secret_file)
         .map_err(|e| format!("read control secret: {e}"))?
         .trim()
@@ -57,6 +80,7 @@ async fn run() -> Result<(), String> {
             test_run_id,
             control_secret,
             lifecycle_log,
+            admission,
         },
     )
     .map_err(|e| e.message)?;
@@ -71,4 +95,14 @@ fn optional_arg(args: &[String], key: &str) -> Option<String> {
         .position(|arg| arg == key)
         .and_then(|index| args.get(index + 1))
         .cloned()
+}
+
+fn optional_u64_arg(args: &[String], key: &str) -> Result<Option<u64>, String> {
+    optional_arg(args, key)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|e| format!("invalid {key}: {e}"))
+        })
+        .transpose()
 }
