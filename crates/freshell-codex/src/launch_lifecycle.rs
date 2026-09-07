@@ -1273,6 +1273,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                             created_at: now,
                             updated_at: now,
                             state: SidecarRecordState::Active,
+                            lane: None,
                         };
                         // Write failures are logged LOUDLY, never abort the
                         // launch (the pane-ledger write-failure policy).

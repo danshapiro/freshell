@@ -39,6 +39,7 @@
 pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
+pub(crate) mod codex_sidecar_tracking;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
