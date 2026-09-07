@@ -18,7 +18,9 @@
 //!
 //! `set_active(true)` runs ONE immediate fast tick (a fresh subscriber gets a
 //! shaped snapshot at once); the slow tier only ticks on its own interval.
-//! `set_active(false)` aborts ALL collection tasks (true zero cost).
+//! `set_active(false)` aborts ALL collection tasks (true zero cost) and clears
+//! every delta base + the merged live cache, so a restart takes the null-safe
+//! first-sample path like a fresh start (Node stop() parity).
 //! `snapshot()` never blocks on I/O — ticks write caches, snapshots read
 //! caches.
 //!
@@ -841,6 +843,20 @@ impl HostStatsCollector for HostStatsCollectorService {
             handles.fast.abort();
             handles.slow.abort();
             handles.drift.abort();
+            // Restart = fresh start (Node stop() parity): drop every
+            // cumulative-counter delta base so the restart's immediate tick
+            // reports the null-safe first sample instead of deltas spanning
+            // the whole unwatched interval; clear queued drift samples (Node
+            // disables/nulls its histogram at stop); reset the merged live
+            // cache so no stale slow sections survive. The `manual` refresh
+            // cache is request-owned (not sampled state) and stays. Cadence
+            // is locked first; these are disjoint mutexes — no lock cycle.
+            *self.ctx.share.prev_cpu.lock().unwrap() = None;
+            *self.ctx.share.prev_vmstat.lock().unwrap() = None;
+            *self.ctx.share.prev_disks.lock().unwrap() = None;
+            *self.ctx.share.prev_net.lock().unwrap() = None;
+            self.ctx.share.lag_samples.lock().unwrap().clear();
+            *self.ctx.share.live.lock().unwrap() = zero_live(&self.ctx.machine);
         }
     }
 }
@@ -2187,6 +2203,201 @@ mod tests {
         // Restart resumes ticking.
         collector.set_active(true);
         assert!(collector.is_running());
+        collector.set_active(false);
+    }
+
+    /// Rewrite the first `name value` line inside a copied fixture file — the
+    /// overlay tree's counters grow in place to simulate an unwatched
+    /// interval (Node suite parity: re-seeded reader mocks).
+    fn rewrite_counter(path: &Path, name: &str, value: u64) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut out = String::new();
+        let mut replaced = false;
+        for line in text.lines() {
+            if !replaced && line.starts_with(&format!("{name} ")) {
+                out.push_str(&format!("{name} {value}\n"));
+                replaced = true;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        assert!(replaced, "counter `{name}` present in {}", path.display());
+        std::fs::write(path, out).unwrap();
+    }
+
+    // Full-file fixture rewrites for the restart rebase test. `lo`/headers/
+    // partitions/`docker0` lines are always identical to the committed
+    // fixtures; only the named device counters grow. (Trailing newline each.)
+
+    /// diskstats growth over the unwatched interval (every device grows).
+    const DISKSTATS_G1: &str = r"   8       0 sda 6000 150 440000 7000 2400 75 240800 4000 0 4500 9000
+   8       1 sda1 4000 80 300000 5000 1500 40 150000 2500 0 3000 7500
+   7       0 loop0 100 0 800 10 0 0 0 0 0 10 10
+ 259       0 nvme0n1 9000 200 700000 8000 3000 60 300000 4000 0 5000 12000
+ 259       1 nvme0n1p1 8000 150 600000 7000 2500 55 250000 3500 0 4500 10500
+";
+
+    /// diskstats after the rebase proof bump — only the sda line changes
+    /// (dReads 100, dReadMs 2000, dWrites 400, dWriteMs 2000, dIosMs 1000).
+    const DISKSTATS_G2: &str = r"   8       0 sda 6100 150 491200 9000 2800 75 343200 6000 0 5500 9000
+   8       1 sda1 4000 80 300000 5000 1500 40 150000 2500 0 3000 7500
+   7       0 loop0 100 0 800 10 0 0 0 0 0 10 10
+ 259       0 nvme0n1 9000 200 700000 8000 3000 60 300000 4000 0 5000 12000
+ 259       1 nvme0n1p1 8000 150 600000 7000 2500 55 250000 3500 0 4500 10500
+";
+
+    /// net/dev growth over the unwatched interval — only eth0 errs 7->17.
+    const NET_DEV_G1: &str = r"Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1000000   10000    0    0    0     0          0         0  1000000   10000    0    0    0     0       0          0
+  eth0: 5000000   50000   17    3    0     0          0         0  8000000   80000   11    4    0     0       0          0
+docker0: 2000000   20000    2    1    0     0          0         0  3000000   30000    5    2    0     0       0          0
+";
+
+    /// net/dev after the rebase proof bump — only eth0 errs 17->18.
+    const NET_DEV_G2: &str = r"Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1000000   10000    0    0    0     0          0         0  1000000   10000    0    0    0     0       0          0
+  eth0: 5000000   50000   18    3    0     0          0         0  8000000   80000   11    4    0     0       0          0
+docker0: 2000000   20000    2    1    0     0          0         0  3000000   30000    5    2    0     0       0          0
+";
+
+    #[tokio::test]
+    async fn host_stats_set_active_restart_rebases_deltas_and_resets_live_cache() {
+        // Full tmpdir overlay: the config roots are immutable after
+        // construction, so the fixture counters grow via file rewrites.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let sys_root = tmp.path().join("sys");
+        copy_tree(&proc_fixture(), &proc_root);
+        copy_tree(&sys_fixture(), &sys_root);
+
+        let interest = HostStatsInterestRegistry::default();
+        let collector = test_collector(proc_root.clone(), sys_root, &interest);
+
+        // Cycle 1: run until every prev_* store AND the slow-owned live
+        // sections have populated from the committed fixture counters.
+        collector.set_active(true);
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                collector.snapshot().live.disk_io.available
+            })
+            .await,
+            "slow sections populate before stop"
+        );
+        collector.set_active(false);
+        // A stopped collector publishes the documented fresh-subscriber shape
+        // again — no stale slow sections survive a stop.
+        let stopped = collector.snapshot();
+        assert!(!stopped.live.disk_io.available);
+        assert!(!stopped.live.network.available);
+        assert!(!stopped.live.limits.available);
+
+        // The unwatched counters GROW: aggregate cpu line x10 (busy 78850 /
+        // total 1742360) plus pswpin/pswpout/pgmajfault/oom_kill growth, and
+        // the diskstats/net-dev G1 files below.
+        let stat_path = proc_root.join("stat");
+        let stat = std::fs::read_to_string(&stat_path).unwrap();
+        let grown = stat.replacen(
+            "cpu  4705 356 1622 164331 2020 80 345 777 0 0",
+            "cpu  47050 3560 16220 1643310 20200 800 3450 7770 0 0",
+            1,
+        );
+        assert!(grown != stat, "aggregate cpu line rewritten");
+        std::fs::write(&stat_path, grown).unwrap();
+        rewrite_counter(&proc_root.join("vmstat"), "pswpin", 11234);
+        rewrite_counter(&proc_root.join("vmstat"), "pswpout", 15678);
+        rewrite_counter(&proc_root.join("vmstat"), "pgmajfault", 1890);
+        rewrite_counter(&proc_root.join("vmstat"), "oom_kill", 13);
+        std::fs::write(proc_root.join("diskstats"), DISKSTATS_G1).unwrap();
+        std::fs::write(proc_root.join("net/dev"), NET_DEV_G1).unwrap();
+
+        collector.set_active(true);
+        let restarted = collector.snapshot();
+        // The restart's immediate tick is the documented null-safe first
+        // sample: zero rates/deltas, totals carried from the CURRENT (grown)
+        // sample, slow sections still unavailable.
+        assert!(restarted.live.cpu.available);
+        assert_eq!(restarted.live.cpu.usage_pct, 0.0);
+        assert_eq!(restarted.live.cpu.steal_pct, Some(0.0));
+        assert_eq!(restarted.live.paging.swap_in_kbps, 0.0);
+        assert_eq!(restarted.live.paging.swap_out_kbps, 0.0);
+        assert_eq!(restarted.live.paging.maj_faults_per_sec, 0.0);
+        assert_eq!(restarted.live.paging.oom_kills_delta, 0);
+        assert_eq!(restarted.live.paging.oom_kills_total, 13);
+        assert!(!restarted.live.disk_io.available);
+        assert!(!restarted.live.network.available);
+        assert!(!restarted.live.limits.available);
+
+        // Positive re-base proof #1: bump ONLY oom_kill by 1; the next fast
+        // tick reports delta 1 against the RESTART sample — never 11 against
+        // the pre-stop sample.
+        rewrite_counter(&proc_root.join("vmstat"), "oom_kill", 14);
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                let paging = &collector.snapshot().live.paging;
+                paging.oom_kills_delta == 1 && paging.oom_kills_total == 14
+            })
+            .await,
+            "paging deltas re-base on the restart sample (delta 1, total 14)"
+        );
+
+        // Slow tier (Finding 1 disposition): the FIRST post-restart slow tick
+        // is the null-safe first slow sample — zero rates/deltas, totals
+        // carried from the G1 growth (eth0 rx errs 7->17 plus docker0 2 = 19).
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                collector.snapshot().live.disk_io.available
+            })
+            .await,
+            "first post-restart slow tick populates the slow sections"
+        );
+        assert!(
+            wait_until(Duration::from_millis(500), || {
+                let live = &collector.snapshot().live;
+                live.disk_io.available
+                    && live.disk_io.read_bps == 0.0
+                    && live.disk_io.write_bps == 0.0
+                    && live.disk_io.util_pct.is_none()
+                    && live.disk_io.weighted_await_ms.is_none()
+                    && live.network.available
+                    && live.network.rx_bps == 0.0
+                    && live.network.tx_bps == 0.0
+                    && live.network.rx_errors_total == 19
+                    && live.network.tx_errors_total == 16
+                    && live.network.rx_dropped_total == 4
+                    && live.network.tx_dropped_total == 6
+                    && live.network.rx_errors_delta == 0
+            })
+            .await,
+            "first post-restart slow tick is the null-safe first slow sample with G1 totals"
+        );
+
+        // Positive re-base proof #2 (dt-free witnesses only): grow eth0 rx
+        // errs by exactly 1 (17->18) and grow ONLY sda's diskstats counters
+        // (G1->G2: dReads 100, dReadMs 2000, dWrites 400, dWriteMs 2000,
+        // dIosMs 1000; every other device unchanged so sda is the worst-util
+        // device). The next slow tick must report counts/ratios against the
+        // RESTART samples: rx_errors_delta == 1 (never 11) and
+        // weighted_await_ms == (2000+2000)/(100+400) == 8.0 (never the
+        // gap-spanning value). BEFORE finalizing, verify the exact field
+        // mapping, loopback/partition exclusion, and worst-device selection
+        // in freshell-platform/src/host_stats_readers.rs and adjust THESE
+        // COMMENTS/VALUES only if the code contradicts them (record any
+        // adjustment in your report).
+        std::fs::write(proc_root.join("diskstats"), DISKSTATS_G2).unwrap();
+        std::fs::write(proc_root.join("net/dev"), NET_DEV_G2).unwrap();
+        assert!(
+            wait_until(Duration::from_millis(2000), || {
+                let live = &collector.snapshot().live;
+                live.network.rx_errors_delta == 1
+                    && live.network.rx_errors_total == 20
+                    && live.disk_io.weighted_await_ms == Some(8.0)
+            })
+            .await,
+            "network/disk re-base on the restart sample (dt-free witnesses)"
+        );
         collector.set_active(false);
     }
 
