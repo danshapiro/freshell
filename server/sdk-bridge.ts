@@ -19,7 +19,7 @@ import { sanitizeFreshAgentPluginPaths } from '../shared/fresh-agent-plugins.js'
 import { FreshAgentSessionCommandSchema, type FreshAgentSessionCommand } from '../shared/fresh-agent-contract.js'
 import { logger } from './logger.js'
 import { synthesizeClaudeFreshAgentLiveMessageId } from './fresh-agent/history/claude/history-ledger.js'
-import { nextMonotonicTurnCompleteAt } from './fresh-agent/turn-complete-clock.js'
+import { nextMonotonicStatusSeq, nextMonotonicTurnCompleteAt } from './fresh-agent/turn-complete-clock.js'
 import type { ClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
 import type {
   SdkSessionState,
@@ -186,6 +186,22 @@ export class SdkBridge extends EventEmitter {
     }
   }
 
+  /**
+   * Fold a new tracked status into the session state, minting a fresh statusSeq
+   * when the status actually changes. Re-folding the SAME status reuses the
+   * recorded seq (a no-change fold must not bump the client-side accept
+   * baseline) — this is the codex `mintStatusSeq` reuse semantics, shared so
+   * the seq regime stays provider-agnostic. Returns the tracked (stamped) seq.
+   */
+  private foldStatus(state: SdkSessionState, status: SdkSessionState['status']): number {
+    const seq = state.status === status && state.lastStatusSeq !== undefined
+      ? state.lastStatusSeq
+      : nextMonotonicStatusSeq(state.lastStatusSeq, Date.now())
+    state.status = status
+    state.lastStatusSeq = seq
+    return seq
+  }
+
   private assignMessageId(
     state: SdkSessionState,
     message: { role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string; model?: string; messageId?: string },
@@ -231,6 +247,8 @@ export class SdkBridge extends EventEmitter {
       permissionMode: options.permissionMode,
       plugins: options.plugins ? sanitizeFreshAgentPluginPaths(options.plugins) : undefined,
       status: 'starting',
+      // First tracked fold mints the session's first statusSeq (the wall clock).
+      lastStatusSeq: nextMonotonicStatusSeq(undefined, Date.now()),
       createdAt: Date.now(),
       messages: [],
       streamingActive: false,
@@ -419,7 +437,7 @@ export class SdkBridge extends EventEmitter {
 
       if (wasAborted) {
         // Session was explicitly killed -- mark as exited and clean up fully
-        if (state && state.status !== 'exited') state.status = 'exited'
+        if (state && state.status !== 'exited') this.foldStatus(state, 'exited')
         this.broadcastToSession(sessionId, {
           type: 'sdk.exit',
           sessionId,
@@ -433,8 +451,15 @@ export class SdkBridge extends EventEmitter {
         // false instead of silently pushing into a dead queue. Broadcast an explicit
         // idle status so the client clears blue (busy = streamingActive || running);
         // a natural end / error previously left the pane stuck blue.
-        if (state) state.status = 'idle'
-        this.broadcastToSession(sessionId, { type: 'sdk.status', sessionId, status: 'idle' })
+        // Tracked-stateless emission (state gone) stays seq-less per the
+        // never-mint-from-defaults rule.
+        const statusSeq = state ? this.foldStatus(state, 'idle') : undefined
+        this.broadcastToSession(sessionId, {
+          type: 'sdk.status',
+          sessionId,
+          status: 'idle',
+          ...(statusSeq !== undefined ? { statusSeq } : {}),
+        })
         log.debug({ sessionId }, 'SDK query stream ended')
       }
 
@@ -458,7 +483,7 @@ export class SdkBridge extends EventEmitter {
           state.model = init.model || state.model
           state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
-          state.status = 'connected'
+          this.foldStatus(state, 'connected')
           // Capture the init frame's terminal slash-command name-list (optional per
           // sdk.d.ts:4766-4770). It drives the publish subtract; absent = empty
           // subtract list (data-driven, no name denylist).
@@ -489,11 +514,12 @@ export class SdkBridge extends EventEmitter {
         } else if (msg.subtype === 'status') {
           const statusMsg = msg as SDKStatusMessage
           if (statusMsg.status === 'compacting') {
-            state.status = 'compacting'
+            const statusSeq = this.foldStatus(state, 'compacting')
             this.broadcastToSession(sessionId, {
               type: 'sdk.status',
               sessionId,
               status: 'compacting',
+              statusSeq,
             })
           }
         }
@@ -526,7 +552,7 @@ export class SdkBridge extends EventEmitter {
         this.syncRestoreLedger(state)
         state.streamingActive = false
         state.streamingText = ''
-        state.status = 'running'
+        this.foldStatus(state, 'running')
         this.broadcastToSession(sessionId, {
           type: 'sdk.assistant',
           sessionId,
@@ -545,7 +571,7 @@ export class SdkBridge extends EventEmitter {
         }
         state.streamingActive = false
         state.streamingText = ''
-        state.status = 'idle'
+        this.foldStatus(state, 'idle')
         // Extract usage fields to satisfy the Zod-inferred structural type (SDK's
         // NonNullableUsage is a mapped type that is structurally compatible but not directly
         // assignable to the Zod output type)
@@ -809,12 +835,12 @@ export class SdkBridge extends EventEmitter {
       // Also check if the session exists without a process (stream ended naturally)
       const state = this.sessions.get(sessionId)
       if (!state) return false
-      state.status = 'exited'
+      this.foldStatus(state, 'exited')
       return true
     }
 
     const state = this.sessions.get(sessionId)
-    if (state) state.status = 'exited'
+    if (state) this.foldStatus(state, 'exited')
 
     try {
       sp.abortController.abort()

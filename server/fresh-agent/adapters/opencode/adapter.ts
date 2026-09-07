@@ -8,7 +8,7 @@ import type {
   FreshAgentThreadLocator,
 } from '../../runtime-adapter.js'
 import { FreshAgentLostSessionError } from '../../runtime-manager.js'
-import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
+import { nextMonotonicStatusSeq, nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 import type { FreshAgentSessionCommand } from '../../../../shared/fresh-agent-contract.js'
 import {
@@ -92,6 +92,9 @@ type OpencodeSessionState = {
   unsubscribeServe?: () => void
   /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
   lastTurnCompleteAt?: number
+  /** Last minted statusSeq, kept per session so the status sequence stays strictly
+   * monotonic. Undefined until the session's first tracked status fold. */
+  lastStatusSeq?: number
   /** Set by interrupt() so the in-flight send suppresses its chime when idle resolves. */
   turnAborted?: boolean
   /**
@@ -454,6 +457,18 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       : await serveManager.fork(state.realSessionId)
   }
 
+  /** Fold a tracked opencode status into state, minting a fresh statusSeq when the
+   * status actually changes (a same-status fold reuses the recorded seq — it must
+   * not bump the client's accept baseline). Returns the tracked (stamped) seq. */
+  function foldTrackedStatus(state: OpencodeSessionState, status: 'running' | 'idle'): number {
+    const seq = state.status === status && state.lastStatusSeq !== undefined
+      ? state.lastStatusSeq
+      : nextMonotonicStatusSeq(state.lastStatusSeq, Date.now())
+    state.status = status
+    state.lastStatusSeq = seq
+    return seq
+  }
+
   /** Bridge serve SSE events for this state's real session into the state's
    * own EventEmitter, mapped to sdk.* and stamped with the placeholder id the
    * client first subscribed with. */
@@ -471,7 +486,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
           }
           if (mapped.type === 'sdk.session.snapshot') {
             const status: 'running' | 'idle' = mapped.status === 'idle' ? 'idle' : 'running'
-            state.status = status
+            // SSE-direct emission lane: fold the tracked status and stamp the minted
+            // seq onto the relayed frame, same as adapter-synthesized emitStatus.
+            const statusSeq = foldTrackedStatus(state, status)
             recordFreshAgentObservabilityEvent({
               kind: 'fresh_agent_opencode_status_observed',
               provider: 'opencode',
@@ -481,8 +498,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
               opencodeEventKind: parsed.kind,
               ...(state.cwd ? { cwdHash: hashForLogs(state.cwd) } : {}),
             })
+            state.events.emit('event', { ...mapped, statusSeq })
+          } else {
+            state.events.emit('event', mapped)
           }
-          state.events.emit('event', mapped)
         }
       },
       () => {
@@ -505,8 +524,8 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   }
 
   function emitStatus(state: OpencodeSessionState, status: 'running' | 'idle'): void {
-    state.status = status
-    state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status })
+    const statusSeq = foldTrackedStatus(state, status)
+    state.events.emit('event', { type: 'sdk.session.snapshot', sessionId: state.placeholderId, status, statusSeq })
     recordFreshAgentObservabilityEvent({
       kind: 'fresh_agent_opencode_status_observed',
       provider: 'opencode',
@@ -1166,6 +1185,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         return normalizeOpencodeSnapshot({
           sessionType: 'freshopencode', threadId: thread.threadId, status: liveState.status,
           model: liveState.model, effort: liveState.effort, commands: liveState.commands,
+          statusSeq: liveState.lastStatusSeq,
         })
       }
       const realId = durableId(thread.threadId)
@@ -1178,6 +1198,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
         exported: { ...exported, info: { ...(exported.info ?? {}), time: { ...((exported.info?.time) ?? {}), updated: revision } } },
         status: liveState?.status ?? 'idle', model: liveState?.model, effort: liveState?.effort,
         commands: liveState?.commands,
+        // Seq-less by design when there is no live tracked state: the 'idle' above is
+        // then an untracked default, and only tracked folds mint a statusSeq.
+        statusSeq: liveState?.lastStatusSeq,
         // Task 4's client busy-clear gate: only a snapshot whose status comes from live,
         // reconciled adapter state may clear busy; the untracked default above must not.
         statusFromLiveState: liveState?.initialReconcileCompleted === true,

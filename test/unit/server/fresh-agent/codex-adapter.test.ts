@@ -1070,11 +1070,12 @@ describe('Codex fresh-agent adapter', () => {
       sessionId: 'thread-new-1',
       status: 'idle',
     }))
-    expect(listener).toHaveBeenCalledWith({
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
       type: 'sdk.status',
       sessionId: 'thread-new-1',
       status: 'exited',
-    })
+      statusSeq: expect.any(Number),
+    }))
 
     unsubscribe?.()
     expect(off).toHaveBeenCalledTimes(1)
@@ -1294,6 +1295,59 @@ describe('Codex fresh-agent adapter', () => {
       const secondAt = secondListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
       expect(firstAt).toBe(9000)
       expect(secondAt).toBeGreaterThan(firstAt)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
+  it('keeps the status sequence monotonic per thread across a re-subscribe (WS reconnect)', async () => {
+    // Same regime as the turn-complete clock above: WS fresh-agent subscriptions are
+    // torn down and recreated on reconnect, but the client store's statusSeq gate
+    // state survives. The per-thread (status, statusSeq) tracker must therefore live
+    // on adapter state, not the subscribe closure, or a same-ms / backward-clock status
+    // edge right after a reconnect is dropped as stale.
+    let lifecycleHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn((handler) => {
+        lifecycleHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(9000)
+    try {
+      const firstListener = vi.fn()
+      const unsub1 = await adapter.subscribe?.('thread-new-1', firstListener)
+      lifecycleHandler?.({
+        kind: 'thread_status_changed',
+        threadId: 'thread-new-1',
+        status: { type: 'active', activeFlags: [] },
+      })
+      unsub1?.()
+
+      // Reconnect: a brand-new subscription to the same thread, same wall-clock ms.
+      const secondListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', secondListener)
+      lifecycleHandler?.({
+        kind: 'thread_status_changed',
+        threadId: 'thread-new-1',
+        status: { type: 'idle' },
+      })
+
+      const firstSeq = firstListener.mock.calls
+        .map(([e]) => e)
+        .find((e) => e?.type === 'sdk.session.snapshot')?.statusSeq
+      const secondSeq = secondListener.mock.calls
+        .map(([e]) => e)
+        .find((e) => e?.type === 'sdk.session.snapshot')?.statusSeq
+      expect(firstSeq).toBe(9000)
+      expect(secondSeq).toBeGreaterThan(firstSeq)
     } finally {
       nowSpy.mockRestore()
     }
@@ -1683,7 +1737,12 @@ describe('Codex fresh-agent adapter', () => {
 
     exitHandler?.(undefined, 'app_server_exit')
 
-    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sdk.status',
+      sessionId: 'thread-new-1',
+      status: 'exited',
+      statusSeq: expect.any(Number),
+    }))
     // A crash is NOT a positive completion: it clears BLUE but must never chime green.
     expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
 
@@ -1723,7 +1782,12 @@ describe('Codex fresh-agent adapter', () => {
 
     // Sidecar crashes mid-turn.
     exitHandler?.(undefined, 'app_server_exit')
-    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sdk.status',
+      sessionId: 'thread-new-1',
+      status: 'exited',
+      statusSeq: expect.any(Number),
+    }))
     expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
     // Recovery, not teardown: a crash must NOT release/shutdown the runtime.
     expect(runtime.shutdown).not.toHaveBeenCalled()

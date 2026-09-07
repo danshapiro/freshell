@@ -67,6 +67,10 @@ export type SdkServerMessage =
     revision: number
     streamingActive?: boolean
     streamingText?: string
+    /** Server-authoritative per-session status sequence (wall-clock ms, strictly
+     * monotonic via the nextMonotonicStatusSeq clamp). Present only when the status
+     * came from a tracked fold; absent on untracked default-idle emissions. */
+    statusSeq?: number
   }
   | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'sdk.session.changed'; sessionId: string; reason?: string }
@@ -76,7 +80,7 @@ export type SdkServerMessage =
   | { type: 'sdk.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }
   | { type: 'sdk.permission.request'; sessionId: string; requestId: string; subtype: string; tool?: { name: string; input?: Record<string, unknown> }; toolUseID?: string; suggestions?: unknown[]; blockedPath?: string; decisionReason?: string }
   | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
-  | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
+  | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus; statusSeq?: number }
   | { type: 'sdk.turn.complete'; sessionId: string; at: number }
   | { type: 'sdk.turn.waiting'; sessionId: string; at: number }
   | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
@@ -131,6 +135,8 @@ export interface SdkSessionState {
   totalOutputTokens: number
   /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
   lastTurnCompleteAt?: number
+  /** Last minted statusSeq, kept per session so the status sequence stays strictly monotonic. */
+  lastStatusSeq?: number
   /** Last emitted turn-waiting `at`, kept per session so the waiting edge stays strictly monotonic, independent of the completion edge. */
   lastWaitingAt?: number
   /** Latest system/init `terminal_slash_commands` name-list. The SDK marks it optional: absent = empty subtract list (data-driven; no name denylist). */

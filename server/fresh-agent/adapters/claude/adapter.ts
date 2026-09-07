@@ -207,6 +207,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
             resolved,
             liveSession,
             status: liveSession.status,
+            statusSeq: liveSession.lastStatusSeq,
           })
         }
 
@@ -224,6 +225,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
           resolved: liveOnly,
           liveSession,
           status: liveSession.status,
+          statusSeq: liveSession.lastStatusSeq,
         })
       }
 
@@ -242,6 +244,8 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
         },
         liveSession,
         status: 'idle',
+        // Seq-less by design: this 'idle' is an untracked disk-only default, and the
+        // statusSeq mint rule is "only tracked folds mint" — never mint from defaults.
       })
     },
 

@@ -216,8 +216,8 @@ describe('OpenCode serve adapter: create + send', () => {
     // serve emits a part update + idle on the real session
     manager._emit('ses_real_1', { kind: 'message.part.updated', sessionId: 'ses_real_1', raw: { type: 'message.part.updated', properties: { sessionID: 'ses_real_1' } } })
     manager._emit('ses_real_1', { kind: 'session.idle', sessionId: 'ses_real_1', raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } } })
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'running' })
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'running', statusSeq: expect.any(Number) }))
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'idle', statusSeq: expect.any(Number) }))
   })
 
   it('emits exactly one server-authoritative sdk.turn.complete on a successful send', async () => {
@@ -257,6 +257,48 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(ats[1]).toBeGreaterThan(ats[0])
   })
 
+  it('stamps a strictly increasing statusSeq across running → idle → running → idle even at a frozen wall clock', async () => {
+    // Both emission lanes fold through the same per-session tracker: adapter-synthesized
+    // emitStatus (send bracket) and the bindServeStream direct-emit (SSE relay). The
+    // clamp keeps every edge strictly above the last even when Date.now never advances,
+    // so the client statusSeq gate never drops a real transition as stale.
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-seq', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-seq', (e) => events.push(e))
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(8000)
+    try {
+      await adapter.send?.('freshopencode-req-seq', { text: 'one' })
+      // SSE relay lane: busy then idle on the materialized real session.
+      manager._emit('ses_real_1', {
+        kind: 'session.status',
+        sessionId: 'ses_real_1',
+        properties: { status: { type: 'busy' } },
+        raw: { type: 'session.status', properties: { sessionID: 'ses_real_1', status: { type: 'busy' } } },
+      })
+      manager._emit('ses_real_1', {
+        kind: 'session.idle',
+        sessionId: 'ses_real_1',
+        raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } },
+      })
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    const snapshots = events
+      .filter((e): e is { type: string; status: string; statusSeq: number } =>
+        !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.session.snapshot')
+      .map((e) => [e.status, e.statusSeq])
+    expect(snapshots).toEqual([
+      ['running', 8000],
+      ['idle', 8001],
+      ['running', 8002],
+      ['idle', 8003],
+    ])
+  })
+
   it('does NOT emit sdk.turn.complete when the in-flight turn is interrupted, even though onceIdle resolves on the abort-triggered idle', async () => {
     // interrupt() aborts the turn; the sidecar then emits session.idle, which RESOLVES
     // onceIdle (it does not reject). Without tracking the abort, the success path would
@@ -279,7 +321,7 @@ describe('OpenCode serve adapter: create + send', () => {
     const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
     expect(completions).toHaveLength(0)
     // The interrupt still returns the pane to idle (clears blue) — it just must not chime.
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-int', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-int', status: 'idle', statusSeq: expect.any(Number) }))
   })
 
   it('resumes chiming on the next completed turn after an interrupt', async () => {
@@ -354,7 +396,7 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(completions).toHaveLength(0)
     // The error is still surfaced, and the pane still returns to idle (clears blue).
     expect(events.some((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.error')).toBe(true)
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-err', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-err', status: 'idle', statusSeq: expect.any(Number) }))
   })
 
   it('resumes chiming on the next clean turn after an errored turn', async () => {
@@ -391,7 +433,7 @@ describe('OpenCode serve adapter: create + send', () => {
     await expect(adapter.send?.('freshopencode-req-abort', { text: 'go' })).rejects.toThrow()
 
     // The catch path still returns the pane to idle (clearing blue) but must not chime.
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-abort', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-abort', status: 'idle', statusSeq: expect.any(Number) }))
     expect(events.find((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toBeUndefined()
   })
 
@@ -411,11 +453,12 @@ describe('OpenCode serve adapter: create + send', () => {
     void send?.finally(() => { sendSettled = true })
 
     await Promise.resolve()
-    expect(events).toContainEqual({
+    expect(events).toContainEqual(expect.objectContaining({
       type: 'sdk.session.snapshot',
       sessionId: 'freshopencode-slow-create',
       status: 'running',
-    })
+      statusSeq: expect.any(Number),
+    }))
     expect(manager.promptAsync).not.toHaveBeenCalled()
 
     createSession.resolve({ id: 'ses_real_1', title: 'T' })
@@ -448,8 +491,8 @@ describe('OpenCode serve adapter: create + send', () => {
 
     await expect(adapter.send?.('freshopencode-create-fails', { text: 'go' })).rejects.toThrow('session create timed out')
     expect(events).toEqual(expect.arrayContaining([
-      { type: 'sdk.session.snapshot', sessionId: 'freshopencode-create-fails', status: 'running' },
-      { type: 'sdk.session.snapshot', sessionId: 'freshopencode-create-fails', status: 'idle' },
+      expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-create-fails', status: 'running', statusSeq: expect.any(Number) }),
+      expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-create-fails', status: 'idle', statusSeq: expect.any(Number) }),
     ]))
   })
 
@@ -805,7 +848,7 @@ describe('OpenCode serve adapter: create + send', () => {
     adapter.subscribe?.('freshopencode-resilient-1', (e) => events.push(e))
 
     await expect(adapter.send?.('freshopencode-resilient-1', { text: 'first' })).rejects.toThrow('prompt failed')
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-resilient-1', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-resilient-1', status: 'idle', statusSeq: expect.any(Number) }))
 
     const result = await adapter.send?.('freshopencode-resilient-1', { text: 'second' })
     expect(result).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
@@ -846,7 +889,7 @@ describe('OpenCode serve adapter: create + send', () => {
     adapter.subscribe?.('freshopencode-lost-1', (e) => events.push(e))
 
     await expect(adapter.send?.('freshopencode-lost-1', { text: 'hi' })).rejects.toThrow(/sidecar was lost/i)
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-lost-1', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-lost-1', status: 'idle', statusSeq: expect.any(Number) }))
   })
 
   it('does not return to running when OpenCode emits a late message update after idle', async () => {
@@ -871,11 +914,12 @@ describe('OpenCode serve adapter: create + send', () => {
       raw: { type: 'message.updated', properties: { sessionID: 'ses_real_1' } },
     })
 
-    expect(events).toContainEqual({
+    expect(events).toContainEqual(expect.objectContaining({
       type: 'sdk.session.snapshot',
       sessionId: 'freshopencode-late-update',
       status: 'idle',
-    })
+      statusSeq: expect.any(Number),
+    }))
     expect(events.at(-1)).toEqual({
       type: 'sdk.session.changed',
       sessionId: 'freshopencode-late-update',
@@ -1034,7 +1078,7 @@ describe('OpenCode serve adapter: control', () => {
       await adapter.send?.('ses_child_1', { text: 'child turn' })
       expect(manager.promptAsync).toHaveBeenCalledWith('ses_child_1', expect.objectContaining({ parts: [{ type: 'text', text: 'child turn' }] }))
       manager._emit('ses_child_1', { kind: 'session.idle', sessionId: 'ses_child_1', raw: { type: 'session.idle', properties: { sessionID: 'ses_child_1' } } })
-      expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'ses_child_1', status: 'idle' })
+      expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'ses_child_1', status: 'idle', statusSeq: expect.any(Number) }))
     } finally {
       off()
     }
@@ -2042,8 +2086,8 @@ describe('OpenCode serve adapter: slash-command catalog + dispatch', () => {
     await expect(adapter.send?.('freshopencode-req-cmdfail', { text: '/review' }))
       .rejects.toThrow('→ 500 exploded')
 
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-cmdfail', status: 'running' })
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-cmdfail', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-cmdfail', status: 'running', statusSeq: expect.any(Number) }))
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-cmdfail', status: 'idle', statusSeq: expect.any(Number) }))
     expect(events.find((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toBeUndefined()
     expect(manager.promptAsync).not.toHaveBeenCalled()
   })
@@ -2065,14 +2109,14 @@ describe('OpenCode serve adapter: slash-command catalog + dispatch', () => {
     const send = adapter.send?.('freshopencode-req-busy', { text: '/review now' })
     await vi.waitFor(() => expect(manager.runCommand).toHaveBeenCalled())
 
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'running' })
-    expect(events).not.toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'running', statusSeq: expect.any(Number) }))
+    expect(events).not.toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'idle', statusSeq: expect.any(Number) }))
     expect(manager.onceIdle).not.toHaveBeenCalled()
 
     posted.resolve({ info: { id: 'msg_cmd_2', role: 'assistant', time: { created: 1, completed: 2 } }, parts: [] })
     await send
 
-    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'idle' })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-busy', status: 'idle', statusSeq: expect.any(Number) }))
     expect(events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toHaveLength(1)
     expect(manager.onceIdle).not.toHaveBeenCalled()
   })
