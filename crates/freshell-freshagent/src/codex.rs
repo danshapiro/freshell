@@ -3886,17 +3886,21 @@ fn build_codex_snapshot_json(
     // Wedged-sidecar deadman overlay: a deadman-flagged session whose fresh read still
     // shows the thread running OR starting reports `stuck` (never a fabricated
     // completion) — the Node lane's `withStuckOverlay` also overlays over `'starting'`
-    // (`adapter.ts:793-795`). The overlay touches ONLY the serialized status —
-    // `is_running` and the derived capabilities still follow the freshly-read provider
-    // status.
+    // (`adapter.ts:793-795`). PARITY RULE: the overlay applies BEFORE capability
+    // derivation — `normalize.ts:756`'s `isRunning` reads the POST-overlay status, so
+    // `is_running` and the derived capabilities below follow the OVERLAID wire status
+    // (a stuck session reports `send: true, interrupt: false`), byte-identical with
+    // the Node lane.
     let wire_status = if stuck && matches!(status, CodexStatus::Running | CodexStatus::Starting) {
         CodexStatus::Stuck
     } else {
         status
     };
-    // `isRunning` (`normalize.ts:756`): PURELY the freshly-read thread status --
-    // `status === 'running' || status === 'compacting'` -- and NOTHING else. The reference
-    // has no independently-tracked in-flight-turn fallback here.
+    // `isRunning` (`normalize.ts:756`): PURELY the wire thread status (post stuck
+    // overlay — the reference's `input.status` there is what `withStuckOverlay`
+    // already rewrote) -- `status === 'running' || status === 'compacting'` -- and
+    // NOTHING else. The reference has no independently-tracked in-flight-turn
+    // fallback here.
     //
     // FIX-1 (codex-first triage, `test/e2e-browser/specs/restore-matrix.spec.ts`'s
     // `test.fail` annotation): this used to also OR in `active_turn_present` (this
@@ -3913,7 +3917,7 @@ fn build_codex_snapshot_json(
     // [`FreshCodexState::get_snapshot`] -- for callers that still need the value for other
     // purposes); a snapshot is sendable whenever the freshly-read status says so, full
     // stop, matching the legacy adapter exactly.
-    let is_running = status == CodexStatus::Running;
+    let is_running = wire_status == CodexStatus::Running;
     let revision = thread.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
     let summary = thread
         .get("preview")
@@ -5650,6 +5654,10 @@ pub(crate) mod tests {
             snap["status"], "running",
             "freshly observed, not yet flagged"
         );
+        // Unflagged running capabilities are unchanged: send locked, interrupt
+        // available (`is_running` from the raw running status).
+        assert_eq!(snap["capabilities"]["send"], false);
+        assert_eq!(snap["capabilities"]["interrupt"], true);
 
         // Silence follows: the snapshot-armed window fires on its own.
         let collect = collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
@@ -5676,6 +5684,12 @@ pub(crate) mod tests {
             .expect("snapshot task")
             .expect("snapshot builds");
         assert_eq!(snap["status"], "stuck");
+        // Capability parity pin (Node `normalize.ts:756` derives `isRunning` from
+        // the OVERLAID `'stuck'` status, so `send: true, interrupt: false`): the
+        // REST snapshot's capabilities follow the wire status the card renders —
+        // recovery actions stay available, no useless interrupt.
+        assert_eq!(snap["capabilities"]["send"], true);
+        assert_eq!(snap["capabilities"]["interrupt"], false);
 
         // Overlay parity pin (Node `adapter.ts:793-795` overlays `stuck` over
         // `running` OR `starting`): a flagged session whose fresh read is

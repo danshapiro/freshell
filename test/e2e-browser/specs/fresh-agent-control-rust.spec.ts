@@ -1713,7 +1713,8 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       extraBehavior: { turnCompleteDelayMs: 3_000 },
       extraEnv: { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '8000' },
     })
-    try {      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
       const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
 
