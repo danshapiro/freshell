@@ -510,4 +510,52 @@ mod tests {
             "a.txt must be filtered out: {diff:?}"
         );
     }
+
+    // ── run_bounded helper failure machinery (task 1 review M1) ──────
+
+    #[tokio::test]
+    async fn read_capped_retains_prefix_to_cap_and_drains_overflow_to_eof() {
+        // 10_000 bytes exceeds the internal 8KiB read chunk, so a 9_000 cap
+        // boundary lands mid-chunk, exercising partial-chunk retention. The
+        // implementation has no overflow flag; its contract (module docs) is
+        // prefix retention up to the cap plus drain-to-EOF — the latter
+        // asserted via the exhausted slice reader.
+        let input: Vec<u8> = (0u32..10_000).map(|i| (i % 251) as u8).collect();
+        let cap = 9_000;
+        let mut reader: &[u8] = &input[..];
+        let kept = read_capped(&mut reader, cap).await.unwrap();
+        assert_eq!(kept.len(), cap);
+        assert_eq!(kept.as_slice(), &input[..cap]);
+        assert!(
+            reader.is_empty(),
+            "overflow bytes must be drained to EOF, not retained or fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_timeout_kills_and_reaps_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let output = run_bounded(
+            "sleep",
+            &["2"],
+            dir.path().to_str().unwrap(),
+            Duration::from_millis(50),
+            1_024,
+        )
+        .await
+        .unwrap();
+        assert!(output.timed_out);
+        assert!(output.exit_code.is_none());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        // Returning long before the 2s sleep could end proves the child was
+        // killed and reaped: an un-killed child would hold `wait()` (and its
+        // open pipes) pending until exit.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout kill+reap must return promptly, took {:?}",
+            started.elapsed()
+        );
+    }
 }
