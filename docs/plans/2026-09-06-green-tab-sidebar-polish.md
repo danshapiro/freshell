@@ -289,16 +289,18 @@ In the `preloadedState` object (after the `freshAgent` block ending at line 249)
       ]
 
       const store = createTestStore({ projects, repoIcons: {} })
-      const dispatchSpy = vi.spyOn(store, 'dispatch')
       renderSidebar(store, [])
 
       await act(async () => {
         vi.advanceTimersByTime(100)
       })
 
-      // The probe effect should dispatch fetchRepoIconMeta for the session's cwd
-      expect(dispatchSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'repoIcons/fetchMeta/pending' }),
+      // The probe effect dispatched the thunk, whose pending reducer set the
+      // entry to { status: 'loading' }. Verifying state (not dispatch spy)
+      // because Redux Toolkit's thunk middleware does not route internal
+      // pending actions through the replaced store.dispatch property.
+      expect(store.getState().repoIcons.byCwd['/home/user/myproject']).toEqual(
+        expect.objectContaining({ status: 'loading' }),
       )
     })
   })
@@ -337,6 +339,18 @@ Add after the `timestampTick` comparison:
   if (prev.repoIconInfo?.repoKey !== next.repoIconInfo?.repoKey) return false
   if (prev.repoIconInfo?.repoName !== next.repoIconInfo?.repoName) return false
   if (prev.repoIconInfo?.iconUrl !== next.repoIconInfo?.iconUrl) return false
+```
+
+Also add `repoPath` to both `areSidebarItemPropsEqual` and `isSessionItemEqual` — the `item.repoPath` field is now load-bearing for repo-icon lookup but is not currently compared by either function:
+
+In `areSidebarItemPropsEqual` (around line 1031, after `a.cwd === b.cwd &&`):
+```typescript
+    a.repoPath === b.repoPath &&
+```
+
+In `isSessionItemEqual` (around line 155, after `a.cwd === b.cwd &&`):
+```typescript
+    a.repoPath === b.repoPath &&
 ```
 
 **3d. Add `repoIcons` plumbing to the `Sidebar` component.** In the `Sidebar` function body (after the existing `useAppSelector` calls, around line 230), add:
@@ -381,7 +395,7 @@ Add the probe `useEffect` (after `sortedItems` is declared at line 374 and `busy
   }, [sortedItems, repoIconsOnTabs, repoIconsByCwd, dispatch])
 ```
 
-Note: `sortedItems` is derived from `useStableArray` and the `selectSortedItems` selector — it's the same array used to render the session list. The fallback chain is `item.cwd ?? item.repoPath` only (not `item.projectPath` — that is a display path, not a filesystem path, and using it would probe the repo-icon endpoint with non-repo paths).
+Note: `sortedItems` is derived from `useStableArray` and the `selectSortedItems` selector — it's the same array used to render the session list. The fallback chain is `item.repoPath ?? item.cwd` (preferring the canonical repo root over the session's working directory, matching the pane header's repo-root-first priority).
 
 **3e. Pass `repoIconInfo` to each `SidebarItem`** in the render loop (around line 946):
 
@@ -632,11 +646,21 @@ Add these tests to `test/unit/client/components/Sidebar.test.tsx`, inside the `d
               cwd: '/home/user/project',
               provider: 'codex',
             },
+            {
+              sessionId: sessionId('other-session'),
+              projectPath: '/home/user/project',
+              lastActivityAt: now,
+              title: 'Other active session',
+              cwd: '/home/user/project',
+            },
           ],
         },
       ]
+      // Two tabs: the active one is a shell (so the busy session is NOT active),
+      // and the second tab has the busy codex session with a pane terminal.
       const tabs: Array<{ id: string; mode: string; terminalId?: string; resumeSessionId?: string }> = [
-        { id: 'tab-other', mode: 'shell' },
+        { id: 'tab-active', mode: 'shell' },
+        { id: 'tab-busy', mode: 'codex', terminalId, resumeSessionId: busySid },
       ]
       const terminals: BackgroundTerminal[] = [
         {
@@ -645,7 +669,7 @@ Add these tests to `test/unit/client/components/Sidebar.test.tsx`, inside the `d
         },
       ]
       const store = createTestStore({
-        projects, tabs, terminals,
+        projects, tabs, terminals, activeTabId: 'tab-active',
         codexActivity: { byTerminalId: { [terminalId]: { terminalId, sessionId: 's1', phase: 'busy', lastActivityAt: 10 } } },
       })
       renderSidebar(store, terminals)
