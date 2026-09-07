@@ -101,7 +101,7 @@ export class RuntimeHarness {
     this.candidateSha = git(this.repoRoot, ['rev-parse', 'HEAD']).trim()
     this.testRoot = path.join('/tmp/frt', runId.slice(0, 12))
     this.evidenceDir = path.join(this.repoRoot, '.runtime-evidence', this.candidateSha, runId)
-    this.buildDir = path.join(this.repoRoot, '.runtime-build')
+    this.buildDir = path.join(this.repoRoot, '.runtime-build', this.runId)
     this.assertionsPath = path.join(this.evidenceDir, 'assertions.jsonl')
     this.lifecyclePath = path.join(this.evidenceDir, 'lifecycle.jsonl')
     this.incidentsDir = path.join(this.evidenceDir, 'incidents')
@@ -176,6 +176,10 @@ export class RuntimeHarness {
       try { await this.broker.close() } catch (error) { errors.push(`broker close: ${String(error)}`) }
       this.brokerStarted = false
     }
+    // Build copies are unique to this run, so retries/concurrent gates never
+    // overwrite an executable that another still-running container/process
+    // has mapped. Remove them only after every receipt-owned runtime stopped.
+    try { fs.rmSync(this.buildDir, { recursive: true, force: true }) } catch (error) { errors.push(`runtime build dir: ${String(error)}`) }
     const cleanup = {
       ok: errors.length === 0,
       errors,

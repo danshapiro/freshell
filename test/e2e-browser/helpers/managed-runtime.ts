@@ -130,7 +130,7 @@ export class ManagedRuntimeBrowserRig {
       '--features', 'managed-runtime-v1',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
-    const target = path.join(this.repoRoot, '.runtime-build', `freshell-server-managed-${this.runtime.candidateSha}`)
+    const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
     fs.copyFileSync(source, target)
     fs.chmodSync(target, 0o755)
     return target
