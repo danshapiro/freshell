@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -50,8 +51,14 @@ function createSourceFixture(root: string): {
   writeFileSync(path.join(clientDir, 'index.html'), '<!doctype html><title>Freshell</title>')
   writeExecutable(nodeBinary)
   mkdirSync(claudeSidecarDir, { recursive: true })
-  writeFileSync(path.join(claudeSidecarDir, 'index.mjs'), 'process.stdin.resume()\n')
+  writeFileSync(path.join(claudeSidecarDir, 'index.mjs'), [
+    "import { configureSession } from './session-settings.mjs'",
+    "import { probeModelCatalog } from './model-catalog.mjs'",
+    "console.log(JSON.stringify({ configureSession: typeof configureSession, probeModelCatalog: typeof probeModelCatalog }))",
+  ].join('\n') + '\n')
   writeFileSync(path.join(claudeSidecarDir, 'permission-channel.mjs'), 'export {}\n')
+  writeFileSync(path.join(claudeSidecarDir, 'session-settings.mjs'), 'export const configureSession = () => ({ staged: true })\n')
+  writeFileSync(path.join(claudeSidecarDir, 'model-catalog.mjs'), 'export const probeModelCatalog = () => [{ value: "staged-model" }]\n')
   writeFileSync(path.join(claudeSidecarDir, 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
   writeFileSync(path.join(claudeSidecarDir, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3 }))
   mkdirSync(path.join(claudeSidecarDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true })
@@ -159,7 +166,12 @@ describe('prepare-electron-runtime staging', () => {
     expect(readFileSync(path.join(outputRoot, 'bin', 'freshell-server'), 'utf8')).toContain('exit 0')
     expect(readFileSync(path.join(outputRoot, 'client', 'index.html'), 'utf8')).toContain('Freshell')
     expect(readFileSync(path.join(outputRoot, 'node', 'bin', 'node'), 'utf8')).toContain('exit 0')
-    expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'index.mjs'), 'utf8')).toContain('stdin')
+    expect(JSON.parse(execFileSync('node', [path.join(outputRoot, 'claude-sidecar', 'index.mjs')], { encoding: 'utf8' }))).toEqual({
+      configureSession: 'function',
+      probeModelCatalog: 'function',
+    })
+    expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'session-settings.mjs'), 'utf8')).toContain('staged')
+    expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'model-catalog.mjs'), 'utf8')).toContain('staged-model')
     expect(readFileSync(path.join(outputRoot, 'mcp', 'server.js'), 'utf8')).toContain('modelcontextprotocol')
     expect(readFileSync(path.join(outputRoot, 'node-client-runtime', 'keys.js'), 'utf8')).toContain('export')
     expect(receipt).toMatchObject({ severity: 'info', event: 'electron_runtime_prepared' })

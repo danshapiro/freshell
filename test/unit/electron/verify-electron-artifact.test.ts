@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -33,6 +33,8 @@ function writeArtifact(root: string, platform: 'darwin' | 'linux' | 'win32' = 'l
   writeFileSync(path.join(root, 'claude-sidecar', 'index.mjs'), 'process.stdin.resume()')
   writeFileSync(path.join(root, 'claude-sidecar', 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
   writeFileSync(path.join(root, 'claude-sidecar', 'package-lock.json'), JSON.stringify({ lockfileVersion: 3 }))
+  writeFileSync(path.join(root, 'claude-sidecar', 'session-settings.mjs'), 'export const configureSession = () => ({})\n')
+  writeFileSync(path.join(root, 'claude-sidecar', 'model-catalog.mjs'), 'export const probeModelCatalog = () => []\n')
   writeFileSync(path.join(root, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), '{}')
   mkdirSync(path.join(root, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk'), { recursive: true })
   mkdirSync(path.join(root, 'mcp', 'node_modules', 'zod'), { recursive: true })
@@ -77,6 +79,16 @@ describe('verify-electron-artifact', () => {
       writeFileSync(target, 'forbidden')
       expect(() => verifyElectronArtifact(root, 'linux', { probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }) })).toThrow(/forbidden/i)
     }
+  })
+
+  it('rejects an artifact missing a required Claude helper', () => {
+    const root = artifactRoot()
+    writeArtifact(root)
+    rmSync(path.join(root, 'claude-sidecar', 'model-catalog.mjs'))
+
+    expect(() => verifyElectronArtifact(root, 'linux', {
+      probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }),
+    })).toThrow(/missing required file.*model-catalog\.mjs/i)
   })
 
   it('rejects unapproved runtime files even when they are not forbidden names', () => {

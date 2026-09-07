@@ -356,6 +356,61 @@ fn claude_catalog_keeps_live_effort_choices_and_deduplicates_models() {
     assert!(normalize_claude_catalog(json!([{"displayName": "No id"}])).is_err());
 }
 
+/// The installed Electron runtime relocates the sidecar away from the source
+/// checkout. A relative SDK seam must therefore be resolved by the copied
+/// model-catalog helper, not by the source-tree helper baked into the binary.
+#[tokio::test]
+async fn claude_catalog_probe_uses_the_configured_sidecar_directory() {
+    let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let directory = tempfile::tempdir().expect("temporary sidecar directory");
+    let sidecar_entry = directory.path().join("index.mjs");
+    let catalog_entry = directory.path().join("model-catalog.mjs");
+    let sdk_name = "task-b-relocated-sdk.mjs";
+    let sdk_entry = directory.path().join(sdk_name);
+
+    std::fs::write(&sidecar_entry, "export {}\n").expect("write sidecar entry");
+    std::fs::copy(
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../freshell-claude-sidecar/model-catalog.mjs"
+        )),
+        &catalog_entry,
+    )
+    .expect("copy model catalog helper");
+    std::fs::write(
+        &sdk_entry,
+        r#"
+export function query() {
+  return {
+    supportedModels: async () => [{
+      value: 'task-b-relocated-model',
+      displayName: 'Task B Relocated Model',
+      supportedEffortLevels: ['medium'],
+      supportsAdaptiveThinking: true,
+    }],
+    close: async () => {},
+  }
+}
+"#,
+    )
+    .expect("write fake SDK module");
+
+    std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &sidecar_entry);
+    std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+    std::env::set_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE", format!("./{sdk_name}"));
+    let result = ClaudeCatalogProbe.probe(None).await;
+    std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+    std::env::remove_var("FRESHELL_CLAUDE_NODE");
+    std::env::remove_var("FRESHELL_CLAUDE_SDK_QUERY_MODULE");
+
+    let models = result.expect("configured sidecar catalog should be probed");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "task-b-relocated-model");
+    assert_eq!(models[0].display_name, "Task B Relocated Model");
+    assert_eq!(models[0].supported_effort_levels, vec!["medium"]);
+    assert!(models[0].supports_adaptive_thinking);
+}
+
 // ── route level (model-capabilities-router.ts ports) ─────────────────────────
 
 fn app_with_probe(probe: Arc<RecordingProbe>) -> Router {
