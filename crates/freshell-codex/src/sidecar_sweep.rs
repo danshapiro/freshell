@@ -73,6 +73,11 @@ const SWEEP_PROBE_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const KILL_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
+/// A force signal must also be followed by positive disappearance evidence;
+/// "SIGKILL sent" is not itself a reaping verdict.
+#[cfg(target_os = "linux")]
+const KILL_FORCE_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
 /// Poll interval while waiting for a signalled pid to go away.
 #[cfg(target_os = "linux")]
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -96,6 +101,10 @@ pub enum SweepOutcome {
     /// The record left `held` (claimed by a restore) during the probe
     /// window — skipped, NO signal sent.
     SkippedClaimedDuringSweep,
+    /// A verified kill attempt did not prove the entire owned tree empty.
+    /// The row is retained with `termination-unconfirmed` and MUST NOT be
+    /// reported as reaped.
+    TerminationUnconfirmed,
 }
 
 /// The decide-phase verdict the commit arm executes. Fieldless (Copy) so the
@@ -216,15 +225,27 @@ impl SidecarReconciler {
                 // the helper re-verifies (pid, starttime, cmdline)
                 // immediately before every signal.
                 let outcome = kill_verified_sidecar_tree(record).await;
-                tracing::info!(
-                    target: "freshell_codex::sidecar_sweep",
-                    ownership_id = %record.ownership_id,
-                    pid = record.pid,
-                    outcomes = ?outcome.outcomes,
-                    "sidecar_sweep_reaped: unclaimed sidecar tree reaped"
-                );
-                remove_pruned(&self.store, &record.ownership_id);
-                SweepOutcome::Reaped
+                if outcome.verified_empty(record) {
+                    tracing::info!(
+                        target: "freshell_codex::sidecar_sweep",
+                        ownership_id = %record.ownership_id,
+                        pid = record.pid,
+                        outcomes = ?outcome.outcomes,
+                        "sidecar_sweep_reaped: unclaimed sidecar tree verified empty"
+                    );
+                    remove_pruned(&self.store, &record.ownership_id);
+                    SweepOutcome::Reaped
+                } else {
+                    tracing::error!(
+                        target: "freshell_codex::sidecar_sweep",
+                        ownership_id = %record.ownership_id,
+                        pid = record.pid,
+                        outcomes = ?outcome.outcomes,
+                        "sidecar_sweep_termination_unconfirmed: ownership evidence retained; NOT reaped"
+                    );
+                    self.restore_unconfirmed_held(record);
+                    SweepOutcome::TerminationUnconfirmed
+                }
             }
             SweepDecision::RetainMidTurn
             | SweepDecision::RetainWriterHeld
@@ -254,6 +275,30 @@ impl SidecarReconciler {
                 }
             }
         }
+    }
+
+    /// A kill attempt can lose certainty after the record was fenced out of
+    /// `held`. Put the ownership evidence back so a later boot can retry or
+    /// an operator can inspect it. This is intentionally conservative: a
+    /// failed cleanup is never converted into absence by deleting its row.
+    fn restore_unconfirmed_held(&self, record: &CodexSidecarRecord) {
+        let mut retained = record.clone();
+        retained.state = SidecarRecordState::Retained {
+            reason: "termination-unconfirmed".to_string(),
+        };
+        retained.updated_at = unix_millis();
+        {
+            let mut held = self.held.lock().unwrap();
+            held.insert(retained.ownership_id.clone(), retained.clone());
+            let mut by_session = self.by_session.lock().unwrap();
+            if let Some(session_id) = &retained.session_id {
+                let ids = by_session.entry(session_id.clone()).or_default();
+                if !ids.iter().any(|id| id == &retained.ownership_id) {
+                    ids.push(retained.ownership_id.clone());
+                }
+            }
+        }
+        write_record_loudly(&self.store, &retained);
     }
 
     /// The TOCTOU commit gate: re-acquire `held`, confirm the record is
@@ -445,8 +490,11 @@ fn fd_opened_for_write(pid: i32, fd: &str) -> bool {
 pub enum KillOutcome {
     /// Gone (exited, reaped, or zombie) within the drain budget after SIGTERM.
     ExitedAfterSigterm,
-    /// Survived the SIGTERM drain budget; SIGKILL was sent once.
-    SigkilledAfterBudget,
+    /// Survived SIGTERM, then exited after a verified SIGKILL.
+    ExitedAfterSigkill,
+    /// A verified SIGKILL was sent but this exact incarnation was still
+    /// observed after the force-drain budget. Cleanup is unconfirmed.
+    SigkillSentStillAlive,
     /// Already gone before any signal was needed.
     AlreadyDead,
     /// Live pid whose evidence no longer matches its snapshot (pid reuse) —
@@ -468,6 +516,23 @@ pub enum KillOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KillTreeOutcome {
     pub outcomes: Vec<(u32, KillOutcome)>,
+}
+
+impl KillTreeOutcome {
+    /// True only when every captured pid has positive disappearance evidence
+    /// and no process still advertises this invocation's unique ownership tag.
+    /// The `/proc` scan is verification-only; it never authorizes a signal.
+    pub fn verified_empty(&self, record: &CodexSidecarRecord) -> bool {
+        let all_confirmed = self.outcomes.iter().all(|(_, outcome)| {
+            matches!(
+                outcome,
+                KillOutcome::ExitedAfterSigterm
+                    | KillOutcome::ExitedAfterSigkill
+                    | KillOutcome::AlreadyDead
+            )
+        });
+        all_confirmed && !ownership_tag_still_live(&record.ownership_id)
+    }
 }
 
 /// Re-verify (pid, starttime, cmdline); capture the pid's live descendant
@@ -595,7 +660,17 @@ async fn kill_verified_tree_linux(record: &CodexSidecarRecord) -> KillTreeOutcom
                 match verify_sidecar_identity(record) {
                     IdentityVerdict::Verified => {
                         signal_pid(root_pid, libc::SIGKILL);
-                        KillOutcome::SigkilledAfterBudget
+                        if poll_incarnation_gone(
+                            root_pid,
+                            record.starttime,
+                            KILL_FORCE_DRAIN_BUDGET,
+                        )
+                        .await
+                        {
+                            KillOutcome::ExitedAfterSigkill
+                        } else {
+                            KillOutcome::SigkillSentStillAlive
+                        }
                     }
                     IdentityVerdict::Dead => KillOutcome::ExitedAfterSigterm,
                     verdict @ (IdentityVerdict::Mismatch | IdentityVerdict::Unverifiable) => {
@@ -679,7 +754,13 @@ async fn kill_captured_descendant(snapshot: &PidSnapshot) -> KillOutcome {
         }
         SnapshotVerdict::Matches => {
             signal_pid(snapshot.pid, libc::SIGKILL);
-            KillOutcome::SigkilledAfterBudget
+            if poll_incarnation_gone(snapshot.pid, snapshot.starttime, KILL_FORCE_DRAIN_BUDGET)
+                .await
+            {
+                KillOutcome::ExitedAfterSigkill
+            } else {
+                KillOutcome::SigkillSentStillAlive
+            }
         }
     }
 }
@@ -762,6 +843,39 @@ async fn poll_incarnation_gone(pid: i32, starttime: u64, budget: Duration) -> bo
         }
         tokio::time::sleep(KILL_POLL_INTERVAL).await;
     }
+}
+
+#[cfg(target_os = "linux")]
+fn ownership_tag_still_live(ownership_id: &str) -> bool {
+    let needle = crate::durability::ownership_needle(ownership_id);
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        // Zombies do not count as a live workload; their pid cannot be reused
+        // until the parent reaps them.
+        if proc_starttime(pid).is_none() {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            continue;
+        };
+        if environ
+            .split(|&b| b == 0)
+            .any(|var| var == needle.as_bytes())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ownership_tag_still_live(_ownership_id: &str) -> bool {
+    true
 }
 
 #[cfg(test)]

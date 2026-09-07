@@ -94,7 +94,9 @@
     "contract:generate": "tsx port/contract/generate-ws-contract.ts",
     "test:port": "vitest run --config config/vitest/vitest.port.config.ts",
     "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
-    "test:sandbox": "bash scripts/sandbox-test.sh"
+    "test:sandbox": "bash scripts/sandbox-test.sh",
+    "test:runtime": "tsx scripts/testing/test-coordinator.ts run test:runtime",
+    "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

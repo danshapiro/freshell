@@ -37,6 +37,14 @@ describe('coordinator command matrix', () => {
     })
   })
 
+  it('coordinates the destructive runtime gate as one dedicated suite', () => {
+    expect(classifyCommand({ commandKey: 'test:runtime', forwardedArgs: ['gate', 'phase-1', '--require-live'] })).toEqual({
+      kind: 'coordinated',
+      suiteKey: 'runtime:gate',
+      phases: [{ runner: 'npm', script: 'test:runtime:raw', args: ['gate', 'phase-1', '--require-live'] }],
+    })
+  })
+
   it('keeps help/version requests on the Cargo lane instead of starting a broad test run', () => {
     expect(classifyCommand({ commandKey: 'test:server', forwardedArgs: ['--help'] })).toEqual({
       kind: 'passthrough',

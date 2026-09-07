@@ -5,6 +5,7 @@ export type SuiteKey =
   | 'default:test/unit/client'
   | 'rust:server'
   | 'rust:integration'
+  | 'runtime:gate'
 
 export type CommandKey =
   | 'test'
@@ -19,6 +20,7 @@ export type CommandKey =
   | 'test:integration'
   | 'test:client'
   | 'test:vitest'
+  | 'test:runtime'
 
 export const COMMAND_KEYS = [
   'test',
@@ -33,6 +35,7 @@ export const COMMAND_KEYS = [
   'test:integration',
   'test:client',
   'test:vitest',
+  'test:runtime',
 ] as const satisfies readonly CommandKey[]
 
 export type CoordinatorInput = {
@@ -48,7 +51,7 @@ export type UpstreamPhase =
   }
   | {
     runner: 'npm'
-    script: 'typecheck' | 'build' | 'test:balanced'
+    script: 'typecheck' | 'build' | 'test:balanced' | 'test:runtime:raw'
     args: string[]
   }
   | {
@@ -73,6 +76,10 @@ function isCompositeCommand(commandKey: CommandKey): commandKey is CompositeComm
 
 export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const args = stripLeadingArgSeparator(input.forwardedArgs)
+
+  if (input.commandKey === 'test:runtime') {
+    return coordinated('runtime:gate', [npmPhase('test:runtime:raw', args)])
+  }
 
   if (input.commandKey === 'test:vitest') {
     if (args.some((arg) => isRetiredServerConfigSelector(arg))) {
@@ -264,7 +271,7 @@ function vitestPhase(config: 'default' | 'direct', args: string[]): UpstreamPhas
   return { runner: 'vitest', config, args }
 }
 
-function npmPhase(script: 'typecheck' | 'build' | 'test:balanced', args: string[]): UpstreamPhase {
+function npmPhase(script: 'typecheck' | 'build' | 'test:balanced' | 'test:runtime:raw', args: string[]): UpstreamPhase {
   return { runner: 'npm', script, args }
 }
 
