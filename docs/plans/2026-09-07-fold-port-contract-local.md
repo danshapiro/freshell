@@ -34,7 +34,11 @@ separate `port-contract` CI workflow for that signal.
   still routes to the default config (which excludes port tests) — that is a
   pre-existing coordinator routing gap, not widened by this change. The
   `test:balanced` narrow path (`npm run test:balanced -- test/unit/port/foo`)
-  IS fixed here by extending `classifySuitePath`.
+  IS fixed here by extending `classifySuitePath`, but only on the local
+  (non-cloud) path: when `FRESHELL_VITEST_BACKEND=cloud` is set, the cloud
+  branch executes before `createStandardTestPlan` and dispatches client+server
+  to Cloud Run regardless of narrow targets — that cloud-dispatch narrow
+  targeting limitation is pre-existing and out of scope.
 
 **Goal:** Make every local `npm test` run include the WS port contract drift
 guard so wire-protocol drift between the React/TS frontend and the Rust server
@@ -261,6 +265,13 @@ Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test
 Expected: PASS — the standard-runner tests (including the new port assertions)
 pass, the coordinator matrix tests still pass, and the port contract freeze
 suite passes (proving the folded-in suite is green on this base).
+
+Note: the cloud-backend branch (`FRESHELL_VITEST_BACKEND=cloud`) is not
+exercised by these tests — it follows the established electron local-run
+pattern (sequential `execFileSync` with a vitest config) and the existing
+opt-in cloud integration tests (`scripts/test/cloud-vitest-integration.test.sh`,
+requiring cloud credentials) cover the dispatch mechanism. Adding a
+process-level test for the port block is out of scope for this change.
 
 - [ ] **Step 7: Commit the task**
 
