@@ -1,12 +1,27 @@
-# Managed runtime image contract
+# Managed runtime image and deployment contract
 
-Phase 1 deliberately does not route production coding agents through this
-runtime yet. The live gate uses an **exact `sha256:` Docker image identity** and
-bind-mounts only the compiled `freshell-session-host` binary plus one
-incarnation-scoped runtime directory. The supervisor's restricted Docker broker
-rejects floating images, extra mounts, networking, host PID namespace access,
-privilege escalation, and management sockets.
+Phase 2 uses a digest-pinned workload image based on Node 22.23.2 and an exact
+Claude Code 2.1.263 install. `provider-versions.json` is the machine-readable
+version receipt and `Dockerfile` must reproduce it; floating `latest` tags are
+not accepted by the supervisor or live gate.
 
-A production runtime image will be pinned and built here in the later provider
-integration phase. Do not replace the exact-image requirement with a tag at the
-supervisor boundary.
+The session-host binary is not baked into the image. The supervisor bind-mounts
+the exact candidate binary read-only at `/runtime/freshell-session-host`, so
+runtime evidence can independently hash the tested host and the tool image.
+Each soul receives a separate named provider volume mounted at
+`/home/freshell/provider`; workspaces and required Git common directories are
+canonical-path bind mounts. Supervisor registry/control state and Docker sockets
+are forbidden from workload mounts.
+
+The image currently runs as container UID 0 because host worktrees in the live
+gate may be owned by different unprivileged UIDs. This does **not** grant host
+root: every managed runtime has its own PID namespace, `CapDrop=ALL`,
+`no-new-privileges`, a read-only image root, bounded tmpfs, explicit CPU/memory/
+PID limits, and no Docker/control socket. This avoids broad host `chmod`/`chown`
+changes. A rootless UID-mapping profile can replace this once it is proven across
+Linux/WSL/macOS hosts.
+
+`compose.yaml` owns only the web and supervisor services. Dynamic session-host
+containers are intentionally outside Compose. Operational restart commands must
+name `web` or `supervisor`; do not use `docker compose down` for an ordinary
+Freshell restart, because that is a project-wide destruction primitive.

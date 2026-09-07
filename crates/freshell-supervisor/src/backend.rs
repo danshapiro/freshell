@@ -287,9 +287,27 @@ impl RuntimeBackend for DockerEngineBackend {
                 "{}:/home/freshell/provider:rw",
                 spec.provider_volume_name
             ));
+            for (index, source) in mounts.provider_bootstrap_files.iter().enumerate() {
+                binds.push(format!(
+                    "{}:/run/freshell-bootstrap/provider-{index}:ro",
+                    source.display()
+                ));
+            }
         }
+        let host_env: Vec<String> = [
+            "FRESHELL_RUNTIME_OUTPUT_RING_BYTES",
+            "FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES",
+        ]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| format!("{key}={value}"))
+        })
+        .collect();
         let body = json!({
             "Image": spec.image_ref,
+            "Env": host_env,
             "Cmd": [
                 "/runtime/freshell-session-host", "serve",
                 "--control-socket", "/run/freshell/host.sock",
@@ -726,6 +744,21 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             return Err(BackendError::OwnershipMismatch(
                 "provider home volume changed".into(),
             ));
+        }
+        for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
+            let source_text = source.to_string_lossy();
+            let destination = format!("/run/freshell-bootstrap/provider-{index}");
+            let found = mounts.iter().any(|mount| {
+                mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                    && mount.get("Destination").and_then(Value::as_str)
+                        == Some(destination.as_str())
+                    && mount.get("RW").and_then(Value::as_bool) == Some(false)
+            });
+            if !found {
+                return Err(BackendError::OwnershipMismatch(
+                    "provider bootstrap mount changed".into(),
+                ));
+            }
         }
     }
     Ok(())

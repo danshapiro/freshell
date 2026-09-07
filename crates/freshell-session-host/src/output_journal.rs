@@ -36,13 +36,22 @@ impl OutputJournal {
         terminal_id: String,
         stream_epoch: String,
     ) -> Result<Self, String> {
+        // Production defaults are the Phase 2 contract; test/deployment
+        // overrides are bounded and explicit so an operator can tune them
+        // without changing PTY semantics. Invalid/zero values fail back to
+        // the documented defaults rather than creating an unbounded journal.
+        let ring = configured_bytes(
+            "FRESHELL_RUNTIME_OUTPUT_RING_BYTES",
+            DEFAULT_RING_BYTES as u64,
+        ) as usize;
+        let spool = configured_bytes("FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES", DEFAULT_SPOOL_BYTES);
         Self::with_limits(
             state_dir,
             incarnation_id,
             terminal_id,
             stream_epoch,
-            DEFAULT_RING_BYTES,
-            DEFAULT_SPOOL_BYTES,
+            ring,
+            spool,
         )
     }
 
@@ -229,6 +238,14 @@ impl OutputJournal {
     fn previous_path(&self) -> PathBuf {
         self.state_dir.join("terminal-spool-previous.jsonl")
     }
+}
+
+fn configured_bytes(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0 && *value <= 1024 * 1024 * 1024)
+        .unwrap_or(default)
 }
 
 fn split_utf8(data: &str, max_bytes: usize) -> Vec<&str> {

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct TerminalMounts {
     pub workspace: PathBuf,
     pub git_common_dir: Option<PathBuf>,
+    pub provider_bootstrap_files: Vec<PathBuf>,
 }
 
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
@@ -37,9 +38,20 @@ pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, Stri
     if let Some(git) = &git_common_dir {
         reject_management_path(git)?;
     }
+    let mut provider_bootstrap_files = Vec::with_capacity(spec.provider_bootstrap_files.len());
+    for file in &spec.provider_bootstrap_files {
+        let source = std::fs::canonicalize(&file.source_path)
+            .map_err(|error| format!("provider bootstrap file: {error}"))?;
+        if !source.is_file() || source != PathBuf::from(&file.source_path) {
+            return Err("provider bootstrap file must be a canonical regular file".into());
+        }
+        reject_management_path(&source)?;
+        provider_bootstrap_files.push(source);
+    }
     Ok(TerminalMounts {
         workspace,
         git_common_dir,
+        provider_bootstrap_files,
     })
 }
 
