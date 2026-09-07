@@ -264,7 +264,12 @@ export class RuntimeHarness {
     const name = `freshell-p${this.phase}-supervisor-${this.runId.slice(0, 8)}-${scenarioId}-${randomUUID().slice(0, 8)}`
     const args = [
       'run', '-d', '--name', name,
-      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      // The supervisor is trusted control-plane test code. Rootful Docker
+      // preserves the host runner uid on bind mounts, so uid-0 with CapDrop=ALL
+      // cannot traverse this harness's 0700 testRoot or read its 0600 secret.
+      // Add only DAC_OVERRIDE to keep the same private-file contract portable;
+      // managed workload containers still use the stricter broker-enforced set.
+      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--cap-add', 'DAC_OVERRIDE', '--security-opt', 'no-new-privileges',
       '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
       '-v', `${this.testRoot}:${this.testRoot}:rw`,
       '-v', `${this.buildDir}:${this.buildDir}:ro`,
