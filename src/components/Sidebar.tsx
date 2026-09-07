@@ -1088,10 +1088,18 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
         <button
           onClick={onClick}
           className={cn(
-            'w-full flex items-center gap-2 px-2 py-3 md:py-2 rounded-md text-left transition-colors group',
+            'w-full flex items-center gap-2 px-2 py-3 md:py-2 rounded-md text-left transition-colors group border-l-2',
             isActiveTab
-              ? 'bg-muted'
-              : 'hover:bg-muted/50'
+              ? isBusy
+                ? 'bg-blue-100 dark:bg-blue-900/40 border-l-blue-500'
+                : item.hasTab
+                  ? 'bg-emerald-100 dark:bg-emerald-900/40 border-l-emerald-500'
+                  : 'bg-muted border-l-transparent'
+              : isBusy
+                ? 'bg-blue-50 dark:bg-blue-900/20 border-l-blue-500/70 hover:bg-blue-100 dark:hover:bg-blue-900/30'
+                : item.hasTab
+                  ? 'bg-emerald-50 dark:bg-emerald-900/20 border-l-emerald-500/70 hover:bg-emerald-100 dark:hover:bg-emerald-900/30'
+                  : 'hover:bg-muted/50 border-l-transparent'
           )}
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
