@@ -45,7 +45,7 @@ before the container hits its actual cap.
 
 **Goal:** Fresh installs of Freshell running inside Docker with the default private cgroup namespace report the container's real memory/pids limits on the host-pressure pane instead of the host's.
 
-**Architecture:** Localize the change to leaf resolution: `resolveCgroupLeaf` (and the Rust `resolve_cgroup_leaf`) gains the `cgroupRoot` it already indirectly serves, and for cgroup v2 returns the namespace-visible fs root (path `''`) when membership is `0::/` or when the resolved membership path does not exist under `cgroupRoot`. The memory and pids readers then read at that root through the exact same file names and fallback logic as today; the pids-constraint chain walk extends one extra depth (the fs-root node) for v2 only, which is a no-op on real hosts because the root node carries no limit files there.
+**Architecture:** Localize the change to leaf resolution: `resolveCgroupLeaf` (and the Rust `resolve_cgroup_leaf`) gains the `cgroupRoot` it already indirectly serves, and for cgroup v2 returns the namespace-visible fs root (path `''`) when membership is `0::/` or when the resolved membership path does not exist under `cgroupRoot`. Memberships the kernel encodes `../`-relative (a process seen from outside its cgroup namespace, per `cgroup_namespaces(7)`) likewise resolve to the fs root — the closest visible ancestor — and never read above the injected `cgroupRoot`. The memory and pids readers then read at that root through the exact same file names and fallback logic as today; the pids-constraint chain walk extends one extra depth (the fs-root node) for v2 only, which is a no-op on real hosts because the root node carries no limit files there.
 
 **Tech Stack:** TypeScript (Node/ESM) server readers + Vitest unit tests; Rust `freshell-platform` reader mirror + `freshell-server` `#[cfg(test)]` fixture tests (tempfile-built trees); the Darkforge full QA gate (`npm run check` + cargo fmt/clippy).
 
@@ -95,6 +95,7 @@ let nsV2Proc: string
 let nsV2Cgroup: string
 let nsMissingProc: string
 let nsRootCgroup: string
+let nsEscapeProc: string
 ```
 
 ```ts
@@ -121,6 +122,17 @@ let nsRootCgroup: string
   writeFile(nsRootCgroup, 'memory.max', '536870912\n')
   writeFile(nsRootCgroup, 'pids.max', '256\n')
   writeFile(nsRootCgroup, 'pids.current', '10\n')
+
+  // '../'-relative membership (cgroup_namespaces(7): a process seen from
+  // outside its cgroup namespace). The sibling 'escape' dir carries
+  // DIFFERENT limit values and sits ABOVE the injected cgroup root; the
+  // resolver must bind the namespace root (nsV2Cgroup), never the escape.
+  nsEscapeProc = path.join(tmp, 'ns-escape', 'proc')
+  writeFile(nsEscapeProc, 'self/cgroup', '0::/../escape\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/memory.current', '1\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/memory.max', '2\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/pids.max', '999\n')
+  writeFile(path.join(tmp, 'ns-v2'), 'escape/pids.current', '1\n')
 ```
 
 Add `writeFile(pidsRootCgroupProc, 'sys/kernel/threads-max', '4242\n')` next
@@ -187,6 +199,21 @@ In `describe('readPidsConstraint', ...)`:
   it('binds the fs-root node when the v2 membership path is not mounted', () => {
     expect(readPidsConstraint(nsMissingProc, nsRootCgroup)).toEqual({ current: 10, max: 256 })
   })
+
+  it('treats ../-relative v2 membership as the fs root, never above the injected root', () => {
+    expect(readPidsConstraint(nsEscapeProc, nsV2Cgroup)).toEqual({ current: 400, max: 512 })
+  })
+```
+
+In `describe('readCgroupMemory', ...)`:
+
+```ts
+  it('treats ../-relative v2 membership as the fs root, never above the injected root', () => {
+    expect(readCgroupMemory(nsV2Cgroup, nsEscapeProc)).toEqual({
+      limitBytes: 4294967296,
+      currentBytes: 1073741824,
+    })
+  })
 ```
 
 and retitle the existing root test (currently line 517) to
@@ -203,9 +230,11 @@ Expected: FAIL — exactly the three new tests whose titles contain `namespace
 root` run, and all three fail because `resolveCgroupLeaf` returns null for
 `0::/` today (`readCgroupMemory`/`readPidsConstraint` → null instead of the
 root-file values; `readPidsLimit` → the threads-max fallback 999999 instead
-of 512). Then run the full file without `-t` and confirm exactly six new
-failures — the three `0::/` value tests plus the three unmounted-path value
-tests — with everything else (including the three new fallback-shaped tests)
+of 512). Then run the full file without `-t` and confirm exactly eight new
+failures — the three `0::/` value tests, the three unmounted-path value
+tests, and the two `../`-relative tests (today the resolver returns the
+`../escape` leaf and binds the sibling dir's values 2/1 or {current: 1, max:
+999}) — with everything else (including the three fallback-shaped tests)
 still passing.
 
 - [ ] **Step 3: Add the minimal production implementation**
@@ -245,11 +274,12 @@ function safeIsDir(dirPath: string): boolean {
  * none of them (only statistics/pressure files), so reads resolved to the fs
  * root degrade to the same null/threads-max fallbacks as before there. Two
  * v2 shapes therefore resolve to the fs root (path ''): membership '0::/',
- * and a membership path that does not exist under <cgroupRoot> (a mount
- * rooted at the container's cgroup while /proc still reports the host path).
- * cgroup v1 is unchanged: v1 has no namespace membership rewrite and the v1
- * fs root DOES carry (garbage-sentinel) limit files, so v1 never resolves to
- * the fs root.
+ * a membership path that does not exist under <cgroupRoot> (a mount rooted
+ * at the container's cgroup while /proc still reports the host path), and a
+ * '../'-relative membership (out-of-namespace — reads at the closest visible
+ * ancestor, never above <cgroupRoot>). cgroup v1 is unchanged: v1 has no
+ * namespace membership rewrite and the v1 fs root DOES carry
+ * (garbage-sentinel) limit files, so v1 never resolves to the fs root.
  */
 type CgroupLeaf = { version: 'v1' | 'v2'; path: string } | null
 
@@ -262,10 +292,13 @@ function resolveCgroupLeaf(procRoot: string, v1Controller: string, cgroupRoot: s
   if (v2) {
     const leaf = v2.slice('0::'.length).replace(/^\/+/, '')
     // '' is a cgroup-namespace root; a membership path absent from the mounted
-    // cgroupfs is the same namespace shape seen through /proc. Both read at
-    // the fs root; on a real non-namespaced host the root has no limit files,
-    // so the readers' null fallbacks fire exactly as before.
-    if (leaf === '' || !safeIsDir(path.join(cgroupRoot, leaf))) {
+    // cgroupfs is the same namespace shape seen through /proc; a '../'-relative
+    // membership is the kernel's encoding for a cgroup outside the visible
+    // namespace (cgroup_namespaces(7)) and must never resolve ABOVE the
+    // injected root. All three read at the fs root — the closest visible
+    // ancestor; on a real non-namespaced host the root has no limit files, so
+    // the readers' null fallbacks fire exactly as before.
+    if (leaf === '' || leaf.split('/').includes('..') || !safeIsDir(path.join(cgroupRoot, leaf))) {
       return { version: 'v2', path: '' }
     }
     return { version: 'v2', path: leaf }
@@ -477,6 +510,37 @@ In `crates/freshell-server/src/host_stats.rs`, add one test after
             readers::read_pids_constraint(&proc_root, &cgroup_root),
             Some(readers::PidsConstraint { current: 10, max: 256 })
         );
+
+        // '../'-relative membership (cgroup_namespaces(7): out-of-namespace):
+        // a sibling dir ABOVE the injected root carries different limits; the
+        // resolver must bind the namespace root, never the escape.
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("cgroup");
+        let escape = tmp.path().join("escape");
+        write_rel(&proc_root, "self/cgroup", "0::/../escape\n");
+        write_rel(&cgroup_root, "memory.current", "1073741824\n");
+        write_rel(&cgroup_root, "memory.max", "4294967296\n");
+        write_rel(&cgroup_root, "pids.max", "512\n");
+        write_rel(&cgroup_root, "pids.current", "400\n");
+        write_rel(&escape, "memory.current", "1\n");
+        write_rel(&escape, "memory.max", "2\n");
+        write_rel(&escape, "pids.max", "999\n");
+        write_rel(&escape, "pids.current", "1\n");
+        assert_eq!(
+            readers::read_cgroup_memory(&cgroup_root, &proc_root),
+            Some(readers::CgroupMemory {
+                limit_bytes: Some(4294967296),
+                current_bytes: 1073741824,
+            })
+        );
+        assert_eq!(
+            readers::read_pids_constraint(&proc_root, &cgroup_root),
+            Some(readers::PidsConstraint {
+                current: 400,
+                max: 512,
+            })
+        );
     }
 ```
 
@@ -495,7 +559,9 @@ Run: `cargo test -p freshell-server host_stats_cgroup_v2_namespace_root_reads`
 
 Expected: FAIL because `resolve_cgroup_leaf` returns `None` for `0::/` today
 (first assertion block: `read_cgroup_memory` returns `None` instead of the
-`Some(...)` root values).
+`Some(...)` root values; the last, `../`-relative block also fails today —
+the old resolver returns the `../escape` leaf and binds the sibling dir's
+`2`/`{1, 999}` values).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
