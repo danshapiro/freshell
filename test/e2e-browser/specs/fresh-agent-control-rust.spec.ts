@@ -1235,7 +1235,16 @@ function projectSlugOf(cwd: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
-async function bootCodexLane(page: Page): Promise<{
+async function bootCodexLane(
+  page: Page,
+  options?: {
+    // Per-test behavior knobs merged INTO FAKE_CODEX_APP_SERVER_BEHAVIOR
+    // (e.g. turnCompleteDelayMs to wedge a mid-flight turn).
+    extraBehavior?: Record<string, unknown>
+    // Per-test server env (e.g. FRESHELL_FRESHCODEX_QUIET_WINDOW_MS).
+    extraEnv?: Record<string, string>
+  },
+): Promise<{
   server: RustServer
   info: TestServerInfo
   harness: TestHarness
@@ -1258,7 +1267,9 @@ async function bootCodexLane(page: Page): Promise<{
           // REAL per-thread turn recording (fixture opt-in): thread/read
           // answers the recorded history, so forks provably diverge at the pin.
           recordTurns: true,
+          ...(options?.extraBehavior ?? {}),
         }),
+        ...(options?.extraEnv ?? {}),
       },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
     })
@@ -1277,6 +1288,18 @@ async function bootCodexLane(page: Page): Promise<{
 
 function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
+}
+
+/** Read a freshAgent session's status from the harness store — the exact
+ * `agentSession.status` the stuck card's `effectiveStatus` renders from. */
+async function readFreshAgentSessionStatus(
+  harness: TestHarness,
+  sessionId: string,
+): Promise<string | null> {
+  const state = await harness.getState()
+  const sessions = state?.freshAgent?.sessions ?? {}
+  const session = Object.values(sessions).find((s: any) => s?.sessionId === sessionId) as any
+  return session?.status ?? null
 }
 
 /**
@@ -1615,6 +1638,102 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         }, { timeout: 30_000, message: 'post-restart resume+read evidence for BOTH source and child' })
         .toBe(true)
       sourceRestartWs.close()
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // Wedged-sidecar deadman (r47n): the fake's turnCompleteDelayMs keeps the
+  // process alive but the turn/completed broadcast effectively never lands
+  // (3.6e6 ms), so the quiet window must surface the stuck state with recovery
+  // instead of an eternal spinner.
+  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page, {
+      extraBehavior: { turnCompleteDelayMs: 3_600_000 },
+      extraEnv: { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '4000' },
+    })
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+      const threadId = ((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId ?? '') as string
+      expect(threadId, 'freshcodex thread id materialized before the send').toBeTruthy()
+
+      await sendComposerText(page, 'run a turn that will wedge')
+
+      // Within the bound (2s < 4s window, measured from the send — the
+      // deadman arms when the send's turn/start RPC lands): no stuck state.
+      await page.waitForTimeout(2000)
+      await expect(stuckAlert).toHaveCount(0)
+
+      // Past the bound: the stuck notice surfaces (role=alert), and the pane
+      // stops asserting "working" — the session status the card reads is now
+      // 'stuck', never a fabricated idle/turn-complete.
+      await expect(stuckAlert, 'stuck notice after the quiet window').toBeVisible({ timeout: 25_000 })
+      await expect
+        .poll(
+          () => readFreshAgentSessionStatus(lane.harness, threadId),
+          { timeout: 15_000, message: 'session status stops asserting busy (stuck)' },
+        )
+        .toBe('stuck')
+
+      // The wedge is a live, in-flight turn: exactly one recorded turn
+      // renders (user + assistant rows) and nothing ever completes it.
+      await expect(
+        paneRoot.locator('article[data-turn-index]'),
+        'exactly one wedged turn renders (user+assistant rows), alive but silent',
+      ).toHaveCount(2, { timeout: 30_000 })
+
+      // Recovery: restart the sidecar and resume the durable thread. Truthful
+      // terminal state = idle with transcript intact, or idle with the explicit
+      // memory-loss alert (both are acceptance-valid).
+      await stuckAlert.getByRole('button', { name: /restart sidecar/i }).click()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await expect(stuckAlert).toHaveCount(0)
+      const opsAfter = readCodexOps(lane.opLogPath).map((op: any) => op.method)
+      const resumed = opsAfter.includes('thread/resume')
+      const respawnedFresh = opsAfter.filter((m: string) => m === 'thread/start').length >= 2
+      expect(resumed || respawnedFresh).toBe(true)
+      if (respawnedFresh && !resumed) {
+        // Respawn-as-new surfaces through the existing restore-error alert
+        // machinery (getRestoreErrorMessage, FreshAgentView.tsx).
+        await expect(paneRoot.getByRole('alert').filter({ hasText: /cannot be resumed|no longer has memory/i })).toBeVisible()
+      }
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page, {
+      extraBehavior: { turnCompleteDelayMs: 3_000 },
+      extraEnv: { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '8000' },
+    })
+    try {      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+
+      await sendComposerText(page, 'a slow but healthy turn')
+      const sentAt = Date.now()
+
+      // The turn runs and renders (user + assistant rows = exactly one
+      // recorded turn) and completes within the 8s window: the pane returns
+      // to a truthful idle (turn/completed at ~3s disarms the deadman).
+      await expect(
+        paneRoot.locator('article[data-turn-index]'),
+        'the slow turn renders and is tracked',
+      ).toHaveCount(2, { timeout: 30_000 })
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+
+      // ... and stays stuck-free PAST the bound (measured from the send): a
+      // completed turn must never fire the deadman — an alert here would be
+      // exactly the false positive the bound exists to prevent.
+      await page.waitForTimeout(Math.max(0, 11_000 - (Date.now() - sentAt)))
+      await expect(stuckAlert).toHaveCount(0)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
