@@ -105,7 +105,7 @@ describe('TerminalCreateStagger', () => {
     }
   })
 
-  it('clear drops all pending sends', () => {
+  it('clear drops all pending sends and resets lastSendAt', () => {
     const stagger = new TerminalCreateStagger()
     const sent: string[] = []
     stagger.enqueue(() => { sent.push('a') })
@@ -116,6 +116,10 @@ describe('TerminalCreateStagger', () => {
     stagger.clear()
     vi.advanceTimersByTime(1000)
     expect(sent).toEqual(['a'])
+    // After clear(), lastSendAt is reset — next send goes immediately
+    stagger.enqueue(() => { sent.push('d') })
+    vi.advanceTimersByTime(0)
+    expect(sent).toEqual(['a', 'd'])
   })
 
   it('resetForTests clears pending and resets lastSendAt', () => {
@@ -196,6 +200,7 @@ export class TerminalCreateStagger {
       clearTimeout(this.timer)
       this.timer = null
     }
+    this.lastSendAt = 0
   }
 
   resetForTests(): void {
@@ -225,7 +230,7 @@ export function getTerminalCreateStagger(): TerminalCreateStagger {
 }
 
 export function resetTerminalCreateStaggerForTests(): void {
-  singleton?.resetForTests()
+  singleton = null
 }
 ```
 
@@ -350,35 +355,31 @@ function isTerminalCreateMessage(msg: unknown): boolean {
 private terminalCreateStagger: TerminalCreateStagger = getTerminalCreateStagger()
 ```
 
-4. Add a `sendCreateNow` helper method (near `sendNow` at line 946):
+4. Add a `sendCreateNow` helper method (near `sendNow` at line 946). This method filters by message type — only `terminal.create` is staggered; `freshAgent.create` and other create-type messages bypass the stagger and send immediately:
+
 ```typescript
 private sendCreateNow(msg: unknown) {
-  this.terminalCreateStagger.enqueue(() => this.sendNow(msg))
+  if (isTerminalCreateMessage(msg)) {
+    this.terminalCreateStagger.enqueue(() => this.sendNow(msg))
+  } else {
+    this.sendNow(msg)
+  }
 }
 ```
 
-5. Route `terminal.create` sends through the stagger. At each create-related `sendNow` call site, replace `this.sendNow(msg)` with a check:
+5. Route create-related sends through the stagger. At each create-related `sendNow` call site, replace `this.sendNow(msg)` with `this.sendCreateNow(msg)`. Since `sendCreateNow` internally checks `isTerminalCreateMessage`, it is a safe drop-in: `terminal.create` messages are staggered; all others (including `freshAgent.create`) send immediately.
 
-**Line 852** (direct-ready path in `send`): the message could be any type. Replace:
-```typescript
-      this.sendNow(msg)
-```
-with:
-```typescript
-      if (isTerminalCreateMessage(msg)) {
-        this.sendCreateNow(msg)
-      } else {
-        this.sendNow(msg)
-      }
-```
+**Line 852** (direct-ready path in `send`): replace `this.sendNow(msg)` with `this.sendCreateNow(msg)`.
 
-**Line 210** (`setReconcilePendingCreates`): these are always create messages from `heldCreates`. Replace `this.sendNow(msg)` with `this.sendCreateNow(msg)`.
+**Line 210** (`setReconcilePendingCreates`): replace `this.sendNow(msg)` with `this.sendCreateNow(msg)`.
 
-**Line 231** (`clearReconcileCreateHold`): these are always create messages. Replace `this.sendNow(msg)` with `this.sendCreateNow(msg)`.
+**Line 231** (`clearReconcileCreateHold`): replace `this.sendNow(msg)` with `this.sendCreateNow(msg)`.
 
-**Line 320** (ready handler non-reconcile flush): these are always create messages from `preReadyCreateQueue`. Replace `this.sendNow(createMsg)` with `this.sendCreateNow(createMsg)`.
+**Line 320** (ready handler non-reconcile flush): replace `this.sendNow(createMsg)` with `this.sendCreateNow(createMsg)`.
 
-**Line 356** (reconnect re-send): these are always create messages from `inFlightCreates`. Replace `this.sendNow(entry.message)` with `this.sendCreateNow(entry.message)`.
+**Line 356** (reconnect re-send): replace `this.sendNow(entry.message)` with `this.sendCreateNow(entry.message)`.
+
+Non-create paths (line 341 pendingMessages, line 510 hello, line 750/813 ping, line 898 terminal.interest) keep calling `this.sendNow(...)` directly.
 
 6. Clear the stagger on each `ready` frame. At the beginning of the `ready` block (line 263, right after `if (msg.type === 'ready') {`):
 ```typescript
@@ -403,7 +404,9 @@ The stagger affects ALL tests that send `terminal.create` messages through the w
 
 Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client-protocol-reload.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
 
-Expected: PASS. Tests that assert `terminal.create` sends arrive immediately may need to advance fake timers by 450ms to flush the stagger. If any existing test fails because it expects an immediate `terminal.create` but the stagger delays it, advance the test's fake timers by `STAGGER_INTERVAL_MS` (450) to flush the send. Do NOT reduce the stagger interval or disable the stagger for tests — the test must accommodate the real behavior.
+Expected: PASS. Tests that assert `terminal.create` sends arrive immediately may need to advance fake timers by 450ms to flush the stagger. Do NOT reduce the stagger interval or disable the stagger for tests — the test must accommodate the real behavior.
+
+**Important:** Approximately 6 existing tests in `test/unit/client/lib/ws-client.test.ts` send `terminal.create` through the real `WsClient` and assert on `MockWebSocket.instances[N].sent` immediately after `await p` (which flushes microtasks only). The stagger's first send uses `setTimeout(0)` (a macrotask), which does not fire on `await`. These tests need `vi.advanceTimersByTime(0)` (for the first create) or `vi.advanceTimersByTime(450 * N)` (for N creates) added after `await p` and before asserting on `.sent`. The specific tests are: "connect-time queued create flushes after ready" (~line 137), "connect failure then ready flush sends queued create exactly once" (~line 153), "reconnect with unknown terminalId resends in-flight create" (~line 193), "does not resend a create after terminal.created already cleared it" (~line 212), "evicted queued creates" (~line 239), "resends an in-flight create after reconnect" (~line 271). Line numbers may drift; the implementer should identify all tests that send `terminal.create` and assert on `.sent` without advancing timers.
 
 - [ ] **Step 7: Commit the task**
 
@@ -440,32 +443,38 @@ Fixes kata rf0v."
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Create `test/e2e-browser/specs/restore-create-stagger-rust.spec.ts` following the patterns from `create-protection-restore-storm-rust.spec.ts` and `restore-matrix.spec.ts`:
+Create `test/e2e-browser/specs/restore-create-stagger-rust.spec.ts` following the patterns from `create-protection-restore-storm-rust.spec.ts` and `restore-matrix.spec.ts`. Use `RustServer` from `../helpers/rust-server.js` (NOT `createE2eServerHandle` which does not exist). Register the spec in `RUST_ONLY_SPECS` in `test/e2e-browser/playwright.config.ts`. Seed `panes.defaultNewPane: 'shell'` in the server config so tab-add creates shell terminals directly (the default `'ask'` mode creates picker panes with zero `terminal.create` sends).
 
 ```typescript
 // test/e2e-browser/specs/restore-create-stagger-rust.spec.ts
-import { test, expect } from '@playwright/test'
-import { createE2eServerHandle } from '../helpers/e2e-server'
+import { test, expect } from '../helpers/fixtures.js'
+import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { TestHarness } from '../helpers/test-harness.js'
 // ... copy per-spec helpers per repo convention (collectLeaves, allLeafTerminalIds,
 //     selectShellIfPickerShowing) from existing specs
 
 test.describe('restore create stagger', () => {
   test('multiple persisted terminal panes space terminal.create sends >=400ms on reload', async () => {
-    // 1. Start an ephemeral Rust server (createE2eServerHandle, rust-only)
-    // 2. Open browser, connect, create 5+ terminal panes (shell mode for simplicity)
-    // 3. Persist state (flush localStorage)
-    // 4. Restart the Rust server (so panes have no live terminals)
-    // 5. Reload the page
-    // 6. Wait for all panes to anchor (allLeafTerminalIds)
-    // 7. Read getSentWsMessagesWithTimestamps()
-    // 8. Filter for type === 'terminal.create'
-    // 9. Assert: for every consecutive pair, timestamp[i+1] - timestamp[i] >= 400
-    // 10. Assert: all panes eventually anchor (no wedge)
+    // 1. Start an ephemeral Rust server: new RustServer({ ... }) with server.start()
+    // 2. Seed config: setupHome callback sets config.json with
+    //    { version: 1, settings: { panes: { defaultNewPane: 'shell' } } }
+    //    (matching create-protection-restore-storm-rust.spec.ts:98-105)
+    // 3. Open browser, connect, create 5+ terminal panes via tab-add
+    // 4. Dismiss the boot tab's picker pane via selectShellIfPickerShowing
+    // 5. Persist state (flush localStorage)
+    // 6. Restart the Rust server (server.restartAbrupt()) so panes have no live terminals
+    // 7. Reload the page
+    // 8. Wait for all panes to anchor (allLeafTerminalIds)
+    // 9. Read getSentWsMessagesWithTimestamps()
+    // 10. Filter for type === 'terminal.create'
+    // 11. Assert: for every consecutive pair, timestamp[i+1] - timestamp[i] >= 400
+    // 12. Assert: all panes eventually anchor (no wedge)
   })
 })
-```
 
-The implementer should follow the existing spec patterns: use `createE2eServerHandle` for an ephemeral Rust server, `TestHarness` for the browser interaction, and per-spec-copied helpers (`collectLeaves`, `allLeafTerminalIds`, `selectShellIfPickerShowing`) per the repo convention (specs copy helpers, don't import across spec boundaries).
+// Also add to RUST_ONLY_SPECS in test/e2e-browser/playwright.config.ts:
+//   /restore-create-stagger-rust\.spec\.ts$/
+```
 
 Also modify `src/lib/test-harness.ts` to add timestamps:
 
@@ -490,7 +499,11 @@ const recordSentWsMessage = (msg: unknown) => {
 ```
 
 ```typescript
-// Line 188: add implementation (after getSentWsMessages)
+// Line 188: modify getSentWsMessages to strip __sentAt (backward compatible)
+    getSentWsMessages: () => sentWsMessages.map((msg) => {
+      const { __sentAt, ...rest } = msg as { __sentAt?: number }
+      return rest
+    }),
     getSentWsMessagesWithTimestamps: () => [...sentWsMessages] as Array<{ __sentAt?: number; type?: string; requestId?: string }>,
 ```
 
