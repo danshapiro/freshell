@@ -966,16 +966,16 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     await expect(freshcodexRoot.locator('.fresh-agent-turn-header', { hasText: 'Freshcodex' })).toHaveCount(1)
     await expect(freshcodexRoot.locator('[data-turn-continuation="true"]')).toHaveCount(1)
-    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
-    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     // The status strip shrank the transcript viewport by one row, so the
-    // "Jump to your message" glom chip overlays the top band where the
-    // Thinking toggle's click point lands. The chip re-derives from scroll
-    // position on every scroll-into-view, so mouse dismissing it is racy
-    // (Playwright re-scrolls to the toggle and the chip returns on top of the
-    // click point). Activate the toggle by keyboard Enter instead: focus +
+    // "Jump to your message" glom chip overlays the top band where these
+    // toggles' click points land. The chip re-derives from scroll position on
+    // every scroll-into-view, so mouse dismissing it is racy (Playwright
+    // re-scrolls to the toggle and the chip returns on top of the click
+    // point). Activate both toggles by keyboard Enter instead: focus +
     // keypress targets the element, not the point, so the overlay cannot
     // intercept the activation.
+    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).press('Enter')
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()
