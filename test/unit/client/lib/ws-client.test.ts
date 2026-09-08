@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WsClient, getWsClient, resetWsClientForTests } from '../../../../src/lib/ws-client'
 import { WS_PROTOCOL_VERSION } from '../../../../shared/ws-protocol'
+import { resetTerminalCreateStaggerForTests } from '@/lib/terminal-create-stagger'
 
 class MockWebSocket {
   static OPEN = 1
@@ -142,6 +143,7 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p
+    vi.advanceTimersByTime(0)
     const flushed = MockWebSocket.instances[0].sent.map((x) => JSON.parse(x))
     expect(flushed).toContainEqual(expect.objectContaining({
       type: 'terminal.create',
@@ -163,6 +165,7 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[1]._open()
     MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
+    vi.advanceTimersByTime(0)
 
     const sent = MockWebSocket.instances[1].sent.map((x) => JSON.parse(x))
     expect(sent.filter((m) => m.type === 'terminal.create' && m.requestId === 'queued-fail-then-ready')).toHaveLength(1)
@@ -198,12 +201,14 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
+    vi.advanceTimersByTime(0)
     MockWebSocket.instances[0]._close(1006, 'drop-after-create')
 
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
     MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
+    vi.advanceTimersByTime(0)
 
     const sent = MockWebSocket.instances[1].sent.map((x) => JSON.parse(x))
     expect(sent.filter((m) => m.type === 'terminal.create' && m.requestId === 'reconnect-unknown-1')).toHaveLength(1)
@@ -217,6 +222,7 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
+    vi.advanceTimersByTime(0)
     MockWebSocket.instances[0]._message({
       type: 'terminal.created',
       requestId: 'created-before-reconnect',
@@ -247,6 +253,7 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
+    vi.advanceTimersByTime(0)
 
     const firstCreates = MockWebSocket.instances[0].sent
       .map((x) => JSON.parse(x))
@@ -260,6 +267,7 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[1]._open()
     MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
+    vi.advanceTimersByTime(0)
 
     const secondCreates = MockWebSocket.instances[1].sent
       .map((x) => JSON.parse(x))
@@ -280,12 +288,14 @@ describe('WsClient.connect', () => {
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
+    vi.advanceTimersByTime(0)
     MockWebSocket.instances[0]._close(1006, 'drop-after-create')
 
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
     MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
+    vi.advanceTimersByTime(0)
 
     const secondCreates = MockWebSocket.instances[1].sent
       .map((x) => JSON.parse(x))
@@ -754,5 +764,165 @@ describe('WsClient.sendTerminalInterest', () => {
       .filter((m) => m.type === 'terminal.interest')
     expect(interest).toHaveLength(1)
     expect(interest[0].revision).toBe(1)
+  })
+})
+
+describe('WsClient terminal.create stagger', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    MockWebSocket.instances = []
+    // @ts-expect-error - test override
+    globalThis.WebSocket = MockWebSocket
+    localStorage.setItem('freshell.auth-token', 't')
+    ;(window as any).setTimeout = globalThis.setTimeout
+    ;(window as any).clearTimeout = globalThis.clearTimeout
+    resetTerminalCreateStaggerForTests()
+  })
+
+  afterEach(() => {
+    resetWsClientForTests()
+    vi.clearAllTimers()
+    vi.useRealTimers()
+  })
+
+  const typesOf = (instance: MockWebSocket) =>
+    instance.sent.map((x) => JSON.parse(x))
+  const createsOf = (instance: MockWebSocket) =>
+    typesOf(instance).filter((m: any) => m.type === 'terminal.create')
+
+  it('paces terminal.create sends 450ms apart when multiple are ready', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+
+    c.send({ type: 'terminal.create', requestId: 'tc-1', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'tc-2', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'tc-3', mode: 'shell' } as any)
+
+    vi.advanceTimersByTime(0)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1'])
+
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1', 'tc-2'])
+
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1', 'tc-2', 'tc-3'])
+  })
+
+  it('non-create messages bypass the stagger (sent immediately)', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+
+    c.send({ type: 'terminal.create', requestId: 'tc-1', mode: 'shell' } as any)
+    c.send({ type: 'terminal.input', terminalId: 'term-x', data: 'ls\n' } as any)
+
+    // terminal.input bypasses the stagger — sent immediately, before the
+    // terminal.create's setTimeout(0) fires.
+    const inputsBeforeAdvance = typesOf(MockWebSocket.instances[0])
+      .filter((m: any) => m.type === 'terminal.input')
+    expect(inputsBeforeAdvance).toHaveLength(1)
+
+    vi.advanceTimersByTime(0)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1'])
+  })
+
+  it('clears the stagger on ready (no stale sends from dead socket)', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+
+    // Send 2 creates: 1st at t=0, 2nd at t=450 — lastSendAt is set to 450.
+    c.send({ type: 'terminal.create', requestId: 'tc-1', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'tc-2', mode: 'shell' } as any)
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1', 'tc-2'])
+
+    // Disconnect: onclose clears the stagger (lastSendAt → 0).
+    MockWebSocket.instances[0]._close(1006, 'drop')
+
+    // Reconnect: ready clears the stagger again (belt-and-suspenders).
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    // The reconnect replay re-sends tc-1 then tc-2 through the fresh stagger.
+    // Because lastSendAt was reset to 0, tc-1 sends immediately (setTimeout(0)).
+    // Without the clear, lastSendAt=450 and Date.now()=450, so elapsed=0 and
+    // tc-1 would wait 450ms instead of sending immediately.
+    vi.advanceTimersByTime(0)
+    const sentAfter0 = createsOf(MockWebSocket.instances[1])
+    expect(sentAfter0).toHaveLength(1)
+    expect(sentAfter0[0].requestId).toBe('tc-1')
+
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[1]).map((m) => m.requestId)).toEqual(['tc-1', 'tc-2'])
+  })
+
+  it('clears the stagger on disconnect — stale timer does NOT fire on replacement socket before ready', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+
+    // Send 2 creates: 1st sends via setTimeout(0), 2nd arms a 450ms timer.
+    c.send({ type: 'terminal.create', requestId: 'tc-1', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'tc-2', mode: 'shell' } as any)
+    vi.advanceTimersByTime(0)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1'])
+
+    // Disconnect: onclose clears the stagger, cancelling tc-2's 450ms timer.
+    MockWebSocket.instances[0]._close(1006, 'drop')
+
+    // Open a replacement socket but do NOT deliver ready yet.
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+
+    // Advance past the 450ms window — the stale timer from the dead socket
+    // would fire here if the onclose clear hadn't cancelled it.
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[1])).toHaveLength(0)
+
+    // Now deliver ready — the in-flight creates replay through the fresh stagger.
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    vi.advanceTimersByTime(0)
+    expect(createsOf(MockWebSocket.instances[1]).map((m) => m.requestId)).toContain('tc-1')
+  })
+
+  it('cancelCreate retracts a queued create — stagger callback skips the send', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+
+    // Send 3 creates: 1st sends via setTimeout(0), 2nd and 3rd queue behind it.
+    c.send({ type: 'terminal.create', requestId: 'tc-1', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'tc-2', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'tc-3', mode: 'shell' } as any)
+    vi.advanceTimersByTime(0)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1'])
+
+    // Cancel tc-2 while it is queued in the stagger (before its 450ms timer fires).
+    c.cancelCreate('tc-2')
+
+    // Advance 450ms — tc-2's stagger callback fires but skips the send
+    // (inFlightCreates no longer has tc-2).
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1'])
+
+    // tc-3 sends after another 450ms.
+    vi.advanceTimersByTime(450)
+    expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1', 'tc-3'])
   })
 })
