@@ -24,7 +24,7 @@ import {
   type SidebarSessionItem,
 } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { getActiveSessionRefForTab, collectSessionRefsFromTabs } from '@/lib/session-utils'
+import { getActiveSessionRefForTab, collectSessionRefsFromTabs, getTabSessionRefs } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
@@ -45,6 +45,7 @@ const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
+const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 /** Non-color carriers for the remote status ring (a11y): tooltip line + sr-only hint. */
@@ -390,6 +391,20 @@ export default function Sidebar({
     freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
   }), shallowEqual)
   const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
+
+  const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
+  const allTabs = useAppSelector((s) => s.tabs.tabs)
+  const allPanes = useAppSelector((s) => s.panes)
+  const attentionSessionKeySet = useMemo(() => {
+    const out = new Set<string>()
+    for (const tab of allTabs) {
+      if (!attentionByTab[tab.id]) continue
+      for (const ref of getTabSessionRefs({ tabs: allTabs, panes: allPanes } as any, tab.id)) {
+        out.add(`${ref.provider}:${ref.sessionId}`)
+      }
+    }
+    return out
+  }, [attentionByTab, allTabs, allPanes])
 
   const repoIconInfoByCwd = useMemo(() => {
     if (!repoIconsOnTabs) return {}
@@ -976,7 +991,7 @@ export default function Sidebar({
                   })
 
                   return (
-                    <div key={sessionKey} className="pb-0.5">
+                    <div key={sessionKey}>
                       <SidebarItem
                         item={item}
                         isActiveTab={isActive}
@@ -990,6 +1005,7 @@ export default function Sidebar({
                         repoIconInfo={
                           repoIconInfoByCwd[item.repoPath ?? item.cwd ?? '']
                         }
+                        needsAttention={attentionSessionKeySet.has(sessionKey)}
                         onClick={() => handleItemClick(item)}
                         timestampTick={timestampTick}
                       />
@@ -1038,6 +1054,8 @@ interface SidebarItemProps {
   showProjectBadge?: boolean
   /** Repo icon info for this session's repo; absent when repoIconsOnTabs is off or no cwd. */
   repoIconInfo?: RepoIconInfo
+  /** True when the session's tab has turn-complete attention (green treatment). */
+  needsAttention?: boolean
   onClick: () => void
   /** Changing tick value breaks memo equality to refresh relative timestamps. */
   timestampTick?: number
@@ -1056,6 +1074,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
   if (prev.repoIconInfo?.repoKey !== next.repoIconInfo?.repoKey) return false
   if (prev.repoIconInfo?.repoName !== next.repoIconInfo?.repoName) return false
   if (prev.repoIconInfo?.iconUrl !== next.repoIconInfo?.iconUrl) return false
+  if (prev.needsAttention !== next.needsAttention) return false
 
   const a = prev.item, b = next.item
   return (
@@ -1079,7 +1098,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 }
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
-  const { item, isActiveTab, isBusy = false, remoteStatus, showProjectBadge, repoIconInfo, onClick } = props
+  const { item, isActiveTab, isBusy = false, remoteStatus, showProjectBadge, repoIconInfo, needsAttention, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
@@ -1088,17 +1107,17 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
         <button
           onClick={onClick}
           className={cn(
-            'w-full flex items-center gap-2 px-2 py-3 md:py-2 rounded-md text-left transition-colors group border-l-2',
-            isActiveTab
-              ? isBusy
-                ? 'bg-blue-100 dark:bg-blue-900/40 border-l-blue-500'
-                : item.hasTab
-                  ? 'bg-emerald-100 dark:bg-emerald-900/40 border-l-emerald-500'
-                  : 'bg-muted border-l-transparent'
+            'w-full flex items-center gap-2 px-2 py-2 md:py-1.5 rounded-md text-left transition-colors group border-l-2',
+            needsAttention && !isBusy
+              ? isActiveTab
+                ? 'bg-emerald-100 dark:bg-emerald-900/40 border-l-emerald-500'
+                : 'bg-emerald-50 dark:bg-emerald-900/20 border-l-emerald-500/70 hover:bg-emerald-100 dark:hover:bg-emerald-900/30'
               : isBusy
-                ? 'bg-blue-50 dark:bg-blue-900/20 border-l-blue-500/70 hover:bg-blue-100 dark:hover:bg-blue-900/30'
-                : item.hasTab
-                  ? 'bg-emerald-50 dark:bg-emerald-900/20 border-l-emerald-500/70 hover:bg-emerald-100 dark:hover:bg-emerald-900/30'
+                ? isActiveTab
+                  ? 'bg-blue-100 dark:bg-blue-900/40 border-l-blue-500'
+                  : 'bg-blue-50 dark:bg-blue-900/20 border-l-blue-500/70 hover:bg-blue-100 dark:hover:bg-blue-900/30'
+                : isActiveTab
+                  ? 'bg-muted border-l-transparent'
                   : 'hover:bg-muted/50 border-l-transparent'
           )}
           data-context={ContextIds.SidebarSession}

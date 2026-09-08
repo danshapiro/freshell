@@ -20,6 +20,7 @@ import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/ope
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode, Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -151,6 +152,7 @@ function createTestStore(options?: {
   freshAgentSessions?: Record<string, FreshAgentSessionState>
   repoIcons?: Record<string, any>
   panesSettings?: Partial<(typeof defaultSettings)['panes']>
+  attentionByTab?: Record<string, boolean>
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -198,6 +200,7 @@ function createTestStore(options?: {
       tabRegistry: tabRegistryReducer,
       freshAgent: freshAgentReducer,
       repoIcons: repoIconsReducer,
+      turnCompletion: turnCompletionReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -288,6 +291,10 @@ function createTestStore(options?: {
       },
       repoIcons: {
         byCwd: options?.repoIcons ?? {},
+      },
+      turnCompletion: {
+        ...turnCompletionReducer(undefined, { type: '@@test/init' }),
+        attentionByTab: options?.attentionByTab ?? {},
       },
     },
   })
@@ -917,7 +924,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           .querySelectorAll<HTMLButtonElement>(`button[data-session-id="${activeSessionId}"]`),
       )
       expect(rows).toHaveLength(1)
-      expect(rows.filter((row) => row.classList.contains('bg-emerald-100'))).toHaveLength(1)
+      expect(rows.filter((row) => row.classList.contains('bg-muted'))).toHaveLength(1)
     })
 
     it('treats pane resumeSessionId as open and active even when tab has none', async () => {
@@ -974,7 +981,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const button = screen.getByText('Pane-owned session').closest('button')
       expect(button).not.toBeNull()
       expect(button).toHaveAttribute('data-has-tab', 'true')
-      expect(button).toHaveClass('bg-emerald-100')
+      expect(button).toHaveClass('bg-muted')
     })
 
     it('does not treat non-UUID Claude pane resumeSessionId as canonical tab identity', async () => {
@@ -5446,7 +5453,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('Sidebar row green/blue treatments', () => {
-    it('applies green fill and left border for an active open session', async () => {
+    it('applies green fill and left border for an active session that needs attention', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -5462,7 +5469,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       ]
       const tabs = [{ id: 'tab-1', resumeSessionId: sessionId('active-open'), mode: 'claude' }]
-      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1' })
+      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1', attentionByTab: { 'tab-1': true } })
       renderSidebar(store, [])
 
       await act(async () => { vi.advanceTimersByTime(100) })
@@ -5543,7 +5550,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(button).toHaveClass('border-l-transparent')
     })
 
-    it('applies light green fill for an inactive open session', async () => {
+    it('applies light green fill for an inactive session that needs attention', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -5559,7 +5566,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       ]
       const tabs = [{ id: 'tab-1', resumeSessionId: sessionId('inactive-open'), mode: 'claude' }]
-      const store = createTestStore({ projects, tabs })
+      const store = createTestStore({ projects, tabs, attentionByTab: { 'tab-1': true } })
       renderSidebar(store, [])
 
       await act(async () => { vi.advanceTimersByTime(100) })
