@@ -5517,10 +5517,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       await act(async () => { vi.advanceTimersByTime(100) })
 
       const button = screen.getByRole('button', { name: /active busy session/i })
-      expect(button).toHaveClass('bg-blue-100')
-      expect(button).toHaveClass('border-l-2')
-      expect(button).toHaveClass('border-l-blue-500')
-      expect(button).toHaveClass('dark:bg-blue-900/40')
+      expect(button).toHaveClass('bg-muted')
+      expect(button).toHaveClass('border-l-transparent')
+      expect(button).not.toHaveClass('bg-blue-100')
+      expect(button).not.toHaveClass('border-l-blue-500')
     })
 
     it('applies transparent border and no color treatment for an inactive closed session', async () => {
@@ -5623,10 +5623,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
       await act(async () => { vi.advanceTimersByTime(100) })
 
       const button = screen.getByRole('button', { name: /inactive busy session/i })
-      expect(button).toHaveClass('bg-blue-50')
-      expect(button).toHaveClass('border-l-2')
-      expect(button).toHaveClass('border-l-blue-500/70')
-      expect(button).toHaveClass('dark:bg-blue-900/20')
+      expect(button).not.toHaveClass('bg-blue-50')
+      expect(button).not.toHaveClass('border-l-blue-500')
+      expect(button).toHaveClass('border-l-transparent')
     })
   })
 })

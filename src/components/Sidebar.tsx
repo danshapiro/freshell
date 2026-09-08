@@ -1112,13 +1112,9 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               ? isActiveTab
                 ? 'bg-emerald-100 dark:bg-emerald-900/40 border-l-emerald-500'
                 : 'bg-emerald-50 dark:bg-emerald-900/20 border-l-emerald-500/70 hover:bg-emerald-100 dark:hover:bg-emerald-900/30'
-              : isBusy
-                ? isActiveTab
-                  ? 'bg-blue-100 dark:bg-blue-900/40 border-l-blue-500'
-                  : 'bg-blue-50 dark:bg-blue-900/20 border-l-blue-500/70 hover:bg-blue-100 dark:hover:bg-blue-900/30'
-                : isActiveTab
-                  ? 'bg-muted border-l-transparent'
-                  : 'hover:bg-muted/50 border-l-transparent'
+              : isActiveTab
+                ? 'bg-muted border-l-transparent'
+                : 'hover:bg-muted/50 border-l-transparent'
           )}
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
