@@ -282,8 +282,8 @@ mechanisms. Includes singleton + resetForTests for test isolation."
 
 **Files:**
 - Modify: `src/lib/ws-client.ts` (import stagger, add field, route creates, clear on ready)
-- Test: `test/unit/client/ws-client-protocol-reload.test.ts` (add stagger assertions)
 - Test: `test/unit/client/lib/ws-client.test.ts` (add stagger assertions)
+- Test: `test/unit/client/lib/ws-client.reconcile.test.ts` (modify existing tests for setTimeout(0) stagger)
 
 **Interfaces:**
 - Consumes: `getTerminalCreateStagger()` from Task 1
@@ -336,6 +336,16 @@ describe('WsClient terminal.create stagger', () => {
     // 8. Now deliver the ready frame
     // 9. Assert the create is re-sent through the fresh stagger (via inFlightCreates replay)
   })
+
+  it('cancelCreate retracts a queued create — stagger callback skips the send', () => {
+    // 1. Setup: WsClient with mock WebSocket, connect → ready
+    // 2. Send 3 terminal.create messages (first sends immediately, 2nd/3rd queued)
+    // 3. Call wsClient.cancelCreate(requestId_of_2nd) before the 450ms timer fires
+    // 4. Advance fake timers by 450ms — 2nd create's timer fires but skips send
+    //    (inFlightCreates no longer has the requestId)
+    // 5. Advance fake timers by 450ms — 3rd create sends normally
+    // 6. Assert: mock socket received 1st and 3rd creates, NOT 2nd
+  })
 })
 ```
 
@@ -373,11 +383,20 @@ private terminalCreateStagger: TerminalCreateStagger = getTerminalCreateStagger(
 
 ```typescript
 private sendCreateNow(msg: unknown) {
-  if (isTerminalCreateMessage(msg)) {
-    this.terminalCreateStagger.enqueue(() => this.sendNow(msg))
-  } else {
+  if (!isTerminalCreateMessage(msg)) {
     this.sendNow(msg)
+    return
   }
+  const requestId = (msg as { requestId?: string }).requestId
+  this.terminalCreateStagger.enqueue(() => {
+    // Guard: cancelCreate may have retracted this create while it was
+    // queued in the stagger. If so, skip the send entirely. This preserves
+    // the existing cancelCreate → reconcile-verdict-fold contract from
+    // App.tsx (lines 1203-1207) where stale create parameters are
+    // retracted before the fold-corrected resend.
+    if (requestId && !this.inFlightCreates.has(requestId)) return
+    this.sendNow(msg)
+  })
 }
 ```
 
@@ -395,19 +414,16 @@ private sendCreateNow(msg: unknown) {
 
 Non-create paths (line 341 pendingMessages, line 510 hello, line 750/813 ping, line 898 terminal.interest) keep calling `this.sendNow(...)` directly.
 
-6. Clear the stagger on disconnect AND on each `ready` frame. Between a socket disconnect and the next `ready`, stale timer callbacks from the dead socket can fire and call `sendNow` on the replacement socket (which may already be OPEN but not yet `ready`), reopening the crash window. Clear on both transitions:
+6. Clear the stagger on ALL socket teardown paths AND on each `ready` frame. Between a socket disconnect and the next `ready`, stale timer callbacks from the dead socket can fire and call `sendNow` on the replacement socket (which may already be OPEN but not yet `ready`), reopening the crash window. Clear on both transitions:
 
-**On disconnect** — in the `handleDisconnect` method (or wherever `_state` transitions to `disconnected`/`connecting`, e.g. the `onclose`/`onerror` handlers). Add:
-```typescript
-      this.terminalCreateStagger.clear()
-```
+**On all socket teardown** — in every path that transitions the connection to a non-ready state: the `onclose` handler, the `onerror` handler, the public `disconnect()` method, AND `abandonStaleSocket()` (which detaches `onclose` before opening a replacement — an `onclose`-only clear would miss it). Add `this.terminalCreateStagger.clear()` to each of these paths.
 
 **On `ready`** — at the beginning of the `ready` block (line 263, right after `if (msg.type === 'ready') {`):
 ```typescript
       this.terminalCreateStagger.clear()
 ```
 
-The disconnect clear drops stale callbacks that haven't fired yet. The ready clear is a belt-and-suspenders defense: if a callback fired between disconnect and ready (race window), the ready clear drops any remaining entries before the ready handler flushes/re-sends creates through the fresh stagger.
+The teardown clear drops stale callbacks that haven't fired yet (covering onclose, onerror, disconnect, and abandonStaleSocket). The ready clear is a belt-and-suspenders defense: if a callback fired between teardown and ready (race window), the ready clear drops any remaining entries before the ready handler flushes/re-sends creates through the fresh stagger.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -423,7 +439,7 @@ Review the call sites for consistency. The `sendCreateNow` helper is the single 
 
 The stagger affects ALL tests that send `terminal.create` messages through the ws-client. Run the ws-client suites and the TerminalView lifecycle suites:
 
-Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client-protocol-reload.test.ts test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
+Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
 
 Expected: PASS. Tests that assert `terminal.create` sends arrive immediately may need to advance fake timers by 450ms to flush the stagger. Do NOT reduce the stagger interval or disable the stagger for tests — the test must accommodate the real behavior.
 
@@ -483,14 +499,18 @@ test.describe('restore create stagger', () => {
     // 3. Open browser, connect, create 5+ terminal panes via tab-add
     // 4. Dismiss the boot tab's picker pane via selectShellIfPickerShowing
     // 5. Persist state (flush localStorage)
-    // 6. Restart the Rust server (server.restartAbrupt()) so panes have no live terminals
-    // 7. Reload the page
-    // 8. Wait for all panes to anchor (allLeafTerminalIds)
-    // 9. Read getSentWsMessagesWithTimestamps()
-    // 10. Filter for type === 'terminal.create'
-    // 11. Assert: at least 2 terminal.create messages were captured (cardinality check)
-    // 12. Assert: for every consecutive pair, timestamp[i+1] - timestamp[i] >= 400
-    // 13. Assert: all panes eventually anchor (no wedge)
+    // 6. Capture idsBefore = allLeafTerminalIds() (terminal IDs before restart)
+    // 7. Restart the Rust server (server.restartAbrupt()) so panes have no live terminals
+    // 8. Reload the page
+    // 9. Wait for all panes to anchor with NEW terminal IDs:
+    //    poll allLeafTerminalIds() until every pane has a terminalId that is
+    //    non-null AND NOT in idsBefore (proves they're fresh creates, not stale
+    //    pre-restart IDs — matching create-protection-restore-storm-rust.spec.ts pattern)
+    // 10. Read getSentWsMessagesWithTimestamps()
+    // 11. Filter for type === 'terminal.create'
+    // 12. Assert: at least 2 terminal.create messages were captured (cardinality check)
+    // 13. Assert: for every consecutive pair, timestamp[i+1] - timestamp[i] >= 400
+    // 14. Assert: all panes eventually anchor (no wedge)
   })
 })
 
