@@ -6,9 +6,9 @@
 
 use freshell_runtime_protocol::{
     read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
-    LaunchRequest, RequestId, RuntimeError, RuntimeErrorCode, RuntimeMetricsRequest, SoulId,
-    StopRequest, TerminalInputRequest, TerminalReadOutputRequest, TerminalResizeRequest,
-    CONTROL_PROTOCOL_VERSION,
+    LaunchRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger, RequestId, RuntimeError,
+    RuntimeErrorCode, RuntimeMetricsRequest, SoulId, StopRequest, TerminalInputRequest,
+    TerminalReadOutputRequest, TerminalResizeRequest, CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -206,6 +206,48 @@ impl RuntimeClient {
             .await?
         {
             AdminResult::RuntimeMetrics(metrics) => Ok(metrics),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn probe_recovery(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<freshell_runtime_protocol::RecoveryProbe, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::ProbeRecovery(RecoveryProbeRequest {
+                    soul_id,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::RecoveryProbe(probe) => Ok(probe),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn recover(
+        &self,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+    ) -> Result<freshell_runtime_protocol::RecoveryResult, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::Recover(RecoverRequest {
+                    soul_id,
+                    trigger,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::Recovery(result) => Ok(result),
             _ => Err(ClientError::UnexpectedResult),
         }
     }

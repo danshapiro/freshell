@@ -577,9 +577,11 @@ fn validate_rest_resume(
     resume_session_id: Option<String>,
     launch_intent: LaunchIntent,
     probe: Option<&freshell_platform::resume_gate::ResumeProbeFn>,
+    intent: freshell_platform::resume_gate::ResumeIntent,
 ) -> RestResumeOutcome {
     use freshell_platform::resume_gate::{
-        evaluate_resume_gate, provider_validated, stale_resume_notice, ResumeGateDecision,
+        evaluate_resume_gate_for_intent, provider_validated, stale_resume_notice,
+        ResumeGateDecision,
     };
     let Some(probe) = probe else {
         return rest_resume_passthrough(resume_session_id, launch_intent);
@@ -591,8 +593,15 @@ fn validate_rest_resume(
         return rest_resume_passthrough(resume_session_id, launch_intent);
     }
     let answer = probe(mode, &sid);
-    match evaluate_resume_gate(mode, answer.existence, answer.ever_observed_on_disk) {
-        ResumeGateDecision::Proceed => rest_resume_passthrough(resume_session_id, launch_intent),
+    match evaluate_resume_gate_for_intent(
+        mode,
+        answer.existence,
+        answer.ever_observed_on_disk,
+        intent,
+    ) {
+        ResumeGateDecision::Proceed | ResumeGateDecision::BlockedRecovery => {
+            rest_resume_passthrough(resume_session_id, launch_intent)
+        }
         ResumeGateDecision::SpawnFresh => {
             let notice = stale_resume_notice(mode, &sid);
             let (fresh_id, intent, claude_fresh_prealloc) = match mode {
@@ -957,6 +966,8 @@ pub(crate) async fn spawn_terminal_pane(
     // the gate entirely (passthrough — same shape validate_rest_resume
     // returns for Proceed), so the unchanged create flows into the D7-REST
     // guard and D8 lease exactly as today.
+    let managed_recovery = registry.has_managed_controller()
+        && matches!(mode.as_str(), "shell" | "claude" | "opencode");
     let rest_outcome = if candidate_is_live {
         rest_resume_passthrough(resume_session_id.take(), launch_intent)
     } else {
@@ -965,7 +976,17 @@ pub(crate) async fn spawn_terminal_pane(
         let rid = resume_session_id.take();
         let intent = launch_intent;
         tokio::task::spawn_blocking(move || {
-            validate_rest_resume(&mode_for_gate, rid, intent, probe.as_ref())
+            validate_rest_resume(
+                &mode_for_gate,
+                rid,
+                intent,
+                probe.as_ref(),
+                if managed_recovery {
+                    freshell_platform::resume_gate::ResumeIntent::ManagedRecovery
+                } else {
+                    freshell_platform::resume_gate::ResumeIntent::UserCreate
+                },
+            )
         })
         .await
         .expect("resume validation task panicked")
@@ -5160,6 +5181,7 @@ mod tests {
             Some("stale-amp".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_ne!(out.resume_session_id.as_deref(), Some("stale-amp"));
         assert!(out.resume_session_id.is_some());
@@ -5174,6 +5196,7 @@ mod tests {
             Some("anything".into()),
             LaunchIntent::Resume,
             None,
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_eq!(out.resume_session_id.as_deref(), Some("anything"));
         assert!(out.stale_session_id.is_none());
@@ -5190,6 +5213,7 @@ mod tests {
                 Some("ses_x".into()),
                 LaunchIntent::Resume,
                 Some(&probe),
+                freshell_platform::resume_gate::ResumeIntent::UserCreate,
             );
             assert_eq!(out.resume_session_id.as_deref(), Some("ses_x"));
             assert!(out.notice.is_none());
@@ -5205,6 +5229,7 @@ mod tests {
             Some("stale-cx".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert!(out.resume_session_id.is_none());
         assert_eq!(out.stale_session_id.as_deref(), Some("stale-cx"));
@@ -5223,6 +5248,7 @@ mod tests {
             Some("stale-cl".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_eq!(out.launch_intent, LaunchIntent::Start);
         let minted = out.resume_session_id.expect("fresh claude id minted");

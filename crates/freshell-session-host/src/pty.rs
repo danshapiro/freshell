@@ -1,7 +1,9 @@
 use crate::{
     command_journal::{BeginDisposition, CommandJournal},
     output_journal::OutputJournal,
+    providers::PreparedCodexLaunch,
 };
+use freshell_codex::{launch_lifecycle::CodexLaunchSidecar, remote_proxy::RemoteProxyEvent};
 use freshell_platform::SpawnSpec;
 use freshell_protocol::ServerMessage;
 use freshell_runtime_protocol::{
@@ -20,6 +22,12 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::{sync::mpsc, task::JoinHandle};
+
+struct CodexLifecycle {
+    sidecar: Arc<CodexLaunchSidecar>,
+    event_task: JoinHandle<()>,
+}
 
 pub struct HostedPty {
     pty: PtyTerminal,
@@ -30,13 +38,15 @@ pub struct HostedPty {
     terminal_id: String,
     stream_epoch: String,
     native_session_id: Arc<Mutex<Option<String>>>,
+    codex: Option<CodexLifecycle>,
 }
 
 impl HostedPty {
-    pub fn spawn(
+    pub async fn spawn(
         state_dir: &Path,
         incarnation_id: IncarnationId,
         launch: &TerminalLaunchSpec,
+        prepared_codex: Option<PreparedCodexLaunch>,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
         let launch_floor_ms = epoch_ms().saturating_sub(500);
@@ -63,9 +73,21 @@ impl HostedPty {
         let exit_code = Arc::new(AtomicI64::new(0));
         let exit_flag = Arc::clone(&exited);
         let exit_value = Arc::clone(&exit_code);
+        let codex_sidecar_on_exit = prepared_codex
+            .as_ref()
+            .map(|prepared| Arc::clone(&prepared.sidecar));
+        let runtime_handle = tokio::runtime::Handle::try_current().ok();
         let on_exit = Box::new(move |code: i64| {
             exit_value.store(code, Ordering::SeqCst);
             exit_flag.store(true, Ordering::SeqCst);
+            if let (Some(handle), Some(sidecar)) =
+                (runtime_handle.as_ref(), codex_sidecar_on_exit.as_ref())
+            {
+                let sidecar = Arc::clone(sidecar);
+                handle.spawn(async move {
+                    let _ = sidecar.shutdown().await;
+                });
+            }
         });
         let mut provider_args = vec![
             "--reuid".to_string(),
@@ -94,7 +116,7 @@ impl HostedPty {
         provider_env.insert("GIT_CONFIG_COUNT".into(), "1".into());
         provider_env.insert("GIT_CONFIG_KEY_0".into(), "safe.directory".into());
         provider_env.insert("GIT_CONFIG_VALUE_0".into(), launch.workspace_path.clone());
-        let pty = PtyTerminal::spawn_with_sink(
+        let mut pty = match PtyTerminal::spawn_with_sink(
             &spec,
             &provider_env,
             &launch.terminal_id,
@@ -102,10 +124,22 @@ impl HostedPty {
             None,
             Some(sink),
             Some(on_exit),
-        )
-        .map_err(|e| e.to_string())?;
+        ) {
+            Ok(pty) => pty,
+            Err(error) => {
+                if let Some(prepared) = prepared_codex {
+                    let _ = prepared.sidecar.shutdown().await;
+                }
+                return Err(error.to_string());
+            }
+        };
         let commands = CommandJournal::open(state_dir)?;
-        let native_session_id = Arc::new(Mutex::new(launch.resume_session_id.clone()));
+        // Codex must report the thread identity through its app-server proxy;
+        // do not treat the requested resume id as provider-observed evidence.
+        let initial_native_id = (launch.mode != "codex")
+            .then(|| launch.resume_session_id.clone())
+            .flatten();
+        let native_session_id = Arc::new(Mutex::new(initial_native_id));
         if launch.mode == "opencode" && launch.resume_session_id.is_none() {
             spawn_opencode_identity_watcher(
                 launch,
@@ -114,6 +148,27 @@ impl HostedPty {
                 Arc::clone(&exited),
             );
         }
+        let codex = if let Some(prepared) = prepared_codex {
+            if let Err(error) = prepared.sidecar.adopt(&launch.terminal_id, 0).await {
+                pty.kill();
+                let _ = prepared.sidecar.shutdown().await;
+                return Err(format!("adopt managed Codex app-server: {error}"));
+            }
+            let sidecar = Arc::clone(&prepared.sidecar);
+            let event_task = tokio::spawn(run_codex_identity_events(
+                prepared.events,
+                Arc::clone(&sidecar),
+                state_dir.to_path_buf(),
+                launch.resume_session_id.clone(),
+                Arc::clone(&native_session_id),
+            ));
+            Some(CodexLifecycle {
+                sidecar,
+                event_task,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             pty,
             output,
@@ -123,6 +178,7 @@ impl HostedPty {
             terminal_id: launch.terminal_id.clone(),
             stream_epoch,
             native_session_id,
+            codex,
         })
     }
 
@@ -188,8 +244,12 @@ impl HostedPty {
         Ok(batch)
     }
 
-    pub fn stop(&mut self) {
+    pub async fn stop(&mut self) {
         self.pty.kill();
+        if let Some(codex) = self.codex.take() {
+            codex.event_task.abort();
+            let _ = codex.sidecar.shutdown().await;
+        }
     }
     pub fn pid(&self) -> u32 {
         self.pty.pid().unwrap_or(0)
@@ -212,6 +272,112 @@ impl HostedPty {
     pub fn spool_bytes(&self) -> u64 {
         self.output.lock().map(|j| j.spool_bytes()).unwrap_or(0)
     }
+    pub fn native_session_id(&self) -> Option<String> {
+        self.native_session_id
+            .lock()
+            .ok()
+            .and_then(|session| session.clone())
+    }
+}
+
+async fn run_codex_identity_events(
+    mut events: mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    sidecar: Arc<CodexLaunchSidecar>,
+    state_dir: PathBuf,
+    expected_session_id: Option<String>,
+    native_session_id: Arc<Mutex<Option<String>>>,
+) {
+    while let Some(event) = events.recv().await {
+        let candidate = match event {
+            RemoteProxyEvent::Candidate(candidate) => Some(candidate.thread),
+            RemoteProxyEvent::ThreadStarted(started) => Some(started.thread),
+            _ => None,
+        };
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let current = native_session_id
+            .lock()
+            .ok()
+            .and_then(|identity| identity.clone());
+        if let Err(message) = validate_codex_candidate(
+            expected_session_id.as_deref(),
+            current.as_deref(),
+            &candidate.id,
+            candidate.ephemeral,
+        ) {
+            let _ = crate::append_event(
+                &state_dir,
+                "host.codex_identity_rejected",
+                serde_json::json!({"candidate":candidate.id,"reason":message}),
+            );
+            sidecar.fail_candidate_capture(&message).await;
+            continue;
+        }
+        let receipt = serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "codex",
+            "nativeSessionId": candidate.id,
+            "ephemeral": false,
+            "observedAt": epoch_ms(),
+        });
+        let encoded = match serde_json::to_vec_pretty(&receipt) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                sidecar
+                    .fail_candidate_capture(&format!("serialize Codex identity receipt: {error}"))
+                    .await;
+                continue;
+            }
+        };
+        if let Err(error) = crate::atomic_write(&state_dir.join("provider-identity.json"), &encoded)
+        {
+            sidecar
+                .fail_candidate_capture(&format!("persist Codex identity receipt: {error}"))
+                .await;
+            continue;
+        }
+        if let Ok(mut identity) = native_session_id.lock() {
+            *identity = Some(candidate.id.clone());
+        }
+        let _ = crate::append_event(
+            &state_dir,
+            "host.codex_identity_observed",
+            serde_json::json!({"nativeSessionId":candidate.id}),
+        );
+        sidecar.mark_candidate_persisted().await;
+    }
+}
+
+fn validate_codex_candidate(
+    expected: Option<&str>,
+    current: Option<&str>,
+    candidate: &str,
+    ephemeral: bool,
+) -> Result<(), String> {
+    if ephemeral {
+        return Err(format!(
+            "Codex candidate {candidate} is ephemeral and cannot establish durable identity"
+        ));
+    }
+    if candidate.is_empty() {
+        return Err("Codex returned an empty thread identity".into());
+    }
+    if let Some(expected) = expected {
+        if candidate != expected {
+            return Err(format!(
+                "Codex resumed wrong thread: expected {expected}, observed {candidate}"
+            ));
+        }
+    }
+    if let Some(current) = current {
+        if candidate != current {
+            return Err(format!(
+                "Codex attempted to rebind {current} to competing thread {candidate}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn epoch_ms() -> i64 {
@@ -381,5 +547,18 @@ mod managed_opencode_identity_tests {
 
         let ambiguous = vec![row("ses_a", "/repo", 1_100), row("ses_b", "/repo", 1_200)];
         assert_eq!(select_opencode_session(&ambiguous, "/repo", 1_000), None);
+    }
+}
+
+#[cfg(test)]
+mod codex_identity_tests {
+    use super::validate_codex_candidate;
+
+    #[test]
+    fn exact_non_ephemeral_codex_identity_is_required() {
+        assert!(validate_codex_candidate(Some("thread-a"), None, "thread-a", false).is_ok());
+        assert!(validate_codex_candidate(Some("thread-a"), None, "thread-b", false).is_err());
+        assert!(validate_codex_candidate(None, None, "thread-a", true).is_err());
+        assert!(validate_codex_candidate(None, Some("thread-a"), "thread-b", false).is_err());
     }
 }

@@ -388,6 +388,9 @@ pub struct ManagedTerminalLaunch {
     pub stream_id: String,
     pub mode: String,
     pub resume_session_id: Option<String>,
+    pub provider_model: Option<String>,
+    pub provider_sandbox: Option<String>,
+    pub provider_permission_mode: Option<String>,
     pub create_request_id: Option<String>,
 }
 
@@ -416,6 +419,11 @@ pub struct ManagedOutputRead {
 /// remain the browser-facing replay/fan-out owner while the web server has no PTY,
 /// PID, Docker socket, or direct kill authority for managed rows.
 pub trait ManagedTerminalController: Send + Sync {
+    fn lookup_terminal<'a>(
+        &'a self,
+        terminal_id: &'a str,
+        create_request_id: Option<String>,
+    ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>>;
     fn launch<'a>(
         &'a self,
         request: ManagedTerminalLaunch,
@@ -2095,6 +2103,41 @@ impl TerminalRegistry {
             .lock()
             .expect("managed runtime connections lock")
             .contains(&conn_id)
+    }
+
+    /// Reconstruct a browser-facing facade from protected supervisor inventory
+    /// before legacy pane reconciliation consults host-local provider stores.
+    /// This is read/adopt only: it never launches or resumes a provider.
+    pub async fn adopt_managed_for_reconcile(
+        &self,
+        terminal_id: &str,
+        create_request_id: Option<String>,
+    ) -> Result<bool, String> {
+        if self.exists(terminal_id) {
+            return Ok(self.is_managed(terminal_id));
+        }
+        let controller = self
+            .managed_controller
+            .read()
+            .expect("managed controller lock")
+            .clone();
+        let Some(controller) = controller else {
+            return Ok(false);
+        };
+        let Some(descriptor) = controller
+            .lookup_terminal(terminal_id, create_request_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if descriptor.terminal_id != terminal_id {
+            return Err(format!(
+                "managed inventory returned terminal {} for requested {terminal_id}",
+                descriptor.terminal_id
+            ));
+        }
+        self.register_managed(descriptor);
+        Ok(true)
     }
 
     pub fn managed_descriptor(&self, terminal_id: &str) -> Option<ManagedTerminalDescriptor> {

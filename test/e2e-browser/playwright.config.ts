@@ -185,8 +185,9 @@ export const MATRIX_SPECS = [
 // Exported (no behavior change) so test/e2e-browser/playwright.gate01.config.ts
 // (GATE-01) can testIgnore the SAME array instead of drifting a copy.
 export const RUST_ONLY_SPECS = [
-  // Durable Souls Phase 2: owns a feature-enabled RustServer + runtime supervisor.
+  // Durable Souls Phase 2/3: own a feature-enabled RustServer + runtime supervisor.
   /runtime-terminal-continuity-rust\.spec\.ts$/,
+  /runtime-provider-resurrection-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
   // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
@@ -417,6 +418,7 @@ export default defineConfig({
         ...MATRIX_SPECS,
         /harness-01-rust-server\.spec\.ts$/,
         /runtime-terminal-continuity-rust\.spec\.ts$/,
+        /runtime-provider-resurrection-rust\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
         // TERM-15/TERM-16 — terminal-mode CLI activity (blue/busy), the

@@ -8,8 +8,8 @@
 
 use freshell_platform::cli_launch::LaunchIntent;
 use freshell_platform::resume_gate::{
-    evaluate_resume_gate, provider_validated, stale_resume_notice, ResumeExistence,
-    ResumeGateDecision,
+    evaluate_resume_gate_for_intent, provider_validated, stale_resume_notice, ResumeExistence,
+    ResumeGateDecision, ResumeIntent,
 };
 
 use crate::existence::{SessionExistence, SessionExistenceProbe};
@@ -56,6 +56,37 @@ pub fn validate_wire_resume(
     launch_intent: LaunchIntent,
     probe: &dyn SessionExistenceProbe,
 ) -> ResumeValidationOutcome {
+    validate_wire_resume_for_intent(
+        mode,
+        resume_session_id,
+        launch_intent,
+        probe,
+        ResumeIntent::UserCreate,
+    )
+}
+
+pub fn validate_managed_wire_resume(
+    mode: &str,
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+    probe: &dyn SessionExistenceProbe,
+) -> ResumeValidationOutcome {
+    validate_wire_resume_for_intent(
+        mode,
+        resume_session_id,
+        launch_intent,
+        probe,
+        ResumeIntent::ManagedRecovery,
+    )
+}
+
+fn validate_wire_resume_for_intent(
+    mode: &str,
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+    probe: &dyn SessionExistenceProbe,
+    intent: ResumeIntent,
+) -> ResumeValidationOutcome {
     let Some(sid) = resume_session_id.clone().filter(|s| !s.is_empty()) else {
         return passthrough(resume_session_id, launch_intent);
     };
@@ -64,8 +95,10 @@ pub fn validate_wire_resume(
     }
     let existence = map_existence(probe.exists_for_gate(mode, &sid));
     let ever_on_disk = probe.ever_observed_on_disk(mode, &sid);
-    match evaluate_resume_gate(mode, existence, ever_on_disk) {
-        ResumeGateDecision::Proceed => passthrough(resume_session_id, launch_intent),
+    match evaluate_resume_gate_for_intent(mode, existence, ever_on_disk, intent) {
+        ResumeGateDecision::Proceed | ResumeGateDecision::BlockedRecovery => {
+            passthrough(resume_session_id, launch_intent)
+        }
         ResumeGateDecision::SpawnFresh => {
             let notice = stale_resume_notice(mode, &sid);
             let (fresh_id, intent, claude_prealloc) = match mode {
@@ -254,5 +287,21 @@ mod tests {
         let out = validate_wire_resume("amplifier", None, LaunchIntent::Resume, &PanickingProbe);
         assert!(out.resume_session_id.is_none());
         assert!(out.stale_session_id.is_none());
+    }
+    #[test]
+    fn managed_recovery_never_mints_a_fresh_session_for_absence() {
+        let out = validate_managed_wire_resume(
+            "claude",
+            Some("exact-managed-session".into()),
+            LaunchIntent::Resume,
+            &absent(),
+        );
+        assert_eq!(
+            out.resume_session_id.as_deref(),
+            Some("exact-managed-session")
+        );
+        assert_eq!(out.launch_intent, LaunchIntent::Resume);
+        assert!(out.stale_session_id.is_none());
+        assert!(out.notice.is_none());
     }
 }

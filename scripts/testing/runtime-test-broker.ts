@@ -240,7 +240,7 @@ export class RestrictedDockerBroker {
     }
 
     const binds = Array.isArray(host.Binds) ? host.Binds as string[] : []
-    if (!terminalWorkload && binds.length !== 2) return { ok: false, reason: `expected exactly two fixture runtime binds, found ${binds.length}` }
+    if (!terminalWorkload && binds.length !== 3) return { ok: false, reason: `expected binary, runtime, and soul provider-volume fixture binds, found ${binds.length}` }
     let binaryBind = false
     let runtimeDir = ''
     let providerVolumeName = ''
@@ -258,7 +258,7 @@ export class RestrictedDockerBroker {
         runtimeDir = source
         continue
       }
-      if (terminalWorkload && destination === '/home/freshell/provider' && mode === 'rw' && /^freshell-provider-[a-f0-9]{24}$/.test(source)) {
+      if (destination === '/home/freshell/provider' && mode === 'rw' && /^freshell-provider-[a-f0-9]{24}$/.test(source)) {
         providerVolumeName = source
         continue
       }
@@ -271,8 +271,8 @@ export class RestrictedDockerBroker {
       }
       return { ok: false, reason: `unapproved bind ${bind}` }
     }
-    if (!binaryBind || !runtimeDir) return { ok: false, reason: 'required binary/runtime bind topology missing' }
-    if (terminalWorkload && (!providerVolumeName || !workspacePath)) return { ok: false, reason: 'terminal workload missing provider volume or approved workspace bind' }
+    if (!binaryBind || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }
+    if (terminalWorkload && !workspacePath) return { ok: false, reason: 'terminal workload missing approved workspace bind' }
     if (binds.some((bind) => bind.includes('docker.sock') || bind.includes('/var/lib/freshell-supervisor') || bind.includes('/run/freshell-supervisor'))) {
       return { ok: false, reason: 'management-state mount is forbidden' }
     }

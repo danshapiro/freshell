@@ -1278,6 +1278,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "freshell-runtime-protocol",
+ "freshell-sessions",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "freshell-api"
 version = "0.1.0"
 dependencies = [
@@ -1432,6 +1445,8 @@ dependencies = [
 name = "freshell-session-host"
 version = "0.1.0"
 dependencies = [
+ "freshell-agent-runtime",
+ "freshell-codex",
  "freshell-platform",
  "freshell-protocol",
  "freshell-runtime-protocol",
@@ -1469,6 +1484,7 @@ name = "freshell-supervisor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "freshell-agent-runtime",
  "freshell-runtime-protocol",
  "libc",
  "rusqlite",

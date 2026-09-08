@@ -307,6 +307,11 @@ pub enum TerminalInputBlockedReason {
     CodexRecoveryPending,
     CodexCleanExitDecisionPending,
     CodexLifecycleLossPending,
+    /// The managed soul is fenced while its exact provider identity is being
+    /// reattached or resurrected. No input reached either incarnation.
+    ManagedRecoveryPending,
+    /// Recovery reached an explicit blocked verdict and requires repair/retry.
+    ManagedRecoveryBlocked,
     /// Silent-loss fix (kata dtfn): `terminal.input` named a terminalId the
     /// registry does not have (never created, killed, or pre-restart). The
     /// reference answers `error{INVALID_TERMINAL_ID}` (`ws-handler.ts:2991-3002`);

@@ -2,25 +2,27 @@ use crate::{
     admission::AdmissionPolicy,
     backend::{BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend},
     registry::{
-        stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord, LaunchPreparation,
-        PreparedLaunch, Registry, RegistryError,
+        stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
+        InputJournalDisposition, LaunchPreparation, PreparedLaunch, Registry, RegistryError,
     },
 };
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, HostBootId, HostCommand, HostReply, HostResult,
-    IncarnationId, LaunchResult, LaunchState, RequestId, RuntimeError, RuntimeErrorCode,
-    RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome,
-    TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    IncarnationId, LaunchResult, LaunchState, RequestId, ResumeSpec, RuntimeError,
+    RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId,
+    StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     net::{UnixListener, UnixStream},
+    sync::Mutex,
     time::{sleep, Duration, Instant},
 };
 
@@ -37,9 +39,13 @@ pub struct SupervisorConfig {
 
 #[derive(Clone)]
 pub struct Supervisor {
-    registry: Registry,
-    backend: Arc<dyn RuntimeBackend>,
-    config: Arc<SupervisorConfig>,
+    pub(crate) registry: Registry,
+    pub(crate) backend: Arc<dyn RuntimeBackend>,
+    pub(crate) config: Arc<SupervisorConfig>,
+    /// Recovery and input dispatch serialize per soul, while unrelated souls
+    /// remain independently recoverable. Stop intentionally does not take this
+    /// lock: its durable intent revision must be able to preempt recovery.
+    pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl Supervisor {
@@ -81,11 +87,21 @@ impl Supervisor {
             registry,
             backend,
             config: Arc::new(config),
+            recovery_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    pub(crate) async fn lifecycle_lock(&self, soul_id: &SoulId) -> Arc<Mutex<()>> {
+        let mut locks = self.recovery_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(soul_id.as_str().to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     pub async fn dispatch(&self, envelope: Envelope<AdminCommand>) -> AdminReply {
@@ -172,6 +188,20 @@ impl Supervisor {
                 let metrics = self.runtime_metrics(request.soul_id).await?;
                 Ok(AdminResult::RuntimeMetrics(metrics))
             }
+            AdminCommand::ProbeRecovery(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.probe_recovery(request.soul_id)
+                    .await
+                    .map(AdminResult::RecoveryProbe)
+            }
+            AdminCommand::Recover(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.recover(request).await.map(AdminResult::Recovery)
+            }
         }
     }
 
@@ -199,6 +229,7 @@ impl Supervisor {
                 requested_limits: limits,
                 profile: request.profile,
                 project_key: request.project_key.clone(),
+                fixture: request.fixture,
                 terminal: request.terminal.clone(),
                 admission: self.config.admission,
             })
@@ -211,6 +242,26 @@ impl Supervisor {
         );
         crash_if("after_prepare");
 
+        self.activate_prepared(
+            prepared,
+            request.soul_id,
+            request.fixture,
+            request.terminal,
+            None,
+            limits,
+        )
+        .await
+    }
+
+    pub(crate) async fn activate_prepared(
+        &self,
+        prepared: PreparedLaunch,
+        soul_id: SoulId,
+        fixture: Option<FixtureKind>,
+        terminal: Option<TerminalLaunchSpec>,
+        resume_spec: Option<ResumeSpec>,
+        limits: RuntimeLimits,
+    ) -> Result<LaunchResult, RuntimeError> {
         let mut state = prepared.state;
         if state == LaunchState::Prepared {
             let runtime_dir = self.ensure_incarnation_dir(&prepared)?;
@@ -225,7 +276,7 @@ impl Supervisor {
                     runtime_dir: runtime_dir.clone(),
                     limits,
                     test_run_id: self.config.test_run_id.clone(),
-                    terminal: request.terminal.clone(),
+                    terminal: terminal.clone(),
                     provider_volume_name: stable_provider_volume_name(
                         self.registry.installation_id(),
                         &prepared.soul_id,
@@ -265,7 +316,7 @@ impl Supervisor {
 
         if state == LaunchState::Running {
             let authenticated = self
-                .authenticate_host(&handle.incarnation_id().clone(), handle.runtime_dir())
+                .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
                 .await?;
             let status = self
                 .host_status(
@@ -275,18 +326,13 @@ impl Supervisor {
                 )
                 .await?;
             return self
-                .launch_result_from_status(
-                    prepared.incarnation_id,
-                    request.soul_id,
-                    authenticated,
-                    status,
-                )
+                .launch_result_from_status(prepared.incarnation_id, soul_id, authenticated, status)
                 .await;
         }
-        if state == LaunchState::Stopping
-            || state == LaunchState::Stopped
-            || state == LaunchState::Failed
-        {
+        if matches!(
+            state,
+            LaunchState::Stopping | LaunchState::Stopped | LaunchState::Failed
+        ) {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 format!("launch request is bound to incarnation in state {state:?}"),
@@ -327,9 +373,10 @@ impl Supervisor {
         let accepted = self
             .send_grant(
                 &handle,
-                request.soul_id.clone(),
-                request.fixture,
-                request.terminal.clone(),
+                soul_id.clone(),
+                fixture,
+                terminal,
+                resume_spec,
                 &authenticated,
                 &grant,
             )
@@ -342,7 +389,7 @@ impl Supervisor {
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_running",
-            serde_json::json!({"soulId":request.soul_id,"incarnationId":handle.incarnation_id(),"containerId":handle.container_id(),"workerPid":accepted.worker_pid,"workerLaunchCount":accepted.worker_launch_count}),
+            serde_json::json!({"soulId":soul_id,"incarnationId":handle.incarnation_id(),"containerId":handle.container_id(),"workerPid":accepted.worker_pid,"workerLaunchCount":accepted.worker_launch_count}),
         );
         let view = find_view(&self.registry, handle.incarnation_id()).await?;
         Ok(LaunchResult {
@@ -367,32 +414,89 @@ impl Supervisor {
                 "terminal input exceeds control-frame budget",
             ));
         }
-        let handle = self
+        // Input dispatch and recovery are mutually exclusive.  The registry
+        // journal is committed before host IPC so a response loss becomes an
+        // explicit AMBIGUOUS outcome rather than an automatic prompt resend.
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let (disposition, incarnation_id) = self
             .registry
-            .active_handle_for_soul(soul_id)
+            .begin_input(soul_id.clone(), request_id.clone(), data.as_bytes())
             .await
             .map_err(map_registry)?;
-        let host = self
+        match disposition {
+            InputJournalDisposition::Completed => return Ok(CommandState::Completed),
+            InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Dispatch => {}
+        }
+        let handle = self
+            .registry
+            .owned_handle(incarnation_id)
+            .await
+            .map_err(map_registry)?;
+        self.registry
+            .mark_input_dispatching(soul_id.clone(), request_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let host = match self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
-        match self
+            .await
+        {
+            Ok(host) => host,
+            Err(error) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                return Err(error);
+            }
+        };
+        let response = self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
                 handle.runtime_dir(),
                 &host,
                 HostCommand::TerminalInput {
                     incarnation_id: handle.incarnation_id().clone(),
-                    request_id,
+                    request_id: request_id.clone(),
                     data,
                 },
             )
-            .await?
-        {
-            HostResult::TerminalInput { state } => Ok(state),
-            _ => Err(RuntimeError::new(
-                RuntimeErrorCode::HostAuthenticationFailed,
-                "unexpected terminal input reply",
-            )),
+            .await;
+        match response {
+            Ok(HostResult::TerminalInput {
+                state: CommandState::Completed,
+            }) => {
+                self.registry
+                    .mark_input_completed(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(CommandState::Completed)
+            }
+            Ok(HostResult::TerminalInput { state }) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(state)
+            }
+            Ok(_) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "unexpected terminal input reply",
+                ))
+            }
+            Err(error) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Err(error)
+            }
         }
     }
 
@@ -439,7 +543,7 @@ impl Supervisor {
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
         let handle = self
             .registry
-            .active_handle_for_soul(soul_id)
+            .active_handle_for_soul(soul_id.clone())
             .await
             .map_err(map_registry)?;
         let host = self
@@ -458,7 +562,22 @@ impl Supervisor {
             )
             .await?
         {
-            HostResult::TerminalOutput(output) => Ok(output),
+            HostResult::TerminalOutput(output) => {
+                if let Some(native_session_id) = output.native_session_id.as_ref() {
+                    self.registry
+                        .record_native_session(
+                            soul_id.clone(),
+                            handle.incarnation_id().clone(),
+                            native_session_id.clone(),
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                    // Materialize durable resume evidence while the soul-local
+                    // store is still reachable. Repeated probes are idempotent.
+                    let _ = self.probe_recovery(soul_id.clone()).await;
+                }
+                Ok(output)
+            }
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected terminal output reply",
@@ -568,7 +687,7 @@ impl Supervisor {
         Ok((outcome, view))
     }
 
-    async fn verify_empty_with_budget(
+    pub(crate) async fn verify_empty_with_budget(
         &self,
         handle: &crate::registry::OwnedRuntimeHandle,
         budget: Duration,
@@ -593,7 +712,10 @@ impl Supervisor {
         }
     }
 
-    fn ensure_incarnation_dir(&self, prepared: &PreparedLaunch) -> Result<PathBuf, RuntimeError> {
+    pub(crate) fn ensure_incarnation_dir(
+        &self,
+        prepared: &PreparedLaunch,
+    ) -> Result<PathBuf, RuntimeError> {
         let runtime_dir = self
             .config
             .runtime_root
@@ -623,7 +745,7 @@ impl Supervisor {
         std::fs::canonicalize(runtime_dir).map_err(io_runtime)
     }
 
-    async fn authenticate_host(
+    pub(crate) async fn authenticate_host(
         &self,
         incarnation_id: &IncarnationId,
         runtime_dir: &Path,
@@ -695,6 +817,7 @@ impl Supervisor {
         soul_id: SoulId,
         fixture: Option<FixtureKind>,
         terminal: Option<TerminalLaunchSpec>,
+        resume_spec: Option<ResumeSpec>,
         host: &AuthenticatedHost,
         grant: &ExecutionGrantRecord,
     ) -> Result<AcceptedGrant, RuntimeError> {
@@ -708,6 +831,7 @@ impl Supervisor {
             grant_id: grant.grant_id.clone(),
             fixture,
             terminal: terminal.map(Box::new),
+            resume_spec: resume_spec.map(Box::new),
         };
         match self
             .send_authenticated_host_command(incarnation_id, handle.runtime_dir(), host, command)
@@ -731,7 +855,7 @@ impl Supervisor {
         }
     }
 
-    async fn host_status(
+    pub(crate) async fn host_status(
         &self,
         incarnation_id: IncarnationId,
         runtime_dir: &Path,
@@ -751,12 +875,16 @@ impl Supervisor {
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
+                exited,
+                native_session_id,
                 ..
             } => Ok(HostStatus {
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
+                exited,
+                native_session_id,
             }),
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -765,7 +893,7 @@ impl Supervisor {
         }
     }
 
-    async fn send_host_stop(
+    pub(crate) async fn send_host_stop(
         &self,
         incarnation_id: IncarnationId,
         runtime_dir: &Path,
@@ -793,7 +921,7 @@ impl Supervisor {
         }
     }
 
-    async fn send_authenticated_host_command(
+    pub(crate) async fn send_authenticated_host_command(
         &self,
         incarnation_id: IncarnationId,
         runtime_dir: &Path,
@@ -819,7 +947,7 @@ impl Supervisor {
         reply.result
     }
 
-    async fn launch_result_from_status(
+    pub(crate) async fn launch_result_from_status(
         &self,
         incarnation_id: IncarnationId,
         _soul_id: SoulId,
@@ -851,22 +979,24 @@ impl Supervisor {
 }
 
 #[derive(Clone)]
-struct AuthenticatedHost {
+pub(crate) struct AuthenticatedHost {
     host_boot_id: HostBootId,
     secret: Vec<u8>,
     effective_limits: RuntimeLimits,
 }
-struct AcceptedGrant {
+pub(crate) struct AcceptedGrant {
     host_boot_id: HostBootId,
     worker_pid: u32,
     worker_launch_count: u64,
     fixture_evidence: serde_json::Value,
 }
-struct HostStatus {
-    host_boot_id: HostBootId,
-    worker_pid: Option<u32>,
-    worker_launch_count: u64,
-    fixture_evidence: serde_json::Value,
+pub(crate) struct HostStatus {
+    pub(crate) host_boot_id: HostBootId,
+    pub(crate) worker_pid: Option<u32>,
+    pub(crate) worker_launch_count: u64,
+    pub(crate) fixture_evidence: serde_json::Value,
+    pub(crate) exited: bool,
+    pub(crate) native_session_id: Option<String>,
 }
 
 pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result<(), String> {
@@ -952,7 +1082,9 @@ async fn find_view(
 fn map_registry(error: RegistryError) -> RuntimeError {
     let code = match &error {
         RegistryError::Busy => RuntimeErrorCode::RegistryBusy,
-        RegistryError::RequestConflict => RuntimeErrorCode::RequestIdConflict,
+        RegistryError::RequestConflict | RegistryError::InputConflict => {
+            RuntimeErrorCode::RequestIdConflict
+        }
         RegistryError::StaleControlEpoch { .. } => RuntimeErrorCode::StaleControlEpoch,
         RegistryError::UnknownSoul(_) => RuntimeErrorCode::UnknownSoul,
         RegistryError::UnknownIncarnation(_) => RuntimeErrorCode::UnknownIncarnation,
@@ -996,7 +1128,7 @@ fn write_secret_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn append_event(path: &Path, event: &str, data: serde_json::Value) {
+pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
     let Some(parent) = path.parent() else {
         return;
     };

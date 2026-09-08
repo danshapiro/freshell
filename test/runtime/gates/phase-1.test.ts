@@ -116,8 +116,16 @@ async function gate01BasicManagedRuntime(h: RuntimeHarness): Promise<void> {
   h.assert(caseId, resumed.ok === true && resumed.sessionId === created.sessionId, 'native-session fixture resumes only the exact identity', resumed)
   const history = await h.nativeFixtureCall(supervisor, native.view.incarnationId, { method: 'history' })
   h.assert(caseId, JSON.stringify(history.history) === JSON.stringify(['create', 'resume']), 'native-session fixture exposes persisted create/resume history', history)
-  const nativeStatePath = path.join(h.runtimeDir(supervisor, native.view.incarnationId), 'native-session-state.json')
-  h.assert(caseId, fs.existsSync(nativeStatePath), 'native-session fixture stores state on disk for later recovery gates')
+  const nativeState = JSON.parse(h.execOwnedContainerExact(
+    native.view.containerId,
+    ['cat', '/home/freshell/provider/native-session-state.json'],
+  ))
+  h.assert(
+    caseId,
+    nativeState.sessionId === created.sessionId && JSON.stringify(nativeState.history) === JSON.stringify(['create', 'resume']),
+    'native-session fixture stores exact provider identity/history in its soul-scoped provider volume',
+    nativeState,
+  )
   const nativeStop = dataOf(await h.adminOk(supervisor, h.stopBody(nativeSoul, epoch)), 'stop')
   h.assert(caseId, nativeStop.outcome === 'verified_empty', 'native-session fixture remains inside exact owned enclosure')
 }

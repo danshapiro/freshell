@@ -1144,6 +1144,13 @@ async fn handle_client_text(
                     .managed_input(&input.terminal_id, input.data.clone())
                     .await
                 {
+                    if let Some(reason) = managed_input_blocked_reason(&error) {
+                        return send(
+                            ws_tx,
+                            &managed_runtime_input_blocked(&input.terminal_id, reason),
+                        )
+                        .await;
+                    }
                     return send(
                         ws_tx,
                         &managed_runtime_error(
@@ -1761,8 +1768,14 @@ async fn handle_client_text(
             // refusal can never reach pre-reconcile ("frozen") clients — they
             // never send the request at all (§3).
             if pane_reconcile_v1 {
-                return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
-                    .await;
+                return handle_pane_reconcile(
+                    request,
+                    ws_tx,
+                    state,
+                    pane_reconcile_fresh_agent_v1,
+                    state.registry.managed_runtime_connection(conn_id),
+                )
+                .await;
             }
             // Capability not negotiated on THIS connection: answer explicitly.
             send(
@@ -2017,6 +2030,22 @@ fn opencode_rebind_precompute() -> Option<String> {
 /// — model/sandbox/permissionMode route to the app-server plan instead).
 /// Boot-snapshot settings. Extracted from `handle_create` so the auto-resume
 /// respawn seam (Task 4) derives launch params identically.
+fn configured_provider_settings(
+    state: &WsState,
+    mode: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(provider) = state.settings.coding_cli.providers.get(mode) else {
+        return (None, None, None);
+    };
+    let pick = |key: &str| {
+        provider
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    (pick("permissionMode"), pick("model"), pick("sandbox"))
+}
+
 fn cli_provider_settings(
     state: &WsState,
     mode: &str,
@@ -2024,11 +2053,7 @@ fn cli_provider_settings(
     if mode == "shell" || mode == "codex" {
         return (None, None, None);
     }
-    let Some(p) = state.settings.coding_cli.providers.get(mode) else {
-        return (None, None, None);
-    };
-    let pick = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    (pick("permissionMode"), pick("model"), pick("sandbox"))
+    configured_provider_settings(state, mode)
 }
 
 /// WS-side projection of [`CodexLaunchError`] keeping exactly the
@@ -2440,7 +2465,10 @@ pub(crate) struct LaunchPrep {
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
 fn managed_runtime_mode(mode: &str) -> bool {
-    matches!(mode, "shell" | "claude" | "opencode")
+    matches!(
+        mode,
+        "shell" | "claude" | "codex" | "opencode" | "amplifier"
+    )
 }
 
 fn managed_opencode_endpoint(
@@ -2487,12 +2515,12 @@ mod managed_runtime_id_tests {
     }
 
     #[test]
-    fn phase2_managed_modes_include_opencode_but_not_other_unmigrated_providers() {
-        assert!(managed_runtime_mode("shell"));
-        assert!(managed_runtime_mode("claude"));
-        assert!(managed_runtime_mode("opencode"));
-        assert!(!managed_runtime_mode("codex"));
-        assert!(!managed_runtime_mode("amplifier"));
+    fn phase3_managed_modes_cover_every_enabled_terminal_provider() {
+        for mode in ["shell", "claude", "codex", "opencode", "amplifier"] {
+            assert!(managed_runtime_mode(mode), "missing managed mode {mode}");
+        }
+        assert!(!managed_runtime_mode("gemini"));
+        assert!(!managed_runtime_mode("kimi"));
     }
 
     #[test]
@@ -2664,6 +2692,7 @@ async fn gate_wire_resume(
     resume_session_id: &mut Option<String>,
     launch_intent: &mut LaunchIntent,
     claude_fresh_prealloc: &mut bool,
+    intent: freshell_platform::resume_gate::ResumeIntent,
 ) -> ResumeGateCarry {
     // In-gate liveness precondition: legacy resumeSessionId-only
     // carriers bypass D7 in every ordering — a LIVE session must never
@@ -2705,14 +2734,24 @@ async fn gate_wire_resume(
         let probe = state.session_existence.clone();
         let mode_for_gate = mode.to_string();
         let rid = resume_session_id.take();
-        let intent = *launch_intent;
-        spawn_blocking_in_span(move || {
-            crate::resume_validation::validate_wire_resume(
-                &mode_for_gate,
-                rid,
-                intent,
-                probe.as_ref(),
-            )
+        let launch_intent_value = *launch_intent;
+        spawn_blocking_in_span(move || match intent {
+            freshell_platform::resume_gate::ResumeIntent::ManagedRecovery => {
+                crate::resume_validation::validate_managed_wire_resume(
+                    &mode_for_gate,
+                    rid,
+                    launch_intent_value,
+                    probe.as_ref(),
+                )
+            }
+            freshell_platform::resume_gate::ResumeIntent::UserCreate => {
+                crate::resume_validation::validate_wire_resume(
+                    &mode_for_gate,
+                    rid,
+                    launch_intent_value,
+                    probe.as_ref(),
+                )
+            }
         })
         .await
         .expect("resume validation task panicked")
@@ -2762,6 +2801,7 @@ pub(crate) async fn prepare_launch(
     create: &TerminalCreate,
     state: &WsState,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
+    managed_runtime_v1: bool,
 ) -> Result<PreparedLaunch, PrepareError> {
     // Same mode derivation handle_create uses (copy the exact expression
     // from handle_create's `mode` binding so the two sites can never
@@ -2784,6 +2824,11 @@ pub(crate) async fn prepare_launch(
                 &mut prep.resume_session_id,
                 &mut prep.launch_intent,
                 &mut prep.claude_fresh_prealloc,
+                if managed_runtime_v1 && managed_runtime_mode(&mode) {
+                    freshell_platform::resume_gate::ResumeIntent::ManagedRecovery
+                } else {
+                    freshell_platform::resume_gate::ResumeIntent::UserCreate
+                },
             )
             .await,
         )
@@ -2800,7 +2845,7 @@ pub(crate) async fn prepare_launch(
     // sessionRef/resumeSessionId keeps today's EXACT on-permit inline
     // planning path (LaunchClass::Interactive inside handle_create),
     // byte-identical to today.
-    let codex_launch = if prep.resume_session_id.is_some() {
+    let codex_launch = if !managed_runtime_v1 && prep.resume_session_id.is_some() {
         match plan_codex_managed_launch(
             state,
             &mode,
@@ -3280,6 +3325,11 @@ pub(crate) async fn handle_create(
                 &mut resume_session_id,
                 &mut launch_intent,
                 &mut claude_fresh_prealloc,
+                if use_managed_runtime {
+                    freshell_platform::resume_gate::ResumeIntent::ManagedRecovery
+                } else {
+                    freshell_platform::resume_gate::ResumeIntent::UserCreate
+                },
             )
             .await,
         ),
@@ -3325,7 +3375,7 @@ pub(crate) async fn handle_create(
     // below uses it (re-resolution is idempotent: an absolute unix path
     // passes through resolve_unix_shell_cwd unchanged).
     let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
-    if mode == "amplifier" {
+    if mode == "amplifier" && !use_managed_runtime {
         // Amplifier identity hardening (kata qmpk) — sequential, complementary
         // to the cross-mode D7 liveness guard above (PR #540): D7 rejects
         // cross-terminal session theft generically; these two are
@@ -3491,7 +3541,11 @@ pub(crate) async fn handle_create(
     // app-server plan instead). Boot-snapshot settings (same documented caveat
     // as `defaultCwd` above). Shared with the auto-resume respawn seam
     // (Task 4) via `cli_provider_settings`.
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, sandbox) = if use_managed_runtime {
+        configured_provider_settings(state, &mode)
+    } else {
+        cli_provider_settings(state, &mode)
+    };
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -3523,40 +3577,40 @@ pub(crate) async fn handle_create(
     // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
     // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
     // passes `m.cwd`).
-    let codex_launch = match prepared_codex.as_mut() {
-        // Restore path with a derived resume id: planned pre-gate (P1).
-        // take() disarms the guard — from here the existing failed-spawn
-        // arm and adopt path own the launch exactly as today. The None arm
-        // below serves interactive creates AND the A4 fresh-plan exclusion
-        // (restore:true codex with no derived resume session id): both plan
-        // on-permit inline, byte-identical to today.
-        Some(guard) => guard.take(),
-        None => match plan_codex_managed_launch(
-            state,
-            &mode,
-            create.cwd.as_deref(),
-            resume_session_id.as_deref(),
-            freshell_codex::launch_lifecycle::LaunchClass::Interactive,
-            None,
-        )
-        .await
-        {
-            Ok(launch) => launch,
-            Err(error) => {
-                // A thrown planCodexLaunch surfaces through the generic create catch
-                // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
-                // QueueFull/Cancelled are unreachable for Interactive-class
-                // `None`-cancel calls; `message()` keeps the frame text
-                // identical for `Failed`.
-                return send_create_error(
-                    out,
-                    ErrorCode::PtySpawnFailed,
-                    error.message(),
-                    &create.request_id,
-                )
-                .await;
-            }
-        },
+    let codex_launch = if use_managed_runtime && mode == "codex" {
+        // The soul session-host owns the app-server and loopback proxy. The
+        // web process must not create a sibling sidecar that disappears on a
+        // web restart or competes for the same thread writer.
+        None
+    } else {
+        match prepared_codex.as_mut() {
+            // Restore path with a derived resume id: planned pre-gate (P1).
+            // take() disarms the guard — from here the existing failed-spawn
+            // arm and adopt path own the launch exactly as today. The None arm
+            // below serves interactive creates AND the A4 fresh-plan exclusion.
+            Some(guard) => guard.take(),
+            None => match plan_codex_managed_launch(
+                state,
+                &mode,
+                create.cwd.as_deref(),
+                resume_session_id.as_deref(),
+                freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+                None,
+            )
+            .await
+            {
+                Ok(launch) => launch,
+                Err(error) => {
+                    return send_create_error(
+                        out,
+                        ErrorCode::PtySpawnFailed,
+                        error.message(),
+                        &create.request_id,
+                    )
+                    .await;
+                }
+            },
+        }
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
@@ -3571,9 +3625,7 @@ pub(crate) async fn handle_create(
 
     // MCP injection (§3.2 IO layer). Reference parity: a throw here propagates out
     // of buildSpawnSpec BEFORE the pty.spawn try — no cleanup call on this path.
-    let mcp_injection = if mode == "shell"
-        || (use_managed_runtime && matches!(mode.as_str(), "claude" | "opencode"))
-    {
+    let mcp_injection = if mode == "shell" || (use_managed_runtime && managed_runtime_mode(&mode)) {
         // Phase 2 managed providers must not depend on web-owned MCP files or
         // project-local mutations. Phase 3 replaces this with the durable tool router.
         McpInjection::default()
@@ -3812,6 +3864,9 @@ pub(crate) async fn handle_create(
             stream_id: stream_id.clone(),
             mode: mode.clone(),
             resume_session_id: resume_session_id.clone(),
+            provider_model: model.clone(),
+            provider_sandbox: sandbox.clone(),
+            provider_permission_mode: permission_mode.clone(),
             create_request_id: Some(create.request_id.clone()),
         };
         match state.registry.launch_managed(managed).await {
@@ -5099,6 +5154,7 @@ async fn handle_pane_reconcile(
     ws_tx: &mut WsSink,
     state: &WsState,
     pane_reconcile_fresh_agent_v1: bool,
+    managed_runtime_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
@@ -5114,6 +5170,39 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    if managed_runtime_v1 {
+        for pane in request
+            .panes
+            .iter()
+            .filter(|pane| pane.kind.as_deref() == Some("terminal"))
+        {
+            let Some(terminal_id) = pane.terminal_id.as_deref() else {
+                continue;
+            };
+            if state.registry.exists(terminal_id) {
+                continue;
+            }
+            match state
+                .registry
+                .adopt_managed_for_reconcile(terminal_id, pane.create_request_id.clone())
+                .await
+            {
+                Ok(true) => tracing::info!(
+                    terminal_id,
+                    pane_key = %pane.pane_key,
+                    "pane_reconcile.adopted_managed_terminal"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    terminal_id,
+                    pane_key = %pane.pane_key,
+                    %error,
+                    "pane_reconcile.managed_terminal_lookup_failed"
+                ),
+            }
+        }
+    }
+
     // Built ONCE per reconcile request and reused for any re-derivation of deps
     // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
     // snapshot would double-burn the respawn counter; V9 §3.6).
@@ -5707,6 +5796,32 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
 fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
     ServerMessage::TerminalInputBlocked(TerminalInputBlocked {
         reason: TerminalInputBlockedReason::UnknownTerminal,
+        terminal_id: terminal_id.to_string(),
+    })
+}
+
+fn managed_input_blocked_reason(detail: &str) -> Option<TerminalInputBlockedReason> {
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("recovery is in progress")
+        || normalized.contains("input was not dispatched")
+    {
+        Some(TerminalInputBlockedReason::ManagedRecoveryPending)
+    } else if normalized.contains("recovery ended in blocked")
+        || normalized.contains("recovery is blocked")
+        || normalized.contains("blocked_retry_budget")
+    {
+        Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
+    } else {
+        None
+    }
+}
+
+fn managed_runtime_input_blocked(
+    terminal_id: &str,
+    reason: TerminalInputBlockedReason,
+) -> ServerMessage {
+    ServerMessage::TerminalInputBlocked(TerminalInputBlocked {
+        reason,
         terminal_id: terminal_id.to_string(),
     })
 }
@@ -7899,7 +8014,11 @@ mod input_identity_tests {
 
 #[cfg(test)]
 mod terminal_dims_range_tests {
-    use super::{invalid_dims_error, terminal_dims_in_range, unknown_terminal_input_blocked};
+    use super::{
+        invalid_dims_error, managed_input_blocked_reason, managed_runtime_input_blocked,
+        terminal_dims_in_range, unknown_terminal_input_blocked,
+    };
+    use freshell_protocol::TerminalInputBlockedReason;
 
     #[test]
     fn rejects_zero_and_one_below_node_floor() {
@@ -7950,6 +8069,31 @@ mod terminal_dims_range_tests {
                 "type": "terminal.input.blocked",
                 "reason": "unknown_terminal",
                 "terminalId": "t-gone",
+            })
+        );
+    }
+
+    #[test]
+    fn managed_recovery_input_is_visibly_fenced() {
+        let pending = managed_input_blocked_reason(
+            "managed soul recovery is in progress; input was not dispatched",
+        )
+        .expect("pending recovery reason");
+        let blocked = managed_input_blocked_reason(
+            "managed soul recovery ended in Blocked: BLOCKED_RETRY_BUDGET",
+        )
+        .expect("blocked recovery reason");
+        assert_eq!(pending, TerminalInputBlockedReason::ManagedRecoveryPending);
+        assert_eq!(blocked, TerminalInputBlockedReason::ManagedRecoveryBlocked);
+
+        let json = serde_json::to_value(managed_runtime_input_blocked("managed-1", pending))
+            .expect("serialize managed input fence");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "terminal.input.blocked",
+                "reason": "managed_recovery_pending",
+                "terminalId": "managed-1",
             })
         );
     }

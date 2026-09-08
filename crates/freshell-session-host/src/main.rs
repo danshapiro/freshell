@@ -1,12 +1,15 @@
 mod command_journal;
 mod control;
 mod output_journal;
+mod providers;
 mod pty;
 
+use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, GrantId, HostBootId,
-    HostCommand, HostReply, HostResult, IncarnationId, RuntimeError, RuntimeErrorCode,
-    RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    HostCommand, HostReply, HostResult, IncarnationId, RecoveryPath, RecoveryProbe, ResumeSpec,
+    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec,
+    CONTROL_PROTOCOL_VERSION,
 };
 use pty::HostedPty;
 use serde::{Deserialize, Serialize};
@@ -68,7 +71,8 @@ async fn run() -> Result<(), String> {
         Some("worker") => worker(&args[2..]).await,
         Some("fixture-child") => fixture_child(&args[2..]).await,
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
-        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|opencode-identity-worker> ...".into()),
+        Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
+        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|opencode-identity-worker|provider-probe-worker> ...".into()),
     }
 }
 
@@ -202,6 +206,7 @@ async fn dispatch(
                     grant_id,
                     fixture,
                     terminal,
+                    resume_spec,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     if host_boot_id != state.host_boot_id {
@@ -218,6 +223,7 @@ async fn dispatch(
                         grant_id,
                         fixture,
                         terminal.map(|terminal| *terminal),
+                        resume_spec.map(|resume_spec| *resume_spec),
                     )
                     .await
                 }
@@ -239,8 +245,8 @@ async fn dispatch(
                     if let Some(child) = state.child.lock().await.as_mut() {
                         let _ = child.start_kill();
                     }
-                    if let Some(pty) = state.pty.lock().await.as_mut() {
-                        pty.stop();
+                    if let Some(mut pty) = state.pty.lock().await.take() {
+                        pty.stop().await;
                     }
                     append_event(&state.state_dir, "host.stop_requested", serde_json::json!({"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
                     Ok(HostResult::Stopped)
@@ -253,16 +259,46 @@ async fn dispatch(
                     ensure_incarnation(&incarnation_id, state)?;
                     let persisted = state.persisted.lock().await.clone();
                     let mut evidence = persisted.fixture_evidence;
+                    let mut exited = false;
+                    let mut native_session_id = None;
                     if let Some(pty) = state.pty.lock().await.as_ref() {
+                        exited = pty.exited();
+                        native_session_id = pty.native_session_id();
                         evidence = serde_json::json!({
                             "workload":"terminal",
                             "terminalId":pty.terminal_id(),
                             "streamEpoch":pty.stream_epoch(),
                             "headSeq":pty.head_seq(),
                             "spoolBytes":pty.spool_bytes(),
-                            "exited":pty.exited(),
+                            "exited":exited,
                             "exitCode":pty.exit_code(),
+                            "nativeSessionId":native_session_id,
                         });
+                    } else if let Some(child) = state.child.lock().await.as_mut() {
+                        exited = child
+                            .try_wait()
+                            .map_err(|error| {
+                                RuntimeError::new(
+                                    RuntimeErrorCode::HostUnreachable,
+                                    error.to_string(),
+                                )
+                            })?
+                            .is_some();
+                        let native_state =
+                            Path::new("/home/freshell/provider").join("native-session-state.json");
+                        if native_state.is_file() {
+                            native_session_id = std::fs::read(&native_state)
+                                .ok()
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                })
+                                .and_then(|value| {
+                                    value
+                                        .get("sessionId")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                });
+                        }
                     }
                     Ok(HostResult::Status {
                         host_boot_id: state.host_boot_id.clone(),
@@ -271,6 +307,8 @@ async fn dispatch(
                         max_control_epoch: persisted.max_control_epoch,
                         max_execution_generation: persisted.max_execution_generation,
                         fixture_evidence: evidence,
+                        exited,
+                        native_session_id,
                     })
                 }
                 HostCommand::TerminalInput {
@@ -328,6 +366,32 @@ async fn dispatch(
                     ensure_incarnation(&incarnation_id, state)?;
                     Ok(HostResult::RuntimeMetrics(read_runtime_metrics()))
                 }
+                HostCommand::ProbeRecovery {
+                    incarnation_id,
+                    resume_spec,
+                    creation_seed_ref,
+                    never_dispatched,
+                    run_as_uid,
+                    run_as_gid,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let probe = match resume_spec {
+                        Some(spec) => providers::probe_resume(*spec, run_as_uid, run_as_gid).await,
+                        None if never_dispatched => RecoveryProbe::PristineSeedReady {
+                            seed: creation_seed_ref,
+                            never_dispatched_proof: format!(
+                                "{}:command-journal-empty",
+                                state.incarnation_id
+                            ),
+                        },
+                        None => RecoveryProbe::DefinitivelyUnavailable {
+                            path: RecoveryPath::NativeResume,
+                            reason: "no durable native identity or checkpoint is recorded".into(),
+                            evidence: vec![state.state_dir.display().to_string()],
+                        },
+                    };
+                    Ok(HostResult::RecoveryProbe(probe))
+                }
                 HostCommand::Hello { .. } => unreachable!(),
             }
         }
@@ -355,6 +419,7 @@ async fn grant_execution(
     grant_id: GrantId,
     fixture: Option<FixtureKind>,
     terminal: Option<TerminalLaunchSpec>,
+    resume_spec: Option<ResumeSpec>,
 ) -> Result<HostResult, RuntimeError> {
     let mut persisted = state.persisted.lock().await;
     if control_epoch < persisted.max_control_epoch
@@ -413,9 +478,18 @@ async fn grant_execution(
                 .arg(&state.state_dir)
                 .arg("--soul-id")
                 .arg(soul_id.as_str())
+                .arg("--provider-state-dir")
+                .arg("/home/freshell/provider")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            if fixture == FixtureKind::NativeSession {
+                if let Some(resume) = resume_spec.as_ref() {
+                    command
+                        .arg("--resume-session-id")
+                        .arg(&resume.provider_session.native_session_id);
+                }
+            }
             let child = command.spawn().map_err(|e| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
@@ -437,20 +511,51 @@ async fn grant_execution(
             (pid, evidence)
         }
         (None, Some(terminal)) => {
+            let mut terminal = match resume_spec.as_ref() {
+                Some(resume) => prepare_terminal_for_resume(&terminal, resume)
+                    .map_err(|error| error.runtime_error())?,
+                None => terminal,
+            };
+            providers::prepare_provider_state_before_bootstrap(&mut terminal).map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("prepare managed provider state: {error}"),
+                )
+            })?;
+            transfer_host_created_provider_state(&terminal).map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("transfer managed provider state: {error}"),
+                )
+            })?;
             prepare_provider_bootstrap_files(&terminal).map_err(|error| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
                     format!("prepare provider bootstrap: {error}"),
                 )
             })?;
-            let hosted =
-                HostedPty::spawn(&state.state_dir, state.incarnation_id.clone(), &terminal)
-                    .map_err(|e| {
-                        RuntimeError::new(
-                            RuntimeErrorCode::HostUnreachable,
-                            format!("spawn managed terminal: {e}"),
-                        )
-                    })?;
+            let prepared = providers::prepare_terminal(terminal)
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("prepare managed provider: {error}"),
+                    )
+                })?;
+            let terminal = prepared.terminal;
+            let hosted = HostedPty::spawn(
+                &state.state_dir,
+                state.incarnation_id.clone(),
+                &terminal,
+                prepared.codex,
+            )
+            .await
+            .map_err(|e| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("spawn managed terminal: {e}"),
+                )
+            })?;
             let pid = hosted.pid();
             let evidence = serde_json::json!({
                 "workload":"terminal",
@@ -482,6 +587,61 @@ async fn grant_execution(
         worker_launch_count: persisted.worker_launch_count,
         fixture_evidence: persisted.fixture_evidence.clone(),
     })
+}
+
+fn transfer_host_created_provider_state(terminal: &TerminalLaunchSpec) -> Result<(), String> {
+    if terminal.mode != "amplifier" {
+        return Ok(());
+    }
+    let root = Path::new("/home/freshell/provider/.amplifier");
+    if !root.exists() {
+        return Ok(());
+    }
+    transfer_owned_tree(root, terminal.run_as_uid, terminal.run_as_gid, 10_000)
+}
+
+fn transfer_owned_tree(root: &Path, uid: u32, gid: u32, max_entries: usize) -> Result<(), String> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("canonicalize {}: {error}", root.display()))?;
+    let mut stack = vec![root.clone()];
+    let mut paths = Vec::new();
+    while let Some(path) = stack.pop() {
+        if paths.len() >= max_entries {
+            return Err(format!(
+                "provider state tree exceeded the {max_entries}-entry ownership bound"
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "provider state ownership transfer refuses symlink {}",
+                path.display()
+            ));
+        }
+        if !path.starts_with(&root) {
+            return Err(format!(
+                "provider state ownership transfer escaped {}",
+                root.display()
+            ));
+        }
+        paths.push(path.clone());
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)
+                .map_err(|error| format!("read {}: {error}", path.display()))?
+            {
+                let entry = entry.map_err(|error| error.to_string())?;
+                stack.push(entry.path());
+            }
+        }
+    }
+    // Children first, so the trusted host never loses traversal rights before
+    // all exact host-created files have been transferred.
+    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in paths {
+        set_owner(&path, uid, gid)?;
+    }
+    Ok(())
 }
 
 fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(), String> {
@@ -587,13 +747,25 @@ fn registry_like_error(error: String) -> RuntimeError {
 async fn worker(args: &[String]) -> Result<(), String> {
     let fixture = required_arg(args, "--fixture")?;
     let state_dir = PathBuf::from(required_arg(args, "--state-dir")?);
+    let provider_state_dir = optional_arg(args, "--provider-state-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.clone());
+    let resume_session_id = optional_arg(args, "--resume-session-id");
     let soul = required_arg(args, "--soul-id")?;
     match fixture.as_str() {
         "heartbeat" => heartbeat_worker(&state_dir, &soul).await,
         "descendants" => descendant_worker(&state_dir).await,
         "cpu_burner" => cpu_burner_worker(&state_dir).await,
         "memory_allocator" => memory_allocator_worker(&state_dir).await,
-        "native_session" => native_session_worker(&state_dir, &soul).await,
+        "native_session" => {
+            native_session_worker(
+                &state_dir,
+                &provider_state_dir,
+                &soul,
+                resume_session_id.as_deref(),
+            )
+            .await
+        }
         "security" => security_worker(&state_dir).await,
         _ => Err(format!("unknown fixture {fixture}")),
     }
@@ -668,6 +840,9 @@ async fn memory_allocator_worker(state_dir: &Path) -> Result<(), String> {
 enum NativeFixtureRequest {
     Create,
     Resume { session_id: String },
+    Remember { key: String, value: String },
+    Recall { key: String },
+    Checkpoint,
     History,
 }
 
@@ -676,6 +851,10 @@ enum NativeFixtureRequest {
 struct NativeFixtureState {
     session_id: String,
     history: Vec<String>,
+    #[serde(default)]
+    memory: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    checkpoint_revision: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -684,10 +863,51 @@ struct NativeFixtureResponse {
     ok: bool,
     session_id: Option<String>,
     history: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_revision: Option<u64>,
     error: Option<String>,
 }
 
-async fn native_session_worker(state_dir: &Path, soul: &str) -> Result<(), String> {
+async fn native_session_worker(
+    state_dir: &Path,
+    provider_state_dir: &Path,
+    soul: &str,
+    resume_session_id: Option<&str>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(provider_state_dir).map_err(|error| error.to_string())?;
+    let state_path = provider_state_dir.join("native-session-state.json");
+    if let Some(expected) = resume_session_id {
+        let (mut persisted, restored_revision) = if state_path.exists() {
+            (read_native_fixture_state(&state_path)?, None)
+        } else if let Some((revision, checkpoint)) =
+            read_latest_native_fixture_checkpoint(provider_state_dir)?
+        {
+            (checkpoint, Some(revision))
+        } else {
+            return Err(format!(
+                "native recovery expected {expected}, but durable provider state and verified checkpoints are absent"
+            ));
+        };
+        if persisted.session_id != expected {
+            return Err(format!(
+                "native recovery expected {expected}, durable state belongs to {}",
+                persisted.session_id
+            ));
+        }
+        if let Some(revision) = restored_revision {
+            persisted
+                .history
+                .push(format!("checkpoint_restore:{revision}"));
+            // Restore into the primary path without consuming the retained
+            // checkpoint. The source remains available for diagnostics.
+            write_native_fixture_state(&state_path, &persisted)?;
+        }
+        persisted.history.push("automatic_resume".into());
+        write_native_fixture_state(&state_path, &persisted)?;
+    }
+
     let socket_path = state_dir.join("native.sock");
     if socket_path.exists() {
         std::fs::remove_file(&socket_path).map_err(|e| e.to_string())?;
@@ -696,14 +916,19 @@ async fn native_session_worker(state_dir: &Path, soul: &str) -> Result<(), Strin
     set_mode(&socket_path, 0o600)?;
     atomic_write(
         &state_dir.join("native-session-ready.json"),
-        &serde_json::to_vec(&serde_json::json!({"socket":"native.sock","soulId":soul}))
-            .map_err(|e| e.to_string())?,
+        &serde_json::to_vec(&serde_json::json!({
+            "socket":"native.sock",
+            "soulId":soul,
+            "providerStateDir":provider_state_dir,
+            "resumedSessionId":resume_session_id,
+        }))
+        .map_err(|e| e.to_string())?,
     )?;
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
         let request: NativeFixtureRequest =
             read_frame(&mut stream).await.map_err(|e| e.to_string())?;
-        let response = handle_native_fixture_request(state_dir, soul, request)?;
+        let response = handle_native_fixture_request(provider_state_dir, soul, request)?;
         write_frame(&mut stream, &response)
             .await
             .map_err(|e| e.to_string())?;
@@ -711,11 +936,11 @@ async fn native_session_worker(state_dir: &Path, soul: &str) -> Result<(), Strin
 }
 
 fn handle_native_fixture_request(
-    state_dir: &Path,
+    provider_state_dir: &Path,
     soul: &str,
     request: NativeFixtureRequest,
 ) -> Result<NativeFixtureResponse, String> {
-    let state_path = state_dir.join("native-session-state.json");
+    let state_path = provider_state_dir.join("native-session-state.json");
     match request {
         NativeFixtureRequest::Create => {
             let state = if state_path.exists() {
@@ -724,6 +949,8 @@ fn handle_native_fixture_request(
                 let state = NativeFixtureState {
                     session_id: format!("fixture-native-{soul}"),
                     history: vec!["create".into()],
+                    memory: std::collections::BTreeMap::new(),
+                    checkpoint_revision: 0,
                 };
                 write_native_fixture_state(&state_path, &state)?;
                 state
@@ -741,6 +968,43 @@ fn handle_native_fixture_request(
             state.history.push("resume".into());
             write_native_fixture_state(&state_path, &state)?;
             Ok(native_fixture_ok(state))
+        }
+        NativeFixtureRequest::Remember { key, value } => {
+            if !state_path.exists() {
+                return Ok(native_fixture_error("session state does not exist"));
+            }
+            let mut state = read_native_fixture_state(&state_path)?;
+            state.memory.insert(key.clone(), value);
+            state.history.push(format!("remember:{key}"));
+            write_native_fixture_state(&state_path, &state)?;
+            Ok(native_fixture_ok(state))
+        }
+        NativeFixtureRequest::Recall { key } => {
+            if !state_path.exists() {
+                return Ok(native_fixture_error("session state does not exist"));
+            }
+            let state = read_native_fixture_state(&state_path)?;
+            let value = state.memory.get(&key).cloned();
+            let mut response = native_fixture_ok(state);
+            response.value = value;
+            Ok(response)
+        }
+        NativeFixtureRequest::Checkpoint => {
+            if !state_path.exists() {
+                return Ok(native_fixture_error("session state does not exist"));
+            }
+            let mut state = read_native_fixture_state(&state_path)?;
+            state.checkpoint_revision = state
+                .checkpoint_revision
+                .checked_add(1)
+                .ok_or_else(|| "native fixture checkpoint revision overflow".to_string())?;
+            let revision = state.checkpoint_revision;
+            state.history.push(format!("checkpoint:{revision}"));
+            write_native_fixture_state(&state_path, &state)?;
+            write_native_fixture_checkpoint(provider_state_dir, revision, &state)?;
+            let mut response = native_fixture_ok(state);
+            response.checkpoint_revision = Some(revision);
+            Ok(response)
         }
         NativeFixtureRequest::History => {
             if !state_path.exists() {
@@ -763,11 +1027,76 @@ fn write_native_fixture_state(path: &Path, state: &NativeFixtureState) -> Result
     )
 }
 
+fn native_fixture_checkpoint_dir(provider_state_dir: &Path) -> PathBuf {
+    provider_state_dir.join(".freshell/checkpoints/native-session")
+}
+
+fn write_native_fixture_checkpoint(
+    provider_state_dir: &Path,
+    revision: u64,
+    state: &NativeFixtureState,
+) -> Result<(), String> {
+    let directory = native_fixture_checkpoint_dir(provider_state_dir);
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    atomic_write(
+        &directory.join(format!("{revision}.json")),
+        &serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?,
+    )
+}
+
+fn read_latest_native_fixture_checkpoint(
+    provider_state_dir: &Path,
+) -> Result<Option<(u64, NativeFixtureState)>, String> {
+    let directory = native_fixture_checkpoint_dir(provider_state_dir);
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let mut latest: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(revision) = stem.parse::<u64>() else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|(current, _)| revision > *current)
+        {
+            latest = Some((revision, entry.path()));
+        }
+    }
+    let Some((revision, path)) = latest else {
+        return Ok(None);
+    };
+    let state = read_native_fixture_state(&path)?;
+    if state.checkpoint_revision != revision {
+        return Err(format!(
+            "checkpoint {} records revision {}",
+            path.display(),
+            state.checkpoint_revision
+        ));
+    }
+    Ok(Some((revision, state)))
+}
+
 fn native_fixture_ok(state: NativeFixtureState) -> NativeFixtureResponse {
+    let checkpoint_revision = (state.checkpoint_revision > 0).then_some(state.checkpoint_revision);
     NativeFixtureResponse {
         ok: true,
         session_id: Some(state.session_id),
         history: state.history,
+        value: None,
+        checkpoint_revision,
         error: None,
     }
 }
@@ -777,6 +1106,8 @@ fn native_fixture_error(message: &str) -> NativeFixtureResponse {
         ok: false,
         session_id: None,
         history: Vec::new(),
+        value: None,
+        checkpoint_revision: None,
         error: Some(message.into()),
     }
 }
@@ -981,12 +1312,15 @@ fn append_event(state_dir: &Path, event: &str, data: serde_json::Value) -> Resul
     file.sync_data().map_err(|e| e.to_string())
 }
 
-fn required_arg(args: &[String], key: &str) -> Result<String, String> {
+fn optional_arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|arg| arg == key)
         .and_then(|index| args.get(index + 1))
         .cloned()
-        .ok_or_else(|| format!("missing {key}"))
+}
+
+fn required_arg(args: &[String], key: &str) -> Result<String, String> {
+    optional_arg(args, key).ok_or_else(|| format!("missing {key}"))
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
@@ -1119,6 +1453,7 @@ mod tests {
                 grant_id: GrantId::new(),
                 fixture: Some(FixtureKind::Heartbeat),
                 terminal: None,
+                resume_spec: None,
             },
         );
         let error = dispatch(envelope, &state).await.unwrap_err();
@@ -1193,5 +1528,35 @@ mod tests {
 
     fn uuid_like() -> String {
         format!("{}-{}", std::process::id(), now_millis())
+    }
+
+    #[test]
+    fn host_created_provider_tree_transfers_exact_paths_and_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("provider/.amplifier/projects/p/sessions/s");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("metadata.json"), b"{}").unwrap();
+        transfer_owned_tree(
+            &dir.path().join("provider/.amplifier"),
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            32,
+        )
+        .unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        symlink(&outside, tree.join("escape")).unwrap();
+        let error = transfer_owned_tree(
+            &dir.path().join("provider/.amplifier"),
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            32,
+        )
+        .unwrap_err();
+        assert!(error.contains("refuses symlink"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
     }
 }
