@@ -230,6 +230,7 @@ export function getTerminalCreateStagger(): TerminalCreateStagger {
 }
 
 export function resetTerminalCreateStaggerForTests(): void {
+  singleton?.clear()
   singleton = null
 }
 ```
@@ -381,12 +382,19 @@ private sendCreateNow(msg: unknown) {
 
 Non-create paths (line 341 pendingMessages, line 510 hello, line 750/813 ping, line 898 terminal.interest) keep calling `this.sendNow(...)` directly.
 
-6. Clear the stagger on each `ready` frame. At the beginning of the `ready` block (line 263, right after `if (msg.type === 'ready') {`):
+6. Clear the stagger on disconnect AND on each `ready` frame. Between a socket disconnect and the next `ready`, stale timer callbacks from the dead socket can fire and call `sendNow` on the replacement socket (which may already be OPEN but not yet `ready`), reopening the crash window. Clear on both transitions:
+
+**On disconnect** — in the `handleDisconnect` method (or wherever `_state` transitions to `disconnected`/`connecting`, e.g. the `onclose`/`onerror` handlers). Add:
 ```typescript
       this.terminalCreateStagger.clear()
 ```
 
-This ensures stale entries from a dead socket are dropped before the ready handler flushes/re-sends creates through the fresh stagger.
+**On `ready`** — at the beginning of the `ready` block (line 263, right after `if (msg.type === 'ready') {`):
+```typescript
+      this.terminalCreateStagger.clear()
+```
+
+The disconnect clear drops stale callbacks that haven't fired yet. The ready clear is a belt-and-suspenders defense: if a callback fired between disconnect and ready (race window), the ready clear drops any remaining entries before the ready handler flushes/re-sends creates through the fresh stagger.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -402,11 +410,11 @@ Review the call sites for consistency. The `sendCreateNow` helper is the single 
 
 The stagger affects ALL tests that send `terminal.create` messages through the ws-client. Run the ws-client suites and the TerminalView lifecycle suites:
 
-Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client-protocol-reload.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
+Run: `npm run test:vitest -- run test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client-protocol-reload.test.ts test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-restart-recovery.test.tsx --config config/vitest/vitest.config.ts`
 
 Expected: PASS. Tests that assert `terminal.create` sends arrive immediately may need to advance fake timers by 450ms to flush the stagger. Do NOT reduce the stagger interval or disable the stagger for tests — the test must accommodate the real behavior.
 
-**Important:** Approximately 6 existing tests in `test/unit/client/lib/ws-client.test.ts` send `terminal.create` through the real `WsClient` and assert on `MockWebSocket.instances[N].sent` immediately after `await p` (which flushes microtasks only). The stagger's first send uses `setTimeout(0)` (a macrotask), which does not fire on `await`. These tests need `vi.advanceTimersByTime(0)` (for the first create) or `vi.advanceTimersByTime(450 * N)` (for N creates) added after `await p` and before asserting on `.sent`. The specific tests are: "connect-time queued create flushes after ready" (~line 137), "connect failure then ready flush sends queued create exactly once" (~line 153), "reconnect with unknown terminalId resends in-flight create" (~line 193), "does not resend a create after terminal.created already cleared it" (~line 212), "evicted queued creates" (~line 239), "resends an in-flight create after reconnect" (~line 271). Line numbers may drift; the implementer should identify all tests that send `terminal.create` and assert on `.sent` without advancing timers.
+**Important:** Approximately 6 existing tests in `test/unit/client/lib/ws-client.test.ts` AND several tests in `test/unit/client/lib/ws-client.reconcile.test.ts` send `terminal.create` through the real `WsClient` and assert on `MockWebSocket.instances[N].sent` immediately after `await p` (which flushes microtasks only). The stagger's first send uses `setTimeout(0)` (a macrotask), which does not fire on `await`. These tests need `vi.advanceTimersByTime(0)` (for the first create) or `vi.advanceTimersByTime(450 * N)` (for N creates) added after `await p` and before asserting on `.sent`. The specific tests in `ws-client.test.ts` are: "connect-time queued create flushes after ready" (~line 137), "connect failure then ready flush sends queued create exactly once" (~line 153), "reconnect with unknown terminalId resends in-flight create" (~line 193), "does not resend a create after terminal.created already cleared it" (~line 212), "evicted queued creates" (~line 239), "resends an in-flight create after reconnect" (~line 271). In `ws-client.reconcile.test.ts`: "keeps the legacy replay", "releases creates OUTSIDE the pending set", "without paneReconcileV1 the pre-ready flush is byte-identical", and any other test that flushes creates through the real WsClient. Line numbers may drift; the implementer should identify all tests that send `terminal.create` and assert on `.sent` without advancing timers.
 
 - [ ] **Step 7: Commit the task**
 
@@ -467,13 +475,19 @@ test.describe('restore create stagger', () => {
     // 8. Wait for all panes to anchor (allLeafTerminalIds)
     // 9. Read getSentWsMessagesWithTimestamps()
     // 10. Filter for type === 'terminal.create'
-    // 11. Assert: for every consecutive pair, timestamp[i+1] - timestamp[i] >= 400
-    // 12. Assert: all panes eventually anchor (no wedge)
+    // 11. Assert: at least 2 terminal.create messages were captured (cardinality check)
+    // 12. Assert: for every consecutive pair, timestamp[i+1] - timestamp[i] >= 400
+    // 13. Assert: all panes eventually anchor (no wedge)
   })
 })
 
-// Also add to RUST_ONLY_SPECS in test/e2e-browser/playwright.config.ts:
-//   /restore-create-stagger-rust\.spec\.ts$/
+// Also modify test/e2e-browser/playwright.config.ts:
+// 1. Add /restore-create-stagger-rust\.spec\.ts$/ to RUST_ONLY_SPECS array
+//    (excludes it from the match-all chromium project)
+// 2. Add /restore-create-stagger-rust\.spec\.ts$/ to the rust-chromium
+//    project's testMatch array (the explicit list that DOES collect rust-only specs)
+// Both additions are needed — RUST_ONLY_SPECS alone excludes from chromium but
+// does NOT include in rust-chromium (which has its own explicit testMatch list).
 ```
 
 Also modify `src/lib/test-harness.ts` to add timestamps:
@@ -549,7 +563,7 @@ Expected: PASS (existing specs unaffected by the additive `__sentAt` field).
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/lib/test-harness.ts test/e2e-browser/helpers/test-harness.ts test/e2e-browser/specs/restore-create-stagger-rust.spec.ts
+git add src/lib/test-harness.ts test/e2e-browser/helpers/test-harness.ts test/e2e-browser/specs/restore-create-stagger-rust.spec.ts test/e2e-browser/playwright.config.ts
 git commit -m "test(e2e): add restore-create-stagger e2e spec and sentWsMessage timestamps
 
 E2E spec persists multiple terminal panes, restarts the server, reloads,
