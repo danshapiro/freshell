@@ -358,6 +358,10 @@ export const RUST_ONLY_SPECS = [
   // against the REAL Rust server, same raw-WS second-device harness; landed
   // upstream unregistered (silent false green) — registered here.
   /sidebar-status-tier-sort-rust\.spec\.ts$/,
+  // Restore-create stagger (kata rf0v): owns its RustServer (ephemeral port)
+  // for restartAbrupt(); proves terminal.create wire sends are spaced
+  // >=400ms on reload. See docs/plans/2026-09-08-stagger-restore-launches.md
+  /restore-create-stagger-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -621,6 +625,10 @@ export default defineConfig({
         // Sidebar status-tier sort e2e pin (see the RUST_ONLY_SPECS entry + the
         // spec's doc comment; owns its RustServer on an ephemeral port).
         /sidebar-status-tier-sort-rust\.spec\.ts$/,
+        // Restore-create stagger (kata rf0v, see RUST_ONLY_SPECS entry):
+        // owns its RustServer on an ephemeral port; proves terminal.create
+        // wire sends are spaced >=400ms on reload.
+        /restore-create-stagger-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

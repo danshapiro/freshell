@@ -93,6 +93,14 @@ export class TestHarness {
     })
   }
 
+  async getSentWsMessagesWithTimestamps(): Promise<Array<{ __sentAt?: number; type?: string; requestId?: string }>> {
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getSentWsMessagesWithTimestamps?.() ?? []
+    })
+  }
+
   async clearSentWsMessages(): Promise<void> {
     await this.page.evaluate(() => {
       const harness = window.__FRESHELL_TEST_HARNESS__
