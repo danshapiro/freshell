@@ -217,6 +217,17 @@ export class RuntimeHarness {
     fs.writeFileSync(path.join(this.incidentsDir, `${sanitizeName(name)}.json`), JSON.stringify(value, null, 2))
   }
 
+  writeBrowserArtifact(name: string, value: unknown): string {
+    fs.mkdirSync(this.browserDir, { recursive: true })
+    const target = path.join(this.browserDir, `${sanitizeName(name)}.json`)
+    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    return target
+  }
+
+  writeProviderResults(value: unknown): void {
+    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(value, null, 2))
+  }
+
   writeSummary(summary: unknown): void {
     fs.writeFileSync(path.join(this.evidenceDir, 'summary.json'), JSON.stringify(summary, null, 2))
   }
@@ -622,7 +633,21 @@ export class RuntimeHarness {
     } else {
       // Always invoke the Phase 2 build so Docker validates the current
       // Dockerfile/provider pins. Layer caching keeps unchanged rebuilds cheap.
-      execFileSync('docker', ['build', '--pull=false', '-f', 'docker/runtime/Dockerfile', '-t', tag, '.'], { cwd: this.repoRoot, stdio: 'inherit' })
+      // BuildKit provenance captures the whole context digest, including files
+      // the image never copies, and therefore changes the manifest-list ID for
+      // an otherwise identical workload image. Disable attestations here so
+      // the exact image identity is a reproducible digest of the image itself.
+      execFileSync('docker', [
+        'build',
+        '--pull=false',
+        '--provenance=false',
+        '--sbom=false',
+        '-f',
+        'docker/runtime/Dockerfile',
+        '-t',
+        tag,
+        '.',
+      ], { cwd: this.repoRoot, stdio: 'inherit' })
       inspect = spawnSync('docker', ['image', 'inspect', tag, '--format', '{{.Id}}'], { encoding: 'utf8' })
     }
     this.imageRef = inspect.stdout.trim()

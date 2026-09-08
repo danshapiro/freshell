@@ -33,6 +33,17 @@ export class TerminalHelper {
   }
 
   /**
+   * Insert text through the focused xterm textarea as one browser input event.
+   * This exercises the same terminal input path without serializing a large
+   * command into one keydown/WebSocket acknowledgement per character.
+   */
+  async insertTextInTerminal(text: string, nth = 0): Promise<void> {
+    const container = this.getTerminalContainer(nth)
+    await container.click()
+    await this.page.keyboard.insertText(text)
+  }
+
+  /**
    * Press a key in the terminal (e.g., 'Enter', 'Escape', 'Tab').
    */
   async pressKey(key: string, nth = 0): Promise<void> {
@@ -46,6 +57,12 @@ export class TerminalHelper {
    */
   async executeCommand(command: string, nth = 0): Promise<void> {
     await this.typeInTerminal(command, nth)
+    await this.pressKey('Enter', nth)
+  }
+
+  /** Insert a command as one text-input event and press Enter. */
+  async executeCommandInserted(command: string, nth = 0): Promise<void> {
+    await this.insertTextInTerminal(command, nth)
     await this.pressKey('Enter', nth)
   }
 

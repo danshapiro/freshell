@@ -225,12 +225,12 @@ not broaden their legacy authority beyond the explicitly managed shell/Claude/Op
 
 | Runtime family | Current production ownership/spawn/reap seams | Required migration destination |
 |---|---|---|
-| Rust terminal/PTy | Managed shell/Claude use the session-host facade; non-managed modes still use `PtyTerminal::spawn_with_sink` and legacy `kill_all`. | Finish remaining terminal providers in Phase 3; managed rows must stay excluded from legacy kill/idle paths. |
+| Rust terminal/PTy | Managed shell/Claude/OpenCode use the session-host facade; non-managed modes still use `PtyTerminal::spawn_with_sink` and legacy `kill_all`. | Finish remaining terminal providers in Phase 3; managed rows must stay excluded from legacy kill/idle paths. |
 | Rust FreshClaude/Kilroy | `crates/freshell-freshagent/src/claude.rs` (Node bridge spawn, child kills, `/proc` tag sweep) | Phase 3 per-soul host transport + native provider recovery. |
 | Rust FreshCodex | `crates/freshell-freshagent/src/codex.rs` (app-server spawn/kill/exit watcher) | Phase 3 per-soul host transport + exact native session resume. |
 | Rust fresh-agent lease cleanup | `crates/freshell-freshagent/src/session_lease.rs` (PID/tree SIGTERM/SIGKILL) | Retire for managed sessions in favor of exact enclosure cleanup. |
 | Rust Codex terminal sidecar | `crates/freshell-codex/src/launch_lifecycle.rs` (detached launch, now hardened), `sidecar_sweep.rs`, and `transport.rs` | Fold into supervisor ownership; legacy safety fixes remain until last caller migrates. |
-| Rust OpenCode | `crates/freshell-opencode/src/serve.rs` + `transport.rs` (shared serve process, child/tag cleanup) | Phase 3 one managed OpenCode runtime per soul. |
+| Rust OpenCode | The managed terminal lane now runs one pinned OpenCode runtime per soul through the session host. `crates/freshell-opencode/src/serve.rs` + `transport.rs` still own the legacy shared serve process for non-managed callers. | Phase 3 routes managed tool traffic through the durable capability-scoped router and migrates the remaining legacy callers. |
 | Rust server shutdown coupling | `crates/freshell-server/src/main.rs` calls terminal `kill_all` and fresh-agent/sidecar shutdown routines | Managed runtimes must be absent from this shutdown fanout; web shutdown becomes connection-only. |
 | Node terminal/PTy | `server/terminal-registry.ts` (`pty.spawn`, kill, shutdown) | Remains legacy until a supervisor-backed Node client exists; must never claim `managedRuntimeV1`. |
 | Node coding CLI sessions | `server/coding-cli/session-manager.ts` | Same: legacy-only process ownership. |
@@ -259,10 +259,11 @@ is not complete until it has zero calls into these legacy ownership paths.
 - Destructive-test containment: `scripts/sandbox-test.sh --runtime-suite` and
   `scripts/sandbox-selftest.sh`.
 - Legacy R04/R05 hardening: Codex launch lifecycle + sidecar sweep regressions.
-- Production managed routing: explicit Rust `managedRuntimeV1` opt-in for shell
-  and Claude CLI; default/Node/non-negotiated routes remain legacy.
-- Pinned workload image: Ubuntu 24.04 + Node 22.23.2 + Claude Code 2.1.263;
-  machine-readable versions in `docker/runtime/provider-versions.json`.
+- Production managed routing: explicit Rust `managedRuntimeV1` opt-in for shell,
+  Claude CLI, and OpenCode; default/Node/non-negotiated routes remain legacy.
+- Pinned workload image: Ubuntu 24.04 + Node 22.23.2 + Claude Code 2.1.263 +
+  OpenCode 1.18.21; machine-readable versions in
+  `docker/runtime/provider-versions.json`.
 - Transactional resource admission, named profiles, bounded host replay/spool,
   durable input request dedupe, provider-home/worktree mounts, and safe
   credential-file bootstrap are Phase 2 contracts.
@@ -279,10 +280,14 @@ Run:
 npm run test:runtime -- gate phase-2 --require-live
 ```
 
-The gate executes `P1-G01` through `P1-G10` and writes reproducible evidence to
-`.runtime-evidence/<candidate-sha>/<run-id>/`. Missing/skipped cases, cleanup
-failure, or any unsafe destructive request fail the gate. Legacy process-kill
-regressions run through `scripts/sandbox-test.sh --runtime-suite`, whose no-network/read-only-root mode is validated by `scripts/sandbox-selftest.sh`.
+The gate executes cumulative `P1-G01` through `P1-G10` and `P2-G01` through
+`P2-G11`, imports commit- and image-bound browser/OpenCode receipts, and writes
+reproducible evidence to `.runtime-evidence/<candidate-sha>/<run-id>/`, including
+normalized browser artifacts and the actual provider version/model/native-session
+result. Missing/skipped cases, stale or wrong-image receipts, cleanup failure, or
+any unsafe destructive request fail the gate. Legacy process-kill regressions run
+through `scripts/sandbox-test.sh --runtime-suite`, whose no-network/read-only-root
+mode is validated by `scripts/sandbox-selftest.sh`.
 
 The runtime suite is excluded from ordinary Vitest discovery so `npm test`
 never performs destructive lifecycle tests accidentally.

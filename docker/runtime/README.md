@@ -3,7 +3,10 @@
 Phase 2 uses a digest-pinned workload image based on Node 22.23.2 with exact
 Claude Code 2.1.263 and OpenCode 1.18.21 installs. `provider-versions.json` is the machine-readable
 version receipt and `Dockerfile` must reproduce it; floating `latest` tags are
-not accepted by the supervisor or live gate.
+not accepted by the supervisor or live gate. The runtime harness disables
+BuildKit provenance/SBOM attestations for this local workload build so unrelated
+build-context metadata cannot change the image identity; the recorded `sha256:`
+therefore names the reproducible image manifest itself.
 
 The session-host binary is not baked into the image. The supervisor bind-mounts
 the exact candidate binary read-only at `/runtime/freshell-session-host`, so

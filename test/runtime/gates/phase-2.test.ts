@@ -112,12 +112,15 @@ async function gate01BrowserContinuityReceipt(h: RuntimeHarness): Promise<void> 
     'Run runtime-terminal-continuity-rust.spec.ts against the selected E2E backend and set FRESHELL_RUNTIME_BROWSER_RECEIPT to its JSON receipt.',
   )
   h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'browser receipt is an explicit P2-G01 PASS', receipt)
+  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'browser receipt belongs to the exact candidate commit', receipt)
+  h.assert(caseId, receipt.runtimeImage === h.imageRef, 'browser receipt used the exact reproducible workload image', receipt)
   h.assert(caseId, receipt.restartCycles === 10, 'browser continuity performed exactly ten web restart/crash cycles', receipt)
   for (const key of ['soulId', 'incarnationId', 'containerId', 'hostBootId', 'childPid']) {
     h.assert(caseId, typeof receipt[key] === 'string' || typeof receipt[key] === 'number', `browser receipt carries ${key}`, receipt)
   }
   h.assert(caseId, receipt.outputAdvanced === true && receipt.inputUsable === true, 'browser output/input survived web replacement', receipt)
   h.assert(caseId, receipt.viewAssociations === 1, 'browser retained one tab/view association', receipt)
+  h.writeBrowserArtifact('p2-g01-browser-continuity', receipt)
 }
 
 async function gate02BoundedReplayWhileWebAbsent(h: RuntimeHarness): Promise<void> {
@@ -227,11 +230,40 @@ async function gate03SupervisorRestartAdoptsHost(h: RuntimeHarness): Promise<voi
 
   const stale = await h.adminRaw(second, h.terminalInputBody(soulId, "echo SHOULD_NOT_RUN\n", epoch1), { requestId: newRequest() })
   h.assert(caseId, stale.result.Err?.code === 'STALE_CONTROL_EPOCH', 'old control epoch is rejected before terminal input', stale)
-  await h.adminOk(second, h.terminalInputBody(soulId, "echo P2_G03_CURRENT\n", epoch2), { requestId: newRequest() })
-  const output = await waitForOutput(h, second, soulId, epoch2, /P2_G03_CURRENT/)
-  h.assert(caseId, !output.includes('SHOULD_NOT_RUN'), 'stale control produced no terminal side effect', output)
-  const stop = dataOf(await h.adminOk(second, h.stopBody(soulId, epoch2)), 'stop')
-  h.assert(caseId, stop.outcome === 'verified_empty', 'adopted runtime remains authoritatively stoppable')
+
+  // Abrupt controller death: remove exactly the owned supervisor container
+  // without its graceful stop path, then adopt the same live host once more.
+  h.removeContainerExact(second.containerId)
+  h.assert(caseId, h.isContainerRunning(launch1.view.containerId), 'runtime survives abrupt supervisor removal', launch1)
+  const childAliveAfterCrash = h.execOwnedContainerExact(launch1.view.containerId, [
+    'sh', '-lc', `if test -d /proc/${childPid}; then printf alive; fi`,
+  ]).trim()
+  h.assert(caseId, childAliveAfterCrash === 'alive', 'long child PID survives abrupt supervisor removal', { childPid, childAliveAfterCrash })
+
+  const third = await h.startSupervisor({ scenarioId: 'p2-g03-adopt', volumeName: first.volumeName })
+  const epoch3 = await controlEpoch(h, third)
+  h.assert(caseId, epoch3 > epoch2, 'post-crash supervisor advances the durable control epoch again', { epoch1, epoch2, epoch3 })
+  const launch3 = dataOf(await h.adminOk(third, h.launchBody({
+    soulId,
+    limits: PHASE2_TEST_LIMITS,
+    profile: 'test_fixture',
+    projectKey: 'p2-adopt',
+    provider: 'shell',
+    terminal,
+    expectedControlEpoch: epoch3,
+  }), { requestId: newRequest() }), 'launch')
+  h.assert(caseId, launch3.view.incarnationId === launch1.view.incarnationId, 'same incarnation adopted after abrupt supervisor restart', { launch1, launch3 })
+  h.assert(caseId, launch3.view.containerId === launch1.view.containerId, 'same container adopted after abrupt supervisor restart', { launch1, launch3 })
+  h.assert(caseId, launch3.hostBootId === launch1.hostBootId && launch3.workerPid === launch1.workerPid, 'same host boot and PTY child survive abrupt supervisor restart', { launch1, launch3 })
+  h.assert(caseId, launch3.workerLaunchCount === 1, 'abrupt supervisor recovery did not launch a replacement provider', launch3)
+
+  const staleAfterCrash = await h.adminRaw(third, h.terminalInputBody(soulId, "echo SHOULD_NOT_RUN_AFTER_CRASH\n", epoch2), { requestId: newRequest() })
+  h.assert(caseId, staleAfterCrash.result.Err?.code === 'STALE_CONTROL_EPOCH', 'pre-crash control epoch is rejected before terminal input', staleAfterCrash)
+  await h.adminOk(third, h.terminalInputBody(soulId, "echo P2_G03_CURRENT\n", epoch3), { requestId: newRequest() })
+  const output = await waitForOutput(h, third, soulId, epoch3, /P2_G03_CURRENT/)
+  h.assert(caseId, !output.includes('SHOULD_NOT_RUN'), 'stale control produced no terminal side effect across either restart', output)
+  const stop = dataOf(await h.adminOk(third, h.stopBody(soulId, epoch3)), 'stop')
+  h.assert(caseId, stop.outcome === 'verified_empty', 'twice-adopted runtime remains authoritatively stoppable')
 }
 
 async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<void> {
@@ -242,6 +274,8 @@ async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<v
     'Run the real free-tier OpenCode leg of runtime-terminal-continuity-rust.spec.ts and set FRESHELL_RUNTIME_OPENCODE_RECEIPT.',
   )
   h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'real-OpenCode receipt is an explicit P2-G04 PASS', receipt)
+  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'OpenCode receipt belongs to the exact candidate commit', receipt)
+  h.assert(caseId, receipt.runtimeImage === h.imageRef, 'OpenCode receipt used the exact reproducible workload image', receipt)
   h.assert(caseId, receipt.provider === 'opencode', 'gate used the OpenCode provider', receipt)
   h.assert(caseId, receipt.opencodeVersion === '1.18.21', 'gate used the pinned OpenCode version', receipt)
   h.assert(caseId, receipt.model === 'opencode/big-pickle' && receipt.freeTier === true, 'gate used the pinned free-tier OpenCode model', receipt)
@@ -249,6 +283,23 @@ async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<v
   h.assert(caseId, receipt.sameNativeSession === true && receipt.sameIncarnation === true, 'native OpenCode identity and OS incarnation survive web restart', receipt)
   h.assert(caseId, receipt.toolCompletionCount === 1 && receipt.followupSucceeded === true, 'long tool completed once and follow-up succeeded', receipt)
   h.assert(caseId, receipt.providerLaunchCount === 1, 'restoration hid no replacement OpenCode launch', receipt)
+  h.writeBrowserArtifact('p2-g04-real-opencode-continuity', receipt)
+  h.writeProviderResults({
+    phase: 'phase-2',
+    workloadImage: h.imageRef,
+    opencode: {
+      status: 'PASS',
+      version: receipt.opencodeVersion,
+      model: receipt.model,
+      freeTier: receipt.freeTier,
+      nativeSessionId: receipt.nativeSessionId,
+      sameNativeSession: receipt.sameNativeSession,
+      sameIncarnation: receipt.sameIncarnation,
+      toolCompletionCount: receipt.toolCompletionCount,
+      followupSucceeded: receipt.followupSucceeded,
+      providerLaunchCount: receipt.providerLaunchCount,
+    },
+  })
 }
 
 async function gate05CpuQuota(h: RuntimeHarness): Promise<void> {
