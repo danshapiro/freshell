@@ -323,6 +323,19 @@ describe('WsClient terminal.create stagger', () => {
     // ... enqueue creates, disconnect, reconnect (ready)
     // ... assert stagger was cleared and re-sent creates start fresh
   })
+
+  it('clears the stagger on disconnect — stale timer does NOT fire on replacement socket before ready', () => {
+    // 1. Setup: WsClient with mock WebSocket, connect → ready
+    // 2. Send a terminal.create (first one fires immediately via setTimeout(0))
+    // 3. Send a second terminal.create (queued, timer armed for 450ms)
+    // 4. Disconnect the socket (simulate onclose)
+    // 5. Connect a replacement mock WebSocket (simulate reconnect, but do NOT deliver ready yet)
+    // 6. Advance fake timers by 450ms — the stale timer from step 3 would fire here
+    // 7. Assert the replacement socket received ZERO terminal.create messages
+    //    (the disconnect clear dropped the pending callback before it could fire)
+    // 8. Now deliver the ready frame
+    // 9. Assert the create is re-sent through the fresh stagger (via inFlightCreates replay)
+  })
 })
 ```
 
@@ -419,7 +432,7 @@ Expected: PASS. Tests that assert `terminal.create` sends arrive immediately may
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/lib/ws-client.ts test/unit/client/lib/ws-client.test.ts
+git add src/lib/ws-client.ts test/unit/client/lib/ws-client.test.ts test/unit/client/lib/ws-client.reconcile.test.ts
 git commit -m "feat(ws): route terminal.create through TerminalCreateStagger in WsClient
 
 All terminal.create wire sends now pass through the TerminalCreateStagger
