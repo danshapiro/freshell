@@ -10,6 +10,7 @@ default = []
 runtime-test-faults = []
 
 [dependencies]
+freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }

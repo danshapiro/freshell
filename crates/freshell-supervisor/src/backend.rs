@@ -8,7 +8,10 @@ use freshell_runtime_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
@@ -224,6 +227,53 @@ impl DockerEngineBackend {
     }
 }
 
+fn runtime_host_environment(
+    terminal: Option<&TerminalLaunchSpec>,
+) -> Result<Vec<String>, BackendError> {
+    let mut values = BTreeMap::new();
+    for key in [
+        "FRESHELL_RUNTIME_OUTPUT_RING_BYTES",
+        "FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            values.insert(key.to_string(), value);
+        }
+    }
+    if let Some(terminal) = terminal.filter(|terminal| terminal.mode == "codex") {
+        for key in [
+            "HOME",
+            "CODEX_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "TMPDIR",
+            "PATH",
+            "TERM",
+            "LANG",
+            "LC_ALL",
+        ] {
+            if let Some(value) = terminal.env.get(key) {
+                values.insert(key.to_string(), value.clone());
+            }
+        }
+        if terminal.program.contains(char::is_whitespace) || terminal.program.contains('\0') {
+            return Err(BackendError::InvalidConfig(
+                "managed Codex program must be one argument-safe executable token".into(),
+            ));
+        }
+        values.insert(
+            "CODEX_CMD".into(),
+            format!(
+                "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- {}",
+                terminal.run_as_uid, terminal.run_as_gid, terminal.program
+            ),
+        );
+    }
+    Ok(values
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect())
+}
+
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
     async fn create_stopped(
@@ -266,6 +316,7 @@ impl RuntimeBackend for DockerEngineBackend {
         let mut binds = vec![
             format!("{}:/runtime/freshell-session-host:ro", binary.display()),
             format!("{}:/run/freshell:rw", runtime_dir.display()),
+            format!("{}:/home/freshell/provider:rw", spec.provider_volume_name),
         ];
         let network_mode = if spec.terminal.is_some() {
             "bridge"
@@ -283,10 +334,6 @@ impl RuntimeBackend for DockerEngineBackend {
                     binds.push(format!("{}:{}:rw", git.display(), git.display()));
                 }
             }
-            binds.push(format!(
-                "{}:/home/freshell/provider:rw",
-                spec.provider_volume_name
-            ));
             for (index, source) in mounts.provider_bootstrap_files.iter().enumerate() {
                 binds.push(format!(
                     "{}:/run/freshell-bootstrap/provider-{index}:ro",
@@ -294,17 +341,7 @@ impl RuntimeBackend for DockerEngineBackend {
                 ));
             }
         }
-        let host_env: Vec<String> = [
-            "FRESHELL_RUNTIME_OUTPUT_RING_BYTES",
-            "FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES",
-        ]
-        .into_iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| format!("{key}={value}"))
-        })
-        .collect();
+        let host_env = runtime_host_environment(spec.terminal.as_ref())?;
         let cap_add: Vec<&str> = if spec.terminal.is_some() {
             vec!["CHOWN", "SETGID", "SETUID"]
         } else {
@@ -649,6 +686,45 @@ fn digest_expected(expected: &ExpectedConfig) -> Result<String, BackendError> {
     Ok(format!("sha256:{digest:x}"))
 }
 
+fn verify_runtime_environment(inspect: &Value, expected: &[String]) -> Result<(), BackendError> {
+    let actual = inspect
+        .get("Config")
+        .and_then(|config| config.get("Env"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| BackendError::OwnershipMismatch("missing runtime environment".into()))?;
+    let actual: std::collections::BTreeMap<String, String> = actual
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    for entry in expected {
+        let (key, expected_value) = entry
+            .split_once('=')
+            .ok_or_else(|| BackendError::InvalidConfig("runtime env entry has no '='".into()))?;
+        if actual.get(key).map(String::as_str) != Some(expected_value) {
+            return Err(BackendError::OwnershipMismatch(format!(
+                "runtime environment changed for {key}"
+            )));
+        }
+    }
+    for forbidden in [
+        "AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENCODE_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+    ] {
+        if actual.contains_key(forbidden) {
+            return Err(BackendError::OwnershipMismatch(format!(
+                "forbidden credential environment {forbidden} reached the session host"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(), BackendError> {
     let actual_image = value
         .get("Image")
@@ -682,6 +758,9 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             )));
         }
     }
+    let expected_env = runtime_host_environment(handle.terminal())?;
+    verify_runtime_environment(value, &expected_env)?;
+
     let host_config = value
         .get("HostConfig")
         .ok_or_else(|| BackendError::OwnershipMismatch("missing HostConfig".into()))?;
@@ -779,6 +858,15 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             "runtime mount topology changed".into(),
         ));
     }
+    let has_provider = mounts.iter().any(|mount| {
+        mount.get("Name").and_then(Value::as_str) == Some(handle.provider_volume_name())
+            && mount.get("Destination").and_then(Value::as_str) == Some("/home/freshell/provider")
+    });
+    if !has_provider {
+        return Err(BackendError::OwnershipMismatch(
+            "provider home volume changed".into(),
+        ));
+    }
     if let Some(terminal) = handle.terminal() {
         let expected =
             docker::terminal_mounts(terminal).map_err(BackendError::OwnershipMismatch)?;
@@ -805,15 +893,6 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                     ));
                 }
             }
-        }
-        let has_provider = mounts.iter().any(|m| {
-            m.get("Name").and_then(Value::as_str) == Some(handle.provider_volume_name())
-                && m.get("Destination").and_then(Value::as_str) == Some("/home/freshell/provider")
-        });
-        if !has_provider {
-            return Err(BackendError::OwnershipMismatch(
-                "provider home volume changed".into(),
-            ));
         }
         for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
             let source_text = source.to_string_lossy();
@@ -988,5 +1067,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.body, b"test");
+    }
+    #[test]
+    fn codex_host_environment_drops_to_the_provider_uid_and_uses_soul_home() {
+        let terminal = TerminalLaunchSpec {
+            terminal_id: "terminal-one".into(),
+            stream_id: "stream-one".into(),
+            mode: "codex".into(),
+            program: "codex".into(),
+            args: Vec::new(),
+            env: BTreeMap::from([
+                ("HOME".into(), "/home/freshell/provider".into()),
+                ("CODEX_HOME".into(), "/home/freshell/provider/.codex".into()),
+                ("AUTH_TOKEN".into(), "must-not-cross".into()),
+            ]),
+            cwd: "/workspace".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-one".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+        };
+        let env = runtime_host_environment(Some(&terminal)).unwrap();
+        assert!(env
+            .iter()
+            .any(|value| value == "HOME=/home/freshell/provider"));
+        assert!(env
+            .iter()
+            .any(|value| value == "CODEX_HOME=/home/freshell/provider/.codex"));
+        assert!(env.iter().any(|value| value == "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex"));
+        assert!(!env.iter().any(|value| value.contains("AUTH_TOKEN")));
+    }
+
+    #[test]
+    fn inspect_environment_requires_exact_host_policy_and_rejects_credentials() {
+        let expected = vec![
+            "HOME=/home/freshell/provider".to_string(),
+            "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex".to_string(),
+        ];
+        let good = serde_json::json!({
+            "Config": {"Env": [
+                "PATH=/usr/local/bin:/usr/bin:/bin",
+                "HOME=/home/freshell/provider",
+                "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex"
+            ]}
+        });
+        assert!(verify_runtime_environment(&good, &expected).is_ok());
+
+        let changed = serde_json::json!({
+            "Config": {"Env": [
+                "HOME=/home/freshell/provider",
+                "CODEX_CMD=codex"
+            ]}
+        });
+        assert!(matches!(
+            verify_runtime_environment(&changed, &expected),
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+
+        let leaked = serde_json::json!({
+            "Config": {"Env": [
+                "HOME=/home/freshell/provider",
+                "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex",
+                "OPENAI_API_KEY=secret"
+            ]}
+        });
+        assert!(matches!(
+            verify_runtime_environment(&leaked, &expected),
+            Err(BackendError::OwnershipMismatch(_))
+        ));
     }
 }

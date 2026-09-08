@@ -589,6 +589,10 @@ struct RestResumeOutcome {
     /// SESSION_MISSING outcome (b8ke ext r16 F3 — no substitution), after
     /// invoking `on_stale_resume` (the ledger retire).
     stale_session_id: Option<String>,
+    /// A managed recovery without positive native-session evidence must stop
+    /// before spawning, without retiring the durable identity.
+    blocked_recovery: bool,
+    blocked_session_id: Option<String>,
 }
 
 /// The Proceed shape — shared by [`validate_rest_resume`] and the wiring
@@ -602,44 +606,73 @@ fn rest_resume_passthrough(
         launch_intent,
         claude_fresh_prealloc: false,
         stale_session_id: None,
+        blocked_recovery: false,
+        blocked_session_id: None,
+    }
+}
+
+fn rest_resume_blocked(
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+) -> RestResumeOutcome {
+    RestResumeOutcome {
+        resume_session_id: None,
+        launch_intent,
+        claude_fresh_prealloc: false,
+        stale_session_id: None,
+        blocked_recovery: true,
+        blocked_session_id: resume_session_id,
     }
 }
 
 /// Door 3 gate (resume-validation): before the REST create pipeline turns a
 /// cached session id into resume argv, ask the disk-existence probe. On
-/// POSITIVE absence, fall back to the same shape a genuinely fresh pane of
-/// that mode uses (claude → new UUID + `Start`; amplifier → new UUID +
-/// `Resume`; codex/opencode → `None`). Unknown/unavailable, unvalidated
-/// providers, and `probe: None` (feature not wired — bare unit-test states)
-/// all fail open. Body mirrors `freshell_ws::resume_validation::
+/// POSITIVE absence, refuse the exact resume with SESSION_MISSING. A user
+/// create still fails open on unknown/unavailable evidence, an unvalidated
+/// provider, or `probe: None` (feature not wired in bare unit-test states).
+/// Managed recovery requires positive evidence and refuses in all of those
+/// cases. Body mirrors `freshell_ws::resume_validation::
 /// validate_wire_resume`, using the `ResumeProbeFn` injection shape because
 /// this crate must not depend on `freshell-ws`. SYNC by design: the wiring
 /// site runs it inside `tokio::task::spawn_blocking` (A13 — the probe does
-/// real filesystem walks). Minted UUIDs MUST be RFC-4122 v4 (`Uuid::new_v4()`,
-/// the crate's existing mint convention) — `is_canonical_claude_session_id`
-/// enforces version 1..=5 + RFC-4122 variant, so a v7 or nil UUID would fail
-/// [`plausible_resume_session_id`] and break the healed identity stamping.
+/// real filesystem walks).
 fn validate_rest_resume(
     mode: &str,
     resume_session_id: Option<String>,
     launch_intent: LaunchIntent,
     probe: Option<&freshell_platform::resume_gate::ResumeProbeFn>,
+    intent: freshell_platform::resume_gate::ResumeIntent,
 ) -> RestResumeOutcome {
     use freshell_platform::resume_gate::{
-        evaluate_resume_gate, provider_validated, ResumeGateDecision,
+        evaluate_resume_gate_for_intent, provider_validated, ResumeGateDecision, ResumeIntent,
     };
     let Some(probe) = probe else {
+        if intent == ResumeIntent::ManagedRecovery {
+            return rest_resume_blocked(resume_session_id, launch_intent);
+        }
         return rest_resume_passthrough(resume_session_id, launch_intent);
     };
     let Some(sid) = resume_session_id.clone().filter(|s| !s.is_empty()) else {
+        if intent == ResumeIntent::ManagedRecovery {
+            return rest_resume_blocked(resume_session_id, launch_intent);
+        }
         return rest_resume_passthrough(resume_session_id, launch_intent);
     };
     if !provider_validated(mode) {
+        if intent == ResumeIntent::ManagedRecovery {
+            return rest_resume_blocked(resume_session_id, launch_intent);
+        }
         return rest_resume_passthrough(resume_session_id, launch_intent);
     }
     let answer = probe(mode, &sid);
-    match evaluate_resume_gate(mode, answer.existence, answer.ever_observed_on_disk) {
+    match evaluate_resume_gate_for_intent(
+        mode,
+        answer.existence,
+        answer.ever_observed_on_disk,
+        intent,
+    ) {
         ResumeGateDecision::Proceed => rest_resume_passthrough(resume_session_id, launch_intent),
+        ResumeGateDecision::BlockedRecovery => rest_resume_blocked(Some(sid), launch_intent),
         ResumeGateDecision::SpawnFresh => {
             // b8ke ext r16 F3: the gate's SpawnFresh verdict REFUSES at the
             // consumer — the minted-fresh fallback fields are dead, so the
@@ -650,6 +683,8 @@ fn validate_rest_resume(
                 launch_intent,
                 claude_fresh_prealloc: false,
                 stale_session_id: Some(sid),
+                blocked_recovery: false,
+                blocked_session_id: None,
             }
         }
     }
@@ -1305,13 +1340,40 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         let rid = resume_session_id.take();
         let intent = launch_intent;
         tokio::task::spawn_blocking(move || {
-            validate_rest_resume(&mode_for_gate, rid, intent, probe.as_ref())
+            validate_rest_resume(
+                &mode_for_gate,
+                rid,
+                intent,
+                probe.as_ref(),
+                // REST tab/split/respawn requests are user creates. The
+                // server-wide managed controller does not prove this request
+                // is resurrecting an existing soul; recovery uses its own
+                // coordinator path with explicit durable identity.
+                freshell_platform::resume_gate::ResumeIntent::UserCreate,
+            )
         })
         .await
         .expect("resume validation task panicked")
     };
     let mut resume_session_id = rest_outcome.resume_session_id;
     let launch_intent = rest_outcome.launch_intent;
+    if rest_outcome.blocked_recovery {
+        let blocked = rest_outcome.blocked_session_id.as_deref().unwrap_or("");
+        tracing::warn!(target: "freshell_freshagent::terminal_tabs",
+            mode = %mode, session_id = %blocked, pane_id = %pane_id,
+            "spawn_refused: managed recovery has no positive native-session evidence"
+        );
+        let message = if blocked.is_empty() {
+            format!("The saved {mode} session could not be verified for recovery.")
+        } else {
+            format!("The saved {mode} session {blocked} could not be verified for recovery.")
+        };
+        return Err(crate::fail_json_code(
+            StatusCode::CONFLICT,
+            "RECOVERY_BLOCKED",
+            message,
+        ));
+    }
     if let Some(stale) = rest_outcome.stale_session_id.as_deref() {
         // b8ke ext r16 F3: a DEFINITIVELY MISSING exact-resume target no
         // longer auto-substitutes a replacement session (the request's
@@ -6808,6 +6870,146 @@ if (args.includes('app-server')) {{
         })
     }
 
+    struct UnusedManagedController;
+
+    impl freshell_terminal::registry::ManagedTerminalController for UnusedManagedController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String>,
+        > {
+            Box::pin(async { Err("unexpected managed lookup".into()) })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalLaunch,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<freshell_terminal::registry::ManagedTerminalDescriptor, String>,
+        > {
+            Box::pin(async { Err("unexpected managed launch".into()) })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: String,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unexpected managed input".into()) })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: u16,
+            _: u16,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unexpected managed resize".into()) })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Err("unexpected managed stop".into()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _: freshell_terminal::registry::ManagedTerminalDescriptor,
+            _: i64,
+            _: u64,
+        ) -> freshell_terminal::registry::ManagedTerminalFuture<
+            'a,
+            Result<freshell_terminal::registry::ManagedOutputRead, String>,
+        > {
+            Box::pin(async { Err("unexpected managed output read".into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_user_create_remains_user_create_when_managed_controller_is_installed() {
+        use freshell_platform::resume_gate::ResumeExistence;
+        let (stale_count, on_stale) = counting_on_stale_resume();
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "opencode",
+                &unique_argv_file("rest-managed-controller-gate"),
+            )]))
+            .with_resume_probe(probe_answering(ResumeExistence::Absent, true))
+            .with_on_stale_resume(on_stale);
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        registry.set_managed_controller(Some(Arc::new(UnusedManagedController)));
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "opencode",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "opencode", "sessionId": "ses_missing" },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("SESSION_MISSING"), "{body}");
+        assert_eq!(
+            stale_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ordinary REST creates retain the missing-session ledger transition"
+        );
+        assert!(registry.directory().is_empty(), "nothing was launched");
+    }
+
+    #[test]
+    fn rest_managed_recovery_without_native_evidence_cannot_pass_resume_through() {
+        use freshell_platform::resume_gate::{ResumeExistence, ResumeIntent};
+        for existence in [ResumeExistence::Absent, ResumeExistence::Unknown] {
+            let probe = probe_answering(existence, true);
+            let out = validate_rest_resume(
+                "claude",
+                Some("saved-session".into()),
+                LaunchIntent::Resume,
+                Some(&probe),
+                ResumeIntent::ManagedRecovery,
+            );
+            assert!(out.resume_session_id.is_none());
+            assert!(out.stale_session_id.is_none());
+            assert!(out.blocked_recovery);
+            assert_eq!(out.blocked_session_id.as_deref(), Some("saved-session"));
+        }
+        for (mode, session_id, probe) in [
+            ("claude", Some("saved-session".into()), None),
+            (
+                "claude",
+                None,
+                Some(probe_answering(ResumeExistence::Present, true)),
+            ),
+            (
+                "unsupported-provider",
+                Some("saved-session".into()),
+                Some(probe_answering(ResumeExistence::Present, true)),
+            ),
+        ] {
+            let out = validate_rest_resume(
+                mode,
+                session_id,
+                LaunchIntent::Resume,
+                probe.as_ref(),
+                ResumeIntent::ManagedRecovery,
+            );
+            assert!(out.blocked_recovery, "{mode} without recovery evidence");
+            assert!(out.resume_session_id.is_none());
+            assert!(out.stale_session_id.is_none());
+        }
+    }
+
     #[test]
     fn rest_resume_amplifier_absent_answers_the_missing_verdict() {
         use freshell_platform::resume_gate::ResumeExistence;
@@ -6817,6 +7019,7 @@ if (args.includes('app-server')) {{
             Some("stale-amp".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         // b8ke ext r16 F3: the SpawnFresh verdict carries ONLY the stale id
         // — the consumer refuses (no minted replacement).
@@ -6831,6 +7034,7 @@ if (args.includes('app-server')) {{
             Some("anything".into()),
             LaunchIntent::Resume,
             None,
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_eq!(out.resume_session_id.as_deref(), Some("anything"));
         assert!(out.stale_session_id.is_none());
@@ -6846,6 +7050,7 @@ if (args.includes('app-server')) {{
                 Some("ses_x".into()),
                 LaunchIntent::Resume,
                 Some(&probe),
+                freshell_platform::resume_gate::ResumeIntent::UserCreate,
             );
             assert_eq!(out.resume_session_id.as_deref(), Some("ses_x"));
         }
@@ -6860,6 +7065,7 @@ if (args.includes('app-server')) {{
             Some("stale-cx".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert!(out.resume_session_id.is_none());
         assert_eq!(out.stale_session_id.as_deref(), Some("stale-cx"));
@@ -6877,6 +7083,7 @@ if (args.includes('app-server')) {{
             Some("stale-cl".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert!(out.resume_session_id.is_none());
         assert_eq!(out.stale_session_id.as_deref(), Some("stale-cl"));

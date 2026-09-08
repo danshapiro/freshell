@@ -1,9 +1,11 @@
 #![cfg(feature = "managed-runtime-v1")]
 
-use freshell_runtime_client::RuntimeClient;
+use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    LaunchRequest, LaunchState, ProviderBootstrapFile, RequestId, RuntimeLimits, RuntimeProfile,
-    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    DesiredState, LaunchRequest, LaunchState, ProviderBootstrapFile, RecoveryBlockReason,
+    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryState, RecoveryTrigger, RequestId,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome,
+    TerminalLaunchSpec,
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
@@ -11,14 +13,24 @@ use freshell_terminal::registry::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
 };
+use tokio::sync::Mutex;
+
+#[derive(Default)]
+struct ManagedRecoveryState {
+    in_flight: Mutex<HashSet<String>>,
+    reset_pending: Mutex<HashSet<String>>,
+    blocked: Mutex<HashMap<String, String>>,
+}
 
 #[derive(Clone)]
 pub struct ServerManagedRuntimeController {
     client: RuntimeClient,
+    recovery: Arc<ManagedRecoveryState>,
 }
 
 impl ServerManagedRuntimeController {
@@ -40,11 +52,154 @@ impl ServerManagedRuntimeController {
             .health()
             .await
             .map_err(|e| format!("managed runtime supervisor health: {e}"))?;
-        Ok(Some(Arc::new(Self { client })))
+        let controller = Arc::new(Self {
+            client,
+            recovery: Arc::new(ManagedRecoveryState::default()),
+        });
+        controller.reconcile_startup().await?;
+        Self::spawn_death_observer(&controller);
+        Ok(Some(controller))
+    }
+
+    async fn reconcile_startup(&self) -> Result<(), String> {
+        let views = self
+            .client
+            .inventory()
+            .await
+            .map_err(|error| format!("managed runtime startup inventory: {error}"))?;
+        // Registry state cannot prove that a container or its provider process
+        // survived while the server was down. Probe every desired-running
+        // managed terminal; live ones cheaply reattach, dead ones replace.
+        for view in views.into_iter().filter(should_observe) {
+            self.schedule_recovery(view.soul_id, RecoveryTrigger::StartupReconcile)
+                .await;
+        }
+        Ok(())
+    }
+
+    fn spawn_death_observer(controller: &Arc<Self>) {
+        let weak = Arc::downgrade(controller);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                controller.observe_once().await;
+            }
+        });
+    }
+
+    async fn observe_once(&self) {
+        let Ok(views) = self.client.inventory().await else {
+            return;
+        };
+        for view in views.into_iter().filter(should_observe) {
+            let soul = view.soul_id;
+            if view.launch_state != LaunchState::Running
+                || view.recovery_state != RecoveryState::Live
+            {
+                self.schedule_recovery(soul, RecoveryTrigger::StartupReconcile)
+                    .await;
+                continue;
+            }
+            match self.client.read_output(soul.clone(), 0, 1).await {
+                Ok(output) if output.exited => {
+                    self.schedule_recovery(soul, RecoveryTrigger::ProviderExit)
+                        .await;
+                }
+                Err(error) if recoverable_host_error(&error) => {
+                    self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable)
+                        .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn recovery_in_flight(&self, soul_id: &str) -> bool {
+        self.recovery.in_flight.lock().await.contains(soul_id)
+    }
+
+    async fn take_recovery_reset(&self, soul_id: &str) -> bool {
+        self.recovery.reset_pending.lock().await.remove(soul_id)
+    }
+
+    async fn blocked_recovery(&self, soul_id: &str) -> Option<String> {
+        self.recovery.blocked.lock().await.get(soul_id).cloned()
+    }
+
+    async fn schedule_recovery(&self, soul: SoulId, trigger: RecoveryTrigger) {
+        let key = soul.to_string();
+        {
+            let mut in_flight = self.recovery.in_flight.lock().await;
+            if !in_flight.insert(key.clone()) {
+                return;
+            }
+        }
+        self.recovery.blocked.lock().await.remove(&key);
+        let client = self.client.clone();
+        let state = Arc::clone(&self.recovery);
+        tokio::spawn(async move {
+            if let Some(delay) = managed_recovery_test_delay() {
+                tokio::time::sleep(delay).await;
+            }
+            let result = recover_with_policy(&client, soul, trigger).await;
+            match result {
+                Ok(result) if result.outcome == RecoveryOutcome::Replaced => {
+                    state.reset_pending.lock().await.insert(key.clone());
+                    state.blocked.lock().await.remove(&key);
+                }
+                Ok(result) if result.outcome == RecoveryOutcome::Reattached => {
+                    state.blocked.lock().await.remove(&key);
+                }
+                Ok(result) => {
+                    state.blocked.lock().await.insert(
+                        key.clone(),
+                        format!(
+                            "managed soul recovery ended in {:?}: {}",
+                            result.outcome,
+                            recovery_probe_summary(result.probe.as_ref())
+                        ),
+                    );
+                }
+                Err(error) => {
+                    state.blocked.lock().await.insert(key.clone(), error);
+                }
+            }
+            state.in_flight.lock().await.remove(&key);
+        });
     }
 }
 
 impl ManagedTerminalController for ServerManagedRuntimeController {
+    fn lookup_terminal<'a>(
+        &'a self,
+        terminal_id: &'a str,
+        create_request_id: Option<String>,
+    ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+        Box::pin(async move {
+            let views = self
+                .client
+                .inventory()
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(view) = views.iter().rev().find(|view| {
+                view.terminal_id.as_deref() == Some(terminal_id)
+                    && view.desired_state == DesiredState::Running
+                    && !matches!(
+                        view.launch_state,
+                        LaunchState::Stopped | LaunchState::Failed
+                    )
+            }) else {
+                return Ok(None);
+            };
+            managed_descriptor_from_view(view, create_request_id).map(Some)
+        })
+    }
+
     fn launch<'a>(
         &'a self,
         request: ManagedTerminalLaunch,
@@ -116,6 +271,9 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     git_common_dir: git_common_dir.map(|p| p.to_string_lossy().into_owned()),
                     create_request_id: request.create_request_id.clone(),
                     resume_session_id: request.resume_session_id.clone(),
+                    provider_model: request.provider_model.clone(),
+                    provider_sandbox: request.provider_sandbox.clone(),
+                    provider_permission_mode: request.provider_permission_mode.clone(),
                     provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
                 }),
                 expected_control_epoch: None,
@@ -145,7 +303,49 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         data: String,
     ) -> ManagedTerminalFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let soul = SoulId::parse(terminal.soul_id).map_err(|e| e.to_string())?;
+            let soul_key = terminal.soul_id;
+            let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
+            if self.recovery_in_flight(&soul_key).await {
+                return Err(
+                    "managed soul recovery is in progress; input was not dispatched".into(),
+                );
+            }
+            if self.blocked_recovery(&soul_key).await.is_some() {
+                // New user input is an explicit retry/repair signal. Re-arm the
+                // persisted flap ceiling and prove continuity before accepting
+                // any bytes; never substitute a fresh provider session.
+                let recovered = self
+                    .client
+                    .recover(soul.clone(), RecoveryTrigger::ManualRetry)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match recovered.outcome {
+                    RecoveryOutcome::Reattached => {
+                        self.recovery.blocked.lock().await.remove(&soul_key);
+                    }
+                    RecoveryOutcome::Replaced => {
+                        self.recovery.blocked.lock().await.remove(&soul_key);
+                        self.recovery
+                            .reset_pending
+                            .lock()
+                            .await
+                            .insert(soul_key.clone());
+                    }
+                    _ => {
+                        let message = format!(
+                            "managed soul recovery ended in {:?}: {}",
+                            recovered.outcome,
+                            recovery_probe_summary(recovered.probe.as_ref())
+                        );
+                        self.recovery
+                            .blocked
+                            .lock()
+                            .await
+                            .insert(soul_key, message.clone());
+                        return Err(message);
+                    }
+                }
+            }
             self.client
                 .input(RequestId::new(), soul, data)
                 .await
@@ -174,9 +374,15 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         terminal: ManagedTerminalDescriptor,
     ) -> ManagedTerminalFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let soul = SoulId::parse(terminal.soul_id).map_err(|e| e.to_string())?;
+            let soul_key = terminal.soul_id;
+            let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
             match self.client.stop(soul).await.map_err(|e| e.to_string())? {
-                StopOutcome::VerifiedEmpty => Ok(()),
+                StopOutcome::VerifiedEmpty => {
+                    self.recovery.in_flight.lock().await.remove(&soul_key);
+                    self.recovery.reset_pending.lock().await.remove(&soul_key);
+                    self.recovery.blocked.lock().await.remove(&soul_key);
+                    Ok(())
+                }
                 other => Err(format!(
                     "managed runtime stop not verified empty: {other:?}"
                 )),
@@ -191,28 +397,66 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         max_bytes: u64,
     ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
         Box::pin(async move {
-            let soul = SoulId::parse(terminal.soul_id).map_err(|e| e.to_string())?;
-            let output = self
+            let soul_key = terminal.soul_id.clone();
+            let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
+            if let Some(error) = self.blocked_recovery(&soul_key).await {
+                return Err(error);
+            }
+            if self.recovery_in_flight(&soul_key).await {
+                return Ok(ManagedOutputRead {
+                    reset_required: false,
+                    truncated: false,
+                    retained_from_seq: after_seq,
+                    head_seq: after_seq,
+                    exit_code: None,
+                    native_session_id: terminal.resume_session_id,
+                    chunks: Vec::new(),
+                });
+            }
+            let output = match self
                 .client
                 .read_output(soul.clone(), after_seq.max(0) as u64, max_bytes)
                 .await
-                .map_err(|e| e.to_string())?;
-            if output.exited {
-                match self.client.stop(soul).await.map_err(|e| e.to_string())? {
-                    StopOutcome::VerifiedEmpty => {}
-                    other => {
-                        return Err(format!(
-                            "provider exited but managed enclosure stop was not verified empty: {other:?}"
-                        ))
-                    }
+            {
+                Ok(output) => output,
+                Err(error) if recoverable_host_error(&error) => {
+                    self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable)
+                        .await;
+                    return Ok(ManagedOutputRead {
+                        reset_required: false,
+                        truncated: false,
+                        retained_from_seq: after_seq,
+                        head_seq: after_seq,
+                        exit_code: None,
+                        native_session_id: terminal.resume_session_id,
+                        chunks: Vec::new(),
+                    });
                 }
+                Err(error) => return Err(error.to_string()),
+            };
+            if output.exited {
+                // Never hold the WS poll's 500ms timeout across stop/start or
+                // retry backoff. A single per-soul background task owns the
+                // 2s/10s retry policy and leaves the pane attached meanwhile.
+                self.schedule_recovery(soul, RecoveryTrigger::ProviderExit)
+                    .await;
             }
+            let recovered = self.take_recovery_reset(&soul_key).await;
             Ok(ManagedOutputRead {
-                reset_required: output.reset_required,
+                // Replacement starts a new durable output epoch. Force the
+                // consumer to reset its cursor instead of interpreting the new
+                // incarnation as a gap in the old stream.
+                reset_required: output.reset_required || recovered,
                 truncated: output.truncated,
                 retained_from_seq: output.retained_from_seq.min(i64::MAX as u64) as i64,
                 head_seq: output.head_seq.min(i64::MAX as u64) as i64,
-                exit_code: output.exited.then_some(output.exit_code.unwrap_or(0)),
+                // Provider exit is observed state, not user stop. Keep the pane
+                // alive while the recovery task runs or reports BLOCKED.
+                exit_code: if output.exited {
+                    None
+                } else {
+                    output.exit_code
+                },
                 native_session_id: output.native_session_id,
                 chunks: output
                     .frames
@@ -226,6 +470,138 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             })
         })
     }
+}
+
+fn should_observe(view: &RuntimeView) -> bool {
+    view.desired_state == DesiredState::Running && view.terminal_id.is_some()
+}
+
+fn managed_recovery_test_delay() -> Option<std::time::Duration> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var("FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|delay| *delay > 0 && *delay <= 10_000)
+        .map(std::time::Duration::from_millis)
+}
+
+fn recoverable_host_error(error: &ClientError) -> bool {
+    matches!(
+        error.runtime_code(),
+        Some(
+            RuntimeErrorCode::HostUnreachable
+                | RuntimeErrorCode::HostAuthenticationFailed
+                | RuntimeErrorCode::BackendUnavailable
+        )
+    )
+}
+
+const AUTOMATIC_RECOVERY_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(10),
+];
+
+async fn recover_with_policy(
+    client: &RuntimeClient,
+    soul: SoulId,
+    trigger: RecoveryTrigger,
+) -> Result<RecoveryResult, String> {
+    let mut last_result = None;
+    let mut last_error = None;
+    for attempt in 0..=AUTOMATIC_RECOVERY_RETRY_DELAYS.len() {
+        if attempt > 0 {
+            tokio::time::sleep(AUTOMATIC_RECOVERY_RETRY_DELAYS[attempt - 1]).await;
+        }
+        match client.recover(soul.clone(), trigger).await {
+            Ok(result) => {
+                if !automatic_retryable(&result) {
+                    return Ok(result);
+                }
+                last_result = Some(result);
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    if last_result.is_some() {
+        return client
+            .recover(soul, RecoveryTrigger::RetryExhausted)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    Err(last_error.unwrap_or_else(|| "managed recovery exhausted without a verdict".into()))
+}
+
+fn automatic_retryable(result: &RecoveryResult) -> bool {
+    if result.outcome != RecoveryOutcome::Blocked {
+        return false;
+    }
+    matches!(
+        result.probe.as_ref(),
+        Some(RecoveryProbe::Blocked {
+            reason: RecoveryBlockReason::RateLimited
+                | RecoveryBlockReason::ProviderUnavailable
+                | RecoveryBlockReason::StoreUnreadable
+                | RecoveryBlockReason::WorkspaceUnavailable
+                | RecoveryBlockReason::InsufficientResources
+                | RecoveryBlockReason::OldRuntimeNotEmpty,
+            ..
+        })
+    )
+}
+
+fn recovery_probe_summary(probe: Option<&RecoveryProbe>) -> String {
+    match probe {
+        Some(RecoveryProbe::Blocked {
+            reason, retry_hint, ..
+        }) => retry_hint
+            .repair
+            .clone()
+            .unwrap_or_else(|| format!("{reason:?}")),
+        Some(RecoveryProbe::DefinitivelyUnavailable { reason, .. }) => reason.clone(),
+        Some(RecoveryProbe::PristineSeedReady { .. }) => "pristine seed ready".into(),
+        Some(RecoveryProbe::ResumeReady { .. }) => "native resume ready".into(),
+        Some(RecoveryProbe::ReattachReady { .. }) => "reattach ready".into(),
+        None => "no recovery probe was returned".into(),
+    }
+}
+
+fn managed_descriptor_from_view(
+    view: &RuntimeView,
+    reconcile_create_request_id: Option<String>,
+) -> Result<ManagedTerminalDescriptor, String> {
+    let terminal_id = view
+        .terminal_id
+        .clone()
+        .ok_or_else(|| "managed runtime view has no terminal id".to_string())?;
+    let stream_id = view
+        .terminal_stream_id
+        .clone()
+        .ok_or_else(|| format!("managed terminal {terminal_id} has no durable stream id"))?;
+    let mode = view
+        .terminal_mode
+        .clone()
+        .or_else(|| view.provider.clone())
+        .ok_or_else(|| format!("managed terminal {terminal_id} has no durable mode"))?;
+    let cwd = view
+        .terminal_cwd
+        .clone()
+        .ok_or_else(|| format!("managed terminal {terminal_id} has no durable cwd"))?;
+    Ok(ManagedTerminalDescriptor {
+        soul_id: view.soul_id.to_string(),
+        incarnation_id: view.incarnation_id.to_string(),
+        terminal_id,
+        stream_id,
+        mode,
+        cwd,
+        resume_session_id: view
+            .native_session_id
+            .clone()
+            .or_else(|| view.terminal_resume_session_id.clone()),
+        create_request_id: reconcile_create_request_id
+            .or_else(|| view.terminal_create_request_id.clone()),
+    })
 }
 
 fn reusable_running_view(
@@ -292,6 +668,9 @@ fn managed_provider_env(
     source: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
     let mut env = managed_env_allowlist(source);
+    // Never persist the web host's PATH into a pinned workload image. It may
+    // contain host-only homes, version-manager shims, or credential helpers.
+    env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
     // Provider state belongs to this soul's Docker volume, not the web
     // server's inherited HOME. These paths are inside the workload.
     env.insert("HOME".into(), "/home/freshell/provider".into());
@@ -312,15 +691,32 @@ fn managed_provider_env(
         "XDG_CONFIG_HOME".into(),
         "/home/freshell/provider/.config".into(),
     );
+    env.insert(
+        "AMPLIFIER_HOME".into(),
+        "/home/freshell/provider/.amplifier".into(),
+    );
+    env.insert(
+        "FRESHELL_AMPLIFIER_HOME".into(),
+        "/home/freshell/provider/.amplifier".into(),
+    );
     if mode == "opencode" {
         env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
         // The legacy inline OpenCode config may contain credential-shaped
-        // values. Never persist it in supervisor state. Phase 2 carries only
-        // the invariant Freshell needs for safe conversation rollback.
-        env.insert(
-            "OPENCODE_CONFIG_CONTENT".into(),
-            r#"{"snapshot":false,"autoupdate":false}"#.to_string(),
-        );
+        // values. Never persist it in supervisor state. Rebuild a minimal,
+        // non-secret config and accept only the explicit permission enum used
+        // by managed-runtime policy and its live browser proof.
+        let permission = source
+            .get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+            .map(String::as_str)
+            .filter(|value| matches!(*value, "ask" | "allow" | "deny"));
+        let mut config = serde_json::json!({
+            "snapshot": false,
+            "autoupdate": false,
+        });
+        if let Some(permission) = permission {
+            config["permission"] = serde_json::json!({ "bash": permission });
+        }
+        env.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
     }
     env
 }
@@ -382,6 +778,29 @@ fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, St
             }
             ("FRESHELL_MANAGED_OPENCODE_AUTH_FILE", paths)
         }
+        "codex" => {
+            let mut paths = Vec::new();
+            if let Ok(dir) = std::env::var("CODEX_HOME") {
+                if !dir.trim().is_empty() {
+                    paths.push(PathBuf::from(dir).join("auth.json"));
+                }
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                if !home.trim().is_empty() {
+                    paths.push(PathBuf::from(home).join(".codex").join("auth.json"));
+                }
+            }
+            ("FRESHELL_MANAGED_CODEX_AUTH_FILE", paths)
+        }
+        "amplifier" => {
+            let mut paths = Vec::new();
+            if let Ok(home) = std::env::var("HOME") {
+                if !home.trim().is_empty() {
+                    paths.push(PathBuf::from(home).join(".amplifier").join("settings.yaml"));
+                }
+            }
+            ("FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE", paths)
+        }
         _ => return Ok(Vec::new()),
     };
 
@@ -408,6 +827,8 @@ fn provider_bootstrap_files_from_candidate(
     let provider_relative_path = match mode {
         "claude" => ".claude/.credentials.json",
         "opencode" => ".local/share/opencode/auth.json",
+        "codex" => ".codex/auth.json",
+        "amplifier" => ".amplifier/settings.yaml",
         _ => return Ok(Vec::new()),
     };
     let canonical = std::fs::canonicalize(&candidate)
@@ -533,9 +954,41 @@ mod tests {
             execution_generation: 1,
             effective_limits: None,
             terminal_id: Some("terminal-stable".into()),
+            terminal_stream_id: Some("stream-stable".into()),
+            terminal_mode: Some("opencode".into()),
+            terminal_cwd: Some("/workspace".into()),
+            terminal_create_request_id: Some("create-stable".into()),
+            terminal_resume_session_id: None,
             project_key: Some("project-test".into()),
             profile: Some(RuntimeProfile::DefaultAgent),
+            desired_state: freshell_runtime_protocol::DesiredState::Running,
+            recovery_state: freshell_runtime_protocol::RecoveryState::Live,
+            durability_state: freshell_runtime_protocol::DurabilityState::Unknown,
+            allocation_state: freshell_runtime_protocol::AllocationState::Allocated,
+            provider: Some("opencode".into()),
+            native_session_id: None,
+            recovery_reason: None,
+            prior_incarnation_id: None,
+            recovery_attempt_id: None,
+            evidence_revision: 0,
+            successful_recoveries_in_window: 0,
         };
+        assert!(should_observe(&running));
+        let descriptor = managed_descriptor_from_view(&running, Some("reconcile-create".into()))
+            .expect("durable managed descriptor");
+        assert_eq!(descriptor.terminal_id, "terminal-stable");
+        assert_eq!(descriptor.stream_id, "stream-stable");
+        assert_eq!(
+            descriptor.create_request_id.as_deref(),
+            Some("reconcile-create")
+        );
+        let mut stopped_intent = running.clone();
+        stopped_intent.desired_state = DesiredState::Stopped;
+        assert!(!should_observe(&stopped_intent));
+        let mut non_terminal = running.clone();
+        non_terminal.terminal_id = None;
+        assert!(!should_observe(&non_terminal));
+
         let reused =
             reusable_running_view(std::slice::from_ref(&running), &soul, "terminal-stable")
                 .unwrap()
@@ -577,10 +1030,14 @@ mod tests {
             env.get("XDG_CONFIG_HOME").map(String::as_str),
             Some("/home/freshell/provider/.config")
         );
-        assert_eq!(
-            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-            Some(r#"{"snapshot":false,"autoupdate":false}"#)
-        );
+        let config: serde_json::Value = serde_json::from_str(
+            env.get("OPENCODE_CONFIG_CONTENT")
+                .expect("managed OpenCode config"),
+        )
+        .unwrap();
+        assert_eq!(config["snapshot"], false);
+        assert_eq!(config["autoupdate"], false);
+        assert!(config.get("permission").is_none());
         assert_eq!(
             env.get("TMPDIR").map(String::as_str),
             Some("/run/opencode-tmp")
@@ -588,6 +1045,34 @@ mod tests {
         assert!(!env.contains_key("OPENCODE_TUI_CONFIG"));
         assert!(!env.contains_key("OPENCODE_API_KEY"));
         assert!(!env.values().any(|value| value.contains("do-not-persist")));
+    }
+
+    #[test]
+    fn managed_opencode_permission_policy_is_sanitized_and_persistable() {
+        for allowed in ["ask", "allow", "deny"] {
+            let source = std::collections::BTreeMap::from([(
+                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".to_string(),
+                allowed.to_string(),
+            )]);
+            let env = managed_provider_env("opencode", &source);
+            let config: serde_json::Value = serde_json::from_str(
+                env.get("OPENCODE_CONFIG_CONTENT")
+                    .expect("managed OpenCode config"),
+            )
+            .unwrap();
+            assert_eq!(config["permission"]["bash"], allowed);
+            assert!(!env.contains_key("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION"));
+        }
+
+        let source = std::collections::BTreeMap::from([(
+            "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".to_string(),
+            "ask-with-secret-text".to_string(),
+        )]);
+        let env = managed_provider_env("opencode", &source);
+        let config: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert!(config.get("permission").is_none());
+        assert!(!env.values().any(|value| value.contains("secret-text")));
     }
 
     #[test]
@@ -618,5 +1103,25 @@ mod tests {
             managed_provider_args("claude", args),
             vec!["--settings", "{}", "--session-id", "s1"]
         );
+    }
+    #[test]
+    fn codex_bootstrap_reference_targets_soul_auth_store_without_persisting_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = dir.path().join("auth.json");
+        std::fs::write(&auth, r#"{"tokens":{"access_token":"secret-bytes"}}"#).unwrap();
+        let files = provider_bootstrap_files_from_candidate("codex", Some(auth)).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].provider_relative_path, ".codex/auth.json");
+        assert!(!files[0].source_path.contains("secret-bytes"));
+    }
+
+    #[test]
+    fn amplifier_bootstrap_reference_targets_soul_settings_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.yaml");
+        std::fs::write(&settings, "bundle:\n  active: foundation\n").unwrap();
+        let files = provider_bootstrap_files_from_candidate("amplifier", Some(settings)).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].provider_relative_path, ".amplifier/settings.yaml");
     }
 }

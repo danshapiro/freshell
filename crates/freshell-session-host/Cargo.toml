@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+freshell-agent-runtime = { path = "../freshell-agent-runtime" }
+freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 freshell-terminal = { path = "../freshell-terminal" }
 freshell-platform = { path = "../freshell-platform" }

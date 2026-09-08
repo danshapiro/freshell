@@ -5,19 +5,21 @@ import { fileURLToPath } from 'node:url'
 import { RuntimeHarness } from './runtime-sandbox.js'
 import { PHASE1_CASE_IDS, runPhase1Gate, validateRequiredCoverage } from '../../test/runtime/gates/phase-1.test.js'
 import { PHASE2_CASE_IDS, runPhase2Gate } from '../../test/runtime/gates/phase-2.test.js'
+import { PHASE3_CASE_IDS, runPhase3Gate } from '../../test/runtime/gates/phase-3.test.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '../..')
 
-type GatePhase = 'phase-1' | 'phase-2'
+type GatePhase = 'phase-1' | 'phase-2' | 'phase-3'
 
 async function main(): Promise<number> {
   const args = process.argv.slice(2)
-  const phase = args[0] === 'gate' && (args[1] === 'phase-1' || args[1] === 'phase-2')
+  const phase = args[0] === 'gate'
+    && (args[1] === 'phase-1' || args[1] === 'phase-2' || args[1] === 'phase-3')
     ? args[1] as GatePhase
     : null
   if (!phase) {
-    console.error('usage: npm run test:runtime -- gate <phase-1|phase-2> --require-live')
+    console.error('usage: npm run test:runtime -- gate <phase-1|phase-2|phase-3> --require-live')
     return 1
   }
   if (!args.includes('--require-live')) {
@@ -34,13 +36,19 @@ async function main(): Promise<number> {
   const requiredCases = phaseManifest.cumulative_required_case_ids as string[]
   const codeCases = phase === 'phase-1'
     ? [...PHASE1_CASE_IDS]
-    : [...PHASE1_CASE_IDS, ...PHASE2_CASE_IDS]
+    : phase === 'phase-2'
+      ? [...PHASE1_CASE_IDS, ...PHASE2_CASE_IDS]
+      : [...PHASE1_CASE_IDS, ...PHASE2_CASE_IDS, ...PHASE3_CASE_IDS]
   if (JSON.stringify([...requiredCases].sort()) !== JSON.stringify([...codeCases].sort())) {
     console.error(`FAIL: gate implementation/manifest mismatch. manifest=${[...requiredCases].sort().join(',')} code=${[...codeCases].sort().join(',')}`)
     return 1
   }
 
-  const harness = new RuntimeHarness(repoRoot, undefined, phase === 'phase-2' ? 2 : 1)
+  const harness = new RuntimeHarness(
+    repoRoot,
+    undefined,
+    phase === 'phase-3' ? 3 : phase === 'phase-2' ? 2 : 1,
+  )
   const executed: string[] = []
   let blockedCases: Array<{ caseId: string; message: string; evidence?: unknown }> = []
   let primaryError: unknown
@@ -51,12 +59,21 @@ async function main(): Promise<number> {
     await runPhase1Gate(harness, (caseId) => executed.push(caseId))
     validateRequiredCoverage(PHASE1_CASE_IDS, executed.filter((id) => id.startsWith('P1-')))
 
-    if (phase === 'phase-2') {
+    if (phase === 'phase-2' || phase === 'phase-3') {
       const result = await runPhase2Gate(harness, (caseId) => executed.push(caseId))
-      blockedCases = result.blocked
+      blockedCases.push(...result.blocked)
     }
 
-    const safetyCase = phase === 'phase-2' ? 'P2-G11' : 'P1-G10'
+    if (phase === 'phase-3') {
+      const result = await runPhase3Gate(harness, (caseId) => executed.push(caseId))
+      blockedCases.push(...result.blocked)
+    }
+
+    const safetyCase = phase === 'phase-3'
+      ? 'P3-G12'
+      : phase === 'phase-2'
+        ? 'P2-G11'
+        : 'P1-G10'
     harness.assert(
       safetyCase,
       harness.broker.unsafeAttempts().length === 0,

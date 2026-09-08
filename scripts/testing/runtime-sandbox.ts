@@ -69,7 +69,7 @@ export class RuntimeGateBlockedError extends Error {
 
 export class RuntimeHarness {
   readonly repoRoot: string
-  readonly phase: 1 | 2
+  readonly phase: 1 | 2 | 3
   readonly runId: string
   readonly candidateSha: string
   readonly testRoot: string
@@ -94,7 +94,7 @@ export class RuntimeHarness {
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
 
-  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 = 1) {
+  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 = 1) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.phase = phase
     this.runId = runId
@@ -120,9 +120,21 @@ export class RuntimeHarness {
 
     const sourceManifest = JSON.parse(fs.readFileSync(path.join(this.repoRoot, 'test/runtime/gate-manifest.json'), 'utf8'))
     fs.writeFileSync(path.join(this.evidenceDir, 'manifest.json'), JSON.stringify({ ...sourceManifest, execution: { candidateSha: this.candidateSha, runId: this.runId, startedAt: new Date().toISOString() } }, null, 2))
-    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(this.phase === 1
+    const providerResults = this.phase === 1
       ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
-      : { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true }, workloadImage: 'pinned' }, null, 2))
+      : this.phase === 2
+        ? { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true }, workloadImage: 'pinned' }
+        : {
+            phase: 'phase-3',
+            deterministicFixture: { provider: 'native-session-fixture', status: 'pending-live-gate' },
+            providers: {
+              claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
+              opencode: { status: 'pending-receipt', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true },
+              codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
+              amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
+            },
+          }
+    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(providerResults, null, 2))
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
     this.ensureRuntimeImage()
@@ -469,6 +481,22 @@ export class RuntimeHarness {
     return { method: 'runtime_metrics', params: { soulId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
   }
 
+  inventoryBody(): any {
+    return { method: 'inventory' }
+  }
+
+  probeRecoveryBody(soulId: string, expectedControlEpoch?: number): any {
+    return { method: 'probe_recovery', params: { soulId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
+  recoverBody(
+    soulId: string,
+    trigger: 'provider_exit' | 'host_unreachable' | 'startup_reconcile' | 'manual_retry' | 'retry_exhausted' | 'explicit_request' = 'explicit_request',
+    expectedControlEpoch?: number,
+  ): any {
+    return { method: 'recover', params: { soulId, trigger, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
   stopBody(soulId: string, expectedControlEpoch?: number): any {
     return { method: 'stop', params: { soulId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
   }
@@ -510,6 +538,20 @@ export class RuntimeHarness {
     if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to restart non-receipt container ${containerId}`)
     const result = spawnSync('docker', ['restart', '-t', '1', containerId], { encoding: 'utf8' })
     if (result.status !== 0) throw new Error(result.stderr || `docker restart failed for owned runtime ${containerId}`)
+  }
+
+  stopOwnedRuntimeExact(containerId: string): void {
+    if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to stop non-receipt container ${containerId}`)
+    if (!this.isContainerRunning(containerId)) return
+    const result = spawnSync('docker', ['stop', '-t', '1', containerId], { encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for owned runtime ${containerId}`)
+  }
+
+  killOwnedRuntimeExact(containerId: string): void {
+    if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to kill non-receipt container ${containerId}`)
+    if (!this.isContainerRunning(containerId)) return
+    const result = spawnSync('docker', ['kill', containerId], { encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(result.stderr || `docker kill failed for owned runtime ${containerId}`)
   }
 
   execOwnedContainerExact(containerId: string, command: string[]): string {
@@ -656,7 +698,12 @@ export class RuntimeHarness {
 
   private phase2BootstrapFiles(): string[] {
     const files = new Set<string>()
-    for (const key of ['FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE', 'FRESHELL_MANAGED_OPENCODE_AUTH_FILE']) {
+    for (const key of [
+      'FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE',
+      'FRESHELL_MANAGED_OPENCODE_AUTH_FILE',
+      'FRESHELL_MANAGED_CODEX_AUTH_FILE',
+      'FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE',
+    ]) {
       const configured = process.env[key]?.trim()
       if (!configured) continue
       try {

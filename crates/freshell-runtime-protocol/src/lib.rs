@@ -85,16 +85,18 @@ pub struct ProviderSessionRef {
     pub native_session_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DesiredState {
+    #[default]
     Running,
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryState {
+    #[default]
     Live,
     Recovering,
     Blocked,
@@ -102,14 +104,238 @@ pub enum RecoveryState {
     Stopped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityState {
+    #[default]
     Unknown,
     LiveOnly,
     ResumeCaptured,
     CheckpointCaptured,
     IntrinsicallyNonResumable,
+}
+
+/// Materialization is deliberately separate from provider-id allocation. A
+/// provider-minted id is not durable continuity evidence until its store has
+/// been inspected and the identity is uniquely bound to the soul.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationState {
+    #[default]
+    Allocated,
+    Materializing,
+    VerifiedDurable,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPath {
+    Reattach,
+    NativeResume,
+    CheckpointRestore,
+    PristineSeed,
+    NativeImport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryTrigger {
+    ProviderExit,
+    HostUnreachable,
+    StartupReconcile,
+    ManualRetry,
+    /// Records that the bounded automatic 2s/10s retry policy is exhausted.
+    /// This is a blocked verdict, never evidence of loss.
+    RetryExhausted,
+    ExplicitRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RecoveryBlockReason {
+    CredentialsExpired,
+    RateLimited,
+    ProviderUnavailable,
+    StoreUnreadable,
+    StoreMissing,
+    WorkspaceUnavailable,
+    IncompatibleBinary,
+    UnsupportedProtocol,
+    AmbiguousIdentity,
+    ImplementationUnavailable,
+    InsufficientResources,
+    RetryBudget,
+    StopIntent,
+    OldRuntimeNotEmpty,
+    WrongNativeIdentity,
+    CommandAmbiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryHint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_after_ms: Option<u64>,
+    pub manual_retry: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<String>,
+}
+
+pub const RESUME_SPEC_SCHEMA_VERSION: u32 = 1;
+
+fn default_resume_spec_schema_version() -> u32 {
+    RESUME_SPEC_SCHEMA_VERSION
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityProvenance {
+    #[default]
+    Unknown,
+    Preallocated,
+    ProviderObserved,
+    Imported,
+    FixtureObserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderVolumeRef {
+    pub volume_name: String,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurablePosition {
+    #[serde(default)]
+    pub accepted_command_count: u64,
+    #[serde(default)]
+    pub completed_command_count: u64,
+    #[serde(default)]
+    pub output_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointReference {
+    pub kind: String,
+    pub reference: String,
+    pub revision: u64,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialReference {
+    /// Relative path under the soul-scoped provider home. Credential bytes
+    /// never enter the supervisor registry or control protocol.
+    pub provider_relative_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSpec {
+    #[serde(default = "default_resume_spec_schema_version")]
+    pub schema_version: u32,
+    pub provider_session: ProviderSessionRef,
+    pub mode: String,
+    #[serde(default)]
+    pub runtime_variant: String,
+    pub program: String,
+    #[serde(default)]
+    pub resume_argv: Vec<String>,
+    pub provider_home: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_volume: Option<ProviderVolumeRef>,
+    pub cwd: String,
+    pub workspace_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_profile: Option<RuntimeProfile>,
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_version: Option<String>,
+    #[serde(default)]
+    pub credential_references: Vec<CredentialReference>,
+    #[serde(default)]
+    pub identity_provenance: IdentityProvenance,
+    #[serde(default)]
+    pub durable_position: DurablePosition,
+    #[serde(default)]
+    pub checkpoint_references: Vec<CheckpointReference>,
+    pub creation_seed_ref: String,
+    pub checkpoint_revision: u64,
+    pub allocation_state: AllocationState,
+    pub evidence_revision: u64,
+    /// True only when the durable command journal proves no provider input was
+    /// ever dispatched. It is the sole authority for pristine-seed recovery.
+    pub never_dispatched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReattachHandle {
+    pub incarnation_id: IncarnationId,
+    pub host_boot_id: HostBootId,
+    pub container_id: String,
+}
+
+/// A probe is evidence, not a command. In particular `Blocked` and
+/// `DefinitivelyUnavailable` remain distinct so temporary failures can never
+/// be promoted to loss merely because retries were exhausted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum RecoveryProbe {
+    ReattachReady {
+        handle: ReattachHandle,
+        protocol_version: u32,
+    },
+    ResumeReady {
+        resume_spec: Box<ResumeSpec>,
+        evidence_revision: u64,
+    },
+    PristineSeedReady {
+        seed: String,
+        never_dispatched_proof: String,
+    },
+    DefinitivelyUnavailable {
+        path: RecoveryPath,
+        reason: String,
+        #[serde(default)]
+        evidence: Vec<String>,
+    },
+    Blocked {
+        path: RecoveryPath,
+        reason: RecoveryBlockReason,
+        retry_hint: RetryHint,
+        #[serde(default)]
+        evidence: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryOutcome {
+    Reattached,
+    Replaced,
+    Blocked,
+    Lost,
+    Stopped,
+    AlreadyLive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +403,12 @@ pub enum RuntimeErrorCode {
     OutputCursorExpired,
     UnsupportedWorkload,
     FaultInjected,
+    RecoveryBlocked,
+    RecoveryImplementationUnavailable,
+    RecoveryWrongIdentity,
+    RecoveryRetryBudget,
+    RecoveryInProgress,
+    RecoveryStopUnconfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +490,14 @@ pub struct TerminalLaunchSpec {
     pub create_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
+    /// Provider settings needed by host-owned helper services (notably the
+    /// Codex app-server). These are ordinary launch policy, never credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
 }
@@ -286,6 +526,24 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
+        }
+        for (name, value) in [
+            ("providerModel", self.provider_model.as_deref()),
+            ("providerSandbox", self.provider_sandbox.as_deref()),
+            (
+                "providerPermissionMode",
+                self.provider_permission_mode.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                if value.is_empty() || value.len() > 256 || value.chars().any(|ch| ch.is_control())
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        format!("managed terminal {name} is empty, oversized, or contains control characters"),
+                    ));
+                }
+            }
         }
         for file in &self.provider_bootstrap_files {
             let source = std::path::Path::new(&file.source_path);
@@ -512,6 +770,28 @@ pub struct StopRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryProbeRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverRequest {
+    pub soul_id: SoulId,
+    #[serde(default = "default_recovery_trigger")]
+    pub trigger: RecoveryTrigger,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+fn default_recovery_trigger() -> RecoveryTrigger {
+    RecoveryTrigger::ExplicitRequest
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AdminCommand {
     Health,
@@ -522,6 +802,8 @@ pub enum AdminCommand {
     TerminalResize(TerminalResizeRequest),
     TerminalReadOutput(TerminalReadOutputRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
+    ProbeRecovery(RecoveryProbeRequest),
+    Recover(RecoverRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,9 +824,58 @@ pub struct RuntimeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_stream_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_create_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_resume_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<RuntimeProfile>,
+    #[serde(default)]
+    pub desired_state: DesiredState,
+    #[serde(default)]
+    pub recovery_state: RecoveryState,
+    #[serde(default)]
+    pub durability_state: DurabilityState,
+    #[serde(default)]
+    pub allocation_state: AllocationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_incarnation_id: Option<IncarnationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_attempt_id: Option<RecoveryAttemptId>,
+    #[serde(default)]
+    pub evidence_revision: u64,
+    #[serde(default)]
+    pub successful_recoveries_in_window: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryResult {
+    pub outcome: RecoveryOutcome,
+    pub view: RuntimeView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<RecoveryProbe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_incarnation_id: Option<IncarnationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<RecoveryAttemptId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_native_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_native_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +909,8 @@ pub enum AdminResult {
     TerminalResize,
     TerminalOutput(RuntimeOutputBatch),
     RuntimeMetrics(RuntimeMetrics),
+    RecoveryProbe(RecoveryProbe),
+    Recovery(RecoveryResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -605,6 +938,8 @@ pub enum HostCommand {
         fixture: Option<FixtureKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<Box<TerminalLaunchSpec>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_spec: Option<Box<ResumeSpec>>,
     },
     Stop {
         incarnation_id: IncarnationId,
@@ -634,6 +969,15 @@ pub enum HostCommand {
     },
     RuntimeMetrics {
         incarnation_id: IncarnationId,
+    },
+    ProbeRecovery {
+        incarnation_id: IncarnationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_spec: Option<Box<ResumeSpec>>,
+        creation_seed_ref: String,
+        never_dispatched: bool,
+        run_as_uid: u32,
+        run_as_gid: u32,
     },
 }
 
@@ -668,7 +1012,12 @@ pub enum HostResult {
         max_execution_generation: u64,
         #[serde(default)]
         fixture_evidence: serde_json::Value,
+        #[serde(default)]
+        exited: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_session_id: Option<String>,
     },
+    RecoveryProbe(RecoveryProbe),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -783,5 +1132,152 @@ mod tests {
         let restored: Envelope<AdminCommand> = read_frame(&mut cursor).await.unwrap();
         assert_eq!(restored.protocol_version, CONTROL_PROTOCOL_VERSION);
         assert!(matches!(restored.body, AdminCommand::Health));
+    }
+
+    #[test]
+    fn legacy_resume_spec_remains_readable_after_contract_expansion() {
+        let legacy = serde_json::json!({
+            "providerSession": {
+                "provider": "opencode",
+                "providerStoreId": "store-one",
+                "nativeSessionId": "ses_exact"
+            },
+            "mode": "opencode",
+            "program": "opencode",
+            "resumeArgv": ["--session", "ses_exact"],
+            "providerHome": "/home/freshell/provider",
+            "cwd": "/workspace",
+            "workspacePath": "/workspace",
+            "environment": {"HOME": "/home/freshell/provider"},
+            "providerVersion": "1.18.21",
+            "creationSeedRef": "seed-one",
+            "checkpointRevision": 0,
+            "allocationState": "verified_durable",
+            "evidenceRevision": 7,
+            "neverDispatched": false
+        });
+        let spec: ResumeSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(spec.schema_version, RESUME_SPEC_SCHEMA_VERSION);
+        assert_eq!(spec.runtime_variant, "");
+        assert_eq!(spec.provider_volume, None);
+        assert_eq!(spec.identity_provenance, IdentityProvenance::Unknown);
+        assert_eq!(spec.durable_position, DurablePosition::default());
+        assert!(spec.credential_references.is_empty());
+        assert!(spec.checkpoint_references.is_empty());
+    }
+
+    #[test]
+    fn recovery_contract_serializes_references_not_credential_bytes() {
+        let spec = ResumeSpec {
+            schema_version: RESUME_SPEC_SCHEMA_VERSION,
+            provider_session: ProviderSessionRef {
+                provider: "claude".into(),
+                provider_store_id: "store-one".into(),
+                native_session_id: "session-one".into(),
+            },
+            mode: "claude".into(),
+            runtime_variant: "managed_terminal_pty".into(),
+            program: "claude".into(),
+            resume_argv: vec!["--resume".into(), "session-one".into()],
+            provider_home: "/home/freshell/provider".into(),
+            provider_volume: Some(ProviderVolumeRef {
+                volume_name: "freshell-provider-soul-one".into(),
+                mount_path: "/home/freshell/provider".into(),
+            }),
+            cwd: "/workspace".into(),
+            workspace_path: "/workspace".into(),
+            project_key: Some("project-one".into()),
+            runtime_profile: Some(RuntimeProfile::DefaultAgent),
+            environment: std::collections::BTreeMap::from([(
+                "HOME".into(),
+                "/home/freshell/provider".into(),
+            )]),
+            model: Some("haiku".into()),
+            reasoning_effort: Some("low".into()),
+            permission_mode: Some("default".into()),
+            image_ref: Some("sha256:image".into()),
+            provider_version: Some("1.0.0".into()),
+            credential_references: vec![CredentialReference {
+                provider_relative_path: ".claude/.credentials.json".into(),
+            }],
+            identity_provenance: IdentityProvenance::ProviderObserved,
+            durable_position: DurablePosition {
+                accepted_command_count: 2,
+                completed_command_count: 1,
+                output_sequence: 9,
+                provider_cursor: Some("transcript:9".into()),
+            },
+            checkpoint_references: vec![CheckpointReference {
+                kind: "provider_state".into(),
+                reference: "soul://soul-one/checkpoint/3".into(),
+                revision: 3,
+                verified: true,
+            }],
+            creation_seed_ref: "seed-one".into(),
+            checkpoint_revision: 3,
+            allocation_state: AllocationState::VerifiedDurable,
+            evidence_revision: 9,
+            never_dispatched: false,
+        };
+        let encoded = serde_json::to_string(&spec).unwrap();
+        assert!(encoded.contains(".claude/.credentials.json"));
+        assert!(!encoded.contains("secretbytes"));
+        let restored: ResumeSpec = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, spec);
+    }
+
+    #[test]
+    fn recovery_probe_preserves_blocked_vs_definitive_semantics() {
+        let blocked = RecoveryProbe::Blocked {
+            path: RecoveryPath::NativeResume,
+            reason: RecoveryBlockReason::CredentialsExpired,
+            retry_hint: RetryHint {
+                automatic_after_ms: None,
+                manual_retry: true,
+                repair: Some("refresh credentials".into()),
+            },
+            evidence: vec!["provider store remains present".into()],
+        };
+        let encoded = serde_json::to_value(&blocked).unwrap();
+        assert_eq!(encoded["kind"], "blocked");
+        assert_eq!(encoded["data"]["reason"], "CREDENTIALS_EXPIRED");
+        assert!(matches!(
+            serde_json::from_value::<RecoveryProbe>(encoded).unwrap(),
+            RecoveryProbe::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn managed_provider_options_are_bounded_and_control_free() {
+        let mut spec = TerminalLaunchSpec {
+            terminal_id: "terminal-one".into(),
+            stream_id: "stream-one".into(),
+            mode: "codex".into(),
+            program: "codex".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: "/workspace".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-one".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: Some("gpt-5.6-luna".into()),
+            provider_sandbox: Some("workspace-write".into()),
+            provider_permission_mode: Some("on-request".into()),
+            provider_bootstrap_files: Vec::new(),
+        };
+        assert!(spec.validate().is_ok());
+        spec.provider_model = Some("bad\0model".into());
+        assert!(spec.validate().is_err());
+        spec.provider_model = Some("m".repeat(257));
+        assert!(spec.validate().is_err());
+        spec.provider_model = None;
+        spec.provider_permission_mode = Some("line\nbreak".into());
+        assert!(spec.validate().is_err());
     }
 }

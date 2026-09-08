@@ -1,15 +1,16 @@
 //! Spawn-door resume validation (resume-validation feature): before a cached
 //! session id is turned into resume argv, ask the disk-existence probe. On
-//! POSITIVE absence, fall back to the same shape a genuinely fresh pane of
-//! that mode uses. Unknown/unavailable always fail open.
+//! POSITIVE absence, reject an exact user-create resume. Unknown/unavailable
+//! evidence fails open for user creates; managed recovery requires positive
+//! evidence and never turns an uncertain resume into a new session.
 //!
 //! Callers (the spawn doors in `crate::terminal`) apply the outcome: retire
 //! the stale ledger row, emit the notice, and never stamp the stale ref.
 
 use freshell_platform::cli_launch::LaunchIntent;
 use freshell_platform::resume_gate::{
-    evaluate_resume_gate, provider_validated, stale_resume_notice, ResumeExistence,
-    ResumeGateDecision,
+    evaluate_resume_gate_for_intent, provider_validated, stale_resume_notice, ResumeExistence,
+    ResumeGateDecision, ResumeIntent,
 };
 
 use crate::existence::{SessionExistence, SessionExistenceProbe};
@@ -25,6 +26,11 @@ pub struct ResumeValidationOutcome {
     /// emits the notice, and must NOT stamp the stale sessionRef.
     pub stale_session_id: Option<String>,
     pub notice: Option<String>,
+    /// Recovery may proceed only with a positively verified native session.
+    /// This is distinct from a stale user-create id: the durable identity
+    /// remains intact and no replacement is started.
+    pub recovery_blocked: bool,
+    pub blocked_session_id: Option<String>,
 }
 
 fn passthrough(
@@ -37,6 +43,23 @@ fn passthrough(
         claude_fresh_prealloc: false,
         stale_session_id: None,
         notice: None,
+        recovery_blocked: false,
+        blocked_session_id: None,
+    }
+}
+
+fn blocked_recovery(
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+) -> ResumeValidationOutcome {
+    ResumeValidationOutcome {
+        resume_session_id: None,
+        launch_intent,
+        claude_fresh_prealloc: false,
+        stale_session_id: None,
+        notice: None,
+        recovery_blocked: true,
+        blocked_session_id: resume_session_id,
     }
 }
 
@@ -56,16 +79,54 @@ pub fn validate_wire_resume(
     launch_intent: LaunchIntent,
     probe: &dyn SessionExistenceProbe,
 ) -> ResumeValidationOutcome {
+    validate_wire_resume_for_intent(
+        mode,
+        resume_session_id,
+        launch_intent,
+        probe,
+        ResumeIntent::UserCreate,
+    )
+}
+
+pub fn validate_managed_wire_resume(
+    mode: &str,
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+    probe: &dyn SessionExistenceProbe,
+) -> ResumeValidationOutcome {
+    validate_wire_resume_for_intent(
+        mode,
+        resume_session_id,
+        launch_intent,
+        probe,
+        ResumeIntent::ManagedRecovery,
+    )
+}
+
+fn validate_wire_resume_for_intent(
+    mode: &str,
+    resume_session_id: Option<String>,
+    launch_intent: LaunchIntent,
+    probe: &dyn SessionExistenceProbe,
+    intent: ResumeIntent,
+) -> ResumeValidationOutcome {
     let Some(sid) = resume_session_id.clone().filter(|s| !s.is_empty()) else {
+        if intent == ResumeIntent::ManagedRecovery {
+            return blocked_recovery(resume_session_id, launch_intent);
+        }
         return passthrough(resume_session_id, launch_intent);
     };
     if !provider_validated(mode) {
+        if intent == ResumeIntent::ManagedRecovery {
+            return blocked_recovery(resume_session_id, launch_intent);
+        }
         return passthrough(resume_session_id, launch_intent);
     }
     let existence = map_existence(probe.exists_for_gate(mode, &sid));
     let ever_on_disk = probe.ever_observed_on_disk(mode, &sid);
-    match evaluate_resume_gate(mode, existence, ever_on_disk) {
+    match evaluate_resume_gate_for_intent(mode, existence, ever_on_disk, intent) {
         ResumeGateDecision::Proceed => passthrough(resume_session_id, launch_intent),
+        ResumeGateDecision::BlockedRecovery => blocked_recovery(Some(sid), launch_intent),
         ResumeGateDecision::SpawnFresh => {
             let notice = stale_resume_notice(mode, &sid);
             let (fresh_id, intent, claude_prealloc) = match mode {
@@ -89,6 +150,8 @@ pub fn validate_wire_resume(
                 claude_fresh_prealloc: claude_prealloc,
                 stale_session_id: Some(sid),
                 notice: Some(notice),
+                recovery_blocked: false,
+                blocked_session_id: None,
             }
         }
     }
@@ -254,5 +317,64 @@ mod tests {
         let out = validate_wire_resume("amplifier", None, LaunchIntent::Resume, &PanickingProbe);
         assert!(out.resume_session_id.is_none());
         assert!(out.stale_session_id.is_none());
+    }
+    #[test]
+    fn managed_recovery_never_mints_a_fresh_session_for_absence() {
+        let out = validate_managed_wire_resume(
+            "claude",
+            Some("exact-managed-session".into()),
+            LaunchIntent::Resume,
+            &absent(),
+        );
+        assert!(out.resume_session_id.is_none());
+        assert!(out.recovery_blocked);
+        assert_eq!(
+            out.blocked_session_id.as_deref(),
+            Some("exact-managed-session")
+        );
+        assert_eq!(out.launch_intent, LaunchIntent::Resume);
+        assert!(out.stale_session_id.is_none());
+        assert!(out.notice.is_none());
+    }
+
+    #[test]
+    fn managed_recovery_requires_positive_supported_evidence() {
+        for answer in [
+            SessionExistence::Unknown,
+            SessionExistence::ProviderUnavailable,
+        ] {
+            let probe = FakeProbe {
+                answer,
+                ever_on_disk: false,
+            };
+            let out = validate_managed_wire_resume(
+                "opencode",
+                Some("ses_saved".into()),
+                LaunchIntent::Resume,
+                &probe,
+            );
+            assert!(out.recovery_blocked);
+            assert!(out.resume_session_id.is_none());
+            assert!(out.stale_session_id.is_none());
+        }
+        let present = FakeProbe {
+            answer: SessionExistence::Present,
+            ever_on_disk: true,
+        };
+        let out = validate_managed_wire_resume(
+            "opencode",
+            Some("ses_saved".into()),
+            LaunchIntent::Resume,
+            &present,
+        );
+        assert!(!out.recovery_blocked);
+        assert_eq!(out.resume_session_id.as_deref(), Some("ses_saved"));
+
+        for (mode, session_id) in [("shell", Some("saved".into())), ("opencode", None)] {
+            let out =
+                validate_managed_wire_resume(mode, session_id, LaunchIntent::Resume, &present);
+            assert!(out.recovery_blocked);
+            assert!(out.resume_session_id.is_none());
+        }
     }
 }

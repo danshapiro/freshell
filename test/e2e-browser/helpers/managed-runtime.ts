@@ -15,16 +15,32 @@ export type ManagedRuntimeView = {
   soulId: string
   incarnationId: string
   launchState: string
+  desiredState?: string
+  recoveryState?: string
+  durabilityState?: string
+  allocationState?: string
   containerId?: string
   hostBootId?: string
   terminalId?: string
+  terminalStreamId?: string
+  terminalMode?: string
+  terminalCwd?: string
+  terminalCreateRequestId?: string
+  terminalResumeSessionId?: string
   projectKey?: string
   profile?: string
+  provider?: string
+  nativeSessionId?: string
+  recoveryReason?: string
+  priorIncarnationId?: string
+  recoveryAttemptId?: string
+  evidenceRevision?: number
+  successfulRecoveriesInWindow?: number
 }
 
 /**
- * Owned Phase-2 browser rig: restricted Docker broker + supervisor + a
- * feature-enabled Rust web server. Web restart methods touch only the web
+ * Owned managed-runtime browser rig: restricted Docker broker + supervisor +
+ * a feature-enabled Rust web server. Web restart methods touch only the web
  * process; dynamic session-host containers are outside its process tree and
  * remain owned by the supervisor/harness receipts.
  */
@@ -35,10 +51,16 @@ export class ManagedRuntimeBrowserRig {
   web!: RustServer
   info!: TestServerInfo
   private serverBin = ''
+  private readonly serverEnv: Record<string, string>
 
-  constructor(repoRoot = process.cwd()) {
+  constructor(
+    repoRoot = process.cwd(),
+    phase: 2 | 3 = 2,
+    serverEnv: Record<string, string> = {},
+  ) {
     this.repoRoot = fs.realpathSync(repoRoot)
-    this.runtime = new RuntimeHarness(this.repoRoot, undefined, 2)
+    this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
+    this.serverEnv = { ...serverEnv }
   }
 
   async start(): Promise<TestServerInfo> {
@@ -51,6 +73,7 @@ export class ManagedRuntimeBrowserRig {
         FRESHELL_MANAGED_RUNTIME_V1: '1',
         FRESHELL_RUNTIME_CONTROL_SOCKET: this.supervisor.controlSocket,
         FRESHELL_RUNTIME_CONTROL_SECRET_FILE: this.supervisor.controlSecretFile,
+        ...this.serverEnv,
       },
       setupHome: async (homeDir) => {
         const freshell = path.join(homeDir, '.freshell')
@@ -170,6 +193,14 @@ export class ManagedRuntimeBrowserRig {
   writeOpencodeReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT
       || path.join(this.runtime.browserDir, 'p2-g04-real-opencode-continuity.json')
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    return target
+  }
+
+  writePhase3BrowserReceipt(value: unknown): string {
+    const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
+      || path.join(this.runtime.browserDir, 'p3-g10-provider-resurrection.json')
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target

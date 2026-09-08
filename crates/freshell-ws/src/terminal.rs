@@ -1733,6 +1733,13 @@ async fn handle_client_text(
                     .managed_input(&input.terminal_id, input.data.clone())
                     .await
                 {
+                    if let Some(reason) = managed_input_blocked_reason(&error) {
+                        return send(
+                            ws_tx,
+                            &managed_runtime_input_blocked(&input.terminal_id, reason),
+                        )
+                        .await;
+                    }
                     return send(
                         ws_tx,
                         &managed_runtime_error(
@@ -2442,8 +2449,14 @@ async fn handle_client_text(
             // refusal can never reach pre-reconcile ("frozen") clients — they
             // never send the request at all (§3).
             if pane_reconcile_v1 {
-                return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
-                    .await;
+                return handle_pane_reconcile(
+                    request,
+                    ws_tx,
+                    state,
+                    pane_reconcile_fresh_agent_v1,
+                    state.registry.managed_runtime_connection(conn_id),
+                )
+                .await;
             }
             // Capability not negotiated on THIS connection: answer explicitly.
             send(
@@ -2735,6 +2748,22 @@ fn opencode_rebind_precompute() -> Option<String> {
 /// — model/sandbox/permissionMode route to the app-server plan instead).
 /// Boot-snapshot settings. Extracted from `handle_create` so the auto-resume
 /// respawn seam (Task 4) derives launch params identically.
+fn configured_provider_settings(
+    state: &WsState,
+    mode: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(provider) = state.settings.coding_cli.providers.get(mode) else {
+        return (None, None, None);
+    };
+    let pick = |key: &str| {
+        provider
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    (pick("permissionMode"), pick("model"), pick("sandbox"))
+}
+
 fn cli_provider_settings(
     state: &WsState,
     mode: &str,
@@ -2742,11 +2771,7 @@ fn cli_provider_settings(
     if mode == "shell" || mode == "codex" {
         return (None, None, None);
     }
-    let Some(p) = state.settings.coding_cli.providers.get(mode) else {
-        return (None, None, None);
-    };
-    let pick = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    (pick("permissionMode"), pick("model"), pick("sandbox"))
+    configured_provider_settings(state, mode)
 }
 
 /// One value-safe rendering of the managed Codex launch shared by its TUI
@@ -3278,7 +3303,10 @@ pub(crate) struct LaunchPrep {
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
 fn managed_runtime_mode(mode: &str) -> bool {
-    matches!(mode, "shell" | "claude" | "opencode")
+    matches!(
+        mode,
+        "shell" | "claude" | "codex" | "opencode" | "amplifier"
+    )
 }
 
 fn managed_opencode_endpoint(
@@ -3325,12 +3353,12 @@ mod managed_runtime_id_tests {
     }
 
     #[test]
-    fn phase2_managed_modes_include_opencode_but_not_other_unmigrated_providers() {
-        assert!(managed_runtime_mode("shell"));
-        assert!(managed_runtime_mode("claude"));
-        assert!(managed_runtime_mode("opencode"));
-        assert!(!managed_runtime_mode("codex"));
-        assert!(!managed_runtime_mode("amplifier"));
+    fn phase3_managed_modes_cover_every_enabled_terminal_provider() {
+        for mode in ["shell", "claude", "codex", "opencode", "amplifier"] {
+            assert!(managed_runtime_mode(mode), "missing managed mode {mode}");
+        }
+        assert!(!managed_runtime_mode("gemini"));
+        assert!(!managed_runtime_mode("kimi"));
     }
 
     #[test]
@@ -3499,15 +3527,18 @@ pub(crate) struct PreparedLaunch {
 
 /// Outcome of the wire-resume disk-existence gate, carried from wherever the
 /// gate ran (off-permit in prepare_launch for codex; on-permit in
-/// handle_create for everything else) to the single place that answers the
-/// typed SESSION_MISSING refusal and releases the D8 stale-ref lease.
+/// handle_create for everything else) to the single place that answers a
+/// typed refusal and releases the D8 stale-ref lease.
 pub(crate) struct ResumeGateCarry {
     pub stale_session_id: Option<String>,
+    pub recovery_blocked: bool,
+    pub blocked_session_id: Option<String>,
 }
 
 /// Resume validation (docs/plans/2026-07-29-resume-validation.md): never hand
 /// the CLI a resume id that is definitively absent from the provider's
-/// on-disk store. Fail open on Unknown/ProviderUnavailable; a LIVE session
+/// on-disk store. User creates fail open on Unknown/ProviderUnavailable;
+/// explicit managed recovery refuses without positive evidence. A LIVE session
 /// never gates (same join D7 uses: registry + async fresh-agent sidecar
 /// arms). The probe's by-id locators do real filesystem walks (~1 s for
 /// codex) — spawn-door callers only, never inline on the async runtime.
@@ -3517,6 +3548,7 @@ async fn gate_wire_resume(
     resume_session_id: &mut Option<String>,
     launch_intent: &mut LaunchIntent,
     claude_fresh_prealloc: &mut bool,
+    intent: freshell_platform::resume_gate::ResumeIntent,
 ) -> ResumeGateCarry {
     // In-gate liveness precondition: legacy resumeSessionId-only
     // carriers bypass D7 in every ordering — a LIVE session must never
@@ -3548,6 +3580,8 @@ async fn gate_wire_resume(
     if candidate_is_live {
         return ResumeGateCarry {
             stale_session_id: None,
+            recovery_blocked: false,
+            blocked_session_id: None,
         };
     }
     // The probe's by-id locators do real filesystem walks (~1 s for
@@ -3557,14 +3591,24 @@ async fn gate_wire_resume(
         let probe = state.session_existence.clone();
         let mode_for_gate = mode.to_string();
         let rid = resume_session_id.take();
-        let intent = *launch_intent;
-        spawn_blocking_in_span(move || {
-            crate::resume_validation::validate_wire_resume(
-                &mode_for_gate,
-                rid,
-                intent,
-                probe.as_ref(),
-            )
+        let launch_intent_value = *launch_intent;
+        spawn_blocking_in_span(move || match intent {
+            freshell_platform::resume_gate::ResumeIntent::ManagedRecovery => {
+                crate::resume_validation::validate_managed_wire_resume(
+                    &mode_for_gate,
+                    rid,
+                    launch_intent_value,
+                    probe.as_ref(),
+                )
+            }
+            freshell_platform::resume_gate::ResumeIntent::UserCreate => {
+                crate::resume_validation::validate_wire_resume(
+                    &mode_for_gate,
+                    rid,
+                    launch_intent_value,
+                    probe.as_ref(),
+                )
+            }
         })
         .await
         .expect("resume validation task panicked")
@@ -3592,6 +3636,115 @@ async fn gate_wire_resume(
     }
     ResumeGateCarry {
         stale_session_id: outcome.stale_session_id,
+        recovery_blocked: outcome.recovery_blocked,
+        blocked_session_id: outcome.blocked_session_id,
+    }
+}
+
+#[cfg(test)]
+mod managed_resume_gate_tests {
+    use super::*;
+    use crate::existence::{SessionExistence, SessionExistenceProbe};
+    use std::sync::Mutex;
+
+    struct FixedProbe(SessionExistence);
+
+    impl SessionExistenceProbe for FixedProbe {
+        fn exists(&self, _: &str, _: &str) -> SessionExistence {
+            self.0
+        }
+
+        fn ever_observed(&self, _: &str, _: &str) -> bool {
+            true
+        }
+
+        fn ever_observed_on_disk(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_managed_recovery_carries_blocked_verdict_without_retiring_identity() {
+        for evidence in [SessionExistence::Absent, SessionExistence::Unknown] {
+            let mut state = super::pane_reconcile_gate_tests::state();
+            state.session_existence = Arc::new(FixedProbe(evidence));
+            let mut resume_id = Some("ses_saved".to_string());
+            let mut launch_intent = LaunchIntent::Resume;
+            let mut claude_prealloc = false;
+
+            let carry = gate_wire_resume(
+                &state,
+                "opencode",
+                &mut resume_id,
+                &mut launch_intent,
+                &mut claude_prealloc,
+                freshell_platform::resume_gate::ResumeIntent::ManagedRecovery,
+            )
+            .await;
+
+            assert!(carry.recovery_blocked);
+            assert_eq!(carry.blocked_session_id.as_deref(), Some("ses_saved"));
+            assert!(carry.stale_session_id.is_none());
+            assert!(resume_id.is_none());
+            assert!(!claude_prealloc);
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiated_managed_terminal_create_keeps_user_create_missing_refusal() {
+        let mut state = super::pane_reconcile_gate_tests::state();
+        state.session_existence = Arc::new(FixedProbe(SessionExistence::Absent));
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            default_cmd: "opencode".into(),
+            ..Default::default()
+        }]);
+        let conn_id = 17;
+        state.registry.set_managed_runtime_connection(conn_id, true);
+        let frames = Arc::new(Mutex::new(Vec::<ServerMessage>::new()));
+        let collector = Arc::clone(&frames);
+        let sink: FrameSink = Arc::new(move |message| {
+            collector.lock().expect("frames lock").push(message);
+        });
+        let mut output = crate::create_gate::CreateOutput::Channel(&sink);
+        let create: TerminalCreate = serde_json::from_value(serde_json::json!({
+            "requestId": "managed-user-create-missing",
+            "mode": "opencode",
+            "shell": "system",
+            "restore": true,
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_missing" },
+        }))
+        .expect("terminal create");
+        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+
+        assert!(
+            handle_create(
+                create,
+                None,
+                &mut output,
+                &state,
+                conn_id,
+                false,
+                &mut limiter,
+                &ConnectionIdentity::default(),
+                now_ms(),
+            )
+            .await
+        );
+
+        let frames = frames.lock().expect("frames lock");
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                ServerMessage::Error(error) if error.code == ErrorCode::SessionMissing
+            )),
+            "expected typed SESSION_MISSING refusal: {frames:?}"
+        );
+        assert!(
+            state.registry.directory().is_empty(),
+            "no managed launch occurred"
+        );
     }
 }
 
@@ -3614,6 +3767,7 @@ pub(crate) async fn prepare_launch(
     create: &TerminalCreate,
     state: &WsState,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
+    managed_runtime_v1: bool,
 ) -> Result<PreparedLaunch, PrepareError> {
     // Same mode derivation handle_create uses (copy the exact expression
     // from handle_create's `mode` binding so the two sites can never
@@ -3636,6 +3790,10 @@ pub(crate) async fn prepare_launch(
                 &mut prep.resume_session_id,
                 &mut prep.launch_intent,
                 &mut prep.claude_fresh_prealloc,
+                // A negotiated managed runtime still receives user-created
+                // terminal.create requests. Supervisor resurrection owns the
+                // separate ManagedRecovery intent and its durable identity.
+                freshell_platform::resume_gate::ResumeIntent::UserCreate,
             )
             .await,
         )
@@ -3654,7 +3812,10 @@ pub(crate) async fn prepare_launch(
     // byte-identical to today.
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    let codex_launch = if prep.resume_session_id.is_some()
+    // The managed session host plans its own Codex app-server and proxy.
+    // Only a legacy web-owned launch needs a plan before the spawn gate.
+    let codex_launch = if !managed_runtime_v1
+        && prep.resume_session_id.is_some()
         && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
     {
         // Reserve exactly one ID only for a managed resume that will plan.
@@ -4761,12 +4922,35 @@ pub(crate) async fn handle_create(
                 &mut resume_session_id,
                 &mut launch_intent,
                 &mut claude_fresh_prealloc,
+                freshell_platform::resume_gate::ResumeIntent::UserCreate,
             )
             .await,
         ),
         None => None,
     };
     if let Some(carry) = resume_gate_carry {
+        if carry.recovery_blocked {
+            let blocked = carry.blocked_session_id.as_deref().unwrap_or("");
+            drop(session_ref_lease.take());
+            drop(terminal_ownership.take());
+            tracing::warn!(target: "freshell_ws::terminal",
+                mode = %mode, session_id = %blocked,
+                request_id = %create.request_id,
+                "terminal_create_refused: managed recovery has no positive native-session evidence"
+            );
+            let message = if blocked.is_empty() {
+                format!("The saved {mode} session could not be verified for recovery.")
+            } else {
+                format!("The saved {mode} session {blocked} could not be verified for recovery.")
+            };
+            return send_create_error(
+                out,
+                ErrorCode::RestoreUnavailable,
+                message,
+                &create.request_id,
+            )
+            .await;
+        }
         if let Some(stale) = carry.stale_session_id.as_deref() {
             // b8ke ext r16 F3: a DEFINITIVELY MISSING exact-resume target
             // no longer auto-substitutes a replacement session (the
@@ -5065,7 +5249,7 @@ pub(crate) async fn handle_create(
     // below uses it (re-resolution is idempotent: an absolute unix path
     // passes through resolve_unix_shell_cwd unchanged).
     let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
-    if mode == "amplifier" {
+    if mode == "amplifier" && !use_managed_runtime {
         // Amplifier identity hardening (kata qmpk) — sequential, complementary
         // to the cross-mode D7 liveness guard above (PR #540): D7 rejects
         // cross-terminal session theft generically; these two are
@@ -5231,7 +5415,11 @@ pub(crate) async fn handle_create(
     // app-server plan instead). Boot-snapshot settings (same documented caveat
     // as `defaultCwd` above). Shared with the auto-resume respawn seam
     // (Task 4) via `cli_provider_settings`.
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, sandbox) = if use_managed_runtime {
+        configured_provider_settings(state, &mode)
+    } else {
+        cli_provider_settings(state, &mode)
+    };
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -5253,15 +5441,18 @@ pub(crate) async fn handle_create(
             None
         };
 
-    // Build one managed setup for each newly spawned pair. A prepared resume
-    // hands us its original setup/launch; a fresh or A4-inline plan builds it
-    // only after every validation/duplicate gate above has passed.
+    // Build one web-owned Codex setup for each legacy spawn. A prepared
+    // resume hands us its original setup/launch; a fresh or A4-inline plan
+    // builds it only after every validation/duplicate gate above has passed.
+    // Managed Codex runs its app-server in the session host instead.
     let prepared_pair = prepared_codex.as_mut().and_then(PreparedCodexLaunch::take);
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
     let (codex_setup, codex_launch) = match prepared_pair {
         Some((setup, launch)) => (Some(setup), Some(launch)),
-        None if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) => {
+        None if !use_managed_runtime
+            && codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) =>
+        {
             let setup = match build_codex_managed_launch_setup(
                 terminal_id.clone(),
                 shell,
@@ -5325,32 +5516,31 @@ pub(crate) async fn handle_create(
             } else {
                 resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
             };
-            let mcp_injection = if mode == "shell"
-                || (use_managed_runtime && matches!(mode.as_str(), "claude" | "opencode"))
-            {
-                // Managed providers launch inside the session host. The web
-                // process must not create provider-local MCP files for them.
-                McpInjection::default()
-            } else {
-                match generate_mcp_injection(
-                    &RealMcpRuntime,
-                    &mode,
-                    &terminal_id,
-                    mcp_cwd.as_deref(),
-                    target,
-                ) {
-                    Ok(injection) => injection,
-                    Err(error) => {
-                        return send_create_error(
-                            out,
-                            ErrorCode::PtySpawnFailed,
-                            error.message,
-                            &create.request_id,
-                        )
-                        .await
+            let mcp_injection =
+                if mode == "shell" || (use_managed_runtime && managed_runtime_mode(&mode)) {
+                    // Managed providers launch inside the session host. The web
+                    // process must not create provider-local MCP files for them.
+                    McpInjection::default()
+                } else {
+                    match generate_mcp_injection(
+                        &RealMcpRuntime,
+                        &mode,
+                        &terminal_id,
+                        mcp_cwd.as_deref(),
+                        target,
+                    ) {
+                        Ok(injection) => injection,
+                        Err(error) => {
+                            return send_create_error(
+                                out,
+                                ErrorCode::PtySpawnFailed,
+                                error.message,
+                                &create.request_id,
+                            )
+                            .await
+                        }
                     }
-                }
-            };
+                };
             let overrides = build_terminal_base_env(
                 &RealEnv,
                 &terminal_id,
@@ -5568,6 +5758,9 @@ pub(crate) async fn handle_create(
             stream_id: stream_id.clone(),
             mode: mode.clone(),
             resume_session_id: resume_session_id.clone(),
+            provider_model: model.clone(),
+            provider_sandbox: sandbox.clone(),
+            provider_permission_mode: permission_mode.clone(),
             create_request_id: Some(create.request_id.clone()),
         };
         match state.registry.launch_managed(managed).await {
@@ -7084,6 +7277,7 @@ async fn handle_pane_reconcile(
     ws_tx: &mut WsSink,
     state: &WsState,
     pane_reconcile_fresh_agent_v1: bool,
+    managed_runtime_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
@@ -7099,6 +7293,39 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    if managed_runtime_v1 {
+        for pane in request
+            .panes
+            .iter()
+            .filter(|pane| pane.kind.as_deref() == Some("terminal"))
+        {
+            let Some(terminal_id) = pane.terminal_id.as_deref() else {
+                continue;
+            };
+            if state.registry.exists(terminal_id) {
+                continue;
+            }
+            match state
+                .registry
+                .adopt_managed_for_reconcile(terminal_id, pane.create_request_id.clone())
+                .await
+            {
+                Ok(true) => tracing::info!(
+                    terminal_id,
+                    pane_key = %pane.pane_key,
+                    "pane_reconcile.adopted_managed_terminal"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    terminal_id,
+                    pane_key = %pane.pane_key,
+                    %error,
+                    "pane_reconcile.managed_terminal_lookup_failed"
+                ),
+            }
+        }
+    }
+
     // Built ONCE per reconcile request and reused for any re-derivation of deps
     // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
     // snapshot would double-burn the respawn counter; V9 §3.6).
@@ -7911,6 +8138,32 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
 fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
     ServerMessage::TerminalInputBlocked(TerminalInputBlocked {
         reason: TerminalInputBlockedReason::UnknownTerminal,
+        terminal_id: terminal_id.to_string(),
+    })
+}
+
+fn managed_input_blocked_reason(detail: &str) -> Option<TerminalInputBlockedReason> {
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("recovery is in progress")
+        || normalized.contains("input was not dispatched")
+    {
+        Some(TerminalInputBlockedReason::ManagedRecoveryPending)
+    } else if normalized.contains("recovery ended in blocked")
+        || normalized.contains("recovery is blocked")
+        || normalized.contains("blocked_retry_budget")
+    {
+        Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
+    } else {
+        None
+    }
+}
+
+fn managed_runtime_input_blocked(
+    terminal_id: &str,
+    reason: TerminalInputBlockedReason,
+) -> ServerMessage {
+    ServerMessage::TerminalInputBlocked(TerminalInputBlocked {
+        reason,
         terminal_id: terminal_id.to_string(),
     })
 }
@@ -10745,7 +10998,11 @@ mod input_identity_tests {
 
 #[cfg(test)]
 mod terminal_dims_range_tests {
-    use super::{invalid_dims_error, terminal_dims_in_range, unknown_terminal_input_blocked};
+    use super::{
+        invalid_dims_error, managed_input_blocked_reason, managed_runtime_input_blocked,
+        terminal_dims_in_range, unknown_terminal_input_blocked,
+    };
+    use freshell_protocol::TerminalInputBlockedReason;
 
     #[test]
     fn rejects_zero_and_one_below_node_floor() {
@@ -10796,6 +11053,31 @@ mod terminal_dims_range_tests {
                 "type": "terminal.input.blocked",
                 "reason": "unknown_terminal",
                 "terminalId": "t-gone",
+            })
+        );
+    }
+
+    #[test]
+    fn managed_recovery_input_is_visibly_fenced() {
+        let pending = managed_input_blocked_reason(
+            "managed soul recovery is in progress; input was not dispatched",
+        )
+        .expect("pending recovery reason");
+        let blocked = managed_input_blocked_reason(
+            "managed soul recovery ended in Blocked: BLOCKED_RETRY_BUDGET",
+        )
+        .expect("blocked recovery reason");
+        assert_eq!(pending, TerminalInputBlockedReason::ManagedRecoveryPending);
+        assert_eq!(blocked, TerminalInputBlockedReason::ManagedRecoveryBlocked);
+
+        let json = serde_json::to_value(managed_runtime_input_blocked("managed-1", pending))
+            .expect("serialize managed input fence");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "terminal.input.blocked",
+                "reason": "managed_recovery_pending",
+                "terminalId": "managed-1",
             })
         );
     }
@@ -11365,6 +11647,14 @@ mod managed_output_order_tests {
     struct ExitedOpenCodeRead;
 
     impl ManagedTerminalController for ExitedOpenCodeRead {
+        fn lookup_terminal<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async { Err("unused lookup".into()) })
+        }
+
         fn launch<'a>(
             &'a self,
             _: ManagedTerminalLaunch,

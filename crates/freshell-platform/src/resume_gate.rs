@@ -5,10 +5,10 @@
 //! fresh. IO-free by design (mirrors `cli_launch`'s purity rule); callers map
 //! their probe answers into [`ResumeExistence`].
 //!
-//! FAIL-OPEN INVARIANT: only a POSITIVE "store readable, session definitively
-//! absent" returns [`ResumeGateDecision::SpawnFresh`]. Unknown/unreadable
-//! stores, unvalidated providers (gemini, kimi, third-party), and the claude
-//! zero-turn carve-out all Proceed (today's behavior).
+//! User-create requests preserve the legacy fail-open behavior. Managed
+//! recovery is deliberately fail-closed: it may proceed only with positive
+//! evidence and can never convert an absent or unreadable native session into a
+//! fresh conversation.
 
 use std::sync::Arc;
 
@@ -32,13 +32,25 @@ pub enum ResumeExistence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeGateDecision {
-    /// Pass the resume id through unchanged (validated present, or fail-open).
+    /// Pass the exact resume id through unchanged.
     Proceed,
-    /// Definitively absent: drop the resume, spawn fresh, notify, retire.
+    /// A user-create request may retire a stale id and intentionally start a
+    /// new conversation. This outcome is impossible for managed recovery.
     SpawnFresh,
+    /// Recovery evidence is absent, unreadable, or unsupported. Preserve the
+    /// soul and surface a repair/retry path; never mint another conversation.
+    BlockedRecovery,
 }
 
-pub fn evaluate_resume_gate(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeIntent {
+    /// A new user request may retain the legacy stale-id retirement behavior.
+    UserCreate,
+    /// Resurrection of an existing managed soul must preserve exact identity.
+    ManagedRecovery,
+}
+
+fn evaluate_user_create_gate(
     provider: &str,
     existence: ResumeExistence,
     ever_observed_on_disk: bool,
@@ -49,15 +61,8 @@ pub fn evaluate_resume_gate(
     match existence {
         ResumeExistence::Present | ResumeExistence::Unknown => ResumeGateDecision::Proceed,
         ResumeExistence::Absent => {
-            // Zero-turn carve-out: a freshell-minted claude session that never
-            // conversed has no transcript on disk yet (mirrors
-            // freshell-ws/reconcile.rs claude carve-out, deliberately more
-            // fail-open: no ledger-bound requirement).
-            //
-            // Amplifier deliberately gets NO such carve-out (plan AD-5): a
-            // never-used stub GC'd at terminal exit is indistinguishable on
-            // disk from the incident's stale id, and the gate-fired fresh
-            // spawn is an equivalent empty session for a never-typed pane.
+            // Zero-turn carve-out belongs only to user-create. The managed
+            // coordinator requires its own durable never-dispatched proof.
             if provider == "claude" && !ever_observed_on_disk {
                 ResumeGateDecision::Proceed
             } else {
@@ -65,6 +70,43 @@ pub fn evaluate_resume_gate(
             }
         }
     }
+}
+
+fn evaluate_managed_recovery_gate(
+    provider: &str,
+    existence: ResumeExistence,
+) -> ResumeGateDecision {
+    match (provider_validated(provider), existence) {
+        (true, ResumeExistence::Present) => ResumeGateDecision::Proceed,
+        _ => ResumeGateDecision::BlockedRecovery,
+    }
+}
+
+pub fn evaluate_resume_gate_for_intent(
+    provider: &str,
+    existence: ResumeExistence,
+    ever_observed_on_disk: bool,
+    intent: ResumeIntent,
+) -> ResumeGateDecision {
+    match intent {
+        ResumeIntent::UserCreate => {
+            evaluate_user_create_gate(provider, existence, ever_observed_on_disk)
+        }
+        ResumeIntent::ManagedRecovery => evaluate_managed_recovery_gate(provider, existence),
+    }
+}
+
+pub fn evaluate_resume_gate(
+    provider: &str,
+    existence: ResumeExistence,
+    ever_observed_on_disk: bool,
+) -> ResumeGateDecision {
+    evaluate_resume_gate_for_intent(
+        provider,
+        existence,
+        ever_observed_on_disk,
+        ResumeIntent::UserCreate,
+    )
 }
 
 /// The operator-visible notice line. MUST name the stale id (spec requirement).
@@ -137,6 +179,69 @@ mod tests {
             assert_eq!(evaluate_resume_gate(p, Absent, false), Proceed);
             assert!(!provider_validated(p));
         }
+    }
+
+    #[test]
+    fn managed_recovery_never_spawns_fresh() {
+        for provider in [
+            "claude",
+            "codex",
+            "opencode",
+            "amplifier",
+            "gemini",
+            "kimi",
+            "shell",
+        ] {
+            for existence in [Present, Absent, Unknown] {
+                for ever_observed in [false, true] {
+                    let decision = evaluate_resume_gate_for_intent(
+                        provider,
+                        existence,
+                        ever_observed,
+                        ResumeIntent::ManagedRecovery,
+                    );
+                    assert!(
+                        matches!(decision, Proceed | BlockedRecovery),
+                        "{provider} {existence:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn managed_recovery_requires_positive_supported_evidence() {
+        for provider in VALIDATED_PROVIDERS {
+            assert_eq!(
+                evaluate_resume_gate_for_intent(
+                    provider,
+                    Present,
+                    false,
+                    ResumeIntent::ManagedRecovery,
+                ),
+                Proceed
+            );
+            for existence in [Absent, Unknown] {
+                assert_eq!(
+                    evaluate_resume_gate_for_intent(
+                        provider,
+                        existence,
+                        false,
+                        ResumeIntent::ManagedRecovery,
+                    ),
+                    BlockedRecovery
+                );
+            }
+        }
+        assert_eq!(
+            evaluate_resume_gate_for_intent(
+                "unimplemented-provider",
+                Present,
+                true,
+                ResumeIntent::ManagedRecovery,
+            ),
+            BlockedRecovery
+        );
     }
 
     #[test]
