@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import { Check, Copy, GitFork, History, MoreHorizontal, Undo2 } from 'lucide-react'
 import { copyText } from '@/lib/clipboard'
 import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { stripSystemReminders } from './FreshAgentItemCard'
 import type { ActionSheetItem } from './FreshAgentActionSheet'
-import { cn } from '@/lib/utils'
 
 export function turnPlainText(turn: FreshAgentTurn): string {
   const text = turn.items
@@ -29,8 +28,10 @@ export type TurnActionCallbacks = {
 }
 
 /**
- * One source of truth for what you can do to a turn — consumed by the desktop
- * context menu and the mobile action sheet so they never drift apart.
+ * One source of truth for what you can do to a turn — consumed by the mobile
+ * action sheet directly and by the desktop unified context menu through the
+ * transcript's pane-registered FreshAgentTurnItemsBuilder, so the two
+ * surfaces never drift apart.
  */
 export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnActionCallbacks): ActionSheetItem[] {
   return [
@@ -64,7 +65,10 @@ export function buildTurnActionItems(turn: FreshAgentTurn, callbacks: TurnAction
 /**
  * Per-turn affordances. Pointer-capability aware:
  * - hover/fine: a hover toolbar (copy / fork / rewind) — hidden entirely on
- *   no-hover devices via the (hover:none) media variant;
+ *   no-hover devices via the (hover:none) media variant; right-click is owned
+ *   by the global ContextMenuProvider's unified fresh-agent menu (the turn
+ *   rows ride in through the pane-registered builder the transcript registers
+ *   around buildTurnActionItems);
  * - touch/no-hover: an always-visible ⋯ button (44px target) that opens the
  *   bottom action sheet; long-press on the turn does the same.
  */
@@ -160,70 +164,4 @@ export function FreshAgentTurnActions({
   )
 }
 
-type ContextMenuState = { x: number; y: number; turn: FreshAgentTurn } | null
 
-/**
- * Floating right-click menu for fine pointers. Touch devices use
- * FreshAgentActionSheet instead (same items via buildTurnActionItems).
- */
-export function FreshAgentTurnContextMenu({
-  state,
-  canFork,
-  canRollback,
-  rollbackBusy,
-  onForkFromTurn,
-  onRollbackToTurn,
-  onRewindToTurn,
-  onClose,
-}: TurnActionCallbacks & {
-  state: ContextMenuState
-  onClose: () => void
-}) {
-  useEffect(() => {
-    if (!state) return
-    const handle = () => onClose()
-    document.addEventListener('click', handle)
-    document.addEventListener('contextmenu', handle)
-    return () => {
-      document.removeEventListener('click', handle)
-      document.removeEventListener('contextmenu', handle)
-    }
-  }, [onClose, state])
-
-  if (!state) return null
-
-  const items = buildTurnActionItems(state.turn, { canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn })
-
-  return (
-    <div
-      role="menu"
-      aria-label="Turn context menu"
-      className="fixed z-50 min-w-[220px] rounded-md border border-border bg-popover p-1 text-sm shadow-lg"
-      style={{
-        left: Math.min(state.x, typeof window !== 'undefined' ? window.innerWidth - 240 : state.x),
-        top: Math.min(state.y, typeof window !== 'undefined' ? window.innerHeight - 150 : state.y),
-      }}
-    >
-      {items.map((item) => (
-        <button
-          key={item.label}
-          type="button"
-          role="menuitem"
-          disabled={item.disabled}
-          className={cn(
-            'block w-full rounded px-3 py-1.5 text-left transition-colors',
-            item.disabled ? 'cursor-not-allowed opacity-40' : 'hover:bg-accent hover:text-accent-foreground',
-          )}
-          onClick={() => {
-            onClose()
-            if (!item.disabled) item.run()
-          }}
-        >
-          {item.label}
-        </button>
-      ))}
-    </div>
-  )
-}
-
-export type { ContextMenuState as FreshAgentTurnContextMenuState }

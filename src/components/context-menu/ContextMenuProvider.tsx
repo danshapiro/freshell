@@ -62,7 +62,7 @@ import type { ContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
 import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
-import { copyDataset, isFreshAgentSpecializedRegion, isTextInputLike, parseContextTarget } from './context-menu-utils'
+import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
 import {
   copyFreshAgentCodeBlock,
   copyFreshAgentToolInput,
@@ -146,11 +146,12 @@ function findContextElement(start: HTMLElement | null): HTMLElement | null {
 }
 
 /**
- * Fresh-agent transcript turn articles (sole producer: FreshAgentTranscript)
- * own their contextmenu gesture entirely — the transcript always installs a
- * turn handler per pointer kind (turn menu on fine pointers, action sheet on
- * coarse). The provider's capture-phase document listener would otherwise
- * beat that bubble-phase handler and stack its pane menu at the same point.
+ * True when the target sits inside a fresh-agent transcript turn article
+ * (sole producer: FreshAgentTranscript). Because the transcript installs a
+ * per-article contextmenu handler only for its touch action sheet, the
+ * provider's capture-phase listener uses this predicate for the remaining
+ * gesture-scoped carve-out: while a touch gesture is in flight on a turn, the
+ * sheet owns it and no provider menu may open.
  */
 function isFreshAgentTurnTarget(el: HTMLElement | null): boolean {
   return !!el?.closest?.('article[data-turn-role]')
@@ -1120,31 +1121,26 @@ export function ContextMenuProvider({
 
     const handleContextMenu = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null
-      // Turn articles own their contextmenu gesture (see predicate comment) —
-      // no openMenu, and we cancel the event on the early return: for an
-      // article-targeted event the transcript's bubble-phase handler cancels
-      // it too (a harmless double cancel — opening the transcript's menu does
-      // not depend on defaultPrevented), while a late sheet-targeted event has
-      // no transcript handler at all, so the provider must cancel it here or
-      // the browser shows its native context menu over the sheet. While a
-      // touch gesture is in flight (the Android-race case-B condition below),
-      // resolve ownership against the gesture's ORIGINAL target, not e.target:
-      // a late native contextmenu retargeted onto the transcript's action
-      // sheet would otherwise bypass this check and stack the provider menu on
-      // top. For non-turn gestures the recorded target fails the predicate
-      // identically to e.target, so their behavior is unchanged.
+      // One menu system owns every fresh-agent right-click: fine-pointer
+      // turns, specialized sub-regions, and pane background all flow through
+      // the fresh-agent menu builder below (it selects region- and turn-aware
+      // items). The transcript's bubble-phase article handler installs no
+      // handler at all on fine pointers. The carve-out that remains is
+      // gesture-scoped: while a touch gesture is in flight on a turn article,
+      // the transcript's long-press action sheet owns the whole turn, and we
+      // must not stack a menu on it. We still cancel the event on the early
+      // return: for an article-targeted event the transcript's bubble-phase
+      // handler cancels it too (a harmless double cancel), while a late
+      // sheet-targeted event has no transcript handler at all — without a
+      // cancel here the browser shows its native context menu over the sheet.
+      // Since a late native contextmenu can arrive retargeted onto the
+      // just-opened sheet (Android-race case B below), ownership resolves
+      // against the gesture's ORIGINAL target, not e.target. For non-turn
+      // gestures the recorded target fails the predicate identically to
+      // e.target, so their behavior is unchanged.
       const gestureInFlight = touchStartPos !== null || longPressTimer !== null
       const ownershipTarget = gestureInFlight ? touchGestureTarget : target
-      // Fine-pointer (no touch gesture in flight) right-clicks into the turn's
-      // specialized sub-regions (markdown code blocks, tool input/output,
-      // diffs) fall through to the normal fresh-agent menu below so their
-      // context-sensitive items ("Copy code block", "Copy output", ...) stay
-      // available — the transcript article yields this gesture to us. A touch
-      // gesture in flight (early or late Android contextmenu) keeps the
-      // carve-out: the transcript's action sheet owns the whole turn on
-      // coarse pointers, which never install specialized-region menus.
-      if (isFreshAgentTurnTarget(ownershipTarget)
-        && !(isFreshAgentSpecializedRegion(ownershipTarget) && !gestureInFlight)) {
+      if (gestureInFlight && isFreshAgentTurnTarget(ownershipTarget)) {
         if (e.cancelable) e.preventDefault()
         return
       }

@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { createRoot, type Root } from 'react-dom/client'
 import { flushSync } from 'react-dom'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from '@/components/fresh-agent/FreshAgentTranscript'
+import { getFreshAgentTurnItemsBuilder } from '@/lib/pane-action-registry'
 import type { FreshAgentTranscriptItem, FreshAgentTurn } from '@shared/fresh-agent-contract'
 
 // Render markdown bodies synchronously. The real LazyMarkdown wraps MarkdownRenderer
@@ -1536,15 +1537,42 @@ describe('FreshAgentTranscript', () => {
       expect(screen.queryByRole('button', { name: 'Fork conversation from here' })).not.toBeInTheDocument()
     })
 
-    it('opens a context menu on right-click with fork wired to the turn', () => {
+    it('registers a pane-scoped turn-items builder for the unified context menu and no local menu of its own', () => {
       const onFork = vi.fn()
-      render(<FreshAgentTranscript turns={TURNS} canFork onForkFromTurn={onFork} />)
+      const { unmount } = render(
+        <FreshAgentTranscript paneId="pane-test" turns={TURNS} canFork onForkFromTurn={onFork} />,
+      )
 
-      fireEvent.contextMenu(screen.getByRole('article', { name: 'Assistant transcript turn' }))
-      const menu = screen.getByRole('menu', { name: 'Turn context menu' })
-      expect(menu).toHaveTextContent('Copy turn text')
-      fireEvent.click(screen.getByRole('menuitem', { name: 'Fork conversation from here' }))
+      // Fine-pointer right-click: the transcript yields the gesture to the
+      // global ContextMenuProvider — no preventDefault, no transcript-rendered
+      // menu. The provider builds the visible menu from the registry below.
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+      act(() => {
+        screen.getByRole('article', { name: 'Assistant transcript turn' }).dispatchEvent(event)
+      })
+      expect(event.defaultPrevented).toBe(false)
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+
+      // The registered builder resolves an article index to that article's
+      // action turn and returns the SAME items the touch action sheet shows
+      // (buildTurnActionItems is the single builder for both surfaces).
+      const build = getFreshAgentTurnItemsBuilder('pane-test')
+      expect(build).toBeDefined()
+      const items = build!(1)
+      expect(items?.map((item) => item.label)).toEqual([
+        'Copy turn text',
+        'Fork conversation from here',
+        'Undo to here',
+        'Rewind code to here',
+      ])
+      items![1].run()
       expect(onFork).toHaveBeenCalledWith('turn-2')
+
+      // Unknown/out-of-range article indexes yield no turn rows.
+      expect(build!(42)).toBeNull()
+
+      unmount()
+      expect(getFreshAgentTurnItemsBuilder('pane-test')).toBeUndefined()
     })
 
     it('yields to the provider menu for a fine-pointer right-click on a code block inside a turn', () => {
@@ -1593,13 +1621,33 @@ describe('FreshAgentTranscript', () => {
       expect(onRewind).toHaveBeenCalledWith(expect.objectContaining({ id: 'turn-1', role: 'user' }))
     })
 
-    it('disables rewind in the context menu for assistant turns', () => {
+    it('gates fork/rollback/rewind per capability and role through the registered builder', () => {
       const onRewind = vi.fn()
-      render(<FreshAgentTranscript turns={TURNS} canFork={false} onRewindToTurn={onRewind} />)
+      render(
+        <FreshAgentTranscript
+          paneId="pane-test"
+          turns={TURNS}
+          canFork={false}
+          canRollback
+          onRollbackToTurn={vi.fn()}
+          onRewindToTurn={onRewind}
+        />,
+      )
 
-      fireEvent.contextMenu(screen.getByRole('article', { name: 'Assistant transcript turn' }))
-      const item = screen.getByRole('menuitem', { name: 'Rewind code to here' })
-      expect(item).toBeDisabled()
+      const build = getFreshAgentTurnItemsBuilder('pane-test')
+      expect(build).toBeDefined()
+      const userItems = build!(0)!
+      const assistantItems = build!(1)!
+
+      // User turn: fork needs the capability stamp; rewind is offered.
+      expect(userItems.find((item) => item.label === 'Fork conversation from here')?.disabled).toBe(true)
+      expect(userItems.find((item) => item.label === 'Rewind code to here')?.disabled).toBeFalsy()
+      expect(userItems.find((item) => item.label === 'Undo to here')?.disabled).toBeFalsy()
+
+      // Assistant turn: undo and rewind stay role-gated off, fork disabled.
+      expect(assistantItems.find((item) => item.label === 'Rewind code to here')?.disabled).toBe(true)
+      expect(assistantItems.find((item) => item.label === 'Undo to here')?.disabled).toBe(true)
+      expect(assistantItems.find((item) => item.label === 'Fork conversation from here')?.disabled).toBe(true)
     })
   })
 

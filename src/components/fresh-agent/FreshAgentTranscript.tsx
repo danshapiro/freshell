@@ -15,12 +15,10 @@ import {
 import {
   buildTurnActionItems,
   FreshAgentTurnActions,
-  FreshAgentTurnContextMenu,
   turnPlainText,
-  type FreshAgentTurnContextMenuState,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
-import { isFreshAgentSpecializedRegion } from '@/components/context-menu/context-menu-utils'
+import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
 import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
@@ -724,7 +722,6 @@ type TurnActionProps = {
   canRollback?: boolean
   rollbackBusy?: boolean
   onRollbackToTurn?: (turnId: string) => void
-  onTurnContextMenu?: (event: React.MouseEvent, turn: FreshAgentTurn) => void
   /** Coarse-pointer path: open the bottom action sheet for this turn. */
   onOpenActions?: (turn: FreshAgentTurn) => void
 }
@@ -806,6 +803,9 @@ function FreshAgentTurnArticle({
         continuation && 'mt-1.5',
       )}
       data-turn-role={turn.role}
+      // Load-bearing beyond the glom chip: the global ContextMenuProvider's
+      // fresh-agent menu reads this index at right-click time and resolves
+      // the action turn through the pane-registered builder below.
       data-turn-index={index}
       data-turn-continuation={continuation ? 'true' : 'false'}
       // Ownership marker for the global ContextMenuProvider: present exactly
@@ -816,31 +816,20 @@ function FreshAgentTurnArticle({
       data-longpress-owned={longPress ? 'true' : undefined}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
-        // The global ContextMenuProvider's document listener is capture-phase,
-        // so stopPropagation could never beat it — the real protection today is
-        // the provider's early-return carve-out for article[data-turn-role]
-        // targets. stopPropagation is kept as cheap, correct event hygiene.
-        if (actions.onOpenActions) {
-          event.preventDefault()
-          event.stopPropagation()
-          // The sheet opens mid-touch via this native-contextmenu route (no
-          // long-press timer involved): mark the overlay open so the gesture's
-          // touchend suppresses the synthesized compat click.
-          longPress?.notifyOverlayOpened?.()
-          actions.onOpenActions(actionTurn)
-          return
-        }
-        if (!actions.onTurnContextMenu) return
-        // Fine-pointer right-click into a specialized sub-region (markdown
-        // code block, tool input/output, diff): yield WITHOUT cancelling the
-        // event or opening the turn menu — the provider's capture-phase
-        // handler already opened its context-sensitive fresh-agent menu for
-        // this gesture (on coarse pointers the sheet branch above owns the
-        // whole turn and never yields).
-        if (isFreshAgentSpecializedRegion(event.target as HTMLElement | null)) return
+        // Coarse pointers only: open the bottom action sheet. On fine
+        // pointers this article installs no behavior at all — the global
+        // ContextMenuProvider's capture-phase document listener owns every
+        // fresh-agent right-click and already opened its unified menu for
+        // this gesture (turn action rows ride in via the pane-registered
+        // builder, so the transcript needs no menu of its own).
+        if (!actions.onOpenActions) return
         event.preventDefault()
         event.stopPropagation()
-        actions.onTurnContextMenu(event, actionTurn)
+        // The sheet opens mid-touch via this native-contextmenu route (no
+        // long-press timer involved): mark the overlay open so the gesture's
+        // touchend suppresses the synthesized compat click.
+        longPress?.notifyOverlayOpened?.()
+        actions.onOpenActions(actionTurn)
       }}
       {...(longPress?.handlers ?? {})}
     >
@@ -916,6 +905,11 @@ export type FreshAgentTranscriptHandle = {
 
 export type FreshAgentTranscriptProps = {
   turns: FreshAgentTurn[]
+  /** Owning pane. When present, the transcript registers a pane-scoped
+   * turn-items builder so the global ContextMenuProvider's fresh-agent menu
+   * can show per-turn rows for plain-text turn regions. Omitted in
+   * isolation/tests: no context-menu turn rows are registered. */
+  paneId?: string
   canFork?: boolean
   agentLabel?: string
   showModel?: boolean
@@ -943,6 +937,7 @@ export type FreshAgentTranscriptProps = {
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
   turns,
+  paneId,
   canFork = false,
   agentLabel,
   showModel = false,
@@ -963,7 +958,6 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [newMessages, setNewMessages] = useState(0)
-  const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
   const coarsePointer = useCoarsePointer()
@@ -1045,10 +1039,6 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     el?.scrollIntoView?.({ block: 'start' })
   }, [glomTarget])
 
-  const handleTurnContextMenu = useCallback((event: React.MouseEvent, turn: FreshAgentTurn) => {
-    setContextMenu({ x: event.clientX, y: event.clientY, turn })
-  }, [])
-
   const handleOpenActions = useCallback((turn: FreshAgentTurn) => {
     setSheetTurn(turn)
   }, [])
@@ -1060,9 +1050,31 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     canRollback,
     rollbackBusy,
     onRollbackToTurn,
-    onTurnContextMenu: coarsePointer ? undefined : handleTurnContextMenu,
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
-  }), [canFork, canRollback, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn, onRollbackToTurn, rollbackBusy])
+  }), [canFork, canRollback, coarsePointer, handleOpenActions, onForkFromTurn, onRewindToTurn, onRollbackToTurn, rollbackBusy])
+
+  // Desktop right-click surface: the global ContextMenuProvider owns every
+  // fresh-agent contextmenu gesture and asks this pane's registered builder
+  // for the per-turn rows. Registering HERE (not in the pane view) keeps the
+  // article-index → action-turn resolution next to the merged-line layout it
+  // depends on (lineEndIndex), so a merged activity line still forks/undoes/
+  // rewinds its LAST contributing turn. Same items as the touch action sheet:
+  // buildTurnActionItems is the single builder for both surfaces.
+  useEffect(() => {
+    if (!paneId) return
+    return registerFreshAgentTurnItems(paneId, (articleIndex) => {
+      const turn = displayTurns[lineEndIndex.get(articleIndex) ?? articleIndex]
+      if (!turn) return null
+      return buildTurnActionItems(turn, {
+        canFork,
+        canRollback,
+        rollbackBusy,
+        onForkFromTurn,
+        onRollbackToTurn,
+        onRewindToTurn,
+      })
+    })
+  }, [paneId, displayTurns, lineEndIndex, canFork, canRollback, rollbackBusy, onForkFromTurn, onRollbackToTurn, onRewindToTurn])
 
   useImperativeHandle(ref, () => ({
     scrollByLine: (direction) => {
@@ -1200,16 +1212,6 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           <span className="min-w-0 flex-1 truncate">{glomTarget.text.split('\n')[0]}</span>
         </button>
       ) : null}
-      <FreshAgentTurnContextMenu
-        state={contextMenu}
-        canFork={canFork}
-        canRollback={canRollback}
-        rollbackBusy={rollbackBusy}
-        onForkFromTurn={onForkFromTurn}
-        onRollbackToTurn={onRollbackToTurn}
-        onRewindToTurn={onRewindToTurn}
-        onClose={() => setContextMenu(null)}
-      />
       {sheetTurn ? (
         <FreshAgentActionSheet
           title={turnPlainText(sheetTurn).slice(0, 80) || getTurnLabel(sheetTurn, agentLabel)}

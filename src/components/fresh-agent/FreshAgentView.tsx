@@ -2895,6 +2895,7 @@ export function FreshAgentView({
             </div>
             <FreshAgentTranscript
               ref={transcriptRef}
+              paneId={paneId}
               turns={localEcho
                 ? [...turns, {
                     id: `__local-echo:${localEcho.requestId}`,
