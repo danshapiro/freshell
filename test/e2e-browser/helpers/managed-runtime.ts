@@ -82,13 +82,44 @@ export class ManagedRuntimeBrowserRig {
     return this.withManagedBin(() => this.web.restart())
   }
 
+  async restartWeb(): Promise<TestServerInfo> {
+    return this.restartWebGracefully()
+  }
+
   async crashAndRestartWeb(): Promise<TestServerInfo> {
     return this.withManagedBin(() => this.web.restartAbrupt())
+  }
+
+  async crashWeb(): Promise<TestServerInfo> {
+    return this.crashAndRestartWeb()
+  }
+
+  async restartSupervisor(): Promise<SupervisorInstance> {
+    const previous = this.supervisor
+    this.runtime.stopSupervisorExact(previous)
+    this.runtime.removeContainerExact(previous.containerId)
+    this.supervisor = await this.runtime.startSupervisor({
+      scenarioId: previous.scenarioId,
+      volumeName: previous.volumeName,
+      binaryKind: previous.binaryKind,
+      reuseSecret: true,
+    })
+    return this.supervisor
+  }
+
+  async stopSoul(soulId: string): Promise<any> {
+    const epoch = await this.controlEpoch()
+    const result = await this.runtime.adminOk(this.supervisor, this.runtime.stopBody(soulId, epoch))
+    return this.dataOf(result, 'stop')
   }
 
   async stop(): Promise<{ ok: boolean; errors: string[] }> {
     await this.web?.stop().catch(() => undefined)
     return this.runtime.cleanup()
+  }
+
+  async destroyTestRig(): Promise<{ ok: boolean; errors: string[] }> {
+    return this.stop()
   }
 
   async controlEpoch(): Promise<number> {
@@ -115,9 +146,17 @@ export class ManagedRuntimeBrowserRig {
   }
 
   ownedContainerHasPid(containerId: string, pid: number): boolean {
-    return this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid']).split(/\r?\n/)
-      .slice(1)
-      .some((line) => Number(line.trim()) === pid)
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false
+    const result = this.runtime.execOwnedContainerExact(containerId, [
+      'sh',
+      '-lc',
+      `if test -d /proc/${pid}; then printf alive; fi`,
+    ])
+    return result.trim() === 'alive'
+  }
+
+  ownedContainerProcessTable(containerId: string): string {
+    return this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid,args'])
   }
 
   writeBrowserReceipt(value: unknown): string {
