@@ -39,30 +39,133 @@
 //! exists off-Linux) and the tracked-spawn detach arm is Linux-gated.
 #![cfg(target_os = "linux")]
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_codex::launch_lifecycle::{
-    set_global_codex_launch_manager_for_tests, CodexTerminalLaunchManager,
+    set_global_codex_launch_manager_for_tests, CodexLaunchRuntime, CodexRuntimeReady,
+    CodexTerminalLaunchManager, SpawnedCodexAppServerRuntime,
 };
 use freshell_codex::{
-    proc_cmdline, proc_starttime, select_codex_runtime, CodexSidecarRecord, CodexSidecarStore,
-    SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
+    proc_cmdline, proc_starttime, select_codex_runtime, BoxFuture, CodexSidecarRecord,
+    CodexSidecarStore, SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV,
+    SIDECAR_RECORD_VERSION,
 };
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "e2e-codex-sidecar-reattach-token";
 const RECV_TIMEOUT: Duration = Duration::from_secs(20);
+const SYNTHETIC_FRESHELL_TOKEN: &str = "synthetic-prepared-restore-token";
+const FRESHELL_CONTEXT_ENV_KEYS: [&str; 6] = [
+    "FRESHELL",
+    "FRESHELL_URL",
+    "FRESHELL_TOKEN",
+    "FRESHELL_TERMINAL_ID",
+    "FRESHELL_TAB_ID",
+    "FRESHELL_PANE_ID",
+];
 
 // ─── the set-once global manager over a swappable test reconciler/store ──────
 
 static TEST_RECONCILER: Mutex<Option<Arc<SidecarReconciler>>> = Mutex::new(None);
 static TEST_STORE: Mutex<Option<Arc<CodexSidecarStore>>> = Mutex::new(None);
+static TEST_FAIL_ADOPTION: AtomicBool = AtomicBool::new(false);
+
+/// A real spawned runtime whose ownership update deliberately fails. This keeps
+/// the test on the production process/proxy path while making the failure occur
+/// strictly after the PTY was spawned, which is the prepared-launch boundary.
+struct FailingAdoptionRuntime {
+    inner: SpawnedCodexAppServerRuntime,
+}
+
+impl FailingAdoptionRuntime {
+    fn new(sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext) -> Self {
+        Self {
+            inner: SpawnedCodexAppServerRuntime::with_context(sidecar_context),
+        }
+    }
+}
+
+impl CodexLaunchRuntime for FailingAdoptionRuntime {
+    fn ensure_ready(
+        &self,
+        cwd: Option<String>,
+    ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
+        self.inner.ensure_ready(cwd)
+    }
+
+    fn update_ownership_metadata(
+        &self,
+        _terminal_id: String,
+        _generation: u64,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        // Give the PTY child a bounded opportunity to exec and write its
+        // allowlisted capture. The failure still happens only after the PTY
+        // exists, which is the lifecycle boundary under test.
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Err("injected adoption failure".to_string())
+        })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+        self.inner.shutdown()
+    }
+}
+
+/// Restores the test-only factory mode even if an assertion fails, so the
+/// ordinary survivor scenarios never inherit an injected failure.
+struct AdoptionFailureMode;
+
+impl AdoptionFailureMode {
+    fn enable() -> Self {
+        TEST_FAIL_ADOPTION.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for AdoptionFailureMode {
+    fn drop(&mut self) {
+        TEST_FAIL_ADOPTION.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Snapshot test-owned environment entries without ever formatting their
+/// values. The prepared-restore fixture uses only synthetic values, but the
+/// restoration is still panic-safe so no ambient context leaks across tests.
+struct TestEnvRestore {
+    values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl TestEnvRestore {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self {
+            values: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for TestEnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in self.values.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 /// Install the ONE process-wide launch manager (set-once): its factory
 /// re-reads the statics per plan and dispatches through the REAL production
@@ -77,8 +180,14 @@ fn install_global_manager() {
             // MutexGuards must never cross an await point.
             let reconciler = TEST_RECONCILER.lock().unwrap().clone();
             let store = TEST_STORE.lock().unwrap().clone();
+            let sidecar_context = plan.sidecar_context.clone();
             Box::pin(async move {
-                select_codex_runtime(reconciler.as_ref(), store.as_ref(), plan).await
+                if TEST_FAIL_ADOPTION.load(Ordering::SeqCst) {
+                    Arc::new(FailingAdoptionRuntime::new(sidecar_context))
+                        as Arc<dyn CodexLaunchRuntime>
+                } else {
+                    select_codex_runtime(reconciler.as_ref(), store.as_ref(), plan).await
+                }
             })
         }));
         assert!(
@@ -226,8 +335,9 @@ fn fixture_path() -> std::path::PathBuf {
 /// attribution from `codex_managed_launch_e2e.rs::write_codex_dispatcher`):
 /// - argv contains `app-server` → run the committed fake app-server fixture
 ///   (the manager-spawned sidecar; reads `FAKE_CODEX_APP_SERVER_BEHAVIOR`).
-/// - otherwise (the TUI launch) → dump argv JSON to
-///   `$CODEX_ARGV_CAPTURE_PATH` and stay alive until the test kills the pane.
+/// - otherwise (the TUI launch) → dump complete argv plus only the six
+///   allowlisted Freshell context fields to `$CODEX_ARGV_CAPTURE_PATH` and
+///   stay alive until the test kills the pane.
 fn codex_dispatcher() -> &'static std::path::PathBuf {
     static DISPATCHER: OnceLock<std::path::PathBuf> = OnceLock::new();
     DISPATCHER.get_or_init(|| {
@@ -243,7 +353,17 @@ fn codex_dispatcher() -> &'static std::path::PathBuf {
              if (args.includes('app-server')) {{\n\
                await import('file://{fixture}')\n\
              }} else {{\n\
-               fs.writeFileSync(process.env.CODEX_ARGV_CAPTURE_PATH, JSON.stringify(args))\n\
+               fs.writeFileSync(process.env.CODEX_ARGV_CAPTURE_PATH, JSON.stringify({{\n\
+                 argv: args,\n\
+                 env: {{\n\
+                   FRESHELL: process.env.FRESHELL,\n\
+                   FRESHELL_URL: process.env.FRESHELL_URL,\n\
+                   FRESHELL_TOKEN: process.env.FRESHELL_TOKEN,\n\
+                   FRESHELL_TERMINAL_ID: process.env.FRESHELL_TERMINAL_ID,\n\
+                   FRESHELL_TAB_ID: process.env.FRESHELL_TAB_ID,\n\
+                   FRESHELL_PANE_ID: process.env.FRESHELL_PANE_ID,\n\
+                 }},\n\
+               }}))\n\
                setInterval(() => undefined, 1000)\n\
              }}\n",
             fixture = fixture.display()
@@ -255,6 +375,15 @@ fn codex_dispatcher() -> &'static std::path::PathBuf {
         std::fs::set_permissions(&dispatcher, perms).unwrap();
         dispatcher
     })
+}
+
+/// The dispatcher and fake app-server deliberately capture no ambient
+/// environment outside this allowlist. Assertion messages below never print
+/// the captured values.
+#[derive(Deserialize)]
+struct CapturedCodexProcess {
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
 }
 
 async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
@@ -406,14 +535,56 @@ async fn create_codex_restore_terminal(
     }
 }
 
-/// Poll the capture file the dispatcher writes until it appears, then parse
-/// the argv (JSON array — the dispatcher shape).
-fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
+/// Same frozen restore create, but this one captures the expected post-PTY
+/// adoption error rather than panicking. It exercises the ownership-failure
+/// cleanup boundary of a preplanned restore launch.
+async fn create_codex_restore_terminal_expect_error(
+    ws: &mut TestWs,
+    request_id: &str,
+    cwd: &str,
+    session_id: &str,
+) -> serde_json::Value {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "codex",
+            "shell": "system",
+            "cwd": cwd,
+            "restore": true,
+            "sessionRef": { "provider": "codex", "sessionId": session_id },
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, ws.next())
+            .await
+            .expect("terminal.create error within timeout")
+            .expect("stream open")
+            .expect("no ws error");
+        if let WsMessage::Text(text) = msg {
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+            match value["type"].as_str() {
+                Some("error") if value["requestId"] == json!(request_id) => return value,
+                Some("terminal.created") if value["requestId"] == json!(request_id) => {
+                    panic!("post-PTY adoption failure unexpectedly created a terminal")
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Poll the capture file the dispatcher or fake app-server writes until it
+/// appears, then parse its allowlisted process capture.
+fn wait_for_captured_process(path: &std::path::Path) -> CapturedCodexProcess {
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     loop {
         if let Ok(raw) = std::fs::read_to_string(path) {
             if !raw.is_empty() {
-                return serde_json::from_str(&raw).expect("captured argv is a JSON array");
+                return serde_json::from_str(&raw).expect("captured process is JSON");
             }
         }
         assert!(
@@ -425,9 +596,66 @@ fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
     }
 }
 
+fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
+    wait_for_captured_process(path).argv
+}
+
 fn resume_pair_position(argv: &[String], session_id: &str) -> Option<usize> {
     argv.windows(2)
         .position(|w| w[0] == "resume" && w[1] == session_id)
+}
+
+fn freshell_mcp_pairs(argv: &[String]) -> Vec<(String, String)> {
+    argv.windows(2)
+        .filter(|pair| pair[0] == "-c" && pair[1].starts_with("mcp_servers.freshell."))
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect()
+}
+
+fn managed_env_vars_config() -> String {
+    let names = freshell_platform::mcp_inject::FRESHELL_MCP_CONTEXT_ENV_VARS
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("mcp_servers.freshell.env_vars=[{names}]")
+}
+
+fn assert_prepared_pair_uses_one_reserved_context(
+    tui: &CapturedCodexProcess,
+    sidecar: &CapturedCodexProcess,
+) -> String {
+    let expected_env_vars = managed_env_vars_config();
+    for process in [tui, sidecar] {
+        assert!(
+            freshell_mcp_pairs(&process.argv)
+                .iter()
+                .any(|(flag, value)| flag == "-c" && value == &expected_env_vars),
+            "prepared managed pair must retain the exact static Freshell env_vars declaration"
+        );
+        assert!(
+            !process
+                .argv
+                .iter()
+                .any(|arg| arg.contains(SYNTHETIC_FRESHELL_TOKEN)),
+            "synthetic Freshell token must never be serialized into argv"
+        );
+    }
+    assert!(
+        tui.env == sidecar.env
+            // Prepared recovery launches are headless: tab/pane are
+            // intentionally absent, leaving the four non-layout fields.
+            && tui.env.len() == FRESHELL_CONTEXT_ENV_KEYS.len() - 2
+            && FRESHELL_CONTEXT_ENV_KEYS
+                .iter()
+                .take(4)
+                .all(|key| tui.env.contains_key(*key)),
+        "prepared TUI and newly spawned sidecar must receive one equal allowlisted context"
+    );
+    tui.env
+        .get("FRESHELL_TERMINAL_ID")
+        .cloned()
+        .expect("prepared terminal context includes terminal id")
 }
 
 // ─── the survivor: this test's OWN fake app-server child ─────────────────────
@@ -665,6 +893,102 @@ fn capture_path(name: &str) -> std::path::PathBuf {
     path
 }
 
+async fn poll_terminal_stopped(
+    registry: &freshell_terminal::TerminalRegistry,
+    terminal_id: &str,
+    budget: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if !registry.is_pty_running(terminal_id) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// ─── prepared restore: reuse setup, then clean it up on failed adoption ──────
+
+#[test]
+fn prepared_codex_launch_reuses_reserved_setup_and_discards_after_adopt_failure() {
+    reattach_rt().block_on(async {
+        let _serial = test_lock().lock().await;
+        install_global_manager();
+        ensure_mcp_deps_resolvable();
+        let _environment = TestEnvRestore::capture(&[
+            "AUTH_TOKEN",
+            "CODEX_ARGV_CAPTURE_PATH",
+            "CODEX_CMD",
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            "FAKE_CODEX_APP_SERVER_ARG_LOG",
+            "FRESHELL_CODEX_MANAGED_LAUNCH",
+            "FRESHELL_URL",
+            "PORT",
+        ]);
+        let _injected_failure = AdoptionFailureMode::enable();
+        std::env::set_var("CODEX_CMD", codex_dispatcher());
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "1");
+        std::env::set_var("PORT", "23125");
+        std::env::set_var("FRESHELL_URL", "http://127.0.0.1:23125");
+        std::env::set_var("AUTH_TOKEN", SYNTHETIC_FRESHELL_TOKEN);
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+        swap_test_reconciler(None, None);
+
+        let tui_capture = capture_path("prepared-adoption-failure-tui");
+        let sidecar_capture = capture_path("prepared-adoption-failure-sidecar");
+        std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &tui_capture);
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &sidecar_capture);
+
+        let (ws_url, registry) = spawn_server().await;
+        let mut ws = connect_and_handshake(&ws_url).await;
+        let cwd = scenario_cwd("prepared-adoption-failure");
+        let error = create_codex_restore_terminal_expect_error(
+            &mut ws,
+            "req-prepared-adoption-failure",
+            cwd.to_str().expect("utf8 cwd"),
+            "thread-prepared-adoption-failure",
+        )
+        .await;
+        let tui = wait_for_captured_process(&tui_capture);
+        let sidecar = wait_for_captured_process(&sidecar_capture);
+        let reserved_terminal_id = assert_prepared_pair_uses_one_reserved_context(&tui, &sidecar);
+        let proxy_url = tui
+            .argv
+            .windows(2)
+            .find(|pair| pair[0] == "--remote")
+            .map(|pair| pair[1].clone())
+            .expect("managed TUI receives the proxy URL");
+
+        // The injected runtime rejects only `adopt`, after the PTY has been
+        // spawned. The WS door must kill that PTY and the manager must tear
+        // the prepared sidecar/proxy down instead of leaving either launch
+        // behind for a later create.
+        let pty_stopped =
+            poll_terminal_stopped(&registry, &reserved_terminal_id, Duration::from_secs(8)).await;
+        let proxy_torn_down = poll_proxy_refused(&proxy_url, Duration::from_secs(8)).await;
+        swap_test_reconciler(None, None);
+
+        assert_eq!(error["code"], json!("PTY_SPAWN_FAILED"));
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message == "injected adoption failure"),
+            "post-PTY adoption failure must surface the ownership error"
+        );
+        assert!(
+            pty_stopped,
+            "the reserved terminal's PTY must be discarded after adoption fails"
+        );
+        assert!(
+            proxy_torn_down,
+            "the unadopted prepared sidecar/proxy must be discarded after adoption fails"
+        );
+    });
+}
+
 // ─── scenario 1: reattach to the surviving sidecar ────────────────────────────
 
 #[test]
@@ -673,6 +997,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         let _serial = test_lock().lock().await;
         install_global_manager();
         ensure_mcp_deps_resolvable();
+        TEST_FAIL_ADOPTION.store(false, Ordering::SeqCst);
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         // DEV-0006 S5.e: unset = managed launch ON (the leg under test).
         std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
@@ -735,7 +1060,9 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         let (ws_url, registry) = spawn_server().await;
         let mut ws = connect_and_handshake(&ws_url).await;
         let capture = capture_path("reattach");
+        let replacement_capture = capture_path("reattach-replacement-sidecar");
         std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &replacement_capture);
         let cwd = scenario_cwd("reattach");
         let created = create_codex_restore_terminal(
             &mut ws,
@@ -769,6 +1096,10 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         let record_terminal_id =
             poll_record_terminal_id(&store, ownership_id, Duration::from_secs(10));
         let unclaimed = reconciler.unclaimed_len();
+        let replacement_child_started = replacement_capture
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false);
 
         // Cleanup: kill ONLY pids this test spawned. The pane kill queues the
         // reattached sidecar's teardown, which reaps the survivor (this
@@ -782,6 +1113,7 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         let _ = poll_proxy_refused(&proxy_url, Duration::from_secs(8)).await;
         swap_test_reconciler(None, None);
         std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_ARG_LOG");
 
         // (3c) Asserts.
         assert!(
@@ -803,6 +1135,10 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
             survivor_alive_same_incarnation,
             "the surviving sidecar (pid {survivor_pid}) must still be alive, same incarnation"
         );
+        assert!(
+            !replacement_child_started,
+            "a verified survivor must be reattached unchanged; no replacement app-server child may start"
+        );
         assert_eq!(
             record_terminal_id.as_deref(),
             Some(terminal_id.as_str()),
@@ -810,6 +1146,16 @@ fn restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn() {
         );
         assert_eq!(unclaimed, 0, "the one-shot claim was consumed");
     });
+}
+
+/// The host-gated verification entry point required for this binary's
+/// process-global Codex fixture. It deliberately delegates to the normal
+/// survivor test instead of replacing it, so the default package suite keeps
+/// exercising the original boundary too.
+#[test]
+#[ignore = "host-gated e2e; mutates process-global Codex launch seams — run alone with --ignored --test-threads=1"]
+fn ignored_survivor_reattach_keeps_verified_pid_and_starts_no_replacement() {
+    restore_reattaches_tui_to_surviving_sidecar_preserving_in_flight_turn();
 }
 
 // ─── scenario 2: no tracked survivor → today's fresh-spawn path ───────────────
@@ -820,6 +1166,7 @@ fn restore_falls_back_to_fresh_sidecar_without_tracked_survivor() {
         let _serial = test_lock().lock().await;
         install_global_manager();
         ensure_mcp_deps_resolvable();
+        TEST_FAIL_ADOPTION.store(false, Ordering::SeqCst);
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
@@ -913,6 +1260,7 @@ fn active_writer_collision_surfaces_minus32600_only_on_the_fresh_path() {
         let _serial = test_lock().lock().await;
         install_global_manager();
         ensure_mcp_deps_resolvable();
+        TEST_FAIL_ADOPTION.store(false, Ordering::SeqCst);
         std::env::set_var("CODEX_CMD", codex_dispatcher());
         std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 

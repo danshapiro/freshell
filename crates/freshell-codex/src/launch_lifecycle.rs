@@ -47,7 +47,7 @@ use crate::app_server::BoxFuture;
 use crate::durability::{default_server_instance_id, mint_ownership_id};
 use crate::launch_plan::{
     codex_sidecar_spawn_spec, plan_codex_launch, plan_codex_launch_retry, CodexLaunchConfigError,
-    CodexLaunchPlan, CodexLaunchPlanInput, CodexLaunchRetryDecision,
+    CodexLaunchPlan, CodexLaunchPlanInput, CodexLaunchRetryDecision, CodexSidecarLaunchContext,
     CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS,
 };
 use crate::remote_proxy::{CodexRemoteProxy, CodexRemoteProxyOptions, RemoteProxyEvent};
@@ -801,7 +801,17 @@ impl CodexTerminalLaunchManager {
         launch: CodexTerminalLaunch,
         generation: u64,
     ) -> Result<(), String> {
-        launch.sidecar.adopt(terminal_id, generation).await?;
+        if let Err(adoption_error) = launch.sidecar.adopt(terminal_id, generation).await {
+            if let Err(cleanup_error) = launch.sidecar.shutdown().await {
+                tracing::error!(
+                    target: "freshell_codex::launch",
+                    terminal_id,
+                    error = %cleanup_error,
+                    "codex_launch_adopt_cleanup_failed"
+                );
+            }
+            return Err(adoption_error);
+        }
         // S5.d.3 DECISION (recorded): `launch.plan.binding_reason` is
         // deliberately DROPPED here — the identity tail derives adopt-vs-rebind
         // from context, and no Rust wire frame carries sessionBindingReason.
@@ -1008,6 +1018,9 @@ struct SpawnedSidecar {
 pub struct SpawnedCodexAppServerRuntime {
     codex_command: Option<String>,
     start_budget: Duration,
+    /// Immutable, spawn-only configuration/context. It is intentionally not
+    /// copied into the child record or any durable sidecar identity state.
+    sidecar_context: CodexSidecarLaunchContext,
     /// Durable sidecar record store (Task 3). Production resolves the
     /// process-global handle ([`crate::sidecar_store::set_codex_sidecar_store`],
     /// wired at boot in Task 10); absent global ⇒ disabled store ⇒ behavior
@@ -1029,9 +1042,17 @@ impl SpawnedCodexAppServerRuntime {
     /// interpreter-plus-script support) falling back to `codex`. The record
     /// store resolves from the process-global handle; absent ⇒ disabled.
     pub fn new() -> Self {
+        Self::with_context(CodexSidecarLaunchContext::default())
+    }
+
+    /// Construct a newly spawned runtime with its immutable process context.
+    /// Reattached runtimes intentionally do not have this constructor: their
+    /// child process already exists and must remain unchanged.
+    pub fn with_context(sidecar_context: CodexSidecarLaunchContext) -> Self {
         Self {
             codex_command: None,
             start_budget: SIDECAR_START_BUDGET,
+            sidecar_context,
             store: codex_sidecar_store().unwrap_or_else(|| Arc::new(CodexSidecarStore::disabled())),
             state: tokio::sync::Mutex::new(None),
             adopted_metadata: Mutex::new(None),
@@ -1149,7 +1170,7 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             let port = allocate_loopback_port()?;
             let ws_url = format!("ws://127.0.0.1:{port}");
             let ownership_id = mint_ownership_id();
-            let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id);
+            let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id, &self.sidecar_context);
 
             let command = self.resolved_command();
             let mut parts = command.split_whitespace();

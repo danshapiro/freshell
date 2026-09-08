@@ -16,7 +16,8 @@ import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
-import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
+import { getFreshAgentPaneActions, getFreshAgentTurnItemsBuilder } from '@/lib/pane-action-registry'
+import type { ActionSheetItem } from '@/components/fresh-agent/FreshAgentActionSheet'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import {
   resolveReopenPaneSessionTarget,
@@ -743,13 +744,17 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const selection = window.getSelection()
     const hasSelection = !!(selection && selection.toString().trim())
 
-    // Detect sub-region from click target using closest()
-    // KEEP IN SYNC: these selectors must mirror isFreshAgentSpecializedRegion
-    // in context-menu-utils.ts EXACTLY — edit both together.
+    // One menu, region-aware items: the specialized sub-region partition
+    // (markdown code blocks, tool input/output rows, diff views) selects WHICH
+    // rows this menu shows — it no longer decides which menu renders. Plain
+    // turn regions (inside a turn article but outside every specialized
+    // sub-region) prepend the pane-registered per-turn actions; specialized
+    // sub-regions keep their context-sensitive rows and gain no turn rows.
     const codeBlock = clickTarget?.closest?.('.prose pre code') as HTMLElement | null
     const toolInput = clickTarget?.closest?.('[data-tool-input]') as HTMLElement | null
     const toolOutput = clickTarget?.closest?.('[data-tool-output]') as HTMLElement | null
     const diffView = clickTarget?.closest?.('[data-diff]') as HTMLElement | null
+    const isSpecializedRegion = !!(codeBlock || toolInput || toolOutput || diffView)
 
     const items: MenuItem[] = [
       {
@@ -877,8 +882,37 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       )
     }
 
+    // Plain-text region of a turn article: prepend the per-turn rows the pane
+    // registered (single item builder, buildTurnActionItems — the same builder
+    // the touch action sheet consumes). Specialized sub-regions above stay
+    // turn-row-free, exactly as the PR-#735 partition decided; it now selects
+    // items within this one menu instead of handing the gesture between menus.
+    const turnArticle = clickTarget?.closest?.('article[data-turn-role]') as HTMLElement | null
+    const turnArticleIndex = turnArticle?.getAttribute('data-turn-index')
+    if (target.paneId && turnArticle && !isSpecializedRegion && turnArticleIndex != null) {
+      const index = Number(turnArticleIndex)
+      const turnItems = Number.isNaN(index)
+        ? null
+        : getFreshAgentTurnItemsBuilder(target.paneId)?.(index)
+      if (turnItems && turnItems.length > 0) {
+        return [...turnActionItemsToMenuItems(turnItems), { type: 'separator', id: 'fc-turn-sep' }, ...items]
+      }
+    }
+
     return items
   }
 
   return []
+}
+
+/** Adapt the shared turn-action sheet vocabulary onto the context-menu row shape. */
+function turnActionItemsToMenuItems(items: ActionSheetItem[]): MenuItem[] {
+  return items.map((item) => ({
+    type: 'item',
+    id: `fc-turn-${item.label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+    label: item.label,
+    disabled: item.disabled,
+    danger: item.destructive,
+    onSelect: () => item.run(),
+  }))
 }

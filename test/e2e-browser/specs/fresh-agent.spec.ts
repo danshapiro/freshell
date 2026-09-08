@@ -604,7 +604,7 @@ test.describe('Fresh Agent', () => {
     expect(monoFont).not.toBe(defaultFont)
   })
 
-  test('turn context menu renders on an opaque popover surface', async ({ freshellPage: _freshellPage, page, terminal }) => {
+  test('fresh-agent turn right-click opens the unified context menu on an opaque surface', async ({ freshellPage: _freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
     const sessionId = '63333000-0000-4333-8333-000000000006'
     await stubFreshclaudeThread(page, sessionId, [
@@ -631,15 +631,16 @@ test.describe('Fresh Agent', () => {
 
     const paneRoot = page.locator('[data-context="fresh-agent"]')
 
-    // Specialized sub-region partition: right-clicking the rendered code block
-    // inside a turn opens the PROVIDER's context-sensitive menu — exactly one
-    // menu, containing "Copy code block", and never the whole-turn menu.
+    // Specialized sub-region partition: right-clicking the rendered code
+    // block inside a turn opens THE fresh-agent context menu with the
+    // context-sensitive rows ("Copy code block") and no per-turn rows — one
+    // menu system, and the region selects which items it shows.
     const codeBlock = paneRoot.locator('article .prose pre code').first()
     await expect(codeBlock).toBeVisible({ timeout: 10_000 })
     await codeBlock.click({ button: 'right' })
     await expect(page.getByRole('menu')).toHaveCount(1)
     await expect(page.getByRole('menuitem', { name: 'Copy code block' })).toBeVisible()
-    await expect(page.getByRole('menu', { name: 'Turn context menu' })).toHaveCount(0)
+    await expect(page.getByRole('menuitem', { name: 'Copy turn text' })).toHaveCount(0)
     // Dismiss via a left-click outside the menu (the provider's pointerdown
     // dismissal); plain turn text has no click behavior of its own.
     await paneRoot.getByText('Here is the check:', { exact: true }).click()
@@ -652,21 +653,33 @@ test.describe('Fresh Agent', () => {
     // Single-menu invariant: exactly ONE menu may open for a turn gesture.
     // Before the provider carve-out, right-clicking a turn stacked the global
     // pane menu and the transcript's turn menu at the same coordinates (the
-    // "popup with blank lines" bug — two overlapping menus).
+    // "popup with blank lines" bug — two overlapping menus). The transcript
+    // menu has since been deleted outright; the unified menu below is the
+    // provider's fresh-agent menu with turn rows prepended.
     await expect(page.getByRole('menu')).toHaveCount(1)
 
-    // Fine-pointer desktop: right-clicking a turn opens the floating turn menu.
-    const menu = page.getByRole('menu', { name: 'Turn context menu' })
-    await expect(menu).toBeVisible()
+    // Fine-pointer desktop: right-clicking plain turn text opens the unified
+    // fresh-agent context menu — the per-turn rows first, then the base
+    // fresh-agent rows — all from the one portaled menu system.
+    const menu = page.getByRole('menu')
+    await expect(page.getByRole('menuitem', { name: 'Copy turn text' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Fork conversation from here' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Undo to here' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Rewind code to here' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Select all' })).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: 'Copy session ID' })).toBeVisible()
 
-    // Regression pin: bg-popover previously resolved to no rule at all (the
-    // popover tokens were missing from the tailwind config/theme variables),
-    // so the menu floated over the transcript with a transparent background.
+    // Regression pin: a floating menu previously resolved to no surface rule
+    // at all (the popover tokens were missing from the tailwind config/theme
+    // variables), so the menu floated over the transcript with a transparent
+    // background. The unified menu paints bg-card, which equals the popover
+    // token in both bundled themes — the probe below still pins opacity.
     const backgroundColor = await menu.evaluate((el) => getComputedStyle(el).backgroundColor)
-    expect(backgroundColor, 'turn context menu must not be transparent').not.toBe('rgba(0, 0, 0, 0)')
+    expect(backgroundColor, 'context menu must not be transparent').not.toBe('rgba(0, 0, 0, 0)')
     expect(backgroundColor).not.toBe('transparent')
 
-    // And it must be the popover surface token itself, not accidental inheritance.
+    // And it must be the card/popover surface token value itself (equal in
+    // both bundled themes), not accidental inheritance.
     const expectedSurface = await page.evaluate(() => {
       const probe = document.createElement('div')
       probe.style.backgroundColor = 'hsl(var(--popover))'
@@ -953,16 +966,16 @@ test.describe('Fresh Agent', () => {
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     await expect(freshcodexRoot.locator('.fresh-agent-turn-header', { hasText: 'Freshcodex' })).toHaveCount(1)
     await expect(freshcodexRoot.locator('[data-turn-continuation="true"]')).toHaveCount(1)
-    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).click()
-    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     // The status strip shrank the transcript viewport by one row, so the
-    // "Jump to your message" glom chip overlays the top band where the
-    // Thinking toggle's click point lands. The chip re-derives from scroll
-    // position on every scroll-into-view, so mouse dismissing it is racy
-    // (Playwright re-scrolls to the toggle and the chip returns on top of the
-    // click point). Activate the toggle by keyboard Enter instead: focus +
+    // "Jump to your message" glom chip overlays the top band where these
+    // toggles' click points land. The chip re-derives from scroll position on
+    // every scroll-into-view, so mouse dismissing it is racy (Playwright
+    // re-scrolls to the toggle and the chip returns on top of the click
+    // point). Activate both toggles by keyboard Enter instead: focus +
     // keypress targets the element, not the point, so the overlay cannot
     // intercept the activation.
+    await freshcodexRoot.getByRole('button', { name: 'Toggle activity details' }).press('Enter')
+    await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toHaveCount(0)
     await freshcodexRoot.getByRole('button', { name: 'Thinking' }).press('Enter')
     await expect(freshcodexRoot.getByText('private style reasoning should stay hidden')).toBeVisible()
     await freshcodexRoot.getByRole('button', { name: /Diff: src\/index\.css/ }).click()

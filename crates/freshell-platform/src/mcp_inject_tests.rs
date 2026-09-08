@@ -3,7 +3,9 @@
 //!   Split out to respect the campaign's ≤1K-lines-per-file limit.
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::{HostOs, MapEnv};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +41,17 @@ struct FakeRt {
     tmp: PathBuf,
     wsl: bool,
     args: Vec<McpServerArg>,
+    server_command_args_calls: Arc<AtomicUsize>,
+}
+impl FakeRt {
+    fn new(tmp: &Path, wsl: bool, args: Vec<McpServerArg>) -> Self {
+        Self {
+            tmp: tmp.to_path_buf(),
+            wsl,
+            args,
+            server_command_args_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 impl McpRuntime for FakeRt {
     fn tmp_dir(&self) -> PathBuf {
@@ -52,6 +65,8 @@ impl McpRuntime for FakeRt {
         format!("\\\\wsl.localhost\\Ubuntu{}", linux_path.replace('/', "\\"))
     }
     fn server_command_args(&self) -> Result<Vec<McpServerArg>, McpInjectError> {
+        self.server_command_args_calls
+            .fetch_add(1, Ordering::SeqCst);
         Ok(self.args.clone())
     }
 }
@@ -65,11 +80,136 @@ fn mcp_unix_args() -> Vec<McpServerArg> {
 }
 
 fn fake_rt(tmp: &Path, wsl: bool) -> FakeRt {
-    FakeRt {
-        tmp: tmp.to_path_buf(),
-        wsl,
-        args: mcp_unix_args(),
+    FakeRt::new(tmp, wsl, mcp_unix_args())
+}
+
+const MANAGED_CODEX_CONTEXT_ENV_VARS_PAIR: &str = "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]";
+
+fn managed_codex_pairs(args_pair: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "mcp_servers.freshell.command=\"node\"".to_string(),
+        "-c".to_string(),
+        args_pair.to_string(),
+        "-c".to_string(),
+        MANAGED_CODEX_CONTEXT_ENV_VARS_PAIR.to_string(),
+    ]
+}
+
+#[test]
+fn managed_codex_renderings_resolve_one_recipe_and_forward_only_names() {
+    let scratch = Scratch::new("managed-once");
+    let rt = fake_rt(scratch.path(), false);
+    let calls = Arc::clone(&rt.server_command_args_calls);
+    let env = MapEnv::new()
+        .with("FRESHELL_TOKEN", "token-not-in-argv")
+        .with("FRESHELL_TERMINAL_ID", "terminal-id-not-in-argv")
+        .with("FRESHELL_URL", "https://url-not-in-argv.invalid");
+
+    let renderings =
+        build_managed_codex_mcp_renderings(&rt, &env, HostOs::Linux, false, ProviderTarget::Unix)
+            .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let expected = managed_codex_pairs(
+        "mcp_servers.freshell.args=[\"--import\", \"/repo/node_modules/tsx/dist/loader.mjs\", \"/repo/server/mcp/server.ts\"]",
+    );
+    assert_eq!(renderings.tui.args, expected);
+    assert_eq!(renderings.sidecar.args, expected);
+    for injection in [&renderings.tui, &renderings.sidecar] {
+        assert!(injection.env.is_empty());
+        assert!(injection
+            .args
+            .iter()
+            .all(|arg| !arg.starts_with("mcp_servers.freshell.env=")));
+        assert!(injection
+            .args
+            .iter()
+            .all(|arg| !arg.contains("token-not-in-argv")));
+        assert!(injection
+            .args
+            .iter()
+            .all(|arg| !arg.contains("terminal-id-not-in-argv")));
+        assert!(injection
+            .args
+            .iter()
+            .all(|arg| !arg.contains("url-not-in-argv.invalid")));
     }
+}
+
+#[test]
+fn managed_codex_renderings_use_unc_for_wsl_windows_tui_and_posix_for_sidecar() {
+    let scratch = Scratch::new("managed-wsl");
+    let rt = fake_rt(scratch.path(), true);
+    let renderings = build_managed_codex_mcp_renderings(
+        &rt,
+        &MapEnv::new(),
+        HostOs::Linux,
+        true,
+        ProviderTarget::Windows,
+    )
+    .unwrap();
+
+    assert_eq!(
+        renderings.tui.args,
+        managed_codex_pairs(
+            "mcp_servers.freshell.args=[\"--import\", \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\repo\\\\node_modules\\\\tsx\\\\dist\\\\loader.mjs\", \"\\\\\\\\wsl.localhost\\\\Ubuntu\\\\repo\\\\server\\\\mcp\\\\server.ts\"]",
+        )
+    );
+    assert_eq!(
+        renderings.sidecar.args,
+        managed_codex_pairs(
+            "mcp_servers.freshell.args=[\"--import\", \"/repo/node_modules/tsx/dist/loader.mjs\", \"/repo/server/mcp/server.ts\"]",
+        )
+    );
+}
+
+#[test]
+fn managed_codex_renderings_use_wsl_paths_for_native_windows_unix_tui() {
+    let scratch = Scratch::new("managed-win-unix");
+    let windows_args = vec![
+        McpServerArg::Literal("--import".to_string()),
+        McpServerArg::Path("C:\\repo\\node_modules\\tsx\\dist\\loader.mjs".to_string()),
+        McpServerArg::Path("C:\\repo\\server\\mcp\\server.ts".to_string()),
+    ];
+    let rt = FakeRt::new(scratch.path(), false, windows_args);
+    let env = MapEnv::new().with("WSL_MOUNT_PREFIX", "/mnt");
+    let renderings =
+        build_managed_codex_mcp_renderings(&rt, &env, HostOs::Windows, false, ProviderTarget::Unix)
+            .unwrap();
+
+    assert_eq!(
+        renderings.tui.args,
+        managed_codex_pairs(
+            "mcp_servers.freshell.args=[\"--import\", \"/mnt/c/repo/node_modules/tsx/dist/loader.mjs\", \"/mnt/c/repo/server/mcp/server.ts\"]",
+        )
+    );
+    assert_eq!(
+        renderings.sidecar.args,
+        managed_codex_pairs(
+            "mcp_servers.freshell.args=[\"--import\", \"C:\\\\repo\\\\node_modules\\\\tsx\\\\dist\\\\loader.mjs\", \"C:\\\\repo\\\\server\\\\mcp\\\\server.ts\"]",
+        )
+    );
+
+    let unconvertible_rt = FakeRt::new(
+        scratch.path(),
+        false,
+        vec![McpServerArg::Path(
+            "\\\\server\\share\\server.ts".to_string(),
+        )],
+    );
+    let err = build_managed_codex_mcp_renderings(
+        &unconvertible_rt,
+        &env,
+        HostOs::Windows,
+        false,
+        ProviderTarget::Unix,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message,
+        "Cannot render managed Codex MCP path for a Unix TUI: failed to convert the Windows path to a WSL path."
+    );
 }
 
 #[test]
@@ -168,15 +308,15 @@ fn codex_unix_target_on_wsl_keeps_host_paths() {
 #[test]
 fn g_w1_native_windows_host_unix_target_keeps_windows_paths() {
     let scratch = Scratch::new("gw1");
-    let rt = FakeRt {
-        tmp: scratch.path().to_path_buf(),
-        wsl: false, // native Windows host: isWslEnvironment() is false
-        args: vec![
+    let rt = FakeRt::new(
+        scratch.path(),
+        false, // native Windows host: isWslEnvironment() is false
+        vec![
             McpServerArg::Literal("--import".to_string()),
             McpServerArg::Path("C:\\repo\\node_modules\\tsx\\dist\\loader.mjs".to_string()),
             McpServerArg::Path("C:\\repo\\server\\mcp\\server.ts".to_string()),
         ],
-    };
+    );
     let inj = generate_mcp_injection(&rt, "codex", "term1", None, ProviderTarget::Unix).unwrap();
     assert_eq!(
         inj.args[3],

@@ -7,7 +7,6 @@ import {
   useState,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
@@ -2699,11 +2698,6 @@ export function FreshAgentView({
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
     const WatermarkIcon = descriptor?.icon
-    const handlePanePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
-      if (isEditableTarget(event.target)) return
-      if (window.getSelection()?.toString()) return
-      requestAnimationFrame(() => composerRef.current?.focus())
-    }
     const handlePaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
       if (event.defaultPrevented) return
       if (isTranscriptNavigationKey(event) && !isInteractiveTarget(event.target)) {
@@ -2760,7 +2754,6 @@ export function FreshAgentView({
         data-provider={paneContent.provider}
         data-session-type={paneContent.sessionType}
         style={{ '--fresh-transcript-font-size': `${terminalFontSize}px` } as CSSProperties}
-        onPointerUpCapture={handlePanePointerUp}
         onKeyDownCapture={handlePaneKeyDown}
       >
         {WatermarkIcon ? (
@@ -2902,6 +2895,7 @@ export function FreshAgentView({
             </div>
             <FreshAgentTranscript
               ref={transcriptRef}
+              paneId={paneId}
               turns={localEcho
                 ? [...turns, {
                     id: `__local-echo:${localEcho.requestId}`,

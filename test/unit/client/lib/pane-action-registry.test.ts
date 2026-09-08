@@ -3,6 +3,9 @@ import {
   getTerminalActions,
   registerTerminalActions,
   type TerminalActions,
+  getFreshAgentTurnItemsBuilder,
+  registerFreshAgentTurnItems,
+  type FreshAgentTurnItemsBuilder,
 } from '@/lib/pane-action-registry'
 
 function createTerminalActions(): TerminalActions {
@@ -35,5 +38,27 @@ describe('pane action registry', () => {
     }
 
     expect(getTerminalActions(paneId)).toBeUndefined()
+  })
+
+  it('registers a per-pane fresh-agent turn-items builder and unregisters by identity', () => {
+    const paneId = 'pane-turn-items'
+    const staleBuilder: FreshAgentTurnItemsBuilder = () => [{ label: 'Stale', run: vi.fn() }]
+    const currentBuilder: FreshAgentTurnItemsBuilder = (articleIndex) =>
+      articleIndex === 0 ? [{ label: 'Copy turn text', run: vi.fn() }] : null
+
+    const unregisterStale = registerFreshAgentTurnItems(paneId, staleBuilder)
+    const unregisterCurrent = registerFreshAgentTurnItems(paneId, currentBuilder)
+
+    try {
+      unregisterStale()
+      expect(getFreshAgentTurnItemsBuilder(paneId)).toBe(currentBuilder)
+      // The builder maps an article index to turn action items (null off-turn).
+      expect(currentBuilder(0)?.map((item) => item.label)).toEqual(['Copy turn text'])
+      expect(currentBuilder(7)).toBeNull()
+    } finally {
+      unregisterCurrent()
+    }
+
+    expect(getFreshAgentTurnItemsBuilder(paneId)).toBeUndefined()
   })
 })

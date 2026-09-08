@@ -140,13 +140,20 @@ describe('mobile coarse-pointer transcript behavior', () => {
     expect(screen.queryByRole('menu', { name: 'Turn context menu' })).not.toBeInTheDocument()
   })
 
-  it('keeps the floating context menu on fine pointers', () => {
+  it('yields fine-pointer right-clicks to the global provider (no transcript-owned menu)', () => {
     stubCoarsePointer(false)
     render(<FreshAgentTranscript turns={TURNS} canFork={false} />)
 
     expect(screen.queryByRole('button', { name: 'Turn actions menu' })).not.toBeInTheDocument()
-    fireEvent.contextMenu(screen.getByRole('article', { name: 'You transcript turn' }))
-    expect(screen.getByRole('menu', { name: 'Turn context menu' })).toBeInTheDocument()
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    act(() => {
+      screen.getByRole('article', { name: 'You transcript turn' }).dispatchEvent(event)
+    })
+    // The transcript renders no menu of its own on fine pointers and does not
+    // cancel the event — the global ContextMenuProvider's capture-phase
+    // listener opens its unified menu for this gesture.
+    expect(event.defaultPrevented).toBe(false)
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
   })
 })
 
