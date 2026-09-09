@@ -13,6 +13,7 @@ import {
 import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 import {
   loadRuntimeSoakReceipt,
+  runtimeSoakRetainedBundle,
   SOAK_MAX_RUNTIME_LOG_BYTES,
   SOAK_MAX_TERMINAL_SPOOL_BYTES,
 } from '../../../scripts/testing/runtime-soak-evidence.js'
@@ -487,10 +488,11 @@ async function gate10SoakReceipt(h: RuntimeHarness): Promise<void> {
     'Run scripts/testing/runtime-phase5-soak.ts for at least 30 minutes and provide its candidate-bound receipt.',
   )
   const summary = receipt.soakValidation
-  h.assert(caseId, summary.durationMs >= 30 * 60 * 1_000, 'hashed samples span at least 30 measured minutes', summary)
+  h.assert(caseId, summary.durationMs >= 30 * 60 * 1_000, 'hashed samples span at least 30 monotonic measured minutes', summary)
   h.assert(caseId, summary.desiredSouls >= 50, 'every sample keeps at least 50 persistent desired souls', summary)
   h.assert(caseId, summary.memoryPressureObserved && summary.cpuThrottlingObserved && summary.pidPressureObserved, 'samples prove actual CPU, memory, and PID pressure', summary)
   h.assert(caseId, summary.falseLossNotices === 0 && summary.duplicateWriters === 0, 'samples have no false loss notices or duplicate writers', summary)
+  h.assert(caseId, summary.terminalOutputObserved && summary.terminalOutputGrowthObserved && summary.terminalSpoolBoundedTailObserved, 'samples prove continuous production shell output and bounded terminal retention', summary)
   h.assert(caseId, summary.maxTerminalSpoolBytes <= SOAK_MAX_TERMINAL_SPOOL_BYTES && summary.maxRuntimeLogBytes <= SOAK_MAX_RUNTIME_LOG_BYTES, 'samples prove actual host spool/log retained-byte bounds', summary)
 }
 
@@ -814,10 +816,13 @@ function requiredReceipt(
       receipt,
     })
     soakValidation = validated.summary
-    fs.writeFileSync(
-      path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-samples.jsonl`),
-      validated.sampleEvidenceBytes,
-    )
+    const retained = runtimeSoakRetainedBundle(validated)
+    const bundleDir = path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-bundle`)
+    fs.mkdirSync(bundleDir, { recursive: true, mode: 0o700 })
+    for (const [fileName, bytes] of Object.entries(retained.files)) {
+      fs.writeFileSync(path.join(bundleDir, fileName), bytes, { mode: 0o600 })
+    }
+    fs.writeFileSync(path.join(bundleDir, 'index.json'), JSON.stringify(retained.index, null, 2), { mode: 0o600 })
   } else {
     h.assert(caseId, receipt.schemaVersion === 1, `${envName} uses its expected schema v1`, receipt)
   }
