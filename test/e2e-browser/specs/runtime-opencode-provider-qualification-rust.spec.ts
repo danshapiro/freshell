@@ -25,7 +25,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -284,10 +284,10 @@ function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntim
 
 async function nextNativeAssistantTurn(
   rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
-  priorMessageIds: ReadonlySet<string>,
+  priorMessageIds: ReadonlySet<string>, expectedText: string,
 ): Promise<NativeAssistantTurn> {
-  return waitForValue('a new completed native assistant message, not a rendered echo', () => (
-    nativeAssistantTurns(rig, view, sessionId).find((turn) => !priorMessageIds.has(turn.messageId)) ?? null
+  return waitForValue('the correlated completed native assistant response, not a rendered echo', () => (
+    selectNativeAssistantTurn(nativeAssistantTurns(rig, view, sessionId), priorMessageIds, expectedText)
   ), 180_000)
 }
 
@@ -402,7 +402,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         await paneSessionId(harness, tabId, first.paneId)
       ), 120_000)
       expect(nativeSessionId).toMatch(/^ses_/)
-      const firstAnswer = await nextNativeAssistantTurn(rig, first.view, nativeSessionId, new Set())
+      const firstAnswer = await nextNativeAssistantTurn(rig, first.view, nativeSessionId, new Set(), nonce)
       verifyMemoryAnswer(firstAnswer, nonce)
       const nativeConversationProofs = [nativeAssistantProof(nativeSessionId, firstAnswer)]
 
@@ -431,7 +431,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
       const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
       await executeInPane(page, first.paneId, 'What is the name of the project we chose earlier?')
-      const recalledAnswer = await nextNativeAssistantTurn(rig, afterHostCrash, nativeSessionId, beforeRecall)
+      const recalledAnswer = await nextNativeAssistantTurn(rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
       verifyMemoryAnswer(recalledAnswer, nonce)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
       nativeConversationProofs.push(nativeAssistantProof(nativeSessionId, recalledAnswer))
@@ -465,7 +465,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
       const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
       await executeInPane(page, first.paneId, 'Please remind me of the project name we selected.')
-      const providerAnswer = await nextNativeAssistantTurn(rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup)
+      const providerAnswer = await nextNativeAssistantTurn(rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
       verifyMemoryAnswer(providerAnswer, nonce)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
       nativeConversationProofs.push(nativeAssistantProof(nativeSessionId, providerAnswer))
@@ -482,7 +482,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
-      const secondAnswer = await nextNativeAssistantTurn(rig, second.view, secondSessionId, new Set())
+      const secondAnswer = await nextNativeAssistantTurn(rig, second.view, secondSessionId, new Set(), secondNonce)
       verifyMemoryAnswer(secondAnswer, secondNonce)
       expect(secondAnswer.text).not.toContain(nonce)
       nativeConversationProofs.push(nativeAssistantProof(secondSessionId, secondAnswer))
