@@ -8,6 +8,8 @@
  * until their corresponding live campaign can produce the same receipt.
  */
 import { execFileSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { stripVTControlCharacters } from 'node:util'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -198,6 +200,53 @@ async function waitForPaneIncarnation(
   }, timeoutMs)
 }
 
+async function waitForReplacementPrompt(
+  page: Page,
+  harness: TestHarness,
+  rig: ManagedRuntimeBrowserRig,
+  tabId: string,
+  paneId: string,
+  view: ManagedRuntimeView,
+): Promise<void> {
+  let sourceEpoch = ''
+  let cursor = 0
+  let sourceText = ''
+  await waitForValue('replacement provider prompt in its actual source epoch and browser', async () => {
+    // Inventory RUNNING means the process exists, not that its TUI has begun
+    // reading input. Observe the NEW host's own output before typing: otherwise
+    // a pre-raw-mode PTY echo can swallow the recall request at startup.
+    const output = dataOf(await rig.runtime.adminOk(
+      rig.supervisor,
+      rig.runtime.terminalReadOutputBody(view.soulId, cursor, 256 * 1024, await rig.controlEpoch()),
+    ), 'terminal_output')
+    if (output.incarnationId !== view.incarnationId || !output.streamEpoch) return null
+    if (output.streamEpoch !== sourceEpoch || output.resetRequired) {
+      sourceEpoch = output.streamEpoch
+      sourceText = ''
+      cursor = 0
+    }
+    for (const frame of output.frames ?? []) {
+      if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== view.terminalId) {
+        throw new Error('replacement prompt frame has mismatched ownership')
+      }
+      sourceText = (sourceText + stripVTControlCharacters(frame.data)).slice(-512 * 1024)
+      cursor = Math.max(cursor, frame.seqEnd)
+    }
+    if (!sourceText.includes('Ask anything')) return null
+    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((row) => row.id === paneId)
+    if (leaf?.content?.streamId !== sourceEpoch || leaf?.content?.incarnationId !== view.incarnationId) return null
+    const rendered = await page.evaluate((terminalId) => {
+      const h = window.__FRESHELL_TEST_HARNESS__
+      return { text: h?.getTerminalBuffer(terminalId), modes: h?.getTerminalModes?.(terminalId) }
+    }, view.terminalId)
+    if (!rendered.text?.includes('Ask anything') || !rendered.modes?.bracketedPasteMode) return null
+    rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
+      soulId: view.soulId, incarnationId: view.incarnationId, terminalId: view.terminalId, streamEpoch: sourceEpoch, cursor,
+    })
+    return true
+  }, 120_000)
+}
+
 async function terminalBuffer(page: Page, terminalId: string): Promise<string> {
   return page.evaluate((id) => (
     window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? ''
@@ -317,7 +366,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const limitsVerified = cgroupLimitsVerified(rig, first.view)
       expect(limitsVerified).toBe(true)
 
-      const nonce = `P3_NATIVE_MEMORY_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+      const nonce = `P3_NATIVE_MEMORY_${randomBytes(16).toString('hex')}`
       const storedSuffix = Math.random().toString(36).slice(2, 10).toUpperCase()
       const storedMarker = `P3_STORED_${storedSuffix}`
       const storedBefore = occurrenceCount(await terminalBuffer(page, first.terminalId), storedMarker)
@@ -358,6 +407,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       await waitForValue('pane retains the exact native identity after host loss', async () => (
         (await paneSessionId(harness, tabId, first.paneId)) === nativeSessionId ? true : null
       ), 120_000)
+      await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
       const nonceOccurrencesBeforeRecall = occurrenceCount(
         await terminalBuffer(page, first.terminalId),
         nonce,
@@ -398,6 +448,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         first.paneId,
         afterProviderCrash.incarnationId,
       )
+      await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
       const providerMarker = `P3_PROVIDER_PROCESS_RECOVERED_${Math.random().toString(36).slice(2, 10).toUpperCase()}`
       const providerMarkerParts = providerMarker.split('_')
       const providerMarkerBefore = occurrenceCount(await terminalBuffer(page, first.terminalId), providerMarker)
