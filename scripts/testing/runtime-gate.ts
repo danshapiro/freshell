@@ -29,6 +29,7 @@ import {
   resolveGateOutcome,
 } from './provider-certification.js'
 import { type GatePhase, parseGateArgs } from './runtime-gate-args.js'
+import { auditRuntimeArtifacts, candidateIntegrityFailures, captureRuntimeCandidate, type RuntimeCandidate } from './runtime-gate-integrity.js'
 import { PHASE1_CASE_IDS, runPhase1Gate, validateRequiredCoverage } from '../../test/runtime/gates/phase-1.test.js'
 import { PHASE2_CASE_IDS, runPhase2Gate } from '../../test/runtime/gates/phase-2.test.js'
 import { PHASE3_CASE_IDS, runPhase3Gate } from '../../test/runtime/gates/phase-3.test.js'
@@ -81,6 +82,28 @@ async function main(): Promise<number> {
     undefined,
     phase === 'phase-5' ? 5 : phase === 'phase-4' ? 4 : phase === 'phase-3' ? 3 : phase === 'phase-2' ? 2 : 1,
   )
+  const candidateBefore = captureRuntimeCandidate(repoRoot)
+  if (candidateBefore.dirty || candidateBefore.sha !== harness.candidateSha) {
+    // Do not spend provider budget or create containers for evidence that
+    // cannot certify this commit. Incomplete preflight is BLOCKED, never PASS.
+    fs.mkdirSync(harness.evidenceDir, { recursive: true })
+    const summary = {
+      phase,
+      mode,
+      status: 'BLOCKED',
+      blockedReason: 'uncommitted_or_changed_candidate',
+      candidateSha: harness.candidateSha,
+      runId: harness.runId,
+      preflightOnly: true,
+      candidate: candidateBefore,
+      requiredCases,
+      executedCases: [],
+      cleanup: { ok: true, required: false, reason: 'no test resources created' },
+    }
+    harness.writeSummary(summary)
+    console.error(JSON.stringify({ ...summary, evidenceDir: harness.evidenceDir }, null, 2))
+    return 2
+  }
   const executed: string[] = []
   const blockedCases: Array<{ caseId: string; message: string; evidence?: unknown }> = []
   let certificationResults: CaseResult[] = []
@@ -154,7 +177,7 @@ async function main(): Promise<number> {
     const blocked = blockedById.get(caseId)
     if (blocked) return { caseId, status: 'BLOCKED', reason: blocked.message }
     if (executed.includes(caseId)) return { caseId, status: 'PASS' }
-    return { caseId, status: primaryError === undefined ? 'BLOCKED' : 'FAIL', reason: 'case did not execute' }
+    return { caseId, status: 'FAIL', reason: 'required case did not execute' }
   })
   const caseResults = [...phaseCaseResults, ...certificationResults]
 
@@ -166,23 +189,37 @@ async function main(): Promise<number> {
     ...(phaseManifest.required_artifacts ?? []),
     ...(certification.required_artifacts ?? []),
   ]
-  const missingArtifacts = [...new Set(declaredArtifacts)]
-    // `summary.json` is this very file, written a few lines below.
-    .filter((artifact) => artifact !== 'summary.json')
-    .filter((artifact) => {
-      const target = path.join(harness.evidenceDir, artifact.replace(/\/$/, ''))
-      if (!fs.existsSync(target)) return true
-      return artifact.endsWith('/') && fs.readdirSync(target).length === 0
-    })
-  const artifactResults: CaseResult[] = missingArtifacts.length
-    ? [{ caseId: 'EVIDENCE-ARTIFACTS', status: 'FAIL', reason: `missing declared artifacts: ${missingArtifacts.join(', ')}` }]
+  const artifactAudit = auditRuntimeArtifacts(harness.evidenceDir, declaredArtifacts)
+  const missingArtifacts = artifactAudit.missing
+  const invalidArtifacts = artifactAudit.invalid
+  const artifactResults: CaseResult[] = missingArtifacts.length || invalidArtifacts.length
+    ? [{
+        caseId: 'EVIDENCE-ARTIFACTS',
+        status: 'FAIL',
+        reason: `missing declared artifacts: ${missingArtifacts.join(', ')}; invalid artifacts: ${invalidArtifacts.map((row) => `${row.artifact}: ${row.reason}`).join('; ')}`,
+      }]
     : [{ caseId: 'EVIDENCE-ARTIFACTS', status: 'PASS' }]
-  const allCaseResults = [...caseResults, ...artifactResults]
+
+  let candidateAfter: RuntimeCandidate | null = null
+  let candidateFailures: string[]
+  try {
+    candidateAfter = captureRuntimeCandidate(repoRoot)
+    candidateFailures = candidateIntegrityFailures(harness.candidateSha, candidateBefore, candidateAfter)
+  } catch {
+    candidateFailures = ['could not verify candidate inputs after qualification']
+  }
+  const candidateResults: CaseResult[] = [{
+    caseId: 'EVIDENCE-CANDIDATE',
+    status: candidateFailures.length ? 'FAIL' : 'PASS',
+    ...(candidateFailures.length ? { reason: candidateFailures.join('; ') } : {}),
+  }]
+  const allCaseResults = [...caseResults, ...artifactResults, ...candidateResults]
 
   const unsafeDockerAttempts = harness.broker?.unsafeAttempts?.() ?? []
   const outcome = resolveGateOutcome({
     mode,
     caseResults: allCaseResults,
+    expectedCaseIds: [...requiredCases, ...declaredCertificationCases, 'EVIDENCE-ARTIFACTS', 'EVIDENCE-CANDIDATE'],
     cleanupOk: cleanup.ok,
     unsafeBrokerAttempts: unsafeDockerAttempts.length,
     primaryError,
@@ -208,6 +245,8 @@ async function main(): Promise<number> {
     executedCases: executed,
     caseResults: allCaseResults,
     missingArtifacts,
+    invalidArtifacts,
+    candidateIntegrity: { before: candidateBefore, after: candidateAfter, failures: candidateFailures },
     counts: {
       pass: allCaseResults.filter((row) => row.status === 'PASS').length,
       deferred: allCaseResults.filter((row) => row.status === DEFERRED_CASE_STATUS).length,
