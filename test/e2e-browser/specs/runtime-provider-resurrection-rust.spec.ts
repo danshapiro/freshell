@@ -98,7 +98,14 @@ test.describe.serial('Phase 3 provider resurrection', () => {
   test('P3-G10: pending native approval survives exact provider resurrection', async ({ page, e2eServerKind }) => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE3_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE3_LIVE=1 for the live provider receipt')
     expect(e2eServerKind).toBe('rust')
-    test.setTimeout(1_200_000)
+    // Live-provider wall clock: this case drives a real model turn, a web
+    // restart, a provider kill with exact native resurrection, an approval
+    // round trip and a follow-up turn. The per-step budgets below are what
+    // actually guard correctness; this envelope only has to be larger than
+    // their sum. Observed ~20min against opencode/big-pickle, so 20min was
+    // the envelope AND the observed runtime -- the case died of the envelope,
+    // not of any step.
+    test.setTimeout(2_400_000)
 
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {
       FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask',
@@ -154,14 +161,14 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       expect(rig.ownedContainerExec(before.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
       rig.ownedProviderExec(before.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
 
-      const providerSessionIdBefore = await waitForValue('native OpenCode session id', async () => {
-        const value = (await content())?.sessionRef?.sessionId
-        return typeof value === 'string' && value.length > 0 ? value : null
-      }, 120_000)
-
-      const approvalCommand = `printf 'P3_APPROVAL_EFFECT\\n' >> "$HOME/p3-tool-effect-count"`
+      // Phrase this as the ordinary file-edit task it is. An earlier wording
+      // ("do not continue until permission is granted") read as manipulation
+      // to the free-tier model, which refused outright -- no tool call, so no
+      // permission prompt, so nothing about Freshell's approval plumbing was
+      // exercised at all. The assertions below are unchanged; only the natural
+      // language that has to survive provider safety behaviour is.
       await terminal.executeCommandInserted(
-        `Use the bash tool exactly once to run: ${approvalCommand}. Do not use any other tool. Do not continue until permission is granted.`,
+        `Append the exact line P3_APPROVAL_EFFECT to the file $HOME/p3-tool-effect-count. Use the bash tool exactly once and no other tool.`,
         1,
       )
       await waitForValue('native OpenCode permission prompt', async () => {
@@ -171,6 +178,17 @@ test.describe.serial('Phase 3 provider resurrection', () => {
           : null
       }, 180_000)
       expect(markerLineCount(rig, before.containerId)).toBe(0)
+
+      // OpenCode writes its session row on the FIRST turn, never at TUI start
+      // -- that IS the capability manifest's `session-row-must-materialize`
+      // zero-turn policy, verified directly: a 25s TUI with no prompt leaves
+      // `session` empty in opencode.db. So the exact native id is only
+      // observable once a turn exists, which the approval prompt above
+      // guarantees. Capturing it earlier can only ever time out.
+      const providerSessionIdBefore = await waitForValue('native OpenCode session id', async () => {
+        const value = (await content())?.sessionRef?.sessionId
+        return typeof value === 'string' && value.length > 0 ? value : null
+      }, 120_000)
 
       const readyBeforeWebRestart = await harness.getLastReadyAt()
       await rig.crashAndRestartWeb()
