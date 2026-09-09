@@ -172,6 +172,37 @@ describe('managed runtime recovery merge', () => {
     expect(plan.updates[0]).toMatchObject({ tabId: 'user-tab', paneId: 'user-pane' })
   })
 
+  it('never erases local pane truth with an unset field from a partial projection', () => {
+    // A supervisor projection is partial while a soul is still materialising.
+    // Spreading it wholesale writes `terminalId: undefined` over the pane's
+    // real terminal id, which silently detaches the pane from its own output
+    // and stops the session ref from ever being stamped.
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-real',
+      streamId: 'stream-real',
+      status: 'running',
+      mode: 'opencode',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_real' },
+      initialCwd: '/workspace/real',
+    }
+    const partial = soul({
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      nativeSessionId: undefined,
+      terminalCwd: undefined,
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([partial]), state)
+    expect(plan.updates).toHaveLength(1)
+    const content: any = plan.updates[0].content
+    expect(content.terminalId).toBe('terminal-real')
+    expect(content.streamId).toBe('stream-real')
+    expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_real' })
+    expect(content.initialCwd).toBe('/workspace/real')
+  })
+
   it('does not adopt an unrelated pane that merely lacks a terminal id', () => {
     const state = baseState()
     state.panes.layouts['user-tab'].content = {
