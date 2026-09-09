@@ -10,6 +10,7 @@ import {
   RuntimeHarness,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
+import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 
 export const PHASE5_CASE_IDS = [
   'P5-G01', 'P5-G02', 'P5-G03', 'P5-G04', 'P5-G05', 'P5-G06',
@@ -789,7 +790,7 @@ function requiredReceipt(
   // Copy the exact validated input into the gate's own evidence tree. A PASS
   // must remain independently reviewable after temporary receipt paths are
   // removed; the source file is never treated as the evidence artifact.
-  h.writeBrowserArtifact(caseId, receipt)
+  h.writeBrowserArtifact(receiptArtifactName(envName, caseId), receipt)
   return receipt
 }
 

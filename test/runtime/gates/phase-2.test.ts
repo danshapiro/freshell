@@ -11,6 +11,7 @@ import {
   type RuntimeLimits,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
+import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 
 export const PHASE2_CASE_IDS = [
   'P2-G01', 'P2-G02', 'P2-G03', 'P2-G04', 'P2-G05', 'P2-G06',
@@ -120,7 +121,7 @@ async function gate01BrowserContinuityReceipt(h: RuntimeHarness): Promise<void> 
   }
   h.assert(caseId, receipt.outputAdvanced === true && receipt.inputUsable === true, 'browser output/input survived web replacement', receipt)
   h.assert(caseId, receipt.viewAssociations === 1, 'browser retained one tab/view association', receipt)
-  h.writeBrowserArtifact('p2-g01-browser-continuity', receipt)
+  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_BROWSER_RECEIPT', caseId), receipt)
 }
 
 async function gate02BoundedReplayWhileWebAbsent(h: RuntimeHarness): Promise<void> {
@@ -283,7 +284,7 @@ async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<v
   h.assert(caseId, receipt.sameNativeSession === true && receipt.sameIncarnation === true, 'native OpenCode identity and OS incarnation survive web restart', receipt)
   h.assert(caseId, receipt.toolCompletionCount === 1 && receipt.followupSucceeded === true, 'long tool completed once and follow-up succeeded', receipt)
   h.assert(caseId, receipt.providerLaunchCount === 1, 'restoration hid no replacement OpenCode launch', receipt)
-  h.writeBrowserArtifact('p2-g04-real-opencode-continuity', receipt)
+  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_OPENCODE_RECEIPT', caseId), receipt)
   h.writeProviderResults({
     phase: 'phase-2',
     workloadImage: h.imageRef,
