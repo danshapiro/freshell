@@ -11,6 +11,7 @@ import {
   type RuntimeLimits,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
+import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 
 export const PHASE4_CASE_IDS = [
   'P4-G01', 'P4-G02', 'P4-G03', 'P4-G04', 'P4-G05', 'P4-G06',
@@ -359,7 +360,7 @@ async function gate08BrowserReceipt(h: RuntimeHarness): Promise<void> {
   h.assert(caseId, browser.sameSoulIds === true && browser.noBlankSubstitution === true, 'browser recovery preserves soul/native identity without a blank substitute', browser)
   h.assert(caseId, browser.closeViewKeepsAgent === true && browser.stopAgentStopsRuntime === true, 'browser distinguishes Close view from Stop agent', browser)
   h.assert(caseId, browser.oldClientNoDuplicate === true, 'compatibility client cannot duplicate an existing managed soul', browser)
-  h.writeBrowserArtifact(caseId, receipt)
+  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT', caseId), receipt)
 }
 
 async function gate09StartupBoundsAndDatabaseHealth(h: RuntimeHarness): Promise<void> {

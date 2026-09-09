@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
+import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
 import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
@@ -200,7 +201,7 @@ export class ManagedRuntimeBrowserRig {
 
   writeBrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, 'p2-g01-browser-continuity.json')
+      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_BROWSER_RECEIPT'))
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target
@@ -208,7 +209,7 @@ export class ManagedRuntimeBrowserRig {
 
   writeOpencodeReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT
-      || path.join(this.runtime.browserDir, 'p2-g04-real-opencode-continuity.json')
+      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_OPENCODE_RECEIPT'))
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target
@@ -233,7 +234,7 @@ export class ManagedRuntimeBrowserRig {
 
   writePhase3BrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, 'p3-g10-provider-resurrection.json')
+      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT'))
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target
@@ -241,7 +242,7 @@ export class ManagedRuntimeBrowserRig {
 
   writePhase4BrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, 'p4-g08-runtime-tabs-rehydrate.json')
+      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT'))
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target
@@ -249,7 +250,7 @@ export class ManagedRuntimeBrowserRig {
 
   writePhase5LossReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT
-      || path.join(this.runtime.browserDir, 'p5-g02-real-opencode-loss.json')
+      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT'))
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target
@@ -257,7 +258,7 @@ export class ManagedRuntimeBrowserRig {
 
   writePhase5ChaosReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT
-      || path.join(this.runtime.browserDir, 'p5-g09-browser-chaos.json')
+      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT'))
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target

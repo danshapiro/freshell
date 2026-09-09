@@ -165,6 +165,14 @@ function paneMatchesView(
   if (content.kind === 'terminal' && soul.terminalId && content.terminalId === soul.terminalId) {
     return true
   }
+  // The originating pane knows its createRequestId long before the server
+  // answers with a terminalId. Without this, the whole create round trip is a
+  // window in which the pane is invisible to the matcher and the reconciler
+  // manufactures a SECOND view of the same soul — a duplicate tab over one
+  // writer, and a pane whose output the user never sees.
+  if (soul.terminalCreateRequestId && content.createRequestId === soul.terminalCreateRequestId) {
+    return true
+  }
   const sessionRef = sessionRefFor(soul)
   return Boolean(
     sessionRef
