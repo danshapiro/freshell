@@ -125,6 +125,22 @@ function managedTerminalContent(
   }
 }
 
+/**
+ * Drop keys whose value is `undefined`.
+ *
+ * A supervisor projection is PARTIAL while a soul is still materialising: it
+ * legitimately carries no terminal id, stream id, cwd, or native session yet.
+ * Spreading those absent fields wholesale would write `undefined` over the
+ * pane's own truth — detaching a live pane from its output and preventing its
+ * session ref from ever being stamped. An unset field means "the supervisor
+ * has nothing to say", never "erase what you know".
+ */
+function definedOnly<T extends object>(value: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== undefined),
+  ) as Partial<T>
+}
+
 function updateExistingContent(
   existing: PaneContent,
   soul: ManagedRuntimeSoul,
@@ -134,7 +150,7 @@ function updateExistingContent(
   if (existing.kind === 'terminal') {
     return {
       ...existing,
-      ...managedTerminalContent(soul, view),
+      ...definedOnly(managedTerminalContent(soul, view)),
       // Preserve a user pane's stable create key when the supervisor record
       // predates that field. Otherwise use the authoritative managed key.
       createRequestId: soul.terminalCreateRequestId || existing.createRequestId,
@@ -145,7 +161,7 @@ function updateExistingContent(
     return {
       ...existing,
       ...(sessionRef ? { sessionRef } : {}),
-      ...fields,
+      ...definedOnly(fields),
     }
   }
   return existing
