@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module'
+import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -20,6 +21,9 @@ const __dirname = path.dirname(__filename)
 const REPO_ROOT = path.resolve(__dirname, '../../../..')
 const FIXTURE_PATH = path.join(REPO_ROOT, 'test', 'fixtures', 'testing', 'fake-coordinated-workload.mjs')
 const require = createRequire(import.meta.url)
+const vitestPackagePath = require.resolve('vitest/package.json')
+const vitestManifest = JSON.parse(fs.readFileSync(vitestPackagePath, 'utf8')) as { bin: { vitest: string } }
+const expectedVitestEntrypoint = path.resolve(path.dirname(vitestPackagePath), vitestManifest.bin.vitest)
 
 let tempDir: string
 let captureFile: string
@@ -57,7 +61,7 @@ describe('coordinator-upstream', () => {
     const command = resolveVitestCommand(REPO_ROOT)
 
     expect(command.command).toBe(process.execPath)
-    expect(command.args).toEqual([require.resolve('vitest/vitest.mjs')])
+    expect(command.args).toEqual([expectedVitestEntrypoint])
   })
 
   it('prefers the npm CLI JavaScript entrypoint when npm exposes it', () => {
@@ -76,7 +80,7 @@ describe('coordinator-upstream', () => {
   })
 
   it('passes delegated help and watch invocations through the repo-local vitest entry with the recursion guard env set', async () => {
-    const expectedVitest = require.resolve('vitest/vitest.mjs')
+    const expectedVitest = expectedVitestEntrypoint
     const serverHelpPhase: UpstreamPhase = {
       runner: 'vitest',
       config: 'server',

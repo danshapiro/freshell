@@ -64,12 +64,7 @@ export default defineConfig({
     },
     // Maximum parallelization settings
     pool: 'threads',
-    poolOptions: {
-      threads: {
-        singleThread: false,
-        isolate: true,
-      },
-    },
+    isolate: true,
     fileParallelism: true,
     maxConcurrency: 10,
     sequence: {

@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
@@ -9,7 +10,13 @@ import { fileURLToPath } from 'node:url'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..')
 const require = createRequire(import.meta.url)
-const vitestEntrypoint = require.resolve('vitest/vitest.mjs')
+const vitestPackagePath = require.resolve('vitest/package.json')
+const vitestManifest = JSON.parse(readFileSync(vitestPackagePath, 'utf8')) as { bin?: string | Record<string, string> }
+const vitestRelativeBin = typeof vitestManifest.bin === 'string' ? vitestManifest.bin : vitestManifest.bin?.vitest
+if (!vitestRelativeBin || resolve(dirname(vitestPackagePath), vitestRelativeBin).startsWith(dirname(vitestPackagePath)) === false) {
+  throw new Error('Vitest package does not expose a safe CLI entrypoint.')
+}
+const vitestEntrypoint = resolve(dirname(vitestPackagePath), vitestRelativeBin)
 const defaultVitestConfig = 'config/vitest/vitest.config.ts'
 const serverVitestConfig = 'config/vitest/vitest.server.config.ts'
 const electronVitestConfig = 'config/vitest/vitest.electron.config.ts'

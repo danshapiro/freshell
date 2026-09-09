@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { constants as osConstants } from 'node:os'
+import fs from 'node:fs'
 import path from 'node:path'
 
 import type { UpstreamPhase } from './coordinator-command-matrix.js'
@@ -17,9 +18,15 @@ export function assertNoCoordinatorRecursion(envVars: NodeJS.ProcessEnv = proces
 
 export function resolveVitestCommand(repoRoot: string): { command: string; args: string[] } {
   const require = createRequire(path.join(repoRoot, 'package.json'))
+  const packagePath = require.resolve('vitest/package.json')
+  const manifest = JSON.parse(fs.readFileSync(packagePath, 'utf8')) as { bin?: string | Record<string, string> }
+  const relativeBin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.vitest
+  if (!relativeBin || path.isAbsolute(relativeBin) || relativeBin.split(/[\/]/).includes('..')) {
+    throw new Error('Vitest package does not expose a safe CLI entrypoint.')
+  }
   return {
     command: process.execPath,
-    args: [require.resolve('vitest/vitest.mjs')],
+    args: [path.resolve(path.dirname(packagePath), relativeBin)],
   }
 }
 

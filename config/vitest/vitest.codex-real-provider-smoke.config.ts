@@ -34,11 +34,6 @@ export default defineConfig({
     testTimeout: 60000,
     hookTimeout: 30000,
     pool: 'threads',
-    poolOptions: {
-      threads: {
-        singleThread: false,
-        isolate: true,
-      },
-    },
+    isolate: true,
   },
 })
