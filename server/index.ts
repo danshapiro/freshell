@@ -136,6 +136,7 @@ function buildCliCommandsMap(extensionManager: ExtensionManager): Map<string, Co
       args: cli.args,
       env: cli.env,
       modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
+      effortArgs: compileArgTemplate(cli.effortArgs, '{{effort}}'),
       sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
       permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
       createSessionArgs: compileArgTemplate(cli.createSessionArgs, '{{sessionId}}'),

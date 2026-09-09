@@ -75,6 +75,7 @@ fn codex_cli_spec() -> freshell_platform::CliCommandSpec {
         default_cmd: "codex".into(),
         resume_args: Some(s(&["resume", "{{sessionId}}"])),
         model_args: Some(s(&["--model", "{{model}}"])),
+        effort_args: None,
         sandbox_args: Some(s(&["--sandbox", "{{sandbox}}"])),
         ..Default::default()
     }

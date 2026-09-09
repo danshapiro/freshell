@@ -2685,22 +2685,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_bootstrap_persists_reference_never_credential_bytes() {
+    async fn amplifier_bootstrap_persists_references_never_secret_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let credential = workspace.path().join("claude-credential.json");
-        let secret = "phase2-secret-byte-sentinel-never-persist";
-        std::fs::write(&credential, format!(r#"{{"token":"{secret}"}}"#)).unwrap();
-        let credential = std::fs::canonicalize(credential).unwrap();
+        let settings = workspace.path().join("amplifier-settings.yaml");
+        let oauth = workspace.path().join("amplifier-oauth.json");
+        let settings_secret = "amplifier-settings-secret-never-persist";
+        let oauth_secret = "amplifier-oauth-secret-never-persist";
+        std::fs::write(&settings, format!("api_key: {settings_secret}\n")).unwrap();
+        std::fs::write(&oauth, format!(r#"{{"token":"{oauth_secret}"}}"#)).unwrap();
+        let settings = std::fs::canonicalize(settings).unwrap();
+        let oauth = std::fs::canonicalize(oauth).unwrap();
         let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
 
         let registry = Registry::open(dir.path(), None).unwrap();
         let mut launch = prep(SoulId::new(), RequestId::new(), "bootstrap-ref-only");
-        launch.provider = "claude".into();
+        launch.provider = "amplifier".into();
         launch.terminal = Some(TerminalLaunchSpec {
             terminal_id: "terminal-bootstrap".into(),
             stream_id: "stream-bootstrap".into(),
-            mode: "claude".into(),
+            mode: "amplifier".into(),
             program: "/bin/true".into(),
             args: Vec::new(),
             env: std::collections::BTreeMap::new(),
@@ -2715,12 +2719,19 @@ mod tests {
             create_request_id: Some("create-bootstrap".into()),
             resume_session_id: Some("session-bootstrap".into()),
             provider_model: None,
+            provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
-            provider_bootstrap_files: vec![freshell_runtime_protocol::ProviderBootstrapFile {
-                source_path: credential.to_string_lossy().into_owned(),
-                provider_relative_path: ".claude/.credentials.json".into(),
-            }],
+            provider_bootstrap_files: vec![
+                freshell_runtime_protocol::ProviderBootstrapFile {
+                    source_path: settings.to_string_lossy().into_owned(),
+                    provider_relative_path: ".amplifier/settings.yaml".into(),
+                },
+                freshell_runtime_protocol::ProviderBootstrapFile {
+                    source_path: oauth.to_string_lossy().into_owned(),
+                    provider_relative_path: ".amplifier/openai-chatgpt-oauth.json".into(),
+                },
+            ],
         });
         registry.prepare_launch(launch).await.unwrap();
 
@@ -2732,8 +2743,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(terminal_json.contains(&credential.to_string_lossy().to_string()));
-        assert!(!terminal_json.contains(secret));
+        assert!(terminal_json.contains(&settings.to_string_lossy().to_string()));
+        assert!(terminal_json.contains(&oauth.to_string_lossy().to_string()));
+        assert!(!terminal_json.contains(settings_secret));
+        assert!(!terminal_json.contains(oauth_secret));
         drop(conn);
 
         let mut durable_bytes = Vec::new();
@@ -2746,8 +2759,9 @@ mod tests {
             }
         }
         assert!(
-            !String::from_utf8_lossy(&durable_bytes).contains(secret),
-            "credential bytes must never enter supervisor durable state"
+            !String::from_utf8_lossy(&durable_bytes).contains(settings_secret)
+                && !String::from_utf8_lossy(&durable_bytes).contains(oauth_secret),
+            "bootstrap secret bytes must never enter supervisor durable state"
         );
     }
 
@@ -2976,6 +2990,7 @@ mod tests {
             create_request_id: Some("create-exact-resume".into()),
             resume_session_id: None,
             provider_model: Some("opencode/big-pickle".into()),
+            provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),

@@ -90,6 +90,33 @@ session, or sole remaining session as ownership or identity proof.
 Unavailable required low-cost configuration is a rollout blocker. Do not
 silently upgrade model cost or reasoning.
 
+Before a deferred-provider live campaign, persist the exact coding-CLI launch
+policy rather than relying on a provider default:
+
+```json
+{
+  "codingCli": {
+    "providers": {
+      "claude": { "model": "haiku", "effort": "low" },
+      "codex": { "model": "gpt-5.6-luna", "effort": "minimal" }
+    }
+  }
+}
+```
+
+For Amplifier, point
+`FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE` at the settings file that selects
+the approved lowest-cost model and point
+`FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE` at its separate OAuth token file.
+Defaults are `~/.amplifier/settings.yaml` and
+`~/.amplifier/openai-chatgpt-oauth.json`. Both are canonical, reference-only
+bootstrap inputs; do not inline their contents in settings, commands, or test
+evidence.
+
+These values and bootstrap paths make a live campaign reproducible. They do
+not certify or enable Claude, Codex, or Amplifier; the capability manifest
+remains authoritative until a later, receipt-bearing promotion change.
+
 ## Enabling managed default
 
 Managed-default additionally requires:

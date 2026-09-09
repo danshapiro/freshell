@@ -2437,6 +2437,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn coding_cli_model_and_effort_are_typed_persisted_settings() {
+        let dir = std::env::temp_dir().join(format!("frs-settings-{}", uuid_like()));
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let store = store_at(&dir);
+
+        let merged = store
+            .patch(&json!({
+                "codingCli": {
+                    "providers": {
+                        "claude": { "model": "haiku", "effort": "low" },
+                        "codex": { "model": "gpt-5.6-luna", "effort": "minimal" }
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        let claude = merged.coding_cli.providers.get("claude").unwrap();
+        assert_eq!(claude.model.as_deref(), Some("haiku"));
+        assert_eq!(claude.effort.as_deref(), Some("low"));
+        let codex = merged.coding_cli.providers.get("codex").unwrap();
+        assert_eq!(codex.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(codex.effort.as_deref(), Some("minimal"));
+
+        let cfg: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".freshell").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg["settings"]["codingCli"]["providers"]["claude"],
+            json!({ "permissionMode": "default", "model": "haiku", "effort": "low" })
+        );
+        assert_eq!(
+            cfg["settings"]["codingCli"]["providers"]["codex"],
+            json!({ "model": "gpt-5.6-luna", "effort": "minimal" })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Live-pinned 2026-07-12 (persisted `knownProviders: ["claude"]`,
     /// `enabledProviders: ["claude"]`, then a boot discovering 5 extensions):
     /// new names are APPENDED to `knownProviders` AND auto-enabled

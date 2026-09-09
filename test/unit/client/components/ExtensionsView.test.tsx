@@ -48,6 +48,8 @@ const claudeExt: ClientExtensionEntry = {
   description: 'Claude Code agent',
   category: 'cli',
   cli: {
+    supportsModel: true,
+    supportsEffort: true,
     supportsPermissionMode: true,
     supportsResume: true,
     resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'],
@@ -62,6 +64,7 @@ const codexExt: ClientExtensionEntry = {
   category: 'cli',
   cli: {
     supportsModel: true,
+    supportsEffort: true,
     supportsSandbox: true,
     supportsResume: true,
     resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'],
@@ -227,6 +230,23 @@ describe('ExtensionsView', () => {
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         codingCli: { providers: { codex: { model: 'gpt-5-codex' } } },
+      })
+    })
+
+    it('debounces effort text saves', async () => {
+      renderExtensionsView()
+
+      fireEvent.click(screen.getByLabelText('Show Codex CLI configuration'))
+      const input = screen.getByLabelText('Codex CLI effort')
+      fireEvent.change(input, { target: { value: 'minimal' } })
+
+      expect(api.patch).not.toHaveBeenCalled()
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { providers: { codex: { effort: 'minimal' } } },
       })
     })
 

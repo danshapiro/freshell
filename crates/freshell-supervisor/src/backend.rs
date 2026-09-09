@@ -227,6 +227,54 @@ impl DockerEngineBackend {
     }
 }
 
+fn docker_create_body(
+    spec: &CreateRuntimeSpec,
+    binds: Vec<String>,
+    host_env: Vec<String>,
+    cap_add: Vec<&str>,
+    runtime_tmpfs_config: BTreeMap<String, String>,
+    requested_limits: String,
+    memory_swap: u64,
+) -> Value {
+    json!({
+        "Image": spec.image_ref,
+        "Env": host_env,
+        "Cmd": [
+            "/runtime/freshell-session-host", "serve",
+            "--control-socket", "/run/freshell/host.sock",
+            "--state-dir", "/run/freshell",
+            "--secret-file", "/run/freshell/secret",
+            "--incarnation-id", spec.incarnation_id.as_str(),
+            "--requested-limits", requested_limits
+        ],
+        "Labels": {
+            "project": "freshell",
+            "com.freshell.managed": "true",
+            "com.freshell.installation-id": spec.installation_id.as_str(),
+            "com.freshell.soul-id": spec.soul_id.as_str(),
+            "com.freshell.incarnation-id": spec.incarnation_id.as_str(),
+            "com.freshell.runtime-test-run-id": spec.test_run_id,
+        },
+        "HostConfig": {
+            "AutoRemove": false,
+            "NetworkMode": if spec.terminal.is_some() { "bridge" } else { "none" },
+            "PidMode": "",
+            "ReadonlyRootfs": true,
+            "Privileged": false,
+            "CapDrop": ["ALL"],
+            "CapAdd": cap_add,
+            "SecurityOpt": ["no-new-privileges:true"],
+            "RestartPolicy": {"Name":"no","MaximumRetryCount":0},
+            "NanoCpus": spec.limits.cpu_milli.saturating_mul(1_000_000),
+            "Memory": spec.limits.memory_bytes,
+            "MemorySwap": memory_swap,
+            "PidsLimit": spec.limits.pids_max,
+            "Binds": binds,
+            "Tmpfs": runtime_tmpfs_config
+        }
+    })
+}
+
 fn runtime_host_environment(
     terminal: Option<&TerminalLaunchSpec>,
 ) -> Result<Vec<String>, BackendError> {
@@ -318,11 +366,6 @@ impl RuntimeBackend for DockerEngineBackend {
             format!("{}:/run/freshell:rw", runtime_dir.display()),
             format!("{}:/home/freshell/provider:rw", spec.provider_volume_name),
         ];
-        let network_mode = if spec.terminal.is_some() {
-            "bridge"
-        } else {
-            "none"
-        };
         if let Some(mounts) = &terminal_mounts {
             binds.push(format!(
                 "{}:{}:rw",
@@ -352,43 +395,15 @@ impl RuntimeBackend for DockerEngineBackend {
                 .as_ref()
                 .map(|terminal| terminal.mode.as_str()),
         );
-        let body = json!({
-            "Image": spec.image_ref,
-            "Env": host_env,
-            "Cmd": [
-                "/runtime/freshell-session-host", "serve",
-                "--control-socket", "/run/freshell/host.sock",
-                "--state-dir", "/run/freshell",
-                "--secret-file", "/run/freshell/secret",
-                "--incarnation-id", spec.incarnation_id.as_str(),
-                "--requested-limits", requested_limits
-            ],
-            "Labels": {
-                "project": "freshell",
-                "com.freshell.managed": "true",
-                "com.freshell.installation-id": spec.installation_id.as_str(),
-                "com.freshell.soul-id": spec.soul_id.as_str(),
-                "com.freshell.incarnation-id": spec.incarnation_id.as_str(),
-                "com.freshell.runtime-test-run-id": spec.test_run_id,
-            },
-            "HostConfig": {
-                "AutoRemove": false,
-                "NetworkMode": network_mode,
-                "PidMode": "",
-                "ReadonlyRootfs": true,
-                "Privileged": false,
-                "CapDrop": ["ALL"],
-                "CapAdd": cap_add,
-                "SecurityOpt": ["no-new-privileges:true"],
-                "RestartPolicy": {"Name":"no","MaximumRetryCount":0},
-                "NanoCpus": spec.limits.cpu_milli.saturating_mul(1_000_000),
-                "Memory": spec.limits.memory_bytes,
-                "MemorySwap": memory_swap,
-                "PidsLimit": spec.limits.pids_max,
-                "Binds": binds,
-                "Tmpfs": runtime_tmpfs_config
-            }
-        });
+        let body = docker_create_body(
+            spec,
+            binds,
+            host_env,
+            cap_add,
+            runtime_tmpfs_config,
+            requested_limits,
+            memory_swap,
+        );
         // The name is diagnostic only and is deliberately unique per create attempt.
         // A crash after Docker create but before the container-id commit can leave a
         // stopped, unregistered object. Retrying the PREPARED transaction must be able
@@ -1092,6 +1107,7 @@ mod tests {
             create_request_id: None,
             resume_session_id: None,
             provider_model: None,
+            provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
@@ -1105,6 +1121,98 @@ mod tests {
             .any(|value| value == "CODEX_HOME=/home/freshell/provider/.codex"));
         assert!(env.iter().any(|value| value == "CODEX_CMD=/usr/bin/setpriv --reuid 65534 --regid 0 --clear-groups --no-new-privs -- codex"));
         assert!(!env.iter().any(|value| value.contains("AUTH_TOKEN")));
+    }
+
+    #[test]
+    fn amplifier_bootstrap_mounts_are_reference_only_in_docker_json() {
+        use freshell_runtime_protocol::ProviderBootstrapFile;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let settings = root.path().join("settings.yaml");
+        let oauth = root.path().join("openai-chatgpt-oauth.json");
+        let settings_secret = "amplifier-settings-secret-sentinel";
+        let oauth_secret = "amplifier-oauth-secret-sentinel";
+        std::fs::write(&settings, format!("api_key: {settings_secret}\n")).unwrap();
+        std::fs::write(&oauth, format!(r#"{{"access_token":"{oauth_secret}"}}"#)).unwrap();
+        let settings = std::fs::canonicalize(settings).unwrap();
+        let oauth = std::fs::canonicalize(oauth).unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let terminal = TerminalLaunchSpec {
+            terminal_id: "terminal-amplifier".into(),
+            stream_id: "stream-amplifier".into(),
+            mode: "amplifier".into(),
+            program: "amplifier".into(),
+            args: Vec::new(),
+            env: BTreeMap::from([("HOME".into(), "/home/freshell/provider".into())]),
+            cwd: workspace.to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-amplifier".into(),
+            workspace_path: workspace.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: Some("create-amplifier".into()),
+            resume_session_id: Some("session-amplifier".into()),
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: vec![
+                ProviderBootstrapFile {
+                    source_path: settings.to_string_lossy().into_owned(),
+                    provider_relative_path: ".amplifier/settings.yaml".into(),
+                },
+                ProviderBootstrapFile {
+                    source_path: oauth.to_string_lossy().into_owned(),
+                    provider_relative_path: ".amplifier/openai-chatgpt-oauth.json".into(),
+                },
+            ],
+        };
+        let mounts = docker::terminal_mounts(&terminal).unwrap();
+        let binds: Vec<String> = mounts
+            .provider_bootstrap_files
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                format!(
+                    "{}:/run/freshell-bootstrap/provider-{index}:ro",
+                    source.display()
+                )
+            })
+            .collect();
+        let spec = CreateRuntimeSpec {
+            installation_id: InstallationId::parse("installation-test").unwrap(),
+            soul_id: SoulId::parse("soul-test").unwrap(),
+            incarnation_id: IncarnationId::parse("incarnation-test").unwrap(),
+            image_ref: "sha256:image".into(),
+            host_binary_path: root.path().join("host"),
+            runtime_dir: root.path().join("runtime"),
+            limits: RuntimeLimits {
+                cpu_milli: 1000,
+                memory_bytes: 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            test_run_id: "reference-only".into(),
+            terminal: Some(terminal),
+            provider_volume_name: "freshell-provider-test".into(),
+        };
+        let body = docker_create_body(
+            &spec,
+            binds,
+            Vec::new(),
+            vec!["CHOWN", "SETGID", "SETUID"],
+            BTreeMap::new(),
+            serde_json::to_string(&spec.limits).unwrap(),
+            spec.limits.memory_bytes,
+        );
+        let durable_json = serde_json::to_string(&body).unwrap();
+        assert!(durable_json.contains(&settings.to_string_lossy().to_string()));
+        assert!(durable_json.contains(&oauth.to_string_lossy().to_string()));
+        assert!(!durable_json.contains(settings_secret));
+        assert!(!durable_json.contains(oauth_secret));
     }
 
     #[test]

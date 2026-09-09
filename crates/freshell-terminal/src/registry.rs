@@ -389,6 +389,7 @@ pub struct ManagedTerminalLaunch {
     pub mode: String,
     pub resume_session_id: Option<String>,
     pub provider_model: Option<String>,
+    pub provider_reasoning_effort: Option<String>,
     pub provider_sandbox: Option<String>,
     pub provider_permission_mode: Option<String>,
     pub view_tab_id: Option<String>,

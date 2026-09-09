@@ -2028,32 +2028,51 @@ fn opencode_rebind_precompute() -> Option<String> {
 }
 
 /// Provider settings `codingCli.providers[mode]` (`ws:2317-2319`) as
-/// `(permission_mode, model, sandbox)`, with the codex strip (`ws:2464-2465`
-/// — model/sandbox/permissionMode route to the app-server plan instead).
+/// `(permission_mode, model, effort, sandbox)`, with the codex split: model,
+/// sandbox, and permission mode route to the app-server plan while the exact
+/// reasoning config remains provider CLI argv.
 /// Boot-snapshot settings. Extracted from `handle_create` so the auto-resume
 /// respawn seam (Task 4) derives launch params identically.
 fn configured_provider_settings(
     state: &WsState,
     mode: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let Some(provider) = state.settings.coding_cli.providers.get(mode) else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
-    let pick = |key: &str| {
-        provider
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-    };
-    (pick("permissionMode"), pick("model"), pick("sandbox"))
+    (
+        provider.permission_mode.clone(),
+        provider.model.clone(),
+        provider.effort.clone(),
+        provider.sandbox.clone(),
+    )
 }
 
 fn cli_provider_settings(
     state: &WsState,
     mode: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
-    if mode == "shell" || mode == "codex" {
-        return (None, None, None);
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    if mode == "shell" {
+        return (None, None, None, None);
+    }
+    if mode == "codex" {
+        let effort = state
+            .settings
+            .coding_cli
+            .providers
+            .get(mode)
+            .and_then(|provider| provider.effort.clone());
+        return (None, None, effort, None);
     }
     configured_provider_settings(state, mode)
 }
@@ -2151,16 +2170,10 @@ async fn plan_codex_managed_launch(
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
     let codex_provider = state.settings.coding_cli.providers.get("codex");
-    let provider_str = |key: &str| {
-        codex_provider
-            .and_then(|p| p.get(key))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    };
-    let plan_model = provider_str("model");
-    let plan_sandbox = provider_str("sandbox");
+    let plan_model = codex_provider.and_then(|provider| provider.model.clone());
+    let plan_sandbox = codex_provider.and_then(|provider| provider.sandbox.clone());
     // `approvalPolicy: providerSettings?.permissionMode` (`ws:942`).
-    let plan_approval = provider_str("permissionMode");
+    let plan_approval = codex_provider.and_then(|provider| provider.permission_mode.clone());
     let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
         cwd: setup.runtime_cwd.as_deref(),
         resume_session_id,
@@ -3827,11 +3840,11 @@ pub(crate) async fn handle_create(
         }
     }
     // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
-    // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
-    // app-server plan instead). Boot-snapshot settings (same documented caveat
+    // codex split: model/sandbox/permissionMode route to the app-server plan,
+    // while effort remains the exact CLI config argv. Boot-snapshot settings (same documented caveat
     // as `defaultCwd` above). Shared with the auto-resume respawn seam
     // (Task 4) via `cli_provider_settings`.
-    let (permission_mode, model, sandbox) = if use_managed_runtime {
+    let (permission_mode, model, effort, sandbox) = if use_managed_runtime {
         configured_provider_settings(state, &mode)
     } else {
         cli_provider_settings(state, &mode)
@@ -3988,6 +4001,7 @@ pub(crate) async fn handle_create(
         launch_intent,
         permission_mode: permission_mode.as_deref(),
         model: model.as_deref(),
+        effort: effort.as_deref(),
         sandbox: sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
         opencode_server: opencode_endpoint
@@ -4173,6 +4187,7 @@ pub(crate) async fn handle_create(
             mode: mode.clone(),
             resume_session_id: resume_session_id.clone(),
             provider_model: model.clone(),
+            provider_reasoning_effort: effort.clone(),
             provider_sandbox: sandbox.clone(),
             provider_permission_mode: permission_mode.clone(),
             view_tab_id: create.tab_id.clone(),
@@ -4846,7 +4861,7 @@ pub async fn respawn_agent_terminal(
     // Launch params from state.settings EXACTLY as handle_create derives them
     // (BindingRow launch fields are hardcoded None for terminal panes —
     // pane_ledger.rs:405-408).
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, effort, sandbox) = cli_provider_settings(state, &mode);
 
     // opencode: allocate the loopback control endpoint BEFORE building the
     // launch, same seam as `handle_create`.
@@ -4940,6 +4955,7 @@ pub async fn respawn_agent_terminal(
         launch_intent,
         permission_mode: permission_mode.as_deref(),
         model: model.as_deref(),
+        effort: effort.as_deref(),
         sandbox: sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
         opencode_server: opencode_endpoint

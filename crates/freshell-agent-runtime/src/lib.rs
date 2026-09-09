@@ -187,7 +187,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         resume_command: Some("amplifier session resume --full-history <exact-id>"),
         zero_turn_policy: "stub-is-not-durable-conversation-proof",
         checkpoint_policy: "provider-session-directory",
-        bootstrap: ".amplifier/settings.yaml copied before privilege drop",
+        bootstrap: ".amplifier/settings.yaml and .amplifier/openai-chatgpt-oauth.json copied before privilege drop",
         live_gate: "provider-approved-lowest-cost-model",
         blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
@@ -388,15 +388,17 @@ pub fn build_resume_spec(input: ResumeSpecInput<'_>) -> Result<ResumeSpec, Adapt
         project_key: Some(terminal.project_key.clone()),
         runtime_profile: None,
         environment: terminal.env.clone(),
-        model: option_value(&terminal.args, &["--model", "-m"]),
-        reasoning_effort: option_value(
-            &terminal.args,
-            &["--effort", "--reasoning-effort", "--thinking"],
-        ),
-        permission_mode: option_value(
-            &terminal.args,
-            &["--permission-mode", "--approval-mode", "--approval-policy"],
-        ),
+        model: terminal
+            .provider_model
+            .clone()
+            .or_else(|| option_value(&terminal.args, &["--model", "-m"])),
+        reasoning_effort: terminal.provider_reasoning_effort.clone(),
+        permission_mode: terminal.provider_permission_mode.clone().or_else(|| {
+            option_value(
+                &terminal.args,
+                &["--permission-mode", "--approval-mode", "--approval-policy"],
+            )
+        }),
         image_ref: None,
         provider_version,
         credential_references: Vec::new(),
@@ -447,6 +449,9 @@ pub fn prepare_terminal_for_resume(
     replacement.cwd = resume.cwd.clone();
     replacement.workspace_path = resume.workspace_path.clone();
     replacement.resume_session_id = Some(expected.clone());
+    replacement.provider_model = resume.model.clone();
+    replacement.provider_reasoning_effort = resume.reasoning_effort.clone();
+    replacement.provider_permission_mode = resume.permission_mode.clone();
     replacement
         .validate()
         .map_err(|error| AdapterError::InvalidLaunch(error.message))?;
@@ -1135,10 +1140,41 @@ mod tests {
             create_request_id: Some("create-one".into()),
             resume_session_id: None,
             provider_model: None,
+            provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::<ProviderBootstrapFile>::new(),
         }
+    }
+
+    #[test]
+    fn durable_model_and_effort_are_captured_and_restored_without_argv_inference() {
+        let mut original = terminal("codex", &["resume", "thread-one"]);
+        original.provider_model = Some("gpt-5.6-luna".into());
+        original.provider_reasoning_effort = Some("minimal".into());
+        let resume = build_resume_spec(ResumeSpecInput {
+            provider: "codex",
+            provider_store_id: "store-one",
+            native_session_id: "thread-one",
+            terminal: &original,
+            provider_version: Some("1.0.0".into()),
+            creation_seed_ref: "seed-one".into(),
+            checkpoint_revision: 0,
+            evidence_revision: 1,
+            never_dispatched: false,
+        })
+        .unwrap();
+        let resume: ResumeSpec =
+            serde_json::from_str(&serde_json::to_string(&resume).unwrap()).unwrap();
+        assert_eq!(resume.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(resume.reasoning_effort.as_deref(), Some("minimal"));
+
+        let restored = prepare_terminal_for_resume(&original, &resume).unwrap();
+        assert_eq!(restored.provider_model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(
+            restored.provider_reasoning_effort.as_deref(),
+            Some("minimal")
+        );
     }
 
     #[test]

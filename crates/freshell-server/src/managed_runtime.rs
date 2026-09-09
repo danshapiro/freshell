@@ -216,6 +216,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     create_request_id: request.create_request_id.clone(),
                     resume_session_id: request.resume_session_id.clone(),
                     provider_model: request.provider_model.clone(),
+                    provider_reasoning_effort: request.provider_reasoning_effort.clone(),
                     provider_sandbox: request.provider_sandbox.clone(),
                     provider_permission_mode: request.provider_permission_mode.clone(),
                     provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
@@ -689,7 +690,13 @@ fn managed_provider_args(mode: &str, args: Vec<String>) -> Vec<String> {
 }
 
 fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, String> {
-    let (explicit_key, fallbacks): (&str, Vec<PathBuf>) = match mode {
+    struct BootstrapSpec {
+        env_key: &'static str,
+        fallbacks: Vec<PathBuf>,
+        provider_relative_path: &'static str,
+    }
+
+    let specs: Vec<BootstrapSpec> = match mode {
         "claude" => {
             let mut paths = Vec::new();
             if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
@@ -706,7 +713,11 @@ fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, St
                     );
                 }
             }
-            ("FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE", paths)
+            vec![BootstrapSpec {
+                env_key: "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
+                fallbacks: paths,
+                provider_relative_path: ".claude/.credentials.json",
+            }]
         }
         "opencode" => {
             let mut paths = Vec::new();
@@ -726,7 +737,11 @@ fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, St
                     );
                 }
             }
-            ("FRESHELL_MANAGED_OPENCODE_AUTH_FILE", paths)
+            vec![BootstrapSpec {
+                env_key: "FRESHELL_MANAGED_OPENCODE_AUTH_FILE",
+                fallbacks: paths,
+                provider_relative_path: ".local/share/opencode/auth.json",
+            }]
         }
         "codex" => {
             let mut paths = Vec::new();
@@ -740,30 +755,59 @@ fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, St
                     paths.push(PathBuf::from(home).join(".codex").join("auth.json"));
                 }
             }
-            ("FRESHELL_MANAGED_CODEX_AUTH_FILE", paths)
+            vec![BootstrapSpec {
+                env_key: "FRESHELL_MANAGED_CODEX_AUTH_FILE",
+                fallbacks: paths,
+                provider_relative_path: ".codex/auth.json",
+            }]
         }
         "amplifier" => {
-            let mut paths = Vec::new();
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(PathBuf::from(home).join(".amplifier").join("settings.yaml"));
-                }
-            }
-            ("FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE", paths)
+            let amplifier_home = std::env::var("HOME")
+                .ok()
+                .filter(|home| !home.trim().is_empty())
+                .map(PathBuf::from)
+                .map(|home| home.join(".amplifier"));
+            vec![
+                BootstrapSpec {
+                    env_key: "FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE",
+                    fallbacks: amplifier_home
+                        .as_ref()
+                        .map(|home| vec![home.join("settings.yaml")])
+                        .unwrap_or_default(),
+                    provider_relative_path: ".amplifier/settings.yaml",
+                },
+                BootstrapSpec {
+                    env_key: "FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE",
+                    fallbacks: amplifier_home
+                        .map(|home| vec![home.join("openai-chatgpt-oauth.json")])
+                        .unwrap_or_default(),
+                    provider_relative_path: ".amplifier/openai-chatgpt-oauth.json",
+                },
+            ]
         }
         _ => return Ok(Vec::new()),
     };
 
-    if let Ok(explicit) = std::env::var(explicit_key) {
-        if !explicit.trim().is_empty() {
-            return provider_bootstrap_files_from_candidate(mode, Some(PathBuf::from(explicit)))
-                .map_err(|error| format!("{explicit_key}: {error}"));
+    let mut files = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let explicit = std::env::var(spec.env_key)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let candidate = explicit
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| spec.fallbacks.into_iter().find(|path| path.is_file()));
+        if let Some(candidate) = candidate {
+            let file =
+                provider_bootstrap_file_from_candidate(candidate, spec.provider_relative_path)
+                    .map_err(|error| format!("{}: {error}", spec.env_key))?;
+            files.push(file);
         }
     }
-    let candidate = fallbacks.into_iter().find(|path| path.is_file());
-    provider_bootstrap_files_from_candidate(mode, candidate)
+    Ok(files)
 }
 
+#[cfg(test)]
 fn provider_bootstrap_files_from_candidate(
     mode: &str,
     candidate: Option<PathBuf>,
@@ -781,12 +825,34 @@ fn provider_bootstrap_files_from_candidate(
         "amplifier" => ".amplifier/settings.yaml",
         _ => return Ok(Vec::new()),
     };
+    provider_bootstrap_files_from_candidates(vec![(candidate, provider_relative_path)])
+}
+
+fn provider_bootstrap_file_from_candidate(
+    candidate: PathBuf,
+    provider_relative_path: &str,
+) -> Result<ProviderBootstrapFile, String> {
+    if !candidate.is_file() {
+        return Err(format!("not a readable file: {}", candidate.display()));
+    }
     let canonical = std::fs::canonicalize(&candidate)
         .map_err(|error| format!("canonicalize provider bootstrap reference: {error}"))?;
-    Ok(vec![ProviderBootstrapFile {
+    Ok(ProviderBootstrapFile {
         source_path: canonical.to_string_lossy().into_owned(),
         provider_relative_path: provider_relative_path.to_string(),
-    }])
+    })
+}
+
+#[cfg(test)]
+fn provider_bootstrap_files_from_candidates(
+    candidates: Vec<(PathBuf, &str)>,
+) -> Result<Vec<ProviderBootstrapFile>, String> {
+    candidates
+        .into_iter()
+        .map(|(candidate, destination)| {
+            provider_bootstrap_file_from_candidate(candidate, destination)
+        })
+        .collect()
 }
 
 fn provider_label(provider: &str) -> &str {
@@ -1072,12 +1138,34 @@ mod tests {
     }
 
     #[test]
-    fn amplifier_bootstrap_reference_targets_soul_settings_store() {
+    fn amplifier_bootstrap_references_target_settings_and_oauth_without_persisting_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let settings = dir.path().join("settings.yaml");
+        let oauth = dir.path().join("openai-chatgpt-oauth.json");
         std::fs::write(&settings, "bundle:\n  active: foundation\n").unwrap();
-        let files = provider_bootstrap_files_from_candidate("amplifier", Some(settings)).unwrap();
-        assert_eq!(files.len(), 1);
+        std::fs::write(&oauth, r#"{"access_token":"oauth-secret-bytes"}"#).unwrap();
+        let expected_settings = std::fs::canonicalize(&settings).unwrap();
+        let expected_oauth = std::fs::canonicalize(&oauth).unwrap();
+        let files = provider_bootstrap_files_from_candidates(vec![
+            (settings, ".amplifier/settings.yaml"),
+            (oauth, ".amplifier/openai-chatgpt-oauth.json"),
+        ])
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files[0].source_path,
+            expected_settings.to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            files[1].source_path,
+            expected_oauth.to_string_lossy().into_owned()
+        );
         assert_eq!(files[0].provider_relative_path, ".amplifier/settings.yaml");
+        assert_eq!(
+            files[1].provider_relative_path,
+            ".amplifier/openai-chatgpt-oauth.json"
+        );
+        let json = serde_json::to_string(&files).unwrap();
+        assert!(!json.contains("oauth-secret-bytes"));
     }
 }

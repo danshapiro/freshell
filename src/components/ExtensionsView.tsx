@@ -372,6 +372,13 @@ export function ExtensionsManager({ className, includeCli = true }: ExtensionsMa
         })
         return
       }
+      if (key === 'effort') {
+        const effort = (value as string).trim()
+        scheduleTextSave(`codingCli.providers.${item.id}.effort`, {
+          codingCli: { providers: { [item.id]: { effort: effort || undefined } } },
+        })
+        return
+      }
       // Immediate saves for select fields
       const settingValue = (value === '' || value === 'default') ? undefined : value
       void dispatch(saveServerSettingsPatch({

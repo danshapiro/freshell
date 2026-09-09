@@ -9,8 +9,10 @@
     "envVar": "CODEX_CMD",
     "resumeArgs": ["resume", "{{sessionId}}"],
     "modelArgs": ["--model", "{{model}}"],
+    "effortArgs": ["-c", "model_reasoning_effort=\"{{effort}}\""],
     "sandboxArgs": ["--sandbox", "{{sandbox}}"],
     "supportsModel": true,
+    "supportsEffort": true,
     "supportsSandbox": true
   },
   "picker": {

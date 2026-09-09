@@ -50,6 +50,8 @@ fn specs() -> Vec<CliCommandSpec> {
             default_cmd: "claude".into(),
             resume_args: Some(s(&["--resume", "{{sessionId}}"])),
             create_session_args: Some(s(&["--session-id", "{{sessionId}}"])),
+            model_args: Some(s(&["--model", "{{model}}"])),
+            effort_args: Some(s(&["--effort", "{{effort}}"])),
             permission_mode_args: Some(s(&["--permission-mode", "{{permissionMode}}"])),
             ..Default::default()
         },
@@ -60,6 +62,7 @@ fn specs() -> Vec<CliCommandSpec> {
             default_cmd: "codex".into(),
             resume_args: Some(s(&["resume", "{{sessionId}}"])),
             model_args: Some(s(&["--model", "{{model}}"])),
+            effort_args: Some(s(&["-c", "model_reasoning_effort=\"{{effort}}\""])),
             sandbox_args: Some(s(&["--sandbox", "{{sandbox}}"])),
             ..Default::default()
         },
@@ -83,12 +86,45 @@ fn claude_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
         launch_intent: LaunchIntent::Resume,
         permission_mode: Some("default"),
         model: None,
+        effort: None,
         sandbox: None,
         codex_remote_ws_url: None,
         opencode_server: None,
         mcp_injection: injection,
         opencode_rebind_tui_config: None,
     }
+}
+
+#[test]
+fn claude_model_and_effort_use_manifest_templates() {
+    let mut inputs = claude_inputs(McpInjection::default());
+    inputs.model = Some("haiku");
+    inputs.effort = Some("low");
+    let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[]))
+        .unwrap()
+        .unwrap();
+    assert!(launch
+        .args
+        .windows(2)
+        .any(|pair| pair == ["--model", "haiku"]));
+    assert!(launch
+        .args
+        .windows(2)
+        .any(|pair| pair == ["--effort", "low"]));
+}
+
+#[test]
+fn codex_reasoning_effort_uses_exact_config_argv() {
+    let mut inputs = codex_inputs(McpInjection::default());
+    inputs.model = Some("gpt-5.6-luna");
+    inputs.effort = Some("minimal");
+    let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[]))
+        .unwrap()
+        .unwrap();
+    assert!(launch
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c", "model_reasoning_effort=\"minimal\""]));
 }
 
 fn claude_mcp_unix() -> McpInjection {
@@ -249,6 +285,7 @@ fn codex_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
         launch_intent: LaunchIntent::Resume,
         permission_mode: None,
         model: None,
+        effort: None,
         sandbox: None,
         codex_remote_ws_url: None,
         opencode_server: None,
@@ -379,6 +416,7 @@ fn opencode_inputs<'a>() -> CliLaunchInputs<'a> {
         launch_intent: LaunchIntent::Resume,
         permission_mode: None,
         model: None,
+        effort: None,
         sandbox: None,
         codex_remote_ws_url: None,
         opencode_server: Some(("127.0.0.1", 51234)),
@@ -852,6 +890,7 @@ fn amplifier_inputs<'a>(resume_session_id: Option<&'a str>) -> CliLaunchInputs<'
         launch_intent: LaunchIntent::Resume,
         permission_mode: None,
         model: None,
+        effort: None,
         sandbox: None,
         codex_remote_ws_url: None,
         opencode_server: None,

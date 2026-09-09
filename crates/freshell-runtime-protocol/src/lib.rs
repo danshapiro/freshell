@@ -924,6 +924,8 @@ pub struct TerminalLaunchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_permission_mode: Option<String>,
@@ -958,6 +960,10 @@ impl TerminalLaunchSpec {
         }
         for (name, value) in [
             ("providerModel", self.provider_model.as_deref()),
+            (
+                "providerReasoningEffort",
+                self.provider_reasoning_effort.as_deref(),
+            ),
             ("providerSandbox", self.provider_sandbox.as_deref()),
             (
                 "providerPermissionMode",
@@ -1799,6 +1805,7 @@ mod tests {
             create_request_id: None,
             resume_session_id: None,
             provider_model: Some("gpt-5.6-luna".into()),
+            provider_reasoning_effort: Some("minimal".into()),
             provider_sandbox: Some("workspace-write".into()),
             provider_permission_mode: Some("on-request".into()),
             provider_bootstrap_files: Vec::new(),
@@ -1809,6 +1816,9 @@ mod tests {
         spec.provider_model = Some("m".repeat(257));
         assert!(spec.validate().is_err());
         spec.provider_model = None;
+        spec.provider_reasoning_effort = Some("line\nbreak".into());
+        assert!(spec.validate().is_err());
+        spec.provider_reasoning_effort = None;
         spec.provider_permission_mode = Some("line\nbreak".into());
         assert!(spec.validate().is_err());
     }

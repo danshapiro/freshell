@@ -79,6 +79,7 @@ fn claude_spec(script_path: &std::path::Path) -> freshell_platform::CliCommandSp
             "{{sessionId}}".to_string(),
         ]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }
@@ -564,6 +565,7 @@ fn crash_once_codex_spec(marker: &std::path::Path) -> freshell_platform::CliComm
         // the shipped-spec shape.
         create_session_args: None,
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }

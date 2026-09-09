@@ -52,6 +52,8 @@ pub struct CliCommandSpec {
     pub create_session_args: Option<Vec<String>>,
     /// `modelArgs` template (`"{{model}}"`, replace-all).
     pub model_args: Option<Vec<String>>,
+    /// `effortArgs` template (`"{{effort}}"`, replace-all).
+    pub effort_args: Option<Vec<String>>,
     /// `sandboxArgs` template (`"{{sandbox}}"`, replace-all).
     pub sandbox_args: Option<Vec<String>>,
     /// `permissionModeArgs` template (`"{{permissionMode}}"`, replace-all).
@@ -113,6 +115,7 @@ pub struct CliLaunchInputs<'a> {
     /// stripped on the live path, `ws:2464-2465`).
     pub permission_mode: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
     pub sandbox: Option<&'a str>,
     /// `providerSettings.codexAppServer.wsUrl` (always present on the live codex
     /// path; `None` only for direct/unit callers — spec §2.2(1) / UNCERTAIN U2).
@@ -519,6 +522,12 @@ pub fn resolve_coding_cli_command(
     };
     if let (Some(model), Some(template)) = (&effective_model, &spec.model_args) {
         settings_args.extend(apply_template_all(template, "{{model}}", model));
+    }
+    if let (Some(effort), Some(template)) = (
+        inputs.effort.filter(|value| !value.is_empty()),
+        &spec.effort_args,
+    ) {
+        settings_args.extend(apply_template_all(template, "{{effort}}", effort));
     }
     if let (Some(sandbox), Some(template)) =
         (inputs.sandbox.filter(|s| !s.is_empty()), &spec.sandbox_args)

@@ -422,6 +422,7 @@ fn gated_exit_cli_spec(
             "{{sessionId}}".to_string(),
         ]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }

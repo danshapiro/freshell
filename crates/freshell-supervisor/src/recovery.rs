@@ -1937,6 +1937,7 @@ mod tests {
             create_request_id: Some("create-exact".into()),
             resume_session_id: None,
             provider_model: Some("free".into()),
+            provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: vec![freshell_runtime_protocol::ProviderBootstrapFile {

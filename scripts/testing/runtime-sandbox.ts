@@ -904,19 +904,26 @@ export class RuntimeHarness {
 
   private phase2BootstrapFiles(): string[] {
     const files = new Set<string>()
+    const addRegularFile = (candidate: string | undefined) => {
+      if (!candidate) return
+      try {
+        const resolved = fs.realpathSync(candidate)
+        if (fs.statSync(resolved).isFile()) files.add(resolved)
+      } catch {}
+    }
     for (const key of [
       'FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE',
       'FRESHELL_MANAGED_OPENCODE_AUTH_FILE',
       'FRESHELL_MANAGED_CODEX_AUTH_FILE',
       'FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE',
+      'FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE',
     ]) {
       const configured = process.env[key]?.trim()
-      if (!configured) continue
-      try {
-        const resolved = fs.realpathSync(configured)
-        if (fs.statSync(resolved).isFile()) files.add(resolved)
-      } catch {}
+      addRegularFile(configured)
     }
+    const amplifierHome = path.join(os.homedir(), '.amplifier')
+    addRegularFile(path.join(amplifierHome, 'settings.yaml'))
+    addRegularFile(path.join(amplifierHome, 'openai-chatgpt-oauth.json'))
     return [...files]
   }
 
