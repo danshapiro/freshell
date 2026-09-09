@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
+freshell-freshagent = { path = "../freshell-freshagent" }
 freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
@@ -20,6 +21,8 @@ serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "process", "io-util"] }
 libc = "0.2"
 tracing = "0.1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

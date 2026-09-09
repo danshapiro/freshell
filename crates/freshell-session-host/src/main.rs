@@ -7,10 +7,10 @@ mod pty;
 
 use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{
-    host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, GrantId, HostBootId,
-    HostCommand, HostReply, HostResult, IncarnationId, RecoveryPath, RecoveryProbe, ResumeSpec,
-    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec,
-    CONTROL_PROTOCOL_VERSION,
+    host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec,
+    GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId, ProviderBootstrapFile,
+    RecoveryPath, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
+    RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use pty::HostedPty;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,7 @@ struct HostState {
     persisted: Mutex<PersistedHostState>,
     child: Mutex<Option<Child>>,
     pty: Mutex<Option<HostedPty>>,
+    fresh_agent: Mutex<Option<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>>>,
 }
 
 /// A managed session host runs inside a CPU-capped container, so
@@ -150,6 +151,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         persisted: Mutex::new(persisted),
         child: Mutex::new(None),
         pty: Mutex::new(None),
+        fresh_agent: Mutex::new(None),
     });
 
     loop {
@@ -217,6 +219,7 @@ async fn dispatch(
                     "terminal-v1".into(),
                     "output-replay-v1".into(),
                     "runtime-metrics-v1".into(),
+                    "fresh-agent-v1".into(),
                 ],
                 effective_limits: limits,
             })
@@ -238,6 +241,7 @@ async fn dispatch(
                     grant_id,
                     fixture,
                     terminal,
+                    fresh_agent,
                     resume_spec,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
@@ -255,6 +259,7 @@ async fn dispatch(
                         grant_id,
                         fixture,
                         terminal.map(|terminal| *terminal),
+                        fresh_agent.map(|agent| *agent),
                         resume_spec.map(|resume_spec| *resume_spec),
                     )
                     .await
@@ -279,6 +284,9 @@ async fn dispatch(
                     }
                     if let Some(mut pty) = state.pty.lock().await.take() {
                         pty.stop().await;
+                    }
+                    if let Some(agent) = state.fresh_agent.lock().await.take() {
+                        let _ = agent.stop().await;
                     }
                     append_event_with_secret(&state.state_dir, &state.secret, "host.stop_requested", serde_json::json!({"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
                     Ok(HostResult::Stopped)
@@ -305,6 +313,14 @@ async fn dispatch(
                             "exited":exited,
                             "exitCode":pty.exit_code(),
                             "nativeSessionId":native_session_id,
+                        });
+                    } else if let Some(agent) = state.fresh_agent.lock().await.as_ref() {
+                        exited = !agent.is_live().await;
+                        native_session_id = agent.profile().await.native_session_id;
+                        evidence = serde_json::json!({
+                            "workload":"fresh-agent",
+                            "nativeSessionId":native_session_id,
+                            "exited":exited,
                         });
                     } else if let Some(child) = state.child.lock().await.as_mut() {
                         exited = child
@@ -394,6 +410,79 @@ async fn dispatch(
                         .read_output(incarnation_id, after_seq, max_bytes)?;
                     Ok(HostResult::TerminalOutput(batch))
                 }
+                HostCommand::FreshAgentSend {
+                    incarnation_id,
+                    request_id,
+                    text,
+                    settings,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| unsupported_fresh_agent())?;
+                    let command_state = actor
+                        .dispatch(request_id, text, settings)
+                        .await
+                        .map_err(map_actor_error)?;
+                    let native_session_id = actor.profile().await.native_session_id;
+                    Ok(HostResult::FreshAgentCommand {
+                        state: command_state,
+                        native_session_id,
+                    })
+                }
+                HostCommand::FreshAgentResolve {
+                    incarnation_id,
+                    decision_id,
+                    decision,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| unsupported_fresh_agent())?;
+                    actor
+                        .resolve_permission(&decision_id, decision)
+                        .await
+                        .map_err(map_actor_error)?;
+                    let native_session_id = actor.profile().await.native_session_id;
+                    Ok(HostResult::FreshAgentCommand {
+                        state: freshell_runtime_protocol::CommandState::Completed,
+                        native_session_id,
+                    })
+                }
+                HostCommand::FreshAgentInterrupt { incarnation_id } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| unsupported_fresh_agent())?;
+                    actor.interrupt().await.map_err(map_actor_error)?;
+                    Ok(HostResult::FreshAgentInterrupted)
+                }
+                HostCommand::FreshAgentReadEvents {
+                    incarnation_id,
+                    after_sequence,
+                    max_events,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| unsupported_fresh_agent())?;
+                    let events = actor
+                        .read_events(after_sequence, (max_events as usize).clamp(1, 4096))
+                        .await;
+                    Ok(HostResult::FreshAgentEvents(events))
+                }
                 HostCommand::RuntimeMetrics { incarnation_id } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     Ok(HostResult::RuntimeMetrics(read_runtime_metrics()))
@@ -431,6 +520,31 @@ async fn dispatch(
     }
 }
 
+fn unsupported_fresh_agent() -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::UnsupportedWorkload,
+        "incarnation is not a hosted fresh-agent",
+    )
+}
+
+fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> RuntimeError {
+    use freshell_agent_runtime::host_actor::ActorError;
+    let code = match error {
+        ActorError::RequestConflict => RuntimeErrorCode::RequestIdConflict,
+        ActorError::AmbiguousDispatch => RuntimeErrorCode::CommandAmbiguous,
+        ActorError::NativeIdentityMismatch => RuntimeErrorCode::RecoveryWrongIdentity,
+        ActorError::UnknownDecision | ActorError::DecisionAlreadyResolved => {
+            RuntimeErrorCode::InvalidRequest
+        }
+        ActorError::WriterBusy => RuntimeErrorCode::OwnershipMismatch,
+        ActorError::InvalidProfile => RuntimeErrorCode::InvalidRequest,
+        ActorError::Transport(_) | ActorError::Persistence(_) => RuntimeErrorCode::HostUnreachable,
+    };
+    // Provider error strings may contain request bodies, environment values,
+    // or credentials. Keep the control payload typed and deliberately opaque.
+    RuntimeError::new(code, "hosted fresh-agent command failed")
+}
+
 fn ensure_incarnation(
     incarnation_id: &IncarnationId,
     state: &HostState,
@@ -452,6 +566,7 @@ async fn grant_execution(
     grant_id: GrantId,
     fixture: Option<FixtureKind>,
     terminal: Option<TerminalLaunchSpec>,
+    fresh_agent: Option<FreshAgentLaunchSpec>,
     resume_spec: Option<ResumeSpec>,
 ) -> Result<HostResult, RuntimeError> {
     let mut persisted = state.persisted.lock().await;
@@ -466,11 +581,17 @@ async fn grant_execution(
     if let Some(existing) = persisted.grant_id.as_ref() {
         if existing == &grant_id {
             if let Some(pid) = persisted.worker_pid {
+                let actor = state.fresh_agent.lock().await.clone();
+                let native_session_id = match actor {
+                    Some(actor) => actor.profile().await.native_session_id,
+                    None => None,
+                };
                 return Ok(HostResult::GrantAccepted {
                     host_boot_id: state.host_boot_id.clone(),
                     worker_pid: pid,
                     worker_launch_count: persisted.worker_launch_count,
                     fixture_evidence: persisted.fixture_evidence.clone(),
+                    native_session_id,
                 });
             }
             return Err(RuntimeError::new(
@@ -490,8 +611,8 @@ async fn grant_execution(
     persisted.worker_pid = None;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
 
-    let (pid, evidence) = match (fixture, terminal) {
-        (Some(fixture), None) => {
+    let (pid, evidence, native_session_id) = match (fixture, terminal, fresh_agent) {
+        (Some(fixture), None, None) => {
             let exe = std::env::current_exe()
                 .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
             let fixture_name = match fixture {
@@ -541,9 +662,9 @@ async fn grant_execution(
             } else {
                 serde_json::json!({"fixture":fixture_name})
             };
-            (pid, evidence)
+            (pid, evidence, None)
         }
-        (None, Some(terminal)) => {
+        (None, Some(terminal), None) => {
             let exact_resume = resume_spec.is_some();
             let mut terminal = match resume_spec.as_ref() {
                 Some(resume) => prepare_terminal_for_resume(&terminal, resume)
@@ -598,12 +719,69 @@ async fn grant_execution(
                 "mode":terminal.mode,
             });
             *state.pty.lock().await = Some(hosted);
-            (pid, evidence)
+            (pid, evidence, None)
+        }
+        (None, None, Some(mut launch)) => {
+            let exact_resume = resume_spec.is_some();
+            if let Some(resume) = resume_spec.as_ref() {
+                if resume.provider_session.native_session_id.is_empty()
+                    || resume.provider_session.provider != launch.provider.as_str()
+                    || resume.provider_session.provider_store_id != launch.provider_store_id
+                    || resume.mode != launch.session_type
+                    || resume.runtime_variant != launch.runtime_variant
+                    || launch
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|native| native != &resume.provider_session.native_session_id)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::RecoveryWrongIdentity,
+                        "fresh-agent resume identity does not match the persisted launch profile",
+                    ));
+                }
+                launch.native_session_id = Some(resume.provider_session.native_session_id.clone());
+                launch.model = resume.model.clone();
+                launch.effort = resume.reasoning_effort.clone();
+                launch.permission_mode = resume.permission_mode.clone();
+                launch.cwd = resume.cwd.clone();
+            }
+            if !exact_resume {
+                prepare_provider_bootstrap_files(
+                    &launch.provider_bootstrap_files,
+                    launch.run_as_uid,
+                    launch.run_as_gid,
+                )
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "prepare hosted fresh-agent provider state failed",
+                    )
+                })?;
+            }
+            let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "hosted fresh-agent provider failed to start",
+                    )
+                })?;
+            let profile = actor.profile().await;
+            let native_session_id = profile.native_session_id.clone();
+            let evidence = serde_json::json!({
+                "workload":"fresh-agent",
+                "provider":launch.provider.as_str(),
+                "sessionType":launch.session_type,
+                "runtimeVariant":profile.runtime_variant,
+                "nativeSessionId":profile.native_session_id,
+            });
+            *state.fresh_agent.lock().await = Some(actor);
+            (std::process::id(), evidence, native_session_id)
         }
         _ => {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
-                "execution grant must carry exactly one fixture or terminal workload",
+                "execution grant must carry exactly one fixture, terminal, or fresh-agent workload",
             ));
         }
     };
@@ -619,6 +797,7 @@ async fn grant_execution(
         worker_pid: pid,
         worker_launch_count: persisted.worker_launch_count,
         fixture_evidence: persisted.fixture_evidence.clone(),
+        native_session_id,
     })
 }
 
@@ -637,7 +816,12 @@ fn prepare_provider_state_for_fresh_launch(
             format!("transfer managed provider state: {error}"),
         )
     })?;
-    prepare_provider_bootstrap_files(terminal).map_err(|error| {
+    prepare_provider_bootstrap_files(
+        &terminal.provider_bootstrap_files,
+        terminal.run_as_uid,
+        terminal.run_as_gid,
+    )
+    .map_err(|error| {
         RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
             format!("prepare provider bootstrap: {error}"),
@@ -700,12 +884,12 @@ fn transfer_owned_tree(root: &Path, uid: u32, gid: u32, max_entries: usize) -> R
     Ok(())
 }
 
-fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(), String> {
-    let home = terminal
-        .env
-        .get("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "managed provider requires terminal HOME".to_string())?;
+fn prepare_provider_bootstrap_files(
+    files: &[ProviderBootstrapFile],
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<(), String> {
+    let home = PathBuf::from("/home/freshell/provider");
     if home != Path::new("/home/freshell/provider") {
         return Err("managed provider HOME must be /home/freshell/provider".into());
     }
@@ -720,9 +904,17 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
     let mut provider_dirs = std::collections::BTreeSet::new();
     provider_dirs.insert(home.clone());
 
-    for (index, file) in terminal.provider_bootstrap_files.iter().enumerate() {
+    for (index, file) in files.iter().enumerate() {
         let source = PathBuf::from(format!("/run/freshell-bootstrap/provider-{index}"));
         let relative = PathBuf::from(&file.provider_relative_path);
+        if file.provider_relative_path.is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("provider bootstrap destination is unsafe".into());
+        }
         let destination = home.join(&relative);
         if !destination.starts_with(&home) {
             return Err("provider bootstrap destination escaped HOME".into());
@@ -756,7 +948,7 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
         out.sync_all().map_err(|error| error.to_string())?;
         set_mode(&tmp, 0o600)?;
         std::fs::rename(&tmp, &destination).map_err(|error| error.to_string())?;
-        set_owner(&destination, terminal.run_as_uid, terminal.run_as_gid)?;
+        set_owner(&destination, run_as_uid, run_as_gid)?;
         if let Some(parent) = destination.parent() {
             let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
         }
@@ -768,7 +960,7 @@ fn prepare_provider_bootstrap_files(terminal: &TerminalLaunchSpec) -> Result<(),
     let mut provider_dirs = provider_dirs.into_iter().collect::<Vec<_>>();
     provider_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for dir in provider_dirs {
-        set_owner(&dir, terminal.run_as_uid, terminal.run_as_gid)?;
+        set_owner(&dir, run_as_uid, run_as_gid)?;
     }
     Ok(())
 }
@@ -1415,6 +1607,61 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use freshell_agent_runtime::host_actor::{
+        DispatchAck, DispatchFailure, FreshAgentProfile, FreshAgentTransport, TransportStart,
+    };
+    use freshell_runtime_protocol::{AgentEvent, FreshProvider, RequestId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RpcFixtureTransport {
+        dispatches: AtomicUsize,
+        decisions: AtomicUsize,
+        stops: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FreshAgentTransport for RpcFixtureTransport {
+        async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+            Ok(TransportStart {
+                native_session_id: Some("fixture-native-thread".into()),
+            })
+        }
+
+        async fn dispatch(
+            &self,
+            request_id: &RequestId,
+            _text: &str,
+            _profile: &FreshAgentProfile,
+        ) -> Result<DispatchAck, DispatchFailure> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            Ok(DispatchAck {
+                provider_ack_id: Some(request_id.to_string()),
+            })
+        }
+
+        async fn resolve_permission(
+            &self,
+            _decision_id: &str,
+            _decision: serde_json::Value,
+        ) -> Result<(), DispatchFailure> {
+            self.decisions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn stop(self: Arc<Self>) -> Result<(), String> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+            None
+        }
+    }
 
     /// The control plane must keep a worker even inside a half-CPU cgroup
     /// where `available_parallelism()` reports 1. Without the floor, one
@@ -1445,6 +1692,112 @@ mod tests {
         assert!(limits.cpu_milli > 0);
         assert!(limits.memory_bytes > 0);
         assert!(limits.pids_max > 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_fresh_agent_rpc_keeps_one_host_owned_transport_until_explicit_stop() {
+        let state = test_host_state();
+        let transport = Arc::new(RpcFixtureTransport {
+            dispatches: AtomicUsize::new(0),
+            decisions: AtomicUsize::new(0),
+            stops: AtomicUsize::new(0),
+        });
+        let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+            state.state_dir.join("rpc-fixture-agent"),
+            FreshAgentProfile {
+                provider: FreshProvider::Claude,
+                runtime_variant: "fixture-sdk".into(),
+                cwd: "/workspace".into(),
+                model: Some("fixture-model".into()),
+                effort: Some("low".into()),
+                permission_mode: Some("ask".into()),
+                sandbox: None,
+                provider_store_id: "fixture-store".into(),
+                native_session_id: None,
+            },
+            transport.clone(),
+        )
+        .await
+        .unwrap();
+        actor
+            .record_permission("permission-1".into(), serde_json::json!({"tool":"shell"}))
+            .await
+            .unwrap();
+        *state.fresh_agent.lock().await = Some(actor);
+
+        let request_id = RequestId::parse("rpc-command-one").unwrap();
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: request_id.clone(),
+                    text: "perform fixture work".into(),
+                    settings: None,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            HostResult::FreshAgentCommand {
+                state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                native_session_id: Some(ref native),
+            }
+            if native == "fixture-native-thread"
+        ));
+
+        // A gateway reconnect is only a new cursor. The same request and the
+        // same decision are idempotent at the host-owned actor.
+        let batch = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentReadEvents {
+                    incarnation_id: state.incarnation_id.clone(),
+                    after_sequence: 0,
+                    max_events: 32,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(batch, HostResult::FreshAgentEvents(_)));
+        for _ in 0..2 {
+            dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::FreshAgentResolve {
+                        incarnation_id: state.incarnation_id.clone(),
+                        decision_id: "permission-1".into(),
+                        decision: serde_json::json!({"behavior":"allow"}),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
+
+        dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::Stop {
+                    incarnation_id: state.incarnation_id.clone(),
+                    control_epoch: 1,
+                    execution_generation: 1,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1541,6 +1894,7 @@ mod tests {
                 grant_id: GrantId::new(),
                 fixture: Some(FixtureKind::Heartbeat),
                 terminal: None,
+                fresh_agent: None,
                 resume_spec: None,
             },
         );
@@ -1668,6 +2022,7 @@ mod tests {
                 grant_id: GrantId::new(),
                 fixture: None,
                 terminal: Some(Box::new(terminal)),
+                fresh_agent: None,
                 resume_spec: Some(Box::new(resume_spec)),
             },
         );
@@ -1713,6 +2068,7 @@ mod tests {
             persisted: Mutex::new(PersistedHostState::default()),
             child: Mutex::new(None),
             pty: Mutex::new(None),
+            fresh_agent: Mutex::new(None),
         })
     }
 

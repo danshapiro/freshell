@@ -52,6 +52,57 @@ pub fn exact_resume_candidate(
         return Ok(None);
     };
 
+    if let Some(agent) = context.fresh_agent.as_ref() {
+        let spec = ResumeSpec {
+            schema_version: RESUME_SPEC_SCHEMA_VERSION,
+            provider_session: ProviderSessionRef {
+                provider: agent.provider.as_str().into(),
+                provider_store_id: agent.provider_store_id.clone(),
+                native_session_id,
+            },
+            mode: agent.session_type.clone(),
+            runtime_variant: agent.runtime_variant.clone(),
+            program: "freshell-session-host fresh-agent".into(),
+            resume_argv: Vec::new(),
+            provider_home: PROVIDER_HOME.into(),
+            provider_volume: Some(ProviderVolumeRef {
+                volume_name: context.prior_handle.provider_volume_name().to_string(),
+                mount_path: PROVIDER_HOME.into(),
+            }),
+            cwd: agent.cwd.clone(),
+            workspace_path: agent.workspace_path.clone(),
+            project_key: Some(context.project_key.clone()),
+            runtime_profile: Some(context.profile),
+            environment: BTreeMap::from([("HOME".into(), PROVIDER_HOME.into())]),
+            model: agent.model.clone(),
+            reasoning_effort: agent.effort.clone(),
+            permission_mode: agent.permission_mode.clone(),
+            image_ref: Some(context.prior_handle.image_ref().to_string()),
+            provider_version: pinned_provider_version(agent.provider.as_str()),
+            credential_references: agent
+                .provider_bootstrap_files
+                .iter()
+                .map(|file| CredentialReference {
+                    provider_relative_path: file.provider_relative_path.clone(),
+                })
+                .collect(),
+            identity_provenance: IdentityProvenance::ProviderObserved,
+            durable_position: DurablePosition {
+                accepted_command_count: context.accepted_command_count,
+                completed_command_count: context.completed_command_count,
+                output_sequence: 0,
+                provider_cursor: Some(format!("evidence:{}", context.evidence_revision)),
+            },
+            checkpoint_references: checkpoint_references(context),
+            creation_seed_ref: context.creation_seed_ref.clone(),
+            checkpoint_revision: context.checkpoint_revision,
+            allocation_state: AllocationState::VerifiedDurable,
+            evidence_revision: context.evidence_revision,
+            never_dispatched: context.never_dispatched,
+        };
+        return Ok(Some(spec));
+    }
+
     if let Some(terminal) = context.terminal.as_ref() {
         let spec = build_resume_spec(ResumeSpecInput {
             provider: &context.provider,
@@ -162,7 +213,12 @@ fn enrich_resume_spec(
         output_sequence: 0,
         provider_cursor: Some(format!("evidence:{}", context.evidence_revision)),
     };
-    spec.checkpoint_references = if context.checkpoint_revision == 0 {
+    spec.checkpoint_references = checkpoint_references(context);
+    spec
+}
+
+fn checkpoint_references(context: &RecoveryContext) -> Vec<CheckpointReference> {
+    if context.checkpoint_revision == 0 {
         Vec::new()
     } else {
         vec![CheckpointReference {
@@ -174,8 +230,7 @@ fn enrich_resume_spec(
             revision: context.checkpoint_revision,
             verified: true,
         }]
-    };
-    spec
+    }
 }
 
 fn blocked(reason: RecoveryBlockReason, message: String) -> RecoveryProbe {
@@ -196,8 +251,9 @@ mod tests {
     use super::*;
     use crate::registry::OwnedRuntimeHandle;
     use freshell_runtime_protocol::{
-        DesiredState, DockerDaemonId, DurabilityState, IncarnationId, InstallationId, LaunchNonce,
-        RecoveryState, RuntimeLimits, RuntimeProfile, SoulId,
+        DesiredState, DockerDaemonId, DurabilityState, FreshAgentLaunchSpec, FreshProvider,
+        IncarnationId, InstallationId, LaunchNonce, RecoveryState, RuntimeLimits, RuntimeProfile,
+        SoulId,
     };
     use std::path::PathBuf;
 
@@ -225,11 +281,13 @@ mod tests {
                 },
                 Some(freshell_runtime_protocol::FixtureKind::NativeSession),
                 None,
+                None,
                 "freshell-provider-test".into(),
             ),
             provider: "phase1-fixture".into(),
             provider_store_id: "store".into(),
             native_session_id: native.map(str::to_string),
+            fresh_agent: None,
             creation_seed_ref: "seed".into(),
             desired_state: DesiredState::Running,
             intent_revision: 1,
@@ -255,6 +313,44 @@ mod tests {
             recovery_window_started_at: None,
             successful_recoveries_in_window: 0,
         }
+    }
+
+    #[test]
+    fn hosted_fresh_agent_resume_preserves_exact_runtime_profile_and_native_identity() {
+        let mut context = fixture_context(Some("thread-native-42"));
+        context.provider = "codex".into();
+        context.provider_store_id = "codex-store-42".into();
+        context.fresh_agent = Some(FreshAgentLaunchSpec {
+            session_id: "presentation-42".into(),
+            provider: FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-app-server-v1".into(),
+            provider_store_id: "codex-store-42".into(),
+            cwd: "/workspace/project".into(),
+            workspace_path: "/workspace/project".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("gpt-test".into()),
+            effort: Some("high".into()),
+            permission_mode: Some("ask".into()),
+            sandbox: Some("workspace-write".into()),
+            native_session_id: Some("thread-native-42".into()),
+            provider_bootstrap_files: Vec::new(),
+        });
+
+        let resume = exact_resume_candidate(&context, Some("thread-native-42"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resume.provider_session.native_session_id,
+            "thread-native-42"
+        );
+        assert_eq!(resume.provider_session.provider_store_id, "codex-store-42");
+        assert_eq!(resume.runtime_variant, "codex-app-server-v1");
+        assert_eq!(resume.model.as_deref(), Some("gpt-test"));
+        assert_eq!(resume.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(resume.permission_mode.as_deref(), Some("ask"));
     }
 
     #[test]

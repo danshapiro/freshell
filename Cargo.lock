@@ -1281,13 +1281,17 @@ dependencies = [
 name = "freshell-agent-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "freshell-runtime-protocol",
  "freshell-sessions",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -1326,6 +1330,7 @@ dependencies = [
 name = "freshell-freshagent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "fancy-regex",
  "freshell-agent-runtime",
@@ -1385,6 +1390,7 @@ name = "freshell-runtime-client"
 version = "0.1.0"
 dependencies = [
  "freshell-runtime-protocol",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1418,6 +1424,7 @@ dependencies = [
 name = "freshell-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -1460,8 +1467,10 @@ dependencies = [
 name = "freshell-session-host"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "freshell-agent-runtime",
  "freshell-codex",
+ "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",
  "freshell-runtime-observability",
@@ -1475,6 +1484,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

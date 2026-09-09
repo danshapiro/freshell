@@ -8,8 +8,8 @@ use crate::{
 };
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
-    ControlRole, Envelope, FixtureKind, HostBootId, HostCommand, HostReply, HostResult,
-    IncarnationId, LaunchResult, LaunchState, LimitApplication, RequestId, ResumeSpec,
+    ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
+    HostResult, IncarnationId, LaunchResult, LaunchState, LimitApplication, RequestId, ResumeSpec,
     RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView,
     SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
 };
@@ -323,6 +323,49 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::TerminalOutput(output))
             }
+            AdminCommand::FreshAgentSend(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_send(
+                        envelope.request_id,
+                        request.soul_id,
+                        request.text,
+                        request.settings,
+                    )
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentResolve(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_resolve(request.soul_id, request.decision_id, request.decision)
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentInterrupt(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.fresh_agent_interrupt(request.soul_id).await?;
+                Ok(AdminResult::FreshAgentInterrupted)
+            }
+            AdminCommand::FreshAgentReadEvents(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let events = self
+                    .fresh_agent_read_events(
+                        request.soul_id,
+                        request.after_sequence,
+                        request.max_events,
+                    )
+                    .await?;
+                Ok(AdminResult::FreshAgentEvents(events))
+            }
             AdminCommand::RuntimeMetrics(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -358,6 +401,7 @@ impl Supervisor {
             &request.provider,
             request.fixture.is_some(),
             request.terminal.is_some(),
+            request.fresh_agent.is_some(),
         ) {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::UnsupportedWorkload,
@@ -386,6 +430,7 @@ impl Supervisor {
                 project_key: request.project_key.clone(),
                 fixture: request.fixture,
                 terminal: request.terminal.clone(),
+                fresh_agent: request.fresh_agent.clone(),
                 view_intent: request.view_intent.clone(),
                 admission: self.config.admission,
             })
@@ -403,6 +448,7 @@ impl Supervisor {
             request.soul_id,
             request.fixture,
             request.terminal,
+            request.fresh_agent,
             None,
             limits,
         )
@@ -415,6 +461,7 @@ impl Supervisor {
         soul_id: SoulId,
         fixture: Option<FixtureKind>,
         terminal: Option<TerminalLaunchSpec>,
+        fresh_agent: Option<FreshAgentLaunchSpec>,
         resume_spec: Option<ResumeSpec>,
         limits: RuntimeLimits,
     ) -> Result<LaunchResult, RuntimeError> {
@@ -435,6 +482,7 @@ impl Supervisor {
                     limits,
                     test_run_id: self.config.test_run_id.clone(),
                     terminal: terminal.clone(),
+                    fresh_agent: fresh_agent.clone(),
                     provider_volume_name: stable_provider_volume_name(
                         self.registry.installation_id(),
                         &prepared.soul_id,
@@ -576,6 +624,7 @@ impl Supervisor {
                 soul_id.clone(),
                 fixture,
                 terminal,
+                fresh_agent,
                 resume_spec,
                 &authenticated,
                 &grant,
@@ -592,6 +641,19 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "commit_running_state", error)
             })?;
+        if let Some(native_session_id) = accepted.native_session_id.as_ref() {
+            self.registry
+                .record_native_session(
+                    soul_id.clone(),
+                    handle.incarnation_id().clone(),
+                    native_session_id.clone(),
+                )
+                .await
+                .map_err(map_registry)
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "record_native_identity", error)
+                })?;
+        }
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_running",
@@ -646,7 +708,7 @@ impl Supervisor {
         let _lifecycle_guard = lifecycle_lock.lock().await;
         let (disposition, incarnation_id) = self
             .registry
-            .begin_input(soul_id.clone(), request_id.clone(), data.as_bytes())
+            .begin_input(soul_id.clone(), request_id.clone(), data.as_bytes(), None)
             .await
             .map_err(map_registry)?;
         match disposition {
@@ -760,6 +822,265 @@ impl Supervisor {
         }
     }
 
+    async fn fresh_agent_send(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        text: String,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+    ) -> Result<CommandState, RuntimeError> {
+        if text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES / 2 {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "fresh-agent input exceeds control-frame budget",
+            ));
+        }
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let active = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if active.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let settings_correlation = serde_json::to_vec(&settings).map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "fresh-agent settings could not be correlated",
+            )
+        })?;
+        let (disposition, incarnation_id) = self
+            .registry
+            .begin_input(
+                soul_id.clone(),
+                request_id.clone(),
+                text.as_bytes(),
+                Some(&settings_correlation),
+            )
+            .await
+            .map_err(map_registry)?;
+        match disposition {
+            InputJournalDisposition::Completed => return Ok(CommandState::Completed),
+            InputJournalDisposition::Ambiguous => return Ok(CommandState::Ambiguous),
+            InputJournalDisposition::Dispatch => {}
+        }
+        if let Some(settings) = settings.clone() {
+            self.registry
+                .update_fresh_agent_settings(soul_id.clone(), incarnation_id.clone(), settings)
+                .await
+                .map_err(map_registry)?;
+        }
+        let handle = self
+            .registry
+            .owned_handle(incarnation_id)
+            .await
+            .map_err(map_registry)?;
+        self.registry
+            .mark_input_dispatching(soul_id.clone(), request_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let host = match self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await
+        {
+            Ok(host) => host,
+            Err(error) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                return Err(error);
+            }
+        };
+        let response = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentSend {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id: request_id.clone(),
+                    text,
+                    settings,
+                },
+            )
+            .await;
+        match response {
+            Ok(HostResult::FreshAgentCommand {
+                state: CommandState::ProviderAcked | CommandState::Completed,
+                native_session_id,
+            }) => {
+                if let Some(native_session_id) = native_session_id {
+                    self.registry
+                        .record_native_session(
+                            soul_id.clone(),
+                            handle.incarnation_id().clone(),
+                            native_session_id,
+                        )
+                        .await
+                        .map_err(map_registry)?;
+                }
+                self.registry
+                    .mark_input_completed(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(CommandState::ProviderAcked)
+            }
+            Ok(HostResult::FreshAgentCommand { state, .. }) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(state)
+            }
+            Ok(_) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "unexpected fresh-agent command reply",
+                ))
+            }
+            Err(error) => {
+                self.registry
+                    .mark_input_ambiguous(soul_id, request_id)
+                    .await
+                    .map_err(map_registry)?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn fresh_agent_resolve(
+        &self,
+        soul_id: SoulId,
+        decision_id: String,
+        decision: serde_json::Value,
+    ) -> Result<CommandState, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentResolve {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    decision_id,
+                    decision,
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentCommand { state, .. } => Ok(state),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent decision reply",
+            )),
+        }
+    }
+
+    async fn fresh_agent_interrupt(&self, soul_id: SoulId) -> Result<(), RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentInterrupt {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentInterrupted => Ok(()),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent interrupt reply",
+            )),
+        }
+    }
+
+    async fn fresh_agent_read_events(
+        &self,
+        soul_id: SoulId,
+        after_sequence: u64,
+        max_events: u32,
+    ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentReadEvents {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    after_sequence,
+                    max_events: max_events.clamp(1, 4096),
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentEvents(events) => {
+                for event in &events.events {
+                    if let freshell_runtime_protocol::AgentEvent::Started { native_session_id } =
+                        &event.event
+                    {
+                        self.registry
+                            .record_native_session(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                native_session_id.clone(),
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                        // The host journal is the durable identity edge for
+                        // fresh agents. Materialize recovery evidence at the
+                        // same boundary instead of waiting for a terminal
+                        // output read that these workloads never perform.
+                        let _ = self.probe_recovery(soul_id.clone()).await;
+                    }
+                }
+                Ok(events)
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent events reply",
+            )),
+        }
+    }
+
     async fn terminal_read_output(
         &self,
         soul_id: SoulId,
@@ -843,6 +1164,8 @@ impl Supervisor {
         soul_id: SoulId,
         expected_intent_revision: Option<u64>,
     ) -> Result<(StopOutcome, RuntimeView), RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
         // The durable stop intent is committed before any IPC or Docker signal.
         let handle = self
             .registry
@@ -1047,6 +1370,7 @@ impl Supervisor {
         soul_id: SoulId,
         fixture: Option<FixtureKind>,
         terminal: Option<TerminalLaunchSpec>,
+        fresh_agent: Option<FreshAgentLaunchSpec>,
         resume_spec: Option<ResumeSpec>,
         host: &AuthenticatedHost,
         grant: &ExecutionGrantRecord,
@@ -1061,6 +1385,7 @@ impl Supervisor {
             grant_id: grant.grant_id.clone(),
             fixture,
             terminal: terminal.map(Box::new),
+            fresh_agent: fresh_agent.map(Box::new),
             resume_spec: resume_spec.map(Box::new),
         };
         match self
@@ -1072,11 +1397,13 @@ impl Supervisor {
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
+                native_session_id,
             } => Ok(AcceptedGrant {
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
+                native_session_id,
             }),
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -1158,6 +1485,14 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, RuntimeError> {
+        let is_slow_fresh_agent_command = matches!(
+            &command,
+            HostCommand::FreshAgentSend { .. }
+                | HostCommand::GrantExecution {
+                    fresh_agent: Some(_),
+                    ..
+                }
+        );
         let mut envelope = Envelope::new(RequestId::new(), ControlRole::Supervisor, command);
         envelope.auth = Some(host_proof(
             &host.secret,
@@ -1165,19 +1500,23 @@ impl Supervisor {
             &host.host_boot_id,
             &incarnation_id,
         ));
-        let reply = request_host_reply(
-            &runtime_dir.join("host.sock"),
-            &envelope,
-            host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref()),
-        )
-        .await?;
+        let budget = if is_slow_fresh_agent_command {
+            fresh_agent_command_budget(
+                std::env::var(FRESH_AGENT_COMMAND_TIMEOUT_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        } else {
+            host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref())
+        };
+        let reply = request_host_reply(&runtime_dir.join("host.sock"), &envelope, budget).await?;
         reply.result
     }
 
     pub(crate) async fn launch_result_from_status(
         &self,
         incarnation_id: IncarnationId,
-        _soul_id: SoulId,
+        soul_id: SoulId,
         host: AuthenticatedHost,
         status: HostStatus,
     ) -> Result<LaunchResult, RuntimeError> {
@@ -1193,6 +1532,12 @@ impl Supervisor {
                 "RUNNING incarnation has no worker",
             )
         })?;
+        if let Some(native_session_id) = status.native_session_id.as_ref() {
+            self.registry
+                .record_native_session(soul_id, incarnation_id.clone(), native_session_id.clone())
+                .await
+                .map_err(map_registry)?;
+        }
         let view = find_view(&self.registry, &incarnation_id).await?;
         Ok(LaunchResult {
             view,
@@ -1216,6 +1561,7 @@ pub(crate) struct AcceptedGrant {
     worker_pid: u32,
     worker_launch_count: u64,
     fixture_evidence: serde_json::Value,
+    native_session_id: Option<String>,
 }
 pub(crate) struct HostStatus {
     pub(crate) host_boot_id: HostBootId,
@@ -1279,6 +1625,9 @@ pub fn default_backend(socket: impl Into<PathBuf>) -> Arc<dyn RuntimeBackend> {
 pub(crate) const DEFAULT_HOST_COMMAND_TIMEOUT_MS: u64 = 10_000;
 
 pub(crate) const HOST_COMMAND_TIMEOUT_ENV: &str = "FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS";
+pub(crate) const DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const FRESH_AGENT_COMMAND_TIMEOUT_ENV: &str =
+    "FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS";
 
 /// Resolve the round-trip budget. Absent, unparseable, or zero configuration
 /// falls back to the default: the failure direction is always a bounded wait,
@@ -1289,6 +1638,16 @@ pub(crate) fn host_command_budget(configured: Option<&str>) -> Duration {
         .filter(|ms| *ms > 0)
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS))
+}
+
+pub(crate) fn fresh_agent_command_budget(configured: Option<&str>) -> Duration {
+    configured
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(
+            DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS,
+        ))
 }
 
 /// One bounded framed request/reply against a session host's control socket.
@@ -1353,13 +1712,23 @@ pub(crate) async fn exchange_host_frame(
     })
 }
 
-fn release_qualified_workload(provider: &str, is_fixture: bool, has_terminal: bool) -> bool {
-    is_fixture || !has_terminal || freshell_agent_runtime::managed_provider_enabled(provider)
+fn release_qualified_workload(
+    provider: &str,
+    is_fixture: bool,
+    has_terminal: bool,
+    has_fresh_agent: bool,
+) -> bool {
+    is_fixture
+        || has_fresh_agent
+        || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
 }
 
 #[cfg(test)]
 mod host_ipc_timeout_tests {
-    use super::{host_command_budget, request_host_reply, DEFAULT_HOST_COMMAND_TIMEOUT_MS};
+    use super::{
+        fresh_agent_command_budget, host_command_budget, request_host_reply,
+        DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS, DEFAULT_HOST_COMMAND_TIMEOUT_MS,
+    };
     use freshell_runtime_protocol::{
         ControlRole, Envelope, HostCommand, IncarnationId, RequestId, RuntimeErrorCode,
     };
@@ -1425,6 +1794,14 @@ mod host_ipc_timeout_tests {
             Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS)
         );
         assert_eq!(host_command_budget(Some("250")), Duration::from_millis(250));
+        assert_eq!(
+            fresh_agent_command_budget(None),
+            Duration::from_millis(DEFAULT_FRESH_AGENT_COMMAND_TIMEOUT_MS)
+        );
+        assert_eq!(
+            fresh_agent_command_budget(Some("750")),
+            Duration::from_millis(750)
+        );
     }
 }
 
@@ -1440,19 +1817,21 @@ mod release_scope_tests {
 
     #[test]
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
-        assert!(release_qualified_workload("shell", false, true));
-        assert!(release_qualified_workload("opencode", false, true));
+        assert!(release_qualified_workload("shell", false, true, false));
+        assert!(release_qualified_workload("opencode", false, true, false));
         for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
             assert!(
-                !release_qualified_workload(provider, false, true),
+                !release_qualified_workload(provider, false, true, false),
                 "{provider}"
             );
         }
         assert!(release_qualified_workload(
             "native-session-fixture",
             true,
+            false,
             false
         ));
+        assert!(release_qualified_workload("claude", false, false, true));
     }
 
     #[test]

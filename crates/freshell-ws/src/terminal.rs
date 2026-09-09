@@ -922,6 +922,12 @@ async fn handle_client_text(
     if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
+    // Explicit managed fresh-agent rollout: every fresh-agent operation is
+    // consumed by the external gateway when installed. It is never allowed
+    // to fall through and mint a competing web-owned provider writer.
+    if crate::hosted_fresh_agent::dispatch_if_installed(&message) {
+        return true;
+    }
     match message {
         ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
             Ok(()) => true,

@@ -66,6 +66,7 @@ freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = 
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
+async-trait = "0.1"
 serde_json = { workspace = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }

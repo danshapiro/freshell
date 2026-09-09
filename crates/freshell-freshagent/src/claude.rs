@@ -5489,8 +5489,32 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string());
     let ownership_id = mint_ownership_id();
 
-    let mut cmd = tokio::process::Command::new(&node);
-    cmd.arg(&entry);
+    let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
+        .ok()
+        .and_then(|uid| {
+            std::env::var("FRESHELL_PROVIDER_RUN_AS_GID")
+                .ok()
+                .map(|gid| (uid, gid))
+        });
+    let mut cmd = if let Some((uid, gid)) = run_as {
+        let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+        command.args([
+            "--reuid",
+            &uid,
+            "--regid",
+            &gid,
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+            &node,
+        ]);
+        command.arg(&entry);
+        command
+    } else {
+        let mut command = tokio::process::Command::new(&node);
+        command.arg(&entry);
+        command
+    };
     // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
     // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only

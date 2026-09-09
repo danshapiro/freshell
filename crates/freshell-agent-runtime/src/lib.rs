@@ -25,6 +25,7 @@ pub use qualification_policy::{
     process_qualification_policy, qualification_managed_provider_enabled,
     qualification_policy_from_value, QualificationPolicy, QUALIFICATION_PROVIDER_ENV,
 };
+pub mod host_actor;
 
 pub const PROVIDER_HOME: &str = "/home/freshell/provider";
 pub const MAX_SUCCESSFUL_RECOVERIES_PER_HOUR: u64 = 5;
