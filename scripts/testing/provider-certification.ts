@@ -219,6 +219,18 @@ export function providerCertificationCaseIds(manifest: CapabilityManifest): stri
     .map((row) => providerCertificationCaseId(row.provider))
 }
 
+/**
+ * The whole certification case set, including the release-scope audit that
+ * runs before any provider is classified. Every assertion a certification run
+ * records belongs to one of these ids, so expected and actual sets match
+ * exactly rather than by count.
+ */
+export const RELEASE_SCOPE_CASE_ID = 'PC-SCOPE'
+
+export function certificationCaseIds(manifest: CapabilityManifest): string[] {
+  return [RELEASE_SCOPE_CASE_ID, ...providerCertificationCaseIds(manifest)]
+}
+
 export type ProductionCertificationStatus = {
   status: typeof PRODUCTION_BLOCKED_STATUS | 'ELIGIBLE'
   reason: string | null

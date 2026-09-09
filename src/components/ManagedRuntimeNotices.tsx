@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { selectManagedRuntime } from '@/store/managedRuntimeSlice'
 import type { ManagedRuntimeIncidentSummary, ManagedRuntimeNotice } from '@shared/managed-runtime'
 import {
   getManagedRuntimeIncidentSummary,
@@ -11,7 +12,7 @@ import { useAppSelector } from '@/store/hooks'
 const AUTO_ACK_MS = 10_000
 const POLL_MS = 2_000
 
-function noticeProfileId(deviceId: string): string {
+function noticeProfileId(deviceId: string | undefined): string {
   return `profile:${deviceId || 'local-user'}`
 }
 
@@ -23,9 +24,9 @@ function cleanupLabel(summary: ManagedRuntimeIncidentSummary): string {
 
 export function ManagedRuntimeNotices() {
   const connectionStatus = useAppSelector((state) => state.connection.status)
-  const available = useAppSelector((state) => state.managedRuntime.available)
-  const inventoryRevision = useAppSelector((state) => state.managedRuntime.revision)
-  const deviceId = useAppSelector((state) => state.tabRegistry.deviceId)
+  const available = useAppSelector((state) => selectManagedRuntime(state).available)
+  const inventoryRevision = useAppSelector((state) => selectManagedRuntime(state).revision)
+  const deviceId = useAppSelector((state) => state.tabRegistry?.deviceId)
   const profileId = useMemo(() => noticeProfileId(deviceId), [deviceId])
   const [notices, setNotices] = useState<ManagedRuntimeNotice[]>([])
   const [details, setDetails] = useState<ManagedRuntimeIncidentSummary>()

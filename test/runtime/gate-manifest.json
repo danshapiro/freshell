@@ -896,6 +896,7 @@
     "schema_version": 1,
     "source_manifest": "docs/development/runtime-provider-capabilities.json",
     "provider_certification_case_ids": [
+      "PC-SCOPE",
       "PC-SHELL",
       "PC-CLAUDE",
       "PC-OPENCODE",
@@ -943,6 +944,11 @@
     "required_artifacts": [
       "summary.json",
       "deferred-providers.json"
-    ]
+    ],
+    "scope_case": {
+      "id": "PC-SCOPE",
+      "procedure": "Audit the checked-in capability manifest before classifying any provider: no uncertified provider may be managed-enabled, claim durable recovery, be routed by a managed doorway, or appear in the managed release scope.",
+      "pass_assertion": "Zero release-scope violations; the declared certified/deferred sets equal the provider rows; the certification case set is exact."
+    }
   }
 }

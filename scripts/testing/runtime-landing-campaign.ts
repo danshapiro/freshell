@@ -22,12 +22,24 @@ import { fileURLToPath } from 'node:url'
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
 
+type GateExpectation = {
+  gateArgs: string[]
+  status: 'PASS' | 'BLOCKED'
+  blockedReason?: string
+}
+
 type Step = {
   id: string
   title: string
   /** Receipt env vars this step produces. */
   produces: string[]
-  run: (env: NodeJS.ProcessEnv, logPath: string) => number
+  run?: (env: NodeJS.ProcessEnv, logPath: string) => number
+  /**
+   * Gate steps are judged by the summary they write, not by an exit code that
+   * has to survive npm/coordinator plumbing. A BLOCKED production gate is the
+   * expected, recorded outcome of this landing — never a pass.
+   */
+  expectGateStatus?: GateExpectation
 }
 
 function git(args: string[]): string {
@@ -43,6 +55,16 @@ function playwright(spec: string, extraEnv: Record<string, string>) {
     { ...env, ...extraEnv },
     logPath,
   )
+}
+
+/** Every gate summary currently on disk for this candidate, newest last. */
+function gateSummaryPaths(candidateSha: string): string[] {
+  const root = path.join(repoRoot, '.runtime-evidence', candidateSha)
+  if (!fs.existsSync(root)) return []
+  return fs.readdirSync(root)
+    .map((runId) => path.join(root, runId, 'summary.json'))
+    .filter((candidate) => fs.existsSync(candidate))
+    .sort((left, right) => fs.statSync(left).mtimeMs - fs.statSync(right).mtimeMs)
 }
 
 function run(command: string, args: string[], env: NodeJS.ProcessEnv, logPath: string): number {
@@ -122,30 +144,19 @@ const STEPS: Step[] = [
     id: 'landing-gate',
     title: 'Landing / pre-certification gate (expected PASS)',
     produces: [],
-    run: (env, logPath) => run(
-      mise,
-      ['exec', 'node@22', '--', 'node_modules/.bin/tsx', 'scripts/testing/runtime-gate.ts',
-        'gate', 'landing', '--require-live'],
-      env,
-      logPath,
-    ),
+    expectGateStatus: { gateArgs: ['gate', 'landing', '--require-live'], status: 'PASS' },
   },
   {
     id: 'production-gate',
     title: 'Full production Gate 5 (expected BLOCKED while providers are deferred)',
     produces: [],
-    run: (env, logPath) => run(
-      mise,
-      ['exec', 'node@22', '--', 'node_modules/.bin/tsx', 'scripts/testing/runtime-gate.ts',
-        'gate', 'phase-5', '--require-live'],
-      env,
-      logPath,
-    ),
+    expectGateStatus: {
+      gateArgs: ['gate', 'phase-5', '--require-live'],
+      status: 'BLOCKED',
+      blockedReason: 'pending_live_provider_certification',
+    },
   },
 ]
-
-/** Steps whose non-zero exit is the expected, recorded outcome. */
-const EXPECTED_EXIT: Record<string, number> = { 'production-gate': 2 }
 
 function main(): number {
   const args = process.argv.slice(2)
@@ -182,17 +193,61 @@ function main(): number {
     }
   }
 
-  const results: Array<{ id: string; title: string; exitCode: number; expected: number; ok: boolean; log: string }> = []
+  type StepResult = {
+    id: string
+    title: string
+    exitCode: number
+    ok: boolean
+    log: string
+    gate?: { status: string; blockedReason: string | null; expected: string; summaryPath: string } | { error: string }
+  }
+  const results: StepResult[] = []
   for (const step of STEPS) {
     if (only && !only.includes(step.id)) continue
     const logPath = path.join(logDir, `${step.id}.log`)
     console.log(`\n### ${step.id}: ${step.title}`)
-    const exitCode = step.run({ ...process.env, ...receiptEnv }, logPath)
-    const expected = EXPECTED_EXIT[step.id] ?? 0
-    const ok = exitCode === expected
-    results.push({ id: step.id, title: step.title, exitCode, expected, ok, log: path.relative(repoRoot, logPath) })
+    const env = { ...process.env, ...receiptEnv }
+
+    if (step.expectGateStatus) {
+      const before = gateSummaryPaths(candidateSha)
+      // Route the gate through the repo's coordinator so a broad destructive
+      // run still respects the shared test gate.
+      const exitCode = run(
+        mise,
+        ['exec', 'node@22', '--', 'npm', 'run', 'test:runtime', '--', ...step.expectGateStatus.gateArgs],
+        env,
+        logPath,
+      )
+      const summaryPath = gateSummaryPaths(candidateSha).find((candidate) => !before.includes(candidate))
+      let gate: StepResult['gate']
+      let ok = false
+      if (!summaryPath) {
+        gate = { error: 'the gate wrote no new summary.json' }
+      } else {
+        const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'))
+        gate = {
+          status: summary.status,
+          blockedReason: summary.blockedReason ?? null,
+          expected: step.expectGateStatus.status,
+          summaryPath: path.relative(repoRoot, summaryPath),
+        }
+        ok = summary.status === step.expectGateStatus.status
+          && (!step.expectGateStatus.blockedReason
+            || summary.blockedReason === step.expectGateStatus.blockedReason)
+      }
+      results.push({ id: step.id, title: step.title, exitCode, ok, log: path.relative(repoRoot, logPath), gate })
+      if (!ok) {
+        console.error(`step ${step.id}: gate outcome ${JSON.stringify(gate)} is not the expected ${step.expectGateStatus.status}`)
+        break
+      }
+      continue
+    }
+
+    const exitCode = step.run!(env, logPath)
+    const ok = exitCode === 0
+    results.push({ id: step.id, title: step.title, exitCode, ok, log: path.relative(repoRoot, logPath) })
     if (!ok) {
-      console.error(`step ${step.id} exited ${exitCode}, expected ${expected}`)
+      console.error(`step ${step.id} exited ${exitCode}`)
       break
     }
   }
