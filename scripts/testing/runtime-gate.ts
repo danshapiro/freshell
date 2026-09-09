@@ -28,7 +28,8 @@ import {
   productionCertificationStatus,
   resolveGateOutcome,
 } from './provider-certification.js'
-import { type GatePhase, parseGateArgs } from './runtime-gate-args.js'
+import { parseGateArgs } from './runtime-gate-args.js'
+import { certificationScopeForPhase, type PhaseCertificationScope } from './runtime-phase-scope.js'
 import { auditRuntimeArtifacts, candidateIntegrityFailures, captureRuntimeCandidate, type RuntimeCandidate } from './runtime-gate-integrity.js'
 import { PHASE1_CASE_IDS, runPhase1Gate, validateRequiredCoverage } from '../../test/runtime/gates/phase-1.test.js'
 import { PHASE2_CASE_IDS, runPhase2Gate } from '../../test/runtime/gates/phase-2.test.js'
@@ -75,7 +76,14 @@ async function main(): Promise<number> {
     console.error('FAIL: test/runtime/gate-manifest.json has no certification_gates block')
     return 1
   }
-  const declaredCertificationCases = certification.provider_certification_case_ids as string[]
+  let certificationScope: PhaseCertificationScope
+  try {
+    certificationScope = certificationScopeForPhase(certification, phase, mode)
+  } catch (error) {
+    console.error(`FAIL: ${error instanceof Error ? error.message : 'invalid certification scope'}`)
+    return 1
+  }
+  const declaredCertificationCases = certificationScope.caseIds
 
   const harness: RuntimeHarness = new RuntimeHarness(
     repoRoot,
@@ -136,14 +144,16 @@ async function main(): Promise<number> {
       blockedCases.push(...result.blocked)
     }
 
-    const certificationRun = await runProviderCertificationGate(harness, mode)
-    certificationResults = certificationRun.caseResults
-    deferred = certificationRun.deferred
-    const actualCertificationCases = certificationResults.map((row) => row.caseId)
-    if (JSON.stringify(actualCertificationCases) !== JSON.stringify(declaredCertificationCases)) {
-      throw new Error(
-        `certification case set drifted. manifest=${declaredCertificationCases.join(',')} run=${actualCertificationCases.join(',')}`,
-      )
+    if (certificationScope.required) {
+      const certificationRun = await runProviderCertificationGate(harness, mode)
+      certificationResults = certificationRun.caseResults
+      deferred = certificationRun.deferred
+      const actualCertificationCases = certificationResults.map((row) => row.caseId)
+      if (JSON.stringify(actualCertificationCases) !== JSON.stringify(declaredCertificationCases)) {
+        throw new Error(
+          `certification case set drifted. manifest=${declaredCertificationCases.join(',')} run=${actualCertificationCases.join(',')}`,
+        )
+      }
     }
 
     const safetyCase = phase === 'phase-5'
@@ -187,7 +197,7 @@ async function main(): Promise<number> {
   const declaredArtifacts: string[] = [
     ...(manifest.execution_contract?.required_artifacts ?? []),
     ...(phaseManifest.required_artifacts ?? []),
-    ...(certification.required_artifacts ?? []),
+    ...certificationScope.artifactNames,
   ]
   const artifactAudit = auditRuntimeArtifacts(harness.evidenceDir, declaredArtifacts)
   const missingArtifacts = artifactAudit.missing
@@ -229,7 +239,7 @@ async function main(): Promise<number> {
   const production = productionCertificationStatus(capabilities)
 
   const summary = {
-    gate: mode === 'landing' ? capabilities.certification.landingGate.id : capabilities.certification.productionGate.id,
+    gate: certificationScope.gateId,
     mode,
     phase,
     status: outcome.status,
